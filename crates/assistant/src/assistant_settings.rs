@@ -40,7 +40,7 @@ impl OpenAIModel {
             OpenAIModel::Mistral => OpenAIModel::ThreePointFiveTurbo,
             OpenAIModel::ThreePointFiveTurbo => OpenAIModel::Four,
             OpenAIModel::Four => OpenAIModel::FourTurbo,
-            OpenAIModel::FourTurbo => OpenAIModel::ThreePointFiveTurbo,
+            OpenAIModel::FourTurbo => OpenAIModel::Mistral,
         }
     }
 }
