@@ -1,8 +1,10 @@
 use anyhow::anyhow;
-use tiktoken_rs::{cl100k_base, CoreBPE};
+use tiktoken_rs::CoreBPE;
 use util::ResultExt;
 
 use crate::models::{LanguageModel, TruncationDirection};
+
+use super::OPENAI_BPE_TOKENIZER;
 
 #[derive(Clone)]
 pub struct OpenAILanguageModel {
@@ -12,8 +14,8 @@ pub struct OpenAILanguageModel {
 
 impl OpenAILanguageModel {
     pub fn load(model_name: &str) -> Self {
-        let bpe = tiktoken_rs::get_bpe_from_model(model_name)
-            .unwrap_or(cl100k_base().expect("error cl100k_base"));
+        let bpe =
+            tiktoken_rs::get_bpe_from_model(model_name).unwrap_or(OPENAI_BPE_TOKENIZER.to_owned());
         OpenAILanguageModel {
             name: model_name.to_string(),
             bpe: Some(bpe),
