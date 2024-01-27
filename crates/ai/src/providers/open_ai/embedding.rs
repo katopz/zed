@@ -134,7 +134,7 @@ impl OpenAIEmbeddingProvider {
         spans: Vec<&str>,
         request_timeout: u64,
     ) -> Result<Response<AsyncBody>> {
-        let request = Request::post("https://api.openai.com/v1/embeddings")
+        let request = Request::post("https://127.0.0.1:8080/embed")
             .redirect_policy(isahc::config::RedirectPolicy::Follow)
             .timeout(Duration::from_secs(request_timeout))
             .header("Content-Type", "application/json")
@@ -142,7 +142,7 @@ impl OpenAIEmbeddingProvider {
             .body(
                 serde_json::to_string(&OpenAIEmbeddingRequest {
                     input: spans.clone(),
-                    model: "text-embedding-ada-002",
+                    model: "bge-large-en-v1.5",
                 })
                 .unwrap()
                 .into(),

@@ -93,20 +93,15 @@ pub struct ChatChoiceDelta {
 }
 
 #[derive(Deserialize, Debug)]
-pub struct OpenAIResponseStreamEvent {
-    pub id: Option<String>,
-    pub object: String,
-    pub created: u32,
-    pub model: String,
-    pub choices: Vec<ChatChoiceDelta>,
-    pub usage: Option<OpenAIUsage>,
+pub struct TabbyResponseStreamEvent {
+    pub content: Option<String>,
 }
 
 pub async fn stream_completion(
     credential: ProviderCredential,
     executor: BackgroundExecutor,
     request: Box<dyn CompletionRequest>,
-) -> Result<impl Stream<Item = Result<OpenAIResponseStreamEvent>>> {
+) -> Result<impl Stream<Item = Result<TabbyResponseStreamEvent>>> {
     let api_key = match credential {
         ProviderCredential::Credentials { api_key } => api_key,
         _ => {
@@ -114,12 +109,13 @@ pub async fn stream_completion(
         }
     };
 
-    let (tx, rx) = futures::channel::mpsc::unbounded::<Result<OpenAIResponseStreamEvent>>();
+    let (tx, rx) = futures::channel::mpsc::unbounded::<Result<TabbyResponseStreamEvent>>();
 
     let json_data = request.data()?;
-    let mut response = Request::post(format!("{OPENAI_API_URL}/chat/completions"))
+    // dbg!(&json_data);
+    let mut response = Request::post(format!("{OPENAI_API_URL}/v1beta/chat/completions"))
         .header("Content-Type", "application/json")
-        .header("Authorization", format!("Bearer {}", api_key))
+        // .header("Authorization", format!("Bearer {}", api_key))
         .body(json_data)?
         .send_async()
         .await?;
@@ -132,9 +128,11 @@ pub async fn stream_completion(
 
                 fn parse_line(
                     line: Result<String, io::Error>,
-                ) -> Result<Option<OpenAIResponseStreamEvent>> {
-                    if let Some(data) = line?.strip_prefix("data: ") {
-                        let event = serde_json::from_str(data)?;
+                ) -> Result<Option<TabbyResponseStreamEvent>> {
+                    dbg!(&line);
+                    if let Ok(data) = line {
+                        let event = serde_json::from_str(&data)?;
+                        dbg!(&event);
                         Ok(Some(event))
                     } else {
                         Ok(None)
@@ -143,11 +141,9 @@ pub async fn stream_completion(
 
                 while let Some(line) = lines.next().await {
                     if let Some(event) = parse_line(line).transpose() {
+                        dbg!(&event);
                         let done = event.as_ref().map_or(false, |event| {
-                            event
-                                .choices
-                                .last()
-                                .map_or(false, |choice| choice.finish_reason.is_some())
+                            event.content.is_none() //.map_or(false, |content| !content.is_empty())
                         });
                         if tx.unbounded_send(event).is_err() {
                             break;
@@ -309,7 +305,7 @@ impl CompletionProvider for OpenAICompletionProvider {
             let stream = response
                 .filter_map(|response| async move {
                     match response {
-                        Ok(mut response) => Some(Ok(response.choices.pop()?.delta.content?)),
+                        Ok(mut response) => Some(Ok(response.content?)),
                         Err(error) => Some(Err(error)),
                     }
                 })

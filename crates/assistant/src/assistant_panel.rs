@@ -122,9 +122,11 @@ impl AssistantPanel {
                 .log_err()
                 .unwrap_or_default();
             // Defaulting currently to GPT4, allow for this to be set via config.
-            let completion_provider =
-                OpenAICompletionProvider::new("gpt-4".into(), cx.background_executor().clone())
-                    .await;
+            let completion_provider = OpenAICompletionProvider::new(
+                "mistral-7b-instruct".into(),
+                cx.background_executor().clone(),
+            )
+            .await;
 
             // TODO: deserialize state.
             let workspace_handle = workspace.clone();
