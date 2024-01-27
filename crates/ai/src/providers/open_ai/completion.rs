@@ -112,7 +112,6 @@ pub async fn stream_completion(
     let (tx, rx) = futures::channel::mpsc::unbounded::<Result<TabbyResponseStreamEvent>>();
 
     let json_data = request.data()?;
-    // dbg!(&json_data);
     let mut response = Request::post(format!("{OPENAI_API_URL}/v1beta/chat/completions"))
         .header("Content-Type", "application/json")
         // .header("Authorization", format!("Bearer {}", api_key))
@@ -129,10 +128,8 @@ pub async fn stream_completion(
                 fn parse_line(
                     line: Result<String, io::Error>,
                 ) -> Result<Option<TabbyResponseStreamEvent>> {
-                    dbg!(&line);
                     if let Ok(data) = line {
                         let event = serde_json::from_str(&data)?;
-                        dbg!(&event);
                         Ok(Some(event))
                     } else {
                         Ok(None)
@@ -141,7 +138,6 @@ pub async fn stream_completion(
 
                 while let Some(line) = lines.next().await {
                     if let Some(event) = parse_line(line).transpose() {
-                        dbg!(&event);
                         let done = event.as_ref().map_or(false, |event| {
                             event.content.is_none() //.map_or(false, |content| !content.is_empty())
                         });
