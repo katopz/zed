@@ -134,7 +134,7 @@ impl OpenAIEmbeddingProvider {
         spans: Vec<&str>,
         request_timeout: u64,
     ) -> Result<Response<AsyncBody>> {
-        let request = Request::post("https://127.0.0.1:8080/embed")
+        let request = Request::post("https://127.0.0.1:8081/embed")
             .redirect_policy(isahc::config::RedirectPolicy::Follow)
             .timeout(Duration::from_secs(request_timeout))
             .header("Content-Type", "application/json")
