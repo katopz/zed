@@ -21,7 +21,7 @@ use crate::{
     models::LanguageModel,
 };
 
-use crate::providers::open_ai::{OpenAILanguageModel, OPENAI_API_URL};
+use crate::providers::open_ai::{OpenAILanguageModel, OPENAI_API_PATH, OPENAI_API_URL};
 
 #[derive(Clone, Copy, Serialize, Deserialize, Debug, Eq, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -112,7 +112,7 @@ pub async fn stream_completion(
     let (tx, rx) = futures::channel::mpsc::unbounded::<Result<TabbyResponseStreamEvent>>();
 
     let json_data = request.data()?;
-    let mut response = Request::post(format!("{OPENAI_API_URL}/v1beta/chat/completions"))
+    let mut response = Request::post(format!("{OPENAI_API_URL}{OPENAI_API_PATH}"))
         .header("Content-Type", "application/json")
         // .header("Authorization", format!("Bearer {}", api_key))
         .body(json_data)?
