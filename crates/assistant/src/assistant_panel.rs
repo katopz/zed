@@ -218,7 +218,7 @@ impl AssistantPanel {
         prev_settings_version: usize,
         cx: &mut ViewContext<Self>,
     ) {
-        if self.is_authenticated(cx) {
+        if self.is_local(cx) || self.is_authenticated(cx) {
             self.authentication_prompt = None;
 
             let model = CompletionProvider::global(cx).default_model();
@@ -1023,6 +1023,10 @@ impl AssistantPanel {
         CompletionProvider::global(cx).is_authenticated()
     }
 
+    fn is_local(&mut self, cx: &mut ViewContext<Self>) -> bool {
+        CompletionProvider::global(cx).is_local()
+    }
+
     fn authenticate(&mut self, cx: &mut ViewContext<Self>) -> Task<Result<()>> {
         cx.update_global::<CompletionProvider, _>(|provider, cx| provider.authenticate(cx))
     }
@@ -1236,6 +1240,19 @@ impl Panel for AssistantPanel {
 
     fn set_active(&mut self, active: bool, cx: &mut ViewContext<Self>) {
         if active {
+            if self.is_local(cx) {
+                cx.spawn(|this, mut cx| async move {
+                    this.update(&mut cx, |this, cx| {
+                        if this.active_conversation_editor().is_none() {
+                            this.new_conversation(cx);
+                        }
+                    })
+                })
+                .detach_and_log_err(cx);
+
+                return;
+            }
+
             let load_credentials = self.authenticate(cx);
             cx.spawn(|this, mut cx| async move {
                 load_credentials.await?;
@@ -1538,7 +1555,9 @@ impl Conversation {
         }
 
         if should_assist {
-            if !CompletionProvider::global(cx).is_authenticated() {
+            if !CompletionProvider::global(cx).is_local()
+                && !CompletionProvider::global(cx).is_authenticated()
+            {
                 log::info!("completion provider has no credentials");
                 return Default::default();
             }

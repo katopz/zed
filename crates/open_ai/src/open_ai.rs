@@ -204,7 +204,7 @@ pub struct ResponseStreamEvent {
 pub async fn stream_completion(
     client: &dyn HttpClient,
     api_url: &str,
-    api_key: &str,
+    api_key: Option<String>,
     request: Request,
 ) -> Result<BoxStream<'static, Result<ResponseStreamEvent>>> {
     let uri = format!("{api_url}/chat/completions");
@@ -212,7 +212,11 @@ pub async fn stream_completion(
         .method(Method::POST)
         .uri(uri)
         .header("Content-Type", "application/json")
-        .header("Authorization", format!("Bearer {}", api_key))
+        // This should be nicer here if we ues reqwest and reinsert header later if needed.
+        .header(
+            "Authorization",
+            format!("Bearer {:?}", api_key.or(Some("".to_owned()))),
+        )
         .body(AsyncBody::from(serde_json::to_string(&request)?))?;
     let mut response = client.send(request).await?;
     if response.status().is_success() {

@@ -437,7 +437,7 @@ mod tests {
                 .set_user_settings(
                     r#"{
                         "assistant": {
-                            "default_open_ai_model": "gpt-4-0613"
+                            "default_open_ai_model": "mistralai/mistral-7b-instruct"
                         }
                     }"#,
                     cx,

@@ -63,6 +63,10 @@ impl ZedDotDevCompletionProvider {
         self.status.is_connected()
     }
 
+    pub fn is_local(&self) -> bool {
+        todo!()
+    }
+
     pub fn authenticate(&self, cx: &AppContext) -> Task<Result<()>> {
         let client = self.client.clone();
         cx.spawn(move |cx| async move { client.authenticate_and_connect(true, &cx).await })

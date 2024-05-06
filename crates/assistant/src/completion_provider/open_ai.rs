@@ -50,8 +50,15 @@ impl OpenAiCompletionProvider {
         self.api_key.is_some()
     }
 
+    pub fn is_local(&self) -> bool {
+        // Possible value http://0.0.0.0:9090
+        self.api_url.starts_with("http://localhost")
+            || self.api_url.starts_with("http://0.0.0.0")
+            || self.api_url.starts_with("http://127.0.0.1")
+    }
+
     pub fn authenticate(&self, cx: &AppContext) -> Task<Result<()>> {
-        if self.is_authenticated() {
+        if self.is_local() || self.is_authenticated() {
             Task::ready(Ok(()))
         } else {
             let api_url = self.api_url.clone();
@@ -113,8 +120,8 @@ impl OpenAiCompletionProvider {
         let api_key = self.api_key.clone();
         let api_url = self.api_url.clone();
         async move {
-            let api_key = api_key.ok_or_else(|| anyhow!("missing api key"))?;
-            let request = stream_completion(http_client.as_ref(), &api_url, &api_key, request);
+            // let api_key = api_key.ok_or_else(|| anyhow!("missing api key"))?;
+            let request = stream_completion(http_client.as_ref(), &api_url, api_key, request);
             let response = request.await?;
             let stream = response
                 .filter_map(|response| async move {

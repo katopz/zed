@@ -123,6 +123,15 @@ impl CompletionProvider {
         }
     }
 
+    pub fn is_local(&self) -> bool {
+        match self {
+            CompletionProvider::OpenAi(provider) => provider.is_local(),
+            CompletionProvider::ZedDotDev(provider) => provider.is_local(),
+            #[cfg(test)]
+            CompletionProvider::Fake(_) => true,
+        }
+    }
+
     pub fn authenticate(&self, cx: &AppContext) -> Task<Result<()>> {
         match self {
             CompletionProvider::OpenAi(provider) => provider.authenticate(cx),

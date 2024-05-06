@@ -4215,9 +4215,16 @@ async fn complete_with_language_model(
         .check::<CompleteWithLanguageModelRateLimit>(session.user_id())
         .await?;
 
-    if request.model.starts_with("gpt") {
+    log::info!("🔥 {}", request.model);
+
+    if request.model.starts_with("mistral") {
+        let api_key = open_ai_api_key.unwrap_or(Arc::from(String::from("")));
+        let api_key = Some(api_key.as_ref().to_owned());
+        complete_with_open_ai(request, response, session, api_key).await?;
+    } else if request.model.starts_with("gpt") {
         let api_key =
             open_ai_api_key.ok_or_else(|| anyhow!("no OpenAI API key configured on the server"))?;
+        let api_key = Some(api_key.as_ref().to_owned());
         complete_with_open_ai(request, response, session, api_key).await?;
     } else if request.model.starts_with("gemini") {
         let api_key = google_ai_api_key
@@ -4236,12 +4243,12 @@ async fn complete_with_open_ai(
     request: proto::CompleteWithLanguageModel,
     response: StreamingResponse<proto::CompleteWithLanguageModel>,
     session: UserSession,
-    api_key: Arc<str>,
+    api_key: Option<String>,
 ) -> Result<()> {
     let mut completion_stream = open_ai::stream_completion(
         session.http_client.as_ref(),
         OPEN_AI_API_URL,
-        &api_key,
+        api_key,
         crate::ai::language_model_request_to_open_ai(request)?,
     )
     .await

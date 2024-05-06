@@ -67,11 +67,16 @@ impl CloudCompletionProvider {
 
 impl CompletionProviderBackend for CloudCompletionProvider {
     fn default_model(&self) -> String {
-        "gpt-4-turbo".into()
+        "mistralai/mistral-7b-instruct".into()
     }
 
     fn available_models(&self) -> Vec<String> {
-        vec!["gpt-4-turbo".into(), "gpt-4".into(), "gpt-3.5-turbo".into()]
+        vec![
+            "mistralai/mistral-7b-instruct".into(),
+            "gpt-4-turbo".into(),
+            "gpt-4".into(),
+            "gpt-3.5-turbo".into(),
+        ]
     }
 
     fn complete(

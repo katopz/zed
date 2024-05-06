@@ -1236,9 +1236,13 @@ impl Client {
         let mut url = Self::get_rpc_url(http.clone(), None).await?;
         url.set_path("/user");
         url.set_query(Some(&format!("github_login={login}")));
-        let request = Request::get(url.as_str())
-            .header("Authorization", format!("token {api_token}"))
-            .body("".into())?;
+        let request = if api_token.is_empty() {
+            Request::get(url.as_str()).body("".into())?
+        } else {
+            Request::get(url.as_str())
+                .header("Authorization", format!("token {api_token}"))
+                .body("".into())?
+        };
 
         let mut response = http.send(request).await?;
         let mut body = String::new();
