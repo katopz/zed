@@ -24,6 +24,7 @@ use zed_actions::agent::{
     ResolveConflictsWithAgent, ReviewBranchDiff,
 };
 
+use crate::auto_prompt::AutoPromptNewThread;
 use crate::thread_metadata_store::ThreadMetadataStore;
 use crate::{
     AddContextServer, AgentDiffPane, ConversationView, CopyThreadToClipboard, CycleStartThreadIn,
@@ -187,6 +188,14 @@ pub fn init(cx: &mut App) {
                         }
                     },
                 )
+                .register_action(|workspace, action: &AutoPromptNewThread, window, cx| {
+                    if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+                        panel.update(cx, |panel, cx| {
+                            panel.auto_prompt_new_thread(action, window, cx)
+                        });
+                        workspace.focus_panel::<AgentPanel>(window, cx);
+                    }
+                })
                 .register_action(|workspace, _: &ExpandMessageEditor, window, cx| {
                     if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
                         workspace.focus_panel::<AgentPanel>(window, cx);
@@ -1483,6 +1492,46 @@ impl AgentPanel {
             })
         })
         .detach_and_log_err(cx);
+    }
+
+    /// Handler for `AutoPromptNewThread` — creates a new thread with the
+    /// previous thread's summary link + the external LLM's next_prompt, auto-submits.
+    fn auto_prompt_new_thread(
+        &mut self,
+        action: &AutoPromptNewThread,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let from_session_id = action.from_session_id.clone();
+        let from_title = action.from_title.clone();
+        let next_prompt = action.next_prompt.clone();
+
+        // Build a mention link matching MentionUri::Thread format:
+        // [@{name}](zed:///agent/thread/{id}?name={name})
+        let thread_name = from_title.as_deref().unwrap_or("Thread");
+        let summary_link = format!(
+            "[@{thread_name}](zed:///agent/thread/{from_session_id}?name={thread_name})\n\n"
+        );
+
+        let full_prompt = format!("{summary_link}{next_prompt}");
+
+        let blocks = vec![agent_client_protocol::ContentBlock::Text(
+            agent_client_protocol::TextContent::new(full_prompt),
+        )];
+
+        self.external_thread(
+            Some(Agent::NativeAgent),
+            None,
+            None,
+            None,
+            Some(AgentInitialContent::ContentBlock {
+                blocks,
+                auto_submit: true,
+            }),
+            true,
+            window,
+            cx,
+        );
     }
 
     fn external_thread(

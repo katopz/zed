@@ -1,0 +1,118 @@
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+/// Configuration for the auto-prompt hook.
+///
+/// Loaded from `~/.config/zed/auto_prompt.json` or environment variables.
+/// The LLM used is whatever Zed has configured (thread_summary_model or default_model).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AutoPromptConfig {
+    /// Whether the auto-prompt hook is enabled.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Optional system prompt to use when calling the LLM.
+    /// Defaults to a built-in prompt that instructs the model to return JSON.
+    #[serde(default)]
+    pub system_prompt: Option<String>,
+
+    /// Maximum number of auto-prompt iterations before hard-stopping the loop.
+    #[serde(default = "default_max_iterations")]
+    pub max_iterations: u32,
+
+    /// Token count threshold (approximate) at which context is considered too large
+    /// and the system forces a "continue" prompt instead of asking the LLM.
+    #[serde(default = "default_max_context_tokens")]
+    pub max_context_tokens: usize,
+
+    /// Base delay in milliseconds for exponential backoff on errors.
+    /// Actual delay = backoff_base_ms * 2^retry_count (capped at 60s).
+    #[serde(default = "default_backoff_base_ms")]
+    pub backoff_base_ms: u64,
+}
+
+fn default_max_iterations() -> u32 {
+    20
+}
+
+fn default_max_context_tokens() -> usize {
+    80_000
+}
+
+fn default_backoff_base_ms() -> u64 {
+    2_000
+}
+
+impl Default for AutoPromptConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            system_prompt: None,
+            max_iterations: default_max_iterations(),
+            max_context_tokens: default_max_context_tokens(),
+            backoff_base_ms: default_backoff_base_ms(),
+        }
+    }
+}
+
+impl AutoPromptConfig {
+    /// Returns the path to the config file: `~/.config/zed/auto_prompt.json`
+    pub fn config_path() -> Result<PathBuf> {
+        let config_dir = paths::config_dir().join("zed");
+        Ok(config_dir.join("auto_prompt.json"))
+    }
+
+    /// Load config from file, falling back to environment variables.
+    pub fn load() -> Result<Self> {
+        let path = Self::config_path()?;
+
+        if path.exists() {
+            let content = std::fs::read_to_string(&path)?;
+            let config: Self = serde_json::from_str(&content)?;
+            return Ok(config);
+        }
+
+        Ok(Self::from_env())
+    }
+
+    /// Build config from environment variables.
+    fn from_env() -> Self {
+        let enabled = std::env::var("ZED_AUTO_PROMPT_ENABLED")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
+        let system_prompt = std::env::var("ZED_AUTO_PROMPT_SYSTEM_PROMPT").ok();
+
+        let max_iterations = std::env::var("ZED_AUTO_PROMPT_MAX_ITERATIONS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(default_max_iterations);
+
+        let max_context_tokens = std::env::var("ZED_AUTO_PROMPT_MAX_CONTEXT_TOKENS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(default_max_context_tokens);
+
+        let backoff_base_ms = std::env::var("ZED_AUTO_PROMPT_BACKOFF_BASE_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(default_backoff_base_ms);
+
+        Self {
+            enabled,
+            system_prompt,
+            max_iterations,
+            max_context_tokens,
+            backoff_base_ms,
+        }
+    }
+
+    /// Calculate backoff delay for a given retry count.
+    /// Capped at 60 seconds.
+    pub fn backoff_delay_ms(&self, retry_count: u32) -> u64 {
+        let capped_retry = retry_count.min(5);
+        let delay = self.backoff_base_ms * 2u64.pow(capped_retry);
+        delay.min(60_000)
+    }
+}

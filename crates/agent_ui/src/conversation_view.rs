@@ -1426,6 +1426,8 @@ impl ConversationView {
                     cx,
                 );
 
+                crate::auto_prompt::on_thread_stopped(&thread, used_tools, stop_reason, window, cx);
+
                 let should_send_queued = if let Some(active) = self.active_thread() {
                     active.update(cx, |active, cx| {
                         if active.skip_queue_processing_count > 0 {
