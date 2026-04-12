@@ -1,0 +1,460 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+TEST_DIR="${1:-/tmp/auto-prompt-test-helloworld}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PLAN_SOURCE="$SCRIPT_DIR/../.plan/02_e2e_helloworld_test.md"
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+info()  { echo -e "${CYAN}[INFO]${NC} $*"; }
+ok()    { echo -e "${GREEN}[OK]${NC} $*"; }
+warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
+fail()  { echo -e "${RED}[FAIL]${NC} $*"; exit 1; }
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [COMMAND] [DIR]
+
+Commands:
+  setup     Create the test environment (default)
+  teardown  Remove the test environment
+  verify    Run all verification checks
+  status    Show current git state
+  help      Show this help
+
+DIR defaults to /tmp/auto-prompt-test-helloworld
+
+Examples:
+  $(basename "$0")                          # setup in /tmp
+  $(basename "$0") setup ~/test-hw          # setup in custom dir
+  $(basename "$0") verify /tmp/auto-prompt-test-helloworld
+  $(basename "$0") teardown
+EOF
+}
+
+cmd_setup() {
+    local dir="$1"
+    info "Setting up E2E auto-prompt test environment at: $dir"
+
+    if [ -d "$dir" ]; then
+        warn "Directory exists: $dir"
+        read -rp "Remove and recreate? [y/N] " confirm
+        if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+            rm -rf "$dir"
+        else
+            fail "Aborted. Existing directory kept."
+        fi
+    fi
+
+    mkdir -p "$dir"
+    cd "$dir"
+
+    info "Initializing Cargo project..."
+    cargo init --name helloworld --quiet
+
+    info "Writing Cargo.toml..."
+    cat > Cargo.toml <<'TOML'
+[package]
+name = "helloworld"
+version = "0.1.0"
+edition = "2021"
+TOML
+
+    info "Writing src/main.rs..."
+    cat > src/main.rs <<'RUST'
+fn main() {
+    println!("Hello, world!");
+}
+RUST
+
+    mkdir -p tests
+    touch tests/.gitkeep
+
+    info "Copying plan file..."
+    mkdir -p .plan
+    if [ -f "$PLAN_SOURCE" ]; then
+        cp "$PLAN_SOURCE" .plan/01_helloworld_flow.md
+        ok "Plan file copied from $PLAN_SOURCE"
+    else
+        warn "Plan source not found at $PLAN_SOURCE"
+        warn "Creating stub plan file — copy the real one manually"
+        cat > .plan/01_helloworld_flow.md <<'STUB'
+# HelloWorld E2E Test Plan
+
+## Status
+
+- [ ] Step 1: Initialize git repo with Cargo project structure on `main`
+- [ ] Step 2: Implement hello world with passing tests on `develop`
+- [ ] Step 3: Add greet-by-name feature on `feature/01_greet_by_name` branch
+- [ ] Step 4: Merge feature to `develop`, verify tests pass
+- [ ] Step 5: Release v0.1.0 — bump version, tag, merge to `main`
+- [ ] Step 6: Verify git history matches expected flow
+- [ ] Step 7: Inject bug, ask AI to diagnose and fix
+- [ ] Step 8: Verify fix commit uses `fix:` conventional commit prefix
+- [ ] Step 9: Release v0.2.0 — bump version, tag, merge to `main`
+- [ ] Step 10: Final verification of complete git history
+
+Copy full plan from zed/.plan/02_e2e_helloworld_test.md
+STUB
+    fi
+
+    info "Initializing git repo..."
+    git init --quiet
+    git add .
+    git commit --quiet -m "chore: initialize helloworld project"
+    git branch -M main
+
+    git checkout --quiet -b develop
+
+    ok "Git initialized on main, develop branch created"
+
+    echo ""
+    info "Project structure:"
+    find . -not -path './.git/*' -not -path './.git' | sort | head -20
+
+    echo ""
+    info "Git branches:"
+    git branch -a
+
+    echo ""
+    info "Cargo check..."
+    cargo check --quiet 2>&1 && ok "Cargo check passed" || warn "Cargo check had issues"
+
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    ok "Setup complete!"
+    echo ""
+    info "Next steps:"
+    echo ""
+    echo "  1. Open this folder in Zed:"
+    echo "     ${CYAN}zed $dir${NC}"
+    echo ""
+    echo "  2. Enable auto-prompt in Zed config:"
+    echo "     ${CYAN}mkdir -p ~/.config/zed && cat > ~/.config/zed/auto_prompt.json <<CFG"
+    echo '{'
+    echo '  "enabled": true,'
+    echo '  "max_iterations": 20,'
+    echo '  "max_context_tokens": 80000,'
+    echo '  "backoff_base_ms": 2000'
+    echo '}'
+    echo "CFG${NC}"
+    echo ""
+    echo "  3. Open Agent Panel (cmd+i) and send:"
+    echo "     ${CYAN}Read .plan/01_helloworld_flow.md and execute the plan starting from Step 2.${NC}"
+    echo ""
+    echo "  4. Watch the auto-prompt loop execute the plan."
+    echo ""
+    echo "  5. After the loop finishes, run verification:"
+    echo "     ${CYAN}$(basename "$0") verify $dir${NC}"
+    echo ""
+    echo "  6. When done, tear down:"
+    echo "     ${CYAN}$(basename "$0") teardown $dir${NC}"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+}
+
+cmd_teardown() {
+    local dir="$1"
+    if [ ! -d "$dir" ]; then
+        warn "Directory does not exist: $dir"
+        exit 0
+    fi
+
+    info "Removing test environment: $dir"
+    rm -rf "$dir"
+    ok "Teardown complete"
+}
+
+cmd_status() {
+    local dir="$1"
+    require_dir "$dir"
+    cd "$dir"
+
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    info "Git status for: $dir"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    echo ""
+    info "Current branch:"
+    git branch --show-current
+
+    echo ""
+    info "All branches:"
+    git branch -a
+
+    echo ""
+    info "Tags:"
+    git tag -l
+
+    echo ""
+    info "Recent log (all branches):"
+    git log --oneline --graph --all -20
+
+    echo ""
+    info "Cargo.toml version:"
+    grep '^version' Cargo.toml || warn "No version found"
+
+    echo ""
+    info "Tests:"
+    cargo test --quiet 2>&1 && ok "All tests pass" || warn "Some tests fail"
+
+    echo ""
+    info "Plan status (.plan/01_helloworld_flow.md):"
+    if [ -f .plan/01_helloworld_flow.md ]; then
+        grep -E '^\s*-\s+\[' .plan/01_helloworld_flow.md || echo "(no status items found)"
+    else
+        warn "No plan file found"
+    fi
+
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+}
+
+cmd_verify() {
+    local dir="$1"
+    require_dir "$dir"
+    cd "$dir"
+
+    local pass=0
+    local fail=0
+
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    info "Running E2E verification for: $dir"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    echo ""
+
+    # Check 1: Branches exist
+    info "Check: main and develop branches exist"
+    if git show-ref --verify --quiet refs/heads/main && \
+       git show-ref --verify --quiet refs/heads/develop; then
+        ok "Branches: main, develop"
+        ((pass++))
+    else
+        fail "Missing main or develop branch"
+        ((fail++))
+    fi
+
+    # Check 2: Tags
+    info "Check: Release tags"
+    local tags
+    tags=$(git tag -l | sort)
+    if [ -n "$tags" ]; then
+        ok "Tags found: $(echo "$tags" | tr '\n' ' ')"
+        ((pass++))
+    else
+        warn "No tags found"
+        ((fail++))
+    fi
+
+    # Check 3: Tests pass
+    info "Check: Tests pass"
+    if cargo test --quiet 2>&1; then
+        ok "All tests pass"
+        ((pass++))
+    else
+        fail "Tests failing"
+        ((fail++))
+    fi
+
+    # Check 4: Conventional commits
+    info "Check: Conventional commits in history"
+    local commits
+    commits=$(git log --all --oneline --format='%s')
+    local conventional=0
+    for prefix in "feat:" "fix:" "chore:" "refactor:" "test:" "docs:" "merge:" "release:"; do
+        if echo "$commits" | grep -q "$prefix"; then
+            ((conventional++))
+        fi
+    done
+    if [ "$conventional" -ge 3 ]; then
+        ok "Found $conventional conventional commit types"
+        ((pass++))
+    else
+        warn "Only $conventional conventional commit types found (expected >= 3)"
+        ((fail++))
+    fi
+
+    # Check 5: feat: commit exists
+    info "Check: feat: commit present"
+    if echo "$commits" | grep -q "feat:"; then
+        ok "Feature commit found"
+        ((pass++))
+    else
+        fail "No feat: commit found"
+        ((fail++))
+    fi
+
+    # Check 6: fix: commit exists (if bug was injected and fixed)
+    info "Check: fix: commit present (Step 7-8)"
+    if echo "$commits" | grep -q "fix:"; then
+        ok "Fix commit found"
+        ((pass++))
+    else
+        warn "No fix: commit found (Steps 7-8 may not be done yet)"
+        ((fail++))
+    fi
+
+    # Check 7: Merge commits exist (git flow)
+    info "Check: Merge commits (git flow)"
+    local merge_count
+    merge_count=$(git log --all --oneline --merges | wc -l | tr -d ' ')
+    if [ "$merge_count" -ge 1 ]; then
+        ok "Found $merge_count merge commit(s)"
+        ((pass++))
+    else
+        warn "No merge commits found"
+        ((fail++))
+    fi
+
+    # Check 8: Version in Cargo.toml
+    info "Check: Cargo.toml version"
+    local version
+    version=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+    if [ "$version" = "0.2.0" ]; then
+        ok "Version is $version (final)"
+        ((pass++))
+    elif [ "$version" = "0.1.0" ]; then
+        warn "Version is $version (Step 9 not done yet)"
+        ((fail++))
+    else
+        warn "Unexpected version: $version"
+        ((fail++))
+    fi
+
+    # Check 9: greet function correct
+    info "Check: greet() returns 'Hello, world!'"
+    if [ -f src/lib.rs ] && grep -q '"Hello, world!"' src/lib.rs; then
+        ok "greet() is correct"
+        ((pass++))
+    else
+        fail "greet() not found or incorrect"
+        ((fail++))
+    fi
+
+    # Check 10: greet_by_name function exists
+    info "Check: greet_by_name() function exists"
+    if [ -f src/lib.rs ] && grep -q 'fn greet_by_name' src/lib.rs; then
+        ok "greet_by_name() exists"
+        ((pass++))
+    else
+        warn "greet_by_name() not found (Step 3 not done yet)"
+        ((fail++))
+    fi
+
+    # Check 11: Plan file exists
+    info "Check: Plan file in .plan/"
+    if [ -f .plan/01_helloworld_flow.md ]; then
+        ok "Plan file exists"
+        ((pass++))
+    else
+        fail "Plan file missing"
+        ((fail++))
+    fi
+
+    # Check 12: Plan progress
+    info "Check: Plan progress"
+    if [ -f .plan/01_helloworld_flow.md ]; then
+        local total checked
+        total=$(grep -cE '^\s*-\s+\[' .plan/01_helloworld_flow.md) || total=0
+        checked=$(grep -cE '^\s*-\s+\[x\]' .plan/01_helloworld_flow.md) || checked=0
+        if [ "$checked" -eq "$total" ] && [ "$total" -gt 0 ]; then
+            ok "All $total plan steps completed"
+            ((pass++))
+        else
+            warn "$checked/$total plan steps completed"
+            ((fail++))
+        fi
+    else
+        ((fail++))
+    fi
+
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    info "Results: ${GREEN}$pass passed${NC}, ${RED}$fail failed${NC}"
+    echo ""
+
+    if [ "$fail" -eq 0 ]; then
+        ok "ALL CHECKS PASSED"
+    else
+        info "Full git log:"
+        git log --oneline --graph --all
+        echo ""
+        info "Plan status:"
+        if [ -f .plan/01_helloworld_flow.md ]; then
+            grep -E '^\s*-\s+\[' .plan/01_helloworld_flow.md
+        fi
+    fi
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    return "$fail"
+}
+
+cmd_inject_bug() {
+    local dir="$1"
+    require_dir "$dir"
+    cd "$dir"
+
+    git checkout --quiet develop 2>/dev/null || true
+
+    info "Injecting bug into src/lib.rs..."
+
+    if [ ! -f src/lib.rs ]; then
+        fail "src/lib.rs not found. Run Step 2 first."
+    fi
+
+    if grep -q '"Goodbye, world!"' src/lib.rs; then
+        warn "Bug already injected"
+        return 0
+    fi
+
+    sed -i '' 's/"Hello, world!"/"Goodbye, world!"/' src/lib.rs
+
+    git add src/lib.rs
+    git commit --quiet -m "intentional bug: wrong greeting for testing fix flow"
+
+    ok "Bug injected. Tests should now fail:"
+    cargo test 2>&1 || true
+
+    echo ""
+    info "Now ask the AI agent to fix the failing tests."
+    info "Prompt: ${CYAN}cargo test is failing, diagnose and fix the bug${NC}"
+}
+
+require_dir() {
+    if [ ! -d "$1" ]; then
+        fail "Directory not found: $1"
+    fi
+}
+
+# Main
+command="${1:-setup}"
+shift || true
+
+case "$command" in
+    setup)
+        cmd_setup "${1:-$TEST_DIR}"
+        ;;
+    teardown)
+        cmd_teardown "${1:-$TEST_DIR}"
+        ;;
+    verify)
+        cmd_verify "${1:-$TEST_DIR}"
+        ;;
+    status)
+        cmd_status "${1:-$TEST_DIR}"
+        ;;
+    inject-bug)
+        cmd_inject_bug "${1:-$TEST_DIR}"
+        ;;
+    help|--help|-h)
+        usage
+        ;;
+    *)
+        # Treat as directory for default setup
+        cmd_setup "$command"
+        ;;
+esac
