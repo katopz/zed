@@ -328,6 +328,7 @@ dependencies = [
  "ai_onboarding",
  "anyhow",
  "audio",
+ "auto_prompt",
  "base64 0.22.1",
  "buffer_diff",
  "chrono",
@@ -1191,6 +1192,25 @@ dependencies = [
  "serde",
  "serde_json",
  "topological-sort",
+]
+
+[[package]]
+name = "auto_prompt"
+version = "0.1.0"
+dependencies = [
+ "acp_thread",
+ "agent-client-protocol",
+ "anyhow",
+ "chrono",
+ "futures 0.3.32",
+ "gpui",
+ "indoc",
+ "language_model",
+ "log",
+ "paths",
+ "schemars",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
