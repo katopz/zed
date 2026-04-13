@@ -166,7 +166,11 @@ pub fn on_thread_stopped(
 
                 if let Some(ref tv) = thread_weak {
                     let _ = tv.update(cx, |tv, cx| {
-                        tv.auto_prompt_state = AutoPromptState::Idle;
+                        if result.is_some() {
+                            tv.auto_prompt_state = AutoPromptState::Idle;
+                        } else {
+                            tv.auto_prompt_state = AutoPromptState::Failed;
+                        }
                         cx.notify();
                     });
                 }
@@ -182,7 +186,7 @@ pub fn on_thread_stopped(
                         })
                         .ok();
                 } else {
-                    log::info!("[auto_prompt] LLM returned no action");
+                    log::info!("[auto_prompt] LLM returned no action (error or timeout)");
                 }
             })
             .detach();
