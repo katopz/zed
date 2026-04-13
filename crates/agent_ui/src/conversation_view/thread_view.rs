@@ -4246,46 +4246,41 @@ impl ThreadView {
             crate::auto_prompt::AutoPromptState::Failed
         );
 
-        let tooltip_text = if is_processing {
-            "Auto-Prompt Processing..."
+        let (label, label_color) = if is_processing {
+            ("Processing...", Color::Accent)
         } else if is_failed {
-            "Auto-Prompt Failed - Click to Retry"
+            ("Failed", Color::Error)
         } else if enabled {
-            "Auto-Prompt Enabled"
+            ("Auto", Color::Accent)
         } else {
-            "Auto-Prompt Disabled"
+            ("Off", Color::Muted)
         };
 
-        let (icon_color, toggle_state) = if is_processing {
-            (Color::Accent, enabled)
-        } else if is_failed {
-            (Color::Error, false)
-        } else {
-            (Color::Muted, enabled)
-        };
-
-        let button = IconButton::new("auto-prompt-toggle", IconName::Sparkle)
-            .icon_size(IconSize::Small)
-            .icon_color(icon_color)
-            .toggle_state(toggle_state)
-            .selected_style(ButtonStyle::Tinted(TintColor::Accent))
+        Button::new("auto-prompt-toggle", label)
+            .start_icon(
+                Icon::new(IconName::Sparkle)
+                    .size(IconSize::XSmall)
+                    .color(label_color),
+            )
+            .label_size(LabelSize::XSmall)
+            .color(label_color)
+            .when(enabled && !is_processing && !is_failed, |this| {
+                this.style(ButtonStyle::Tinted(TintColor::Accent))
+            })
             .tooltip(move |_, cx| {
-                Tooltip::for_action(tooltip_text, &crate::auto_prompt::ToggleAutoPrompt, cx)
+                Tooltip::for_action("Auto-Prompt", &crate::auto_prompt::ToggleAutoPrompt, cx)
             })
             .on_click(cx.listener(move |this, _, _, cx| {
                 if is_processing {
                     return;
                 }
-                // If in failed state, retry auto-prompt
                 if is_failed {
                     log::info!("[auto_prompt] Retrying auto-prompt");
                     this.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;
-                    // The retry will be triggered by the next thread stop event
                     cx.notify();
                     return;
                 }
 
-                // Otherwise toggle enabled/disabled
                 let mut config = auto_prompt::load_config_cached().unwrap_or_default();
                 config.enabled = !config.enabled;
                 if let Err(err) = config.save() {
@@ -4300,9 +4295,7 @@ impl ThreadView {
                     }
                 );
                 cx.notify();
-            }));
-
-        button
+            }))
     }
 }
 
