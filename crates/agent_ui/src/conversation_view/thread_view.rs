@@ -279,12 +279,13 @@ pub struct ThreadView {
     pub model_selector: Option<Entity<ModelSelectorPopover>>,
     pub profile_selector: Option<Entity<ProfileSelector>>,
     pub permission_dropdown_handle: PopoverMenuHandle<ContextMenu>,
-    pub thread_retry_status: Option<RetryStatus>,
+    pub(super) thread_retry_status: Option<RetryStatus>,
     pub(super) thread_error: Option<ThreadError>,
     pub thread_error_markdown: Option<Entity<Markdown>>,
     pub token_limit_callout_dismissed: bool,
     pub last_token_limit_telemetry: Option<acp_thread::TokenUsageRatio>,
     thread_feedback: ThreadFeedbackState,
+    pub auto_prompt_state: crate::auto_prompt::AutoPromptState,
     pub list_state: ListState,
     pub session_capabilities: SharedSessionCapabilities,
     /// Tracks which tool calls have their content/output expanded.
@@ -534,6 +535,7 @@ impl ThreadView {
             token_limit_callout_dismissed: false,
             last_token_limit_telemetry: None,
             thread_feedback: Default::default(),
+            auto_prompt_state: Default::default(),
             expanded_tool_calls: HashSet::default(),
             expanded_tool_call_raw_inputs: HashSet::default(),
             expanded_thinking_blocks: HashSet::default(),
@@ -4235,21 +4237,55 @@ impl ThreadView {
             .map(|c| c.enabled)
             .unwrap_or(true);
 
-        let tooltip_text = if enabled {
+        let is_processing = matches!(
+            self.auto_prompt_state,
+            crate::auto_prompt::AutoPromptState::Processing
+        );
+        let is_failed = matches!(
+            self.auto_prompt_state,
+            crate::auto_prompt::AutoPromptState::Failed
+        );
+
+        let tooltip_text = if is_processing {
+            "Auto-Prompt Processing..."
+        } else if is_failed {
+            "Auto-Prompt Failed - Click to Retry"
+        } else if enabled {
             "Auto-Prompt Enabled"
         } else {
             "Auto-Prompt Disabled"
         };
 
-        IconButton::new("auto-prompt-toggle", IconName::Sparkle)
+        let (icon_color, toggle_state) = if is_processing {
+            (Color::Accent, enabled)
+        } else if is_failed {
+            (Color::Error, false)
+        } else {
+            (Color::Muted, enabled)
+        };
+
+        let button = IconButton::new("auto-prompt-toggle", IconName::Sparkle)
             .icon_size(IconSize::Small)
-            .icon_color(Color::Muted)
-            .toggle_state(enabled)
+            .icon_color(icon_color)
+            .toggle_state(toggle_state)
             .selected_style(ButtonStyle::Tinted(TintColor::Accent))
             .tooltip(move |_, cx| {
                 Tooltip::for_action(tooltip_text, &crate::auto_prompt::ToggleAutoPrompt, cx)
             })
-            .on_click(cx.listener(|_, _, _, cx| {
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if is_processing {
+                    return;
+                }
+                // If in failed state, retry auto-prompt
+                if is_failed {
+                    log::info!("[auto_prompt] Retrying auto-prompt");
+                    this.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;
+                    // The retry will be triggered by the next thread stop event
+                    cx.notify();
+                    return;
+                }
+
+                // Otherwise toggle enabled/disabled
                 let mut config = auto_prompt::load_config_cached().unwrap_or_default();
                 config.enabled = !config.enabled;
                 if let Err(err) = config.save() {
@@ -4264,7 +4300,9 @@ impl ThreadView {
                     }
                 );
                 cx.notify();
-            }))
+            }));
+
+        button
     }
 }
 

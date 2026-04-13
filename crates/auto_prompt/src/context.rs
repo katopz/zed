@@ -24,6 +24,8 @@ pub struct AutoPromptContext {
     pub current_plan: Vec<PlanEntryContext>,
     /// Contents of `.plan` folder files found in work directories.
     pub plan_files: Vec<PlanFileContent>,
+    /// Contents of `.doc` folder files found in work directories.
+    pub doc_files: Vec<PlanFileContent>,
     /// Why the thread stopped (end_turn, max_tokens, cancelled, refusal).
     pub stop_reason: String,
     /// Whether the thread encountered an error.
@@ -92,12 +94,14 @@ impl AutoPromptContext {
     ///
     /// `stop_reason` comes from `AcpThreadEvent::Stopped`.
     /// `plan_files` should be pre-read from `.plan` folders on disk.
+    /// `doc_files` should be pre-read from `.doc` folders on disk.
     /// `iteration_count` tracks how many auto-prompt cycles have occurred.
     pub fn collect(
         thread: &AcpThread,
         cx: &App,
         stop_reason: String,
         plan_files: Vec<PlanFileContent>,
+        doc_files: Vec<PlanFileContent>,
         iteration_count: u32,
     ) -> Self {
         let current_datetime = Local::now().to_rfc3339();
@@ -180,6 +184,7 @@ impl AutoPromptContext {
             entry_count,
             current_plan,
             plan_files,
+            doc_files,
             stop_reason,
             had_error,
             approximate_token_count: 0,
@@ -199,6 +204,7 @@ impl AutoPromptContext {
             .map(|m| m.content.len())
             .chain(self.current_plan.iter().map(|p| p.content.len()))
             .chain(self.plan_files.iter().map(|f| f.content.len()))
+            .chain(self.doc_files.iter().map(|f| f.content.len()))
             .sum();
 
         total_chars / 4

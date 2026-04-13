@@ -6,6 +6,18 @@ use gpui::Window;
 #[action(namespace = agent)]
 pub struct ToggleAutoPrompt;
 
+/// State of the auto-prompt system.
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Deserialize, serde::Serialize)]
+pub enum AutoPromptState {
+    /// Auto-prompt is idle (not processing).
+    #[default]
+    Idle,
+    /// Auto-prompt is waiting for LLM decision or dispatching.
+    Processing,
+    /// Auto-prompt failed with an error.
+    Failed,
+}
+
 /// Action dispatched when the external LLM returns a next_prompt.
 ///
 /// Registered in `agent_panel.rs` — creates a new thread with summary link + prompt, auto-submits.
@@ -91,17 +103,39 @@ pub fn on_thread_stopped(
                 delay_ms,
                 action.next_prompt
             );
-            let _ = cx.spawn_in(window, async move |_view, cx| {
+
+            cx.spawn_in(window, async move |_view, cx| {
+                let thread_weak = _view
+                    .update_in(cx, |cv, _window, cx| {
+                        cv.active_thread().map(|tv| {
+                            tv.update(cx, |tv, cx| {
+                                tv.auto_prompt_state = AutoPromptState::Processing;
+                                cx.notify();
+                            });
+                            tv.downgrade()
+                        })
+                    })
+                    .ok()
+                    .flatten();
+
                 cx.background_executor()
                     .timer(std::time::Duration::from_millis(delay_ms))
                     .await;
+
+                if let Some(tv) = thread_weak.as_ref() {
+                    let _ = tv.update(cx, |tv, cx| {
+                        tv.auto_prompt_state = AutoPromptState::Idle;
+                        cx.notify();
+                    });
+                }
 
                 _view
                     .update_in(cx, |_view, window, cx| {
                         dispatch_action(action, window, cx);
                     })
                     .ok();
-            });
+            })
+            .detach();
         }
 
         auto_prompt::AutoPromptDecision::NeedsLlmCall(data) => {
@@ -109,14 +143,35 @@ pub fn on_thread_stopped(
                 "[auto_prompt] NeedsLlmCall - spawning task to call LLM with model: {:?}",
                 data.model.id()
             );
+
             cx.spawn_in(window, async move |_view, cx| {
                 log::info!("[auto_prompt] ASYNC TASK: starting LLM call");
 
-                let action = auto_prompt::decide_with_llm(data, cx).await;
+                let thread_weak = _view
+                    .update_in(cx, |cv, _window, cx| {
+                        cv.active_thread().map(|tv| {
+                            tv.update(cx, |tv, cx| {
+                                tv.auto_prompt_state = AutoPromptState::Processing;
+                                cx.notify();
+                            });
+                            tv.downgrade()
+                        })
+                    })
+                    .ok()
+                    .flatten();
+
+                let result = auto_prompt::decide_with_llm(data, cx).await;
 
                 log::info!("[auto_prompt] ASYNC TASK: LLM call completed");
 
-                if let Some(action) = action {
+                if let Some(ref tv) = thread_weak {
+                    let _ = tv.update(cx, |tv, cx| {
+                        tv.auto_prompt_state = AutoPromptState::Idle;
+                        cx.notify();
+                    });
+                }
+
+                if let Some(action) = result {
                     log::info!(
                         "[auto_prompt] LLM returned action - dispatching with prompt: {}",
                         action.next_prompt

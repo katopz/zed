@@ -5,6 +5,7 @@ mod agent_model_selector;
 mod agent_panel;
 mod agent_registry_ui;
 mod auto_prompt;
+pub use auto_prompt::AutoPromptState;
 mod branch_names;
 mod buffer_codegen;
 mod completion_provider;
@@ -177,6 +178,8 @@ actions!(
         ToggleThinkingEffortMenu,
         /// Toggles fast mode for models that support it.
         ToggleFastMode,
+        /// Sets the auto-prompt state.
+        SetAutoPromptState,
         /// Scroll the output by one page up.
         ScrollOutputPageUp,
         /// Scroll the output by one page down.
