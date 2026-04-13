@@ -218,11 +218,13 @@ pub fn decide(
         let thread_ref = thread.read(cx);
         let stop_reason_str = format!("{stop_reason:?}").to_lowercase();
         let plan_files = read_plan_files(thread_ref);
+        let doc_files = read_doc_files(thread_ref);
         let ctx = AutoPromptContext::collect(
             thread_ref,
             cx,
             stop_reason_str,
             plan_files,
+            doc_files,
             iteration_count,
         );
         let sid = thread_ref.session_id().clone();
@@ -290,8 +292,10 @@ pub fn decide(
             "The AI indicates the task is complete. Verify against the plan:\n\
              - Plan stats: {pending} pending, {in_progress} in progress, {completed} completed\n\
              - Check current_plan against plan_files from .plan/ folder\n\
-             - If ALL items are done, respond with #ALL_PLAN_DONE\n\
-             - If items remain, continue with the next pending item"
+             - IMPORTANT: If plan_files have steps that are done but still marked [ ], your next_prompt MUST be ONLY about updating those checkboxes. Do NOT bundle with other work — the agent skips checkbox updates when given other tasks.\n\
+             - If ALL items are done AND no checkboxes need fixing AND doc_files is empty, set next_prompt to create documentation at .doc/ summarizing what was implemented\n\
+             - If ALL items are done AND doc_files already exist, respond with #ALL_PLAN_DONE\n\
+             - If items remain (and checkboxes are correct), continue with the next pending item"
         ))
     } else if auto_prompt_ctx.last_message_is_question() {
         log::info!("[auto_prompt::decide] Last message is a question");
@@ -508,12 +512,24 @@ fn default_system_prompt() -> String {
         - chore: for maintenance tasks
         - docs: for documentation
 
-        ## Plan Status Tracking (always apply):
+        ## Plan Status Tracking (MANDATORY - always apply):
         - Plan files live in .plan/ folder (accessible via plan_files in context)
         - Plans have a status index at the top using checkboxes: [ ] pending, [x] done
-        - When a step completes, instruct the agent to mark it [x] in the plan file
-        - When suggesting next_prompt, reference the next [ ] step by number
+        - NEVER assume the user will manually update checkboxes — the agent must do it
         - When all steps are [x], set all_plan_done to true
+        - If plan_files show steps that were completed but still marked [ ], you MUST generate a next_prompt that is ONLY about updating those checkboxes
+        - CRITICAL: Do NOT bundle checkbox updates with other work in the same next_prompt. The agent will skip the checkbox update if given other tasks. Make it a dedicated step:
+          Example next_prompt for checkbox fixup: 'Edit .plan/filename.md — mark Step N as [x] by changing [ ] to [x]. This is your only task, do nothing else.'
+        - After checkboxes are updated, the next cycle will proceed with the next pending step
+        - When suggesting next_prompt for a new task, reference the next [ ] step by number
+
+        ## Documentation Generation (MANDATORY on completion):
+        - When all plan steps are [x] and no doc_files exist in context, you MUST generate a next_prompt that instructs the agent to create documentation
+        - Documentation goes in .doc/ folder in the project root
+        - Format: .doc/{NN}_{descriptive_name}.md (use sequential numbering like .plan/ files)
+        - Documentation should cover: what was implemented, key architectural decisions, file changes summary, how to test/use the feature
+        - When doc_files already exist for the completed plan, set all_plan_done to true
+        - The doc creation prompt is the FINAL step before all_plan_done — never skip it
     "}
     .to_string()
 }
@@ -630,6 +646,62 @@ fn read_plan_files(thread: &acp_thread::AcpThread) -> Vec<PlanFileContent> {
     }
 
     plan_files
+}
+
+fn read_doc_files(thread: &acp_thread::AcpThread) -> Vec<PlanFileContent> {
+    let work_dirs = match thread.work_dirs() {
+        Some(dirs) => dirs.paths().to_vec(),
+        None => return Vec::new(),
+    };
+
+    let mut doc_files = Vec::new();
+
+    for work_dir in &work_dirs {
+        let doc_dir = work_dir.join(".doc");
+        if !doc_dir.is_dir() {
+            continue;
+        }
+
+        let entries = match std::fs::read_dir(&doc_dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+
+            let metadata = match std::fs::metadata(&path) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if metadata.len() > 100_000 {
+                continue;
+            }
+
+            let content = match std::fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            doc_files.push(PlanFileContent {
+                path: path.to_string_lossy().to_string(),
+                content,
+            });
+        }
+    }
+
+    if !doc_files.is_empty() {
+        log::info!(
+            "[auto_prompt::read_doc_files] Loaded {} doc file(s): {:?}",
+            doc_files.len(),
+            doc_files.iter().map(|p| &p.path).collect::<Vec<_>>()
+        );
+    }
+
+    doc_files
 }
 
 async fn call_language_model(

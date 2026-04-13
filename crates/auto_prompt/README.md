@@ -27,11 +27,26 @@ AcpThreadEvent::Stopped(stop_reason)
       └─ Returns AutoPromptAction with next prompt
 ```
 
+### Completion flow
+
+```
+Plan step completes → Agent marks [x] in .plan/ (mandatory in every next_prompt)
+        ↓
+All steps [x]? → Check .doc/ folder
+        ├─ No docs → Generate next_prompt: "Create .doc/NN_name.md summarizing implementation"
+        │              ↓
+        │              Agent creates doc → Thread stops → auto_prompt fires again
+        │              ↓
+        │              LLM sees doc_files exists → all_plan_done: true → chain stops
+        │
+        └─ Docs exist → all_plan_done: true → chain stops
+```
+
 ### Key types
 
 - `AutoPromptDecision` — sync result: `NoAction`, `DispatchNow`, `DispatchAfterDelay`, `NeedsLlmCall`
 - `AutoPromptAction` — data needed to dispatch a follow-up prompt (session ID, title, prompt text)
-- `AutoPromptContext` — serializable context payload sent to the orchestration LLM
+- `AutoPromptContext` — serializable context payload sent to the orchestration LLM (includes `plan_files` and `doc_files`)
 - `AutoPromptResponse` — expected JSON response from the LLM
 - `AutoPromptConfig` — loaded from `~/.config/zed/auto_prompt.json` or env vars
 
@@ -39,7 +54,7 @@ AcpThreadEvent::Stopped(stop_reason)
 
 | File | Purpose |
 |------|---------|
-| `auto_prompt.rs` | `decide()` (sync), `decide_with_llm()` (async), system prompt, iteration tracking, plan reading, LLM client |
+| `auto_prompt.rs` | `decide()` (sync), `decide_with_llm()` (async), system prompt, iteration tracking, plan/doc reading, LLM client |
 | `config.rs` | Config from `~/.config/zed/auto_prompt.json` or env vars |
 | `context.rs` | `AutoPromptContext`, `AutoPromptResponse`, plan/message serialization |
 
@@ -128,4 +143,5 @@ The built-in system prompt enforces:
 
 - **Git Flow**: `main`, `develop`, `feature/NN_description`, `hotfix/NN_description`, `release/vX.Y.Z`
 - **Conventional Commits**: `feat:`, `fix:`, `chore:`, `refactor:`, `test:`, `docs:`
-- **Plan Status Tracking**: `[ ]` / `[x]` checkboxes in `.plan/` folder files
+- **Plan Status Tracking** (mandatory): `[ ]` / `[x]` checkboxes in `.plan/` folder files — every `next_prompt` must include instructions to mark completed steps as `[x]`; never assumes manual updates
+- **Documentation Generation** (mandatory on completion): when all plan steps are `[x]` and no `.doc/` folder exists, the orchestration LLM generates a final prompt instructing the agent to create `.doc/{NN}_{descriptive_name}.md` covering what was implemented, key decisions, file changes, and how to test. The chain only stops after documentation exists.
