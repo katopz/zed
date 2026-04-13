@@ -3,15 +3,16 @@
 ## Status
 
 - [x] Step 1: Initialize git repo with Cargo project structure on `main`
-- [x] Step 2: Implement hello world with passing tests on `develop`
-- [x] Step 3: Add greet-by-name feature on `feature/01_greet_by_name` branch
-- [x] Step 4: Merge feature to `develop`, verify tests pass
-- [x] Step 5: Release v0.1.0 — bump version, tag, merge to `main`
-- [x] Step 6: Verify git history matches expected flow
-- [x] Step 7: Inject bug, ask AI to diagnose and fix
-- [x] Step 8: Verify fix commit uses `fix:` conventional commit prefix
-- [x] Step 9: Release v0.2.0 — bump version, tag, merge to `main`
-- [x] Step 10: Final verification of complete git history
+- [ ] Step 2: Quick auto-prompt verification — simple text change and stop
+- [ ] Step 3: Implement hello world with passing tests on `develop`
+- [ ] Step 4: Add greet-by-name feature on `feature/01_greet_by_name` branch
+- [ ] Step 5: Merge feature to `develop`, verify tests pass
+- [ ] Step 6: Release v0.1.0 — bump version, tag, merge to `main`
+- [ ] Step 7: Verify git history matches expected flow
+- [ ] Step 8: Inject bug, ask AI to diagnose and fix
+- [ ] Step 9: Verify fix commit uses `fix:` conventional commit prefix
+- [ ] Step 10: Release v0.2.0 — bump version, tag, merge to `main`
+- [ ] Step 11: Final verification of complete git history
 
 ---
 
@@ -68,7 +69,34 @@ git branch -M main
 
 ---
 
-## Step 2: Implement Hello World with Tests on `develop`
+## Step 2: Quick Auto-Prompt Verification
+
+Ask the AI to make a simple, quick change to verify auto-prompt is working:
+
+**Important:** The AI **must use tools** (not direct editing) to trigger auto-prompt verification.
+
+1. Use the `edit_file` tool to change `"Hello, world!"` in `src/main.rs` to `"hi!"`
+2. Use the `terminal` tool to commit: `git add src/main.rs && git commit -m "feat: simplify greeting to hi"`
+3. **Stop immediately after committing** — do not continue with additional work
+
+Expected behavior:
+- AI should use `edit_file` and `terminal` tools (not direct editing)
+- AI should complete the task in under 30 seconds
+- AI should explicitly stop and wait for next command
+- Logs should show `[auto_prompt::decide]` with full decision process
+- Logs should show auto-prompt evaluating and stopping with `NoAction`
+- One commit should be added to `main`
+
+**Verify**: 
+- `git log --oneline` shows 2 commits on `main`
+- Latest commit starts with `feat:`
+- `src/main.rs` contains `"hi!"`
+- AI stopped and waited for next instruction (auto-prompt verified)
+- Logs contain `[auto_prompt::decide]` messages showing the evaluation process
+
+---
+
+## Step 3: Implement Hello World with Tests on `develop`
 
 Create `develop` branch from `main`:
 
@@ -80,7 +108,7 @@ Create `src/lib.rs` with a `greet()` function:
 
 ```rust
 pub fn greet() -> String {
-    "Hello, world!".to_string()
+    "hi!".to_string()
 }
 ```
 
@@ -91,6 +119,7 @@ use helloworld::greet;
 
 fn main() {
     println!("{}", greet());
+    // Restore original greeting for feature branch work
 }
 ```
 
@@ -101,7 +130,7 @@ use helloworld::greet;
 
 #[test]
 fn test_greet() {
-    assert_eq!(greet(), "Hello, world!");
+    assert_eq!(greet(), "hi!");
 }
 
 #[test]
@@ -123,7 +152,7 @@ git commit -m "feat: implement hello world with greet function and tests"
 
 ---
 
-## Step 3: Add Greet-by-Name Feature on Feature Branch
+## Step 4: Add Greet-by-Name Feature on Feature Branch
 
 Create feature branch from `develop`:
 
@@ -135,11 +164,11 @@ Update `src/lib.rs`:
 
 ```rust
 pub fn greet() -> String {
-    "Hello, world!".to_string()
+    "hi!".to_string()
 }
 
 pub fn greet_by_name(name: &str) -> String {
-    format!("Hello, {name}!")
+    format!("hi, {name}!")
 }
 ```
 
@@ -161,7 +190,7 @@ use helloworld::{greet, greet_by_name};
 
 #[test]
 fn test_greet() {
-    assert_eq!(greet(), "Hello, world!");
+    assert_eq!(greet(), "hi!");
 }
 
 #[test]
@@ -171,12 +200,12 @@ fn test_greet_is_not_empty() {
 
 #[test]
 fn test_greet_by_name() {
-    assert_eq!(greet_by_name("Alice"), "Hello, Alice!");
+    assert_eq!(greet_by_name("Alice"), "hi, Alice!");
 }
 
 #[test]
 fn test_greet_by_name_empty() {
-    assert_eq!(greet_by_name(""), "Hello, !");
+    assert_eq!(greet_by_name(""), "hi, !");
 }
 ```
 
@@ -193,7 +222,7 @@ git commit -m "feat: add greet_by_name function with tests"
 
 ---
 
-## Step 4: Merge Feature to `develop`
+## Step 5: Merge Feature to `develop`
 
 ```
 git checkout develop
@@ -207,7 +236,7 @@ Run tests: `cargo test`
 
 ---
 
-## Step 5: Release v0.1.0
+## Step 6: Release v0.1.0
 
 Create release branch from `develop`:
 
@@ -239,7 +268,7 @@ git branch -d release/v0.1.0
 
 ---
 
-## Step 6: Verify Git History
+## Step 7: Verify Git History
 
 Run these verification commands and confirm:
 
@@ -273,7 +302,7 @@ git checkout develop && cargo test --quiet
 
 ---
 
-## Step 7: Inject Bug and Ask AI to Fix
+## Step 8: Inject Bug and Ask AI to Fix
 
 On `develop` branch, inject this bug in `src/lib.rs`:
 
@@ -281,7 +310,7 @@ Change the `greet()` function to return a wrong value:
 
 ```rust
 pub fn greet() -> String {
-    "Goodbye, world!".to_string()  // BUG: wrong greeting
+    "Bye!".to_string()  // BUG: wrong greeting
 }
 ```
 
@@ -298,15 +327,15 @@ The AI should:
 
 1. Run `cargo test` and see the failure
 2. Diagnose the bug in `src/lib.rs`
-3. Fix `greet()` to return `"Hello, world!"`
+3. Fix `greet()` to return `"hi!"`
 4. Run `cargo test` to confirm fix
-5. Commit with conventional commit: `fix: correct greeting to return Hello, world!`
+5. Commit with conventional commit: `fix: correct greeting to return hi!`
 
 **Verify**: `cargo test` passes. `git log --oneline -1` shows `fix:` commit prefix.
 
 ---
 
-## Step 8: Verify Fix Commit
+## Step 9: Verify Fix Commit
 
 ```bash
 # Latest commit should start with "fix:"
@@ -316,14 +345,14 @@ git log --oneline -1 | grep "^.\{8\}fix:"
 cargo test --quiet
 
 # The fix should be correct
-grep -q '"Hello, world!"' src/lib.rs
+grep -q '"hi!"' src/lib.rs
 ```
 
 **Verify**: All checks pass. Commit message follows conventional format.
 
 ---
 
-## Step 9: Release v0.2.0
+## Step 10: Release v0.2.0
 
 Bump version in `Cargo.toml` to `0.2.0`.
 
@@ -371,7 +400,7 @@ git branch -d release/v0.2.0
 
 ---
 
-## Step 10: Final Verification
+## Step 11: Final Verification
 
 ```bash
 # All tags
@@ -406,9 +435,10 @@ grep 'version = "0.2.0"' Cargo.toml
 
 **Conventional commits in history**:
 - `chore: initialize helloworld project`
+- `feat: simplify greeting to hi`
 - `feat: implement hello world with greet function and tests`
 - `feat: add greet_by_name function with tests`
-- `fix: correct greeting to return Hello, world!`
+- `fix: correct greeting to return hi!`
 - `chore: bump version to 0.2.0`
 - Release merges with `release:` prefix
 

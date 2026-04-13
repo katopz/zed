@@ -1591,6 +1591,9 @@ impl ConversationView {
                     });
                 }
                 if is_subagent {
+                    log::info!(
+                        "[auto_prompt] *** Early return: is_subagent=true, skipping auto-prompt"
+                    );
                     if *stop_reason == acp::StopReason::EndTurn {
                         thread.update(cx, |thread, cx| {
                             thread.mark_as_subagent_output(cx);
@@ -1675,6 +1678,15 @@ impl ConversationView {
                     self.notify_with_sound(
                         "Agent stopped due to an error",
                         IconName::Warning,
+                        window,
+                        cx,
+                    );
+                    // Call auto-prompt for error events (e.g., rate limits)
+                    let used_tools = thread.read(cx).used_tools_since_last_user_message();
+                    crate::auto_prompt::on_thread_stopped(
+                        &thread,
+                        used_tools,
+                        &acp::StopReason::MaxTokens, // Use MaxTokens as error indicator
                         window,
                         cx,
                     );

@@ -47,7 +47,7 @@ fn default_backoff_base_ms() -> u64 {
 impl Default for AutoPromptConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             system_prompt: None,
             max_iterations: default_max_iterations(),
             max_context_tokens: default_max_context_tokens(),
@@ -59,21 +59,38 @@ impl Default for AutoPromptConfig {
 impl AutoPromptConfig {
     /// Returns the path to the config file: `~/.config/zed/auto_prompt.json`
     pub fn config_path() -> Result<PathBuf> {
-        let config_dir = paths::config_dir().join("zed");
+        let config_dir = paths::config_dir();
         Ok(config_dir.join("auto_prompt.json"))
     }
 
     /// Load config from file, falling back to environment variables.
     pub fn load() -> Result<Self> {
+        log::info!("[auto_prompt::config] Loading config...");
         let path = Self::config_path()?;
+        log::info!("[auto_prompt::config] Config path: {:?}", path);
 
         if path.exists() {
+            log::info!("[auto_prompt::config] Config file exists, loading from file");
             let content = std::fs::read_to_string(&path)?;
             let config: Self = serde_json::from_str(&content)?;
+            log::info!(
+                "[auto_prompt::config] Loaded from file: enabled={}, max_iterations={}",
+                config.enabled,
+                config.max_iterations
+            );
             return Ok(config);
         }
 
-        Ok(Self::from_env())
+        log::info!(
+            "[auto_prompt::config] Config file not found, loading from environment variables"
+        );
+        let config = Self::from_env();
+        log::info!(
+            "[auto_prompt::config] Loaded from env: enabled={}, max_iterations={}",
+            config.enabled,
+            config.max_iterations
+        );
+        Ok(config)
     }
 
     /// Build config from environment variables.
@@ -114,5 +131,20 @@ impl AutoPromptConfig {
         let capped_retry = retry_count.min(5);
         let delay = self.backoff_base_ms * 2u64.pow(capped_retry);
         delay.min(60_000)
+    }
+
+    /// Write current config to the config file.
+    pub fn save(&self) -> Result<()> {
+        let path = Self::config_path()?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_string_pretty(self)?;
+        std::fs::write(&path, json)?;
+
+        // Invalidate cache so next load picks up the new config
+        crate::invalidate_config_cache();
+
+        Ok(())
     }
 }
