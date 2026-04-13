@@ -13,7 +13,7 @@ pub use context::{AutoPromptContext, AutoPromptResponse, PlanFileContent};
 
 use agent_client_protocol as acp;
 use anyhow::Context as _;
-use futures::StreamExt;
+use futures::{StreamExt, future, pin_mut};
 use gpui::App;
 use language_model::{
     LanguageModel, LanguageModelCompletionEvent, LanguageModelRequest, LanguageModelRequestMessage,
@@ -21,6 +21,7 @@ use language_model::{
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::time::Duration;
 
 /// Seconds of inactivity before an auto-prompt chain is considered stale.
 const CHAIN_TIMEOUT_SECS: u64 = 300;
@@ -728,24 +729,37 @@ async fn call_language_model(
         ..Default::default()
     };
 
-    let mut stream = model
-        .stream_completion(request, cx)
-        .await
-        .context("auto_prompt: failed to start completion stream")?;
+    let completion_future = async {
+        let mut stream = model
+            .stream_completion(request, cx)
+            .await
+            .context("auto_prompt: failed to start completion stream")?;
 
-    let mut response_text = String::new();
-    while let Some(event) = stream.next().await {
-        match event {
-            Ok(LanguageModelCompletionEvent::Text(text)) => response_text.push_str(&text),
-            Ok(_) => {}
-            Err(err) => {
-                log::warn!("auto_prompt: stream error: {err}");
-                break;
+        let mut response_text = String::new();
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(LanguageModelCompletionEvent::Text(text)) => response_text.push_str(&text),
+                Ok(_) => {}
+                Err(err) => {
+                    log::warn!("auto_prompt: stream error: {err}");
+                    break;
+                }
             }
         }
-    }
+        anyhow::Ok(response_text)
+    };
 
-    parse_response(&response_text)
+    let timeout_future = cx.background_executor().timer(Duration::from_secs(60));
+
+    pin_mut!(completion_future, timeout_future);
+
+    match future::select(completion_future, timeout_future).await {
+        future::Either::Left((Ok(response_text), _)) => parse_response(&response_text),
+        future::Either::Left((Err(err), _)) => Err(err.context("auto_prompt: completion failed")),
+        future::Either::Right(_) => {
+            anyhow::bail!("auto_prompt: LLM call timed out after 60 seconds");
+        }
+    }
 }
 
 fn parse_response(text: &str) -> anyhow::Result<AutoPromptResponse> {
