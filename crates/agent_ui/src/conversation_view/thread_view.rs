@@ -3300,6 +3300,7 @@ impl ThreadView {
                                     .gap_0p5()
                                     .child(self.render_add_context_button(cx))
                                     .child(self.render_follow_toggle(cx))
+                                    .child(self.render_auto_prompt_toggle(cx))
                                     .children(self.render_fast_mode_control(cx))
                                     .children(self.render_thinking_control(cx)),
                             )
@@ -4226,6 +4227,43 @@ impl ThreadView {
             })
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.toggle_following(window, cx);
+            }))
+    }
+
+    fn render_auto_prompt_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let enabled = auto_prompt::load_config_cached()
+            .map(|c| c.enabled)
+            .unwrap_or(true);
+
+        let tooltip_text = if enabled {
+            "Auto-Prompt Enabled"
+        } else {
+            "Auto-Prompt Disabled"
+        };
+
+        IconButton::new("auto-prompt-toggle", IconName::Sparkle)
+            .icon_size(IconSize::Small)
+            .icon_color(Color::Muted)
+            .toggle_state(enabled)
+            .selected_style(ButtonStyle::Tinted(TintColor::Accent))
+            .tooltip(move |_, cx| {
+                Tooltip::for_action(tooltip_text, &crate::auto_prompt::ToggleAutoPrompt, cx)
+            })
+            .on_click(cx.listener(|_, _, _, cx| {
+                let mut config = auto_prompt::load_config_cached().unwrap_or_default();
+                config.enabled = !config.enabled;
+                if let Err(err) = config.save() {
+                    log::warn!("auto_prompt: failed to save config: {err}");
+                }
+                log::info!(
+                    "auto_prompt: {}",
+                    if config.enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                );
+                cx.notify();
             }))
     }
 }

@@ -1391,6 +1391,11 @@ impl ConversationView {
                 }
             }
             AcpThreadEvent::Stopped(stop_reason) => {
+                log::info!(
+                    "[auto_prompt] *** AcpThreadEvent::Stopped received: stop_reason={:?}, is_subagent={}",
+                    stop_reason,
+                    is_subagent
+                );
                 if let Some(active) = self.thread_view(&thread_id) {
                     let is_generating =
                         matches!(thread.read(cx).status(), ThreadStatus::Generating);
@@ -1406,6 +1411,9 @@ impl ConversationView {
                     });
                 }
                 if is_subagent {
+                    log::info!(
+                        "[auto_prompt] *** Early return: is_subagent=true, skipping auto-prompt"
+                    );
                     if *stop_reason == acp::StopReason::EndTurn {
                         thread.update(cx, |thread, cx| {
                             thread.mark_as_subagent_output(cx);
@@ -1426,6 +1434,11 @@ impl ConversationView {
                     cx,
                 );
 
+                log::info!(
+                    "[auto_prompt] *** Calling on_thread_stopped: used_tools={}, stop_reason={:?}",
+                    used_tools,
+                    stop_reason
+                );
                 crate::auto_prompt::on_thread_stopped(&thread, used_tools, stop_reason, window, cx);
 
                 let should_send_queued = if let Some(active) = self.active_thread() {
@@ -1488,6 +1501,15 @@ impl ConversationView {
                     self.notify_with_sound(
                         "Agent stopped due to an error",
                         IconName::Warning,
+                        window,
+                        cx,
+                    );
+                    // Call auto-prompt for error events (e.g., rate limits)
+                    let used_tools = thread.read(cx).used_tools_since_last_user_message();
+                    crate::auto_prompt::on_thread_stopped(
+                        &thread,
+                        used_tools,
+                        &acp::StopReason::MaxTokens, // Use MaxTokens as error indicator
                         window,
                         cx,
                     );

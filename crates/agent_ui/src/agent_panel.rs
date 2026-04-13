@@ -24,7 +24,7 @@ use zed_actions::agent::{
     ResolveConflictsWithAgent, ReviewBranchDiff,
 };
 
-use crate::auto_prompt::AutoPromptNewThread;
+use crate::auto_prompt::{AutoPromptNewThread, ToggleAutoPrompt};
 use crate::thread_metadata_store::ThreadMetadataStore;
 use crate::{
     AddContextServer, AgentDiffPane, ConversationView, CopyThreadToClipboard, CycleStartThreadIn,
@@ -194,6 +194,26 @@ pub fn init(cx: &mut App) {
                             panel.auto_prompt_new_thread(action, window, cx)
                         });
                         workspace.focus_panel::<AgentPanel>(window, cx);
+                    }
+                })
+                .register_action(|workspace, _: &ToggleAutoPrompt, _window, cx| {
+                    if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+                        panel.update(cx, |_panel, cx| {
+                            let mut config = auto_prompt::load_config_cached().unwrap_or_default();
+                            config.enabled = !config.enabled;
+                            if let Err(err) = config.save() {
+                                log::warn!("auto_prompt: failed to save config: {err}");
+                            }
+                            log::info!(
+                                "auto_prompt: {}",
+                                if config.enabled {
+                                    "enabled"
+                                } else {
+                                    "disabled"
+                                }
+                            );
+                            cx.notify();
+                        });
                     }
                 })
                 .register_action(|workspace, _: &ExpandMessageEditor, window, cx| {

@@ -1,6 +1,11 @@
 use agent_client_protocol as acp;
 use gpui::Window;
 
+/// Toggle auto-prompt on/off from the agent panel toolbar.
+#[derive(Clone, Debug, Default, PartialEq, serde::Deserialize, serde::Serialize, gpui::Action)]
+#[action(namespace = agent)]
+pub struct ToggleAutoPrompt;
+
 /// Action dispatched when the external LLM returns a next_prompt.
 ///
 /// Registered in `agent_panel.rs` — creates a new thread with summary link + prompt, auto-submits.
@@ -51,16 +56,41 @@ pub fn on_thread_stopped(
     window: &mut Window,
     cx: &mut gpui::Context<crate::ConversationView>,
 ) {
+    log::warn!(
+        "[auto_prompt] *** ENTRY POINT *** on_thread_stopped called: used_tools={}, stop_reason={:?}",
+        used_tools,
+        stop_reason
+    );
+
+    // Log error state explicitly for rate limits and other errors
+    if matches!(stop_reason, acp::StopReason::MaxTokens) {
+        log::warn!(
+            "[auto_prompt] Error/Rate Limit detected - stop_reason={:?}, will apply backoff retry",
+            stop_reason
+        );
+    }
     let decision = auto_prompt::decide(thread, used_tools, stop_reason, cx);
+    log::info!("[auto_prompt] decision result: {:?}", decision);
 
     match decision {
-        auto_prompt::AutoPromptDecision::NoAction => {}
+        auto_prompt::AutoPromptDecision::NoAction => {
+            log::info!("[auto_prompt] NoAction - taking no action");
+        }
 
         auto_prompt::AutoPromptDecision::DispatchNow(action) => {
+            log::info!(
+                "[auto_prompt] DispatchNow - dispatching action with prompt: {}",
+                action.next_prompt
+            );
             dispatch_action(action, window, cx);
         }
 
         auto_prompt::AutoPromptDecision::DispatchAfterDelay { action, delay_ms } => {
+            log::info!(
+                "[auto_prompt] DispatchAfterDelay - scheduling action in {}ms with prompt: {}",
+                delay_ms,
+                action.next_prompt
+            );
             let _ = cx.spawn_in(window, async move |_view, cx| {
                 cx.background_executor()
                     .timer(std::time::Duration::from_millis(delay_ms))
@@ -75,17 +105,32 @@ pub fn on_thread_stopped(
         }
 
         auto_prompt::AutoPromptDecision::NeedsLlmCall(data) => {
-            let _ = cx.spawn_in(window, async move |_view, cx| {
+            log::info!(
+                "[auto_prompt] NeedsLlmCall - spawning task to call LLM with model: {:?}",
+                data.model.id()
+            );
+            cx.spawn_in(window, async move |_view, cx| {
+                log::info!("[auto_prompt] ASYNC TASK: starting LLM call");
+
                 let action = auto_prompt::decide_with_llm(data, cx).await;
 
+                log::info!("[auto_prompt] ASYNC TASK: LLM call completed");
+
                 if let Some(action) = action {
+                    log::info!(
+                        "[auto_prompt] LLM returned action - dispatching with prompt: {}",
+                        action.next_prompt
+                    );
                     _view
                         .update_in(cx, |_view, window, cx| {
                             dispatch_action(action, window, cx);
                         })
                         .ok();
+                } else {
+                    log::info!("[auto_prompt] LLM returned no action");
                 }
-            });
+            })
+            .detach();
         }
     }
 }
