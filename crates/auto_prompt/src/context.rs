@@ -310,6 +310,31 @@ impl AutoPromptContext {
         (pending, in_progress, completed)
     }
 
+    /// Returns plan files that still have unchecked `[ ]` items,
+    /// indicating incomplete plans. Useful for multi-plan transition.
+    pub fn remaining_plan_files(&self) -> Vec<&PlanFileContent> {
+        self.plan_files
+            .iter()
+            .filter(|file| {
+                let mut in_code_block = false;
+                for line in file.content.lines() {
+                    let trimmed = line.trim_start();
+                    if trimmed.starts_with("```") {
+                        in_code_block = !in_code_block;
+                        continue;
+                    }
+                    if in_code_block {
+                        continue;
+                    }
+                    if trimmed.contains("- [ ] ") {
+                        return true;
+                    }
+                }
+                false
+            })
+            .collect()
+    }
+
     pub fn compute_plan_has_checkboxes(&self) -> bool {
         self.plan_files
             .iter()

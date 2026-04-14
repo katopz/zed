@@ -3,7 +3,7 @@ set -euo pipefail
 
 TEST_DIR="${1:-/tmp/auto-prompt-test-helloworld}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PLAN_SOURCE="$SCRIPT_DIR/../.plan/02_e2e_helloworld_test.md"
+PLAN_DIR="$SCRIPT_DIR/../.plan/e2e"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -75,33 +75,42 @@ RUST
     mkdir -p tests
     touch tests/.gitkeep
 
-    info "Copying plan file..."
+    info "Copying plan files..."
     mkdir -p .plan
-    if [ -f "$PLAN_SOURCE" ]; then
-        cp "$PLAN_SOURCE" .plan/01_helloworld_flow.md
-        sed -i '' 's/^\(- \[ \] Step 1:.*\)/- [x] Step 1: Initialize git repo with Cargo project structure on `main`/' .plan/01_helloworld_flow.md
-        ok "Plan file copied from $PLAN_SOURCE (Step 1 marked complete)"
+    if [ -d "$PLAN_DIR" ]; then
+        cp "$PLAN_DIR/01_helloworld_core.md" .plan/01_helloworld_core.md
+        cp "$PLAN_DIR/02_helloworld_bugfix_release.md" .plan/02_helloworld_bugfix_release.md
+        ok "Plan files copied from $PLAN_DIR (2 plans)"
     else
-        warn "Plan source not found at $PLAN_SOURCE"
-        warn "Creating stub plan file — copy the real one manually"
-        cat > .plan/01_helloworld_flow.md <<'STUB'
-# HelloWorld E2E Test Plan
+        warn "Plan directory not found at $PLAN_DIR"
+        warn "Creating stub plan files — copy the real ones manually"
+        cat > .plan/01_helloworld_core.md <<'STUB01'
+# E2E Plan 01: HelloWorld Core Git Flow
 
 ## Status
 
-- [x] Step 1: Initialize git repo with Cargo project structure on `main`
-- [ ] Step 2: Implement hello world with passing tests on `develop`
-- [ ] Step 3: Add greet-by-name feature on `feature/01_greet_by_name` branch
-- [ ] Step 4: Merge feature to `develop`, verify tests pass
-- [ ] Step 5: Release v0.1.0 — bump version, tag, merge to `main`
-- [ ] Step 6: Verify git history matches expected flow
-- [ ] Step 7: Inject bug, ask AI to diagnose and fix
-- [ ] Step 8: Verify fix commit uses `fix:` conventional commit prefix
-- [ ] Step 9: Release v0.2.0 — bump version, tag, merge to `main`
-- [ ] Step 10: Final verification of complete git history
+- [ ] Step 1: Initialize git repo with Cargo project structure on `main`
+- [ ] Step 2: Quick auto-prompt verification — simple text change and stop
+- [ ] Step 3: Implement hello world with passing tests on `develop`
+- [ ] Step 4: Add greet-by-name feature on `feature/01_greet_by_name` branch
+- [ ] Step 5: Merge feature to `develop`, verify tests pass
+- [ ] Step 6: Release v0.1.0 — bump version, tag, merge to `main`
 
-Copy full plan from zed/.plan/02_e2e_helloworld_test.md
-STUB
+Copy full plan from zed/.plan/e2e/01_helloworld_core.md
+STUB01
+        cat > .plan/02_helloworld_bugfix_release.md <<'STUB02'
+# E2E Plan 02: HelloWorld Bugfix & Second Release
+
+## Status
+
+- [ ] Step 1: Inject bug into `greet()` on `develop` and commit
+- [ ] Step 2: Ask AI to diagnose and fix the failing tests
+- [ ] Step 3: Verify fix commit uses `fix:` conventional commit prefix
+- [ ] Step 4: Release v0.2.0 — bump version, tag, merge to `main`
+- [ ] Step 5: Final verification of complete git history
+
+Copy full plan from zed/.plan/e2e/02_helloworld_bugfix_release.md
+STUB02
     fi
 
     info "Initializing git repo..."
@@ -125,8 +134,12 @@ STUB
     cargo check --quiet 2>&1 && ok "Cargo check passed" || warn "Cargo check had issues"
 
     echo ""
+    info "Plan files in .plan/:"
+    find .plan -name '*.md' -exec basename {} \; | sort
+
+    echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    ok "Setup complete!"
+    ok "Setup complete! (multi-plan test)"
     echo ""
     info "Next steps:"
     echo ""
@@ -137,17 +150,17 @@ STUB
     echo "     ${CYAN}mkdir -p ~/.config/zed && cat > ~/.config/zed/auto_prompt.json <<CFG"
     echo '{'
     echo '  "enabled": true,'
-    echo '  "max_iterations": 20,'
+    echo '  "max_iterations": 30,'
     echo '  "max_context_tokens": 80000,'
     echo '  "backoff_base_ms": 2000'
     echo '}'
     echo "CFG${NC}"
     echo ""
     echo "  3. Open Agent Panel (cmd+i) and send:"
-    echo "     ${CYAN}Read .plan/01_helloworld_flow.md and execute the plan starting from Step 2.${NC}"
-    echo "     (Step 1 is already complete — project initialized on main)"
+    echo "     ${CYAN}Read .plan/01_helloworld_core.md and execute the plan from Step 1.${NC}"
+    echo "     (auto-prompt should transition to 02_helloworld_bugfix_release.md after Plan 01 completes)"
     echo ""
-    echo "  4. Watch the auto-prompt loop execute the plan."
+    echo "  4. Watch the auto-prompt loop execute BOTH plans."
     echo ""
     echo "  5. After the loop finishes, run verification:"
     echo "     ${CYAN}$(basename "$0") verify $dir${NC}"
@@ -203,11 +216,16 @@ cmd_status() {
     cargo test --quiet 2>&1 && ok "All tests pass" || warn "Some tests fail"
 
     echo ""
-    info "Plan status (.plan/01_helloworld_flow.md):"
-    if [ -f .plan/01_helloworld_flow.md ]; then
-        grep -E '^\s*-\s+\[' .plan/01_helloworld_flow.md || echo "(no status items found)"
-    else
-        warn "No plan file found"
+    info "Plan status (all .plan/*.md files):"
+    for plan_file in .plan/*.md; do
+        if [ -f "$plan_file" ]; then
+            echo ""
+            info "  $(basename "$plan_file"):"
+            grep -E '^\s*-\s+\[' "$plan_file" || echo "  (no status items found)"
+        fi
+    done
+    if [ -z "$(ls .plan/*.md 2>/dev/null)" ]; then
+        warn "No plan files found"
     fi
 
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -326,8 +344,8 @@ cmd_verify() {
     fi
 
     # Check 9: greet function correct
-    info "Check: greet() returns 'Hello, world!'"
-    if [ -f src/lib.rs ] && grep -q '"Hello, world!"' src/lib.rs; then
+    info "Check: greet() returns 'hi!'"
+    if [ -f src/lib.rs ] && grep -q '"hi!"' src/lib.rs; then
         ok "greet() is correct"
         ((pass++))
     else
@@ -355,20 +373,28 @@ cmd_verify() {
         ((fail++))
     fi
 
-    # Check 12: Plan progress
-    info "Check: Plan progress"
-    if [ -f .plan/01_helloworld_flow.md ]; then
-        local total checked
-        total=$(grep -cE '^\s*-\s+\[' .plan/01_helloworld_flow.md) || total=0
-        checked=$(grep -cE '^\s*-\s+\[x\]' .plan/01_helloworld_flow.md) || checked=0
-        if [ "$checked" -eq "$total" ] && [ "$total" -gt 0 ]; then
-            ok "All $total plan steps completed"
-            ((pass++))
-        else
-            warn "$checked/$total plan steps completed"
-            ((fail++))
+    # Check 12: All plan progress (multi-plan)
+    info "Check: All plan progress (multi-plan)"
+    local all_total=0
+    local all_checked=0
+    for plan_file in .plan/*.md; do
+        if [ -f "$plan_file" ]; then
+            local plan_total plan_checked
+            plan_total=$(grep -cE '^\s*-\s+\[' "$plan_file") || plan_total=0
+            plan_checked=$(grep -cE '^\s*-\s+\[x\]' "$plan_file") || plan_checked=0
+            all_total=$((all_total + plan_total))
+            all_checked=$((all_checked + plan_checked))
+            info "  $(basename "$plan_file"): $plan_checked/$plan_total"
         fi
+    done
+    if [ "$all_total" -eq 0 ]; then
+        fail "No plan steps found"
+        ((fail++))
+    elif [ "$all_checked" -eq "$all_total" ]; then
+        ok "All $all_total plan steps completed across all plans"
+        ((pass++))
     else
+        warn "$all_checked/$all_total plan steps completed across all plans"
         ((fail++))
     fi
 
@@ -378,15 +404,19 @@ cmd_verify() {
     echo ""
 
     if [ "$fail" -eq 0 ]; then
-        ok "ALL CHECKS PASSED"
+        ok "ALL CHECKS PASSED (multi-plan)"
     else
         info "Full git log:"
         git log --oneline --graph --all
         echo ""
-        info "Plan status:"
-        if [ -f .plan/01_helloworld_flow.md ]; then
-            grep -E '^\s*-\s+\[' .plan/01_helloworld_flow.md
-        fi
+        info "Plan status (all .plan/*.md files):"
+        for plan_file in .plan/*.md; do
+            if [ -f "$plan_file" ]; then
+                echo ""
+                info "  $(basename "$plan_file"):"
+                grep -E '^\s*-\s+\[' "$plan_file"
+            fi
+        done
     fi
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
@@ -403,7 +433,7 @@ cmd_inject_bug() {
     info "Injecting bug into src/lib.rs..."
 
     if [ ! -f src/lib.rs ]; then
-        fail "src/lib.rs not found. Run Step 2 first."
+        fail "src/lib.rs not found. Run Plan 01 first."
     fi
 
     if grep -q '"Goodbye, world!"' src/lib.rs; then
@@ -411,7 +441,7 @@ cmd_inject_bug() {
         return 0
     fi
 
-    sed -i '' 's/"Hello, world!"/"Goodbye, world!"/' src/lib.rs
+    sed -i '' 's/"hi!"/"Goodbye, world!"/' src/lib.rs
 
     git add src/lib.rs
     git commit --quiet -m "intentional bug: wrong greeting for testing fix flow"

@@ -300,13 +300,33 @@ pub fn decide(
         ))
     } else if auto_prompt_ctx.last_message_is_question() {
         log::info!("[auto_prompt::decide] Last message is a question");
-        Some(
-            "The AI asked a question. Re-examine plan_files from .plan/ folder and current_plan \
-             to determine the best course of action. Choose the option that best aligns with the \
-             original plan. If you are not confident (below 0.5), set should_continue to false \
-             and explain why in reason."
-                .to_string(),
-        )
+        let (pending, in_progress, completed) = auto_prompt_ctx.plan_stats();
+        let remaining = auto_prompt_ctx.remaining_plan_files();
+        let has_plan_context = !auto_prompt_ctx.plan_files.is_empty();
+        let has_remaining_steps = !remaining.is_empty() || pending > 0 || in_progress > 0;
+        Some(format!(
+            "The AI asked a question (possibly with multiple options). Project state:\n\
+             - Plan stats: {pending} pending, {in_progress} in progress, {completed} completed\n\
+             - Plan files exist: {has_plan_context}\n\
+             - Remaining plan files with unchecked steps: {}\n\
+             - Has remaining work: {has_remaining_steps}\n\
+             \n\
+             Rules (apply in order):\n\
+             1. If plan_files exist with unchecked [ ] steps → set should_continue=true, \
+             next_prompt to the next unchecked step. Confidence must be >= 0.7.\n\
+             2. If the question is a permission/confirmation (\"proceed?\", \"go ahead?\", \
+             \"continue?\") → answer yes. Set should_continue=true, confidence >= 0.7.\n\
+             3. If the question lists numbered or lettered options → pick option 1 \
+             (\"continue\"/\"proceed\"/the first listed option). Set should_continue=true, \
+             confidence >= 0.6, next_prompt to execute that option.\n\
+             4. If no plan and no clear default but the conversation has work in progress → \
+             set should_continue=true with next_prompt=\"continue\" and confidence >= 0.5.\n\
+             5. ONLY set should_continue=false if the question requires external information \
+             you cannot infer (API keys, credentials, user preferences never mentioned before).\n\
+             \n\
+             NEVER stop just because plan_files is empty. ALWAYS pick a default and continue.",
+            remaining.len(),
+        ))
     } else {
         log::info!("[auto_prompt::decide] Normal state, will call LLM for decision");
         None
@@ -402,8 +422,19 @@ pub async fn decide_with_llm(
                     .is_some_and(|p| p.contains("#ALL_PLAN_DONE"));
 
             if all_done {
+                if let Some(next_plan_prompt) = find_next_plan_prompt(&data.context_json) {
+                    log::info!(
+                        "[auto_prompt::decide_with_llm] Current plan done, transitioning to next plan"
+                    );
+                    return Ok(Some(AutoPromptAction {
+                        from_session_id: data.session_id,
+                        from_title: data.title,
+                        next_prompt: next_plan_prompt,
+                    }));
+                }
+
                 log::info!(
-                    "[auto_prompt::decide_with_llm] #ALL_PLAN_DONE detected, stopping chain"
+                    "[auto_prompt::decide_with_llm] #ALL_PLAN_DONE detected, all plans complete, stopping chain"
                 );
                 reset_iteration();
                 return Ok(None);
@@ -440,6 +471,22 @@ pub async fn decide_with_llm(
                 reset_iteration();
                 return Ok(None);
             }
+
+            // Safety check: if heading to doc creation but plan has unchecked items,
+            // override to checkbox verification first.
+            let next_prompt = if is_doc_creation_prompt(&next_prompt) {
+                match build_checkbox_verification_prompt(&data.context_json) {
+                    Some(verification_prompt) => {
+                        log::info!(
+                            "auto_prompt: plan has unchecked items, overriding doc creation with checkbox verification"
+                        );
+                        verification_prompt
+                    }
+                    None => next_prompt,
+                }
+            } else {
+                next_prompt
+            };
 
             log::info!(
                 "auto_prompt: dispatching new thread with prompt: {}...",
@@ -490,26 +537,33 @@ fn default_system_prompt() -> String {
 
         ### Case 3: Task completion detected
         If the last assistant message indicates task completion (e.g. 'all done', 'task complete', 'completed', 'finished'):
+        - MANDATORY FIRST ACTION: Mark the just-completed step as [x] in the plan file. Every next_prompt below MUST begin with this checkbox update before any other instruction.
         - Compare current_plan entries against plan_files (the original plan from .plan/ folder)
         - Check the code changes against each plan item to verify completion
-        - If ALL plan items are completed AND verified:
-          - Set all_plan_done to true
-          - Set next_prompt to: 'Rebase feature branch feature/{plan_number}_description onto develop, then merge to develop'
-        - If some items remain:
-          - Set next_prompt to proceed with the next pending [ ] task
-          - Include instruction to mark the completed step as [x]
+        - If ALL items in the CURRENT plan are completed AND verified:
+          - Check ALL other plan files in plan_files for remaining [ ] items (multi-plan support)
+          - If another plan has unchecked [ ] items, transition to it:
+            Set next_prompt to: 'Read .plan/{next_plan_filename} and execute the plan starting from the first unchecked step.'
+            Set should_continue to true, keep all_plan_done as false
+          - If NO other plans have remaining [ ] items:
+            Set all_plan_done to true
+            Set next_prompt to: 'Rebase feature branch feature/{plan_number}_description onto develop, then merge to develop'
+        - If some items remain in the current plan:
+          - Set next_prompt to mark the completed step as [x] then proceed with the next pending [ ] task
           - ALWAYS set should_continue to true to automatically proceed without asking
-        - You may include #ALL_PLAN_DONE in next_prompt to signal the loop should stop
+        - You may include #ALL_PLAN_DONE in next_prompt ONLY when every plan file has all steps [x]
         - NEVER ask the user for permission - automatic execution is required
 
         ### Case 4: Question detected
-        If the last assistant message asks a question:
-        - If it's a permission/confirmation question (asking to proceed, go ahead, next step, etc.) AND plan_files exists:
-          - AUTOMATICALLY answer yes: set should_continue to true, set next_prompt to the next [ ] task
-        - Otherwise:
-          - Use plan_files context to choose the best option
-          - If confidence < 0.5, set should_continue to false with reason
-          - Else set should_continue to true with next_prompt answering the question
+        If the last assistant message asks a question (possibly with multiple options):
+        - Apply rules in order:
+          1. plan_files exist with unchecked [ ] → auto-continue with next step (confidence >= 0.7)
+          2. Permission/confirmation question → auto-answer yes (confidence >= 0.7)
+          3. Numbered/lettered options → pick option 1 (confidence >= 0.6)
+          4. No plan but work in progress → continue (confidence >= 0.5)
+          5. Requires external info (keys, credentials, unknown preferences) → stop (confidence < 0.5)
+        - NEVER stop just because plan_files is empty. ALWAYS pick a default and continue.
+        - The goal is to keep the chain moving unless the question is truly unanswerable.
 
         ### Case 5: Normal continuation
         If the conversation ended normally without completion or questions:
@@ -518,14 +572,23 @@ fn default_system_prompt() -> String {
         - If no plan items remain, check if the overall goal seems achieved
         - If achieved, set should_continue to false
 
+        ## Multi-Plan Execution (MANDATORY):
+        - The .plan/ folder may contain MULTIPLE plan files (e.g., 01_core.md, 02_bugfix.md)
+        - Plans are executed IN ORDER by filename (01 before 02, etc.)
+        - When one plan completes (all [x]), immediately transition to the next plan with [ ] items
+        - all_plan_done must be true ONLY when every plan file in .plan/ has all checkboxes [x]
+        - The transition prompt must reference the next plan filename: 'Read .plan/{filename} and execute the plan starting from the first unchecked step.'
+        - Never stop the chain between plans — keep going until all plans are done
+
         ## Rules:
+        - MANDATORY: Every next_prompt MUST include 'Mark step N as [x] in .plan/{filename}' as the first instruction when a step completes. This is per-step — never defer checkbox updates to a later transition. The agent must update the plan file on disk immediately after each step.
         - Keep next_prompt concise and actionable
         - confidence ranges from 0.0 (not sure at all) to 1.0 (very confident)
         - If confidence < 0.5, always set should_continue to false
         - Permission/confirmation questions MUST be auto-answered yes when plan_files exists
         - When working on plans with checkboxes, ALWAYS move to the next [ ] task without stopping
         - Never repeat the same prompt that was just executed
-        - iteration_count tells you how many auto-prompt cycles have run; consider stopping if > 10
+        - iteration_count tells you how many auto-prompt cycles have run; consider stopping if > 15
 
         ## Git Flow Automation (always apply):
         - When starting a new feature: Always instruct to create feature/{plan_number}_description branch from develop
@@ -547,19 +610,23 @@ fn default_system_prompt() -> String {
 
         ## Plan Status Tracking (MANDATORY - always apply):
         - Plan files live in .plan/ folder (accessible via plan_files in context)
+        - There may be MULTIPLE plan files — process them in filename order
         - Plans MUST have a status checklist at the top using checkboxes: [ ] pending, [x] done
         - Check plan_has_checkboxes in context - if false, trigger Case 1 to refine it first
         - NEVER assume the user will manually update checkboxes — the agent must do it
-        - Mark a step as [x] when it completes, work on the next [ ] step
-        - When all steps are [x], set all_plan_done to true
+        - Mark each step as [x] IMMEDIATELY when it completes — do not batch or defer checkbox updates. Every next_prompt after a completed step must include the [x] update for that step.
+        - When all steps in a plan are [x], check other plan files before setting all_plan_done
+        - all_plan_done is true ONLY when every plan file has all steps [x]
         - When suggesting next_prompt for a new task, reference the next [ ] step by number
 
-        ## Documentation Generation (MANDATORY on completion):
-        - When all plan steps are [x] and no doc_files exist in context, you MUST generate a next_prompt that instructs the agent to create documentation
+        ## Documentation Generation (MANDATORY on completion of ALL plans):
+        - Documentation is generated ONLY AFTER every plan file in .plan/ is fully complete (all [x])
+        - MANDATORY: Before generating any documentation prompt, re-read ALL .plan/ files and verify each '- [ ]' step against the actual code changes. If a step was completed but not marked [x], update it FIRST. Only proceed with documentation when every step in every plan file is verified as [x].
+        - When all plans are done and no doc_files exist in context, generate a next_prompt that instructs the agent to create documentation
         - Documentation goes in .doc/ folder in the project root
         - Format: .doc/{NN}_{descriptive_name}.md (use sequential numbering like .plan/ files)
         - Documentation should cover: what was implemented, key architectural decisions, file changes summary, how to test/use the feature
-        - When doc_files already exist for the completed plan, set all_plan_done to true
+        - When doc_files already exist and all plans are done, set all_plan_done to true
         - The doc creation prompt is the FINAL step before all_plan_done — never skip it
     "#}
     .to_string()
@@ -817,4 +884,95 @@ fn extract_json(text: &str) -> &str {
         }
     }
     text.trim()
+}
+
+/// Checks if there are plan files with remaining unchecked `[ ]` items.
+/// Returns a prompt to start the next plan if found, or None if all plans are complete.
+fn find_next_plan_prompt(context_json: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct ContextPlanFiles {
+        plan_files: Vec<context::PlanFileContent>,
+    }
+
+    let ctx: ContextPlanFiles = serde_json::from_str(context_json)
+        .inspect_err(|e| {
+            log::warn!("[auto_prompt::find_next_plan_prompt] Failed to parse context JSON: {e}");
+        })
+        .ok()?;
+
+    for file in &ctx.plan_files {
+        let mut in_code_block = false;
+        for line in file.content.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("```") {
+                in_code_block = !in_code_block;
+                continue;
+            }
+            if in_code_block {
+                continue;
+            }
+            if trimmed.contains("- [ ] ") {
+                let filename = file.path.rsplit('/').next().unwrap_or(&file.path);
+                log::info!("[auto_prompt::find_next_plan_prompt] Found remaining plan: {filename}");
+                return Some(format!(
+                    "Read .plan/{filename} and execute the plan starting from the first unchecked step."
+                ));
+            }
+        }
+    }
+
+    log::info!("[auto_prompt::find_next_plan_prompt] No remaining plans found");
+    None
+}
+
+fn is_doc_creation_prompt(prompt: &str) -> bool {
+    let lower = prompt.to_lowercase();
+    lower.contains("documentation") || lower.contains(".doc/")
+}
+
+fn build_checkbox_verification_prompt(context_json: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct ContextPlanFiles {
+        plan_files: Vec<context::PlanFileContent>,
+    }
+
+    let ctx: ContextPlanFiles = serde_json::from_str(context_json)
+        .inspect_err(|e| {
+            log::warn!(
+                "[auto_prompt::build_checkbox_verification_prompt] Failed to parse context JSON: {e}"
+            );
+        })
+        .ok()?;
+
+    for file in &ctx.plan_files {
+        let mut in_code_block = false;
+        for line in file.content.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("```") {
+                in_code_block = !in_code_block;
+                continue;
+            }
+            if in_code_block {
+                continue;
+            }
+            if trimmed.contains("- [ ] ") {
+                let filename = file.path.rsplit('/').next().unwrap_or(&file.path);
+                log::info!(
+                    "[auto_prompt::build_checkbox_verification_prompt] Found unchecked items in {filename}"
+                );
+                return Some(format!(
+                    "MANDATORY CHECKPOINT: Verify plan checkboxes before documentation.\n\n\
+                     Re-read all .plan/ files and verify every '- [ ]' step against the actual code changes:\n\
+                     1. Read each plan file in .plan/\n\
+                     2. For each '- [ ]' item, check if the code already implements it\n\
+                     3. Mark completed items as '- [x]' — do NOT re-execute completed work\n\
+                     4. If any item is truly incomplete, continue working on it\n\
+                     5. Only after ALL items in ALL plan files are '- [x]', create documentation at .doc/\n\n\
+                     Unchecked items found in: {filename}"
+                ));
+            }
+        }
+    }
+
+    None
 }
