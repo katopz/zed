@@ -97,10 +97,10 @@ A full end-to-end test exercises the git flow with a helloworld Rust project.
 ### Setup
 
 ```bash
-script/test-auto-prompt-e2e setup ./tmp/hw-test
+script/test-auto-prompt-e2e setup /tmp/hw-test
 ```
 
-This creates a Cargo project at `./tmp/hw-test` with a `.plan/01_helloworld_flow.md` plan file, initialized on `main` with a `develop` branch.
+This creates a Cargo project at `/tmp/hw-test` with a `.plan/01_helloworld_flow.md` plan file, initialized on `main` with a `develop` branch.
 
 ### Test with Zed
 
@@ -111,7 +111,7 @@ This creates a Cargo project at `./tmp/hw-test` with a `.plan/01_helloworld_flow
 
 2. Open the test project:
    ```bash
-   target/debug/zed ./tmp/hw-test
+   target/debug/zed /tmp/hw-test
    ```
 
 3. Open Agent Panel (`cmd+i`) and send:
@@ -124,7 +124,7 @@ This creates a Cargo project at `./tmp/hw-test` with a `.plan/01_helloworld_flow
 ### Verify
 
 ```bash
-script/test-auto-prompt-e2e verify ./tmp/hw-test
+script/test-auto-prompt-e2e verify /tmp/hw-test
 ```
 
 Runs 12 checks: branches, tags, tests, conventional commits, version bumps, plan progress, function correctness.
@@ -132,9 +132,9 @@ Runs 12 checks: branches, tags, tests, conventional commits, version bumps, plan
 ### Other commands
 
 ```bash
-script/test-auto-prompt-e2e status ./tmp/hw-test      # show git state
-script/test-auto-prompt-e2e inject-bug ./tmp/hw-test   # inject bug for Step 7
-script/test-auto-prompt-e2e teardown ./tmp/hw-test     # cleanup
+script/test-auto-prompt-e2e status /tmp/hw-test      # show git state
+script/test-auto-prompt-e2e inject-bug /tmp/hw-test   # inject bug for Step 7
+script/test-auto-prompt-e2e teardown /tmp/hw-test     # cleanup
 ```
 
 ## Conventions
