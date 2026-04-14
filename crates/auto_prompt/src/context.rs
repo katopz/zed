@@ -36,6 +36,14 @@ pub struct AutoPromptContext {
     pub iteration_count: u32,
     /// Whether this context was truncated/summarized due to token limits.
     pub was_truncated: bool,
+    /// Whether any plan file contains checkbox patterns (- [ ] or - [x]).
+    pub plan_has_checkboxes: bool,
+    /// The first plan filename that exists, or a default if none.
+    pub first_plan_filename: String,
+    /// The plan number (e.g., "082") from the first plan filename, or "00" if not found.
+    pub plan_number: String,
+    /// Whether we're starting a new plan implementation.
+    pub is_starting_new_plan: bool,
 }
 
 /// A plan entry with its status.
@@ -190,9 +198,20 @@ impl AutoPromptContext {
             approximate_token_count: 0,
             iteration_count,
             was_truncated: false,
+            plan_has_checkboxes: false,
+            first_plan_filename: String::new(),
+            plan_number: String::new(),
+            is_starting_new_plan: false,
         };
 
         context.approximate_token_count = context.estimate_token_count();
+
+        // Compute helper fields
+        context.plan_has_checkboxes = context.compute_plan_has_checkboxes();
+        context.first_plan_filename = context.compute_first_plan_filename();
+        context.plan_number = context.compute_plan_number();
+        context.is_starting_new_plan = context.compute_is_starting_new_plan();
+
         context
     }
 
@@ -289,6 +308,122 @@ impl AutoPromptContext {
             }
         }
         (pending, in_progress, completed)
+    }
+
+    pub fn compute_plan_has_checkboxes(&self) -> bool {
+        self.plan_files
+            .iter()
+            .any(|file| self.has_task_checkboxes(&file.content))
+    }
+
+    /// Checks if content has task-style checkboxes.
+    /// Returns true only if:
+    /// - Checkboxes are at start of lines (not deeply indented)
+    /// - Not in code blocks (```)
+    /// - Not in blockquotes (>)
+    /// - Multiple checkboxes exist (3+ to avoid false positives from examples)
+    fn has_task_checkboxes(&self, content: &str) -> bool {
+        let mut in_code_block = false;
+        let mut checkbox_count = 0;
+
+        for line in content.lines() {
+            let trimmed = line.trim_start();
+            let leading_spaces = line.len() - trimmed.len();
+
+            // Track code blocks
+            if trimmed.starts_with("```") {
+                in_code_block = !in_code_block;
+                continue;
+            }
+
+            // Skip content in code blocks
+            if in_code_block {
+                continue;
+            }
+
+            // Skip blockquotes
+            if trimmed.starts_with(">") {
+                continue;
+            }
+
+            // Check for checkbox pattern at start of line (or with minimal indentation)
+            // Allow up to 2 spaces of indentation (not code blocks or nested lists)
+            let is_checkbox = leading_spaces <= 2
+                && (trimmed.starts_with("- [ ") || trimmed.starts_with("- [x]"));
+
+            if is_checkbox {
+                checkbox_count += 1;
+                // Require at least 3 checkboxes to consider it a task checklist
+                // This avoids matching example sections with 1-2 checkboxes
+                if checkbox_count >= 3 {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    pub fn compute_is_starting_new_plan(&self) -> bool {
+        if self.plan_files.is_empty() {
+            return false;
+        }
+
+        // Check if entry count is low (user message + maybe one assistant response)
+        if self.entry_count > 4 {
+            return false;
+        }
+
+        // Check if user message contains plan implementation keywords
+        let user_messages: Vec<_> = self
+            .messages
+            .iter()
+            .filter(|m| matches!(m.role, ContextMessageRole::User))
+            .collect();
+
+        if user_messages.is_empty() {
+            return false;
+        }
+
+        let last_user_msg = user_messages.last().unwrap();
+        let lower_msg = last_user_msg.content.to_lowercase();
+
+        let plan_keywords = [
+            "impl as a plan",
+            "implement the plan",
+            "execute the plan",
+            "start the plan",
+            "work on plan",
+            "follow the plan",
+        ];
+
+        plan_keywords
+            .iter()
+            .any(|keyword| lower_msg.contains(keyword))
+    }
+
+    pub fn compute_first_plan_filename(&self) -> String {
+        self.plan_files
+            .first()
+            .map(|f| f.path.rsplit('/').next().unwrap_or("plan.md").to_string())
+            .unwrap_or_else(|| "plan.md".to_string())
+    }
+
+    pub fn compute_plan_number(&self) -> String {
+        let filename = self.compute_first_plan_filename();
+        // Extract number from patterns like "082_name.md" or "082.md"
+        filename
+            .split('_')
+            .next()
+            .map(|s| {
+                let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if digits.is_empty() {
+                    "00".to_string()
+                } else {
+                    digits
+                }
+            })
+            .unwrap_or_else(|| "00".to_string())
     }
 }
 

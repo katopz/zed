@@ -27,6 +27,36 @@ AcpThreadEvent::Stopped(stop_reason)
       └─ Returns AutoPromptAction with next prompt
 ```
 
+### Plan refinement
+
+Auto-prompt now supports both checkbox-based and narrative-style plans.
+
+**Narrative plans** (e.g., with `**Tasks**:` sections):
+- When starting a new plan, auto-prompt detects if checkboxes are missing
+- If missing, generates a prompt to add a checkbox checklist at the top
+- Agent adds checkboxes for all `**Tasks**:` and `**Deliverables**:` items
+- Plan becomes executable with checkbox-based tracking
+- Original narrative content is preserved below the checklist
+
+**Checkbox plans** (existing behavior):
+- Plans with `- [ ]` / `- [x]` format work directly
+- No refinement needed
+
+**Flow for narrative plans**:
+```
+User: "impl as a plan 082"
+  ↓
+Auto-prompt detects no checkboxes
+  ↓
+Generates: "Read .plan/082_*.md and add checkboxes..."
+  ↓
+Agent adds checkbox checklist
+  ↓
+Auto-prompt: "Start implementing: Create feature branch..."
+  ↓
+Normal checkbox-based flow
+```
+
 ### Completion flow
 
 ```
@@ -41,6 +71,11 @@ All steps [x]? → Check .doc/ folder
         │
         └─ Docs exist → all_plan_done: true → chain stops
 ```
+
+**Git flow automation**:
+- When starting a new plan: Auto-prompt includes feature branch creation (`feature/NN_description from develop`)
+- When plan completes: Auto-prompt includes rebase and merge instructions to develop
+- Documentation generation follows successful merge
 
 ### Key types
 
@@ -141,7 +176,10 @@ script/test-auto-prompt-e2e teardown /tmp/hw-test     # cleanup
 
 The built-in system prompt enforces:
 
+- **Plan Refinement**: Plans without checkboxes are automatically refined to include a checkbox checklist. Narrative-style plans (with `**Tasks**:` and `**Deliverables**:` sections) are converted to executable checkbox format.
 - **Git Flow**: `main`, `develop`, `feature/NN_description`, `hotfix/NN_description`, `release/vX.Y.Z`
+  - Feature branches are created automatically when starting a new plan
+  - Feature branches are rebased and merged to develop upon completion
 - **Conventional Commits**: `feat:`, `fix:`, `chore:`, `refactor:`, `test:`, `docs:`
 - **Plan Status Tracking** (mandatory): `[ ]` / `[x]` checkboxes in `.plan/` folder files — every `next_prompt` must include instructions to mark completed steps as `[x]`; never assumes manual updates
 - **Documentation Generation** (mandatory on completion): when all plan steps are `[x]` and no `.doc/` folder exists, the orchestration LLM generates a final prompt instructing the agent to create `.doc/{NN}_{descriptive_name}.md` covering what was implemented, key decisions, file changes, and how to test. The chain only stops after documentation exists.
