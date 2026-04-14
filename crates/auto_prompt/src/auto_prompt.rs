@@ -293,7 +293,7 @@ pub fn decide(
             "The AI indicates the task is complete. Verify against the plan:\n\
              - Plan stats: {pending} pending, {in_progress} in progress, {completed} completed\n\
              - Check current_plan against plan_files from .plan/ folder\n\
-             - IMPORTANT: If plan_files have steps that are done but still marked [ ], your next_prompt MUST be ONLY about updating those checkboxes. Do NOT bundle with other work — the agent skips checkbox updates when given other tasks.\n\
+             - If plan_files have steps that are done but still marked [ ] AND remaining pending steps exist, your next_prompt must update checkboxes AND continue the next pending step in the same prompt.\n\
              - If ALL items are done AND no checkboxes need fixing AND doc_files is empty, set next_prompt to create documentation at .doc/ summarizing what was implemented\n\
              - If ALL items are done AND doc_files already exist, respond with #ALL_PLAN_DONE\n\
              - If items remain (and checkboxes are correct), continue with the next pending item"
@@ -342,7 +342,10 @@ pub fn decide(
 /// Async LLM call to determine the next prompt.
 ///
 /// Returns `Some(action)` if the chain should continue, `None` to stop.
-pub async fn decide_with_llm(data: LlmCallData, cx: &gpui::AsyncApp) -> Option<AutoPromptAction> {
+pub async fn decide_with_llm(
+    data: LlmCallData,
+    cx: &gpui::AsyncApp,
+) -> anyhow::Result<Option<AutoPromptAction>> {
     log::warn!(
         "[auto_prompt] *** ENTRY POINT *** decide_with_llm called: session_id={:?}, iteration={}",
         data.session_id,
@@ -403,7 +406,7 @@ pub async fn decide_with_llm(data: LlmCallData, cx: &gpui::AsyncApp) -> Option<A
                     "[auto_prompt::decide_with_llm] #ALL_PLAN_DONE detected, stopping chain"
                 );
                 reset_iteration();
-                return None;
+                return Ok(None);
             }
 
             if response.confidence.is_some_and(|c| c < 0.5) {
@@ -412,13 +415,13 @@ pub async fn decide_with_llm(data: LlmCallData, cx: &gpui::AsyncApp) -> Option<A
                     response.confidence.unwrap()
                 );
                 reset_iteration();
-                return None;
+                return Ok(None);
             }
 
             if !response.should_continue && !has_prompt {
                 log::info!("auto_prompt: LLM says stop, no next_prompt");
                 reset_iteration();
-                return None;
+                return Ok(None);
             }
 
             let next_prompt = if has_prompt {
@@ -429,13 +432,13 @@ pub async fn decide_with_llm(data: LlmCallData, cx: &gpui::AsyncApp) -> Option<A
             } else {
                 log::info!("auto_prompt: no prompt determined, stopping");
                 reset_iteration();
-                return None;
+                return Ok(None);
             };
 
             if next_prompt.is_empty() {
                 log::info!("auto_prompt: prompt was empty after cleanup, stopping");
                 reset_iteration();
-                return None;
+                return Ok(None);
             }
 
             log::info!(
@@ -443,15 +446,15 @@ pub async fn decide_with_llm(data: LlmCallData, cx: &gpui::AsyncApp) -> Option<A
                 next_prompt.chars().take(80).collect::<String>()
             );
 
-            Some(AutoPromptAction {
+            Ok(Some(AutoPromptAction {
                 from_session_id: data.session_id,
                 from_title: data.title,
                 next_prompt,
-            })
+            }))
         }
         Err(err) => {
             log::warn!("auto_prompt: language model call failed: {err}");
-            None
+            Err(err)
         }
     }
 }
@@ -519,9 +522,10 @@ fn default_system_prompt() -> String {
         - NEVER assume the user will manually update checkboxes — the agent must do it
         - When all steps are [x], set all_plan_done to true
         - If plan_files show steps that were completed but still marked [ ], you MUST generate a next_prompt that is ONLY about updating those checkboxes
-        - CRITICAL: Do NOT bundle checkbox updates with other work in the same next_prompt. The agent will skip the checkbox update if given other tasks. Make it a dedicated step:
-          Example next_prompt for checkbox fixup: 'Edit .plan/filename.md — mark Step N as [x] by changing [ ] to [x]. This is your only task, do nothing else.'
-        - After checkboxes are updated, the next cycle will proceed with the next pending step
+        - When checkboxes need updating AND pending steps remain, combine both in one next_prompt to save a cycle:
+          Example: 'Mark Step 2 as [x] in .plan/filename.md, then continue with Step 3: implement the greeting feature.'
+        - If only checkboxes need updating with no remaining work, make it a dedicated step:
+          Example: 'Edit .plan/filename.md — mark Step N as [x] by changing [ ] to [x].'
         - When suggesting next_prompt for a new task, reference the next [ ] step by number
 
         ## Documentation Generation (MANDATORY on completion):

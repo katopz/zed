@@ -164,29 +164,43 @@ pub fn on_thread_stopped(
 
                 log::info!("[auto_prompt] ASYNC TASK: LLM call completed");
 
-                if let Some(ref tv) = thread_weak {
-                    let _ = tv.update(cx, |tv, cx| {
-                        if result.is_some() {
-                            tv.auto_prompt_state = AutoPromptState::Idle;
-                        } else {
-                            tv.auto_prompt_state = AutoPromptState::Failed;
+                match result {
+                    Ok(Some(action)) => {
+                        if let Some(ref tv) = thread_weak {
+                            let _ = tv.update(cx, |tv, cx| {
+                                tv.auto_prompt_state = AutoPromptState::Idle;
+                                cx.notify();
+                            });
                         }
-                        cx.notify();
-                    });
-                }
 
-                if let Some(action) = result {
-                    log::info!(
-                        "[auto_prompt] LLM returned action - dispatching with prompt: {}",
-                        action.next_prompt
-                    );
-                    _view
-                        .update_in(cx, |_view, window, cx| {
-                            dispatch_action(action, window, cx);
-                        })
-                        .ok();
-                } else {
-                    log::info!("[auto_prompt] LLM returned no action (error or timeout)");
+                        log::info!(
+                            "[auto_prompt] LLM returned action - dispatching with prompt: {}",
+                            action.next_prompt
+                        );
+                        _view
+                            .update_in(cx, |_view, window, cx| {
+                                dispatch_action(action, window, cx);
+                            })
+                            .ok();
+                    }
+                    Ok(None) => {
+                        if let Some(ref tv) = thread_weak {
+                            let _ = tv.update(cx, |tv, cx| {
+                                tv.auto_prompt_state = AutoPromptState::Idle;
+                                cx.notify();
+                            });
+                        }
+                        log::info!("[auto_prompt] LLM returned no action (normal stop)");
+                    }
+                    Err(err) => {
+                        if let Some(ref tv) = thread_weak {
+                            let _ = tv.update(cx, |tv, cx| {
+                                tv.auto_prompt_state = AutoPromptState::Failed;
+                                cx.notify();
+                            });
+                        }
+                        log::warn!("[auto_prompt] LLM call failed: {err}");
+                    }
                 }
             })
             .detach();
