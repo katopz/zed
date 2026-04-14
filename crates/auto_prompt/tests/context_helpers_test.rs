@@ -467,3 +467,104 @@ fn test_is_starting_new_plan_without_plan_keyword_returns_false() {
 
     assert!(!context.compute_is_starting_new_plan());
 }
+
+// ===== Remaining Plan Files Tests =====
+
+#[test]
+fn test_remaining_plan_files_all_complete_returns_empty() {
+    let plan_file = PlanFileContent {
+        path: ".plan/01_core.md".to_string(),
+        content: "- [x] Step 1: Do thing\n- [x] Step 2: Do other thing\n- [x] Step 3: Done"
+            .to_string(),
+    };
+
+    let context = AutoPromptContext {
+        plan_files: vec![plan_file],
+        ..default_context()
+    };
+
+    assert!(context.remaining_plan_files().is_empty());
+}
+
+#[test]
+fn test_remaining_plan_files_has_unchecked_returns_file() {
+    let plan_file = PlanFileContent {
+        path: ".plan/01_core.md".to_string(),
+        content: "- [x] Step 1: Done\n- [ ] Step 2: Pending\n- [ ] Step 3: Pending".to_string(),
+    };
+
+    let context = AutoPromptContext {
+        plan_files: vec![plan_file],
+        ..default_context()
+    };
+
+    let remaining = context.remaining_plan_files();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].path, ".plan/01_core.md");
+}
+
+#[test]
+fn test_remaining_plan_files_multi_plan_first_done_second_pending() {
+    let plan_01 = PlanFileContent {
+        path: ".plan/01_core.md".to_string(),
+        content: "- [x] Step 1: Done\n- [x] Step 2: Done".to_string(),
+    };
+    let plan_02 = PlanFileContent {
+        path: ".plan/02_bugfix.md".to_string(),
+        content: "- [ ] Step 1: Inject bug\n- [ ] Step 2: Fix bug".to_string(),
+    };
+
+    let context = AutoPromptContext {
+        plan_files: vec![plan_01, plan_02],
+        ..default_context()
+    };
+
+    let remaining = context.remaining_plan_files();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].path, ".plan/02_bugfix.md");
+}
+
+#[test]
+fn test_remaining_plan_files_multi_plan_both_pending() {
+    let plan_01 = PlanFileContent {
+        path: ".plan/01_core.md".to_string(),
+        content: "- [x] Step 1: Done\n- [ ] Step 2: Pending".to_string(),
+    };
+    let plan_02 = PlanFileContent {
+        path: ".plan/02_bugfix.md".to_string(),
+        content: "- [ ] Step 1: Inject bug".to_string(),
+    };
+
+    let context = AutoPromptContext {
+        plan_files: vec![plan_01, plan_02],
+        ..default_context()
+    };
+
+    let remaining = context.remaining_plan_files();
+    assert_eq!(remaining.len(), 2);
+}
+
+#[test]
+fn test_remaining_plan_files_ignores_checkboxes_in_code_blocks() {
+    let plan_file = PlanFileContent {
+        path: ".plan/01_core.md".to_string(),
+        content: "- [x] Step 1: Done\n- [x] Step 2: Done\n\n```\n- [ ] This is in a code block\n- [ ] Should be ignored\n```".to_string(),
+    };
+
+    let context = AutoPromptContext {
+        plan_files: vec![plan_file],
+        ..default_context()
+    };
+
+    assert!(context.remaining_plan_files().is_empty());
+}
+
+#[test]
+fn test_remaining_plan_files_no_plans_returns_empty() {
+    let context = AutoPromptContext {
+        plan_files: vec![],
+        ..default_context()
+    };
+
+    assert!(context.remaining_plan_files().is_empty());
+}
