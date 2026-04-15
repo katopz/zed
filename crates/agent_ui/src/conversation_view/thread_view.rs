@@ -286,6 +286,7 @@ pub struct ThreadView {
     pub last_token_limit_telemetry: Option<acp_thread::TokenUsageRatio>,
     thread_feedback: ThreadFeedbackState,
     pub auto_prompt_state: crate::auto_prompt::AutoPromptState,
+    pub _auto_prompt_task: Option<gpui::Task<()>>,
     pub list_state: ListState,
     pub session_capabilities: SharedSessionCapabilities,
     /// Tracks which tool calls have their content/output expanded.
@@ -536,6 +537,7 @@ impl ThreadView {
             last_token_limit_telemetry: None,
             thread_feedback: Default::default(),
             auto_prompt_state: Default::default(),
+            _auto_prompt_task: None,
             expanded_tool_calls: HashSet::default(),
             expanded_tool_call_raw_inputs: HashSet::default(),
             expanded_thinking_blocks: HashSet::default(),
@@ -4272,6 +4274,11 @@ impl ThreadView {
             })
             .on_click(cx.listener(move |this, _, _, cx| {
                 if is_processing {
+                    log::info!("[auto_prompt] Cancelling auto-prompt processing");
+                    this._auto_prompt_task = None;
+                    this.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;
+                    auto_prompt::reset_iteration();
+                    cx.notify();
                     return;
                 }
                 if is_failed {

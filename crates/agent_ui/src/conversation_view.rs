@@ -1439,7 +1439,20 @@ impl ConversationView {
                     used_tools,
                     stop_reason
                 );
-                crate::auto_prompt::on_thread_stopped(&thread, used_tools, stop_reason, window, cx);
+                if let Some(task) = crate::auto_prompt::on_thread_stopped(
+                    &thread,
+                    used_tools,
+                    stop_reason,
+                    window,
+                    cx,
+                ) {
+                    if let Some(active) = self.active_thread() {
+                        active.update(cx, |active, cx| {
+                            active._auto_prompt_task = Some(task);
+                            cx.notify();
+                        });
+                    }
+                }
 
                 let should_send_queued = if let Some(active) = self.active_thread() {
                     active.update(cx, |active, cx| {
@@ -1506,13 +1519,20 @@ impl ConversationView {
                     );
                     // Call auto-prompt for error events (e.g., rate limits)
                     let used_tools = thread.read(cx).used_tools_since_last_user_message();
-                    crate::auto_prompt::on_thread_stopped(
+                    if let Some(task) = crate::auto_prompt::on_thread_stopped(
                         &thread,
                         used_tools,
                         &acp::StopReason::MaxTokens, // Use MaxTokens as error indicator
                         window,
                         cx,
-                    );
+                    ) {
+                        if let Some(active) = self.active_thread() {
+                            active.update(cx, |active, cx| {
+                                active._auto_prompt_task = Some(task);
+                                cx.notify();
+                            });
+                        }
+                    }
                 }
             }
             AcpThreadEvent::LoadError(error) => {
