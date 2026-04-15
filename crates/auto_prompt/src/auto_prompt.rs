@@ -19,6 +19,7 @@ use language_model::{
     LanguageModel, LanguageModelCompletionEvent, LanguageModelRequest, LanguageModelRequestMessage,
     Role,
 };
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
@@ -96,6 +97,7 @@ pub struct AutoPromptAction {
     pub from_session_id: acp::SessionId,
     pub from_title: Option<String>,
     pub next_prompt: String,
+    pub work_dirs: Option<Vec<std::path::PathBuf>>,
 }
 
 /// Result of the auto-prompt decision logic.
@@ -119,10 +121,11 @@ pub struct LlmCallData {
     pub model: Arc<dyn LanguageModel>,
     pub system_prompt: String,
     pub context_json: String,
-    pub forced_prompt: Option<String>,
+    pub project_root: Option<PathBuf>,
     pub session_id: acp::SessionId,
     pub title: Option<String>,
     pub iteration_count: u32,
+    pub work_dirs: Option<Vec<PathBuf>>,
 }
 
 impl std::fmt::Debug for LlmCallData {
@@ -134,10 +137,11 @@ impl std::fmt::Debug for LlmCallData {
                 "context_json",
                 &format!("<{} chars>", self.context_json.len()),
             )
-            .field("forced_prompt", &self.forced_prompt)
+            .field("project_root", &self.project_root)
             .field("session_id", &self.session_id)
             .field("title", &self.title)
             .field("iteration_count", &self.iteration_count)
+            .field("work_dirs", &self.work_dirs)
             .finish()
     }
 }
@@ -215,7 +219,7 @@ pub fn decide(
     let model = configured_model.model;
     log::info!("[auto_prompt::decide] Using model: {:?}", model.id());
 
-    let (auto_prompt_ctx, session_id, thread_title) = {
+    let (auto_prompt_ctx, session_id, thread_title, work_dirs) = {
         let thread_ref = thread.read(cx);
         let stop_reason_str = format!("{stop_reason:?}").to_lowercase();
         let plan_files = read_plan_files(thread_ref);
@@ -230,13 +234,42 @@ pub fn decide(
         );
         let sid = thread_ref.session_id().clone();
         let title = thread_ref.title().map(|t| t.to_string());
-        (ctx, sid, title)
+        let dirs = thread_ref.work_dirs().map(|pl| pl.paths().to_vec());
+        (ctx, sid, title, dirs)
     };
 
     let make_action = |prompt: String| AutoPromptAction {
         from_session_id: session_id.clone(),
         from_title: thread_title.clone(),
         next_prompt: prompt,
+        work_dirs: work_dirs.clone(),
+    };
+
+    let make_continue_prompt = || {
+        if let Some(remaining) = auto_prompt_ctx.remaining_plan_files().first() {
+            let filename = remaining.path.rsplit('/').next().unwrap_or(&remaining.path);
+            let plan_dir = remaining.path.rsplit('/').nth(1).unwrap_or(".plans");
+            let plan_number = filename
+                .split('_')
+                .next()
+                .map(|s| {
+                    s.chars()
+                        .take_while(|c| c.is_ascii_digit())
+                        .collect::<String>()
+                })
+                .unwrap_or_default();
+            if plan_number.is_empty() {
+                format!(
+                    "Continue the plan. Read {plan_dir}/{filename} and execute from the first unchecked step. Mark completed steps as [x] in {plan_dir}/ files."
+                )
+            } else {
+                format!(
+                    "Continue Plan {plan_number}. Read {plan_dir}/{filename} and execute from the first unchecked step. Mark completed steps as [x] in {plan_dir}/ files."
+                )
+            }
+        } else {
+            "continue".to_string()
+        }
     };
 
     log::info!(
@@ -255,7 +288,7 @@ pub fn decide(
             auto_prompt_ctx.approximate_token_count,
             config.max_context_tokens
         );
-        return AutoPromptDecision::DispatchNow(make_action("continue".to_string()));
+        return AutoPromptDecision::DispatchNow(make_action(make_continue_prompt()));
     }
 
     log::info!(
@@ -281,56 +314,12 @@ pub fn decide(
             delay
         );
         return AutoPromptDecision::DispatchAfterDelay {
-            action: make_action("continue".to_string()),
+            action: make_action(make_continue_prompt()),
             delay_ms: delay,
         };
     }
 
-    let forced_prompt = if auto_prompt_ctx.last_message_indicates_completion() {
-        log::info!("[auto_prompt::decide] Last message indicates completion");
-        let (pending, in_progress, completed) = auto_prompt_ctx.plan_stats();
-        Some(format!(
-            "The AI indicates the task is complete. Verify against the plan:\n\
-             - Plan stats: {pending} pending, {in_progress} in progress, {completed} completed\n\
-             - Check current_plan against plan_files from .plan/ folder\n\
-             - If plan_files have steps that are done but still marked [ ] AND remaining pending steps exist, your next_prompt must update checkboxes AND continue the next pending step in the same prompt.\n\
-             - If ALL items are done AND no checkboxes need fixing AND doc_files is empty, set next_prompt to create documentation at .doc/ summarizing what was implemented\n\
-             - If ALL items are done AND doc_files already exist, respond with #ALL_PLAN_DONE\n\
-             - If items remain (and checkboxes are correct), continue with the next pending item"
-        ))
-    } else if auto_prompt_ctx.last_message_is_question() {
-        log::info!("[auto_prompt::decide] Last message is a question");
-        let (pending, in_progress, completed) = auto_prompt_ctx.plan_stats();
-        let remaining = auto_prompt_ctx.remaining_plan_files();
-        let has_plan_context = !auto_prompt_ctx.plan_files.is_empty();
-        let has_remaining_steps = !remaining.is_empty() || pending > 0 || in_progress > 0;
-        Some(format!(
-            "The AI asked a question (possibly with multiple options). Project state:\n\
-             - Plan stats: {pending} pending, {in_progress} in progress, {completed} completed\n\
-             - Plan files exist: {has_plan_context}\n\
-             - Remaining plan files with unchecked steps: {}\n\
-             - Has remaining work: {has_remaining_steps}\n\
-             \n\
-             Rules (apply in order):\n\
-             1. If plan_files exist with unchecked [ ] steps → set should_continue=true, \
-             next_prompt to the next unchecked step. Confidence must be >= 0.7.\n\
-             2. If the question is a permission/confirmation (\"proceed?\", \"go ahead?\", \
-             \"continue?\") → answer yes. Set should_continue=true, confidence >= 0.7.\n\
-             3. If the question lists numbered or lettered options → pick option 1 \
-             (\"continue\"/\"proceed\"/the first listed option). Set should_continue=true, \
-             confidence >= 0.6, next_prompt to execute that option.\n\
-             4. If no plan and no clear default but the conversation has work in progress → \
-             set should_continue=true with next_prompt=\"continue\" and confidence >= 0.5.\n\
-             5. ONLY set should_continue=false if the question requires external information \
-             you cannot infer (API keys, credentials, user preferences never mentioned before).\n\
-             \n\
-             NEVER stop just because plan_files is empty. ALWAYS pick a default and continue.",
-            remaining.len(),
-        ))
-    } else {
-        log::info!("[auto_prompt::decide] Normal state, will call LLM for decision");
-        None
-    };
+    log::info!("[auto_prompt::decide] Will call LLM for decision");
 
     let system_prompt = config.system_prompt.unwrap_or_else(default_system_prompt);
     let context_json = match serde_json::to_string(&auto_prompt_ctx) {
@@ -347,15 +336,18 @@ pub fn decide(
         }
     };
 
+    let project_root = auto_prompt_ctx.current_paths.first().map(PathBuf::from);
+
     log::info!("[auto_prompt::decide] Returning NeedsLlmCall decision");
     AutoPromptDecision::NeedsLlmCall(LlmCallData {
         model,
         system_prompt,
         context_json,
-        forced_prompt,
+        project_root,
         session_id,
         title: thread_title,
         iteration_count,
+        work_dirs,
     })
 }
 
@@ -379,11 +371,6 @@ pub async fn decide_with_llm(
         data.session_id
     );
 
-    log::info!(
-        "[auto_prompt::decide_with_llm] Forced prompt: {:?}",
-        data.forced_prompt
-    );
-
     let result =
         call_language_model(&data.model, &data.system_prompt, &data.context_json, cx).await;
 
@@ -393,7 +380,19 @@ pub async fn decide_with_llm(
     );
 
     match result {
-        Ok(response) => {
+        Ok((raw_response, response)) => {
+            if let Some(ref root) = data.project_root {
+                write_decision_log(
+                    root,
+                    data.iteration_count,
+                    &format!("{:?}", data.model.id()),
+                    &data.system_prompt,
+                    &data.context_json,
+                    &raw_response,
+                    &response,
+                );
+            }
+
             let has_prompt = response
                 .next_prompt
                 .as_ref()
@@ -422,14 +421,20 @@ pub async fn decide_with_llm(
                     .is_some_and(|p| p.contains("#ALL_PLAN_DONE"));
 
             if all_done {
-                if let Some(next_plan_prompt) = find_next_plan_prompt(&data.context_json) {
+                if let Some(next_plan_prompt) =
+                    find_next_plan_prompt(&data.context_json, data.work_dirs.as_deref())
+                {
                     log::info!(
                         "[auto_prompt::decide_with_llm] Current plan done, transitioning to next plan"
+                    );
+                    let next_prompt = format!(
+                        "Create a git feature branch for the completed plan from develop and commit all changes with conventional commit messages. Then {next_plan_prompt}"
                     );
                     return Ok(Some(AutoPromptAction {
                         from_session_id: data.session_id,
                         from_title: data.title,
-                        next_prompt: next_plan_prompt,
+                        next_prompt,
+                        work_dirs: data.work_dirs,
                     }));
                 }
 
@@ -458,8 +463,6 @@ pub async fn decide_with_llm(
             let next_prompt = if has_prompt {
                 let prompt = response.next_prompt.unwrap();
                 prompt.replace("#ALL_PLAN_DONE", "").trim().to_string()
-            } else if let Some(forced) = data.forced_prompt {
-                forced
             } else {
                 log::info!("auto_prompt: no prompt determined, stopping");
                 reset_iteration();
@@ -497,137 +500,159 @@ pub async fn decide_with_llm(
                 from_session_id: data.session_id,
                 from_title: data.title,
                 next_prompt,
+                work_dirs: data.work_dirs,
             }))
         }
         Err(err) => {
+            if let Some(ref root) = data.project_root {
+                write_error_log(
+                    root,
+                    data.iteration_count,
+                    &format!("{:?}", data.model.id()),
+                    &err,
+                );
+            }
             log::warn!("auto_prompt: language model call failed: {err}");
             Err(err)
         }
     }
 }
 
+fn write_decision_log(
+    project_root: &PathBuf,
+    iteration: u32,
+    model: &str,
+    system_prompt: &str,
+    context_json: &str,
+    raw_response: &str,
+    parsed: &AutoPromptResponse,
+) {
+    let logs_dir = project_root.join(".logs");
+    if let Err(err) = std::fs::create_dir_all(&logs_dir) {
+        log::warn!("auto_prompt: failed to create .logs dir: {err}");
+        return;
+    }
+
+    let timestamp = chrono::Local::now().format("%Y-%m-%dT%H-%M-%S%.3f");
+    let filename = format!("{timestamp}_{iteration}.json");
+    let path = logs_dir.join(&filename);
+
+    let log_entry = serde_json::json!({
+        "timestamp": chrono::Local::now().to_rfc3339(),
+        "iteration": iteration,
+        "model": model,
+        "request": {
+            "system_prompt": system_prompt,
+            "context_json": context_json,
+        },
+        "raw_response": raw_response,
+        "parsed_response": {
+            "should_continue": parsed.should_continue,
+            "next_prompt": parsed.next_prompt,
+            "reason": parsed.reason,
+            "all_plan_done": parsed.all_plan_done,
+            "confidence": parsed.confidence,
+        },
+    });
+
+    match serde_json::to_string_pretty(&log_entry) {
+        Ok(json) => {
+            if let Err(err) = std::fs::write(&path, json) {
+                log::warn!("auto_prompt: failed to write log {}: {err}", path.display());
+            } else {
+                log::info!("auto_prompt: wrote decision log to {}", path.display());
+            }
+        }
+        Err(err) => {
+            log::warn!("auto_prompt: failed to serialize log entry: {err}");
+        }
+    }
+}
+
+fn write_error_log(project_root: &PathBuf, iteration: u32, model: &str, error: &anyhow::Error) {
+    let logs_dir = project_root.join(".logs");
+    if let Err(err) = std::fs::create_dir_all(&logs_dir) {
+        log::warn!("auto_prompt: failed to create .logs dir: {err}");
+        return;
+    }
+
+    let timestamp = chrono::Local::now().format("%Y-%m-%dT%H-%M-%S%.3f");
+    let filename = format!("{timestamp}_{iteration}_error.json");
+    let path = logs_dir.join(&filename);
+
+    let log_entry = serde_json::json!({
+        "timestamp": chrono::Local::now().to_rfc3339(),
+        "iteration": iteration,
+        "model": model,
+        "error": format!("{error:#}"),
+    });
+
+    match serde_json::to_string_pretty(&log_entry) {
+        Ok(json) => {
+            if let Err(err) = std::fs::write(&path, json) {
+                log::warn!(
+                    "auto_prompt: failed to write error log {}: {err}",
+                    path.display()
+                );
+            } else {
+                log::info!("auto_prompt: wrote error log to {}", path.display());
+            }
+        }
+        Err(err) => {
+            log::warn!("auto_prompt: failed to serialize error log entry: {err}");
+        }
+    }
+}
+
 fn default_system_prompt() -> String {
     indoc::indoc! {r#"
-        You are an orchestration assistant embedded in the Zed editor.
-        You receive the full context of a conversation that just finished \
-        and decide whether a follow-up action is needed.
+        You decide whether to continue working. You receive conversation context and plan files.
 
-        Respond ONLY with valid JSON in this exact format:
+        Respond ONLY with valid JSON:
         {"should_continue": bool, "next_prompt": string | null, "reason": string | null, "all_plan_done": bool, "confidence": float}
 
-        ## Cases to handle:
+        ## Rules (in order):
 
-        ### Case 1: Starting a new plan (CRITICAL - priority check)
-        If is_starting_new_plan is true in context:
+        1. If plan_files has unchecked `- [ ]` steps:
+           - should_continue=true
+           - next_prompt = continue the next unchecked step
+           - Use the actual file paths from plan_files (e.g. .plans/ or .plan/)
+           - Include "Mark completed steps as [x]" referencing actual plan file paths
+           - Process plan files in filename order (01 before 02)
+           - When one plan completes, transition to the next
 
-        **First, check plan_has_checkboxes in context**:
-        - If plan_has_checkboxes is false (narrative format):
-          - Generate a REFINE prompt first:
-            'Read .plan/{first_plan_filename} and add a task checklist at the top with checkboxes for all **Tasks** and **Deliverables**. Keep all existing content below. Format each item as "- [ ] Task description". Include git branch creation as the first task: "- [ ] Create feature branch feature/{plan_number}_description from develop".'
-          - Set should_continue to true
-          - DO NOT proceed to implementation yet
-        - If plan_has_checkboxes is true:
-          - Proceed directly to implementation starting with first [ ] task
+        2. If plan_has_checkboxes is false but plan_files exist:
+           - Use the actual path from plan_files[0].path, not a hardcoded directory
+           - next_prompt = "Read {actual_path} and add checkboxes (- [ ]) for all tasks at the top. Keep existing content below."
+           - should_continue=true
 
-        ### Case 2: Plan refinement just completed
-        If the last assistant message just finished refining a plan (added checkboxes):
-        - Extract the first task from the refined plan
-        - Set next_prompt to: 'Start implementing: "- [ ] Create feature branch feature/{plan_number}_description from develop"'
-        - Set should_continue to true
+        3. If the last message asks a question or lists options:
+           - should_continue=true
+           - Pick option 1 or what the AI recommends
+           - If unsure, search the codebase and pick the best default
+           - confidence >= 0.6
 
-        ### Case 3: Task completion detected
-        If the last assistant message indicates task completion (e.g. 'all done', 'task complete', 'completed', 'finished'):
-        - MANDATORY FIRST ACTION: Mark the just-completed step as [x] in the plan file. Every next_prompt below MUST begin with this checkbox update before any other instruction.
-        - Compare current_plan entries against plan_files (the original plan from .plan/ folder)
-        - Check the code changes against each plan item to verify completion
-        - If ALL items in the CURRENT plan are completed AND verified:
-          - Check ALL other plan files in plan_files for remaining [ ] items (multi-plan support)
-          - If another plan has unchecked [ ] items, transition to it:
-            Set next_prompt to: 'Read .plan/{next_plan_filename} and execute the plan starting from the first unchecked step.'
-            Set should_continue to true, keep all_plan_done as false
-          - If NO other plans have remaining [ ] items:
-            Set all_plan_done to true
-            Set next_prompt to: 'Rebase feature branch feature/{plan_number}_description onto develop, then merge to develop'
-        - If some items remain in the current plan:
-          - Set next_prompt to mark the completed step as [x] then proceed with the next pending [ ] task
-          - ALWAYS set should_continue to true to automatically proceed without asking
-        - You may include #ALL_PLAN_DONE in next_prompt ONLY when every plan file has all steps [x]
-        - NEVER ask the user for permission - automatic execution is required
+        4. If all plan steps are [x]:
+           - If diagnostics or test failures likely exist → next_prompt = "Fix all diagnostics and ensure test coverage. Production grade only — no mock, no TODO, no placeholder."
+           - Else if doc_files is empty → next_prompt = "Create .doc/{NN}_summary.md documenting what was implemented, key decisions, file changes, and how to test."
+           - Else if no git feature branch was created for this plan in the conversation → next_prompt = "Create a git feature branch feature/{plan_number}_{description} from develop. Commit all changes with conventional commit messages."
+           - Else → all_plan_done=true, should_continue=false
 
-        ### Case 4: Question detected
-        If the last assistant message asks a question (possibly with multiple options):
-        - Apply rules in order:
-          1. plan_files exist with unchecked [ ] → auto-continue with next step (confidence >= 0.7)
-          2. Permission/confirmation question → auto-answer yes (confidence >= 0.7)
-          3. Numbered/lettered options → pick option 1 (confidence >= 0.6)
-          4. No plan but work in progress → continue (confidence >= 0.5)
-          5. Requires external info (keys, credentials, unknown preferences) → stop (confidence < 0.5)
-        - NEVER stop just because plan_files is empty. ALWAYS pick a default and continue.
-        - The goal is to keep the chain moving unless the question is truly unanswerable.
+        5. If no plan exists but work seems incomplete → should_continue=true, next_prompt="continue"
 
-        ### Case 5: Normal continuation
-        If the conversation ended normally without completion or questions:
-        - Check if there are pending plan items in current_plan
-        - If yes, set next_prompt to proceed with the next pending [ ] task
-        - If no plan items remain, check if the overall goal seems achieved
-        - If achieved, set should_continue to false
+        6. confidence < 0.5 → should_continue=false
+        7. iteration_count > 15 → consider stopping
 
-        ## Multi-Plan Execution (MANDATORY):
-        - The .plan/ folder may contain MULTIPLE plan files (e.g., 01_core.md, 02_bugfix.md)
-        - Plans are executed IN ORDER by filename (01 before 02, etc.)
-        - When one plan completes (all [x]), immediately transition to the next plan with [ ] items
-        - all_plan_done must be true ONLY when every plan file in .plan/ has all checkboxes [x]
-        - The transition prompt must reference the next plan filename: 'Read .plan/{filename} and execute the plan starting from the first unchecked step.'
-        - Never stop the chain between plans — keep going until all plans are done
+        ## Quality (always enforce):
+        - Production grade: no mock, no TODO, no placeholder, no unwrap()
+        - Fix all compiler diagnostics and warnings before marking done
+        - Ensure test coverage for new code
 
-        ## Rules:
-        - MANDATORY: Every next_prompt MUST include 'Mark step N as [x] in .plan/{filename}' as the first instruction when a step completes. This is per-step — never defer checkbox updates to a later transition. The agent must update the plan file on disk immediately after each step.
-        - Keep next_prompt concise and actionable
-        - confidence ranges from 0.0 (not sure at all) to 1.0 (very confident)
-        - If confidence < 0.5, always set should_continue to false
-        - Permission/confirmation questions MUST be auto-answered yes when plan_files exists
-        - When working on plans with checkboxes, ALWAYS move to the next [ ] task without stopping
-        - Never repeat the same prompt that was just executed
-        - iteration_count tells you how many auto-prompt cycles have run; consider stopping if > 15
-
-        ## Git Flow Automation (always apply):
-        - When starting a new feature: Always instruct to create feature/{plan_number}_description branch from develop
-        - When starting a hotfix: Always instruct to create hotfix/{plan_number}_description branch from main
-        - When feature completes (all tasks [x]): Always instruct to rebase onto develop, then merge to develop
-        - When hotfix completes: Always instruct to merge to main AND develop
-        - After merging to develop: Generate documentation prompt (if doc_files is empty)
-        - Branch naming: Use plan_number from context as prefix
-        - Use git rebase: Always prefer rebase over merge for linear history
-        - Never force push: To shared branches (main, develop)
-
-        ## Conventional Commits (always apply):
-        - feat: for new features
-        - fix: for bug fixes
-        - refactor: for code restructuring
-        - test: for test additions/changes
-        - chore: for maintenance tasks
-        - docs: for documentation
-
-        ## Plan Status Tracking (MANDATORY - always apply):
-        - Plan files live in .plan/ folder (accessible via plan_files in context)
-        - There may be MULTIPLE plan files — process them in filename order
-        - Plans MUST have a status checklist at the top using checkboxes: [ ] pending, [x] done
-        - Check plan_has_checkboxes in context - if false, trigger Case 1 to refine it first
-        - NEVER assume the user will manually update checkboxes — the agent must do it
-        - Mark each step as [x] IMMEDIATELY when it completes — do not batch or defer checkbox updates. Every next_prompt after a completed step must include the [x] update for that step.
-        - When all steps in a plan are [x], check other plan files before setting all_plan_done
-        - all_plan_done is true ONLY when every plan file has all steps [x]
-        - When suggesting next_prompt for a new task, reference the next [ ] step by number
-
-        ## Documentation Generation (MANDATORY on completion of ALL plans):
-        - Documentation is generated ONLY AFTER every plan file in .plan/ is fully complete (all [x])
-        - MANDATORY: Before generating any documentation prompt, re-read ALL .plan/ files and verify each '- [ ]' step against the actual code changes. If a step was completed but not marked [x], update it FIRST. Only proceed with documentation when every step in every plan file is verified as [x].
-        - When all plans are done and no doc_files exist in context, generate a next_prompt that instructs the agent to create documentation
-        - Documentation goes in .doc/ folder in the project root
-        - Format: .doc/{NN}_{descriptive_name}.md (use sequential numbering like .plan/ files)
-        - Documentation should cover: what was implemented, key architectural decisions, file changes summary, how to test/use the feature
-        - When doc_files already exist and all plans are done, set all_plan_done to true
-        - The doc creation prompt is the FINAL step before all_plan_done — never skip it
+        ## Git flow (when applicable):
+        - Feature: feature/{plan_number}_description from develop
+        - Hotfix: hotfix/{plan_number}_description from main
+        - Complete: rebase onto develop, merge to develop
+        - Conventional commits: feat:, fix:, refactor:, test:, chore:, docs:
     "#}
     .to_string()
 }
@@ -680,18 +705,20 @@ fn read_plan_files(thread: &acp_thread::AcpThread) -> Vec<PlanFileContent> {
     let mut plan_files = Vec::new();
 
     for work_dir in &work_dirs {
-        let plan_dir = work_dir.join(".plan");
+        let plan_dir_candidates = [work_dir.join(".plan"), work_dir.join(".plans")];
+        let Some(plan_dir) = plan_dir_candidates.iter().find(|d| d.is_dir()) else {
+            log::info!(
+                "[auto_prompt::read_plan_files] Neither .plan/ nor .plans/ directory exists in {}",
+                work_dir.display()
+            );
+            continue;
+        };
         log::info!(
-            "[auto_prompt::read_plan_files] Checking for plan directory: {}",
+            "[auto_prompt::read_plan_files] Found plan directory: {}",
             plan_dir.display()
         );
-        if !plan_dir.is_dir() {
-            log::info!("[auto_prompt::read_plan_files] Plan directory does not exist");
-            continue;
-        }
-        log::info!("[auto_prompt::read_plan_files] Found plan directory");
 
-        let entries = match std::fs::read_dir(&plan_dir) {
+        let entries = match std::fs::read_dir(plan_dir) {
             Ok(entries) => entries,
             Err(err) => {
                 log::warn!(
@@ -755,12 +782,12 @@ fn read_doc_files(thread: &acp_thread::AcpThread) -> Vec<PlanFileContent> {
     let mut doc_files = Vec::new();
 
     for work_dir in &work_dirs {
-        let doc_dir = work_dir.join(".doc");
-        if !doc_dir.is_dir() {
+        let doc_dir_candidates = [work_dir.join(".doc"), work_dir.join(".docs")];
+        let Some(doc_dir) = doc_dir_candidates.iter().find(|d| d.is_dir()) else {
             continue;
-        }
+        };
 
-        let entries = match std::fs::read_dir(&doc_dir) {
+        let entries = match std::fs::read_dir(doc_dir) {
             Ok(entries) => entries,
             Err(_) => continue,
         };
@@ -807,7 +834,7 @@ async fn call_language_model(
     system_prompt: &str,
     context_json: &str,
     cx: &gpui::AsyncApp,
-) -> anyhow::Result<AutoPromptResponse> {
+) -> anyhow::Result<(String, AutoPromptResponse)> {
     let request = LanguageModelRequest {
         messages: vec![
             LanguageModelRequestMessage {
@@ -851,7 +878,9 @@ async fn call_language_model(
     pin_mut!(completion_future, timeout_future);
 
     match future::select(completion_future, timeout_future).await {
-        future::Either::Left((Ok(response_text), _)) => parse_response(&response_text),
+        future::Either::Left((Ok(response_text), _)) => {
+            parse_response(&response_text).map(|parsed| (response_text, parsed))
+        }
         future::Either::Left((Err(err), _)) => Err(err.context("auto_prompt: completion failed")),
         future::Either::Right(_) => {
             anyhow::bail!("auto_prompt: LLM call timed out after 60 seconds");
@@ -887,8 +916,17 @@ fn extract_json(text: &str) -> &str {
 }
 
 /// Checks if there are plan files with remaining unchecked `[ ]` items.
+/// First checks the context JSON, then falls back to scanning disk directories.
 /// Returns a prompt to start the next plan if found, or None if all plans are complete.
-fn find_next_plan_prompt(context_json: &str) -> Option<String> {
+fn find_next_plan_prompt(context_json: &str, work_dirs: Option<&[PathBuf]>) -> Option<String> {
+    if let Some(prompt) = find_remaining_in_context(context_json) {
+        return Some(prompt);
+    }
+
+    find_remaining_on_disk(work_dirs)
+}
+
+fn find_remaining_in_context(context_json: &str) -> Option<String> {
     #[derive(serde::Deserialize)]
     struct ContextPlanFiles {
         plan_files: Vec<context::PlanFileContent>,
@@ -896,33 +934,94 @@ fn find_next_plan_prompt(context_json: &str) -> Option<String> {
 
     let ctx: ContextPlanFiles = serde_json::from_str(context_json)
         .inspect_err(|e| {
-            log::warn!("[auto_prompt::find_next_plan_prompt] Failed to parse context JSON: {e}");
+            log::warn!(
+                "[auto_prompt::find_remaining_in_context] Failed to parse context JSON: {e}"
+            );
         })
         .ok()?;
 
     for file in &ctx.plan_files {
-        let mut in_code_block = false;
-        for line in file.content.lines() {
-            let trimmed = line.trim_start();
-            if trimmed.starts_with("```") {
-                in_code_block = !in_code_block;
+        if has_unchecked_items(&file.content) {
+            let filename = file.path.rsplit('/').next().unwrap_or(&file.path);
+            let plan_dir = file.path.rsplit('/').nth(1).unwrap_or(".plans");
+            log::info!(
+                "[auto_prompt::find_remaining_in_context] Found remaining plan: {plan_dir}/{filename}"
+            );
+            return Some(make_plan_read_prompt(plan_dir, filename));
+        }
+    }
+
+    None
+}
+
+fn find_remaining_on_disk(work_dirs: Option<&[PathBuf]>) -> Option<String> {
+    let dirs = work_dirs?;
+
+    for work_dir in dirs {
+        let plan_dir_candidates = [work_dir.join(".plan"), work_dir.join(".plans")];
+        let Some(plan_dir) = plan_dir_candidates.iter().find(|d| d.is_dir()) else {
+            continue;
+        };
+
+        let Ok(entries) = std::fs::read_dir(&plan_dir) else {
+            continue;
+        };
+
+        let mut md_files: Vec<_> = entries
+            .flatten()
+            .filter(|e| e.path().is_file() && e.path().extension().is_some_and(|ext| ext == "md"))
+            .collect();
+        md_files.sort_by_key(|e| e.file_name());
+
+        for entry in md_files {
+            let path = entry.path();
+            let Ok(metadata) = std::fs::metadata(&path) else {
+                continue;
+            };
+            if metadata.len() > 100_000 {
                 continue;
             }
-            if in_code_block {
+            let Ok(content) = std::fs::read_to_string(&path) else {
                 continue;
-            }
-            if trimmed.contains("- [ ] ") {
-                let filename = file.path.rsplit('/').next().unwrap_or(&file.path);
-                log::info!("[auto_prompt::find_next_plan_prompt] Found remaining plan: {filename}");
-                return Some(format!(
-                    "Read .plan/{filename} and execute the plan starting from the first unchecked step."
-                ));
+            };
+
+            if has_unchecked_items(&content) {
+                let filename = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown");
+                let plan_dir_str = path.parent().and_then(|p| p.to_str()).unwrap_or(".plans");
+                log::info!(
+                    "[auto_prompt::find_remaining_on_disk] Found remaining plan on disk: {plan_dir_str}/{filename}"
+                );
+                return Some(make_plan_read_prompt(plan_dir_str, filename));
             }
         }
     }
 
-    log::info!("[auto_prompt::find_next_plan_prompt] No remaining plans found");
+    log::info!("[auto_prompt::find_remaining_on_disk] No remaining plans found on disk");
     None
+}
+
+fn has_unchecked_items(content: &str) -> bool {
+    let mut in_code_block = false;
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            in_code_block = !in_code_block;
+            continue;
+        }
+        if !in_code_block && trimmed.contains("- [ ] ") {
+            return true;
+        }
+    }
+    false
+}
+
+fn make_plan_read_prompt(plan_dir: &str, filename: &str) -> String {
+    format!(
+        "Read {plan_dir}/{filename} and execute the plan starting from the first unchecked step."
+    )
 }
 
 fn is_doc_creation_prompt(prompt: &str) -> bool {
@@ -957,18 +1056,19 @@ fn build_checkbox_verification_prompt(context_json: &str) -> Option<String> {
             }
             if trimmed.contains("- [ ] ") {
                 let filename = file.path.rsplit('/').next().unwrap_or(&file.path);
+                let plan_dir = file.path.rsplit('/').nth(1).unwrap_or(".plans");
                 log::info!(
-                    "[auto_prompt::build_checkbox_verification_prompt] Found unchecked items in {filename}"
+                    "[auto_prompt::build_checkbox_verification_prompt] Found unchecked items in {plan_dir}/{filename}"
                 );
                 return Some(format!(
                     "MANDATORY CHECKPOINT: Verify plan checkboxes before documentation.\n\n\
-                     Re-read all .plan/ files and verify every '- [ ]' step against the actual code changes:\n\
-                     1. Read each plan file in .plan/\n\
+                     Re-read all {plan_dir}/ files and verify every '- [ ]' step against the actual code changes:\n\
+                     1. Read each plan file in {plan_dir}/\n\
                      2. For each '- [ ]' item, check if the code already implements it\n\
                      3. Mark completed items as '- [x]' — do NOT re-execute completed work\n\
                      4. If any item is truly incomplete, continue working on it\n\
                      5. Only after ALL items in ALL plan files are '- [x]', create documentation at .doc/\n\n\
-                     Unchecked items found in: {filename}"
+                     Unchecked items found in: {plan_dir}/{filename}"
                 ));
             }
         }

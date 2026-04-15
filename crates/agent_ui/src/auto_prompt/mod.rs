@@ -1,5 +1,6 @@
 use agent_client_protocol as acp;
 use gpui::Window;
+use std::path::PathBuf;
 
 /// Toggle auto-prompt on/off from the agent panel toolbar.
 #[derive(Clone, Debug, Default, PartialEq, serde::Deserialize, serde::Serialize, gpui::Action)]
@@ -39,6 +40,8 @@ pub struct AutoPromptNewThread {
     pub from_title: Option<String>,
     /// The follow-up prompt text from the external LLM.
     pub next_prompt: String,
+    /// Work directories to propagate to the new thread.
+    pub work_dirs: Option<Vec<PathBuf>>,
 }
 
 fn dispatch_action(
@@ -51,6 +54,7 @@ fn dispatch_action(
             from_session_id: action.from_session_id,
             from_title: action.from_title,
             next_prompt: action.next_prompt,
+            work_dirs: action.work_dirs,
         }),
         cx,
     );

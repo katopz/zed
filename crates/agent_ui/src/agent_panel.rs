@@ -1539,10 +1539,12 @@ impl AgentPanel {
             agent_client_protocol::TextContent::new(full_prompt),
         )];
 
+        let work_dirs = action.work_dirs.as_ref().map(|dirs| PathList::new(dirs));
+
         self.external_thread(
             Some(Agent::NativeAgent),
             None,
-            None,
+            work_dirs,
             None,
             Some(AgentInitialContent::ContentBlock {
                 blocks,
