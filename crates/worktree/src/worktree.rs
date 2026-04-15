@@ -5313,10 +5313,22 @@ impl BackgroundScanner {
                         // pointing to a directory outside the worktree root.
                         // Skip it — the repository was already registered
                         // during the initial scan via `discover_git_paths`.
+                        let is_gitfile = self.fs.is_file(&dot_git_dir).await;
+                        let is_bare_repo = !is_gitfile
+                            && self
+                                .fs
+                                .metadata(&dot_git_dir.join("HEAD"))
+                                .await
+                                .is_ok_and(|m| m.is_some())
+                            && self
+                                .fs
+                                .metadata(&dot_git_dir.join("config"))
+                                .await
+                                .is_ok_and(|m| m.is_some());
                         debug_assert!(
-                            self.fs.is_file(&dot_git_dir).await,
+                            is_gitfile || is_bare_repo,
                             "update_git_repositories: .git path outside worktree root \
-                             is not a gitfile: {dot_git_dir:?}",
+                             is neither a gitfile nor a bare repository: {dot_git_dir:?}",
                         );
                         continue;
                     };
