@@ -21,61 +21,57 @@ AcpThreadEvent::Stopped(stop_reason)
   │   └─ Otherwise → NeedsLlmCall(data)
   │
   └─ decide_with_llm() — async LLM call
-      ├─ Sends context JSON to orchestration LLM
+      ├─ Sends context JSON to orchestration LLM with simple rules
       ├─ Parses JSON response (should_continue, next_prompt, confidence)
       ├─ #ALL_PLAN_DONE or confidence < 0.5 → stop chain
+      ├─ Writes decision log to `.logs/` in project root
       └─ Returns AutoPromptAction with next prompt
 ```
 
-### Plan refinement
+### Debug logs
 
-Auto-prompt now supports both checkbox-based and narrative-style plans.
-
-**Narrative plans** (e.g., with `**Tasks**:` sections):
-- When starting a new plan, auto-prompt detects if checkboxes are missing
-- If missing, generates a prompt to add a checkbox checklist at the top
-- Agent adds checkboxes for all `**Tasks**:` and `**Deliverables**:` items
-- Plan becomes executable with checkbox-based tracking
-- Original narrative content is preserved below the checklist
-
-**Checkbox plans** (existing behavior):
-- Plans with `- [ ]` / `- [x]` format work directly
-- No refinement needed
-
-**Flow for narrative plans**:
-```
-User: "impl as a plan 082"
-  ↓
-Auto-prompt detects no checkboxes
-  ↓
-Generates: "Read .plan/082_*.md and add checkboxes..."
-  ↓
-Agent adds checkbox checklist
-  ↓
-Auto-prompt: "Start implementing: Create feature branch..."
-  ↓
-Normal checkbox-based flow
-```
-
-### Completion flow
+Every LLM decision is logged to `.logs/` in the project root as JSON files:
 
 ```
-Plan step completes → Agent marks [x] in .plan/ (mandatory in every next_prompt)
-        ↓
-All steps [x]? → Check .doc/ folder
-        ├─ No docs → Generate next_prompt: "Create .doc/NN_name.md summarizing implementation"
-        │              ↓
-        │              Agent creates doc → Thread stops → auto_prompt fires again
-        │              ↓
-        │              LLM sees doc_files exists → all_plan_done: true → chain stops
-        │
-        └─ Docs exist → all_plan_done: true → chain stops
+.logs/
+├── 2025-01-15T14-30-22.123_1.json       # iteration 1 decision
+├── 2025-01-15T14-31-05.456_2.json       # iteration 2 decision
+└── 2025-01-15T14-31-10.789_2_error.json # iteration 2 error
 ```
 
-**Git flow automation**:
-- When starting a new plan: Auto-prompt includes feature branch creation (`feature/NN_description from develop`)
-- When plan completes: Auto-prompt includes rebase and merge instructions to develop
-- Documentation generation follows successful merge
+Each log file contains:
+
+| Field | Description |
+|-------|-------------|
+| `timestamp` | ISO 8601 timestamp |
+| `iteration` | Auto-prompt cycle number |
+| `model` | LLM model identifier |
+| `request.system_prompt` | The system prompt sent to the LLM |
+| `request.context_json` | The full context JSON (messages, plan files, doc files) |
+| `raw_response` | Raw text returned by the LLM |
+| `parsed_response` | Parsed `should_continue`, `next_prompt`, `reason`, `all_plan_done`, `confidence` |
+| `error` | Error message (error logs only) |
+
+Add `.logs/` to `.gitignore` — these are for local debugging only.
+
+### Core loop
+
+The orchestration LLM follows a simple priority order:
+
+1. **Plan steps remain** → continue next unchecked `[ ]` step
+2. **New plan without checkboxes** → refine plan to add checkboxes
+3. **AI asked a question** → auto-answer (pick option 1 or AI recommendation)
+4. **All steps `[x]`** → fix diagnostics/tests, then create docs, then done
+5. **No plan but work incomplete** → "continue"
+6. **Confidence < 0.5** → stop
+
+### Quality gates
+
+Before marking `all_plan_done=true`, the system enforces:
+
+- Production grade: no mock, no TODO, no placeholder, no `unwrap()`
+- Fix all compiler diagnostics and warnings
+- Ensure test coverage for new code
 
 ### Key types
 
@@ -96,6 +92,7 @@ All steps [x]? → Check .doc/ folder
 ### Bridge in agent_ui
 
 `crates/agent_ui/src/auto_prompt/mod.rs` — thin bridge that:
+
 - Defines `ToggleAutoPrompt` GPUI action (toolbar sparkle button)
 - Defines `AutoPromptNewThread` GPUI action (creates follow-up thread)
 - `on_thread_stopped()` delegates to `auto_prompt::decide()`, handles async LLM path
@@ -170,16 +167,3 @@ Runs 12 checks: branches, tags, tests, conventional commits, version bumps, plan
 script/test-auto-prompt-e2e status /tmp/hw-test      # show git state
 script/test-auto-prompt-e2e inject-bug /tmp/hw-test   # inject bug for Step 7
 script/test-auto-prompt-e2e teardown /tmp/hw-test     # cleanup
-```
-
-## Conventions
-
-The built-in system prompt enforces:
-
-- **Plan Refinement**: Plans without checkboxes are automatically refined to include a checkbox checklist. Narrative-style plans (with `**Tasks**:` and `**Deliverables**:` sections) are converted to executable checkbox format.
-- **Git Flow**: `main`, `develop`, `feature/NN_description`, `hotfix/NN_description`, `release/vX.Y.Z`
-  - Feature branches are created automatically when starting a new plan
-  - Feature branches are rebased and merged to develop upon completion
-- **Conventional Commits**: `feat:`, `fix:`, `chore:`, `refactor:`, `test:`, `docs:`
-- **Plan Status Tracking** (mandatory): `[ ]` / `[x]` checkboxes in `.plan/` folder files — every `next_prompt` must include instructions to mark completed steps as `[x]`; never assumes manual updates
-- **Documentation Generation** (mandatory on completion): when all plan steps are `[x]` and no `.doc/` folder exists, the orchestration LLM generates a final prompt instructing the agent to create `.doc/{NN}_{descriptive_name}.md` covering what was implemented, key decisions, file changes, and how to test. The chain only stops after documentation exists.

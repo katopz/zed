@@ -1,6 +1,4 @@
-use auto_prompt::context::{
-    AutoPromptContext, ContextMessage, ContextMessageRole, PlanFileContent,
-};
+use auto_prompt::context::{AutoPromptContext, PlanFileContent};
 
 // ===== Helper Functions =====
 
@@ -24,7 +22,6 @@ fn default_context() -> AutoPromptContext {
         plan_has_checkboxes: false,
         first_plan_filename: String::new(),
         plan_number: String::new(),
-        is_starting_new_plan: false,
     }
 }
 
@@ -342,130 +339,6 @@ fn test_plan_number_with_mixed_prefix() {
 
     // "feature" doesn't start with digits, so returns default
     assert_eq!(context.compute_plan_number(), "00");
-}
-
-// ===== New Plan Detection Tests =====
-
-#[test]
-fn test_is_starting_new_plan_with_impl_keyword() {
-    let plan_file = PlanFileContent {
-        path: ".plan/082_test.md".to_string(),
-        content: String::new(),
-    };
-
-    let messages = vec![ContextMessage {
-        role: ContextMessageRole::User,
-        content: "Please impl as a plan 082".to_string(),
-    }];
-
-    let context = AutoPromptContext {
-        plan_files: vec![plan_file],
-        messages,
-        entry_count: 2,
-        ..default_context()
-    };
-
-    assert!(context.compute_is_starting_new_plan());
-}
-
-#[test]
-fn test_is_starting_new_plan_with_implement_keyword() {
-    let plan_file = PlanFileContent {
-        path: ".plan/082_test.md".to_string(),
-        content: String::new(),
-    };
-
-    let messages = vec![ContextMessage {
-        role: ContextMessageRole::User,
-        content: "Implement the plan 082".to_string(),
-    }];
-
-    let context = AutoPromptContext {
-        plan_files: vec![plan_file],
-        messages,
-        entry_count: 2,
-        ..default_context()
-    };
-
-    assert!(context.compute_is_starting_new_plan());
-}
-
-#[test]
-fn test_is_starting_new_plan_high_entry_count_returns_false() {
-    let plan_file = PlanFileContent {
-        path: ".plan/082_test.md".to_string(),
-        content: String::new(),
-    };
-
-    let messages = vec![ContextMessage {
-        role: ContextMessageRole::User,
-        content: "impl as a plan 082".to_string(),
-    }];
-
-    let context = AutoPromptContext {
-        plan_files: vec![plan_file],
-        messages,
-        entry_count: 10, // Too many entries - mid-conversation
-        ..default_context()
-    };
-
-    assert!(!context.compute_is_starting_new_plan());
-}
-
-#[test]
-fn test_is_starting_new_plan_no_plan_files_returns_false() {
-    let messages = vec![ContextMessage {
-        role: ContextMessageRole::User,
-        content: "impl as a plan 082".to_string(),
-    }];
-
-    let context = AutoPromptContext {
-        plan_files: vec![],
-        messages,
-        entry_count: 2,
-        ..default_context()
-    };
-
-    assert!(!context.compute_is_starting_new_plan());
-}
-
-#[test]
-fn test_is_starting_new_plan_no_user_messages_returns_false() {
-    let plan_file = PlanFileContent {
-        path: ".plan/082_test.md".to_string(),
-        content: String::new(),
-    };
-
-    let context = AutoPromptContext {
-        plan_files: vec![plan_file],
-        messages: vec![],
-        entry_count: 2,
-        ..default_context()
-    };
-
-    assert!(!context.compute_is_starting_new_plan());
-}
-
-#[test]
-fn test_is_starting_new_plan_without_plan_keyword_returns_false() {
-    let plan_file = PlanFileContent {
-        path: ".plan/082_test.md".to_string(),
-        content: String::new(),
-    };
-
-    let messages = vec![ContextMessage {
-        role: ContextMessageRole::User,
-        content: "Write some code for this feature".to_string(),
-    }];
-
-    let context = AutoPromptContext {
-        plan_files: vec![plan_file],
-        messages,
-        entry_count: 2,
-        ..default_context()
-    };
-
-    assert!(!context.compute_is_starting_new_plan());
 }
 
 // ===== Remaining Plan Files Tests =====

@@ -42,8 +42,6 @@ pub struct AutoPromptContext {
     pub first_plan_filename: String,
     /// The plan number (e.g., "082") from the first plan filename, or "00" if not found.
     pub plan_number: String,
-    /// Whether we're starting a new plan implementation.
-    pub is_starting_new_plan: bool,
 }
 
 /// A plan entry with its status.
@@ -201,7 +199,6 @@ impl AutoPromptContext {
             plan_has_checkboxes: false,
             first_plan_filename: String::new(),
             plan_number: String::new(),
-            is_starting_new_plan: false,
         };
 
         context.approximate_token_count = context.estimate_token_count();
@@ -210,7 +207,6 @@ impl AutoPromptContext {
         context.plan_has_checkboxes = context.compute_plan_has_checkboxes();
         context.first_plan_filename = context.compute_first_plan_filename();
         context.plan_number = context.compute_plan_number();
-        context.is_starting_new_plan = context.compute_is_starting_new_plan();
 
         context
     }
@@ -241,57 +237,6 @@ impl AutoPromptContext {
             .rev()
             .find(|m| matches!(m.role, ContextMessageRole::Assistant))
             .map(|m| m.content.as_str())
-    }
-
-    /// Returns true if the last assistant message looks like a question.
-    pub fn last_message_is_question(&self) -> bool {
-        if let Some(last) = self.last_assistant_message() {
-            let trimmed = last.trim();
-            let ends_with_question = trimmed.ends_with('?');
-            let has_question_words = trimmed
-                .split('.')
-                .next_back()
-                .map(|s| {
-                    let s = s.to_lowercase();
-                    s.contains("should i")
-                        || s.contains("do you")
-                        || s.contains("what would")
-                        || s.contains("how should")
-                        || s.contains("which ")
-                        || s.contains("would you like")
-                })
-                .unwrap_or(false);
-            ends_with_question || has_question_words
-        } else {
-            false
-        }
-    }
-
-    /// Returns true if the last assistant message indicates task completion.
-    pub fn last_message_indicates_completion(&self) -> bool {
-        if let Some(last) = self.last_assistant_message() {
-            let lower = last.to_lowercase();
-            let completion_markers = [
-                "all done",
-                "task complete",
-                "everything is done",
-                "finished all",
-                "nothing more to do",
-                "all tasks completed",
-                "all plan items are done",
-                "all_plan_done",
-                "implementation is complete",
-                "all changes have been made",
-                "no further action",
-                "nothing left to do",
-                "mission accomplished",
-            ];
-            completion_markers
-                .iter()
-                .any(|marker| lower.contains(marker))
-        } else {
-            false
-        }
     }
 
     /// Returns the count of plan items by status.
@@ -387,44 +332,6 @@ impl AutoPromptContext {
         }
 
         false
-    }
-
-    pub fn compute_is_starting_new_plan(&self) -> bool {
-        if self.plan_files.is_empty() {
-            return false;
-        }
-
-        // Check if entry count is low (user message + maybe one assistant response)
-        if self.entry_count > 4 {
-            return false;
-        }
-
-        // Check if user message contains plan implementation keywords
-        let user_messages: Vec<_> = self
-            .messages
-            .iter()
-            .filter(|m| matches!(m.role, ContextMessageRole::User))
-            .collect();
-
-        if user_messages.is_empty() {
-            return false;
-        }
-
-        let last_user_msg = user_messages.last().unwrap();
-        let lower_msg = last_user_msg.content.to_lowercase();
-
-        let plan_keywords = [
-            "impl as a plan",
-            "implement the plan",
-            "execute the plan",
-            "start the plan",
-            "work on plan",
-            "follow the plan",
-        ];
-
-        plan_keywords
-            .iter()
-            .any(|keyword| lower_msg.contains(keyword))
     }
 
     pub fn compute_first_plan_filename(&self) -> String {
