@@ -421,28 +421,34 @@ pub async fn decide_with_llm(
                     .is_some_and(|p| p.contains("#ALL_PLAN_DONE"));
 
             if all_done {
-                if let Some(next_plan_prompt) =
-                    find_next_plan_prompt(&data.context_json, data.work_dirs.as_deref())
-                {
-                    log::info!(
-                        "[auto_prompt::decide_with_llm] Current plan done, transitioning to next plan"
-                    );
-                    let next_prompt = format!(
-                        "Create a git feature branch for the completed plan from develop and commit all changes with conventional commit messages. Then {next_plan_prompt}"
-                    );
-                    return Ok(Some(AutoPromptAction {
-                        from_session_id: data.session_id,
-                        from_title: data.title,
-                        next_prompt,
-                        work_dirs: data.work_dirs,
-                    }));
+                match find_next_plan_prompt(&data.context_json, data.work_dirs.as_deref()) {
+                    Some(next_plan_prompt) => {
+                        log::info!(
+                            "[auto_prompt::decide_with_llm] Current plan done, transitioning to next plan"
+                        );
+                        let next_prompt = format!(
+                            "Create a git feature branch for the completed plan from develop and commit all changes with conventional commit messages. Then {next_plan_prompt}"
+                        );
+                        return Ok(Some(AutoPromptAction {
+                            from_session_id: data.session_id,
+                            from_title: data.title,
+                            next_prompt,
+                            work_dirs: data.work_dirs,
+                        }));
+                    }
+                    None => {
+                        log::info!(
+                            "[auto_prompt::decide_with_llm] #ALL_PLAN_DONE detected, no remaining plans, dispatching final gitflow commit"
+                        );
+                        let gitflow_prompt = "All plans are complete. Create or reuse a git feature branch from develop and commit all changes with conventional commit messages (feat/fix/refactor) if not committed yet. Do not merge — leave the branch for review.".to_string();
+                        return Ok(Some(AutoPromptAction {
+                            from_session_id: data.session_id,
+                            from_title: data.title,
+                            next_prompt: gitflow_prompt,
+                            work_dirs: data.work_dirs,
+                        }));
+                    }
                 }
-
-                log::info!(
-                    "[auto_prompt::decide_with_llm] #ALL_PLAN_DONE detected, all plans complete, stopping chain"
-                );
-                reset_iteration();
-                return Ok(None);
             }
 
             if response.confidence.is_some_and(|c| c < 0.5) {
@@ -657,7 +663,7 @@ fn default_system_prompt() -> String {
     .to_string()
 }
 
-fn reset_iteration() {
+pub fn reset_iteration() {
     AUTO_PROMPT_ITERATION.store(0, Ordering::Relaxed);
 }
 
@@ -782,7 +788,7 @@ fn read_doc_files(thread: &acp_thread::AcpThread) -> Vec<PlanFileContent> {
     let mut doc_files = Vec::new();
 
     for work_dir in &work_dirs {
-        let doc_dir_candidates = [work_dir.join(".doc"), work_dir.join(".docs")];
+        let doc_dir_candidates = [work_dir.join(".docs")];
         let Some(doc_dir) = doc_dir_candidates.iter().find(|d| d.is_dir()) else {
             continue;
         };

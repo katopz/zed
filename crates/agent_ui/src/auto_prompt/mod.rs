@@ -60,25 +60,39 @@ fn dispatch_action(
     );
 }
 
+fn is_cancelled(
+    thread_view: &gpui::WeakEntity<crate::conversation_view::ThreadView>,
+    cx: &gpui::AsyncWindowContext,
+) -> bool {
+    thread_view
+        .read_with(cx, |tv, _| {
+            !matches!(tv.auto_prompt_state, AutoPromptState::Processing)
+        })
+        .unwrap_or(true)
+}
+
 /// Entry point — called from `ConversationView::handle_thread_event`
 /// when `AcpThreadEvent::Stopped` fires.
 ///
 /// Delegates decision logic to the `auto_prompt` crate and handles
 /// GPUI action dispatch for the results.
+///
+/// Returns the spawned `Task` for `DispatchAfterDelay` and `NeedsLlmCall`
+/// variants so the caller can store it in `ThreadView._auto_prompt_task`
+/// for cancellation support.
 pub fn on_thread_stopped(
     thread: &gpui::Entity<acp_thread::AcpThread>,
     used_tools: bool,
     stop_reason: &acp::StopReason,
     window: &mut Window,
     cx: &mut gpui::Context<crate::ConversationView>,
-) {
+) -> Option<gpui::Task<()>> {
     log::warn!(
         "[auto_prompt] *** ENTRY POINT *** on_thread_stopped called: used_tools={}, stop_reason={:?}",
         used_tools,
         stop_reason
     );
 
-    // Log error state explicitly for rate limits and other errors
     if matches!(stop_reason, acp::StopReason::MaxTokens) {
         log::warn!(
             "[auto_prompt] Error/Rate Limit detected - stop_reason={:?}, will apply backoff retry",
@@ -91,6 +105,7 @@ pub fn on_thread_stopped(
     match decision {
         auto_prompt::AutoPromptDecision::NoAction => {
             log::info!("[auto_prompt] NoAction - taking no action");
+            None
         }
 
         auto_prompt::AutoPromptDecision::DispatchNow(action) => {
@@ -99,6 +114,7 @@ pub fn on_thread_stopped(
                 action.next_prompt
             );
             dispatch_action(action, window, cx);
+            None
         }
 
         auto_prompt::AutoPromptDecision::DispatchAfterDelay { action, delay_ms } => {
@@ -108,7 +124,7 @@ pub fn on_thread_stopped(
                 action.next_prompt
             );
 
-            cx.spawn_in(window, async move |_view, cx| {
+            let task = cx.spawn_in(window, async move |_view, cx| {
                 let thread_weak = _view
                     .update_in(cx, |cv, _window, cx| {
                         cv.active_thread().map(|tv| {
@@ -126,7 +142,14 @@ pub fn on_thread_stopped(
                     .timer(std::time::Duration::from_millis(delay_ms))
                     .await;
 
-                if let Some(tv) = thread_weak.as_ref() {
+                if let Some(ref tv) = thread_weak {
+                    if is_cancelled(tv, cx) {
+                        log::info!("[auto_prompt] Cancelled during delay, aborting dispatch");
+                        return;
+                    }
+                }
+
+                if let Some(ref tv) = thread_weak {
                     let _ = tv.update(cx, |tv, cx| {
                         tv.auto_prompt_state = AutoPromptState::Idle;
                         cx.notify();
@@ -138,8 +161,9 @@ pub fn on_thread_stopped(
                         dispatch_action(action, window, cx);
                     })
                     .ok();
-            })
-            .detach();
+            });
+
+            Some(task)
         }
 
         auto_prompt::AutoPromptDecision::NeedsLlmCall(data) => {
@@ -148,7 +172,7 @@ pub fn on_thread_stopped(
                 data.model.id()
             );
 
-            cx.spawn_in(window, async move |_view, cx| {
+            let task = cx.spawn_in(window, async move |_view, cx| {
                 log::info!("[auto_prompt] ASYNC TASK: starting LLM call");
 
                 let thread_weak = _view
@@ -165,6 +189,13 @@ pub fn on_thread_stopped(
                     .flatten();
 
                 let result = auto_prompt::decide_with_llm(data, cx).await;
+
+                if let Some(ref tv) = thread_weak {
+                    if is_cancelled(tv, cx) {
+                        log::info!("[auto_prompt] Cancelled during LLM call, discarding result");
+                        return;
+                    }
+                }
 
                 log::info!("[auto_prompt] ASYNC TASK: LLM call completed");
 
@@ -206,8 +237,9 @@ pub fn on_thread_stopped(
                         log::warn!("[auto_prompt] LLM call failed: {err}");
                     }
                 }
-            })
-            .detach();
+            });
+
+            Some(task)
         }
     }
 }
