@@ -9,7 +9,7 @@ mod config;
 pub mod context;
 
 pub use config::AutoPromptConfig;
-pub use context::{AutoPromptContext, AutoPromptResponse, PlanFileContent};
+pub use context::{AutoPromptContext, AutoPromptResponse, PlanFileContent, StopPhase};
 
 use agent_client_protocol as acp;
 use anyhow::Context as _;
@@ -32,6 +32,9 @@ static AUTO_PROMPT_ITERATION: AtomicU32 = AtomicU32::new(0);
 
 /// UNIX timestamp of the last auto-prompt iteration.
 static LAST_ITERATION_SECS: AtomicU64 = AtomicU64::new(0);
+
+/// Pre-stop verification attempt counter for the current chain.
+static VERIFICATION_COUNT: AtomicU32 = AtomicU32::new(0);
 
 use std::sync::RwLock;
 use std::time::SystemTime;
@@ -100,6 +103,15 @@ pub struct AutoPromptAction {
     pub work_dirs: Option<Vec<std::path::PathBuf>>,
 }
 
+fn with_first_prompt_context(next_prompt: String, summary: Option<&str>) -> String {
+    match summary {
+        Some(summary) if !summary.trim().is_empty() => {
+            format!("refer to first prompt \"{summary}\"\n---\n{next_prompt}")
+        }
+        _ => next_prompt,
+    }
+}
+
 /// Result of the auto-prompt decision logic.
 #[derive(Debug)]
 pub enum AutoPromptDecision {
@@ -125,7 +137,9 @@ pub struct LlmCallData {
     pub session_id: acp::SessionId,
     pub title: Option<String>,
     pub iteration_count: u32,
+    pub max_verification_attempts: u32,
     pub work_dirs: Option<Vec<PathBuf>>,
+    pub first_user_message: Option<String>,
 }
 
 impl std::fmt::Debug for LlmCallData {
@@ -141,6 +155,7 @@ impl std::fmt::Debug for LlmCallData {
             .field("session_id", &self.session_id)
             .field("title", &self.title)
             .field("iteration_count", &self.iteration_count)
+            .field("max_verification_attempts", &self.max_verification_attempts)
             .field("work_dirs", &self.work_dirs)
             .finish()
     }
@@ -219,12 +234,19 @@ pub fn decide(
     let model = configured_model.model;
     log::info!("[auto_prompt::decide] Using model: {:?}", model.id());
 
+    let verification_count = VERIFICATION_COUNT.load(Ordering::Relaxed);
+    let stop_phase = if verification_count == 0 {
+        StopPhase::Working
+    } else {
+        StopPhase::PreStop
+    };
+
     let (auto_prompt_ctx, session_id, thread_title, work_dirs) = {
         let thread_ref = thread.read(cx);
         let stop_reason_str = format!("{stop_reason:?}").to_lowercase();
         let plan_files = read_plan_files(thread_ref);
         let doc_files = read_doc_files(thread_ref);
-        let ctx = AutoPromptContext::collect(
+        let mut ctx = AutoPromptContext::collect(
             thread_ref,
             cx,
             stop_reason_str,
@@ -232,17 +254,30 @@ pub fn decide(
             doc_files,
             iteration_count,
         );
+        ctx.stop_phase = stop_phase;
+        ctx.verification_count = verification_count;
         let sid = thread_ref.session_id().clone();
         let title = thread_ref.title().map(|t| t.to_string());
         let dirs = thread_ref.work_dirs().map(|pl| pl.paths().to_vec());
         (ctx, sid, title, dirs)
     };
 
-    let make_action = |prompt: String| AutoPromptAction {
-        from_session_id: session_id.clone(),
-        from_title: thread_title.clone(),
-        next_prompt: prompt,
-        work_dirs: work_dirs.clone(),
+    let make_action = |prompt: String| {
+        let fallback_summary = auto_prompt_ctx
+            .first_user_message
+            .as_deref()
+            .and_then(|raw| raw.lines().next())
+            .map(|line| {
+                let trimmed = line.trim();
+                trimmed.chars().take(120).collect::<String>()
+            });
+        let next_prompt = with_first_prompt_context(prompt, fallback_summary.as_deref());
+        AutoPromptAction {
+            from_session_id: session_id.clone(),
+            from_title: thread_title.clone(),
+            next_prompt,
+            work_dirs: work_dirs.clone(),
+        }
     };
 
     let make_continue_prompt = || {
@@ -347,7 +382,9 @@ pub fn decide(
         session_id,
         title: thread_title,
         iteration_count,
+        max_verification_attempts: config.max_verification_attempts,
         work_dirs,
+        first_user_message: auto_prompt_ctx.first_user_message,
     })
 }
 
@@ -414,6 +451,18 @@ pub async fn decide_with_llm(
                 log::info!("[auto_prompt::decide_with_llm] Next prompt: {}", prompt);
             }
 
+            let prompt_summary = response
+                .first_prompt_summary
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    data.first_user_message
+                        .as_deref()
+                        .and_then(|raw| raw.lines().next())
+                        .map(|line| line.trim().chars().take(120).collect::<String>())
+                });
+
             let all_done = response.all_plan_done
                 || response
                     .next_prompt
@@ -429,6 +478,8 @@ pub async fn decide_with_llm(
                         let next_prompt = format!(
                             "Create a git feature branch for the completed plan from develop and commit all changes with conventional commit messages. Then {next_plan_prompt}"
                         );
+                        let next_prompt =
+                            with_first_prompt_context(next_prompt, prompt_summary.as_deref());
                         return Ok(Some(AutoPromptAction {
                             from_session_id: data.session_id,
                             from_title: data.title,
@@ -441,10 +492,12 @@ pub async fn decide_with_llm(
                             "[auto_prompt::decide_with_llm] #ALL_PLAN_DONE detected, no remaining plans, dispatching final gitflow commit"
                         );
                         let gitflow_prompt = "All plans are complete. Create or reuse a git feature branch from develop and commit all changes with conventional commit messages (feat/fix/refactor) if not committed yet. Do not merge — leave the branch for review.".to_string();
+                        let next_prompt =
+                            with_first_prompt_context(gitflow_prompt, prompt_summary.as_deref());
                         return Ok(Some(AutoPromptAction {
                             from_session_id: data.session_id,
                             from_title: data.title,
-                            next_prompt: gitflow_prompt,
+                            next_prompt,
                             work_dirs: data.work_dirs,
                         }));
                     }
@@ -461,9 +514,53 @@ pub async fn decide_with_llm(
             }
 
             if !response.should_continue && !has_prompt {
-                log::info!("auto_prompt: LLM says stop, no next_prompt");
-                reset_iteration();
-                return Ok(None);
+                let verification_count = VERIFICATION_COUNT.load(Ordering::Relaxed);
+                let max_verifications = data.max_verification_attempts;
+
+                if verification_count == 0 {
+                    log::info!(
+                        "auto_prompt: LLM says stop, initiating pre-stop verification (attempt 1/{max_verifications})"
+                    );
+                    VERIFICATION_COUNT.fetch_add(1, Ordering::Relaxed);
+
+                    match build_pre_stop_verification_prompt(&data.context_json, &data.work_dirs) {
+                        Some(verification_prompt) => {
+                            log::info!(
+                                "auto_prompt: dispatching pre-stop verification prompt: {}...",
+                                verification_prompt.chars().take(80).collect::<String>()
+                            );
+                            let next_prompt = with_first_prompt_context(
+                                verification_prompt,
+                                prompt_summary.as_deref(),
+                            );
+                            return Ok(Some(AutoPromptAction {
+                                from_session_id: data.session_id,
+                                from_title: data.title,
+                                next_prompt,
+                                work_dirs: data.work_dirs,
+                            }));
+                        }
+                        None => {
+                            log::info!(
+                                "auto_prompt: no verification needed (no plan files found), stopping"
+                            );
+                            reset_iteration();
+                            return Ok(None);
+                        }
+                    }
+                } else if verification_count < max_verifications {
+                    log::info!(
+                        "auto_prompt: LLM says stop after verification attempt {verification_count}/{max_verifications}, accepting stop"
+                    );
+                    reset_iteration();
+                    return Ok(None);
+                } else {
+                    log::warn!(
+                        "auto_prompt: max verification attempts ({max_verifications}) exceeded, forcing stop"
+                    );
+                    reset_iteration();
+                    return Ok(None);
+                }
             }
 
             let next_prompt = if has_prompt {
@@ -497,10 +594,22 @@ pub async fn decide_with_llm(
                 next_prompt
             };
 
+            // If LLM self-corrects during PreStop, reset verification for fresh cycle on next stop
+            let current_verification = VERIFICATION_COUNT.load(Ordering::Relaxed);
+            if current_verification > 0 {
+                log::info!(
+                    "auto_prompt: LLM continuing during PreStop (verification_count={}), resetting for fresh verification on next stop",
+                    current_verification
+                );
+                VERIFICATION_COUNT.store(0, Ordering::Relaxed);
+            }
+
             log::info!(
                 "auto_prompt: dispatching new thread with prompt: {}...",
                 next_prompt.chars().take(80).collect::<String>()
             );
+
+            let next_prompt = with_first_prompt_context(next_prompt, prompt_summary.as_deref());
 
             Ok(Some(AutoPromptAction {
                 from_session_id: data.session_id,
@@ -615,11 +724,25 @@ fn default_system_prompt() -> String {
         You decide whether to continue working. You receive conversation context and plan files.
 
         Respond ONLY with valid JSON:
-        {"should_continue": bool, "next_prompt": string | null, "reason": string | null, "all_plan_done": bool, "confidence": float}
+        {"should_continue": bool, "next_prompt": string | null, "reason": string | null, "all_plan_done": bool, "confidence": float, "first_prompt_summary": string | null}
+
+        ## first_prompt_summary:
+        - Read the first user message in messages[] and distill it into a concise one-liner
+        - Capture the user's actual intent (e.g. "finish plan 083 085", "implement auth flow")
+        - Omit file references, code blocks, and verbose details
+        - This gets prepended to every subsequent auto-prompt to keep the chain grounded
+        - Only set to null if there is no first user message
 
         ## Rules (in order):
 
-        1. If plan_files has unchecked `- [ ]` steps:
+        1. If stop_phase is "pre_stop":
+           - The LLM worker wants to stop but verification is required
+           - If any plan file has unchecked `- [ ]` items → should_continue=true, next_prompt = continue that work
+           - If diagnostics are likely dirty → should_continue=true, next_prompt = "Run cargo check and cargo clippy. Fix ALL errors and warnings."
+           - If git status is likely dirty → should_continue=true, next_prompt = "Commit all changes with conventional commit messages to a feature branch from develop."
+           - Only if ALL checks pass → should_continue=false
+
+        2. If plan_files has unchecked `- [ ]` steps:
            - should_continue=true
            - next_prompt = continue the next unchecked step
            - Use the actual file paths from plan_files (e.g. .plans/ or .plan/)
@@ -627,27 +750,34 @@ fn default_system_prompt() -> String {
            - Process plan files in filename order (01 before 02)
            - When one plan completes, transition to the next
 
-        2. If plan_has_checkboxes is false but plan_files exist:
+        3. If plan_has_checkboxes is false but plan_files exist:
            - Use the actual path from plan_files[0].path, not a hardcoded directory
            - next_prompt = "Read {actual_path} and add checkboxes (- [ ]) for all tasks at the top. Keep existing content below."
            - should_continue=true
 
-        3. If the last message asks a question or lists options:
+        4. If the last message asks a question or lists options:
            - should_continue=true
            - Pick option 1 or what the AI recommends
            - If unsure, search the codebase and pick the best default
            - confidence >= 0.6
 
-        4. If all plan steps are [x]:
+        5. If all plan steps are [x]:
            - If diagnostics or test failures likely exist → next_prompt = "Fix all diagnostics and ensure test coverage. Production grade only — no mock, no TODO, no placeholder."
            - Else if doc_files is empty → next_prompt = "Create .doc/{NN}_summary.md documenting what was implemented, key decisions, file changes, and how to test."
            - Else if no git feature branch was created for this plan in the conversation → next_prompt = "Create a git feature branch feature/{plan_number}_{description} from develop. Commit all changes with conventional commit messages."
            - Else → all_plan_done=true, should_continue=false
 
-        5. If no plan exists but work seems incomplete → should_continue=true, next_prompt="continue"
+        6. If no plan exists but work seems incomplete → should_continue=true, next_prompt="continue"
 
-        6. confidence < 0.5 → should_continue=false
-        7. iteration_count > 15 → consider stopping
+        7. confidence < 0.5 → should_continue=false
+        8. iteration_count > 15 → consider stopping
+
+        ## Pre-stop verification (when stop_phase is "pre_stop"):
+        Before confirming stop, verify ALL of these:
+        - All plan checkboxes are [x] (no [ ] remaining)
+        - Code diagnostics are clean (no errors, no warnings)
+        - Git is committed with conventional commit messages
+        If ANY check fails → should_continue=true with a fix prompt
 
         ## Quality (always enforce):
         - Production grade: no mock, no TODO, no placeholder, no unwrap()
@@ -665,6 +795,7 @@ fn default_system_prompt() -> String {
 
 pub fn reset_iteration() {
     AUTO_PROMPT_ITERATION.store(0, Ordering::Relaxed);
+    VERIFICATION_COUNT.store(0, Ordering::Relaxed);
 }
 
 fn get_iteration() -> u32 {
@@ -1033,6 +1164,41 @@ fn make_plan_read_prompt(plan_dir: &str, filename: &str) -> String {
 fn is_doc_creation_prompt(prompt: &str) -> bool {
     let lower = prompt.to_lowercase();
     lower.contains("documentation") || lower.contains(".doc/")
+}
+
+fn build_pre_stop_verification_prompt(
+    context_json: &str,
+    work_dirs: &Option<Vec<PathBuf>>,
+) -> Option<String> {
+    let mut checks: Vec<String> = Vec::new();
+
+    let has_plans = context_json.contains("plan_files") && context_json.contains("- [ ]");
+
+    if has_plans {
+        checks.push(
+            "1. **Plan completeness**: Read ALL .plans/ and .plan/ files. Every '- [ ]' must be '- [x]' or explicitly inapplicable. If any unchecked item exists, continue working on it.".to_string()
+        );
+    }
+
+    checks.push("2. **Code diagnostics**: Run `cargo check` and `cargo clippy` (or equivalent). Fix ALL errors and warnings before stopping. No TODOs, no placeholders, no unwrap().".to_string());
+    checks.push("3. **Git status**: Verify all changes are committed with conventional commit messages (feat/fix/refactor/test/chore/docs). Create or reuse a feature branch from develop if not done.".to_string());
+
+    if let Some(remaining) = find_next_plan_prompt(context_json, work_dirs.as_deref()) {
+        checks.push(format!(
+            "\n4. **Next plan found**: {remaining}\n   Complete the current plan verification first, then transition."
+        ));
+    }
+
+    if !has_plans {
+        return None;
+    }
+
+    Some(format!(
+        "PRE-STOP VERIFICATION: Before stopping, verify ALL of the following are true.\n\n{}\n\n\
+         If ALL checks pass, respond that verification is complete and stop.\n\
+         If ANY check fails, fix the issue and continue working.",
+        checks.join("\n")
+    ))
 }
 
 fn build_checkbox_verification_prompt(context_json: &str) -> Option<String> {

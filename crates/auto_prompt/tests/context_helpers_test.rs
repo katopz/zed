@@ -3,6 +3,7 @@ use auto_prompt::context::{AutoPromptContext, PlanFileContent};
 // ===== Helper Functions =====
 
 fn default_context() -> AutoPromptContext {
+    use auto_prompt::context::StopPhase;
     AutoPromptContext {
         current_datetime: String::new(),
         current_paths: vec![],
@@ -18,10 +19,13 @@ fn default_context() -> AutoPromptContext {
         had_error: false,
         approximate_token_count: 0,
         iteration_count: 1,
+        stop_phase: StopPhase::Working,
+        verification_count: 0,
         was_truncated: false,
         plan_has_checkboxes: false,
         first_plan_filename: String::new(),
         plan_number: String::new(),
+        first_user_message: None,
     }
 }
 

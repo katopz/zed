@@ -3,6 +3,19 @@ use chrono::Local;
 use gpui::App;
 use serde::{Deserialize, Serialize};
 
+/// Phase of the auto-prompt stop lifecycle.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum StopPhase {
+    /// Normal working phase — LLM is actively working on tasks.
+    #[default]
+    Working,
+    /// Pre-stop verification — LLM wants to stop but we're verifying completeness.
+    PreStop,
+    /// Verified stop — all checks passed, chain can terminate.
+    Verified,
+}
+
 /// Serializable context payload sent to the external LLM.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AutoPromptContext {
@@ -34,6 +47,12 @@ pub struct AutoPromptContext {
     pub approximate_token_count: usize,
     /// Which auto-prompt iteration this is (starts at 1).
     pub iteration_count: u32,
+    /// Current phase in the stop lifecycle (Working, PreStop, Verified).
+    #[serde(default)]
+    pub stop_phase: StopPhase,
+    /// How many pre-stop verification attempts have been made.
+    #[serde(default)]
+    pub verification_count: u32,
     /// Whether this context was truncated/summarized due to token limits.
     pub was_truncated: bool,
     /// Whether any plan file contains checkbox patterns (- [ ] or - [x]).
@@ -42,6 +61,9 @@ pub struct AutoPromptContext {
     pub first_plan_filename: String,
     /// The plan number (e.g., "082") from the first plan filename, or "00" if not found.
     pub plan_number: String,
+    /// The first user message in the conversation, carrying the original intent.
+    #[serde(default)]
+    pub first_user_message: Option<String>,
 }
 
 /// A plan entry with its status.
@@ -93,6 +115,11 @@ pub struct AutoPromptResponse {
     /// Below 0.5 means the LLM is too uncertain and the chain should stop.
     #[serde(default)]
     pub confidence: Option<f64>,
+    /// A refined one-line summary of the user's original intent from the first message.
+    /// Used to prefix subsequent auto-prompts so every iteration stays grounded
+    /// in what the user actually asked for (e.g. "finish plan 083 085").
+    #[serde(default)]
+    pub first_prompt_summary: Option<String>,
 }
 
 impl AutoPromptContext {
@@ -180,6 +207,11 @@ impl AutoPromptContext {
 
         let current_plan = collect_plan_entries(thread, cx);
 
+        let first_user_message = messages
+            .iter()
+            .find(|m| matches!(m.role, ContextMessageRole::User))
+            .map(|m| m.content.clone());
+
         let mut context = Self {
             current_datetime,
             current_paths,
@@ -195,10 +227,13 @@ impl AutoPromptContext {
             had_error,
             approximate_token_count: 0,
             iteration_count,
+            stop_phase: StopPhase::Working,
+            verification_count: 0,
             was_truncated: false,
             plan_has_checkboxes: false,
             first_plan_filename: String::new(),
             plan_number: String::new(),
+            first_user_message,
         };
 
         context.approximate_token_count = context.estimate_token_count();
