@@ -763,7 +763,7 @@ fn default_system_prompt() -> String {
 
         5. If all plan steps are [x]:
            - If diagnostics or test failures likely exist → next_prompt = "Fix all diagnostics and ensure test coverage. Production grade only — no mock, no TODO, no placeholder."
-           - Else if doc_files is empty → next_prompt = "Create .doc/{NN}_summary.md documenting what was implemented, key decisions, file changes, and how to test."
+           - Else if doc_files is empty → next_prompt = "Create .docs/{NN}_summary.md documenting what was implemented, key decisions, file changes, and how to test."
            - Else if no git feature branch was created for this plan in the conversation → next_prompt = "Create a git feature branch feature/{plan_number}_{description} from develop. Commit all changes with conventional commit messages."
            - Else → all_plan_done=true, should_continue=false
 
@@ -1163,7 +1163,7 @@ fn make_plan_read_prompt(plan_dir: &str, filename: &str) -> String {
 
 fn is_doc_creation_prompt(prompt: &str) -> bool {
     let lower = prompt.to_lowercase();
-    lower.contains("documentation") || lower.contains(".doc/")
+    lower.contains("documentation") || lower.contains(".docs/")
 }
 
 fn build_pre_stop_verification_prompt(
@@ -1239,7 +1239,7 @@ fn build_checkbox_verification_prompt(context_json: &str) -> Option<String> {
                      2. For each '- [ ]' item, check if the code already implements it\n\
                      3. Mark completed items as '- [x]' — do NOT re-execute completed work\n\
                      4. If any item is truly incomplete, continue working on it\n\
-                     5. Only after ALL items in ALL plan files are '- [x]', create documentation at .doc/\n\n\
+                     5. Only after ALL items in ALL plan files are '- [x]', create documentation at .docs/\n\n\
                      Unchecked items found in: {plan_dir}/{filename}"
                 ));
             }
