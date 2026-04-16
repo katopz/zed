@@ -30,6 +30,12 @@ pub struct AutoPromptConfig {
     /// Actual delay = backoff_base_ms * 2^retry_count (capped at 60s).
     #[serde(default = "default_backoff_base_ms")]
     pub backoff_base_ms: u64,
+
+    /// Maximum number of pre-stop verification attempts before forcing a stop.
+    /// When the LLM says stop, we verify (plans done, diagnostics clean, git committed).
+    /// If verification fails, we retry up to this many times before forcing stop.
+    #[serde(default = "default_max_verification_attempts")]
+    pub max_verification_attempts: u32,
 }
 
 fn default_max_iterations() -> u32 {
@@ -44,6 +50,10 @@ fn default_backoff_base_ms() -> u64 {
     2_000
 }
 
+fn default_max_verification_attempts() -> u32 {
+    2
+}
+
 impl Default for AutoPromptConfig {
     fn default() -> Self {
         Self {
@@ -52,6 +62,7 @@ impl Default for AutoPromptConfig {
             max_iterations: default_max_iterations(),
             max_context_tokens: default_max_context_tokens(),
             backoff_base_ms: default_backoff_base_ms(),
+            max_verification_attempts: default_max_verification_attempts(),
         }
     }
 }
@@ -116,12 +127,18 @@ impl AutoPromptConfig {
             .and_then(|v| v.parse().ok())
             .unwrap_or_else(default_backoff_base_ms);
 
+        let max_verification_attempts = std::env::var("ZED_AUTO_PROMPT_MAX_VERIFICATION_ATTEMPTS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(default_max_verification_attempts);
+
         Self {
             enabled,
             system_prompt,
             max_iterations,
             max_context_tokens,
             backoff_base_ms,
+            max_verification_attempts,
         }
     }
 
