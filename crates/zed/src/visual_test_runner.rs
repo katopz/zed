@@ -73,7 +73,9 @@ fn main() {
     // Create test files in the real filesystem
     create_test_files(&project_path);
 
-    let test_result = std::panic::catch_unwind(|| run_visual_tests(project_path, update_baseline));
+    let project_path_buf = project_path.to_path_buf();
+    let test_result =
+        std::panic::catch_unwind(|| run_visual_tests(project_path_buf, update_baseline));
 
     // Note: We don't delete temp_path here because background worktree tasks may still
     // be running. The directory will be cleaned up when the process exits or by the OS.
