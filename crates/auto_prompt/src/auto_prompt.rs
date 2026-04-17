@@ -267,10 +267,7 @@ pub fn decide(
             .first_user_message
             .as_deref()
             .and_then(|raw| raw.lines().next())
-            .map(|line| {
-                let trimmed = line.trim();
-                trimmed.chars().take(120).collect::<String>()
-            });
+            .map(|line| line.trim().to_string());
         let next_prompt = with_first_prompt_context(prompt, fallback_summary.as_deref());
         AutoPromptAction {
             from_session_id: session_id.clone(),
