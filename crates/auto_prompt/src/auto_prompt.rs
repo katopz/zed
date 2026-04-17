@@ -488,18 +488,28 @@ pub async fn decide_with_llm(
                         }));
                     }
                     None => {
-                        log::info!(
-                            "[auto_prompt::decide_with_llm] #ALL_PLAN_DONE detected, no remaining plans, dispatching final gitflow commit"
-                        );
-                        let gitflow_prompt = "All plans are complete. Create or reuse a git feature branch from develop and commit all changes with conventional commit messages (feat/fix/refactor) if not committed yet. Do not merge — leave the branch for review.".to_string();
-                        let next_prompt =
-                            with_first_prompt_context(gitflow_prompt, prompt_summary.as_deref());
-                        return Ok(Some(AutoPromptAction {
-                            from_session_id: data.session_id,
-                            from_title: data.title,
-                            next_prompt,
-                            work_dirs: data.work_dirs,
-                        }));
+                        if response.should_continue {
+                            log::info!(
+                                "[auto_prompt::decide_with_llm] #ALL_PLAN_DONE but LLM says continue, dispatching final gitflow commit"
+                            );
+                            let gitflow_prompt = "All plans are complete. Create or reuse a git feature branch from develop and commit all changes with conventional commit messages (feat/fix/refactor) if not committed yet. Do not merge — leave the branch for review.".to_string();
+                            let next_prompt = with_first_prompt_context(
+                                gitflow_prompt,
+                                prompt_summary.as_deref(),
+                            );
+                            return Ok(Some(AutoPromptAction {
+                                from_session_id: data.session_id,
+                                from_title: data.title,
+                                next_prompt,
+                                work_dirs: data.work_dirs,
+                            }));
+                        } else {
+                            log::info!(
+                                "[auto_prompt::decide_with_llm] #ALL_PLAN_DONE, no remaining plans, LLM says stop — chain complete"
+                            );
+                            reset_iteration();
+                            return Ok(None);
+                        }
                     }
                 }
             }
