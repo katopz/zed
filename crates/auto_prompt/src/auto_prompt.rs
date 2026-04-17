@@ -281,30 +281,10 @@ pub fn decide(
     };
 
     let make_continue_prompt = || {
-        if let Some(remaining) = auto_prompt_ctx.remaining_plan_files().first() {
-            let filename = remaining.path.rsplit('/').next().unwrap_or(&remaining.path);
-            let plan_dir = remaining.path.rsplit('/').nth(1).unwrap_or(".plans");
-            let plan_number = filename
-                .split('_')
-                .next()
-                .map(|s| {
-                    s.chars()
-                        .take_while(|c| c.is_ascii_digit())
-                        .collect::<String>()
-                })
-                .unwrap_or_default();
-            if plan_number.is_empty() {
-                format!(
-                    "Continue the plan. Read {plan_dir}/{filename} and execute from the first unchecked step. Mark completed steps as [x] in {plan_dir}/ files."
-                )
-            } else {
-                format!(
-                    "Continue Plan {plan_number}. Read {plan_dir}/{filename} and execute from the first unchecked step. Mark completed steps as [x] in {plan_dir}/ files."
-                )
-            }
-        } else {
-            "continue".to_string()
-        }
+        // Do not blindly pick plan files here — the user's first message
+        // (prepended via with_first_prompt_context) carries their intent.
+        // Plan transitions are handled by the LLM decision path.
+        "continue".to_string()
     };
 
     log::info!(
@@ -331,12 +311,16 @@ pub fn decide(
         auto_prompt_ctx.had_error
     );
 
-    if auto_prompt_ctx.had_error
-        || matches!(
-            stop_reason,
-            acp::StopReason::Refusal | acp::StopReason::MaxTokens
-        )
-    {
+    // MaxTokens is a hard context limit, not a transient error.
+    // No amount of waiting will help — dispatch new thread immediately.
+    if matches!(stop_reason, acp::StopReason::MaxTokens) {
+        log::info!(
+            "auto_prompt: MaxTokens reached (context limit), dispatching new thread immediately"
+        );
+        return AutoPromptDecision::DispatchNow(make_action(make_continue_prompt()));
+    }
+
+    if auto_prompt_ctx.had_error || matches!(stop_reason, acp::StopReason::Refusal) {
         let delay = config.backoff_delay_ms(iteration_count);
         log::info!(
             "[auto_prompt::decide] Error state detected, backing off {}ms",
