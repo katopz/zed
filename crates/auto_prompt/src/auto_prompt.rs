@@ -224,10 +224,7 @@ pub fn decide(
     }
 
     let registry = language_model::LanguageModelRegistry::read_global(cx);
-    let Some(configured_model) = registry
-        .thread_summary_model()
-        .or_else(|| registry.default_model())
-    else {
+    let Some(configured_model) = registry.default_model() else {
         log::warn!("[auto_prompt::decide] No language model configured in Zed");
         return AutoPromptDecision::NoAction;
     };
