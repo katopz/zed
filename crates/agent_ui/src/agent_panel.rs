@@ -398,11 +398,19 @@ pub fn init(cx: &mut App) {
                     },
                 )
                 .register_action(|workspace, action: &AutoPromptNewThread, window, cx| {
+                    log::info!(
+                        "[auto_prompt] AutoPromptNewThread action received in Workspace handler (from_session_id={:?})",
+                        action.from_session_id
+                    );
                     if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
                         panel.update(cx, |panel, cx| {
                             panel.auto_prompt_new_thread(action, window, cx)
                         });
                         workspace.focus_panel::<AgentPanel>(window, cx);
+                    } else {
+                        log::warn!(
+                            "[auto_prompt] AutoPromptNewThread DROPPED: AgentPanel not found in workspace"
+                        );
                     }
                 })
                 .register_action(|workspace, _: &ToggleAutoPrompt, _window, cx| {
