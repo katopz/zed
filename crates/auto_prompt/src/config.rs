@@ -5,7 +5,7 @@ use std::path::PathBuf;
 /// Configuration for the auto-prompt hook.
 ///
 /// Loaded from `~/.config/zed/auto_prompt.json` or environment variables.
-/// The LLM used is whatever Zed has configured (thread_summary_model or default_model).
+/// The LLM used is whatever Zed has configured as the default model.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AutoPromptConfig {
     /// Whether the auto-prompt hook is enabled.
