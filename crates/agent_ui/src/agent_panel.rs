@@ -189,11 +189,19 @@ pub fn init(cx: &mut App) {
                     },
                 )
                 .register_action(|workspace, action: &AutoPromptNewThread, window, cx| {
+                    log::info!(
+                        "[auto_prompt] AutoPromptNewThread action received in Workspace handler (from_session_id={:?})",
+                        action.from_session_id
+                    );
                     if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
                         panel.update(cx, |panel, cx| {
                             panel.auto_prompt_new_thread(action, window, cx)
                         });
                         workspace.focus_panel::<AgentPanel>(window, cx);
+                    } else {
+                        log::warn!(
+                            "[auto_prompt] AutoPromptNewThread DROPPED: AgentPanel not found in workspace"
+                        );
                     }
                 })
                 .register_action(|workspace, _: &ToggleAutoPrompt, _window, cx| {
@@ -1522,6 +1530,12 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        log::info!(
+            "[auto_prompt] auto_prompt_new_thread: creating thread (prompt {} chars, from_session_id={:?})",
+            action.next_prompt.len(),
+            action.from_session_id
+        );
+
         let from_session_id = action.from_session_id.clone();
         let from_title = action.from_title.clone();
         let next_prompt = action.next_prompt.clone();
@@ -1541,6 +1555,10 @@ impl AgentPanel {
 
         let work_dirs = action.work_dirs.as_ref().map(|dirs| PathList::new(dirs));
 
+        log::info!(
+            "[auto_prompt] auto_prompt_new_thread: calling external_thread with auto_submit=true"
+        );
+
         self.external_thread(
             Some(Agent::NativeAgent),
             None,
@@ -1554,6 +1572,8 @@ impl AgentPanel {
             window,
             cx,
         );
+
+        log::info!("[auto_prompt] auto_prompt_new_thread: thread created successfully");
     }
 
     fn external_thread(

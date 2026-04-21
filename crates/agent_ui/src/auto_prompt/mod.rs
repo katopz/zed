@@ -49,6 +49,10 @@ fn dispatch_action(
     window: &mut Window,
     cx: &mut gpui::Context<crate::ConversationView>,
 ) {
+    log::info!(
+        "[auto_prompt] dispatch_action: dispatching AutoPromptNewThread (prompt {} chars)",
+        action.next_prompt.len()
+    );
     window.dispatch_action(
         Box::new(AutoPromptNewThread {
             from_session_id: action.from_session_id,
@@ -58,6 +62,7 @@ fn dispatch_action(
         }),
         cx,
     );
+    log::info!("[auto_prompt] dispatch_action: action submitted (deferred via cx.defer)");
 }
 
 fn is_cancelled(
@@ -135,8 +140,10 @@ pub fn on_thread_stopped(
                             tv.downgrade()
                         })
                     })
-                    .ok()
-                    .flatten();
+                    .unwrap_or_else(|err| {
+                        log::warn!("[auto_prompt] failed to get active thread (view may have been dropped): {err}");
+                        None
+                    });
 
                 cx.background_executor()
                     .timer(std::time::Duration::from_millis(delay_ms))
@@ -150,17 +157,26 @@ pub fn on_thread_stopped(
                 }
 
                 if let Some(ref tv) = thread_weak {
-                    let _ = tv.update(cx, |tv, cx| {
+                    if let Err(err) = tv.update(cx, |tv, cx| {
                         tv.auto_prompt_state = AutoPromptState::Idle;
                         cx.notify();
-                    });
+                    }) {
+                        log::warn!("[auto_prompt] failed to reset state after delay: {err}");
+                    }
                 }
 
-                _view
-                    .update_in(cx, |_view, window, cx| {
-                        dispatch_action(action, window, cx);
-                    })
-                    .ok();
+                match _view.update_in(cx, |_view, window, cx| {
+                    dispatch_action(action, window, cx);
+                }) {
+                    Ok(()) => {
+                        log::info!("[auto_prompt] DispatchAfterDelay dispatch submitted");
+                    }
+                    Err(err) => {
+                        log::warn!(
+                            "[auto_prompt] FAILED to dispatch after delay (view may have been dropped): {err}"
+                        );
+                    }
+                }
             });
 
             Some(task)
@@ -185,8 +201,10 @@ pub fn on_thread_stopped(
                             tv.downgrade()
                         })
                     })
-                    .ok()
-                    .flatten();
+                    .unwrap_or_else(|err| {
+                        log::warn!("[auto_prompt] failed to get active thread (view may have been dropped): {err}");
+                        None
+                    });
 
                 let result = auto_prompt::decide_with_llm(data, cx).await;
 
@@ -202,37 +220,50 @@ pub fn on_thread_stopped(
                 match result {
                     Ok(Some(action)) => {
                         if let Some(ref tv) = thread_weak {
-                            let _ = tv.update(cx, |tv, cx| {
+                            if let Err(err) = tv.update(cx, |tv, cx| {
                                 tv.auto_prompt_state = AutoPromptState::Idle;
                                 cx.notify();
-                            });
+                            }) {
+                                log::warn!("[auto_prompt] failed to reset state before dispatch: {err}");
+                            }
                         }
 
                         log::info!(
                             "[auto_prompt] LLM returned action - dispatching with prompt: {}",
                             action.next_prompt
                         );
-                        _view
-                            .update_in(cx, |_view, window, cx| {
-                                dispatch_action(action, window, cx);
-                            })
-                            .ok();
+                        match _view.update_in(cx, |_view, window, cx| {
+                            dispatch_action(action, window, cx);
+                        }) {
+                            Ok(()) => {
+                                log::info!("[auto_prompt] NeedsLlmCall dispatch submitted");
+                            }
+                            Err(err) => {
+                                log::warn!(
+                                    "[auto_prompt] FAILED to dispatch new thread (view may have been dropped): {err}"
+                                );
+                            }
+                        }
                     }
                     Ok(None) => {
                         if let Some(ref tv) = thread_weak {
-                            let _ = tv.update(cx, |tv, cx| {
+                            if let Err(err) = tv.update(cx, |tv, cx| {
                                 tv.auto_prompt_state = AutoPromptState::Idle;
                                 cx.notify();
-                            });
+                            }) {
+                                log::warn!("[auto_prompt] failed to reset state on no-action: {err}");
+                            }
                         }
                         log::info!("[auto_prompt] LLM returned no action (normal stop)");
                     }
                     Err(err) => {
                         if let Some(ref tv) = thread_weak {
-                            let _ = tv.update(cx, |tv, cx| {
+                            if let Err(update_err) = tv.update(cx, |tv, cx| {
                                 tv.auto_prompt_state = AutoPromptState::Failed;
                                 cx.notify();
-                            });
+                            }) {
+                                log::warn!("[auto_prompt] failed to set Failed state: {update_err}");
+                            }
                         }
                         log::warn!("[auto_prompt] LLM call failed: {err}");
                     }
