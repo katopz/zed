@@ -4251,7 +4251,7 @@ impl ThreadView {
         let (label, label_color) = if is_processing {
             ("Processing...", Color::Accent)
         } else if is_failed {
-            ("Failed", Color::Error)
+            ("Retry", Color::Error)
         } else if enabled {
             ("Auto", Color::Accent)
         } else {
@@ -4282,8 +4282,9 @@ impl ThreadView {
                     return;
                 }
                 if is_failed {
-                    log::info!("[auto_prompt] Retrying auto-prompt");
+                    log::info!("[auto_prompt] Manual retry triggered by user");
                     this.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;
+                    auto_prompt::reset_llm_failure_count(); // Reset counter for fresh retry
                     cx.notify();
                     return;
                 }

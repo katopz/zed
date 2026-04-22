@@ -206,7 +206,39 @@ pub fn on_thread_stopped(
                         None
                     });
 
-                let result = auto_prompt::decide_with_llm(data, cx).await;
+                let config = auto_prompt::load_config_cached().unwrap_or_default();
+                let mut result = auto_prompt::decide_with_llm(data.clone(), cx).await;
+
+                // Retry loop with exponential backoff
+                while let Err(ref err) = result {
+                    let failure_count = auto_prompt::increment_llm_failure_count();
+
+                    if failure_count > config.max_llm_retries {
+                        break; // Max retries exhausted
+                    }
+
+                    let delay = config.backoff_delay_ms(failure_count);
+                    log::warn!(
+                        "[auto_prompt] LLM call failed (attempt {}/{}): {err}, retrying in {}ms",
+                        failure_count,
+                        config.max_llm_retries,
+                        delay
+                    );
+
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(delay))
+                        .await;
+
+                    if let Some(ref tv) = thread_weak {
+                        if is_cancelled(tv, cx) {
+                            log::info!("[auto_prompt] Cancelled during retry delay");
+                            return;
+                        }
+                    }
+
+                    log::info!("[auto_prompt] Retrying LLM call (attempt {})", failure_count);
+                    result = auto_prompt::decide_with_llm(data.clone(), cx).await;
+                }
 
                 if let Some(ref tv) = thread_weak {
                     if is_cancelled(tv, cx) {
@@ -257,6 +289,7 @@ pub fn on_thread_stopped(
                         log::info!("[auto_prompt] LLM returned no action (normal stop)");
                     }
                     Err(err) => {
+                        // Max retries exhausted (already tried in the loop above)
                         if let Some(ref tv) = thread_weak {
                             if let Err(update_err) = tv.update(cx, |tv, cx| {
                                 tv.auto_prompt_state = AutoPromptState::Failed;
@@ -265,7 +298,10 @@ pub fn on_thread_stopped(
                                 log::warn!("[auto_prompt] failed to set Failed state: {update_err}");
                             }
                         }
-                        log::warn!("[auto_prompt] LLM call failed: {err}");
+                        log::warn!(
+                            "[auto_prompt] LLM call failed after {} attempts: {err}",
+                            config.max_llm_retries
+                        );
                     }
                 }
             });
