@@ -36,6 +36,9 @@ static LAST_ITERATION_SECS: AtomicU64 = AtomicU64::new(0);
 /// Pre-stop verification attempt counter for the current chain.
 static VERIFICATION_COUNT: AtomicU32 = AtomicU32::new(0);
 
+/// LLM orchestration call failure counter for the current chain.
+static AUTO_PROMPT_LLM_FAILURE_COUNT: AtomicU32 = AtomicU32::new(0);
+
 use std::sync::RwLock;
 use std::time::SystemTime;
 
@@ -129,6 +132,7 @@ pub enum AutoPromptDecision {
 }
 
 /// Data needed for the async LLM call path.
+#[derive(Clone)]
 pub struct LlmCallData {
     pub model: Arc<dyn LanguageModel>,
     pub system_prompt: String,
@@ -784,6 +788,15 @@ fn default_system_prompt() -> String {
 pub fn reset_iteration() {
     AUTO_PROMPT_ITERATION.store(0, Ordering::Relaxed);
     VERIFICATION_COUNT.store(0, Ordering::Relaxed);
+    AUTO_PROMPT_LLM_FAILURE_COUNT.store(0, Ordering::Relaxed);
+}
+
+pub fn increment_llm_failure_count() -> u32 {
+    AUTO_PROMPT_LLM_FAILURE_COUNT.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+pub fn reset_llm_failure_count() {
+    AUTO_PROMPT_LLM_FAILURE_COUNT.store(0, Ordering::Relaxed);
 }
 
 fn get_iteration() -> u32 {

@@ -36,6 +36,12 @@ pub struct AutoPromptConfig {
     /// If verification fails, we retry up to this many times before forcing stop.
     #[serde(default = "default_max_verification_attempts")]
     pub max_verification_attempts: u32,
+
+    /// Maximum number of automatic retry attempts for LLM orchestration call failures.
+    /// When the auto-prompt's own LLM call fails (network/timeout/parse), it will
+    /// retry with exponential backoff up to this many times before showing "Retry" button.
+    #[serde(default = "default_max_llm_retries")]
+    pub max_llm_retries: u32,
 }
 
 fn default_max_iterations() -> u32 {
@@ -54,6 +60,10 @@ fn default_max_verification_attempts() -> u32 {
     2
 }
 
+fn default_max_llm_retries() -> u32 {
+    3
+}
+
 impl Default for AutoPromptConfig {
     fn default() -> Self {
         Self {
@@ -63,6 +73,7 @@ impl Default for AutoPromptConfig {
             max_context_tokens: default_max_context_tokens(),
             backoff_base_ms: default_backoff_base_ms(),
             max_verification_attempts: default_max_verification_attempts(),
+            max_llm_retries: default_max_llm_retries(),
         }
     }
 }
@@ -132,6 +143,11 @@ impl AutoPromptConfig {
             .and_then(|v| v.parse().ok())
             .unwrap_or_else(default_max_verification_attempts);
 
+        let max_llm_retries = std::env::var("ZED_AUTO_PROMPT_MAX_LLM_RETRIES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(default_max_llm_retries);
+
         Self {
             enabled,
             system_prompt,
@@ -139,6 +155,7 @@ impl AutoPromptConfig {
             max_context_tokens,
             backoff_base_ms,
             max_verification_attempts,
+            max_llm_retries,
         }
     }
 
