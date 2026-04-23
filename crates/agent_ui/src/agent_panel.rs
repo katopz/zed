@@ -1428,19 +1428,11 @@ impl AgentPanel {
     ) {
         let session_id = action.from_session_id.clone();
 
-        let Some(thread) = ThreadStore::global(cx)
+        let title = ThreadStore::global(cx)
             .read(cx)
             .entries()
             .find(|t| t.id == session_id)
-        else {
-            log::error!("No session found for summarization with id {}", session_id);
-            return;
-        };
-
-        let Some(parent_session_id) = thread.parent_session_id else {
-            log::error!("Session {} has no parent session", session_id);
-            return;
-        };
+            .map(|t| t.title);
 
         cx.spawn_in(window, async move |this, cx| {
             this.update_in(cx, |this, window, cx| {
@@ -1449,10 +1441,7 @@ impl AgentPanel {
                     None,
                     None,
                     None,
-                    Some(AgentInitialContent::ThreadSummary {
-                        session_id: parent_session_id,
-                        title: Some(thread.title),
-                    }),
+                    Some(AgentInitialContent::ThreadSummary { session_id, title }),
                     true,
                     "agent_panel",
                     window,
