@@ -11,6 +11,7 @@ pub mod context;
 pub use config::AutoPromptConfig;
 pub use context::{AutoPromptContext, AutoPromptResponse, PlanFileContent, StopPhase};
 
+use acp::schema::{SessionId, StopReason};
 use agent_client_protocol as acp;
 use anyhow::Context as _;
 use futures::{StreamExt, future, pin_mut};
@@ -100,7 +101,7 @@ pub fn invalidate_config_cache() {
 /// The caller (agent_ui) wraps this in `AutoPromptNewThread` action.
 #[derive(Clone, Debug)]
 pub struct AutoPromptAction {
-    pub from_session_id: acp::SessionId,
+    pub from_session_id: SessionId,
     pub from_title: Option<String>,
     pub next_prompt: String,
     pub work_dirs: Option<Vec<std::path::PathBuf>>,
@@ -138,7 +139,7 @@ pub struct LlmCallData {
     pub system_prompt: String,
     pub context_json: String,
     pub project_root: Option<PathBuf>,
-    pub session_id: acp::SessionId,
+    pub session_id: SessionId,
     pub title: Option<String>,
     pub iteration_count: u32,
     pub max_verification_attempts: u32,
@@ -175,7 +176,7 @@ impl std::fmt::Debug for LlmCallData {
 pub fn decide(
     thread: &gpui::Entity<acp_thread::AcpThread>,
     used_tools: bool,
-    stop_reason: &acp::StopReason,
+    stop_reason: &StopReason,
     cx: &App,
 ) -> AutoPromptDecision {
     log::info!("[auto_prompt::decide] Starting decision process");
@@ -205,7 +206,7 @@ pub fn decide(
 
     log::info!("[auto_prompt::decide] Tools were used, continuing evaluation");
 
-    if matches!(stop_reason, acp::StopReason::Cancelled) {
+    if matches!(stop_reason, StopReason::Cancelled) {
         log::info!("[auto_prompt::decide] Thread was cancelled, skipping auto-prompt");
         return AutoPromptDecision::NoAction;
     }
@@ -311,14 +312,14 @@ pub fn decide(
 
     // MaxTokens is a hard context limit, not a transient error.
     // No amount of waiting will help — dispatch new thread immediately.
-    if matches!(stop_reason, acp::StopReason::MaxTokens) {
+    if matches!(stop_reason, StopReason::MaxTokens) {
         log::info!(
             "auto_prompt: MaxTokens reached (context limit), dispatching new thread immediately"
         );
         return AutoPromptDecision::DispatchNow(make_action(make_continue_prompt()));
     }
 
-    if auto_prompt_ctx.had_error || matches!(stop_reason, acp::StopReason::Refusal) {
+    if auto_prompt_ctx.had_error || matches!(stop_reason, StopReason::Refusal) {
         let delay = config.backoff_delay_ms(iteration_count);
         log::info!(
             "[auto_prompt::decide] Error state detected, backing off {}ms",

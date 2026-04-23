@@ -4,7 +4,7 @@ use gpui::App;
 use language::CursorShape;
 use project::project_settings::DiagnosticSeverity;
 pub use settings::{
-    CompletionDetailAlignment, CurrentLineHighlight, DelayMs, DiffViewStyle, DisplayIn,
+    CodeLens, CompletionDetailAlignment, CurrentLineHighlight, DelayMs, DiffViewStyle, DisplayIn,
     DocumentColorsRenderMode, DoubleClickInMultibuffer, GoToDefinitionFallback, HideMouseMode,
     MinimapThumb, MinimapThumbBorder, MultiCursorModifier, ScrollBeyondLastLine,
     ScrollbarDiagnostics, SeedQuerySetting, ShowMinimap, SnippetSortOrder,
@@ -24,6 +24,8 @@ pub struct EditorSettings {
     pub lsp_highlight_debounce: DelayMs,
     pub hover_popover_enabled: bool,
     pub hover_popover_delay: DelayMs,
+    pub hover_popover_sticky: bool,
+    pub hover_popover_hiding_delay: DelayMs,
     pub toolbar: Toolbar,
     pub scrollbar: Scrollbar,
     pub minimap: Minimap,
@@ -56,6 +58,7 @@ pub struct EditorSettings {
     pub diagnostics_max_severity: Option<DiagnosticSeverity>,
     pub inline_code_actions: bool,
     pub drag_and_drop_selection: DragAndDropSelection,
+    pub code_lens: CodeLens,
     pub lsp_document_colors: DocumentColorsRenderMode,
     pub minimum_contrast_for_highlights: f32,
     pub completion_menu_scrollbar: ShowScrollbar,
@@ -131,6 +134,7 @@ pub struct Gutter {
     pub line_numbers: bool,
     pub runnables: bool,
     pub breakpoints: bool,
+    pub bookmarks: bool,
     pub folds: bool,
 }
 
@@ -205,6 +209,8 @@ impl Settings for EditorSettings {
             lsp_highlight_debounce: editor.lsp_highlight_debounce.unwrap(),
             hover_popover_enabled: editor.hover_popover_enabled.unwrap(),
             hover_popover_delay: editor.hover_popover_delay.unwrap(),
+            hover_popover_sticky: editor.hover_popover_sticky.unwrap(),
+            hover_popover_hiding_delay: editor.hover_popover_hiding_delay.unwrap(),
             toolbar: Toolbar {
                 breadcrumbs: toolbar.breadcrumbs.unwrap(),
                 quick_actions: toolbar.quick_actions.unwrap(),
@@ -244,6 +250,7 @@ impl Settings for EditorSettings {
                 min_line_number_digits: gutter.min_line_number_digits.unwrap(),
                 line_numbers: gutter.line_numbers.unwrap(),
                 runnables: gutter.runnables.unwrap(),
+                bookmarks: gutter.bookmarks.unwrap(),
                 breakpoints: gutter.breakpoints.unwrap(),
                 folds: gutter.folds.unwrap(),
             },
@@ -289,6 +296,7 @@ impl Settings for EditorSettings {
                 enabled: drag_and_drop_selection.enabled.unwrap(),
                 delay: drag_and_drop_selection.delay.unwrap(),
             },
+            code_lens: editor.code_lens.unwrap(),
             lsp_document_colors: editor.lsp_document_colors.unwrap(),
             minimum_contrast_for_highlights: editor.minimum_contrast_for_highlights.unwrap().0,
             completion_menu_scrollbar: editor

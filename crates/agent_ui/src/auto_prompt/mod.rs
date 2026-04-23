@@ -1,3 +1,4 @@
+use acp::schema::{SessionId, StopReason};
 use agent_client_protocol as acp;
 use gpui::Window;
 use std::path::PathBuf;
@@ -35,7 +36,7 @@ pub enum AutoPromptState {
 #[serde(deny_unknown_fields)]
 pub struct AutoPromptNewThread {
     /// Session ID of the previous thread (for summary link).
-    pub from_session_id: acp::SessionId,
+    pub from_session_id: SessionId,
     /// Title of the previous thread.
     pub from_title: Option<String>,
     /// The follow-up prompt text from the external LLM.
@@ -88,7 +89,7 @@ fn is_cancelled(
 pub fn on_thread_stopped(
     thread: &gpui::Entity<acp_thread::AcpThread>,
     used_tools: bool,
-    stop_reason: &acp::StopReason,
+    stop_reason: &StopReason,
     window: &mut Window,
     cx: &mut gpui::Context<crate::ConversationView>,
 ) -> Option<gpui::Task<()>> {
@@ -98,7 +99,7 @@ pub fn on_thread_stopped(
         stop_reason
     );
 
-    if matches!(stop_reason, acp::StopReason::MaxTokens) {
+    if matches!(stop_reason, StopReason::MaxTokens) {
         log::warn!(
             "[auto_prompt] Error/Rate Limit detected - stop_reason={:?}, will apply backoff retry",
             stop_reason

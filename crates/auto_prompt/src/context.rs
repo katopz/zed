@@ -403,15 +403,15 @@ fn collect_plan_entries(thread: &AcpThread, cx: &App) -> Vec<PlanEntryContext> {
         .map(|entry| {
             let content = entry.content.read(cx).source().to_string();
             let status = match entry.status {
-                agent_client_protocol::PlanEntryStatus::Pending => "pending",
-                agent_client_protocol::PlanEntryStatus::InProgress => "in_progress",
-                agent_client_protocol::PlanEntryStatus::Completed => "completed",
+                agent_client_protocol::schema::PlanEntryStatus::Pending => "pending",
+                agent_client_protocol::schema::PlanEntryStatus::InProgress => "in_progress",
+                agent_client_protocol::schema::PlanEntryStatus::Completed => "completed",
                 _ => "unknown",
             };
             let priority = match entry.priority {
-                agent_client_protocol::PlanEntryPriority::High => "high",
-                agent_client_protocol::PlanEntryPriority::Medium => "medium",
-                agent_client_protocol::PlanEntryPriority::Low => "low",
+                agent_client_protocol::schema::PlanEntryPriority::High => "high",
+                agent_client_protocol::schema::PlanEntryPriority::Medium => "medium",
+                agent_client_protocol::schema::PlanEntryPriority::Low => "low",
                 _ => "unknown",
             };
             PlanEntryContext {
