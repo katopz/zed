@@ -1472,6 +1472,7 @@ impl ConversationView {
                     stop_reason
                 );
                 if let Some(task) = crate::auto_prompt::on_thread_stopped(
+                    self,
                     &thread,
                     used_tools,
                     stop_reason,
@@ -1552,6 +1553,7 @@ impl ConversationView {
                     // Call auto-prompt for error events (e.g., rate limits)
                     let used_tools = thread.read(cx).used_tools_since_last_user_message();
                     if let Some(task) = crate::auto_prompt::on_thread_stopped(
+                        self,
                         &thread,
                         used_tools,
                         &acp::StopReason::MaxTokens, // Use MaxTokens as error indicator

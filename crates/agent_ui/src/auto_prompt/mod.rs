@@ -47,6 +47,7 @@ pub struct AutoPromptNewThread {
 
 fn dispatch_action(
     action: auto_prompt::AutoPromptAction,
+    conversation_view: &crate::ConversationView,
     window: &mut Window,
     cx: &mut gpui::Context<crate::ConversationView>,
 ) {
@@ -54,16 +55,23 @@ fn dispatch_action(
         "[auto_prompt] dispatch_action: dispatching AutoPromptNewThread (prompt {} chars)",
         action.next_prompt.len()
     );
-    window.dispatch_action(
-        Box::new(AutoPromptNewThread {
-            from_session_id: action.from_session_id,
-            from_title: action.from_title,
-            next_prompt: action.next_prompt,
-            work_dirs: action.work_dirs,
-        }),
-        cx,
-    );
-    log::info!("[auto_prompt] dispatch_action: action submitted (deferred via cx.defer)");
+
+    let workspace = conversation_view.workspace().clone();
+    let action = Box::new(AutoPromptNewThread {
+        from_session_id: action.from_session_id,
+        from_title: action.from_title,
+        next_prompt: action.next_prompt,
+        work_dirs: action.work_dirs,
+    });
+
+    if let Some(workspace) = workspace.upgrade() {
+        workspace.update(cx, |_workspace, cx| {
+            window.dispatch_action(action, cx);
+        });
+        log::info!("[auto_prompt] dispatch_action: action dispatched via workspace");
+    } else {
+        log::error!("[auto_prompt] dispatch_action: workspace is gone, cannot dispatch");
+    }
 }
 
 fn is_cancelled(
@@ -87,6 +95,7 @@ fn is_cancelled(
 /// variants so the caller can store it in `ThreadView._auto_prompt_task`
 /// for cancellation support.
 pub fn on_thread_stopped(
+    conversation_view: &crate::ConversationView,
     thread: &gpui::Entity<acp_thread::AcpThread>,
     used_tools: bool,
     stop_reason: &StopReason,
@@ -119,7 +128,7 @@ pub fn on_thread_stopped(
                 "[auto_prompt] DispatchNow - dispatching action with prompt: {}",
                 action.next_prompt
             );
-            dispatch_action(action, window, cx);
+            dispatch_action(action, conversation_view, window, cx);
             None
         }
 
@@ -167,7 +176,7 @@ pub fn on_thread_stopped(
                 }
 
                 match _view.update_in(cx, |_view, window, cx| {
-                    dispatch_action(action, window, cx);
+                    dispatch_action(action, _view, window, cx);
                 }) {
                     Ok(()) => {
                         log::info!("[auto_prompt] DispatchAfterDelay dispatch submitted");
@@ -266,7 +275,7 @@ pub fn on_thread_stopped(
                             action.next_prompt
                         );
                         match _view.update_in(cx, |_view, window, cx| {
-                            dispatch_action(action, window, cx);
+                            dispatch_action(action, _view, window, cx);
                         }) {
                             Ok(()) => {
                                 log::info!("[auto_prompt] NeedsLlmCall dispatch submitted");
