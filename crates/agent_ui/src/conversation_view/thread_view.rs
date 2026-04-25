@@ -4332,21 +4332,14 @@ impl ThreadView {
                                     }
 
                                     log::info!("[auto_prompt] Retry succeeded - dispatching action");
-                                    match conversation_view.update_in(cx, |cv, window, cx| {
-                                        let workspace = cv.workspace().clone();
+                                    match conversation_view.update_in(cx, |_cv, window, cx| {
                                         let action = Box::new(crate::auto_prompt::AutoPromptNewThread {
                                             from_session_id: action.from_session_id,
                                             from_title: action.from_title,
                                             next_prompt: action.next_prompt,
                                             work_dirs: action.work_dirs,
                                         });
-                                        if let Some(workspace) = workspace.upgrade() {
-                                            workspace.update(cx, |_workspace, cx| {
-                                                window.dispatch_action(action, cx);
-                                            });
-                                        } else {
-                                            log::error!("[auto_prompt] Retry dispatch: workspace is gone, cannot dispatch action");
-                                        }
+                                        window.dispatch_action(action, cx);
                                     }) {
                                         Ok(()) => {
                                             log::info!("[auto_prompt] Retry dispatch submitted");
