@@ -16,16 +16,33 @@ AcpThreadEvent::Stopped(stop_reason)
   │   ├─ Used tools? No → NoAction
   │   ├─ Cancelled? Yes → NoAction
   │   ├─ Iteration > max? → NoAction
-  │   ├─ Token overflow? → DispatchNow("continue")
-  │   ├─ Error state? → DispatchAfterDelay("continue")
+  │   ├─ Language model configured? No → NoAction
+  │   ├─ Determine stop_phase (Working/PreStop) from VERIFICATION_COUNT
+  │   ├─ Token overflow (max_context_tokens)? → DispatchNow("continue")
+  │   ├─ StopReason::MaxTokens? → DispatchNow("continue")
+  │   ├─ Error state or Refusal? → DispatchAfterDelay("continue")
   │   └─ Otherwise → NeedsLlmCall(data)
   │
   └─ decide_with_llm() — async LLM call
-      ├─ Sends context JSON to orchestration LLM with simple rules
-      ├─ Parses JSON response (should_continue, next_prompt, confidence)
-      ├─ #ALL_PLAN_DONE or confidence < 0.5 → stop chain
-      ├─ Writes decision log to `.logs/` in project root
-      └─ Returns AutoPromptAction with next prompt
+      ├─ Call orchestration LLM with context JSON
+      ├─ On success:
+      │   ├─ Writes decision log to `.logs/` in project root
+      │   ├─ Parse response (should_continue, next_prompt, confidence, all_plan_done)
+      │   ├─ #ALL_PLAN_DONE in prompt or response.all_plan_done?
+      │   │   ├─ Find next plan file → yes → git branch commit + next plan
+      │   │   └─ no → should_continue? → gitflow commit : stop
+      │   ├─ Confidence < 0.5? → stop chain
+      │   ├─ should_continue=false AND no next_prompt?
+      │   │   ├─ verification_count=0? → pre-stop verification prompt, increment VERIFICATION_COUNT
+      │   │   ├─ verification_count < max_attempts? → stop
+      │   │   └─ verification_count >= max_attempts? → stop
+      │   ├─ Doc creation prompt + unchecked plan items? → override with checkbox verification
+      │   ├─ Continuing during PreStop (verification_count>0)? → reset VERIFICATION_COUNT
+      │   └─ Return AutoPromptAction with next_prompt
+      └─ On error:
+          ├─ Writes error log to `.logs/`
+          ├─ Stores LlmCallData for manual retry (if max retries exhausted)
+          └─ Returns error
 ```
 
 ### Debug logs
@@ -65,6 +82,18 @@ The orchestration LLM follows a simple priority order:
 5. **No plan but work incomplete** → "continue"
 6. **Confidence < 0.5** → stop
 
+### Pre-stop verification
+
+When the LLM indicates work is complete (`should_continue=false` with no prompt), the system enters a pre-stop verification phase:
+
+1. First attempt (`verification_count=0`): Build verification prompt to check:
+   - All compiler diagnostics and warnings fixed
+   - All tests passing
+   - No TODO/mock/placeholder/unwrap() in new code
+2. Increment `VERIFICATION_COUNT`
+3. If verification fails or LLM continues: Reset `VERIFICATION_COUNT` to 0 (new cycle)
+4. Subsequent attempts: Accept the stop condition
+
 ### Quality gates
 
 Before marking `all_plan_done=true`, the system enforces:
@@ -77,6 +106,7 @@ Before marking `all_plan_done=true`, the system enforces:
 
 - `AutoPromptDecision` — sync result: `NoAction`, `DispatchNow`, `DispatchAfterDelay`, `NeedsLlmCall`
 - `AutoPromptAction` — data needed to dispatch a follow-up prompt (session ID, title, prompt text)
+- `LlmCallData` — data for async LLM call (model, system prompt, context JSON, iteration count); stored on failure for manual retry
 - `AutoPromptContext` — serializable context payload sent to the orchestration LLM (includes `plan_files` and `doc_files`)
 - `AutoPromptResponse` — expected JSON response from the LLM
 - `AutoPromptConfig` — loaded from `~/.config/zed/auto_prompt.json` or env vars
@@ -85,7 +115,7 @@ Before marking `all_plan_done=true`, the system enforces:
 
 | File | Purpose |
 |------|---------|
-| `auto_prompt.rs` | `decide()` (sync), `decide_with_llm()` (async), system prompt, iteration tracking, plan/doc reading, LLM client |
+| `auto_prompt.rs` | `decide()` (sync), `decide_with_llm()` (async), system prompt, iteration tracking, plan/doc reading, LLM client, verification prompts |
 | `config.rs` | Config from `~/.config/zed/auto_prompt.json` or env vars |
 | `context.rs` | `AutoPromptContext`, `AutoPromptResponse`, plan/message serialization |
 
@@ -98,6 +128,41 @@ Before marking `all_plan_done=true`, the system enforces:
 - `on_thread_stopped()` delegates to `auto_prompt::decide()`, handles async LLM path
 
 Called from `conversation_view.rs` in the `AcpThreadEvent::Stopped` handler.
+
+### User Interface - Retry and Cancel
+
+The auto-prompt toggle button in the agent panel toolbar (sparkle icon) displays four states, each with distinct behavior:
+
+| Button State | Description | Click Behavior |
+|--------------|-------------|-----------------|
+| **"Auto"** | Auto-prompt is enabled and idle | Toggles to "Off" (disables auto-prompt) |
+| **"Off"** | Auto-prompt is disabled | Toggles to "Auto" (enables auto-prompt) |
+| **"Processing..."** | Auto-prompt is currently making an LLM decision or dispatching a follow-up prompt | Cancels the current operation (button returns to "Auto") |
+| **"Retry"** | LLM call failed after all automatic retry attempts | Manually retries the failed LLM call with the same data |
+
+#### Retry Mechanism
+
+When the orchestration LLM call fails after exhausting all automatic retries (`max_llm_retries`), the system:
+
+1. **Stores retry data**: The `LlmCallData` (model, system prompt, context JSON, etc.) is saved in the ThreadView for potential manual retry
+2. **Enters Failed state**: The button displays "Retry" with error color
+3. **Enables manual retry**: Clicking "Retry" triggers:
+   - LLM failure count reset for fresh retry attempt
+   - State changes to "Processing..." (button shows "Processing...")
+   - Async task spawned to call `decide_with_llm()` with the stored data
+   - On success: State → "Idle", retry data cleared, action dispatched
+   - On failure: State → "Failed", retry data restored (allows multiple manual retries)
+
+#### Cancel Mechanism
+
+When auto-prompt is processing (button shows "Processing..."), clicking the button:
+
+1. **Cancels the task**: Drops the current `_auto_prompt_task`, which cancels any ongoing LLM call or pending action dispatch
+2. **Resets state**: Sets `auto_prompt_state` to `Idle`
+3. **Resets iteration**: Clears the iteration counter via `reset_iteration()`
+4. **Stops processing**: The async task's `is_cancelled()` check prevents any further actions from being dispatched
+
+The cancel mechanism is useful for interrupting long-running LLM decisions or stopping the auto-prompt loop when the user wants to take manual control.
 
 ## Configuration
 
@@ -119,8 +184,10 @@ Config file: `~/.config/zed/auto_prompt.json`
 | `max_iterations` | `20` | Hard stop after this many auto-prompt cycles |
 | `max_context_tokens` | `80000` | Token threshold to force "continue" without LLM |
 | `backoff_base_ms` | `2000` | Base delay for exponential backoff on errors |
+| `max_llm_retries` | `3` | Max automatic retry attempts for LLM calls before giving up and showing "Retry" button |
+| `max_verification_attempts` | `3` | Max verification prompts in PreStop phase before accepting stop |
 
-Environment variable overrides: `ZED_AUTO_PROMPT_ENABLED`, `ZED_AUTO_PROMPT_MAX_ITERATIONS`, `ZED_AUTO_PROMPT_MAX_CONTEXT_TOKENS`, `ZED_AUTO_PROMPT_BACKOFF_BASE_MS`, `ZED_AUTO_PROMPT_SYSTEM_PROMPT`.
+Environment variable overrides: `ZED_AUTO_PROMPT_ENABLED`, `ZED_AUTO_PROMPT_MAX_ITERATIONS`, `ZED_AUTO_PROMPT_MAX_CONTEXT_TOKENS`, `ZED_AUTO_PROMPT_BACKOFF_BASE_MS`, `ZED_AUTO_PROMPT_SYSTEM_PROMPT`, `ZED_AUTO_PROMPT_MAX_LLM_RETRIES`.
 
 ## E2E Testing
 
