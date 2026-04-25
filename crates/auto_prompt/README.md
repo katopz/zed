@@ -45,6 +45,110 @@ AcpThreadEvent::Stopped(stop_reason)
           └─ Returns error
 ```
 
+```mermaid
+sequenceDiagram
+    participant User
+    participant Button as Auto-Prompt Button
+    participant TV as ThreadView
+    participant decide as decide()
+    participant decide_llm as decide_with_llm()
+    participant LLM as Orchestration LLM
+    participant Workspace as Workspace
+
+    Note over User,Workspace: Initial Flow
+    User->>TV: Thread stopped
+    TV->>decide: on_thread_stopped()
+    decide->>decide: Check config, tools, cancellation, iteration
+    decide->>decide: Determine stop_phase
+    decide->>decide: Check token limits and error state
+    
+    alt No action needed
+        decide-->>TV: NoAction
+        TV->>TV: State remains Idle
+    else Immediate dispatch
+        decide-->>TV: DispatchNow("continue")
+        TV->>Workspace: dispatch_action()
+    else Delayed dispatch
+        decide-->>TV: DispatchAfterDelay
+        TV->>TV: State = Processing
+        TV->>TV: Start delay timer
+        TV->>Workspace: dispatch_action() after delay
+    else Needs LLM call
+        decide-->>TV: NeedsLlmCall(data)
+        TV->>TV: State = Processing
+        TV->>decide_llm: decide_with_llm(data)
+        
+        Note over TV,decide_llm: Async LLM Call
+        decide_llm->>LLM: Call with context JSON
+        
+        alt Success
+            LLM-->>decide_llm: Return response
+            decide_llm->>decide_llm: Write decision log
+            decide_llm->>decide_llm: Parse response
+            
+            alt #ALL_PLAN_DONE
+                decide_llm->>decide_llm: Find next plan
+                decide_llm-->>TV: AutoPromptAction with next plan
+                TV->>Workspace: dispatch_action()
+            else Confidence < 0.5
+                decide_llm-->>TV: None (stop chain)
+                TV->>TV: State = Idle
+            else Pre-stop verification
+                decide_llm->>decide_llm: Build verification prompt
+                decide_llm->>decide_llm: Increment VERIFICATION_COUNT
+                decide_llm-->>TV: AutoPromptAction with verification
+                TV->>Workspace: dispatch_action()
+            else Continue
+                decide_llm-->>TV: AutoPromptAction with next_prompt
+                TV->>Workspace: dispatch_action()
+                TV->>TV: State = Idle
+            end
+        else Error (auto-retry)
+            decide_llm->>decide_llm: Increment failure count
+            decide_llm->>LLM: Retry with exponential backoff
+            
+            alt Max retries exhausted
+                decide_llm->>decide_llm: Write error log
+                decide_llm->>decide_llm: Store LlmCallData in TV
+                decide_llm-->>TV: Error
+                TV->>TV: State = Failed
+                TV->>Button: Show "Retry"
+                
+                Note over User,Button: Manual Retry Flow
+                User->>Button: Click "Retry"
+                Button->>TV: Retry action
+                TV->>TV: Reset failure count
+                TV->>TV: State = Processing
+                TV->>Button: Show "Processing..."
+                TV->>decide_llm: decide_with_llm(stored_data)
+                
+                alt Retry success
+                    decide_llm-->>TV: AutoPromptAction
+                    TV->>TV: State = Idle
+                    TV->>TV: Clear retry data
+                    TV->>Workspace: dispatch_action()
+                    TV->>Button: Show "Auto"
+                else Retry fails again
+                    decide_llm->>TV: Error
+                    TV->>TV: State = Failed
+                    TV->>TV: Restore retry data
+                    TV->>Button: Show "Retry"
+                end
+            end
+        end
+    end
+    
+    Note over User,Button: Cancel Flow
+    TV->>TV: State = Processing (LLM in progress)
+    User->>Button: Click "Processing..."
+    Button->>TV: Cancel operation
+    TV->>TV: _auto_prompt_task = None
+    TV->>TV: State = Idle
+    TV->>TV: reset_iteration()
+    TV->>Button: Show "Auto"
+    Note over decide_llm: Task checks is_cancelled() and stops
+```
+
 ### Debug logs
 
 Every LLM decision is logged to `.logs/` in the project root as JSON files:
