@@ -520,9 +520,7 @@ impl ThreadView {
             token_limit_callout_dismissed: false,
             last_token_limit_telemetry: None,
             thread_feedback: Default::default(),
-            auto_prompt_enabled: auto_prompt::load_config_cached()
-                .map(|c| c.enabled)
-                .unwrap_or(true),
+            auto_prompt_enabled: false,
             auto_prompt_state: Default::default(),
             _auto_prompt_task: None,
             _auto_prompt_retry_data: None,

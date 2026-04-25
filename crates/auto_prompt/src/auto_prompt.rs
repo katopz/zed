@@ -183,7 +183,7 @@ pub fn decide(
 
     let config = match load_config_cached() {
         Ok(c) => {
-            log::info!("[auto_prompt::decide] Config loaded: enabled={}", c.enabled);
+            log::info!("[auto_prompt::decide] Config loaded");
             c
         }
         Err(err) => {
@@ -192,12 +192,7 @@ pub fn decide(
         }
     };
 
-    if !config.enabled {
-        log::info!("[auto_prompt::decide] Auto-prompt is DISABLED in config");
-        return AutoPromptDecision::NoAction;
-    }
-
-    log::info!("[auto_prompt::decide] Auto-prompt is ENABLED");
+    log::info!("[auto_prompt::decide] Auto-prompt evaluating");
 
     if !used_tools {
         log::info!("[auto_prompt::decide] No tools were used, skipping auto-prompt");

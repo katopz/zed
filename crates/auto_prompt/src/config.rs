@@ -6,12 +6,11 @@ use std::path::PathBuf;
 ///
 /// Loaded from `~/.config/zed/auto_prompt.json` or environment variables.
 /// The LLM used is whatever Zed has configured as the default model.
+///
+/// Enable/disable is controlled by the UI toggle in the agent panel toolbar,
+/// not by this config file.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AutoPromptConfig {
-    /// Whether the auto-prompt hook is enabled.
-    #[serde(default)]
-    pub enabled: bool,
-
     /// Optional system prompt to use when calling the LLM.
     /// Defaults to a built-in prompt that instructs the model to return JSON.
     #[serde(default)]
@@ -67,7 +66,6 @@ fn default_max_llm_retries() -> u32 {
 impl Default for AutoPromptConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
             system_prompt: None,
             max_iterations: default_max_iterations(),
             max_context_tokens: default_max_context_tokens(),
@@ -96,8 +94,7 @@ impl AutoPromptConfig {
             let content = std::fs::read_to_string(&path)?;
             let config: Self = serde_json::from_str(&content)?;
             log::info!(
-                "[auto_prompt::config] Loaded from file: enabled={}, max_iterations={}",
-                config.enabled,
+                "[auto_prompt::config] Loaded from file: max_iterations={}",
                 config.max_iterations
             );
             return Ok(config);
@@ -108,8 +105,7 @@ impl AutoPromptConfig {
         );
         let config = Self::from_env();
         log::info!(
-            "[auto_prompt::config] Loaded from env: enabled={}, max_iterations={}",
-            config.enabled,
+            "[auto_prompt::config] Loaded from env: max_iterations={}",
             config.max_iterations
         );
         Ok(config)
@@ -117,10 +113,6 @@ impl AutoPromptConfig {
 
     /// Build config from environment variables.
     fn from_env() -> Self {
-        let enabled = std::env::var("ZED_AUTO_PROMPT_ENABLED")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-
         let system_prompt = std::env::var("ZED_AUTO_PROMPT_SYSTEM_PROMPT").ok();
 
         let max_iterations = std::env::var("ZED_AUTO_PROMPT_MAX_ITERATIONS")
@@ -149,7 +141,6 @@ impl AutoPromptConfig {
             .unwrap_or_else(default_max_llm_retries);
 
         Self {
-            enabled,
             system_prompt,
             max_iterations,
             max_context_tokens,
