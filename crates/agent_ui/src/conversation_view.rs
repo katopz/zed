@@ -1683,19 +1683,24 @@ impl ConversationView {
                     );
                     // Call auto-prompt for error events (e.g., rate limits)
                     let used_tools = thread.read(cx).used_tools_since_last_user_message();
-                    if let Some(task) = crate::auto_prompt::on_thread_stopped(
-                        self,
-                        &thread,
-                        used_tools,
-                        &acp::StopReason::MaxTokens, // Use MaxTokens as error indicator
-                        window,
-                        cx,
-                    ) {
-                        if let Some(active) = self.active_thread() {
-                            active.update(cx, |active, cx| {
-                                active._auto_prompt_task = Some(task);
-                                cx.notify();
-                            });
+                    let auto_prompt_enabled = self
+                        .active_thread()
+                        .is_some_and(|tv| tv.read(cx).auto_prompt_enabled);
+                    if auto_prompt_enabled {
+                        if let Some(task) = crate::auto_prompt::on_thread_stopped(
+                            self,
+                            &thread,
+                            used_tools,
+                            &acp::StopReason::MaxTokens, // Use MaxTokens as error indicator
+                            window,
+                            cx,
+                        ) {
+                            if let Some(active) = self.active_thread() {
+                                active.update(cx, |active, cx| {
+                                    active._auto_prompt_task = Some(task);
+                                    cx.notify();
+                                });
+                            }
                         }
                     }
                 }
