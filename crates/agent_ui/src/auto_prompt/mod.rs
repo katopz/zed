@@ -46,7 +46,7 @@ pub struct AutoPromptNewThread {
 
 fn dispatch_action(
     action: auto_prompt::AutoPromptAction,
-    conversation_view: &crate::ConversationView,
+    _conversation_view: &crate::ConversationView,
     window: &mut Window,
     cx: &mut gpui::Context<crate::ConversationView>,
 ) {
@@ -55,7 +55,6 @@ fn dispatch_action(
         action.next_prompt.len()
     );
 
-    let workspace = conversation_view.workspace().clone();
     let action = Box::new(AutoPromptNewThread {
         from_session_id: action.from_session_id,
         from_title: action.from_title,
@@ -63,14 +62,8 @@ fn dispatch_action(
         work_dirs: action.work_dirs,
     });
 
-    if let Some(workspace) = workspace.upgrade() {
-        workspace.update(cx, |_workspace, cx| {
-            window.dispatch_action(action, cx);
-        });
-        log::info!("[auto_prompt] dispatch_action: action dispatched via workspace");
-    } else {
-        log::error!("[auto_prompt] dispatch_action: workspace is gone, cannot dispatch");
-    }
+    window.dispatch_action(action, cx);
+    log::info!("[auto_prompt] dispatch_action: action dispatched");
 }
 
 fn is_cancelled(
