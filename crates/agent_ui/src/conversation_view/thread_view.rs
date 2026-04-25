@@ -286,6 +286,7 @@ pub struct ThreadView {
     pub token_limit_callout_dismissed: bool,
     pub last_token_limit_telemetry: Option<acp_thread::TokenUsageRatio>,
     thread_feedback: ThreadFeedbackState,
+    pub auto_prompt_enabled: bool,
     pub auto_prompt_state: crate::auto_prompt::AutoPromptState,
     pub _auto_prompt_task: Option<gpui::Task<()>>,
     pub _auto_prompt_retry_data: Option<auto_prompt::LlmCallData>,
@@ -519,6 +520,9 @@ impl ThreadView {
             token_limit_callout_dismissed: false,
             last_token_limit_telemetry: None,
             thread_feedback: Default::default(),
+            auto_prompt_enabled: auto_prompt::load_config_cached()
+                .map(|c| c.enabled)
+                .unwrap_or(true),
             auto_prompt_state: Default::default(),
             _auto_prompt_task: None,
             _auto_prompt_retry_data: None,
@@ -4251,9 +4255,7 @@ impl ThreadView {
     }
 
     fn render_auto_prompt_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let enabled = auto_prompt::load_config_cached()
-            .map(|c| c.enabled)
-            .unwrap_or(true);
+        let enabled = self.auto_prompt_enabled;
 
         let is_processing = matches!(
             self.auto_prompt_state,
@@ -4386,14 +4388,10 @@ impl ThreadView {
                     return;
                 }
 
-                let mut config = auto_prompt::load_config_cached().unwrap_or_default();
-                config.enabled = !config.enabled;
-                if let Err(err) = config.save() {
-                    log::warn!("auto_prompt: failed to save config: {err}");
-                }
+                this.auto_prompt_enabled = !this.auto_prompt_enabled;
                 log::info!(
                     "auto_prompt: {}",
-                    if config.enabled {
+                    if this.auto_prompt_enabled {
                         "enabled"
                     } else {
                         "disabled"

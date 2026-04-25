@@ -210,21 +210,21 @@ pub fn init(cx: &mut App) {
                 })
                 .register_action(|workspace, _: &ToggleAutoPrompt, _window, cx| {
                     if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
-                        panel.update(cx, |_panel, cx| {
-                            let mut config = auto_prompt::load_config_cached().unwrap_or_default();
-                            config.enabled = !config.enabled;
-                            if let Err(err) = config.save() {
-                                log::warn!("auto_prompt: failed to save config: {err}");
+                        panel.update(cx, |panel, cx| {
+                            if let Some(tv) = panel.active_thread_view(cx) {
+                                tv.update(cx, |tv, cx| {
+                                    tv.auto_prompt_enabled = !tv.auto_prompt_enabled;
+                                    log::info!(
+                                        "auto_prompt: {}",
+                                        if tv.auto_prompt_enabled {
+                                            "enabled"
+                                        } else {
+                                            "disabled"
+                                        }
+                                    );
+                                    cx.notify();
+                                });
                             }
-                            log::info!(
-                                "auto_prompt: {}",
-                                if config.enabled {
-                                    "enabled"
-                                } else {
-                                    "disabled"
-                                }
-                            );
-                            cx.notify();
                         });
                     }
                 })
