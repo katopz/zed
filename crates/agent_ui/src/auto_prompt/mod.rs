@@ -303,6 +303,7 @@ pub fn on_thread_stopped(
                         if let Some(ref tv) = thread_weak {
                             if let Err(update_err) = tv.update(cx, |tv, cx| {
                                 tv.auto_prompt_state = AutoPromptState::Failed;
+                                tv._auto_prompt_retry_data = Some(data.clone());
                                 cx.notify();
                             }) {
                                 log::warn!("[auto_prompt] failed to set Failed state: {update_err}");

@@ -288,6 +288,7 @@ pub struct ThreadView {
     thread_feedback: ThreadFeedbackState,
     pub auto_prompt_state: crate::auto_prompt::AutoPromptState,
     pub _auto_prompt_task: Option<gpui::Task<()>>,
+    pub _auto_prompt_retry_data: Option<auto_prompt::LlmCallData>,
     pub list_state: ListState,
     pub session_capabilities: SharedSessionCapabilities,
     /// Tracks which tool calls have their content/output expanded.
@@ -521,6 +522,7 @@ impl ThreadView {
             thread_feedback: Default::default(),
             auto_prompt_state: Default::default(),
             _auto_prompt_task: None,
+            _auto_prompt_retry_data: None,
             expanded_tool_calls: HashSet::default(),
             expanded_tool_call_raw_inputs: HashSet::default(),
             expanded_thinking_blocks: HashSet::default(),
@@ -4353,7 +4355,7 @@ impl ThreadView {
             .tooltip(move |_, cx| {
                 Tooltip::for_action("Auto-Prompt", &crate::auto_prompt::ToggleAutoPrompt, cx)
             })
-            .on_click(cx.listener(move |this, _, _, cx| {
+            .on_click(cx.listener(move |this, _, window, cx| {
                 if is_processing {
                     log::info!("[auto_prompt] Cancelling auto-prompt processing");
                     this._auto_prompt_task = None;
@@ -4364,9 +4366,97 @@ impl ThreadView {
                 }
                 if is_failed {
                     log::info!("[auto_prompt] Manual retry triggered by user");
-                    this.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;
-                    auto_prompt::reset_llm_failure_count(); // Reset counter for fresh retry
-                    cx.notify();
+                    if let Some(retry_data) = this._auto_prompt_retry_data.take() {
+                        let retry_data_for_restore = retry_data.clone();
+                        auto_prompt::reset_llm_failure_count(); // Reset counter for fresh retry
+                        this.auto_prompt_state = crate::auto_prompt::AutoPromptState::Processing;
+                        cx.notify();
+
+                        let conversation_view = this.server_view.clone();
+
+                        this._auto_prompt_task = Some(cx.spawn_in(window, async move |_this, cx| {
+                            let thread_weak = conversation_view
+                                .update_in(cx, |cv, _window, _cx| {
+                                    cv.active_thread()
+                                        .map(|tv| tv.downgrade())
+                                })
+                                .unwrap_or(None);
+
+                            let result = auto_prompt::decide_with_llm(retry_data, cx).await;
+
+                            log::info!("[auto_prompt] Retry LLM call completed");
+
+                            match result {
+                                Ok(Some(action)) => {
+                                    if let Some(ref tv) = thread_weak {
+                                        if let Err(err) = tv.update(cx, |tv, cx| {
+                                            tv.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;
+                                            tv._auto_prompt_retry_data = None;
+                                            cx.notify();
+                                        }) {
+                                            log::warn!("[auto_prompt] failed to reset state after retry: {err}");
+                                        }
+                                    }
+
+                                    log::info!("[auto_prompt] Retry succeeded - dispatching action");
+                                    match conversation_view.update_in(cx, |cv, window, cx| {
+                                        let workspace = cv.workspace().clone();
+                                        let action = Box::new(crate::auto_prompt::AutoPromptNewThread {
+                                            from_session_id: action.from_session_id,
+                                            from_title: action.from_title,
+                                            next_prompt: action.next_prompt,
+                                            work_dirs: action.work_dirs,
+                                        });
+                                        if let Some(workspace) = workspace.upgrade() {
+                                            workspace.update(cx, |_workspace, cx| {
+                                                window.dispatch_action(action, cx);
+                                            });
+                                        } else {
+                                            log::error!("[auto_prompt] Retry dispatch: workspace is gone, cannot dispatch action");
+                                        }
+                                    }) {
+                                        Ok(()) => {
+                                            log::info!("[auto_prompt] Retry dispatch submitted");
+                                        }
+                                        Err(err) => {
+                                            log::warn!("[auto_prompt] FAILED to dispatch retry action (view may have been dropped): {err}");
+                                        }
+                                    }
+                                }
+                                Ok(None) => {
+                                    if let Some(ref tv) = thread_weak {
+                                        if let Err(err) = tv.update(cx, |tv, cx| {
+                                            tv.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;
+                                            tv._auto_prompt_retry_data = None;
+                                            cx.notify();
+                                        }) {
+                                            log::warn!("[auto_prompt] failed to reset state on retry no-action: {err}");
+                                        }
+                                    }
+                                    log::info!("[auto_prompt] Retry returned no action (normal stop)");
+                                }
+                                Err(err) => {
+                                    // Retry failed again - set back to Failed state and restore retry data
+                                    if let Some(ref tv) = thread_weak {
+                                        if let Err(update_err) = tv.update(cx, |tv, cx| {
+                                            tv.auto_prompt_state = crate::auto_prompt::AutoPromptState::Failed;
+                                            tv._auto_prompt_retry_data = Some(retry_data_for_restore);
+                                            cx.notify();
+                                        }) {
+                                            log::warn!("[auto_prompt] failed to set Failed state after retry: {update_err}");
+                                        }
+                                    }
+                                    log::warn!(
+                                        "[auto_prompt] Retry failed: {err}"
+                                    );
+                                }
+                            }
+                        }));
+                    } else {
+                        log::warn!("[auto_prompt] No retry data available, cannot retry");
+                        this.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;
+                        cx.notify();
+                    }
                     return;
                 }
 
