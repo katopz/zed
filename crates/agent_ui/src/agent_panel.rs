@@ -1453,6 +1453,13 @@ impl AgentPanel {
             cx,
         );
 
+        if let Some(thread_view) = self.active_thread_view(cx) {
+            thread_view.update(cx, |tv, cx| {
+                tv.auto_prompt_enabled = true;
+                cx.notify();
+            });
+        }
+
         log::info!("[auto_prompt] auto_prompt_new_thread: thread created successfully");
     }
 
