@@ -1,7 +1,17 @@
 use acp::schema::{SessionId, StopReason};
 use agent_client_protocol as acp;
 use gpui::Window;
+use prompt_store::{BuiltInPrompt, PromptId, PromptStore};
 use std::path::PathBuf;
+
+async fn load_auto_prompt_system_prompt(cx: &mut gpui::AsyncWindowContext) -> Option<String> {
+    let store_future = cx.update(|_window, cx| PromptStore::global(cx)).ok()?;
+    let store = store_future.await.ok()?;
+    let task = store.update(cx, |s, cx| {
+        s.load(PromptId::BuiltIn(BuiltInPrompt::AutoPromptSystemPrompt), cx)
+    });
+    task.await.ok()
+}
 
 /// Toggle auto-prompt on/off from the agent panel toolbar.
 #[derive(Clone, Debug, Default, PartialEq, serde::Deserialize, serde::Serialize, gpui::Action)]
@@ -210,6 +220,19 @@ pub fn on_thread_stopped(
                     });
 
                 let config = auto_prompt::load_config_cached().unwrap_or_default();
+
+                let store_prompt = load_auto_prompt_system_prompt(cx).await;
+
+                let mut data = data;
+                match config.system_prompt.as_ref() {
+                    Some(prompt) => data.system_prompt = prompt.clone(),
+                    None => {
+                        if let Some(store_prompt) = store_prompt {
+                            data.system_prompt = store_prompt;
+                        }
+                    }
+                }
+
                 let mut result = auto_prompt::decide_with_llm(data.clone(), cx).await;
 
                 // Retry loop with exponential backoff
