@@ -1439,7 +1439,7 @@ impl AgentPanel {
         );
 
         self.external_thread(
-            Some(Agent::NativeAgent),
+            None,
             None,
             work_dirs,
             None,
