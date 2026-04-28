@@ -61,12 +61,14 @@ impl PromptMetadata {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, EnumIter)]
 pub enum BuiltInPrompt {
     CommitMessage,
+    AutoPromptSystemPrompt,
 }
 
 impl BuiltInPrompt {
     pub fn title(&self) -> &'static str {
         match self {
             Self::CommitMessage => "Commit message",
+            Self::AutoPromptSystemPrompt => "Auto prompt system prompt",
         }
     }
 
@@ -74,6 +76,9 @@ impl BuiltInPrompt {
     pub fn default_content(&self) -> &'static str {
         match self {
             Self::CommitMessage => include_str!("../../git_ui/src/commit_message_prompt.txt"),
+            Self::AutoPromptSystemPrompt => {
+                include_str!("../default_auto_prompt_system_prompt.txt")
+            }
         }
     }
 }
@@ -82,6 +87,7 @@ impl std::fmt::Display for BuiltInPrompt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::CommitMessage => write!(f, "Commit message"),
+            Self::AutoPromptSystemPrompt => write!(f, "Auto prompt system prompt"),
         }
     }
 }
