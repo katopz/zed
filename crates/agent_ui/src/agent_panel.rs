@@ -614,6 +614,7 @@ pub fn init(cx: &mut App) {
                             Some(AgentInitialContent::ContentBlock {
                                 blocks: content_blocks,
                                 auto_submit: true,
+                                auto_prompt_enabled: false,
                             }),
                             true,
                             AgentThreadSource::GitPanel,
@@ -641,6 +642,7 @@ pub fn init(cx: &mut App) {
                                 Some(AgentInitialContent::ContentBlock {
                                     blocks: content_blocks,
                                     auto_submit: true,
+                                    auto_prompt_enabled: false,
                                 }),
                                 true,
                                 AgentThreadSource::GitPanel,
@@ -670,6 +672,7 @@ pub fn init(cx: &mut App) {
                                 Some(AgentInitialContent::ContentBlock {
                                     blocks: content_blocks,
                                     auto_submit: true,
+                                    auto_prompt_enabled: false,
                                 }),
                                 true,
                                 AgentThreadSource::GitPanel,
