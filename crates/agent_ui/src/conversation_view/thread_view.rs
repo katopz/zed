@@ -753,7 +753,7 @@ impl ThreadView {
         let placeholder = placeholder_text(agent_display_name.as_ref(), has_slash_completions);
 
         let mut should_auto_submit = false;
-        let mut should_auto_prompt = false;
+        let mut should_auto_prompt = true;
         let mut show_external_source_prompt_warning = false;
 
         let message_editor = cx.new(|cx| {
