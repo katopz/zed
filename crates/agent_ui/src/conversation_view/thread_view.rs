@@ -4389,7 +4389,8 @@ impl ThreadView {
                     return;
                 }
 
-                this.auto_prompt_enabled = !this.auto_prompt_enabled;
+                let new_enabled = !this.auto_prompt_enabled;
+                this.auto_prompt_enabled = new_enabled;
                 log::info!(
                     "auto_prompt: {}",
                     if this.auto_prompt_enabled {
@@ -4398,6 +4399,13 @@ impl ThreadView {
                         "disabled"
                     }
                 );
+                if let Some(workspace) = this.workspace.upgrade() {
+                    if let Some(panel) = workspace.read(cx).panel::<crate::AgentPanel>(cx) {
+                        panel.update(cx, |panel, _| {
+                            panel.set_auto_prompt_enabled(new_enabled);
+                        });
+                    }
+                }
                 cx.notify();
             }))
     }

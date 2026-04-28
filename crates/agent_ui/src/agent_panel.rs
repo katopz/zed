@@ -212,8 +212,9 @@ pub fn init(cx: &mut App) {
                     if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
                         panel.update(cx, |panel, cx| {
                             if let Some(tv) = panel.active_thread_view(cx) {
+                                let new_enabled = !tv.read(cx).auto_prompt_enabled;
                                 tv.update(cx, |tv, cx| {
-                                    tv.auto_prompt_enabled = !tv.auto_prompt_enabled;
+                                    tv.auto_prompt_enabled = new_enabled;
                                     log::info!(
                                         "auto_prompt: {}",
                                         if tv.auto_prompt_enabled {
@@ -224,6 +225,7 @@ pub fn init(cx: &mut App) {
                                     );
                                     cx.notify();
                                 });
+                                panel.auto_prompt_enabled = new_enabled;
                             }
                         });
                     }
@@ -384,7 +386,7 @@ pub fn init(cx: &mut App) {
                             Some(AgentInitialContent::ContentBlock {
                                 blocks: content_blocks,
                                 auto_submit: true,
-                                auto_prompt_enabled: false,
+                                auto_prompt_enabled: true,
                             }),
                             true,
                             "git_panel",
@@ -412,7 +414,7 @@ pub fn init(cx: &mut App) {
                                 Some(AgentInitialContent::ContentBlock {
                                     blocks: content_blocks,
                                     auto_submit: true,
-                                    auto_prompt_enabled: false,
+                                    auto_prompt_enabled: true,
                                 }),
                                 true,
                                 "git_panel",
@@ -442,7 +444,7 @@ pub fn init(cx: &mut App) {
                                 Some(AgentInitialContent::ContentBlock {
                                     blocks: content_blocks,
                                     auto_submit: true,
-                                    auto_prompt_enabled: false,
+                                    auto_prompt_enabled: true,
                                 }),
                                 true,
                                 "git_panel",
@@ -743,6 +745,7 @@ pub struct AgentPanel {
     new_user_onboarding: Entity<AgentPanelOnboarding>,
     new_user_onboarding_upsell_dismissed: AtomicBool,
     selected_agent: Agent,
+    auto_prompt_enabled: bool,
     _thread_view_subscription: Option<Subscription>,
     _active_thread_focus_subscription: Option<Subscription>,
     _base_view_observation: Option<Subscription>,
@@ -953,7 +956,7 @@ impl AgentPanel {
                             AgentInitialContent::ContentBlock {
                                 blocks,
                                 auto_submit: false,
-                                auto_prompt_enabled: false,
+                                auto_prompt_enabled: panel.auto_prompt_enabled,
                             }
                         });
                         let thread = panel.create_agent_thread(
@@ -1101,6 +1104,7 @@ impl AgentPanel {
             new_user_onboarding: onboarding,
             thread_store,
             selected_agent: Agent::default(),
+            auto_prompt_enabled: true,
             _thread_view_subscription: None,
             _active_thread_focus_subscription: None,
             new_user_onboarding_upsell_dismissed: AtomicBool::new(OnboardingUpsell::dismissed(cx)),
@@ -1234,6 +1238,10 @@ impl AgentPanel {
         self.activate_draft(true, "agent_panel", window, cx);
     }
 
+    pub fn set_auto_prompt_enabled(&mut self, enabled: bool) {
+        self.auto_prompt_enabled = enabled;
+    }
+
     pub fn new_external_agent_thread(
         &mut self,
         action: &NewExternalAgentThread,
@@ -1287,13 +1295,35 @@ impl AgentPanel {
             self.draft_thread = None;
             self._draft_editor_observation = None;
         }
-        let previous_content = self.active_initial_content(cx);
+        let initial_content = self
+            .active_initial_content(cx)
+            .map(|mut content| {
+                if let AgentInitialContent::ContentBlock {
+                    auto_prompt_enabled,
+                    ..
+                } = &mut content
+                {
+                    *auto_prompt_enabled = self.auto_prompt_enabled;
+                }
+                content
+            })
+            .or_else(|| {
+                if self.auto_prompt_enabled {
+                    Some(AgentInitialContent::ContentBlock {
+                        blocks: vec![],
+                        auto_submit: false,
+                        auto_prompt_enabled: true,
+                    })
+                } else {
+                    None
+                }
+            });
         let thread = self.create_agent_thread(
             desired_agent,
             None,
             None,
             None,
-            previous_content,
+            initial_content,
             source,
             window,
             cx,
@@ -2702,7 +2732,7 @@ impl AgentPanel {
                 .map(|draft| AgentInitialContent::ContentBlock {
                     blocks: draft.to_vec(),
                     auto_submit: false,
-                    auto_prompt_enabled: false,
+                    auto_prompt_enabled: true,
                 })
                 .filter(|initial_content| match initial_content {
                     AgentInitialContent::ContentBlock { blocks, .. } => !blocks.is_empty(),
@@ -2716,7 +2746,7 @@ impl AgentPanel {
                         Some(AgentInitialContent::ContentBlock {
                             blocks: vec![acp::ContentBlock::Text(acp::TextContent::new(text))],
                             auto_submit: false,
-                            auto_prompt_enabled: false,
+                            auto_prompt_enabled: true,
                         })
                     }
                 })
