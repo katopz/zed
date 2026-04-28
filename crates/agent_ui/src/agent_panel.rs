@@ -417,8 +417,9 @@ pub fn init(cx: &mut App) {
                     if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
                         panel.update(cx, |panel, cx| {
                             if let Some(tv) = panel.active_thread_view(cx) {
+                                let new_enabled = !tv.read(cx).auto_prompt_enabled;
                                 tv.update(cx, |tv, cx| {
-                                    tv.auto_prompt_enabled = !tv.auto_prompt_enabled;
+                                    tv.auto_prompt_enabled = new_enabled;
                                     log::info!(
                                         "auto_prompt: {}",
                                         if tv.auto_prompt_enabled {
@@ -429,6 +430,7 @@ pub fn init(cx: &mut App) {
                                     );
                                     cx.notify();
                                 });
+                                panel.auto_prompt_enabled = new_enabled;
                             }
                         });
                     }
@@ -614,7 +616,7 @@ pub fn init(cx: &mut App) {
                             Some(AgentInitialContent::ContentBlock {
                                 blocks: content_blocks,
                                 auto_submit: true,
-                                auto_prompt_enabled: false,
+                                auto_prompt_enabled: true,
                             }),
                             true,
                             AgentThreadSource::GitPanel,
@@ -642,7 +644,7 @@ pub fn init(cx: &mut App) {
                                 Some(AgentInitialContent::ContentBlock {
                                     blocks: content_blocks,
                                     auto_submit: true,
-                                    auto_prompt_enabled: false,
+                                    auto_prompt_enabled: true,
                                 }),
                                 true,
                                 AgentThreadSource::GitPanel,
@@ -672,7 +674,7 @@ pub fn init(cx: &mut App) {
                                 Some(AgentInitialContent::ContentBlock {
                                     blocks: content_blocks,
                                     auto_submit: true,
-                                    auto_prompt_enabled: false,
+                                    auto_prompt_enabled: true,
                                 }),
                                 true,
                                 AgentThreadSource::GitPanel,
@@ -1225,6 +1227,7 @@ pub struct AgentPanel {
     new_user_onboarding: Entity<AgentPanelOnboarding>,
     new_user_onboarding_upsell_dismissed: AtomicBool,
     selected_agent: Agent,
+    auto_prompt_enabled: bool,
     _thread_view_subscription: Option<Subscription>,
     _active_thread_focus_subscription: Option<Subscription>,
     _base_view_observation: Option<Subscription>,
@@ -1631,6 +1634,7 @@ impl AgentPanel {
             new_user_onboarding: onboarding,
             thread_store,
             selected_agent: Agent::default(),
+            auto_prompt_enabled: true,
             _thread_view_subscription: None,
             _active_thread_focus_subscription: None,
             new_user_onboarding_upsell_dismissed: AtomicBool::new(OnboardingUpsell::dismissed(cx)),
@@ -1957,6 +1961,10 @@ impl AgentPanel {
         );
         self.observe_draft_editor(&thread.conversation_view, cx);
         self.draft_thread = Some(thread.conversation_view);
+    }
+
+    pub fn set_auto_prompt_enabled(&mut self, enabled: bool) {
+        self.auto_prompt_enabled = enabled;
     }
 
     pub fn new_external_agent_thread(
