@@ -384,6 +384,7 @@ pub fn init(cx: &mut App) {
                             Some(AgentInitialContent::ContentBlock {
                                 blocks: content_blocks,
                                 auto_submit: true,
+                                auto_prompt_enabled: false,
                             }),
                             true,
                             "git_panel",
@@ -411,6 +412,7 @@ pub fn init(cx: &mut App) {
                                 Some(AgentInitialContent::ContentBlock {
                                     blocks: content_blocks,
                                     auto_submit: true,
+                                    auto_prompt_enabled: false,
                                 }),
                                 true,
                                 "git_panel",
@@ -440,6 +442,7 @@ pub fn init(cx: &mut App) {
                                 Some(AgentInitialContent::ContentBlock {
                                     blocks: content_blocks,
                                     auto_submit: true,
+                                    auto_prompt_enabled: false,
                                 }),
                                 true,
                                 "git_panel",
@@ -950,6 +953,7 @@ impl AgentPanel {
                             AgentInitialContent::ContentBlock {
                                 blocks,
                                 auto_submit: false,
+                                auto_prompt_enabled: false,
                             }
                         });
                         let thread = panel.create_agent_thread(
@@ -1446,19 +1450,13 @@ impl AgentPanel {
             Some(AgentInitialContent::ContentBlock {
                 blocks,
                 auto_submit: true,
+                auto_prompt_enabled: true,
             }),
             true,
             "auto_prompt",
             window,
             cx,
         );
-
-        if let Some(thread_view) = self.active_thread_view(cx) {
-            thread_view.update(cx, |tv, cx| {
-                tv.auto_prompt_enabled = true;
-                cx.notify();
-            });
-        }
 
         log::info!("[auto_prompt] auto_prompt_new_thread: thread created successfully");
     }
@@ -2704,6 +2702,7 @@ impl AgentPanel {
                 .map(|draft| AgentInitialContent::ContentBlock {
                     blocks: draft.to_vec(),
                     auto_submit: false,
+                    auto_prompt_enabled: false,
                 })
                 .filter(|initial_content| match initial_content {
                     AgentInitialContent::ContentBlock { blocks, .. } => !blocks.is_empty(),
@@ -2717,6 +2716,7 @@ impl AgentPanel {
                         Some(AgentInitialContent::ContentBlock {
                             blocks: vec![acp::ContentBlock::Text(acp::TextContent::new(text))],
                             auto_submit: false,
+                            auto_prompt_enabled: false,
                         })
                     }
                 })

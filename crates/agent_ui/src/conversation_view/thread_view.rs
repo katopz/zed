@@ -387,6 +387,7 @@ impl ThreadView {
         let placeholder = placeholder_text(agent_display_name.as_ref(), has_commands);
 
         let mut should_auto_submit = false;
+        let mut should_auto_prompt = false;
         let mut show_external_source_prompt_warning = false;
 
         let message_editor = cx.new(|cx| {
@@ -413,8 +414,10 @@ impl ThreadView {
                     AgentInitialContent::ContentBlock {
                         blocks,
                         auto_submit,
+                        auto_prompt_enabled,
                     } => {
                         should_auto_submit = auto_submit;
+                        should_auto_prompt = auto_prompt_enabled;
                         editor.set_message(blocks, window, cx);
                     }
                     AgentInitialContent::FromExternalSource(prompt) => {
@@ -520,7 +523,7 @@ impl ThreadView {
             token_limit_callout_dismissed: false,
             last_token_limit_telemetry: None,
             thread_feedback: Default::default(),
-            auto_prompt_enabled: false,
+            auto_prompt_enabled: should_auto_prompt,
             auto_prompt_state: Default::default(),
             _auto_prompt_task: None,
             _auto_prompt_retry_data: None,

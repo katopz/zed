@@ -346,6 +346,7 @@ pub enum AgentInitialContent {
     ContentBlock {
         blocks: Vec<acp::ContentBlock>,
         auto_submit: bool,
+        auto_prompt_enabled: bool,
     },
     FromExternalSource(ExternalSourcePrompt),
 }
