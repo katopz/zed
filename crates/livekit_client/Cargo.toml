@@ -43,7 +43,7 @@ smallvec.workspace = true
 ui.workspace = true
 util.workspace = true
 
-[target.'cfg(not(any(all(target_os = "windows", target_env = "gnu"), target_os = "freebsd")))'.dependencies]
+[target.'cfg(not(any(target_os = "windows", target_os = "freebsd")))'.dependencies]
 libwebrtc.workspace = true
 livekit.workspace = true
 

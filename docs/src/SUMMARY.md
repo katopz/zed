@@ -196,6 +196,7 @@
   - [macOS](./development/macos.md)
   - [Linux](./development/linux.md)
   - [Windows](./development/windows.md)
+  - [Windows Build Notes](./development/windows-notes.md)
   - [FreeBSD](./development/freebsd.md)
   - [Using Debuggers](./development/debuggers.md)
   - [Performance](./performance.md)
