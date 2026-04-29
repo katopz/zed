@@ -131,7 +131,7 @@ fn compute_network_stats(stats: &livekit_client::SessionStats) -> ComputedNetwor
     any(
         test,
         feature = "test-support",
-        all(target_os = "windows", target_env = "gnu"),
+        target_os = "windows",
         target_os = "freebsd"
     )
 ))]
@@ -149,7 +149,7 @@ fn extract_metrics(
     not(any(
         test,
         feature = "test-support",
-        all(target_os = "windows", target_env = "gnu"),
+        target_os = "windows",
         target_os = "freebsd"
     ))
 ))]

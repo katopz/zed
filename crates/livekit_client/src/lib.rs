@@ -14,7 +14,7 @@ pub use record::CaptureInput;
     not(any(
         test,
         feature = "test-support",
-        all(target_os = "windows", target_env = "gnu"),
+        target_os = "windows",
         target_os = "freebsd"
     ))
 ))]
@@ -24,7 +24,7 @@ mod livekit_client;
     not(any(
         test,
         feature = "test-support",
-        all(target_os = "windows", target_env = "gnu"),
+        target_os = "windows",
         target_os = "freebsd"
     ))
 ))]
@@ -35,7 +35,7 @@ pub use livekit_client::*;
     any(
         test,
         feature = "test-support",
-        all(target_os = "windows", target_env = "gnu"),
+        target_os = "windows",
         target_os = "freebsd"
     )
 ))]
@@ -45,7 +45,7 @@ mod mock_client;
     any(
         test,
         feature = "test-support",
-        all(target_os = "windows", target_env = "gnu"),
+        target_os = "windows",
         target_os = "freebsd"
     )
 ))]
@@ -55,7 +55,7 @@ pub mod test;
     any(
         test,
         feature = "test-support",
-        all(target_os = "windows", target_env = "gnu"),
+        target_os = "windows",
         target_os = "freebsd"
     )
 ))]
