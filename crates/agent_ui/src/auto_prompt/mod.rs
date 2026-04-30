@@ -53,6 +53,10 @@ pub struct AutoPromptNewThread {
     pub next_prompt: String,
     /// Work directories to propagate to the new thread.
     pub work_dirs: Option<Vec<PathBuf>>,
+    /// The raw original user message from the very first thread,
+    /// carried across chain hops to prevent summary drift.
+    #[serde(default)]
+    pub original_user_message: Option<String>,
 }
 
 fn dispatch_action(
@@ -71,6 +75,7 @@ fn dispatch_action(
         from_title: action.from_title,
         next_prompt: action.next_prompt,
         work_dirs: action.work_dirs,
+        original_user_message: action.original_user_message,
     });
 
     window.dispatch_action(action, cx);

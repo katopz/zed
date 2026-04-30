@@ -14,6 +14,8 @@ rustflags = [
     "windows_slim_errors",        # This cfg will reduce the size of `windows::core::Error` from 16 bytes to 4 bytes
     "-C",
     "target-feature=+crt-static", # This fixes the linking issue when compiling livekit on Windows
+    "-C", "link-arg=/LIBPATH:E:/git/zed/msvc_stl_shim",
+    "-C", "link-arg=msvc_stl_shim.lib",
 ]
 
 # We need lld to link libwebrtc.a successfully on aarch64-linux

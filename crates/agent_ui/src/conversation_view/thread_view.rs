@@ -4341,6 +4341,7 @@ impl ThreadView {
                                             from_title: action.from_title,
                                             next_prompt: action.next_prompt,
                                             work_dirs: action.work_dirs,
+                                            original_user_message: action.original_user_message,
                                         });
                                         window.dispatch_action(action, cx);
                                     }) {

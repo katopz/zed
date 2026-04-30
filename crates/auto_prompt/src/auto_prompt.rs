@@ -105,6 +105,9 @@ pub struct AutoPromptAction {
     pub from_title: Option<String>,
     pub next_prompt: String,
     pub work_dirs: Option<Vec<std::path::PathBuf>>,
+    /// The raw original user message from the very first thread,
+    /// carried across chain hops to prevent summary drift.
+    pub original_user_message: Option<String>,
 }
 
 fn with_first_prompt_context(next_prompt: String, summary: Option<&str>) -> String {
@@ -113,6 +116,47 @@ fn with_first_prompt_context(next_prompt: String, summary: Option<&str>) -> Stri
             format!("refer to first prompt \"{summary}\"\n---\n{next_prompt}")
         }
         _ => next_prompt,
+    }
+}
+
+/// Extract the raw original user intent from a thread's `first_user_message`.
+///
+/// When auto_prompt chains threads, the new thread's first user message looks like:
+///   `[@Thread Name](link)\n\nrefer to first prompt "..."\n---\nactual work prompt`
+///
+/// This function strips the auto-generated wrapper to recover the original
+/// user intent, which may be embedded in a `refer to first prompt "..."` clause.
+fn extract_original_user_message(first_user_message: &str) -> Option<String> {
+    let stripped = first_user_message.trim();
+
+    // Strip leading markdown link line(s) like "[@Thread Name](zed:///agent/thread/...)"
+    let without_link = stripped
+        .lines()
+        .skip_while(|line| line.trim_start().starts_with('['))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let without_link = without_link.trim();
+
+    // Try to extract from "refer to first prompt "..."" pattern
+    if let Some(rest) = without_link.strip_prefix("refer to first prompt") {
+        let rest = rest.trim();
+        // Extract the quoted string
+        if let Some(after_quote) = rest.strip_prefix('"') {
+            if let Some(end) = after_quote.find('"') {
+                let original = after_quote[..end].to_string();
+                if !original.trim().is_empty() {
+                    return Some(original);
+                }
+            }
+        }
+    }
+
+    // No wrapper found — this is likely the original raw message
+    if !without_link.is_empty() {
+        Some(without_link.to_string())
+    } else {
+        None
     }
 }
 
@@ -145,6 +189,9 @@ pub struct LlmCallData {
     pub max_verification_attempts: u32,
     pub work_dirs: Option<Vec<PathBuf>>,
     pub first_user_message: Option<String>,
+    /// The raw original user message from the very first thread,
+    /// carried across chain hops to prevent summary drift.
+    pub original_user_message: Option<String>,
 }
 
 impl std::fmt::Debug for LlmCallData {
@@ -259,18 +306,24 @@ pub fn decide(
         (ctx, sid, title, dirs)
     };
 
+    // Extract the raw original user message, unwrapping any auto-generated chain wrapper.
+    let original_user_message = auto_prompt_ctx
+        .first_user_message
+        .as_deref()
+        .and_then(|raw| extract_original_user_message(raw));
+
     let make_action = |prompt: String| {
-        let fallback_summary = auto_prompt_ctx
-            .first_user_message
-            .as_deref()
-            .and_then(|raw| raw.lines().next())
-            .map(|line| line.trim().to_string());
+        let fallback_summary = original_user_message.as_deref().map(|s| {
+            let line = s.lines().next().unwrap_or(s);
+            line.trim().to_string()
+        });
         let next_prompt = with_first_prompt_context(prompt, fallback_summary.as_deref());
         AutoPromptAction {
             from_session_id: session_id.clone(),
             from_title: thread_title.clone(),
             next_prompt,
             work_dirs: work_dirs.clone(),
+            original_user_message: original_user_message.clone(),
         }
     };
 
@@ -363,6 +416,7 @@ pub fn decide(
         max_verification_attempts: config.max_verification_attempts,
         work_dirs,
         first_user_message: auto_prompt_ctx.first_user_message,
+        original_user_message,
     })
 }
 
@@ -429,11 +483,24 @@ pub async fn decide_with_llm(
                 log::info!("[auto_prompt::decide_with_llm] Next prompt: {}", prompt);
             }
 
-            let prompt_summary = response
-                .first_prompt_summary
+            // Prefer the raw original user message over the LLM's summary.
+            // The LLM summary drifts across chain hops (telephone game),
+            // while `original_user_message` is carried verbatim from thread 0.
+            let prompt_summary = data
+                .original_user_message
                 .as_deref()
+                .map(|s| {
+                    let line = s.lines().next().unwrap_or(s);
+                    line.trim().chars().take(120).collect::<String>()
+                })
                 .filter(|s| !s.trim().is_empty())
-                .map(|s| s.to_string())
+                .or_else(|| {
+                    response
+                        .first_prompt_summary
+                        .as_deref()
+                        .filter(|s| !s.trim().is_empty())
+                        .map(|s| s.to_string())
+                })
                 .or_else(|| {
                     data.first_user_message
                         .as_deref()
@@ -463,6 +530,7 @@ pub async fn decide_with_llm(
                             from_title: data.title,
                             next_prompt,
                             work_dirs: data.work_dirs,
+                            original_user_message: data.original_user_message,
                         }));
                     }
                     None => {
@@ -480,6 +548,7 @@ pub async fn decide_with_llm(
                                 from_title: data.title,
                                 next_prompt,
                                 work_dirs: data.work_dirs,
+                                original_user_message: data.original_user_message,
                             }));
                         } else {
                             log::info!(
@@ -526,6 +595,7 @@ pub async fn decide_with_llm(
                                 from_title: data.title,
                                 next_prompt,
                                 work_dirs: data.work_dirs,
+                                original_user_message: data.original_user_message,
                             }));
                         }
                         None => {
@@ -604,6 +674,7 @@ pub async fn decide_with_llm(
                 from_title: data.title,
                 next_prompt,
                 work_dirs: data.work_dirs,
+                original_user_message: data.original_user_message,
             }))
         }
         Err(err) => {
