@@ -40,7 +40,8 @@ pub struct GoogleSettings {
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ModelMode {
     #[default]
-    Default,
+    #[serde(alias = "default")]
+    Auto,
     Thinking {
         /// The maximum number of tokens to use for reasoning. Must be lower than the model's `max_output_tokens`.
         budget_tokens: Option<u32>,

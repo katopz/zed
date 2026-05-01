@@ -57,11 +57,12 @@ pub trait CloudLlmTokenProvider: Send + Sync {
     fn refresh_token(&self, auth_context: Self::AuthContext) -> BoxFuture<'static, Result<String>>;
 }
 
-#[derive(Default, Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ModelMode {
     #[default]
-    Default,
+    #[serde(alias = "default")]
+    Auto,
     Thinking {
         /// The maximum number of tokens to use for reasoning. Must be lower than the model's `max_output_tokens`.
         budget_tokens: Option<u32>,
@@ -71,7 +72,7 @@ pub enum ModelMode {
 impl From<ModelMode> for AnthropicModelMode {
     fn from(value: ModelMode) -> Self {
         match value {
-            ModelMode::Default => AnthropicModelMode::Default,
+            ModelMode::Auto => AnthropicModelMode::Auto,
             ModelMode::Thinking { budget_tokens } => AnthropicModelMode::Thinking { budget_tokens },
         }
     }
@@ -403,7 +404,7 @@ impl<TP: CloudLlmTokenProvider + 'static> LanguageModel for CloudLanguageModel<T
                             budget_tokens: Some(4_096),
                         }
                     } else {
-                        AnthropicModelMode::Default
+                        AnthropicModelMode::Auto
                     },
                 );
 
@@ -554,7 +555,7 @@ impl<TP: CloudLlmTokenProvider + 'static> LanguageModel for CloudLanguageModel<T
                 let http_client = self.http_client.clone();
                 let token_provider = self.token_provider.clone();
                 let request =
-                    into_google(request, self.model.id.to_string(), GoogleModelMode::Default);
+                    into_google(request, self.model.id.to_string(), GoogleModelMode::Auto);
                 let auth_context = token_provider.auth_context(cx);
                 let future = self.request_limiter.stream(async move {
                     let PerformLlmCompletionResponse {

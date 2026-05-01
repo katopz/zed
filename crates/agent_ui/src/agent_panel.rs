@@ -387,6 +387,7 @@ pub fn init(cx: &mut App) {
                                 blocks: content_blocks,
                                 auto_submit: true,
                                 auto_prompt_enabled: true,
+                                profile_id: None,
                             }),
                             true,
                             "git_panel",
@@ -415,6 +416,7 @@ pub fn init(cx: &mut App) {
                                     blocks: content_blocks,
                                     auto_submit: true,
                                     auto_prompt_enabled: true,
+                                    profile_id: None,
                                 }),
                                 true,
                                 "git_panel",
@@ -445,6 +447,7 @@ pub fn init(cx: &mut App) {
                                     blocks: content_blocks,
                                     auto_submit: true,
                                     auto_prompt_enabled: true,
+                                    profile_id: None,
                                 }),
                                 true,
                                 "git_panel",
@@ -957,6 +960,7 @@ impl AgentPanel {
                                 blocks,
                                 auto_submit: false,
                                 auto_prompt_enabled: panel.auto_prompt_enabled,
+                                profile_id: None,
                             }
                         });
                         let thread = panel.create_agent_thread(
@@ -1313,6 +1317,7 @@ impl AgentPanel {
                         blocks: vec![],
                         auto_submit: false,
                         auto_prompt_enabled: true,
+                        profile_id: None,
                     })
                 } else {
                     None
@@ -1481,6 +1486,7 @@ impl AgentPanel {
                 blocks,
                 auto_submit: true,
                 auto_prompt_enabled: true,
+                profile_id: action.profile_id.clone(),
             }),
             true,
             "auto_prompt",
@@ -2733,6 +2739,7 @@ impl AgentPanel {
                     blocks: draft.to_vec(),
                     auto_submit: false,
                     auto_prompt_enabled: true,
+                    profile_id: None,
                 })
                 .filter(|initial_content| match initial_content {
                     AgentInitialContent::ContentBlock { blocks, .. } => !blocks.is_empty(),
@@ -2747,6 +2754,7 @@ impl AgentPanel {
                             blocks: vec![acp::ContentBlock::Text(acp::TextContent::new(text))],
                             auto_submit: false,
                             auto_prompt_enabled: true,
+                            profile_id: None,
                         })
                     }
                 })

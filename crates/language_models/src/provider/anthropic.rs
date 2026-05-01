@@ -195,7 +195,7 @@ impl LanguageModelProvider for AnthropicLanguageModelProvider {
                     default_temperature: model.default_temperature,
                     extra_beta_headers: model.extra_beta_headers.clone(),
                     mode: match model.mode.unwrap_or_default() {
-                        settings::ModelMode::Default => AnthropicModelMode::Default,
+                        settings::ModelMode::Auto => AnthropicModelMode::Auto,
                         settings::ModelMode::Thinking { budget_tokens } => {
                             AnthropicModelMode::Thinking { budget_tokens }
                         }

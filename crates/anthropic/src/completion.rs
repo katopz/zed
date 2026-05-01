@@ -183,7 +183,7 @@ pub fn into_anthropic(
                 AnthropicModelMode::AdaptiveThinking => Some(Thinking::Adaptive {
                     display: Some(AdaptiveThinkingDisplay::Summarized),
                 }),
-                AnthropicModelMode::Default => None,
+                AnthropicModelMode::Auto => None,
             }
         } else {
             None
@@ -471,7 +471,7 @@ mod tests {
             "claude-3-5-sonnet".to_string(),
             0.7,
             4096,
-            AnthropicModelMode::Default,
+            AnthropicModelMode::Auto,
         );
 
         assert_eq!(anthropic_request.messages.len(), 1);

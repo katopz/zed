@@ -558,7 +558,7 @@ impl Model {
                     budget_tokens: None,
                 }
             }
-            Self::Gemini3Flash => GoogleModelMode::Default,
+            Self::Gemini3Flash => GoogleModelMode::Auto,
             Self::Gemini31Pro => GoogleModelMode::Thinking {
                 budget_tokens: None,
             },

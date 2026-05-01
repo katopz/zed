@@ -352,7 +352,7 @@ impl LanguageModel for CopilotChatLanguageModel {
                             ),
                         }
                     } else {
-                        AnthropicModelMode::Default
+                        AnthropicModelMode::Auto
                     },
                 );
 

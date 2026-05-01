@@ -28,7 +28,8 @@ pub struct AnthropicModelCacheConfiguration {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub enum AnthropicModelMode {
     #[default]
-    Default,
+    #[serde(alias = "default")]
+    Auto,
     Thinking {
         budget_tokens: Option<u32>,
     },
@@ -314,7 +315,7 @@ impl Model {
             _ if self.supports_thinking() => AnthropicModelMode::Thinking {
                 budget_tokens: Some(4_096),
             },
-            _ => AnthropicModelMode::Default,
+            _ => AnthropicModelMode::Auto,
         }
     }
 
@@ -1148,7 +1149,7 @@ fn custom_mode_default_disables_thinking() {
         max_output_tokens: None,
         default_temperature: None,
         extra_beta_headers: vec![],
-        mode: AnthropicModelMode::Default,
+        mode: AnthropicModelMode::Auto,
     };
     assert!(!model.supports_thinking());
     assert!(!model.supports_adaptive_thinking());

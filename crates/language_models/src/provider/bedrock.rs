@@ -143,7 +143,8 @@ impl From<settings::BedrockAuthMethodContent> for BedrockAuthMethod {
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ModelMode {
     #[default]
-    Default,
+    #[serde(alias = "default")]
+    Auto,
     Thinking {
         /// The maximum number of tokens to use for reasoning. Must be lower than the model's `max_output_tokens`.
         budget_tokens: Option<u64>,
@@ -156,7 +157,7 @@ pub enum ModelMode {
 impl From<ModelMode> for BedrockModelMode {
     fn from(value: ModelMode) -> Self {
         match value {
-            ModelMode::Default => BedrockModelMode::Default,
+            ModelMode::Auto => BedrockModelMode::Auto,
             ModelMode::Thinking { budget_tokens } => BedrockModelMode::Thinking { budget_tokens },
             ModelMode::AdaptiveThinking { effort } => BedrockModelMode::AdaptiveThinking { effort },
         }
@@ -166,7 +167,7 @@ impl From<ModelMode> for BedrockModelMode {
 impl From<BedrockModelMode> for ModelMode {
     fn from(value: BedrockModelMode) -> Self {
         match value {
-            BedrockModelMode::Default => ModelMode::Default,
+            BedrockModelMode::Auto => ModelMode::Auto,
             BedrockModelMode::Thinking { budget_tokens } => ModelMode::Thinking { budget_tokens },
             BedrockModelMode::AdaptiveThinking { effort } => ModelMode::AdaptiveThinking { effort },
         }
@@ -1129,7 +1130,7 @@ pub fn into_bedrock(
                         .unwrap_or(default_effort);
                     Some(bedrock::Thinking::Adaptive { effort })
                 }
-                BedrockModelMode::Default => None,
+                BedrockModelMode::Auto => None,
             }
         } else {
             None

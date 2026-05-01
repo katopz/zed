@@ -581,7 +581,7 @@ impl LanguageModel for OpenCodeLanguageModel {
                     self.model.id().to_string(),
                     1.0,
                     self.model.max_output_tokens().unwrap_or(8192),
-                    anthropic::AnthropicModelMode::Default,
+                    anthropic::AnthropicModelMode::Auto,
                 );
                 let stream = self.stream_anthropic(anthropic_request, http_client, cx);
                 async move {
@@ -627,7 +627,7 @@ impl LanguageModel for OpenCodeLanguageModel {
                 let google_request = into_google(
                     request,
                     self.model.id().to_string(),
-                    google_ai::GoogleModelMode::Default,
+                    google_ai::GoogleModelMode::Auto,
                 );
                 let stream = self.stream_google(google_request, http_client, cx);
                 async move {

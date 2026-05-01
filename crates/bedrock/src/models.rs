@@ -26,7 +26,8 @@ impl BedrockAdaptiveThinkingEffort {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub enum BedrockModelMode {
     #[default]
-    Default,
+    #[serde(alias = "default")]
+    Auto,
     Thinking {
         budget_tokens: Option<u64>,
     },
@@ -611,7 +612,7 @@ impl Model {
                 budget_tokens: Some(4096),
             }
         } else {
-            BedrockModelMode::Default
+            BedrockModelMode::Auto
         }
     }
 

@@ -415,9 +415,25 @@ impl ThreadView {
                         blocks,
                         auto_submit,
                         auto_prompt_enabled,
+                        profile_id,
                     } => {
                         should_auto_submit = auto_submit;
                         should_auto_prompt = auto_prompt_enabled;
+                        if let Some(ref id) = profile_id {
+                            let connection = thread.read(cx).connection().clone();
+                            let session_id = thread.read(cx).session_id().clone();
+                            if let Some(native_connection) =
+                                connection.downcast::<agent::NativeAgentConnection>()
+                            {
+                                if let Some(native_thread) =
+                                    native_connection.thread(&session_id, cx)
+                                {
+                                    native_thread.update(cx, |t, cx| {
+                                        t.set_profile(AgentProfileId(id.clone().into()), cx);
+                                    });
+                                }
+                            }
+                        }
                         editor.set_message(blocks, window, cx);
                     }
                     AgentInitialContent::FromExternalSource(prompt) => {
@@ -4342,6 +4358,7 @@ impl ThreadView {
                                             next_prompt: action.next_prompt,
                                             work_dirs: action.work_dirs,
                                             original_user_message: action.original_user_message,
+                                            profile_id: action.profile_id,
                                         });
                                         window.dispatch_action(action, cx);
                                     }) {

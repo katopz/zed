@@ -57,6 +57,10 @@ pub struct AutoPromptNewThread {
     /// carried across chain hops to prevent summary drift.
     #[serde(default)]
     pub original_user_message: Option<String>,
+    /// The profile/mode from the previous thread (e.g. "Auto", "Sonnet", "High"),
+    /// carried across chain hops to preserve the user's selection.
+    #[serde(default)]
+    pub profile_id: Option<String>,
 }
 
 fn dispatch_action(
@@ -76,6 +80,7 @@ fn dispatch_action(
         next_prompt: action.next_prompt,
         work_dirs: action.work_dirs,
         original_user_message: action.original_user_message,
+        profile_id: action.profile_id,
     });
 
     window.dispatch_action(action, cx);
@@ -125,13 +130,20 @@ pub fn on_thread_stopped(
     let decision = auto_prompt::decide(thread, used_tools, stop_reason, cx);
     log::info!("[auto_prompt] decision result: {:?}", decision);
 
+    let mut profile_id = conversation_view
+        .active_thread()
+        .and_then(|tv| tv.read(cx).current_mode_id(cx))
+        .map(|id| id.to_string());
+    log::info!("[auto_prompt] captured profile_id: {:?}", profile_id);
+
     match decision {
         auto_prompt::AutoPromptDecision::NoAction => {
             log::info!("[auto_prompt] NoAction - taking no action");
             None
         }
 
-        auto_prompt::AutoPromptDecision::DispatchNow(action) => {
+        auto_prompt::AutoPromptDecision::DispatchNow(mut action) => {
+            action.profile_id = profile_id.take();
             log::info!(
                 "[auto_prompt] DispatchNow - dispatching action with prompt: {}",
                 action.next_prompt
@@ -140,7 +152,11 @@ pub fn on_thread_stopped(
             None
         }
 
-        auto_prompt::AutoPromptDecision::DispatchAfterDelay { action, delay_ms } => {
+        auto_prompt::AutoPromptDecision::DispatchAfterDelay {
+            mut action,
+            delay_ms,
+        } => {
+            action.profile_id = profile_id.take();
             log::info!(
                 "[auto_prompt] DispatchAfterDelay - scheduling action in {}ms with prompt: {}",
                 delay_ms,
@@ -200,7 +216,8 @@ pub fn on_thread_stopped(
             Some(task)
         }
 
-        auto_prompt::AutoPromptDecision::NeedsLlmCall(data) => {
+        auto_prompt::AutoPromptDecision::NeedsLlmCall(mut data) => {
+            data.profile_id = profile_id.take();
             log::info!(
                 "[auto_prompt] NeedsLlmCall - spawning task to call LLM with model: {:?}",
                 data.model.id()
