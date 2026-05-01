@@ -107,6 +107,9 @@ pub struct AutoPromptAction {
     /// The raw original user message from the very first thread,
     /// carried across chain hops to prevent summary drift.
     pub original_user_message: Option<String>,
+    /// The profile/mode from the previous thread (e.g. "Auto", "Sonnet", "High"),
+    /// carried across chain hops to preserve the user's selection.
+    pub profile_id: Option<String>,
 }
 
 fn with_first_prompt_context(next_prompt: String, summary: Option<&str>) -> String {
@@ -191,6 +194,9 @@ pub struct LlmCallData {
     /// The raw original user message from the very first thread,
     /// carried across chain hops to prevent summary drift.
     pub original_user_message: Option<String>,
+    /// The profile/mode from the previous thread (e.g. "Auto", "Sonnet", "High"),
+    /// carried across chain hops to preserve the user's selection.
+    pub profile_id: Option<String>,
 }
 
 impl std::fmt::Debug for LlmCallData {
@@ -208,6 +214,7 @@ impl std::fmt::Debug for LlmCallData {
             .field("iteration_count", &self.iteration_count)
             .field("max_verification_attempts", &self.max_verification_attempts)
             .field("work_dirs", &self.work_dirs)
+            .field("profile_id", &self.profile_id)
             .finish()
     }
 }
@@ -323,6 +330,7 @@ pub fn decide(
             next_prompt,
             work_dirs: work_dirs.clone(),
             original_user_message: original_user_message.clone(),
+            profile_id: None,
         }
     };
 
@@ -416,6 +424,7 @@ pub fn decide(
         work_dirs,
         first_user_message: auto_prompt_ctx.first_user_message,
         original_user_message,
+        profile_id: None,
     })
 }
 
@@ -530,6 +539,7 @@ pub async fn decide_with_llm(
                             next_prompt,
                             work_dirs: data.work_dirs,
                             original_user_message: data.original_user_message,
+                            profile_id: data.profile_id.clone(),
                         }));
                     }
                     None => {
@@ -548,6 +558,7 @@ pub async fn decide_with_llm(
                                 next_prompt,
                                 work_dirs: data.work_dirs,
                                 original_user_message: data.original_user_message,
+                                profile_id: data.profile_id.clone(),
                             }));
                         } else {
                             log::info!(
@@ -595,6 +606,7 @@ pub async fn decide_with_llm(
                                 next_prompt,
                                 work_dirs: data.work_dirs,
                                 original_user_message: data.original_user_message,
+                                profile_id: data.profile_id.clone(),
                             }));
                         }
                         None => {
@@ -674,6 +686,7 @@ pub async fn decide_with_llm(
                 next_prompt,
                 work_dirs: data.work_dirs,
                 original_user_message: data.original_user_message,
+                profile_id: data.profile_id.clone(),
             }))
         }
         Err(err) => {

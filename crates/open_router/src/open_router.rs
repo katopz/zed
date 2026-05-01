@@ -91,7 +91,7 @@ impl Model {
             Some(2000000),
             Some(true),
             Some(false),
-            Some(ModelMode::Default),
+            Some(ModelMode::Auto),
             None,
         )
     }
@@ -111,7 +111,7 @@ impl Model {
             max_tokens: max_tokens.unwrap_or(2000000),
             supports_tools,
             supports_images,
-            mode: mode.unwrap_or(ModelMode::Default),
+            mode: mode.unwrap_or(ModelMode::Auto),
             provider,
         }
     }
@@ -600,7 +600,7 @@ pub async fn list_models(
                         budget_tokens: Some(4_096),
                     }
                 } else {
-                    ModelMode::Default
+                    ModelMode::Auto
                 },
                 provider: None,
             })

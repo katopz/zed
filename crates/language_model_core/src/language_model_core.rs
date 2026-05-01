@@ -445,7 +445,8 @@ impl From<Arc<str>> for LanguageModelProviderName {
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ModelMode {
     #[default]
-    Default,
+    #[serde(alias = "default")]
+    Auto,
     Thinking {
         budget_tokens: Option<u32>,
     },

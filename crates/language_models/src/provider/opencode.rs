@@ -730,7 +730,7 @@ impl LanguageModel for OpenCodeLanguageModel {
                 let google_request = into_google(
                     request,
                     self.model.id().to_string(),
-                    google_ai::GoogleModelMode::Default,
+                    google_ai::GoogleModelMode::Auto,
                 );
                 let stream = self.stream_google(google_request, http_client, extra_headers, cx);
                 async move {

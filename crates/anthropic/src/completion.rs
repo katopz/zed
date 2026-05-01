@@ -280,7 +280,7 @@ pub fn into_anthropic(
                 AnthropicModelMode::AdaptiveThinking => Some(Thinking::Adaptive {
                     display: Some(AdaptiveThinkingDisplay::Summarized),
                 }),
-                AnthropicModelMode::Default => None,
+                AnthropicModelMode::Auto => None,
             }
         } else {
             None

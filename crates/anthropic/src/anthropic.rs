@@ -24,7 +24,8 @@ const FAST_MODE_BETA_HEADER: &str = "fast-mode-2026-02-01";
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub enum AnthropicModelMode {
     #[default]
-    Default,
+    #[serde(alias = "default")]
+    Auto,
     Thinking {
         budget_tokens: Option<u32>,
     },
