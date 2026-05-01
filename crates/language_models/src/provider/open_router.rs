@@ -874,7 +874,7 @@ mod tests {
 
     use open_router::{ChoiceDelta, FunctionChunk, ResponseMessageDelta, ToolCallChunk};
 
-    #[gpui::test]
+    #[tokio::test]
     async fn test_reasoning_details_preservation_with_tool_calls() {
         // This test verifies that reasoning_details are properly captured and preserved
         // when a model uses tool calling with reasoning/thinking tokens.
@@ -1057,7 +1057,7 @@ mod tests {
         );
     }
 
-    #[gpui::test]
+    #[tokio::test]
     async fn test_usage_only_chunk_with_empty_choices_does_not_error() {
         let mut mapper = OpenRouterEventMapper::new();
 
@@ -1083,7 +1083,7 @@ mod tests {
         }
     }
 
-    #[gpui::test]
+    #[tokio::test]
     async fn test_agent_prevents_empty_reasoning_details_overwrite() {
         // This test verifies that the agent layer prevents empty reasoning_details
         // from overwriting non-empty ones, even though the mapper emits all events.
