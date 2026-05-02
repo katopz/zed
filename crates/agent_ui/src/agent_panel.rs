@@ -1460,10 +1460,23 @@ impl AgentPanel {
         let from_title = action.from_title.clone();
         let next_prompt = action.next_prompt.clone();
 
-        let thread_name = from_title.as_deref().unwrap_or("Thread");
-        let summary_link = format!(
-            "[@{thread_name}](zed:///agent/thread/{from_session_id}?name={thread_name})\n\n"
-        );
+        // Strip nested [@...](zed:///...) markdown links from the title to avoid
+        // [@[@...]()]() when auto_prompt chains multiple times.
+        let raw_title = from_title.as_deref().unwrap_or("Thread");
+        let mut clean_title = raw_title.to_string();
+        while let Some(rest) = clean_title.strip_prefix("[@") {
+            if let Some(end) = rest.find("](zed:///agent/thread/") {
+                clean_title = rest[..end].to_string();
+            } else {
+                break;
+            }
+        }
+
+        let mention_uri = MentionUri::Thread {
+            id: from_session_id,
+            name: clean_title,
+        };
+        let summary_link = format!("{}\n\n", mention_uri.as_link());
 
         let full_prompt = format!("{summary_link}{next_prompt}");
 
