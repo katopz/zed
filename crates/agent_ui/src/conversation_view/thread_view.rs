@@ -1054,6 +1054,13 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Cancel any running auto_prompt task — user input takes priority.
+        if self._auto_prompt_task.is_some() {
+            log::info!("[auto_prompt] Cancelling auto_prompt: user message takes priority");
+            self._auto_prompt_task = None;
+            self.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;
+        }
+
         let session_id = self.thread.read(cx).session_id().clone();
         let parent_session_id = self.thread.read(cx).parent_session_id().cloned();
         let agent_telemetry_id = self.thread.read(cx).connection().telemetry_id();

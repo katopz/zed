@@ -1539,24 +1539,8 @@ impl ConversationView {
                     used_tools,
                     stop_reason
                 );
-                if auto_prompt_enabled {
-                    if let Some(task) = crate::auto_prompt::on_thread_stopped(
-                        self,
-                        &thread,
-                        used_tools,
-                        stop_reason,
-                        window,
-                        cx,
-                    ) {
-                        if let Some(active) = self.active_thread() {
-                            active.update(cx, |active, cx| {
-                                active._auto_prompt_task = Some(task);
-                                cx.notify();
-                            });
-                        }
-                    }
-                }
-
+                // Check for queued user messages BEFORE auto_prompt.
+                // Queued user input always takes priority over auto-chaining.
                 let should_send_queued = if let Some(active) = self.root_thread_view() {
                     active.update(cx, |active, cx| {
                         if active.skip_queue_processing_count > 0 {
@@ -1580,8 +1564,40 @@ impl ConversationView {
                 } else {
                     false
                 };
+
                 if should_send_queued {
+                    // Cancel any running auto_prompt task — user input wins.
+                    if let Some(active) = self.active_thread() {
+                        active.update(cx, |active, cx| {
+                            if active._auto_prompt_task.is_some() {
+                                log::info!(
+                                    "[auto_prompt] Cancelling auto_prompt: queued user message takes priority"
+                                );
+                                active._auto_prompt_task = None;
+                                active.auto_prompt_state =
+                                    crate::auto_prompt::AutoPromptState::Idle;
+                                cx.notify();
+                            }
+                        });
+                    }
                     self.send_queued_message_at_index(0, false, window, cx);
+                } else if auto_prompt_enabled {
+                    // Only run auto_prompt when no queued messages are waiting.
+                    if let Some(task) = crate::auto_prompt::on_thread_stopped(
+                        self,
+                        &thread,
+                        used_tools,
+                        stop_reason,
+                        window,
+                        cx,
+                    ) {
+                        if let Some(active) = self.active_thread() {
+                            active.update(cx, |active, cx| {
+                                active._auto_prompt_task = Some(task);
+                                cx.notify();
+                            });
+                        }
+                    }
                 }
             }
             AcpThreadEvent::Refusal => {
@@ -1621,24 +1637,53 @@ impl ConversationView {
                         cx,
                     );
                     // Call auto-prompt for error events (e.g., rate limits)
+                    // Same pattern as Stopped handler: queued user messages take priority.
                     let used_tools = thread.read(cx).used_tools_since_last_user_message();
-                    let auto_prompt_enabled = self
-                        .active_thread()
-                        .is_some_and(|tv| tv.read(cx).auto_prompt_enabled);
-                    if auto_prompt_enabled {
-                        if let Some(task) = crate::auto_prompt::on_thread_stopped(
-                            self,
-                            &thread,
-                            used_tools,
-                            &acp::StopReason::MaxTokens, // Use MaxTokens as error indicator
-                            window,
-                            cx,
-                        ) {
-                            if let Some(active) = self.active_thread() {
-                                active.update(cx, |active, cx| {
-                                    active._auto_prompt_task = Some(task);
+
+                    let should_send_queued = if let Some(active) = self.root_thread_view() {
+                        active.update(cx, |active, cx| {
+                            let has_queued = !active.local_queued_messages.is_empty();
+                            let is_first_editor_focused = active
+                                .queued_message_editors
+                                .first()
+                                .is_some_and(|editor| editor.focus_handle(cx).is_focused(window));
+                            has_queued && !is_first_editor_focused
+                        })
+                    } else {
+                        false
+                    };
+
+                    if should_send_queued {
+                        if let Some(active) = self.active_thread() {
+                            active.update(cx, |active, cx| {
+                                if active._auto_prompt_task.is_some() {
+                                    active._auto_prompt_task = None;
+                                    active.auto_prompt_state =
+                                        crate::auto_prompt::AutoPromptState::Idle;
                                     cx.notify();
-                                });
+                                }
+                            });
+                        }
+                        self.send_queued_message_at_index(0, false, window, cx);
+                    } else {
+                        let auto_prompt_enabled = self
+                            .active_thread()
+                            .is_some_and(|tv| tv.read(cx).auto_prompt_enabled);
+                        if auto_prompt_enabled {
+                            if let Some(task) = crate::auto_prompt::on_thread_stopped(
+                                self,
+                                &thread,
+                                used_tools,
+                                &acp::StopReason::MaxTokens, // Use MaxTokens as error indicator
+                                window,
+                                cx,
+                            ) {
+                                if let Some(active) = self.active_thread() {
+                                    active.update(cx, |active, cx| {
+                                        active._auto_prompt_task = Some(task);
+                                        cx.notify();
+                                    });
+                                }
                             }
                         }
                     }
@@ -7562,5 +7607,144 @@ pub(crate) mod tests {
         fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
             self
         }
+    }
+
+    /// When a queued user message exists and the thread stops,
+    /// the queued message should be sent instead of auto_prompt firing.
+    #[gpui::test]
+    async fn test_queued_message_takes_priority_over_auto_prompt(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+
+        // Enable auto_prompt
+        active_thread(&conversation_view, cx).update(cx, |thread, cx| {
+            thread.auto_prompt_enabled = true;
+            cx.notify();
+        });
+
+        // Send initial message to start a turn
+        let msg_editor = message_editor(&conversation_view, cx);
+        msg_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("Start work", window, cx);
+        });
+        active_thread(&conversation_view, cx)
+            .update_in(cx, |view, window, cx| view.send(window, cx));
+
+        cx.run_until_parked();
+
+        // Get session ID after the turn started
+        let session_id = active_thread(&conversation_view, cx)
+            .read_with(cx, |thread, cx| thread.thread.read(cx).session_id().clone());
+
+        // Queue a user message while generating
+        active_thread(&conversation_view, cx).update(cx, |thread, cx| {
+            thread.add_to_queue(
+                vec![acp::ContentBlock::Text(acp::TextContent::new(
+                    "User follow-up".to_string(),
+                ))],
+                vec![],
+                cx,
+            );
+        });
+
+        cx.run_until_parked();
+
+        // Verify the message is queued
+        let queue_len = active_thread(&conversation_view, cx)
+            .read_with(cx, |thread, _cx| thread.local_queued_messages.len());
+        assert_eq!(queue_len, 1, "Message should be queued");
+
+        // End the turn — this triggers the Stopped event
+        cx.update(|_, _cx| {
+            connection.end_turn(session_id, acp::StopReason::EndTurn);
+        });
+
+        cx.run_until_parked();
+
+        // Verify: the queued message was consumed (sent), not auto_prompt
+        let queue_len = active_thread(&conversation_view, cx)
+            .read_with(cx, |thread, _cx| thread.local_queued_messages.len());
+        assert_eq!(queue_len, 0, "Queued message should have been sent");
+
+        // Verify: no auto_prompt task was started
+        let has_auto_prompt_task = active_thread(&conversation_view, cx)
+            .read_with(cx, |thread, _cx| thread._auto_prompt_task.is_some());
+        assert!(
+            !has_auto_prompt_task,
+            "auto_prompt task should NOT have been created when queued message exists"
+        );
+    }
+
+    /// When a user sends a direct message while auto_prompt is processing,
+    /// the auto_prompt task should be cancelled.
+    #[gpui::test]
+    async fn test_direct_message_cancels_auto_prompt_task(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+
+        // Enable auto_prompt
+        active_thread(&conversation_view, cx).update(cx, |thread, cx| {
+            thread.auto_prompt_enabled = true;
+            cx.notify();
+        });
+
+        // Send initial message to start a turn
+        let msg_editor = message_editor(&conversation_view, cx);
+        msg_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("Start work", window, cx);
+        });
+        active_thread(&conversation_view, cx)
+            .update_in(cx, |view, window, cx| view.send(window, cx));
+
+        cx.run_until_parked();
+
+        let session_id = active_thread(&conversation_view, cx)
+            .read_with(cx, |thread, cx| thread.thread.read(cx).session_id().clone());
+
+        // End the turn — this triggers Stopped and may start auto_prompt
+        cx.update(|_, _cx| {
+            connection.end_turn(session_id, acp::StopReason::EndTurn);
+        });
+
+        cx.run_until_parked();
+
+        // Simulate user typing and sending a direct message
+        let msg_editor = message_editor(&conversation_view, cx);
+        msg_editor.update_in(cx, |ed, window, cx| {
+            ed.set_text("User direct message", window, cx);
+        });
+
+        active_thread(&conversation_view, cx)
+            .update_in(cx, |view, window, cx| view.send(window, cx));
+
+        cx.run_until_parked();
+
+        // Verify: auto_prompt task was cancelled by the direct send
+        let has_auto_prompt_task = active_thread(&conversation_view, cx)
+            .read_with(cx, |thread, _cx| thread._auto_prompt_task.is_some());
+        assert!(
+            !has_auto_prompt_task,
+            "auto_prompt task should be cancelled after user sends a direct message"
+        );
+
+        // Verify: auto_prompt state reset to Idle
+        let is_idle = active_thread(&conversation_view, cx).read_with(cx, |thread, _cx| {
+            matches!(
+                thread.auto_prompt_state,
+                crate::auto_prompt::AutoPromptState::Idle
+            )
+        });
+        assert!(
+            is_idle,
+            "auto_prompt state should be Idle after cancellation"
+        );
     }
 }
