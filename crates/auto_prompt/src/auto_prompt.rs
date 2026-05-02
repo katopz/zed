@@ -262,6 +262,13 @@ pub fn decide(
 
     log::info!("[auto_prompt::decide] Stop reason: {:?}", stop_reason);
 
+    // Rule-based check: if the last tool call was an interactive auth command
+    // (browser login, device auth, etc.), the user is mid-flow — don't chain.
+    if is_interactive_tool_pending(thread, cx) {
+        log::info!("[auto_prompt::decide] Interactive auth tool pending, skipping auto-prompt");
+        return AutoPromptDecision::NoAction;
+    }
+
     let iteration_count = get_iteration();
     log::info!(
         "[auto_prompt::decide] Current iteration: {}",
@@ -827,22 +834,27 @@ fn default_system_prompt() -> String {
            - next_prompt = "Read {actual_path} and add checkboxes (- [ ]) for all tasks at the top. Keep existing content below."
            - should_continue=true
 
-        4. If the last message asks a question or lists options:
+        4. If the last tool call was a terminal running an auth/login/oauth command:
+           - The command likely opened a browser or is waiting for interactive user input
+           - should_continue=false — the user must complete the auth flow manually
+           - Do NOT auto-chain when the user is mid-auth-flow
+
+        5. If the last message asks a question or lists options:
            - should_continue=true
            - Pick option 1 or what the AI recommends
            - If unsure, search the codebase and pick the best default
            - confidence >= 0.6
 
-        5. If all plan steps are [x]:
+        6. If all plan steps are [x]:
            - If diagnostics or test failures likely exist → next_prompt = "Fix all diagnostics and ensure test coverage. Production grade only — no mock, no TODO, no placeholder."
            - Else if doc_files is empty → next_prompt = "Create .docs/{NN}_summary.md documenting what was implemented, key decisions, file changes, and how to test."
            - Else if no git feature branch was created for this plan in the conversation → next_prompt = "Create a git feature branch feature/{plan_number}_{description} from develop. Commit all changes with conventional commit messages."
            - Else → all_plan_done=true, should_continue=false
 
-        6. If no plan exists but work seems incomplete → should_continue=true, next_prompt="continue"
+        7. If no plan exists but work seems incomplete → should_continue=true, next_prompt="continue"
 
-        7. confidence < 0.5 → should_continue=false
-        8. iteration_count > 15 → consider stopping
+        8. confidence < 0.5 → should_continue=false
+        9. iteration_count > 15 → consider stopping
 
         ## Pre-stop verification (when stop_phase is "pre_stop"):
         Before confirming stop, verify ALL of these:
@@ -863,6 +875,60 @@ fn default_system_prompt() -> String {
         - Conventional commits: feat:, fix:, refactor:, test:, chore:, docs:
     "#}
     .to_string()
+}
+
+/// Checks if the last tool calls suggest the user is completing an
+/// interactive flow (browser-based auth, login) and auto_prompt should wait.
+fn is_interactive_tool_pending(thread: &gpui::Entity<acp_thread::AcpThread>, cx: &App) -> bool {
+    let thread_ref = thread.read(cx);
+
+    for entry in thread_ref.entries().iter().rev() {
+        match entry {
+            acp_thread::AgentThreadEntry::UserMessage(_) => break,
+            acp_thread::AgentThreadEntry::ToolCall(tool) => {
+                let is_terminal = tool
+                    .tool_name
+                    .as_ref()
+                    .is_some_and(|name| name == "terminal");
+                if !is_terminal {
+                    continue;
+                }
+
+                if let Some(input) = &tool.raw_input {
+                    if let Some(command) = input.get("command").and_then(|v| v.as_str()) {
+                        if is_interactive_auth_command(command) {
+                            log::info!(
+                                "[auto_prompt::decide] Auth command detected: '{}', pausing",
+                                command.chars().take(100).collect::<String>()
+                            );
+                            return true;
+                        }
+                    }
+                }
+            }
+            _ => continue,
+        }
+    }
+
+    false
+}
+
+/// Patterns indicating an interactive command that opens a browser or
+/// waits for external user action (auth flows, device login, etc.).
+fn is_interactive_auth_command(command: &str) -> bool {
+    let lower = command.to_lowercase();
+    const AUTH_COMMANDS: &[&str] = &[
+        "login",
+        "signin",
+        "sign-in",
+        "sign in",
+        "auth ",
+        " authenticate",
+        "oauth",
+        "sso login",
+    ];
+
+    AUTH_COMMANDS.iter().any(|pattern| lower.contains(pattern))
 }
 
 pub fn reset_iteration() {
