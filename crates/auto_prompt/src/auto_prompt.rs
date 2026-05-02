@@ -116,7 +116,7 @@ pub struct AutoPromptAction {
 fn with_first_prompt_context(next_prompt: String, summary: Option<&str>) -> String {
     match summary {
         Some(summary) if !summary.trim().is_empty() => {
-            format!("refer to first prompt \"{summary}\"\n---\n{next_prompt}")
+            format!("refer to first prompt:\n===---===\n{summary}\n===---===\n{next_prompt}")
         }
         _ => next_prompt,
     }
@@ -125,15 +125,24 @@ fn with_first_prompt_context(next_prompt: String, summary: Option<&str>) -> Stri
 /// Extract the raw original user intent from a thread's `first_user_message`.
 ///
 /// When auto_prompt chains threads, the new thread's first user message looks like:
-///   `[@Thread Name](link)\n\nrefer to first prompt "..."\n---\nactual work prompt`
+///   `[@Thread Name](link)\n\nrefer to first prompt:\n===---===\n...\n===---===\nactual work prompt`
 ///
 /// This function strips the auto-generated wrapper to recover the original
-/// user intent, which may be embedded in a `refer to first prompt "..."` clause.
+/// user intent, which may be embedded in a `refer to first prompt` block.
 fn extract_original_user_message(first_user_message: &str) -> Option<String> {
     let stripped = first_user_message.trim();
 
+    // Strip leading "## User" header(s) from to_markdown rendering
+    let without_header = stripped
+        .lines()
+        .skip_while(|line| line.trim_start().starts_with("## "))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let without_header = without_header.trim();
+
     // Strip leading markdown link line(s) like "[@Thread Name](zed:///agent/thread/...)"
-    let without_link = stripped
+    let without_link = without_header
         .lines()
         .skip_while(|line| line.trim_start().starts_with('['))
         .collect::<Vec<_>>()
@@ -141,15 +150,45 @@ fn extract_original_user_message(first_user_message: &str) -> Option<String> {
 
     let without_link = without_link.trim();
 
-    // Try to extract from "refer to first prompt "..."" pattern
+    // Try block-delimited format: "refer to first prompt:\n===---===\n...\n===---===\n<next_prompt>"
+    const DELIM: &str = "===---===";
+    if let Some(rest) = without_link.strip_prefix("refer to first prompt:") {
+        let rest = rest.trim_start();
+        if let Some(after_open) = rest.strip_prefix(DELIM) {
+            let after_open = after_open.trim_start_matches('\n');
+            if let Some(end_pos) = after_open.find(DELIM) {
+                let original = after_open[..end_pos].trim().to_string();
+                if !original.is_empty() {
+                    return Some(original);
+                }
+            }
+        }
+    }
+
+    // Try legacy --- delimited format for threads created before the delimiter change.
+    if let Some(rest) = without_link.strip_prefix("refer to first prompt:") {
+        let rest = rest.trim_start();
+        if let Some(after_open) = rest.strip_prefix("---") {
+            let after_open = after_open.trim_start_matches('\n');
+            if let Some(end_pos) = after_open.find("\n---") {
+                let original = after_open[..end_pos].trim().to_string();
+                if !original.is_empty() {
+                    return Some(original);
+                }
+            }
+        }
+    }
+
+    // Try legacy quote format for backward compat: "refer to first prompt "...""
     if let Some(rest) = without_link.strip_prefix("refer to first prompt") {
         let rest = rest.trim();
-        // Extract the quoted string
-        if let Some(after_quote) = rest.strip_prefix('"') {
-            if let Some(end) = after_quote.find('"') {
-                let original = after_quote[..end].to_string();
-                if !original.trim().is_empty() {
-                    return Some(original);
+        if rest.starts_with('"') {
+            if let Some(after_quote) = rest.strip_prefix('"') {
+                if let Some(end) = after_quote.find('"') {
+                    let original = after_quote[..end].to_string();
+                    if !original.trim().is_empty() {
+                        return Some(original);
+                    }
                 }
             }
         }
@@ -327,10 +366,7 @@ pub fn decide(
         .and_then(|raw| extract_original_user_message(raw));
 
     let make_action = |prompt: String| {
-        let fallback_summary = original_user_message.as_deref().map(|s| {
-            let line = s.lines().next().unwrap_or(s);
-            line.trim().to_string()
-        });
+        let fallback_summary = original_user_message.clone();
         let next_prompt = with_first_prompt_context(prompt, fallback_summary.as_deref());
         AutoPromptAction {
             from_session_id: session_id.clone(),
@@ -504,11 +540,7 @@ pub async fn decide_with_llm(
             // while `original_user_message` is carried verbatim from thread 0.
             let prompt_summary = data
                 .original_user_message
-                .as_deref()
-                .map(|s| {
-                    let line = s.lines().next().unwrap_or(s);
-                    line.trim().chars().take(120).collect::<String>()
-                })
+                .clone()
                 .filter(|s| !s.trim().is_empty())
                 .or_else(|| {
                     response
@@ -520,8 +552,7 @@ pub async fn decide_with_llm(
                 .or_else(|| {
                     data.first_user_message
                         .as_deref()
-                        .and_then(|raw| raw.lines().next())
-                        .map(|line| line.trim().chars().take(120).collect::<String>())
+                        .and_then(extract_original_user_message)
                 });
 
             let all_done = response.all_plan_done
@@ -1394,4 +1425,113 @@ fn build_checkbox_verification_prompt(context_json: &str) -> Option<String> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_with_first_prompt_context_multiline() {
+        let summary = "check .plans against the code\n\nfile.rs\nanother.rs";
+        let result = with_first_prompt_context("continue".to_string(), Some(summary));
+        assert!(result.starts_with("refer to first prompt:\n===---===\n"));
+        assert!(result.contains(summary));
+        assert!(result.ends_with("\n===---===\ncontinue"));
+    }
+
+    #[test]
+    fn test_with_first_prompt_context_none() {
+        let result = with_first_prompt_context("continue".to_string(), None);
+        assert_eq!(result, "continue");
+    }
+
+    #[test]
+    fn test_with_first_prompt_context_empty() {
+        let result = with_first_prompt_context("continue".to_string(), Some(""));
+        assert_eq!(result, "continue");
+    }
+
+    #[test]
+    fn test_extract_original_user_message_new_format_multiline() {
+        let input = "refer to first prompt:\n===---===\ncheck .plans against the code and complete it as possible\n\ncrates\nmmorpg\n===---===\ncontinue";
+        let result = extract_original_user_message(input);
+        assert_eq!(
+            result,
+            Some(
+                "check .plans against the code and complete it as possible\n\ncrates\nmmorpg"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn test_extract_original_user_message_new_format_with_link_and_header() {
+        let input = "## User\n\n[@Thread](zed:///agent/thread/abc)\n\nrefer to first prompt:\n===---===\ndo the thing\nwith stuff\n===---===\ncontinue";
+        let result = extract_original_user_message(input);
+        assert_eq!(result, Some("do the thing\nwith stuff".to_string()));
+    }
+
+    #[test]
+    fn test_extract_original_user_message_legacy_dash_format() {
+        let input = "refer to first prompt:\n---\nold style content\n---\ncontinue";
+        let result = extract_original_user_message(input);
+        assert_eq!(result, Some("old style content".to_string()));
+    }
+
+    #[test]
+    fn test_extract_original_user_message_legacy_quote_format() {
+        let input = "refer to first prompt \"some quoted content\"\n---\ncontinue";
+        let result = extract_original_user_message(input);
+        assert_eq!(result, Some("some quoted content".to_string()));
+    }
+
+    #[test]
+    fn test_extract_original_user_message_raw_message_no_wrapper() {
+        let input = "## User\n\njust a raw user message with no wrapper";
+        let result = extract_original_user_message(input);
+        assert_eq!(
+            result,
+            Some("just a raw user message with no wrapper".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_original_user_message_strips_headers_and_links() {
+        let input =
+            "## User\n\n[@Thread Name](zed:///agent/thread/123?name=Thread)\n\nraw message text";
+        let result = extract_original_user_message(input);
+        assert_eq!(result, Some("raw message text".to_string()));
+    }
+
+    #[test]
+    fn test_extract_original_user_message_empty() {
+        let result = extract_original_user_message("");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_roundtrip_multiline_with_file_refs() {
+        let original = "check .plans against the code and complete it as possible, also update plan md to reflect current state, fix all diag focus only on\n\ncrates\nmmorpg";
+        let wrapped = with_first_prompt_context("continue".to_string(), Some(original));
+        let extracted = extract_original_user_message(&wrapped);
+        assert_eq!(extracted, Some(original.to_string()));
+    }
+
+    #[test]
+    fn test_roundtrip_with_chain_wrapper() {
+        let original = "do important work\n\nfile.rs\nother.rs";
+        let wrapped = with_first_prompt_context("continue".to_string(), Some(original));
+        let chain_message = format!("## User\n\n[@Thread](zed:///agent/thread/abc)\n\n{wrapped}");
+        let extracted = extract_original_user_message(&chain_message);
+        assert_eq!(extracted, Some(original.to_string()));
+    }
+
+    #[test]
+    fn test_roundtrip_content_with_quotes() {
+        let original = r#"use format!("{var}") not format!("{}", var)"#;
+        let wrapped = with_first_prompt_context("continue".to_string(), Some(original));
+        let extracted = extract_original_user_message(&wrapped);
+        assert_eq!(extracted, Some(original.to_string()));
+    }
 }
