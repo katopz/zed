@@ -5,6 +5,26 @@ use gpui::Window;
 use prompt_store::{BuiltInPrompt, PromptId, PromptStore};
 use std::path::PathBuf;
 
+/// Strip the `refer to first prompt:\n===---===\n...\n===---===\n` wrapper
+/// produced by `with_first_prompt_context`. For same-thread continuation
+/// (ACP agents) the AI already has full context — the wrapper wastes tokens.
+fn strip_first_prompt_wrapper(prompt: &str) -> String {
+    const DELIM: &str = "===---===";
+    if let Some(rest) = prompt.strip_prefix("refer to first prompt:") {
+        let rest = rest.trim_start_matches('\n');
+        if let Some(after_open) = rest.strip_prefix(DELIM) {
+            let after_open = after_open.trim_start_matches('\n');
+            if let Some(end_pos) = after_open.find(DELIM) {
+                let tail = after_open[end_pos + DELIM.len()..].trim_start_matches('\n');
+                if !tail.is_empty() {
+                    return tail.to_string();
+                }
+            }
+        }
+    }
+    prompt.to_string()
+}
+
 async fn load_auto_prompt_system_prompt(cx: &mut gpui::AsyncWindowContext) -> Option<String> {
     let store_future = cx.update(|_window, cx| PromptStore::global(cx)).ok()?;
     let store = store_future.await.ok()?;
@@ -76,10 +96,13 @@ fn dispatch_action(
 
     if !is_native_agent {
         if let Some(active_tv) = conversation_view.active_thread() {
+            // Strip the "refer to first prompt" wrapper — same-thread AI
+            // already has full context, the preamble just wastes tokens.
+            let prompt = strip_first_prompt_wrapper(&action.next_prompt);
             active_tv.update(cx, |tv, cx| {
                 tv.message_editor.update(cx, |editor, cx| {
                     editor.set_message(
-                        vec![ContentBlock::Text(TextContent::new(action.next_prompt))],
+                        vec![ContentBlock::Text(TextContent::new(prompt))],
                         window,
                         cx,
                     );

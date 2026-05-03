@@ -386,10 +386,9 @@ pub fn decide(
     };
 
     let make_continue_prompt = || {
-        // Do not blindly pick plan files here — the user's first message
-        // (prepended via with_first_prompt_context) carries their intent.
-        // Plan transitions are handled by the LLM decision path.
-        "continue".to_string()
+        // Prompt the AI to self-evaluate rather than blindly continuing.
+        // This gives the AI a chance to confirm completion and stop on its own.
+        "Review your progress so far. If all tasks from the original request are complete and verified, respond with a brief summary and stop. Otherwise continue with the remaining work. Check for any uncommitted changes and commit them if everything is done.".to_string()
     };
 
     log::info!(
@@ -889,7 +888,11 @@ fn default_system_prompt() -> String {
            - Else if no git feature branch was created for this plan in the conversation → next_prompt = "Create a git feature branch feature/{plan_number}_{description} from develop. Commit all changes with conventional commit messages."
            - Else → all_plan_done=true, should_continue=false
 
-        7. If no plan exists but work seems incomplete → should_continue=true, next_prompt="continue"
+        7. If no plan exists but work seems incomplete:
+           - should_continue=true
+           - next_prompt = "Review your progress so far. If all tasks from the original request are complete and verified, respond with a brief summary and stop. Otherwise continue with the remaining work."
+           - Include specific next-step reasoning based on the last messages and tool results
+           - Do NOT use bare "continue" — always describe what remains or ask the AI to evaluate completion
 
         8. confidence < 0.5 → should_continue=false
         9. iteration_count > 15 → consider stopping
