@@ -1582,20 +1582,29 @@ impl ConversationView {
                     }
                     self.send_queued_message_at_index(0, false, window, cx);
                 } else if auto_prompt_enabled {
-                    // Only run auto_prompt when no queued messages are waiting.
-                    if let Some(task) = crate::auto_prompt::on_thread_stopped(
-                        self,
-                        &thread,
-                        used_tools,
-                        stop_reason,
-                        window,
-                        cx,
-                    ) {
-                        if let Some(active) = self.active_thread() {
-                            active.update(cx, |active, cx| {
-                                active._auto_prompt_task = Some(task);
-                                cx.notify();
-                            });
+                    let has_in_progress = thread.read(cx).has_in_progress_tool_calls();
+                    if has_in_progress {
+                        log::info!(
+                            "[auto_prompt] Skipping: tools still in progress, agent has not finished"
+                        );
+                    }
+                    // Only run auto_prompt when no queued messages are waiting
+                    // and the agent has no tools still running.
+                    if !has_in_progress {
+                        if let Some(task) = crate::auto_prompt::on_thread_stopped(
+                            self,
+                            &thread,
+                            used_tools,
+                            stop_reason,
+                            window,
+                            cx,
+                        ) {
+                            if let Some(active) = self.active_thread() {
+                                active.update(cx, |active, cx| {
+                                    active._auto_prompt_task = Some(task);
+                                    cx.notify();
+                                });
+                            }
                         }
                     }
                 }
@@ -1669,7 +1678,13 @@ impl ConversationView {
                         let auto_prompt_enabled = self
                             .active_thread()
                             .is_some_and(|tv| tv.read(cx).auto_prompt_enabled);
-                        if auto_prompt_enabled {
+                        let has_in_progress = thread.read(cx).has_in_progress_tool_calls();
+                        if has_in_progress {
+                            log::info!(
+                                "[auto_prompt] Skipping error-path chaining: tools still in progress"
+                            );
+                        }
+                        if auto_prompt_enabled && !has_in_progress {
                             if let Some(task) = crate::auto_prompt::on_thread_stopped(
                                 self,
                                 &thread,

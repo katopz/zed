@@ -1,4 +1,5 @@
-use acp::schema::{SessionId, StopReason};
+use acp::schema::{ContentBlock, SessionId, StopReason, TextContent};
+use agent::ZED_AGENT_ID;
 use agent_client_protocol as acp;
 use gpui::Window;
 use prompt_store::{BuiltInPrompt, PromptId, PromptStore};
@@ -65,10 +66,36 @@ pub struct AutoPromptNewThread {
 
 fn dispatch_action(
     action: auto_prompt::AutoPromptAction,
-    _conversation_view: &crate::ConversationView,
+    conversation_view: &crate::ConversationView,
     window: &mut Window,
     cx: &mut gpui::Context<crate::ConversationView>,
 ) {
+    let is_native_agent = conversation_view
+        .active_thread()
+        .is_some_and(|tv| tv.read(cx).thread.read(cx).connection().agent_id() == *ZED_AGENT_ID);
+
+    if !is_native_agent {
+        if let Some(active_tv) = conversation_view.active_thread() {
+            active_tv.update(cx, |tv, cx| {
+                tv.message_editor.update(cx, |editor, cx| {
+                    editor.set_message(
+                        vec![ContentBlock::Text(TextContent::new(action.next_prompt))],
+                        window,
+                        cx,
+                    );
+                });
+                tv.send(window, cx);
+            });
+            log::info!(
+                "[auto_prompt] dispatch_action: sent continuation to same thread (ACP agent)"
+            );
+            return;
+        }
+        log::warn!(
+            "[auto_prompt] dispatch_action: no active thread for ACP agent, falling back to new thread"
+        );
+    }
+
     log::info!(
         "[auto_prompt] dispatch_action: dispatching AutoPromptNewThread (prompt {} chars)",
         action.next_prompt.len()
