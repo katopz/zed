@@ -25,6 +25,12 @@ set CXXFLAGS=/permissive
 cargo build --release
 ```
 
+or
+
+```bash
+CXXFLAGS=/permissive cargo build --release
+```
+
 The remaining sections explain the two workarounds and how to set them up.
 
 ---
