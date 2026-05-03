@@ -287,12 +287,19 @@ pub fn decide(
 
     log::info!("[auto_prompt::decide] Auto-prompt evaluating");
 
-    if !used_tools {
-        log::info!("[auto_prompt::decide] No tools were used, skipping auto-prompt");
+    let thread_has_tools = thread.read(cx).has_tool_calls();
+    if !thread_has_tools {
+        log::info!(
+            "[auto_prompt::decide] No tools were used in this session (last_turn={}), skipping auto-prompt",
+            used_tools
+        );
         return AutoPromptDecision::NoAction;
     }
 
-    log::info!("[auto_prompt::decide] Tools were used, continuing evaluation");
+    log::info!(
+        "[auto_prompt::decide] Tools were used in this session (last_turn={}), continuing evaluation",
+        used_tools
+    );
 
     if matches!(stop_reason, StopReason::Cancelled) {
         log::info!("[auto_prompt::decide] Thread was cancelled, skipping auto-prompt");

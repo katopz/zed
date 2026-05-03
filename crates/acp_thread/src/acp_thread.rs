@@ -1425,6 +1425,12 @@ impl AcpThread {
         false
     }
 
+    pub fn has_tool_calls(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| matches!(entry, AgentThreadEntry::ToolCall(..)))
+    }
+
     pub fn handle_session_update(
         &mut self,
         update: acp::SessionUpdate,
