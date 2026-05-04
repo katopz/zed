@@ -450,10 +450,9 @@ pub fn on_thread_stopped(
                         log::info!("[auto_prompt] Chain stopped: {reason}");
 
                         if let Some(ref workspace) = workspace_weak {
-                            let reason_for_toast = reason.clone();
                             let _ = workspace.update(cx, |workspace, cx| {
                                 let status_toast = StatusToast::new(
-                                    format!("Auto-prompt stopped: {reason_for_toast}"),
+                                    format!("Auto-prompt stopped: {reason}"),
                                     cx,
                                     |this, _| {
                                         this.icon(
