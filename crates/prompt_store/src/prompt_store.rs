@@ -87,6 +87,27 @@ impl BuiltInPrompt {
             }
         }
     }
+
+    /// Returns the version number parsed from the default content's `# version: N` header.
+    /// Returns 0 if no version header is found.
+    pub fn default_version(&self) -> u32 {
+        parse_prompt_version(self.default_content())
+    }
+}
+
+/// Extracts the version number from a `# version: N` header at the start of a prompt string.
+/// Returns 0 if no version header is found.
+pub fn parse_prompt_version(content: &str) -> u32 {
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("# version:") {
+            return rest.trim().parse().unwrap_or(0);
+        }
+        if !trimmed.is_empty() && !trimmed.starts_with('#') {
+            break;
+        }
+    }
+    0
 }
 
 impl std::fmt::Display for BuiltInPrompt {
@@ -897,6 +918,109 @@ mod tests {
         assert!(
             metadata_after_restart.is_none(),
             "Deleted prompt should NOT reappear after restart/migration"
+        );
+    }
+
+    // --- parse_prompt_version tests ---
+
+    #[test]
+    fn test_parse_prompt_version_with_header() {
+        let content = "# version: 3\nSome prompt content here.";
+        assert_eq!(super::parse_prompt_version(content), 3);
+    }
+
+    #[test]
+    fn test_parse_prompt_version_with_whitespace() {
+        let content = "  # version:   7    \nMore content.";
+        assert_eq!(super::parse_prompt_version(content), 7);
+    }
+
+    #[test]
+    fn test_parse_prompt_version_no_header() {
+        let content = "You decide whether to continue working.\nNo version header.";
+        assert_eq!(super::parse_prompt_version(content), 0);
+    }
+
+    #[test]
+    fn test_parse_prompt_version_empty() {
+        assert_eq!(super::parse_prompt_version(""), 0);
+    }
+
+    #[test]
+    fn test_parse_prompt_version_header_after_other_comments() {
+        let content = "# This is a comment\n# version: 5\nActual content";
+        assert_eq!(super::parse_prompt_version(content), 5);
+    }
+
+    #[test]
+    fn test_parse_prompt_version_header_after_content_is_ignored() {
+        let content = "Actual content first\n# version: 9\nShould not find this";
+        assert_eq!(super::parse_prompt_version(content), 0);
+    }
+
+    #[test]
+    fn test_parse_prompt_version_non_numeric() {
+        let content = "# version: abc\nSome content";
+        assert_eq!(super::parse_prompt_version(content), 0);
+    }
+
+    #[test]
+    fn test_parse_prompt_version_zero() {
+        let content = "# version: 0\nSome content";
+        assert_eq!(super::parse_prompt_version(content), 0);
+    }
+
+    #[test]
+    fn test_parse_prompt_version_large_number() {
+        let content = "# version: 999\nSome content";
+        assert_eq!(super::parse_prompt_version(content), 999);
+    }
+
+    #[test]
+    fn test_parse_prompt_version_only_comment_lines_before_header() {
+        let content = "# Comment one\n# Comment two\n# version: 4\nContent";
+        assert_eq!(super::parse_prompt_version(content), 4);
+    }
+
+    #[test]
+    fn test_parse_prompt_version_blank_lines_before_header() {
+        let content = "\n\n# version: 2\nContent";
+        assert_eq!(super::parse_prompt_version(content), 2);
+    }
+
+    #[test]
+    fn test_parse_prompt_version_first_header_wins() {
+        let content = "# version: 3\n# version: 9\nContent";
+        assert_eq!(super::parse_prompt_version(content), 3);
+    }
+
+    // --- BuiltInPrompt::default_version tests ---
+
+    #[test]
+    fn test_auto_prompt_default_version_matches_file() {
+        let version = BuiltInPrompt::AutoPromptSystemPrompt.default_version();
+        assert!(
+            version >= 2,
+            "AutoPromptSystemPrompt default version should be at least 2 (current: {version})"
+        );
+    }
+
+    #[test]
+    fn test_commit_message_default_version_is_zero() {
+        assert_eq!(
+            BuiltInPrompt::CommitMessage.default_version(),
+            0,
+            "CommitMessage has no version header, should return 0"
+        );
+    }
+
+    #[test]
+    fn test_parse_version_on_actual_default_content() {
+        let default_content = BuiltInPrompt::AutoPromptSystemPrompt.default_content();
+        let version = super::parse_prompt_version(default_content);
+        assert!(
+            version >= 2,
+            "Actual default_auto_prompt_system_prompt.txt should have version >= 2, got {version}"
         );
     }
 }

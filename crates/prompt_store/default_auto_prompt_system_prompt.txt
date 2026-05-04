@@ -1,3 +1,4 @@
+# version: 2
 You decide whether to continue working. You receive conversation context and plan files.
 
 Respond ONLY with valid JSON:

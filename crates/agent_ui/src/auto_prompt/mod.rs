@@ -79,13 +79,36 @@ fn skip_context_metadata(text: &str) -> String {
     text.trim().to_string()
 }
 
-async fn load_auto_prompt_system_prompt(cx: &mut gpui::AsyncWindowContext) -> Option<String> {
+async fn load_auto_prompt_system_prompt(
+    cx: &mut gpui::AsyncWindowContext,
+) -> Option<(String, bool)> {
     let store_future = cx.update(|_window, cx| PromptStore::global(cx)).ok()?;
     let store = store_future.await.ok()?;
-    let task = store.update(cx, |s, cx| {
-        s.load(PromptId::BuiltIn(BuiltInPrompt::AutoPromptSystemPrompt), cx)
-    });
-    task.await.ok()
+
+    let builtin = BuiltInPrompt::AutoPromptSystemPrompt;
+    let default_version = builtin.default_version();
+    let default_content = builtin.default_content().to_string();
+
+    let stored_prompt = store
+        .update(cx, |s, cx| s.load(PromptId::BuiltIn(builtin), cx))
+        .await
+        .ok()?;
+
+    let stored_version = prompt_store::parse_prompt_version(&stored_prompt);
+
+    if stored_version < default_version {
+        log::warn!(
+            "[auto_prompt] Stored system prompt is outdated (stored=v{stored_version}, default=v{default_version}), using default and resetting stored prompt"
+        );
+        // Remove outdated stored prompt so the default is used directly on next load.
+        // This prevents the toast from showing every time.
+        let _ = store
+            .update(cx, |s, cx| s.delete(PromptId::BuiltIn(builtin), cx))
+            .await;
+        Some((default_content, true))
+    } else {
+        Some((stored_prompt, false))
+    }
 }
 
 /// Toggle auto-prompt on/off from the agent panel toolbar.
@@ -356,14 +379,31 @@ pub fn on_thread_stopped(
 
                 let config = auto_prompt::load_config_cached().unwrap_or_default();
 
-                let store_prompt = load_auto_prompt_system_prompt(cx).await;
+                let store_prompt_result = load_auto_prompt_system_prompt(cx).await;
 
                 let mut data = data;
                 match config.system_prompt.as_ref() {
                     Some(prompt) => data.system_prompt = prompt.clone(),
                     None => {
-                        if let Some(store_prompt) = store_prompt {
+                        if let Some((store_prompt, is_outdated)) = store_prompt_result {
                             data.system_prompt = store_prompt;
+                            if is_outdated {
+                                if let Some(ref workspace) = workspace_weak {
+                                    let _ = workspace.update(cx, |workspace, cx| {
+                                        let toast = notifications::status_toast::StatusToast::new(
+                                            gpui::SharedString::from("Auto-prompt system prompt updated to a newer version. You can customize it in Settings > Prompts."),
+                                            cx,
+                                            |this, _| {
+                                                this.icon(ui::Icon::new(ui::IconName::Info)
+                                                    .color(ui::Color::Muted))
+                                                    .auto_dismiss(true)
+                                                    .dismiss_button(true)
+                                            },
+                                        );
+                                        workspace.toggle_status_toast(toast, cx);
+                                    });
+                                }
+                            }
                         }
                     }
                 }
