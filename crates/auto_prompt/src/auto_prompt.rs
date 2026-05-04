@@ -1087,32 +1087,42 @@ fn default_system_prompt() -> String {
            - should_continue=false — the user must complete the auth flow manually
            - Do NOT auto-chain when the user is mid-auth-flow
 
-        5. If the last message asks a question or lists options:
+        5. If the last ASSISTANT message asks the user a question or waits for user input:
+           - This means the AI is waiting for the human user to respond — NOT for auto_prompt to answer.
+           - should_continue=false — the chain must stop so the user can reply.
+           - Example: "What would you like to work on?", "Which approach do you prefer?", "Please confirm."
+
+        6. If a tool call result presents multiple options/choices to pick from:
            - should_continue=true
            - Pick option 1 or what the AI recommends
            - If unsure, search the codebase and pick the best default
            - confidence >= 0.6
 
-        6. If all plan steps are [x]:
+        7. If all plan steps are [x]:
            - If diagnostics or test failures likely exist → next_prompt = "Fix all diagnostics and ensure test coverage. Production grade only — no mock, no TODO, no placeholder."
            - Else if doc_files is empty → next_prompt = "Create .docs/{NN}_summary.md documenting what was implemented, key decisions, file changes, and how to test."
            - Else if no git feature branch was created for this plan in the conversation → next_prompt = "Create a git feature branch feature/{plan_number}_{description} from develop. Commit all changes with conventional commit messages."
            - Else → all_plan_done=true, should_continue=false
 
-        7. Examine the last 2-3 assistant messages in messages[]. The AI signals completion when it:
+        8. If there is no active task being worked on:
+           - Examine messages[] — if the conversation is just a greeting, small talk, or the AI is waiting for the user to provide a task, there is no work to continue.
+           - should_continue=false
+           - Do NOT fabricate work to do.
+
+        9. Examine the last 2-3 assistant messages in messages[]. The AI signals completion when it:
            - Summarizes what was done and explicitly states the task is complete
            - Says it is done, finished, all tasks complete, nothing left to do
            - Provides a final summary without indicating more work is needed
            When the AI signals completion → should_continue=false, regardless of whether plan files exist.
            This takes priority over any "seems incomplete" heuristic.
 
-        8. If no plan exists AND the last assistant messages do NOT signal completion AND you can identify specific incomplete work from the conversation:
+        10. If no plan exists AND the last assistant messages do NOT signal completion AND you can identify specific incomplete work from the conversation:
            - should_continue=true
            - next_prompt must describe the SPECIFIC remaining work — never use a generic "review your progress" prompt
            - If you cannot identify specific remaining work → should_continue=false
 
-        9. confidence < 0.5 → should_continue=false
-        10. iteration_count > 15 → should_continue=false
+        11. confidence < 0.5 → should_continue=false
+        12. iteration_count > 15 → should_continue=false
 
         ## Pre-stop verification (when stop_phase is "pre_stop"):
         Before confirming stop, verify ALL of these:
