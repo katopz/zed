@@ -1591,6 +1591,11 @@ impl ConversationView {
                     // Only run auto_prompt when no queued messages are waiting
                     // and the agent has no tools still running.
                     if !has_in_progress {
+                        log::info!(
+                            "[auto_prompt] Stopped event: stop_reason={:?}, used_tools={}, calling on_thread_stopped",
+                            stop_reason,
+                            used_tools
+                        );
                         if let Some(task) = crate::auto_prompt::on_thread_stopped(
                             self,
                             &thread,
@@ -1685,11 +1690,20 @@ impl ConversationView {
                             );
                         }
                         if auto_prompt_enabled && !has_in_progress {
-                            if let Some(task) = crate::auto_prompt::on_thread_stopped(
+                            // Don't override a task already set by the Stopped handler.
+                            // Error events can fire alongside Stopped (e.g. MaxTokens emits both).
+                            let already_has_task = self
+                                .active_thread()
+                                .is_some_and(|tv| tv.read(cx)._auto_prompt_task.is_some());
+                            if already_has_task {
+                                log::info!(
+                                    "[auto_prompt] Error event: auto_prompt task already set by Stopped handler, not overriding"
+                                );
+                            } else if let Some(task) = crate::auto_prompt::on_thread_stopped(
                                 self,
                                 &thread,
                                 used_tools,
-                                &acp::StopReason::MaxTokens, // Use MaxTokens as error indicator
+                                &acp::StopReason::EndTurn,
                                 window,
                                 cx,
                             ) {
