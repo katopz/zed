@@ -19,7 +19,13 @@ Respond ONLY with valid JSON:
    - If git status is likely dirty → should_continue=true, next_prompt = "Commit all changes with conventional commit messages to a feature branch from develop."
    - Only if ALL checks pass → should_continue=false
 
-2. If plan_files has unchecked `- [ ]` steps:
+2. User intent gate — check BEFORE plan files:
+   - Examine messages[]: did the user make a substantive request (describe a task, ask for implementation, reference a plan)?
+   - If the user only greeted, chatted, or gave no instructions → should_continue=false regardless of plan_files
+   - If the last ASSISTANT message asks the user a question or waits for user input → should_continue=false
+   - Plan files are irrelevant when the user did not initiate work in THIS conversation
+
+3. If plan_files has unchecked `- [ ]` steps:
    - should_continue=true
    - next_prompt = continue the next unchecked step
    - Use the actual file paths from plan_files (e.g. .plans/ or .plan/)
@@ -27,27 +33,52 @@ Respond ONLY with valid JSON:
    - Process plan files in filename order (01 before 02)
    - When one plan completes, transition to the next
 
-3. If plan_has_checkboxes is false but plan_files exist:
+4. If plan_has_checkboxes is false but plan_files exist:
    - Use the actual path from plan_files[0].path, not a hardcoded directory
    - next_prompt = "Read {actual_path} and add checkboxes (- [ ]) for all tasks at the top. Keep existing content below."
    - should_continue=true
 
-4. If the last message asks a question or lists options:
+5. If the last tool call was a terminal running an auth/login/oauth command:
+   - The command likely opened a browser or is waiting for interactive user input
+   - should_continue=false — the user must complete the auth flow manually
+   - Do NOT auto-chain when the user is mid-auth-flow
+
+6. If the last ASSISTANT message asks the user a question or waits for user input:
+   - This means the AI is waiting for the human user to respond — NOT for auto_prompt to answer.
+   - should_continue=false — the chain must stop so the user can reply.
+   - Example: "What would you like to work on?", "Which approach do you prefer?", "Please confirm."
+
+7. If a tool call result presents multiple options/choices to pick from:
    - should_continue=true
    - Pick option 1 or what the AI recommends
    - If unsure, search the codebase and pick the best default
    - confidence >= 0.6
 
-5. If all plan steps are [x]:
+8. If all plan steps are [x]:
    - If diagnostics or test failures likely exist → next_prompt = "Fix all diagnostics and ensure test coverage. Production grade only — no mock, no TODO, no placeholder."
    - Else if doc_files is empty → next_prompt = "Create .docs/{NN}_summary.md documenting what was implemented, key decisions, file changes, and how to test."
    - Else if no git feature branch was created for this plan in the conversation → next_prompt = "Create a git feature branch feature/{plan_number}_{description} from develop. Commit all changes with conventional commit messages."
    - Else → all_plan_done=true, should_continue=false
 
-6. If no plan exists but work seems incomplete → should_continue=true, next_prompt="continue"
+9. If there is no active task being worked on:
+   - Examine messages[] — if the conversation is just a greeting, small talk, or the AI is waiting for the user to provide a task, there is no work to continue.
+   - should_continue=false
+   - Do NOT fabricate work to do.
 
-7. confidence < 0.5 → should_continue=false
-8. iteration_count > 15 → consider stopping
+10. Examine the last 2-3 assistant messages in messages[]. The AI signals completion when it:
+   - Summarizes what was done and explicitly states the task is complete
+   - Says it is done, finished, all tasks complete, nothing left to do
+   - Provides a final summary without indicating more work is needed
+   When the AI signals completion → should_continue=false, regardless of whether plan files exist.
+   This takes priority over any "seems incomplete" heuristic.
+
+11. If no plan exists AND the last assistant messages do NOT signal completion AND you can identify specific incomplete work from the conversation:
+   - should_continue=true
+   - next_prompt must describe the SPECIFIC remaining work — never use a generic "review your progress" prompt
+   - If you cannot identify specific remaining work → should_continue=false
+
+12. confidence < 0.5 → should_continue=false
+13. iteration_count > 15 → should_continue=false
 
 ## Pre-stop verification (when stop_phase is "pre_stop"):
 Before confirming stop, verify ALL of these:
