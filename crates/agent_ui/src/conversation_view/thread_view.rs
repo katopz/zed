@@ -4346,7 +4346,7 @@ impl ThreadView {
                             log::info!("[auto_prompt] Retry LLM call completed");
 
                             match result {
-                                Ok(Some(action)) => {
+                                Ok(auto_prompt::AutoPromptOutcome::Continue(action)) => {
                                     if let Some(ref tv) = thread_weak {
                                         if let Err(err) = tv.update(cx, |tv, cx| {
                                             tv.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;
@@ -4377,17 +4377,17 @@ impl ThreadView {
                                         }
                                     }
                                 }
-                                Ok(None) => {
+                                Ok(auto_prompt::AutoPromptOutcome::Stopped { reason }) => {
                                     if let Some(ref tv) = thread_weak {
                                         if let Err(err) = tv.update(cx, |tv, cx| {
                                             tv.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;
                                             tv._auto_prompt_retry_data = None;
                                             cx.notify();
                                         }) {
-                                            log::warn!("[auto_prompt] failed to reset state on retry no-action: {err}");
+                                            log::warn!("[auto_prompt] failed to reset state on retry stop: {err}");
                                         }
                                     }
-                                    log::info!("[auto_prompt] Retry returned no action (normal stop)");
+                                    log::info!("[auto_prompt] Retry chain stopped: {reason}");
                                 }
                                 Err(err) => {
                                     // Retry failed again - set back to Failed state and restore retry data
