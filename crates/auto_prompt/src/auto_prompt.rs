@@ -528,14 +528,12 @@ pub fn decide(
 
     if auto_prompt_ctx.exceeds_token_limit(config.max_context_tokens) {
         log::warn!(
-            "[auto_prompt::decide] Token limit exceeded ({} > {}), forcing continue",
+            "[auto_prompt::decide] PATH=token_limit_bypass: tokens={} > max={}, had_error={}, stop_reason={:?}, iteration={} → DispatchNow with make_continue_prompt (LLM bypassed)",
             auto_prompt_ctx.approximate_token_count,
-            config.max_context_tokens
-        );
-        log::info!(
-            "auto_prompt: token limit exceeded (~{} > {}), forcing continue",
-            auto_prompt_ctx.approximate_token_count,
-            config.max_context_tokens
+            config.max_context_tokens,
+            auto_prompt_ctx.had_error,
+            stop_reason,
+            iteration_count
         );
         return AutoPromptDecision::DispatchNow(make_action(make_continue_prompt()));
     }
@@ -556,14 +554,11 @@ pub fn decide(
 
     if auto_prompt_ctx.had_error || matches!(stop_reason, acp::StopReason::Refusal) {
         let delay = config.backoff_delay_ms(iteration_count);
-        log::info!(
-            "[auto_prompt::decide] Error state detected, backing off {}ms",
-            delay
-        );
-        log::info!(
-            "auto_prompt: error state (had_error={}, stop_reason={:?}), backing off {}ms then continuing",
+        log::warn!(
+            "[auto_prompt::decide] PATH=error_bypass: had_error={}, stop_reason={:?}, iteration={} → DispatchAfterDelay({}ms) with make_continue_prompt (LLM bypassed)",
             auto_prompt_ctx.had_error,
             stop_reason,
+            iteration_count,
             delay
         );
         return AutoPromptDecision::DispatchAfterDelay {
@@ -572,7 +567,13 @@ pub fn decide(
         };
     }
 
-    log::info!("[auto_prompt::decide] Will call LLM for decision");
+    log::info!(
+        "[auto_prompt::decide] PATH=llm_call: had_error={}, stop_reason={:?}, iteration={}, tokens={} → NeedsLlmCall (LLM will decide)",
+        auto_prompt_ctx.had_error,
+        stop_reason,
+        iteration_count,
+        auto_prompt_ctx.approximate_token_count
+    );
 
     let system_prompt = config.system_prompt.unwrap_or_else(default_system_prompt);
     let context_json = match serde_json::to_string(&auto_prompt_ctx) {
