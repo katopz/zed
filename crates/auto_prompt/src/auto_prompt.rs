@@ -113,10 +113,51 @@ pub struct AutoPromptAction {
     pub profile_id: Option<String>,
 }
 
-fn with_first_prompt_context(next_prompt: String, summary: Option<&str>) -> String {
-    match summary {
-        Some(summary) if !summary.trim().is_empty() => {
-            format!("refer to first prompt:\n===---===\n{summary}\n===---===\n{next_prompt}")
+fn with_first_prompt_context(
+    next_prompt: String,
+    original_user_message: Option<&str>,
+    thread_summary: Option<&str>,
+    last_assistant_message: Option<&str>,
+) -> String {
+    match original_user_message {
+        Some(msg) if !msg.trim().is_empty() => {
+            let msg = msg.trim();
+            let mut parts = vec![
+                "## 1. First Prompt (original request)".to_string(),
+                String::new(),
+                msg.to_string(),
+                String::new(),
+                "---".to_string(),
+            ];
+
+            if let Some(summary) = thread_summary.filter(|s| !s.trim().is_empty()) {
+                parts.push(String::new());
+                parts.push("## 2. Thread Summary".to_string());
+                parts.push(String::new());
+                parts.push(summary.trim().to_string());
+                parts.push(String::new());
+                parts.push("---".to_string());
+            }
+
+            if let Some(last) = last_assistant_message.filter(|s| !s.trim().is_empty()) {
+                let truncated = if last.len() > 2000 {
+                    format!("{}...", &last[..2000])
+                } else {
+                    last.trim().to_string()
+                };
+                parts.push(String::new());
+                parts.push("## 3. Last Assistant Message".to_string());
+                parts.push(String::new());
+                parts.push(truncated);
+                parts.push(String::new());
+                parts.push("---".to_string());
+            }
+
+            parts.push(String::new());
+            parts.push("## 4. Decision".to_string());
+            parts.push(String::new());
+            parts.push(next_prompt);
+            parts.join("\n")
         }
         _ => next_prompt,
     }
@@ -131,6 +172,26 @@ fn with_first_prompt_context(next_prompt: String, summary: Option<&str>) -> Stri
 /// user intent, which may be embedded in a `refer to first prompt` block.
 fn extract_original_user_message(first_user_message: &str) -> Option<String> {
     let stripped = first_user_message.trim();
+
+    // Try new 4-part structured format FIRST on raw input,
+    // before any header stripping removes the "## 1. First Prompt" marker.
+    if let Some(pos) = stripped.find("## 1. First Prompt (original request)") {
+        let after_header = &stripped[pos + "## 1. First Prompt (original request)".len()..];
+        let after_header = after_header.trim_start_matches('\n');
+        // Extract everything up to the first "---" separator (before section 2/3/4)
+        if let Some(end_pos) = after_header.find("\n---") {
+            let extracted = after_header[..end_pos].trim();
+            if !extracted.is_empty() {
+                return Some(extracted.to_string());
+            }
+        } else {
+            // No separator found, take everything after header
+            let extracted = after_header.trim();
+            if !extracted.is_empty() {
+                return Some(extracted.to_string());
+            }
+        }
+    }
 
     // Strip leading "## User" header(s) from to_markdown rendering
     let without_header = stripped
@@ -149,6 +210,21 @@ fn extract_original_user_message(first_user_message: &str) -> Option<String> {
         .join("\n");
 
     let without_link = without_link.trim();
+
+    // Try old structured format: "## User (checkpoint)\n\n{text}\n---\nrefer to first thread\n---\n..."
+    if let Some(pos) = without_link.find("\n---\nrefer to first thread\n---\n") {
+        let extracted = without_link[..pos].trim();
+        let cleaned = extracted
+            .lines()
+            .skip_while(|line| line.trim_start().starts_with("## "))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim()
+            .to_string();
+        if !cleaned.is_empty() {
+            return Some(cleaned);
+        }
+    }
 
     // Try block-delimited format: "refer to first prompt:\n===---===\n...\n===---===\n<next_prompt>"
     const DELIM: &str = "===---===";
@@ -234,6 +310,9 @@ pub struct LlmCallData {
     /// The raw original user message from the very first thread,
     /// carried across chain hops to prevent summary drift.
     pub original_user_message: Option<String>,
+    /// The last assistant message from the previous thread,
+    /// included in continuation prompts for context.
+    pub last_assistant_message: Option<String>,
     /// The profile/mode from the previous thread (e.g. "Auto", "Sonnet", "High"),
     /// carried across chain hops to preserve the user's selection.
     pub profile_id: Option<String>,
@@ -254,6 +333,13 @@ impl std::fmt::Debug for LlmCallData {
             .field("iteration_count", &self.iteration_count)
             .field("max_verification_attempts", &self.max_verification_attempts)
             .field("work_dirs", &self.work_dirs)
+            .field(
+                "last_assistant_message",
+                &self
+                    .last_assistant_message
+                    .as_ref()
+                    .map(|s| format!("<{} chars>", s.len())),
+            )
             .field("profile_id", &self.profile_id)
             .finish()
     }
@@ -274,6 +360,12 @@ pub fn decide(
 ) -> AutoPromptDecision {
     log::info!("[auto_prompt::decide] Starting decision process");
 
+    let project_root = thread
+        .read(cx)
+        .work_dirs()
+        .and_then(|pl| pl.paths().first().cloned());
+    let iteration_count = get_iteration();
+
     let config = match load_config_cached() {
         Ok(c) => {
             log::info!("[auto_prompt::decide] Config loaded");
@@ -281,6 +373,11 @@ pub fn decide(
         }
         Err(err) => {
             log::warn!("[auto_prompt::decide] config load failed: {err}");
+            write_stop_log(
+                project_root.as_ref(),
+                iteration_count,
+                &format!("config load failed: {err}"),
+            );
             return AutoPromptDecision::NoAction;
         }
     };
@@ -288,21 +385,25 @@ pub fn decide(
     log::info!("[auto_prompt::decide] Auto-prompt evaluating");
 
     let thread_has_tools = thread.read(cx).has_tool_calls();
-    if !thread_has_tools {
+    if thread_has_tools {
         log::info!(
-            "[auto_prompt::decide] No tools were used in this session (last_turn={}), skipping auto-prompt",
+            "[auto_prompt::decide] Tools were used in this session (last_turn={})",
             used_tools
         );
-        return AutoPromptDecision::NoAction;
+    } else {
+        log::info!(
+            "[auto_prompt::decide] No tools in this session (last_turn={}), continuing to LLM decision",
+            used_tools
+        );
     }
 
-    log::info!(
-        "[auto_prompt::decide] Tools were used in this session (last_turn={}), continuing evaluation",
-        used_tools
-    );
-
     if matches!(stop_reason, StopReason::Cancelled) {
-        log::info!("[auto_prompt::decide] Thread was cancelled, skipping auto-prompt");
+        log::info!("[auto_prompt::decide] Thread was cancelled, stopping");
+        write_stop_log(
+            project_root.as_ref(),
+            iteration_count,
+            "thread cancelled by user",
+        );
         return AutoPromptDecision::NoAction;
     }
 
@@ -311,11 +412,15 @@ pub fn decide(
     // Rule-based check: if the last tool call was an interactive auth command
     // (browser login, device auth, etc.), the user is mid-flow — don't chain.
     if is_interactive_tool_pending(thread, cx) {
-        log::info!("[auto_prompt::decide] Interactive auth tool pending, skipping auto-prompt");
+        log::info!("[auto_prompt::decide] Interactive auth tool pending, stopping");
+        write_stop_log(
+            project_root.as_ref(),
+            iteration_count,
+            "interactive auth tool pending — user must complete login",
+        );
         return AutoPromptDecision::NoAction;
     }
 
-    let iteration_count = get_iteration();
     log::info!(
         "[auto_prompt::decide] Current iteration: {}",
         iteration_count
@@ -326,6 +431,11 @@ pub fn decide(
             "[auto_prompt::decide] Max iterations ({}) reached, stopping chain",
             config.max_iterations
         );
+        write_stop_log(
+            project_root.as_ref(),
+            iteration_count,
+            &format!("max iterations ({}) reached", config.max_iterations),
+        );
         reset_iteration();
         return AutoPromptDecision::NoAction;
     }
@@ -333,6 +443,11 @@ pub fn decide(
     let registry = language_model::LanguageModelRegistry::read_global(cx);
     let Some(configured_model) = registry.default_model() else {
         log::warn!("[auto_prompt::decide] No language model configured in Zed");
+        write_stop_log(
+            project_root.as_ref(),
+            iteration_count,
+            "no language model configured in Zed",
+        );
         return AutoPromptDecision::NoAction;
     };
     let model = configured_model.model;
@@ -372,9 +487,16 @@ pub fn decide(
         .as_deref()
         .and_then(|raw| extract_original_user_message(raw));
 
+    let last_assistant_msg = auto_prompt_ctx
+        .last_assistant_message()
+        .map(|s| s.to_string());
     let make_action = |prompt: String| {
-        let fallback_summary = original_user_message.clone();
-        let next_prompt = with_first_prompt_context(prompt, fallback_summary.as_deref());
+        let next_prompt = with_first_prompt_context(
+            prompt,
+            original_user_message.as_deref(),
+            thread_title.as_deref(),
+            last_assistant_msg.as_deref(),
+        );
         AutoPromptAction {
             from_session_id: session_id.clone(),
             from_title: thread_title.clone(),
@@ -455,11 +577,18 @@ pub fn decide(
         }
         Err(err) => {
             log::warn!("[auto_prompt::decide] failed to serialize context: {err}");
+            write_stop_log(
+                project_root.as_ref(),
+                iteration_count,
+                &format!("context serialization failed: {err}"),
+            );
             return AutoPromptDecision::NoAction;
         }
     };
 
-    let project_root = auto_prompt_ctx.current_paths.first().map(PathBuf::from);
+    let last_assistant_message = auto_prompt_ctx
+        .last_assistant_message()
+        .map(|s| s.to_string());
 
     log::info!("[auto_prompt::decide] Returning NeedsLlmCall decision");
     AutoPromptDecision::NeedsLlmCall(LlmCallData {
@@ -474,6 +603,7 @@ pub fn decide(
         work_dirs,
         first_user_message: auto_prompt_ctx.first_user_message,
         original_user_message,
+        last_assistant_message,
         profile_id: None,
     })
 }
@@ -576,8 +706,12 @@ pub async fn decide_with_llm(
                         let next_prompt = format!(
                             "Create a git feature branch for the completed plan from develop and commit all changes with conventional commit messages. Then {next_plan_prompt}"
                         );
-                        let next_prompt =
-                            with_first_prompt_context(next_prompt, prompt_summary.as_deref());
+                        let next_prompt = with_first_prompt_context(
+                            next_prompt,
+                            prompt_summary.as_deref(),
+                            data.title.as_deref(),
+                            data.last_assistant_message.as_deref(),
+                        );
                         return Ok(Some(AutoPromptAction {
                             from_session_id: data.session_id,
                             from_title: data.title,
@@ -596,6 +730,8 @@ pub async fn decide_with_llm(
                             let next_prompt = with_first_prompt_context(
                                 gitflow_prompt,
                                 prompt_summary.as_deref(),
+                                data.title.as_deref(),
+                                data.last_assistant_message.as_deref(),
                             );
                             return Ok(Some(AutoPromptAction {
                                 from_session_id: data.session_id,
@@ -609,6 +745,11 @@ pub async fn decide_with_llm(
                             log::info!(
                                 "[auto_prompt::decide_with_llm] #ALL_PLAN_DONE, no remaining plans, LLM says stop — chain complete"
                             );
+                            write_stop_log(
+                                data.project_root.as_ref(),
+                                data.iteration_count,
+                                "all plans done, no remaining plans",
+                            );
                             reset_iteration();
                             return Ok(None);
                         }
@@ -620,6 +761,14 @@ pub async fn decide_with_llm(
                 log::info!(
                     "[auto_prompt::decide_with_llm] Confidence too low ({} < 0.5), stopping chain",
                     response.confidence.unwrap()
+                );
+                write_stop_log(
+                    data.project_root.as_ref(),
+                    data.iteration_count,
+                    &format!(
+                        "confidence too low ({:.2} < 0.5)",
+                        response.confidence.unwrap()
+                    ),
                 );
                 reset_iteration();
                 return Ok(None);
@@ -644,6 +793,8 @@ pub async fn decide_with_llm(
                             let next_prompt = with_first_prompt_context(
                                 verification_prompt,
                                 prompt_summary.as_deref(),
+                                data.title.as_deref(),
+                                data.last_assistant_message.as_deref(),
                             );
                             return Ok(Some(AutoPromptAction {
                                 from_session_id: data.session_id,
@@ -658,6 +809,11 @@ pub async fn decide_with_llm(
                             log::info!(
                                 "auto_prompt: no verification needed (no plan files found), stopping"
                             );
+                            write_stop_log(
+                                data.project_root.as_ref(),
+                                data.iteration_count,
+                                "LLM says stop, no plan files found for verification",
+                            );
                             reset_iteration();
                             return Ok(None);
                         }
@@ -666,11 +822,23 @@ pub async fn decide_with_llm(
                     log::info!(
                         "auto_prompt: LLM says stop after verification attempt {verification_count}/{max_verifications}, accepting stop"
                     );
+                    write_stop_log(
+                        data.project_root.as_ref(),
+                        data.iteration_count,
+                        &format!(
+                            "LLM says stop after verification attempt {verification_count}/{max_verifications}"
+                        ),
+                    );
                     reset_iteration();
                     return Ok(None);
                 } else {
                     log::warn!(
                         "auto_prompt: max verification attempts ({max_verifications}) exceeded, forcing stop"
+                    );
+                    write_stop_log(
+                        data.project_root.as_ref(),
+                        data.iteration_count,
+                        &format!("max verification attempts ({max_verifications}) exceeded"),
                     );
                     reset_iteration();
                     return Ok(None);
@@ -682,12 +850,22 @@ pub async fn decide_with_llm(
                 prompt.replace("#ALL_PLAN_DONE", "").trim().to_string()
             } else {
                 log::info!("auto_prompt: no prompt determined, stopping");
+                write_stop_log(
+                    data.project_root.as_ref(),
+                    data.iteration_count,
+                    "no next_prompt determined from LLM response",
+                );
                 reset_iteration();
                 return Ok(None);
             };
 
             if next_prompt.is_empty() {
                 log::info!("auto_prompt: prompt was empty after cleanup, stopping");
+                write_stop_log(
+                    data.project_root.as_ref(),
+                    data.iteration_count,
+                    "next_prompt was empty after cleanup",
+                );
                 reset_iteration();
                 return Ok(None);
             }
@@ -723,7 +901,12 @@ pub async fn decide_with_llm(
                 next_prompt.chars().take(80).collect::<String>()
             );
 
-            let next_prompt = with_first_prompt_context(next_prompt, prompt_summary.as_deref());
+            let next_prompt = with_first_prompt_context(
+                next_prompt,
+                prompt_summary.as_deref(),
+                data.title.as_deref(),
+                data.last_assistant_message.as_deref(),
+            );
 
             Ok(Some(AutoPromptAction {
                 from_session_id: data.session_id,
@@ -831,6 +1014,41 @@ fn write_error_log(project_root: &PathBuf, iteration: u32, model: &str, error: &
         }
         Err(err) => {
             log::warn!("auto_prompt: failed to serialize error log entry: {err}");
+        }
+    }
+}
+
+fn write_stop_log(project_root: Option<&PathBuf>, iteration: u32, reason: &str) {
+    let Some(root) = project_root else {
+        log::info!("[auto_prompt] stop: {reason} (no project root for log file)");
+        return;
+    };
+    let logs_dir = root.join(".logs");
+    if let Err(err) = std::fs::create_dir_all(&logs_dir) {
+        log::warn!("auto_prompt: failed to create .logs dir: {err}");
+        return;
+    }
+    let timestamp = chrono::Local::now().format("%Y-%m-%dT%H-%M-%S%.3f");
+    let filename = format!("{timestamp}_{iteration}_stop.json");
+    let path = logs_dir.join(&filename);
+    let log_entry = serde_json::json!({
+        "timestamp": chrono::Local::now().to_rfc3339(),
+        "iteration": iteration,
+        "reason": reason,
+    });
+    match serde_json::to_string_pretty(&log_entry) {
+        Ok(json) => {
+            if let Err(err) = std::fs::write(&path, json) {
+                log::warn!(
+                    "auto_prompt: failed to write stop log {}: {err}",
+                    path.display()
+                );
+            } else {
+                log::info!("auto_prompt: wrote stop log to {}", path.display());
+            }
+        }
+        Err(err) => {
+            log::warn!("auto_prompt: failed to serialize stop log: {err}");
         }
     }
 }
@@ -1443,23 +1661,72 @@ mod tests {
 
     #[test]
     fn test_with_first_prompt_context_multiline() {
-        let summary = "check .plans against the code\n\nfile.rs\nanother.rs";
-        let result = with_first_prompt_context("continue".to_string(), Some(summary));
-        assert!(result.starts_with("refer to first prompt:\n===---===\n"));
-        assert!(result.contains(summary));
-        assert!(result.ends_with("\n===---===\ncontinue"));
+        let original = "check .plans against the code\n\nfile.rs\nanother.rs";
+        let result = with_first_prompt_context("continue".to_string(), Some(original), None, None);
+        assert!(result.starts_with("## 1. First Prompt (original request)\n\n"));
+        assert!(result.contains(original));
+        assert!(result.contains("## 4. Decision"));
+        assert!(result.ends_with("continue"));
     }
 
     #[test]
     fn test_with_first_prompt_context_none() {
-        let result = with_first_prompt_context("continue".to_string(), None);
+        let result = with_first_prompt_context("continue".to_string(), None, None, None);
         assert_eq!(result, "continue");
     }
 
     #[test]
     fn test_with_first_prompt_context_empty() {
-        let result = with_first_prompt_context("continue".to_string(), Some(""));
+        let result = with_first_prompt_context("continue".to_string(), Some(""), None, None);
         assert_eq!(result, "continue");
+    }
+
+    #[test]
+    fn test_with_first_prompt_context_with_thread_summary_and_last_message() {
+        let original = "fix the bug in auth";
+        let summary = "Auth Bug Fix Thread";
+        let last_msg = "Fixed the auth bug, tests passing";
+        let result = with_first_prompt_context(
+            "commit the changes".to_string(),
+            Some(original),
+            Some(summary),
+            Some(last_msg),
+        );
+        assert!(result.starts_with("## 1. First Prompt (original request)\n\n"));
+        assert!(result.contains(original));
+        assert!(result.contains("## 2. Thread Summary"));
+        assert!(result.contains(summary));
+        assert!(result.contains("## 3. Last Assistant Message"));
+        assert!(result.contains(last_msg));
+        assert!(result.contains("## 4. Decision"));
+        assert!(result.ends_with("commit the changes"));
+    }
+
+    #[test]
+    fn test_with_first_prompt_context_4_part_structure() {
+        let original = "implement feature X";
+        let summary = "Feature X implementation thread";
+        let last_msg = "Completed steps 1-3, need to do step 4";
+        let result = with_first_prompt_context(
+            "do step 4 now".to_string(),
+            Some(original),
+            Some(summary),
+            Some(last_msg),
+        );
+        // Verify 4-part structure with section headers
+        assert!(result.contains("## 1. First Prompt (original request)"));
+        assert!(result.contains("## 2. Thread Summary"));
+        assert!(result.contains("## 3. Last Assistant Message"));
+        assert!(result.contains("## 4. Decision"));
+
+        // Verify sections are in order
+        let pos1 = result.find("## 1.").unwrap();
+        let pos2 = result.find("## 2.").unwrap();
+        let pos3 = result.find("## 3.").unwrap();
+        let pos4 = result.find("## 4.").unwrap();
+        assert!(pos1 < pos2);
+        assert!(pos2 < pos3);
+        assert!(pos3 < pos4);
     }
 
     #[test]
@@ -1523,7 +1790,7 @@ mod tests {
     #[test]
     fn test_roundtrip_multiline_with_file_refs() {
         let original = "check .plans against the code and complete it as possible, also update plan md to reflect current state, fix all diag focus only on\n\ncrates\nmmorpg";
-        let wrapped = with_first_prompt_context("continue".to_string(), Some(original));
+        let wrapped = with_first_prompt_context("continue".to_string(), Some(original), None, None);
         let extracted = extract_original_user_message(&wrapped);
         assert_eq!(extracted, Some(original.to_string()));
     }
@@ -1531,7 +1798,7 @@ mod tests {
     #[test]
     fn test_roundtrip_with_chain_wrapper() {
         let original = "do important work\n\nfile.rs\nother.rs";
-        let wrapped = with_first_prompt_context("continue".to_string(), Some(original));
+        let wrapped = with_first_prompt_context("continue".to_string(), Some(original), None, None);
         let chain_message = format!("## User\n\n[@Thread](zed:///agent/thread/abc)\n\n{wrapped}");
         let extracted = extract_original_user_message(&chain_message);
         assert_eq!(extracted, Some(original.to_string()));
@@ -1540,8 +1807,44 @@ mod tests {
     #[test]
     fn test_roundtrip_content_with_quotes() {
         let original = r#"use format!("{var}") not format!("{}", var)"#;
-        let wrapped = with_first_prompt_context("continue".to_string(), Some(original));
+        let wrapped = with_first_prompt_context("continue".to_string(), Some(original), None, None);
         let extracted = extract_original_user_message(&wrapped);
+        assert_eq!(extracted, Some(original.to_string()));
+    }
+
+    #[test]
+    fn test_extract_original_user_message_new_structured_format() {
+        let input = "## User (checkpoint)\n\nfix the bugs in auth module\n\nsrc/auth.rs\n---\nrefer to first thread\n---\ncommit the changes";
+        let result = extract_original_user_message(input);
+        assert_eq!(
+            result,
+            Some("fix the bugs in auth module\n\nsrc/auth.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_original_user_message_new_4_part_format() {
+        let input = "## 1. First Prompt (original request)\n\nimplement the auth module\n\nsrc/auth.rs\n\n---\n\n## 2. Thread Summary\n\nAuth implementation\n\n---\n\n## 4. Decision\n\ncommit changes";
+        let result = extract_original_user_message(input);
+        assert_eq!(
+            result,
+            Some("implement the auth module\n\nsrc/auth.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn test_roundtrip_4_part_format_with_summary_and_last_message() {
+        let original = "implement feature X with files\n\nmod.rs\nlib.rs";
+        let summary = "Feature X Thread";
+        let last_msg = "Completed implementation";
+        let wrapped = with_first_prompt_context(
+            "do the next thing".to_string(),
+            Some(original),
+            Some(summary),
+            Some(last_msg),
+        );
+        let chain_message = format!("## User\n\n[@Thread](zed:///agent/thread/abc)\n\n{wrapped}");
+        let extracted = extract_original_user_message(&chain_message);
         assert_eq!(extracted, Some(original.to_string()));
     }
 }

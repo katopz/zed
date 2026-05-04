@@ -5,10 +5,39 @@ use gpui::Window;
 use prompt_store::{BuiltInPrompt, PromptId, PromptStore};
 use std::path::PathBuf;
 
-/// Strip the `refer to first prompt:\n===---===\n...\n===---===\n` wrapper
-/// produced by `with_first_prompt_context`. For same-thread continuation
-/// (ACP agents) the AI already has full context — the wrapper wastes tokens.
+/// Strip the context wrapper produced by `with_first_prompt_context`.
+/// For same-thread continuation (ACP agents) the AI already has full
+/// context — the wrapper wastes tokens, so we extract just the instruction.
+///
+/// Handles two formats:
+/// 1. New structured: `## User (checkpoint)\n...\n---\nrefer to first thread\n---\n[metadata]\n{instruction}`
+/// 2. Legacy block: `refer to first prompt:\n===---===\n...\n===---===\n{instruction}`
 fn strip_first_prompt_wrapper(prompt: &str) -> String {
+    // New 4-part structured format: find "## 4. Decision" and extract the instruction
+    if prompt.starts_with("## 1. First Prompt (original request)") {
+        const DECISION_HEADER: &str = "## 4. Decision\n\n";
+        if let Some(pos) = prompt.find(DECISION_HEADER) {
+            let instruction = &prompt[pos + DECISION_HEADER.len()..];
+            let trimmed = instruction.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+
+    // Old structured format: "## User (checkpoint)" with "---\nrefer to first thread\n---"
+    if prompt.starts_with("## User (checkpoint)") {
+        const SEPARATOR: &str = "---\nrefer to first thread\n---\n";
+        if let Some(pos) = prompt.find(SEPARATOR) {
+            let after = &prompt[pos + SEPARATOR.len()..];
+            let result = skip_context_metadata(after);
+            if !result.is_empty() {
+                return result;
+            }
+        }
+    }
+
+    // Legacy block-delimited format
     const DELIM: &str = "===---===";
     if let Some(rest) = prompt.strip_prefix("refer to first prompt:") {
         let rest = rest.trim_start_matches('\n');
@@ -22,7 +51,30 @@ fn strip_first_prompt_wrapper(prompt: &str) -> String {
             }
         }
     }
+
     prompt.to_string()
+}
+
+/// Skip known metadata sections (Thread summary, Last assistant message)
+/// and return the actual instruction prompt.
+///
+/// The metadata and instruction are separated by a `---` line.
+/// We find the last `---` that sits on its own line and return what follows.
+fn skip_context_metadata(text: &str) -> String {
+    // Find the last `---` separator line — everything after it is the instruction.
+    // Scan backwards for a line that is exactly "---".
+    let lines: Vec<&str> = text.lines().collect();
+    for i in (0..lines.len()).rev() {
+        if lines[i].trim() == "---" {
+            let instruction = lines[i + 1..].join("\n").trim().to_string();
+            if !instruction.is_empty() {
+                return instruction;
+            }
+        }
+    }
+
+    // Fallback: no separator found, return trimmed text as-is
+    text.trim().to_string()
 }
 
 async fn load_auto_prompt_system_prompt(cx: &mut gpui::AsyncWindowContext) -> Option<String> {
