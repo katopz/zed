@@ -884,15 +884,10 @@ pub async fn decide_with_llm(
                 next_prompt
             };
 
-            // If LLM self-corrects during PreStop, reset verification for fresh cycle on next stop
-            let current_verification = VERIFICATION_COUNT.load(Ordering::Relaxed);
-            if current_verification > 0 {
-                log::info!(
-                    "auto_prompt: LLM continuing during PreStop (verification_count={}), resetting for fresh verification on next stop",
-                    current_verification
-                );
-                VERIFICATION_COUNT.store(0, Ordering::Relaxed);
-            }
+            log::info!(
+                "auto_prompt: LLM continuing (verification_count={})",
+                VERIFICATION_COUNT.load(Ordering::Relaxed)
+            );
 
             log::info!(
                 "auto_prompt: dispatching new thread with prompt: {}...",
@@ -1104,14 +1099,20 @@ fn default_system_prompt() -> String {
            - Else if no git feature branch was created for this plan in the conversation → next_prompt = "Create a git feature branch feature/{plan_number}_{description} from develop. Commit all changes with conventional commit messages."
            - Else → all_plan_done=true, should_continue=false
 
-        7. If no plan exists but work seems incomplete:
-           - should_continue=true
-           - next_prompt = "Review your progress so far. If all tasks from the original request are complete and verified, respond with a brief summary and stop. Otherwise continue with the remaining work."
-           - Include specific next-step reasoning based on the last messages and tool results
-           - Do NOT use bare "continue" — always describe what remains or ask the AI to evaluate completion
+        7. Examine the last 2-3 assistant messages in messages[]. The AI signals completion when it:
+           - Summarizes what was done and explicitly states the task is complete
+           - Says it is done, finished, all tasks complete, nothing left to do
+           - Provides a final summary without indicating more work is needed
+           When the AI signals completion → should_continue=false, regardless of whether plan files exist.
+           This takes priority over any "seems incomplete" heuristic.
 
-        8. confidence < 0.5 → should_continue=false
-        9. iteration_count > 15 → consider stopping
+        8. If no plan exists AND the last assistant messages do NOT signal completion AND you can identify specific incomplete work from the conversation:
+           - should_continue=true
+           - next_prompt must describe the SPECIFIC remaining work — never use a generic "review your progress" prompt
+           - If you cannot identify specific remaining work → should_continue=false
+
+        9. confidence < 0.5 → should_continue=false
+        10. iteration_count > 15 → should_continue=false
 
         ## Pre-stop verification (when stop_phase is "pre_stop"):
         Before confirming stop, verify ALL of these:
