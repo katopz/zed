@@ -113,6 +113,15 @@ pub struct AutoPromptAction {
     pub profile_id: Option<String>,
 }
 
+/// Outcome of an auto-prompt LLM decision.
+#[derive(Clone, Debug)]
+pub enum AutoPromptOutcome {
+    /// Chain should continue with this action.
+    Continue(AutoPromptAction),
+    /// Chain stopped with a reason (shown to user as info toast).
+    Stopped { reason: String },
+}
+
 fn with_first_prompt_context(
     next_prompt: String,
     original_user_message: Option<&str>,
@@ -614,7 +623,7 @@ pub fn decide(
 pub async fn decide_with_llm(
     data: LlmCallData,
     cx: &gpui::AsyncApp,
-) -> anyhow::Result<Option<AutoPromptAction>> {
+) -> anyhow::Result<AutoPromptOutcome> {
     log::warn!(
         "[auto_prompt] *** ENTRY POINT *** decide_with_llm called: session_id={:?}, iteration={}",
         data.session_id,
@@ -712,7 +721,7 @@ pub async fn decide_with_llm(
                             data.title.as_deref(),
                             data.last_assistant_message.as_deref(),
                         );
-                        return Ok(Some(AutoPromptAction {
+                        return Ok(AutoPromptOutcome::Continue(AutoPromptAction {
                             from_session_id: data.session_id,
                             from_title: data.title,
                             next_prompt,
@@ -733,7 +742,7 @@ pub async fn decide_with_llm(
                                 data.title.as_deref(),
                                 data.last_assistant_message.as_deref(),
                             );
-                            return Ok(Some(AutoPromptAction {
+                            return Ok(AutoPromptOutcome::Continue(AutoPromptAction {
                                 from_session_id: data.session_id,
                                 from_title: data.title,
                                 next_prompt,
@@ -742,16 +751,17 @@ pub async fn decide_with_llm(
                                 profile_id: data.profile_id.clone(),
                             }));
                         } else {
+                            let reason = "all plans done, no remaining plans".to_string();
                             log::info!(
                                 "[auto_prompt::decide_with_llm] #ALL_PLAN_DONE, no remaining plans, LLM says stop — chain complete"
                             );
                             write_stop_log(
                                 data.project_root.as_ref(),
                                 data.iteration_count,
-                                "all plans done, no remaining plans",
+                                &reason,
                             );
                             reset_iteration();
-                            return Ok(None);
+                            return Ok(AutoPromptOutcome::Stopped { reason });
                         }
                     }
                 }
@@ -762,16 +772,13 @@ pub async fn decide_with_llm(
                     "[auto_prompt::decide_with_llm] Confidence too low ({} < 0.5), stopping chain",
                     response.confidence.unwrap()
                 );
-                write_stop_log(
-                    data.project_root.as_ref(),
-                    data.iteration_count,
-                    &format!(
-                        "confidence too low ({:.2} < 0.5)",
-                        response.confidence.unwrap()
-                    ),
+                let reason = format!(
+                    "confidence too low ({:.2} < 0.5)",
+                    response.confidence.unwrap()
                 );
+                write_stop_log(data.project_root.as_ref(), data.iteration_count, &reason);
                 reset_iteration();
-                return Ok(None);
+                return Ok(AutoPromptOutcome::Stopped { reason });
             }
 
             if !response.should_continue && !has_prompt {
@@ -796,7 +803,7 @@ pub async fn decide_with_llm(
                                 data.title.as_deref(),
                                 data.last_assistant_message.as_deref(),
                             );
-                            return Ok(Some(AutoPromptAction {
+                            return Ok(AutoPromptOutcome::Continue(AutoPromptAction {
                                 from_session_id: data.session_id,
                                 from_title: data.title,
                                 next_prompt,
@@ -806,42 +813,39 @@ pub async fn decide_with_llm(
                             }));
                         }
                         None => {
+                            let reason =
+                                "LLM says stop, no plan files found for verification".to_string();
                             log::info!(
                                 "auto_prompt: no verification needed (no plan files found), stopping"
                             );
                             write_stop_log(
                                 data.project_root.as_ref(),
                                 data.iteration_count,
-                                "LLM says stop, no plan files found for verification",
+                                &reason,
                             );
                             reset_iteration();
-                            return Ok(None);
+                            return Ok(AutoPromptOutcome::Stopped { reason });
                         }
                     }
                 } else if verification_count < max_verifications {
                     log::info!(
                         "auto_prompt: LLM says stop after verification attempt {verification_count}/{max_verifications}, accepting stop"
                     );
-                    write_stop_log(
-                        data.project_root.as_ref(),
-                        data.iteration_count,
-                        &format!(
-                            "LLM says stop after verification attempt {verification_count}/{max_verifications}"
-                        ),
+                    let reason = format!(
+                        "LLM says stop after verification attempt {verification_count}/{max_verifications}"
                     );
+                    write_stop_log(data.project_root.as_ref(), data.iteration_count, &reason);
                     reset_iteration();
-                    return Ok(None);
+                    return Ok(AutoPromptOutcome::Stopped { reason });
                 } else {
+                    let reason =
+                        format!("max verification attempts ({max_verifications}) exceeded");
                     log::warn!(
                         "auto_prompt: max verification attempts ({max_verifications}) exceeded, forcing stop"
                     );
-                    write_stop_log(
-                        data.project_root.as_ref(),
-                        data.iteration_count,
-                        &format!("max verification attempts ({max_verifications}) exceeded"),
-                    );
+                    write_stop_log(data.project_root.as_ref(), data.iteration_count, &reason);
                     reset_iteration();
-                    return Ok(None);
+                    return Ok(AutoPromptOutcome::Stopped { reason });
                 }
             }
 
@@ -849,25 +853,19 @@ pub async fn decide_with_llm(
                 let prompt = response.next_prompt.unwrap();
                 prompt.replace("#ALL_PLAN_DONE", "").trim().to_string()
             } else {
+                let reason = "no next_prompt determined from LLM response".to_string();
                 log::info!("auto_prompt: no prompt determined, stopping");
-                write_stop_log(
-                    data.project_root.as_ref(),
-                    data.iteration_count,
-                    "no next_prompt determined from LLM response",
-                );
+                write_stop_log(data.project_root.as_ref(), data.iteration_count, &reason);
                 reset_iteration();
-                return Ok(None);
+                return Ok(AutoPromptOutcome::Stopped { reason });
             };
 
             if next_prompt.is_empty() {
+                let reason = "next_prompt was empty after cleanup".to_string();
                 log::info!("auto_prompt: prompt was empty after cleanup, stopping");
-                write_stop_log(
-                    data.project_root.as_ref(),
-                    data.iteration_count,
-                    "next_prompt was empty after cleanup",
-                );
+                write_stop_log(data.project_root.as_ref(), data.iteration_count, &reason);
                 reset_iteration();
-                return Ok(None);
+                return Ok(AutoPromptOutcome::Stopped { reason });
             }
 
             // Safety check: if heading to doc creation but plan has unchecked items,
@@ -908,7 +906,7 @@ pub async fn decide_with_llm(
                 data.last_assistant_message.as_deref(),
             );
 
-            Ok(Some(AutoPromptAction {
+            Ok(AutoPromptOutcome::Continue(AutoPromptAction {
                 from_session_id: data.session_id,
                 from_title: data.title,
                 next_prompt,

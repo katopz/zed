@@ -2,8 +2,10 @@ use acp::schema::{ContentBlock, SessionId, StopReason, TextContent};
 use agent::ZED_AGENT_ID;
 use agent_client_protocol as acp;
 use gpui::Window;
+use notifications::status_toast::StatusToast;
 use prompt_store::{BuiltInPrompt, PromptId, PromptStore};
 use std::path::PathBuf;
+use ui::prelude::*;
 
 /// Strip the context wrapper produced by `with_first_prompt_context`.
 /// For same-thread continuation (ACP agents) the AI already has full
@@ -343,6 +345,15 @@ pub fn on_thread_stopped(
                         None
                     });
 
+                let workspace_weak = _view
+                    .update_in(cx, |cv, _window, cx| {
+                        cv.active_thread().map(|tv| tv.read(cx).workspace.clone())
+                    })
+                    .unwrap_or_else(|err| {
+                        log::warn!("[auto_prompt] failed to get workspace: {err}");
+                        None
+                    });
+
                 let config = auto_prompt::load_config_cached().unwrap_or_default();
 
                 let store_prompt = load_auto_prompt_system_prompt(cx).await;
@@ -400,7 +411,7 @@ pub fn on_thread_stopped(
                 log::info!("[auto_prompt] ASYNC TASK: LLM call completed");
 
                 match result {
-                    Ok(Some(action)) => {
+                    Ok(auto_prompt::AutoPromptOutcome::Continue(action)) => {
                         if let Some(ref tv) = thread_weak {
                             if let Err(err) = tv.update(cx, |tv, cx| {
                                 tv.auto_prompt_state = AutoPromptState::Idle;
@@ -427,17 +438,38 @@ pub fn on_thread_stopped(
                             }
                         }
                     }
-                    Ok(None) => {
+                    Ok(auto_prompt::AutoPromptOutcome::Stopped { reason }) => {
                         if let Some(ref tv) = thread_weak {
                             if let Err(err) = tv.update(cx, |tv, cx| {
                                 tv.auto_prompt_state = AutoPromptState::Idle;
                                 cx.notify();
                             }) {
-                                log::warn!("[auto_prompt] failed to reset state on no-action: {err}");
+                                log::warn!("[auto_prompt] failed to reset state on stop: {err}");
                             }
                         }
-                        log::info!("[auto_prompt] LLM returned no action (normal stop)");
+                        log::info!("[auto_prompt] Chain stopped: {reason}");
+
+                        if let Some(ref workspace) = workspace_weak {
+                            let reason_for_toast = reason.clone();
+                            let _ = workspace.update(cx, |workspace, cx| {
+                                let status_toast = StatusToast::new(
+                                    format!("Auto-prompt stopped: {reason_for_toast}"),
+                                    cx,
+                                    |this, _| {
+                                        this.icon(
+                                            Icon::new(IconName::Check)
+                                                .size(IconSize::Small)
+                                                .color(Color::Muted),
+                                        )
+                                        .auto_dismiss(true)
+                                        .dismiss_button(true)
+                                    },
+                                );
+                                workspace.toggle_status_toast(status_toast, cx);
+                            });
+                        }
                     }
+
                     Err(err) => {
                         // Max retries exhausted (already tried in the loop above)
                         if let Some(ref tv) = thread_weak {
