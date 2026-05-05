@@ -1390,7 +1390,6 @@ dependencies = [
  "chrono",
  "futures 0.3.32",
  "gpui",
- "indoc",
  "language_model",
  "log",
  "paths",
