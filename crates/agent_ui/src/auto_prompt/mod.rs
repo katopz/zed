@@ -254,6 +254,16 @@ pub fn on_thread_stopped(
             stop_reason
         );
     }
+
+    let is_native_agent = conversation_view
+        .active_thread()
+        .is_some_and(|tv| tv.read(cx).thread.read(cx).connection().agent_id() == *ZED_AGENT_ID);
+
+    if !is_native_agent {
+        log::info!("[auto_prompt] Skipping auto_prompt for external ACP agent (not Zed Agent)");
+        return None;
+    }
+
     let decision = auto_prompt::decide(thread, used_tools, stop_reason, cx);
     log::info!("[auto_prompt] decision result: {:?}", decision);
 

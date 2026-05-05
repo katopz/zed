@@ -4279,7 +4279,8 @@ impl ThreadView {
     }
 
     fn render_auto_prompt_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let enabled = self.auto_prompt_enabled;
+        let is_native_agent = self.agent_id.as_ref() == agent::ZED_AGENT_ID.as_ref();
+        let enabled = self.auto_prompt_enabled && is_native_agent;
 
         let is_processing = matches!(
             self.auto_prompt_state,
@@ -4311,8 +4312,13 @@ impl ThreadView {
             .when(enabled && !is_processing && !is_failed, |this| {
                 this.style(ButtonStyle::Tinted(TintColor::Accent))
             })
+            .disabled(!is_native_agent)
             .tooltip(move |_, cx| {
-                Tooltip::for_action("Auto-Prompt", &crate::auto_prompt::ToggleAutoPrompt, cx)
+                if is_native_agent {
+                    Tooltip::for_action("Auto-Prompt", &crate::auto_prompt::ToggleAutoPrompt, cx)
+                } else {
+                    Tooltip::simple("Auto-prompt is only available for Zed Agent", cx)
+                }
             })
             .on_click(cx.listener(move |this, _, window, cx| {
                 if is_processing {
