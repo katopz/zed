@@ -83,7 +83,7 @@ impl BuiltInPrompt {
         match self {
             Self::CommitMessage => include_str!("../../git_ui/src/commit_message_prompt.txt"),
             Self::AutoPromptSystemPrompt => {
-                include_str!("../default_auto_prompt_system_prompt.txt")
+                include_str!("../../auto_prompt/src/default_auto_prompt_system_prompt.txt")
             }
         }
     }
