@@ -1000,8 +1000,8 @@ mod tests {
     fn test_auto_prompt_default_version_matches_file() {
         let version = BuiltInPrompt::AutoPromptSystemPrompt.default_version();
         assert!(
-            version >= 2,
-            "AutoPromptSystemPrompt default version should be at least 2 (current: {version})"
+            version >= 3,
+            "AutoPromptSystemPrompt default version should be at least 3 (current: {version})"
         );
     }
 
@@ -1019,8 +1019,8 @@ mod tests {
         let default_content = BuiltInPrompt::AutoPromptSystemPrompt.default_content();
         let version = super::parse_prompt_version(default_content);
         assert!(
-            version >= 2,
-            "Actual default_auto_prompt_system_prompt.txt should have version >= 2, got {version}"
+            version >= 3,
+            "Actual default_auto_prompt_system_prompt.txt should have version >= 3, got {version}"
         );
     }
 }

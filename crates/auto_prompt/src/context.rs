@@ -64,6 +64,9 @@ pub struct AutoPromptContext {
     /// The first user message in the conversation, carrying the original intent.
     #[serde(default)]
     pub first_user_message: Option<String>,
+    /// The last assistant message, surfaced for remaining-work detection.
+    #[serde(default)]
+    pub last_assistant_message: Option<String>,
 }
 
 /// A plan entry with its status.
@@ -234,6 +237,7 @@ impl AutoPromptContext {
             first_plan_filename: String::new(),
             plan_number: String::new(),
             first_user_message,
+            last_assistant_message: None,
         };
 
         context.approximate_token_count = context.estimate_token_count();
@@ -242,6 +246,7 @@ impl AutoPromptContext {
         context.plan_has_checkboxes = context.compute_plan_has_checkboxes();
         context.first_plan_filename = context.compute_first_plan_filename();
         context.plan_number = context.compute_plan_number();
+        context.last_assistant_message = context.compute_last_assistant_message();
 
         context
     }
@@ -267,11 +272,21 @@ impl AutoPromptContext {
 
     /// Returns the last assistant message content, if any.
     pub fn last_assistant_message(&self) -> Option<&str> {
+        self.last_assistant_message.as_deref().or_else(|| {
+            self.messages
+                .iter()
+                .rev()
+                .find(|m| matches!(m.role, ContextMessageRole::Assistant))
+                .map(|m| m.content.as_str())
+        })
+    }
+
+    pub fn compute_last_assistant_message(&self) -> Option<String> {
         self.messages
             .iter()
             .rev()
             .find(|m| matches!(m.role, ContextMessageRole::Assistant))
-            .map(|m| m.content.as_str())
+            .map(|m| m.content.clone())
     }
 
     /// Returns the count of plan items by status.
