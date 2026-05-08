@@ -5121,6 +5121,15 @@ impl ThreadView {
                 }
             }));
 
+        let manual_auto_prompt = IconButton::new("manual-auto-prompt", IconName::Sparkle)
+            .shape(ui::IconButtonShape::Square)
+            .icon_size(IconSize::Small)
+            .icon_color(Color::Ignored)
+            .tooltip(Tooltip::text("Auto Prompt"))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.manual_auto_prompt(window, cx);
+            }));
+
         let scroll_to_recent_user_prompt =
             IconButton::new("scroll_to_recent_user_prompt", IconName::ForwardArrow)
                 .shape(ui::IconButtonShape::Square)
@@ -5291,6 +5300,7 @@ impl ThreadView {
 
         container
             .child(open_as_markdown)
+            .child(manual_auto_prompt)
             .child(scroll_to_recent_user_prompt)
             .child(scroll_to_top)
             .into_any_element()
@@ -5498,6 +5508,75 @@ impl ThreadView {
             })?;
             anyhow::Ok(())
         })
+    }
+
+    fn manual_auto_prompt(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let thread = self.thread.read(cx);
+
+        let session_id = thread.session_id().clone();
+        let title = thread.title().map(|t| t.to_string());
+        let work_dirs = thread.work_dirs().map(|pl| pl.paths().to_vec());
+        let profile_id = self.current_mode_id(cx).map(|id| id.to_string());
+
+        let first_user_message = thread.entries().iter().find_map(|entry| match entry {
+            AgentThreadEntry::UserMessage(msg) => {
+                let content = msg.content.to_markdown(cx).to_string();
+                if content.is_empty() {
+                    None
+                } else {
+                    Some(content)
+                }
+            }
+            _ => None,
+        });
+
+        let last_assistant_message = thread.entries().iter().rev().find_map(|entry| match entry {
+            AgentThreadEntry::AssistantMessage(msg) => {
+                let content = msg
+                    .chunks
+                    .iter()
+                    .filter_map(|chunk| {
+                        let block = match chunk {
+                            acp_thread::AssistantMessageChunk::Message { block } => block,
+                            acp_thread::AssistantMessageChunk::Thought { block } => block,
+                        };
+                        let text = block.to_markdown(cx).to_string();
+                        if text.is_empty() { None } else { Some(text) }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if content.is_empty() {
+                    None
+                } else {
+                    Some(content)
+                }
+            }
+            _ => None,
+        });
+
+        let original_user_message = first_user_message
+            .as_deref()
+            .and_then(auto_prompt::extract_original_user_message);
+
+        let continue_prompt = "Review your progress and continue any remaining work. If everything is complete, commit all changes with conventional commit messages.".to_string();
+
+        let next_prompt = auto_prompt::with_first_prompt_context(
+            continue_prompt,
+            original_user_message.as_deref(),
+            title.as_deref(),
+            last_assistant_message.as_deref(),
+        );
+
+        let action = Box::new(crate::auto_prompt::AutoPromptNewThread {
+            from_session_id: session_id,
+            from_title: title,
+            next_prompt,
+            work_dirs,
+            original_user_message,
+            profile_id,
+        });
+
+        window.dispatch_action(action, cx);
     }
 
     pub(crate) fn sync_editor_mode_for_empty_state(&mut self, cx: &mut Context<Self>) {

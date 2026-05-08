@@ -122,7 +122,7 @@ pub enum AutoPromptOutcome {
     Stopped { reason: String },
 }
 
-fn with_first_prompt_context(
+pub fn with_first_prompt_context(
     next_prompt: String,
     original_user_message: Option<&str>,
     thread_summary: Option<&str>,
@@ -179,7 +179,7 @@ fn with_first_prompt_context(
 ///
 /// This function strips the auto-generated wrapper to recover the original
 /// user intent, which may be embedded in a `refer to first prompt` block.
-fn extract_original_user_message(first_user_message: &str) -> Option<String> {
+pub fn extract_original_user_message(first_user_message: &str) -> Option<String> {
     let stripped = first_user_message.trim();
 
     // Try new 4-part structured format FIRST on raw input,
