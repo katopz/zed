@@ -5556,7 +5556,8 @@ impl ThreadView {
 
         let original_user_message = first_user_message
             .as_deref()
-            .and_then(auto_prompt::extract_original_user_message);
+            .and_then(auto_prompt::extract_original_user_message)
+            .or(first_user_message.filter(|s| !s.trim().is_empty()));
 
         let continue_prompt = "Review your progress and continue any remaining work. If everything is complete, commit all changes with conventional commit messages.".to_string();
 
