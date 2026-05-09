@@ -28,6 +28,9 @@ use std::time::Duration;
 /// Seconds of inactivity before an auto-prompt chain is considered stale.
 const CHAIN_TIMEOUT_SECS: u64 = 300;
 
+/// Fallback log directory when no project root is available.
+const FALLBACK_LOG_DIR: &str = "/tmp/zed_auto_prompt_logs";
+
 /// Iteration counter for the current auto-prompt chain.
 static AUTO_PROMPT_ITERATION: AtomicU32 = AtomicU32::new(0);
 
@@ -375,6 +378,12 @@ pub fn decide(
         .and_then(|pl| pl.paths().first().cloned());
     let iteration_count = get_iteration();
 
+    write_stop_log(
+        project_root.as_ref(),
+        iteration_count,
+        &format!("evaluation started (stop_reason={stop_reason:?}, used_tools={used_tools})"),
+    );
+
     let config = match load_config_cached() {
         Ok(c) => {
             log::info!("[auto_prompt::decide] Config loaded");
@@ -649,17 +658,15 @@ pub async fn decide_with_llm(
 
     match result {
         Ok((raw_response, response)) => {
-            if let Some(ref root) = data.project_root {
-                write_decision_log(
-                    root,
-                    data.iteration_count,
-                    &format!("{:?}", data.model.id()),
-                    &data.system_prompt,
-                    &data.context_json,
-                    &raw_response,
-                    &response,
-                );
-            }
+            write_decision_log(
+                data.project_root.as_ref(),
+                data.iteration_count,
+                &format!("{:?}", data.model.id()),
+                &data.system_prompt,
+                &data.context_json,
+                &raw_response,
+                &response,
+            );
 
             let has_prompt = response
                 .next_prompt
@@ -781,6 +788,33 @@ pub async fn decide_with_llm(
                 write_stop_log(data.project_root.as_ref(), data.iteration_count, &reason);
                 reset_iteration();
                 return Ok(AutoPromptOutcome::Stopped { reason });
+            }
+
+            // Code-level remaining work detection: override the LLM's stop decision
+            // if the last assistant message explicitly describes remaining work.
+            // This catches cases where the LLM ignores its own Rule 10.
+            if !response.should_continue {
+                if let Some(remaining_prompt) =
+                    detect_remaining_work(data.last_assistant_message.as_deref())
+                {
+                    log::warn!(
+                        "[auto_prompt::decide_with_llm] PATH=remaining_work_override: LLM says stop but last_assistant_message contains remaining work — overriding to continue"
+                    );
+                    let next_prompt = with_first_prompt_context(
+                        remaining_prompt,
+                        prompt_summary.as_deref(),
+                        data.title.as_deref(),
+                        data.last_assistant_message.as_deref(),
+                    );
+                    return Ok(AutoPromptOutcome::Continue(AutoPromptAction {
+                        from_session_id: data.session_id,
+                        from_title: data.title,
+                        next_prompt,
+                        work_dirs: data.work_dirs,
+                        original_user_message: data.original_user_message,
+                        profile_id: data.profile_id.clone(),
+                    }));
+                }
             }
 
             if !response.should_continue && !has_prompt {
@@ -913,14 +947,12 @@ pub async fn decide_with_llm(
             }))
         }
         Err(err) => {
-            if let Some(ref root) = data.project_root {
-                write_error_log(
-                    root,
-                    data.iteration_count,
-                    &format!("{:?}", data.model.id()),
-                    &err,
-                );
-            }
+            write_error_log(
+                data.project_root.as_ref(),
+                data.iteration_count,
+                &format!("{:?}", data.model.id()),
+                &err,
+            );
             log::warn!("auto_prompt: language model call failed: {err}");
             Err(err)
         }
@@ -928,7 +960,7 @@ pub async fn decide_with_llm(
 }
 
 fn write_decision_log(
-    project_root: &PathBuf,
+    project_root: Option<&PathBuf>,
     iteration: u32,
     model: &str,
     system_prompt: &str,
@@ -936,7 +968,15 @@ fn write_decision_log(
     raw_response: &str,
     parsed: &AutoPromptResponse,
 ) {
-    let logs_dir = project_root.join(".logs");
+    let logs_dir = match project_root {
+        Some(root) => root.join(".logs"),
+        None => {
+            log::info!(
+                "[auto_prompt] decision log: using fallback {FALLBACK_LOG_DIR} (no project root)"
+            );
+            PathBuf::from(FALLBACK_LOG_DIR)
+        }
+    };
     if let Err(err) = std::fs::create_dir_all(&logs_dir) {
         log::warn!("auto_prompt: failed to create .logs dir: {err}");
         return;
@@ -978,8 +1018,21 @@ fn write_decision_log(
     }
 }
 
-fn write_error_log(project_root: &PathBuf, iteration: u32, model: &str, error: &anyhow::Error) {
-    let logs_dir = project_root.join(".logs");
+fn write_error_log(
+    project_root: Option<&PathBuf>,
+    iteration: u32,
+    model: &str,
+    error: &anyhow::Error,
+) {
+    let logs_dir = match project_root {
+        Some(root) => root.join(".logs"),
+        None => {
+            log::info!(
+                "[auto_prompt] error log: using fallback {FALLBACK_LOG_DIR} (no project root)"
+            );
+            PathBuf::from(FALLBACK_LOG_DIR)
+        }
+    };
     if let Err(err) = std::fs::create_dir_all(&logs_dir) {
         log::warn!("auto_prompt: failed to create .logs dir: {err}");
         return;
@@ -1014,11 +1067,15 @@ fn write_error_log(project_root: &PathBuf, iteration: u32, model: &str, error: &
 }
 
 fn write_stop_log(project_root: Option<&PathBuf>, iteration: u32, reason: &str) {
-    let Some(root) = project_root else {
-        log::info!("[auto_prompt] stop: {reason} (no project root for log file)");
-        return;
+    let logs_dir = match project_root {
+        Some(root) => root.join(".logs"),
+        None => {
+            log::info!(
+                "[auto_prompt] stop: {reason} (no project root, using fallback {FALLBACK_LOG_DIR})"
+            );
+            PathBuf::from(FALLBACK_LOG_DIR)
+        }
     };
-    let logs_dir = root.join(".logs");
     if let Err(err) = std::fs::create_dir_all(&logs_dir) {
         log::warn!("auto_prompt: failed to create .logs dir: {err}");
         return;
@@ -1488,6 +1545,56 @@ fn make_plan_read_prompt(plan_dir: &str, filename: &str) -> String {
 fn is_doc_creation_prompt(prompt: &str) -> bool {
     let lower = prompt.to_lowercase();
     lower.contains("documentation") || lower.contains(".docs/")
+}
+
+/// Code-level remaining work detection: scans the last assistant message
+/// for patterns that explicitly indicate incomplete work. This is a safety
+/// net that catches cases where the LLM ignores its own Rule 10.
+fn detect_remaining_work(last_assistant_message: Option<&str>) -> Option<String> {
+    let msg = last_assistant_message?.trim();
+    if msg.is_empty() {
+        return None;
+    }
+
+    let lower = msg.to_lowercase();
+    let patterns: &[(&str, &str)] = &[
+        ("remaining work", "remaining work"),
+        ("remaining:", "remaining:"),
+        ("still need", "still need"),
+        ("still needs", "still needs"),
+        ("next step", "next step"),
+        ("next steps", "next steps"),
+        ("todo:", "todo:"),
+        ("action items", "action items"),
+        ("left to do", "left to do"),
+    ];
+
+    for (pattern, label) in patterns {
+        if lower.contains(pattern) {
+            log::warn!(
+                "[auto_prompt::detect_remaining_work] Pattern found: {label} in last_assistant_message — overriding stop"
+            );
+            return Some(
+                "Continue with the remaining work described in the assistant's last message."
+                    .to_string(),
+            );
+        }
+    }
+
+    for line in msg.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("- [ ] ") || trimmed.starts_with("* [ ] ") {
+            log::warn!(
+                "[auto_prompt::detect_remaining_work] Pattern found: unchecked checkbox in last_assistant_message — overriding stop"
+            );
+            return Some(
+                "Continue with the remaining work described in the assistant's last message."
+                    .to_string(),
+            );
+        }
+    }
+
+    None
 }
 
 fn build_pre_stop_verification_prompt(
