@@ -302,6 +302,7 @@ impl NativeAgent {
     fn new_session(
         &mut self,
         project: Entity<Project>,
+        work_dirs: PathList,
         cx: &mut Context<Self>,
     ) -> Entity<AcpThread> {
         let project_id = self.get_or_create_project_state(&project, cx);
@@ -326,7 +327,7 @@ impl NativeAgent {
             )
         });
 
-        self.register_session(thread, project_id, 1, cx)
+        self.register_session(thread, project_id, 1, Some(work_dirs), cx)
     }
 
     fn register_session(
@@ -334,6 +335,7 @@ impl NativeAgent {
         thread_handle: Entity<Thread>,
         project_id: EntityId,
         ref_count: usize,
+        work_dirs: Option<PathList>,
         cx: &mut Context<Self>,
     ) -> Entity<AcpThread> {
         let connection = Rc::new(NativeAgentConnection(cx.entity()));
@@ -352,7 +354,7 @@ impl NativeAgent {
             let mut acp_thread = acp_thread::AcpThread::new(
                 parent_session_id,
                 title,
-                None,
+                work_dirs,
                 connection,
                 project.clone(),
                 action_log.clone(),
@@ -941,6 +943,7 @@ impl NativeAgent {
         &mut self,
         id: acp::SessionId,
         project: Entity<Project>,
+        work_dirs: Option<PathList>,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<AcpThread>>> {
         if let Some(session) = self.sessions.get_mut(&id) {
@@ -976,7 +979,13 @@ impl NativeAgent {
                                 .pending_sessions
                                 .remove(&id)
                                 .map_or(1, |pending| pending.ref_count);
-                            this.register_session(thread.clone(), project_id, ref_count, cx)
+                            this.register_session(
+                                thread.clone(),
+                                project_id,
+                                ref_count,
+                                work_dirs.clone(),
+                                cx,
+                            )
                         })
                         .map_err(Arc::new)?;
                     let events = thread.update(cx, |thread, cx| thread.replay(cx));
@@ -1013,7 +1022,7 @@ impl NativeAgent {
         project: Entity<Project>,
         cx: &mut Context<Self>,
     ) -> Task<Result<SharedString>> {
-        let thread = self.open_thread(id.clone(), project, cx);
+        let thread = self.open_thread(id.clone(), project, None, cx);
         cx.spawn(async move |this, cx| {
             let acp_thread = thread.await?;
             let result = this
@@ -1530,7 +1539,7 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
         log::debug!("Creating new thread for project at: {work_dirs:?}");
         Task::ready(Ok(self
             .0
-            .update(cx, |agent, cx| agent.new_session(project, cx))))
+            .update(cx, |agent, cx| agent.new_session(project, work_dirs, cx))))
     }
 
     fn supports_load_session(&self) -> bool {
@@ -1541,12 +1550,13 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
         self: Rc<Self>,
         session_id: acp::SessionId,
         project: Entity<Project>,
-        _work_dirs: PathList,
+        work_dirs: PathList,
         _title: Option<SharedString>,
         cx: &mut App,
     ) -> Task<Result<Entity<acp_thread::AcpThread>>> {
-        self.0
-            .update(cx, |agent, cx| agent.open_thread(session_id, project, cx))
+        self.0.update(cx, |agent, cx| {
+            agent.open_thread(session_id, project, Some(work_dirs), cx)
+        })
     }
 
     fn supports_close_session(&self) -> bool {
@@ -1909,7 +1919,7 @@ impl NativeThreadEnvironment {
                     .get(&parent_session_id)
                     .map(|s| s.project_id)
                     .context("parent session not found")?;
-                Ok(agent.register_session(subagent_thread.clone(), project_id, 1, cx))
+                Ok(agent.register_session(subagent_thread.clone(), project_id, 1, None, cx))
             })??;
 
         let depth = current_depth + 1;
@@ -2715,7 +2725,7 @@ mod internal_tests {
         // Reload the thread and verify thinking_enabled is still true.
         let reloaded_acp_thread = agent
             .update(cx, |agent, cx| {
-                agent.open_thread(session_id.clone(), project.clone(), cx)
+                agent.open_thread(session_id.clone(), project.clone(), None, cx)
             })
             .await
             .unwrap();
@@ -2819,7 +2829,7 @@ mod internal_tests {
         // Reload the thread and verify the model was preserved.
         let reloaded_acp_thread = agent
             .update(cx, |agent, cx| {
-                agent.open_thread(session_id.clone(), project.clone(), cx)
+                agent.open_thread(session_id.clone(), project.clone(), None, cx)
             })
             .await
             .unwrap();
@@ -2978,7 +2988,7 @@ mod internal_tests {
         );
         let acp_thread = agent
             .update(cx, |agent, cx| {
-                agent.open_thread(session_id.clone(), project.clone(), cx)
+                agent.open_thread(session_id.clone(), project.clone(), None, cx)
             })
             .await
             .unwrap();
@@ -3090,7 +3100,7 @@ mod internal_tests {
         // Reopen and verify the draft prompt was saved.
         let reloaded = agent
             .update(cx, |agent, cx| {
-                agent.open_thread(session_id.clone(), project.clone(), cx)
+                agent.open_thread(session_id.clone(), project.clone(), None, cx)
             })
             .await
             .unwrap();
