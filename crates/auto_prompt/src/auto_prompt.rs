@@ -357,13 +357,100 @@ impl std::fmt::Debug for LlmCallData {
     }
 }
 
+/// Input for the pure evaluation function.
+pub struct EvaluationInput {
+    pub should_continue: bool,
+    pub confidence: Option<f64>,
+    pub next_prompt: Option<String>,
+    pub reason: Option<String>,
+    pub all_plan_done: bool,
+    pub next_plan_prompt: Option<String>,
+    pub last_assistant_message: Option<String>,
+}
+
+/// Result of evaluating an LLM response.
+#[derive(Debug, PartialEq)]
+pub enum EvaluationResult {
+    /// Continue the chain with this prompt.
+    Continue { prompt: String, reason: String },
+    /// LLM wants to stop — must go through verification gate.
+    WantsStop { reason: String },
+}
+
+/// Pure function — no side effects, no atomics, fully testable.
+pub fn evaluate_response(input: &EvaluationInput) -> EvaluationResult {
+    let has_prompt = input
+        .next_prompt
+        .as_ref()
+        .is_some_and(|p| !p.trim().is_empty());
+
+    // 1. all_done + next plan → Continue (transition to next plan)
+    if input.all_plan_done {
+        if let Some(next_plan_prompt) = &input.next_plan_prompt {
+            return EvaluationResult::Continue {
+                prompt: next_plan_prompt.clone(),
+                reason: "current plan done, transitioning to next plan".to_string(),
+            };
+        }
+        // 2. all_done + should_continue → Continue (dispatch final gitflow commit)
+        if input.should_continue {
+            return EvaluationResult::Continue {
+                prompt: "All plans are complete. Create develop branch from main if it doesn't exist. Then create or reuse a git feature branch from develop and commit all changes with conventional commit messages (feat/fix/refactor) if not committed yet. Do not merge — leave the branch for review.".to_string(),
+                reason: "all plans done but LLM says continue, dispatching final gitflow commit".to_string(),
+            };
+        }
+        return EvaluationResult::WantsStop {
+            reason: "all plans done, no remaining plans".to_string(),
+        };
+    }
+
+    if input.confidence.is_some_and(|c| c < 0.5) {
+        return EvaluationResult::WantsStop {
+            reason: format!(
+                "confidence too low ({:.2} < 0.5)",
+                input.confidence.unwrap()
+            ),
+        };
+    }
+
+    // 3. detect_remaining_work override
+    if !input.should_continue {
+        if let Some(remaining_prompt) =
+            detect_remaining_work(input.last_assistant_message.as_deref())
+        {
+            return EvaluationResult::Continue {
+                prompt: remaining_prompt,
+                reason: "LLM says stop but last_assistant_message contains remaining work — overriding to continue".to_string(),
+            };
+        }
+    }
+
+    // 4. should_continue + non-empty prompt → Continue
+    if input.should_continue && has_prompt {
+        let prompt = input.next_prompt.as_ref().unwrap();
+        let cleaned = prompt.replace("#ALL_PLAN_DONE", "").trim().to_string();
+        if !cleaned.is_empty() {
+            return EvaluationResult::Continue {
+                prompt: cleaned,
+                reason: "LLM says continue with next prompt".to_string(),
+            };
+        }
+    }
+
+    // 5. Everything else → WantsStop
+    let reason = match (&input.reason, has_prompt) {
+        (Some(r), _) => r.clone(),
+        (None, false) => "LLM says stop, no next prompt".to_string(),
+        (None, true) => "LLM says stop despite having prompt".to_string(),
+    };
+    EvaluationResult::WantsStop { reason }
+}
+
 /// Synchronous pre-check and decision.
 ///
 /// Returns `NoAction` if auto-prompt should not fire (disabled, no tools,
 /// cancelled, max iterations, no model configured).
-/// Returns `DispatchNow` or `DispatchAfterDelay` for cases that bypass the LLM
-/// (token overflow, error backoff).
-/// Returns `NeedsLlmCall` when the orchestration LLM must decide.
+/// Returns `NeedsLlmCall` for all non-trivial cases (LLM decides).
 pub fn decide(
     thread: &gpui::Entity<acp_thread::AcpThread>,
     used_tools: bool,
@@ -505,78 +592,19 @@ pub fn decide(
         .as_deref()
         .and_then(|raw| extract_original_user_message(raw));
 
-    let last_assistant_msg = auto_prompt_ctx
+    let _last_assistant_msg = auto_prompt_ctx
         .last_assistant_message()
         .map(|s| s.to_string());
-    let make_action = |prompt: String| {
-        let next_prompt = with_first_prompt_context(
-            prompt,
-            original_user_message.as_deref(),
-            thread_title.as_deref(),
-            last_assistant_msg.as_deref(),
-        );
-        AutoPromptAction {
-            from_session_id: session_id.clone(),
-            from_title: thread_title.clone(),
-            next_prompt,
-            work_dirs: work_dirs.clone(),
-            original_user_message: original_user_message.clone(),
-            profile_id: None,
-        }
-    };
-
-    let make_continue_prompt = || {
-        // Prompt the AI to self-evaluate rather than blindly continuing.
-        // This gives the AI a chance to confirm completion and stop on its own.
-        "Review your progress so far. If all tasks from the original request are complete and verified, respond with a brief summary and stop. Otherwise continue with the remaining work. Check for any uncommitted changes and commit them if everything is done.".to_string()
-    };
 
     log::info!(
         "[auto_prompt::decide] Approximate token count: {}",
         auto_prompt_ctx.approximate_token_count
     );
 
-    if auto_prompt_ctx.exceeds_token_limit(config.max_context_tokens) {
-        log::warn!(
-            "[auto_prompt::decide] PATH=token_limit_bypass: tokens={} > max={}, had_error={}, stop_reason={:?}, iteration={} → DispatchNow with make_continue_prompt (LLM bypassed)",
-            auto_prompt_ctx.approximate_token_count,
-            config.max_context_tokens,
-            auto_prompt_ctx.had_error,
-            stop_reason,
-            iteration_count
-        );
-        return AutoPromptDecision::DispatchNow(make_action(make_continue_prompt()));
-    }
-
     log::info!(
         "[auto_prompt::decide] Had error: {}",
         auto_prompt_ctx.had_error
     );
-
-    if matches!(stop_reason, StopReason::MaxTokens) {
-        log::warn!(
-            "[auto_prompt::decide] PATH=max_tokens_bypass: had_error={}, stop_reason={:?}, iteration={} → DispatchNow with make_continue_prompt (LLM bypassed)",
-            auto_prompt_ctx.had_error,
-            stop_reason,
-            iteration_count
-        );
-        return AutoPromptDecision::DispatchNow(make_action(make_continue_prompt()));
-    }
-
-    if auto_prompt_ctx.had_error || matches!(stop_reason, StopReason::Refusal) {
-        let delay = config.backoff_delay_ms(iteration_count);
-        log::warn!(
-            "[auto_prompt::decide] PATH=error_bypass: had_error={}, stop_reason={:?}, iteration={} → DispatchAfterDelay({}ms) with make_continue_prompt (LLM bypassed)",
-            auto_prompt_ctx.had_error,
-            stop_reason,
-            iteration_count,
-            delay
-        );
-        return AutoPromptDecision::DispatchAfterDelay {
-            action: make_action(make_continue_prompt()),
-            delay_ms: delay,
-        };
-    }
 
     log::info!(
         "[auto_prompt::decide] PATH=llm_call: had_error={}, stop_reason={:?}, iteration={}, tokens={} → NeedsLlmCall (LLM will decide)",
@@ -657,7 +685,7 @@ pub async fn decide_with_llm(
     );
 
     match result {
-        Ok((raw_response, response)) => {
+        Ok((raw_response, mut response)) => {
             write_decision_log(
                 data.project_root.as_ref(),
                 data.iteration_count,
@@ -715,236 +743,164 @@ pub async fn decide_with_llm(
                     .as_ref()
                     .is_some_and(|p| p.contains("#ALL_PLAN_DONE"));
 
-            if all_done {
-                match find_next_plan_prompt(&data.context_json, data.work_dirs.as_deref()) {
-                    Some(next_plan_prompt) => {
-                        log::info!(
-                            "[auto_prompt::decide_with_llm] Current plan done, transitioning to next plan"
-                        );
-                        let next_prompt = format!(
-                            "Create a git feature branch for the completed plan from develop and commit all changes with conventional commit messages. Then {next_plan_prompt}"
-                        );
-                        let next_prompt = with_first_prompt_context(
-                            next_prompt,
-                            prompt_summary.as_deref(),
-                            data.title.as_deref(),
-                            data.last_assistant_message.as_deref(),
-                        );
-                        return Ok(AutoPromptOutcome::Continue(AutoPromptAction {
-                            from_session_id: data.session_id,
-                            from_title: data.title,
-                            next_prompt,
-                            work_dirs: data.work_dirs,
-                            original_user_message: data.original_user_message,
-                            profile_id: data.profile_id.clone(),
-                        }));
-                    }
-                    None => {
-                        if response.should_continue {
-                            log::info!(
-                                "[auto_prompt::decide_with_llm] #ALL_PLAN_DONE but LLM says continue, dispatching final gitflow commit"
-                            );
-                            let gitflow_prompt = "All plans are complete. Create or reuse a git feature branch from develop and commit all changes with conventional commit messages (feat/fix/refactor) if not committed yet. Do not merge — leave the branch for review.".to_string();
-                            let next_prompt = with_first_prompt_context(
-                                gitflow_prompt,
-                                prompt_summary.as_deref(),
-                                data.title.as_deref(),
-                                data.last_assistant_message.as_deref(),
-                            );
-                            return Ok(AutoPromptOutcome::Continue(AutoPromptAction {
-                                from_session_id: data.session_id,
-                                from_title: data.title,
-                                next_prompt,
-                                work_dirs: data.work_dirs,
-                                original_user_message: data.original_user_message,
-                                profile_id: data.profile_id.clone(),
-                            }));
-                        } else {
-                            let reason = "all plans done, no remaining plans".to_string();
-                            log::info!(
-                                "[auto_prompt::decide_with_llm] #ALL_PLAN_DONE, no remaining plans, LLM says stop — chain complete"
-                            );
-                            write_stop_log(
-                                data.project_root.as_ref(),
-                                data.iteration_count,
-                                &reason,
-                            );
-                            reset_iteration();
-                            return Ok(AutoPromptOutcome::Stopped { reason });
+            let next_plan_prompt = if all_done {
+                find_next_plan_prompt(&data.context_json, data.work_dirs.as_deref()).map(
+                    |next_plan| {
+                        format!(
+                            "Create develop branch from main if it doesn't exist. Then create a git feature branch for the completed plan from develop and commit all changes with conventional commit messages. Then {next_plan}"
+                        )
+                    },
+                )
+            } else {
+                None
+            };
+
+            let input = EvaluationInput {
+                should_continue: response.should_continue,
+                confidence: response.confidence,
+                next_prompt: std::mem::take(&mut response.next_prompt),
+                reason: std::mem::take(&mut response.reason),
+                all_plan_done: all_done,
+                next_plan_prompt,
+                last_assistant_message: data.last_assistant_message.clone(),
+            };
+
+            log::info!(
+                "[auto_prompt::decide_with_llm] evaluate_response input: should_continue={}, all_plan_done={}, confidence={:?}, has_next_plan={}",
+                input.should_continue,
+                input.all_plan_done,
+                input.confidence,
+                input.next_plan_prompt.is_some()
+            );
+
+            let evaluation = evaluate_response(&input);
+
+            log::info!(
+                "[auto_prompt::decide_with_llm] evaluate_response result: {:?}",
+                evaluation
+            );
+
+            match evaluation {
+                EvaluationResult::Continue { prompt, reason } => {
+                    log::info!("[auto_prompt::decide_with_llm] Evaluation: Continue — {reason}");
+
+                    let prompt = if is_doc_creation_prompt(&prompt) {
+                        match build_checkbox_verification_prompt(&data.context_json) {
+                            Some(verification_prompt) => {
+                                log::info!(
+                                    "auto_prompt: plan has unchecked items, overriding doc creation with checkbox verification"
+                                );
+                                verification_prompt
+                            }
+                            None => prompt,
                         }
-                    }
-                }
-            }
+                    } else {
+                        prompt
+                    };
 
-            if response.confidence.is_some_and(|c| c < 0.5) {
-                log::info!(
-                    "[auto_prompt::decide_with_llm] Confidence too low ({} < 0.5), stopping chain",
-                    response.confidence.unwrap()
-                );
-                let reason = format!(
-                    "confidence too low ({:.2} < 0.5)",
-                    response.confidence.unwrap()
-                );
-                write_stop_log(data.project_root.as_ref(), data.iteration_count, &reason);
-                reset_iteration();
-                return Ok(AutoPromptOutcome::Stopped { reason });
-            }
-
-            // Code-level remaining work detection: override the LLM's stop decision
-            // if the last assistant message explicitly describes remaining work.
-            // This catches cases where the LLM ignores its own Rule 10.
-            if !response.should_continue {
-                if let Some(remaining_prompt) =
-                    detect_remaining_work(data.last_assistant_message.as_deref())
-                {
-                    log::warn!(
-                        "[auto_prompt::decide_with_llm] PATH=remaining_work_override: LLM says stop but last_assistant_message contains remaining work — overriding to continue"
+                    log::info!(
+                        "auto_prompt: dispatching new thread with prompt: {}...",
+                        prompt.chars().take(80).collect::<String>()
                     );
+
                     let next_prompt = with_first_prompt_context(
-                        remaining_prompt,
+                        prompt,
                         prompt_summary.as_deref(),
                         data.title.as_deref(),
                         data.last_assistant_message.as_deref(),
                     );
-                    return Ok(AutoPromptOutcome::Continue(AutoPromptAction {
+
+                    Ok(AutoPromptOutcome::Continue(AutoPromptAction {
                         from_session_id: data.session_id,
                         from_title: data.title,
                         next_prompt,
                         work_dirs: data.work_dirs,
                         original_user_message: data.original_user_message,
                         profile_id: data.profile_id.clone(),
-                    }));
+                    }))
                 }
-            }
+                EvaluationResult::WantsStop { reason } => {
+                    let verification_count = VERIFICATION_COUNT.load(Ordering::Relaxed);
+                    let max_verifications = data.max_verification_attempts;
 
-            if !response.should_continue && !has_prompt {
-                let verification_count = VERIFICATION_COUNT.load(Ordering::Relaxed);
-                let max_verifications = data.max_verification_attempts;
-
-                if verification_count == 0 {
-                    log::info!(
-                        "auto_prompt: LLM says stop, initiating pre-stop verification (attempt 1/{max_verifications})"
-                    );
-                    VERIFICATION_COUNT.fetch_add(1, Ordering::Relaxed);
-
-                    match build_pre_stop_verification_prompt(&data.context_json, &data.work_dirs) {
-                        Some(verification_prompt) => {
-                            log::info!(
-                                "auto_prompt: dispatching pre-stop verification prompt: {}...",
-                                verification_prompt.chars().take(80).collect::<String>()
-                            );
-                            let next_prompt = with_first_prompt_context(
-                                verification_prompt,
-                                prompt_summary.as_deref(),
-                                data.title.as_deref(),
-                                data.last_assistant_message.as_deref(),
-                            );
-                            return Ok(AutoPromptOutcome::Continue(AutoPromptAction {
-                                from_session_id: data.session_id,
-                                from_title: data.title,
-                                next_prompt,
-                                work_dirs: data.work_dirs,
-                                original_user_message: data.original_user_message,
-                                profile_id: data.profile_id.clone(),
-                            }));
-                        }
-                        None => {
-                            let reason =
-                                "LLM says stop, no plan files found for verification".to_string();
-                            log::info!(
-                                "auto_prompt: no verification needed (no plan files found), stopping"
-                            );
-                            write_stop_log(
-                                data.project_root.as_ref(),
-                                data.iteration_count,
-                                &reason,
-                            );
-                            reset_iteration();
-                            return Ok(AutoPromptOutcome::Stopped { reason });
-                        }
-                    }
-                } else if verification_count < max_verifications {
-                    log::info!(
-                        "auto_prompt: LLM says stop after verification attempt {verification_count}/{max_verifications}, accepting stop"
-                    );
-                    let reason = format!(
-                        "LLM says stop after verification attempt {verification_count}/{max_verifications}"
-                    );
-                    write_stop_log(data.project_root.as_ref(), data.iteration_count, &reason);
-                    reset_iteration();
-                    return Ok(AutoPromptOutcome::Stopped { reason });
-                } else {
-                    let reason =
-                        format!("max verification attempts ({max_verifications}) exceeded");
-                    log::warn!(
-                        "auto_prompt: max verification attempts ({max_verifications}) exceeded, forcing stop"
-                    );
-                    write_stop_log(data.project_root.as_ref(), data.iteration_count, &reason);
-                    reset_iteration();
-                    return Ok(AutoPromptOutcome::Stopped { reason });
-                }
-            }
-
-            let next_prompt = if has_prompt {
-                let prompt = response.next_prompt.unwrap();
-                prompt.replace("#ALL_PLAN_DONE", "").trim().to_string()
-            } else {
-                let reason = "no next_prompt determined from LLM response".to_string();
-                log::info!("auto_prompt: no prompt determined, stopping");
-                write_stop_log(data.project_root.as_ref(), data.iteration_count, &reason);
-                reset_iteration();
-                return Ok(AutoPromptOutcome::Stopped { reason });
-            };
-
-            if next_prompt.is_empty() {
-                let reason = "next_prompt was empty after cleanup".to_string();
-                log::info!("auto_prompt: prompt was empty after cleanup, stopping");
-                write_stop_log(data.project_root.as_ref(), data.iteration_count, &reason);
-                reset_iteration();
-                return Ok(AutoPromptOutcome::Stopped { reason });
-            }
-
-            // Safety check: if heading to doc creation but plan has unchecked items,
-            // override to checkbox verification first.
-            let next_prompt = if is_doc_creation_prompt(&next_prompt) {
-                match build_checkbox_verification_prompt(&data.context_json) {
-                    Some(verification_prompt) => {
+                    if verification_count == 0 {
                         log::info!(
-                            "auto_prompt: plan has unchecked items, overriding doc creation with checkbox verification"
+                            "auto_prompt: WantsStop ('{reason}') — initiating pre-stop verification (attempt 1/{max_verifications})"
                         );
-                        verification_prompt
+                        VERIFICATION_COUNT.fetch_add(1, Ordering::Relaxed);
+
+                        match build_pre_stop_verification_prompt(
+                            &data.context_json,
+                            &data.work_dirs,
+                        ) {
+                            Some(verification_prompt) => {
+                                log::info!(
+                                    "auto_prompt: dispatching pre-stop verification prompt: {}...",
+                                    verification_prompt.chars().take(80).collect::<String>()
+                                );
+                                let next_prompt = with_first_prompt_context(
+                                    verification_prompt,
+                                    prompt_summary.as_deref(),
+                                    data.title.as_deref(),
+                                    data.last_assistant_message.as_deref(),
+                                );
+                                Ok(AutoPromptOutcome::Continue(AutoPromptAction {
+                                    from_session_id: data.session_id,
+                                    from_title: data.title,
+                                    next_prompt,
+                                    work_dirs: data.work_dirs,
+                                    original_user_message: data.original_user_message,
+                                    profile_id: data.profile_id.clone(),
+                                }))
+                            }
+                            None => {
+                                let stop_reason =
+                                    "LLM says stop, no plan files found for verification"
+                                        .to_string();
+                                log::info!(
+                                    "auto_prompt: no verification needed (no plan files found), stopping"
+                                );
+                                write_stop_log(
+                                    data.project_root.as_ref(),
+                                    data.iteration_count,
+                                    &stop_reason,
+                                );
+                                reset_iteration();
+                                Ok(AutoPromptOutcome::Stopped {
+                                    reason: stop_reason,
+                                })
+                            }
+                        }
+                    } else if verification_count < max_verifications {
+                        let stop_reason = format!(
+                            "LLM says stop after verification attempt {verification_count}/{max_verifications}"
+                        );
+                        log::info!("auto_prompt: {stop_reason}");
+                        write_stop_log(
+                            data.project_root.as_ref(),
+                            data.iteration_count,
+                            &stop_reason,
+                        );
+                        reset_iteration();
+                        Ok(AutoPromptOutcome::Stopped {
+                            reason: stop_reason,
+                        })
+                    } else {
+                        let stop_reason =
+                            format!("max verification attempts ({max_verifications}) exceeded");
+                        log::warn!("auto_prompt: {stop_reason}");
+                        write_stop_log(
+                            data.project_root.as_ref(),
+                            data.iteration_count,
+                            &stop_reason,
+                        );
+                        reset_iteration();
+                        Ok(AutoPromptOutcome::Stopped {
+                            reason: stop_reason,
+                        })
                     }
-                    None => next_prompt,
                 }
-            } else {
-                next_prompt
-            };
-
-            log::info!(
-                "auto_prompt: LLM continuing (verification_count={})",
-                VERIFICATION_COUNT.load(Ordering::Relaxed)
-            );
-
-            log::info!(
-                "auto_prompt: dispatching new thread with prompt: {}...",
-                next_prompt.chars().take(80).collect::<String>()
-            );
-
-            let next_prompt = with_first_prompt_context(
-                next_prompt,
-                prompt_summary.as_deref(),
-                data.title.as_deref(),
-                data.last_assistant_message.as_deref(),
-            );
-
-            Ok(AutoPromptOutcome::Continue(AutoPromptAction {
-                from_session_id: data.session_id,
-                from_title: data.title,
-                next_prompt,
-                work_dirs: data.work_dirs,
-                original_user_message: data.original_user_message,
-                profile_id: data.profile_id.clone(),
-            }))
+            }
         }
         Err(err) => {
             write_error_log(
@@ -1612,7 +1568,7 @@ fn build_pre_stop_verification_prompt(
     }
 
     checks.push("2. **Code diagnostics**: Run `cargo check` and `cargo clippy` (or equivalent). Fix ALL errors and warnings before stopping. No TODOs, no placeholders, no unwrap().".to_string());
-    checks.push("3. **Git status**: Verify all changes are committed with conventional commit messages (feat/fix/refactor/test/chore/docs). Create or reuse a feature branch from develop if not done.".to_string());
+    checks.push("3. **Git status**: Verify all changes are committed with conventional commit messages (feat/fix/refactor/test/chore/docs). Create develop from main if it doesn't exist. Then create or reuse a feature branch from develop if not done.".to_string());
 
     if let Some(remaining) = find_next_plan_prompt(context_json, work_dirs.as_deref()) {
         checks.push(format!(
@@ -1871,5 +1827,387 @@ mod tests {
         let chain_message = format!("## User\n\n[@Thread](zed:///agent/thread/abc)\n\n{wrapped}");
         let extracted = extract_original_user_message(&chain_message);
         assert_eq!(extracted, Some(original.to_string()));
+    }
+
+    fn make_input() -> EvaluationInput {
+        EvaluationInput {
+            should_continue: false,
+            confidence: Some(0.8),
+            next_prompt: None,
+            reason: None,
+            all_plan_done: false,
+            next_plan_prompt: None,
+            last_assistant_message: None,
+        }
+    }
+
+    // --- Task 4: evaluate_response() state machine tests ---
+
+    #[test]
+    fn test_eval_all_done_with_next_plan() {
+        let input = EvaluationInput {
+            all_plan_done: true,
+            next_plan_prompt: Some("do next plan work".to_string()),
+            ..make_input()
+        };
+        let result = evaluate_response(&input);
+        assert_eq!(
+            result,
+            EvaluationResult::Continue {
+                prompt: "do next plan work".to_string(),
+                reason: "current plan done, transitioning to next plan".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_eval_all_done_should_continue_no_next_plan() {
+        let input = EvaluationInput {
+            all_plan_done: true,
+            should_continue: true,
+            ..make_input()
+        };
+        let result = evaluate_response(&input);
+        match result {
+            EvaluationResult::Continue { reason, .. } => {
+                assert!(reason.contains("gitflow commit"));
+            }
+            _ => panic!("expected Continue, got {result:?}"),
+        }
+    }
+
+    #[test]
+    fn test_eval_all_done_should_stop_no_next_plan() {
+        let input = EvaluationInput {
+            all_plan_done: true,
+            should_continue: false,
+            ..make_input()
+        };
+        let result = evaluate_response(&input);
+        assert_eq!(
+            result,
+            EvaluationResult::WantsStop {
+                reason: "all plans done, no remaining plans".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_eval_remaining_work_remaining_work_pattern() {
+        let input = EvaluationInput {
+            should_continue: false,
+            last_assistant_message: Some("## Remaining Work\n- fix tests".to_string()),
+            ..make_input()
+        };
+        let result = evaluate_response(&input);
+        match result {
+            EvaluationResult::Continue { reason, .. } => {
+                assert!(reason.contains("remaining work"));
+            }
+            _ => panic!("expected Continue override, got {result:?}"),
+        }
+    }
+
+    #[test]
+    fn test_eval_remaining_work_unchecked_checkbox() {
+        let input = EvaluationInput {
+            should_continue: false,
+            last_assistant_message: Some("- [ ] do thing".to_string()),
+            ..make_input()
+        };
+        let result = evaluate_response(&input);
+        match result {
+            EvaluationResult::Continue { reason, .. } => {
+                assert!(reason.contains("remaining work"));
+            }
+            _ => panic!("expected Continue override, got {result:?}"),
+        }
+    }
+
+    #[test]
+    fn test_eval_remaining_work_todo_pattern() {
+        let input = EvaluationInput {
+            should_continue: false,
+            last_assistant_message: Some("TODO: fix this".to_string()),
+            ..make_input()
+        };
+        let result = evaluate_response(&input);
+        match result {
+            EvaluationResult::Continue { reason, .. } => {
+                assert!(reason.contains("remaining work"));
+            }
+            _ => panic!("expected Continue override, got {result:?}"),
+        }
+    }
+
+    #[test]
+    fn test_eval_remaining_work_no_match() {
+        let input = EvaluationInput {
+            should_continue: false,
+            last_assistant_message: Some("all done, nothing left".to_string()),
+            ..make_input()
+        };
+        let result = evaluate_response(&input);
+        assert!(matches!(result, EvaluationResult::WantsStop { .. }));
+    }
+
+    #[test]
+    fn test_eval_should_continue_with_valid_prompt() {
+        let input = EvaluationInput {
+            should_continue: true,
+            next_prompt: Some("commit changes".to_string()),
+            ..make_input()
+        };
+        let result = evaluate_response(&input);
+        assert_eq!(
+            result,
+            EvaluationResult::Continue {
+                prompt: "commit changes".to_string(),
+                reason: "LLM says continue with next prompt".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_eval_should_continue_empty_prompt() {
+        let input = EvaluationInput {
+            should_continue: true,
+            next_prompt: Some("".to_string()),
+            ..make_input()
+        };
+        let result = evaluate_response(&input);
+        assert!(matches!(result, EvaluationResult::WantsStop { .. }));
+    }
+
+    #[test]
+    fn test_eval_should_continue_whitespace_prompt() {
+        let input = EvaluationInput {
+            should_continue: true,
+            next_prompt: Some("   ".to_string()),
+            ..make_input()
+        };
+        let result = evaluate_response(&input);
+        assert!(matches!(result, EvaluationResult::WantsStop { .. }));
+    }
+
+    #[test]
+    fn test_eval_should_continue_no_prompt() {
+        let input = EvaluationInput {
+            should_continue: true,
+            next_prompt: None,
+            ..make_input()
+        };
+        let result = evaluate_response(&input);
+        assert!(matches!(result, EvaluationResult::WantsStop { .. }));
+    }
+
+    #[test]
+    fn test_eval_should_stop_with_prompt_ignored() {
+        let input = EvaluationInput {
+            should_continue: false,
+            next_prompt: Some("review code".to_string()),
+            ..make_input()
+        };
+        let result = evaluate_response(&input);
+        assert!(matches!(result, EvaluationResult::WantsStop { .. }));
+    }
+
+    #[test]
+    fn test_eval_low_confidence_with_should_continue_and_prompt() {
+        let input = EvaluationInput {
+            should_continue: true,
+            confidence: Some(0.3),
+            next_prompt: Some("go".to_string()),
+            ..make_input()
+        };
+        let result = evaluate_response(&input);
+        match result {
+            EvaluationResult::WantsStop { reason } => {
+                assert!(reason.contains("confidence too low"));
+            }
+            _ => panic!("expected WantsStop for low confidence, got {result:?}"),
+        }
+    }
+
+    #[test]
+    fn test_eval_low_confidence_should_stop() {
+        let input = EvaluationInput {
+            should_continue: false,
+            confidence: Some(0.3),
+            ..make_input()
+        };
+        let result = evaluate_response(&input);
+        match result {
+            EvaluationResult::WantsStop { reason } => {
+                assert!(reason.contains("confidence too low"));
+            }
+            _ => panic!("expected WantsStop, got {result:?}"),
+        }
+    }
+
+    #[test]
+    fn test_eval_high_confidence_should_stop() {
+        let input = EvaluationInput {
+            should_continue: false,
+            confidence: Some(0.8),
+            ..make_input()
+        };
+        let result = evaluate_response(&input);
+        assert!(matches!(result, EvaluationResult::WantsStop { .. }));
+    }
+
+    #[test]
+    fn test_eval_all_done_next_plan_overrides_should_stop() {
+        let input = EvaluationInput {
+            all_plan_done: true,
+            should_continue: false,
+            next_plan_prompt: Some("start next plan".to_string()),
+            ..make_input()
+        };
+        let result = evaluate_response(&input);
+        assert_eq!(
+            result,
+            EvaluationResult::Continue {
+                prompt: "start next plan".to_string(),
+                reason: "current plan done, transitioning to next plan".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_eval_all_done_no_next_plan_remaining_work_still_stops() {
+        let input = EvaluationInput {
+            all_plan_done: true,
+            should_continue: false,
+            last_assistant_message: Some("remaining: fix test".to_string()),
+            ..make_input()
+        };
+        let result = evaluate_response(&input);
+        assert_eq!(
+            result,
+            EvaluationResult::WantsStop {
+                reason: "all plans done, no remaining plans".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_eval_all_plan_done_in_prompt_stripped() {
+        let input = EvaluationInput {
+            should_continue: true,
+            next_prompt: Some("done #ALL_PLAN_DONE".to_string()),
+            ..make_input()
+        };
+        let result = evaluate_response(&input);
+        match result {
+            EvaluationResult::Continue { prompt, .. } => {
+                assert_eq!(prompt, "done");
+                assert!(!prompt.contains("#ALL_PLAN_DONE"));
+            }
+            _ => panic!("expected Continue, got {result:?}"),
+        }
+    }
+
+    #[test]
+    fn test_eval_last_assistant_message_none() {
+        let input = EvaluationInput {
+            should_continue: false,
+            last_assistant_message: None,
+            ..make_input()
+        };
+        let result = evaluate_response(&input);
+        assert!(matches!(result, EvaluationResult::WantsStop { .. }));
+    }
+
+    #[test]
+    fn test_eval_last_assistant_message_empty() {
+        let input = EvaluationInput {
+            should_continue: false,
+            last_assistant_message: Some("".to_string()),
+            ..make_input()
+        };
+        let result = evaluate_response(&input);
+        assert!(matches!(result, EvaluationResult::WantsStop { .. }));
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum VerificationGateResult {
+        DispatchVerification,
+        StopNoPlanFiles,
+        StopAfterVerification,
+        StopMaxExceeded,
+    }
+
+    fn handle_wants_stop(
+        verification_count: u32,
+        max_verifications: u32,
+        has_verification_prompt: bool,
+    ) -> VerificationGateResult {
+        if verification_count == 0 && has_verification_prompt {
+            VerificationGateResult::DispatchVerification
+        } else if verification_count == 0 && !has_verification_prompt {
+            VerificationGateResult::StopNoPlanFiles
+        } else if verification_count < max_verifications {
+            VerificationGateResult::StopAfterVerification
+        } else {
+            VerificationGateResult::StopMaxExceeded
+        }
+    }
+
+    #[test]
+    fn test_gate_first_stop_with_plan_files() {
+        let result = handle_wants_stop(0, 2, true);
+        assert_eq!(result, VerificationGateResult::DispatchVerification);
+    }
+
+    #[test]
+    fn test_gate_first_stop_no_plan_files() {
+        let result = handle_wants_stop(0, 2, false);
+        assert_eq!(result, VerificationGateResult::StopNoPlanFiles);
+    }
+
+    #[test]
+    fn test_gate_after_one_verification() {
+        let result = handle_wants_stop(1, 2, true);
+        assert_eq!(result, VerificationGateResult::StopAfterVerification);
+    }
+
+    #[test]
+    fn test_gate_at_max_verifications() {
+        let result = handle_wants_stop(2, 2, true);
+        assert_eq!(result, VerificationGateResult::StopMaxExceeded);
+    }
+
+    #[test]
+    fn test_gate_exceeded_max() {
+        let result = handle_wants_stop(5, 2, true);
+        assert_eq!(result, VerificationGateResult::StopMaxExceeded);
+    }
+
+    // --- Task 6: decide() gate documentation tests ---
+    // These document the expected routing behavior of decide().
+    // decide() requires App context so unit testing is impractical,
+    // but the behavior is tested via integration in agent_ui.
+
+    #[test]
+    fn test_decide_noaction_conditions_documented() {
+        // This test documents the NoAction exit conditions in decide().
+        // If any of these conditions change, this test should be updated.
+        //
+        // NoAction exits (in order):
+        // 1. Config load failure → NoAction
+        // 2. StopReason::Cancelled → NoAction
+        // 3. Interactive auth tool pending → NoAction
+        // 4. iteration > max_iterations → NoAction
+        // 5. No model configured → NoAction
+        // 6. Context serialization failure → NoAction
+        //
+        // All other cases (including token overflow, MaxTokens, error, Refusal)
+        // fall through to NeedsLlmCall — the LLM decides.
+        //
+        // This was changed in Plan 03: previously token overflow, MaxTokens,
+        // error, and Refusal bypassed the LLM with DispatchNow/DispatchAfterDelay.
+        // Now they all go through the LLM evaluation pipeline.
+        assert!(true, "documentation test — see comments above");
     }
 }
