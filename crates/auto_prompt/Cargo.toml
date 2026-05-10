@@ -23,6 +23,5 @@ language_model.workspace = true
 prompt_store.workspace = true
 log.workspace = true
 paths.workspace = true
-schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
