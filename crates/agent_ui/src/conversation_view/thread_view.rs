@@ -5150,6 +5150,7 @@ impl ThreadView {
 
                             match result {
                                 Ok(auto_prompt::AutoPromptOutcome::Continue(action)) => {
+                                    auto_prompt::reset_llm_failure_count();
                                     if let Some(ref tv) = thread_weak {
                                         if let Err(err) = tv.update(cx, |tv, cx| {
                                             tv.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;
@@ -5181,6 +5182,7 @@ impl ThreadView {
                                     }
                                 }
                                 Ok(auto_prompt::AutoPromptOutcome::Stopped { reason }) => {
+                                    auto_prompt::reset_llm_failure_count();
                                     if let Some(ref tv) = thread_weak {
                                         if let Err(err) = tv.update(cx, |tv, cx| {
                                             tv.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;
