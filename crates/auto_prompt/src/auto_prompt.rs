@@ -114,6 +114,9 @@ pub struct AutoPromptAction {
     /// The profile/mode from the previous thread (e.g. "Auto", "Sonnet", "High"),
     /// carried across chain hops to preserve the user's selection.
     pub profile_id: Option<String>,
+    /// Approximate token count of the source thread context.
+    /// Used by dispatch to decide same-thread vs new-thread continuation.
+    pub approximate_token_count: usize,
 }
 
 /// Outcome of an auto-prompt LLM decision.
@@ -328,6 +331,9 @@ pub struct LlmCallData {
     /// The profile/mode from the previous thread (e.g. "Auto", "Sonnet", "High"),
     /// carried across chain hops to preserve the user's selection.
     pub profile_id: Option<String>,
+    /// Approximate token count of the source thread context.
+    /// Passed through to AutoPromptAction for dispatch decisions.
+    pub approximate_token_count: usize,
 }
 
 impl std::fmt::Debug for LlmCallData {
@@ -653,6 +659,7 @@ pub fn decide(
         original_user_message,
         last_assistant_message,
         profile_id: None,
+        approximate_token_count: auto_prompt_ctx.approximate_token_count,
     })
 }
 
@@ -817,6 +824,7 @@ pub async fn decide_with_llm(
                         work_dirs: data.work_dirs,
                         original_user_message: data.original_user_message,
                         profile_id: data.profile_id.clone(),
+                        approximate_token_count: data.approximate_token_count,
                     }))
                 }
                 EvaluationResult::WantsStop { reason } => {
@@ -851,6 +859,7 @@ pub async fn decide_with_llm(
                                     work_dirs: data.work_dirs,
                                     original_user_message: data.original_user_message,
                                     profile_id: data.profile_id.clone(),
+                                    approximate_token_count: data.approximate_token_count,
                                 }))
                             }
                             None => {

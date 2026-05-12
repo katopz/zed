@@ -171,10 +171,14 @@ fn dispatch_action(
         .active_thread()
         .is_some_and(|tv| tv.read(cx).thread.read(cx).connection().agent_id() == *ZED_AGENT_ID);
 
-    if !is_native_agent {
+    let same_thread_threshold = auto_prompt::load_config_cached()
+        .map(|c| c.same_thread_token_threshold)
+        .unwrap_or(50_000);
+
+    let use_same_thread = action.approximate_token_count < same_thread_threshold;
+
+    if !is_native_agent || use_same_thread {
         if let Some(active_tv) = conversation_view.active_thread() {
-            // Strip the "refer to first prompt" wrapper — same-thread AI
-            // already has full context, the preamble just wastes tokens.
             let prompt = strip_first_prompt_wrapper(&action.next_prompt);
             active_tv.update(cx, |tv, cx| {
                 tv.message_editor.update(cx, |editor, cx| {
@@ -186,19 +190,26 @@ fn dispatch_action(
                 });
                 tv.send(window, cx);
             });
+            let reason = if !is_native_agent {
+                "ACP agent"
+            } else {
+                "low token count"
+            };
             log::info!(
-                "[auto_prompt] dispatch_action: sent continuation to same thread (ACP agent)"
+                "[auto_prompt] dispatch_action: sent continuation to same thread ({reason}, tokens={})",
+                action.approximate_token_count
             );
             return;
         }
         log::warn!(
-            "[auto_prompt] dispatch_action: no active thread for ACP agent, falling back to new thread"
+            "[auto_prompt] dispatch_action: no active thread for same-thread continuation, falling back to new thread"
         );
     }
 
     log::info!(
-        "[auto_prompt] dispatch_action: dispatching AutoPromptNewThread (prompt {} chars)",
-        action.next_prompt.len()
+        "[auto_prompt] dispatch_action: dispatching AutoPromptNewThread (prompt {} chars, tokens={})",
+        action.next_prompt.len(),
+        action.approximate_token_count
     );
 
     let action = Box::new(AutoPromptNewThread {

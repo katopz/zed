@@ -41,6 +41,13 @@ pub struct AutoPromptConfig {
     /// retry with exponential backoff up to this many times before showing "Retry" button.
     #[serde(default = "default_max_llm_retries")]
     pub max_llm_retries: u32,
+
+    /// Token count threshold below which auto-prompt continues in the same thread
+    /// instead of creating a new thread with summary. When the conversation's
+    /// approximate token count is below this value, the next_prompt is injected
+    /// as a user message in the current thread, preserving full context.
+    #[serde(default = "default_same_thread_token_threshold")]
+    pub same_thread_token_threshold: usize,
 }
 
 fn default_max_iterations() -> u32 {
@@ -63,6 +70,10 @@ fn default_max_llm_retries() -> u32 {
     3
 }
 
+fn default_same_thread_token_threshold() -> usize {
+    50_000
+}
+
 impl Default for AutoPromptConfig {
     fn default() -> Self {
         Self {
@@ -72,6 +83,7 @@ impl Default for AutoPromptConfig {
             backoff_base_ms: default_backoff_base_ms(),
             max_verification_attempts: default_max_verification_attempts(),
             max_llm_retries: default_max_llm_retries(),
+            same_thread_token_threshold: default_same_thread_token_threshold(),
         }
     }
 }
@@ -140,6 +152,12 @@ impl AutoPromptConfig {
             .and_then(|v| v.parse().ok())
             .unwrap_or_else(default_max_llm_retries);
 
+        let same_thread_token_threshold =
+            std::env::var("ZED_AUTO_PROMPT_SAME_THREAD_TOKEN_THRESHOLD")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(default_same_thread_token_threshold);
+
         Self {
             system_prompt,
             max_iterations,
@@ -147,6 +165,7 @@ impl AutoPromptConfig {
             backoff_base_ms,
             max_verification_attempts,
             max_llm_retries,
+            same_thread_token_threshold,
         }
     }
 
