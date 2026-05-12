@@ -1335,6 +1335,7 @@ async fn call_language_model(
 
         let mut text_parts: Vec<String> = Vec::new();
         let mut thinking_parts: Vec<String> = Vec::new();
+        let mut stream_errors: Vec<anyhow::Error> = Vec::new();
         while let Some(event) = stream.next().await {
             match event {
                 Ok(LanguageModelCompletionEvent::Text(text)) => text_parts.push(text),
@@ -1343,23 +1344,66 @@ async fn call_language_model(
                 }
                 Ok(_) => {}
                 Err(err) => {
-                    log::warn!("auto_prompt: stream error: {err}");
-                    break;
+                    stream_errors.push(err.into());
                 }
             }
         }
-        let response_text = if !text_parts.is_empty() {
-            text_parts.concat()
-        } else if !thinking_parts.is_empty() {
-            log::info!(
-                "auto_prompt: model returned 0 Text events, using {} Thinking events as fallback",
+
+        if !stream_errors.is_empty() {
+            log::warn!(
+                "auto_prompt: {} stream errors, {} text parts, {} thinking parts",
+                stream_errors.len(),
+                text_parts.len(),
                 thinking_parts.len()
             );
-            thinking_parts.concat()
+        }
+
+        let text = text_parts.concat();
+        if !text.trim().is_empty() {
+            anyhow::Ok(text)
+        } else if !thinking_parts.is_empty() {
+            let thinking = thinking_parts.concat();
+            if !thinking.trim().is_empty() {
+                log::info!(
+                    "auto_prompt: Thinking fallback: {} empty Text parts, {} Thinking events ({} chars)",
+                    text_parts.len(),
+                    thinking_parts.len(),
+                    thinking.len()
+                );
+                log::info!(
+                    "auto_prompt: Thinking content: {}",
+                    thinking.chars().take(500).collect::<String>()
+                );
+                // Thinking content is reasoning, not structured JSON.
+                // Synthesize a safe stop response to avoid parse_response failure
+                // which would trigger the retry loop and show "Retry" button.
+                let synthetic = serde_json::json!({
+                    "should_continue": false,
+                    "next_prompt": null,
+                    "reason": format!("Model returned {} Thinking events but no Text output", thinking_parts.len()),
+                    "all_plan_done": false,
+                    "confidence": 0.3,
+                    "first_prompt_summary": null
+                });
+                anyhow::Ok(synthetic.to_string())
+            } else {
+                anyhow::bail!(
+                    "auto_prompt: model returned no usable content ({} empty Text events, {} empty Thinking events, {} stream errors)",
+                    text_parts.len(),
+                    thinking_parts.len(),
+                    stream_errors.len()
+                )
+            }
+        } else if !stream_errors.is_empty() {
+            anyhow::bail!(
+                "auto_prompt: model stream produced only errors ({} errors, {} text parts, {} thinking parts)",
+                stream_errors.len(),
+                text_parts.len(),
+                thinking_parts.len()
+            )
         } else {
-            String::new()
-        };
-        anyhow::Ok(response_text)
+            anyhow::bail!("auto_prompt: model returned zero events (0 Text, 0 Thinking)")
+        }
     };
 
     let timeout_future = cx.background_executor().timer(Duration::from_secs(60));
