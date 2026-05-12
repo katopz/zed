@@ -4347,6 +4347,33 @@ impl ThreadView {
                                 })
                                 .unwrap_or(None);
 
+                            let config = auto_prompt::load_config_cached().unwrap_or_default();
+
+                            if retry_data.had_error {
+                                let pre_call_delay = config.backoff_delay_ms(1);
+                                log::info!(
+                                    "[auto_prompt] Retry: source thread had error, waiting {pre_call_delay}ms before LLM call"
+                                );
+                                cx.background_executor()
+                                    .timer(std::time::Duration::from_millis(pre_call_delay))
+                                    .await;
+
+                                if let Some(ref tv) = thread_weak {
+                                    if tv
+                                        .read_with(cx, |tv, _| {
+                                            !matches!(
+                                                tv.auto_prompt_state,
+                                                crate::auto_prompt::AutoPromptState::Processing
+                                            )
+                                        })
+                                        .unwrap_or(true)
+                                    {
+                                        log::info!("[auto_prompt] Retry cancelled during pre-call delay");
+                                        return;
+                                    }
+                                }
+                            }
+
                             let result = auto_prompt::decide_with_llm(retry_data, cx).await;
 
                             log::info!("[auto_prompt] Retry LLM call completed");

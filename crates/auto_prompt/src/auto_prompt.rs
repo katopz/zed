@@ -334,6 +334,9 @@ pub struct LlmCallData {
     /// Approximate token count of the source thread context.
     /// Passed through to AutoPromptAction for dispatch decisions.
     pub approximate_token_count: usize,
+    /// Whether the source thread had errors (rate limit, refusal, max tokens, etc.).
+    /// Used by the caller to decide whether to add a pre-call delay.
+    pub had_error: bool,
 }
 
 impl std::fmt::Debug for LlmCallData {
@@ -359,6 +362,8 @@ impl std::fmt::Debug for LlmCallData {
                     .map(|s| format!("<{} chars>", s.len())),
             )
             .field("profile_id", &self.profile_id)
+            .field("approximate_token_count", &self.approximate_token_count)
+            .field("had_error", &self.had_error)
             .finish()
     }
 }
@@ -660,6 +665,7 @@ pub fn decide(
         last_assistant_message,
         profile_id: None,
         approximate_token_count: auto_prompt_ctx.approximate_token_count,
+        had_error: auto_prompt_ctx.had_error,
     })
 }
 

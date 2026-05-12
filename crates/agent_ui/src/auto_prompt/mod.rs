@@ -429,6 +429,25 @@ pub fn on_thread_stopped(
                     }
                 }
 
+                // When the source thread had an error (rate limit, refusal, max tokens, etc.),
+                // add a pre-call delay to avoid immediately hitting the same rate-limited API.
+                if data.had_error {
+                    let pre_call_delay = config.backoff_delay_ms(1);
+                    log::info!(
+                        "[auto_prompt] Source thread had error, waiting {pre_call_delay}ms before orchestration LLM call"
+                    );
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(pre_call_delay))
+                        .await;
+
+                    if let Some(ref tv) = thread_weak {
+                        if is_cancelled(tv, cx) {
+                            log::info!("[auto_prompt] Cancelled during pre-call delay");
+                            return;
+                        }
+                    }
+                }
+
                 let mut result = auto_prompt::decide_with_llm(data.clone(), cx).await;
 
                 // Retry loop with exponential backoff
