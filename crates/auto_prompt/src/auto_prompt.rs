@@ -155,15 +155,10 @@ pub fn with_first_prompt_context(
             }
 
             if let Some(last) = last_assistant_message.filter(|s| !s.trim().is_empty()) {
-                let truncated = if last.len() > 2000 {
-                    format!("{}...", &last[..2000])
-                } else {
-                    last.trim().to_string()
-                };
                 parts.push(String::new());
                 parts.push("## 3. Last Assistant Message".to_string());
                 parts.push(String::new());
-                parts.push(truncated);
+                parts.push(last.trim().to_string());
                 parts.push(String::new());
                 parts.push("---".to_string());
             }
