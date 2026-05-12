@@ -462,6 +462,7 @@ pub fn on_thread_stopped(
 
                 match result {
                     Ok(auto_prompt::AutoPromptOutcome::Continue(action)) => {
+                        auto_prompt::reset_llm_failure_count();
                         if let Some(ref tv) = thread_weak {
                             if let Err(err) = tv.update(cx, |tv, cx| {
                                 tv.auto_prompt_state = AutoPromptState::Idle;
@@ -489,6 +490,7 @@ pub fn on_thread_stopped(
                         }
                     }
                     Ok(auto_prompt::AutoPromptOutcome::Stopped { reason }) => {
+                        auto_prompt::reset_llm_failure_count();
                         if let Some(ref tv) = thread_weak {
                             if let Err(err) = tv.update(cx, |tv, cx| {
                                 tv.auto_prompt_state = AutoPromptState::Idle;
