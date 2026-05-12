@@ -129,7 +129,8 @@ File: `~/.config/zed/auto_prompt.json`
   "system_prompt": null,
   "max_iterations": 20,
   "max_context_tokens": 80000,
-  "backoff_base_ms": 2000
+  "backoff_base_ms": 2000,
+  "same_thread_token_threshold": 50000
 }
 ```
 
@@ -139,6 +140,7 @@ Environment variables (fallback when no config file):
 - `ZED_AUTO_PROMPT_MAX_ITERATIONS=20`
 - `ZED_AUTO_PROMPT_MAX_CONTEXT_TOKENS=80000`
 - `ZED_AUTO_PROMPT_BACKOFF_BASE_MS=2000`
+- `ZED_AUTO_PROMPT_SAME_THREAD_TOKEN_THRESHOLD=50000`
 
 ## LLM Response Format
 
@@ -178,17 +180,22 @@ The orchestration LLM must return JSON:
 ## File Structure
 
 ```
+crates/auto_prompt/src/
+├── auto_prompt.rs  # Core logic: decide(), decide_with_llm(), evaluate_response(),
+│                   # call_language_model(), Thinking fallback, same-thread threshold
+├── config.rs       # Loads ~/.config/zed/auto_prompt.json or env vars
+│                   # same_thread_token_threshold, max_llm_retries, etc.
+└── context.rs      # AutoPromptContext, AutoPromptResponse, plan/message serialization
+
 crates/agent_ui/src/auto_prompt/
-├── mod.rs        # Entry point, on_thread_stopped(), decision flow, iteration tracking
-├── client.rs     # Calls Zed's LLM via LanguageModel::stream_completion()
-├── config.rs     # Loads ~/.config/zed/auto_prompt.json or env vars
-└── context.rs    # AutoPromptContext, AutoPromptResponse, plan/message serialization
+└── mod.rs          # UI integration: on_thread_stopped(), dispatch_action(),
+                    # same-thread vs new-thread dispatch decision
 ```
 
-Minimal changes outside this folder:
-- `agent_ui.rs`: 1 line `mod auto_prompt;`
-- `conversation_view.rs`: 1 line in `AcpThreadEvent::Stopped` handler (passes `stop_reason`)
-- `agent_panel.rs`: ~20 lines to register `AutoPromptNewThread` action handler
+Integration points outside these folders:
+- `agent_panel.rs`: `AutoPromptNewThread` action handler (creates new thread with summary)
+- `conversation_view.rs`: `AcpThreadEvent::Stopped` handler (passes `stop_reason`)
+- `thread_view.rs`: Auto-prompt toggle UI, retry button, state display
 
 ## Flow Diagram
 
@@ -208,9 +215,12 @@ on_thread_stopped() checks:
         ├─ #ALL_PLAN_DONE? → STOP
         ├─ low confidence? → STOP
         ├─ no prompt? → STOP
-        └─ has prompt → dispatch AutoPromptNewThread
-            ↓
-            AgentPanel creates new thread with summary link + prompt
+        └─ has prompt → dispatch
+            ├─ tokens < same_thread_token_threshold (default 50k)?
+            │   → inject next_prompt as user message in CURRENT thread
+            │   → preserves full context, no summary drift
+            └─ tokens >= threshold?
+                → create NEW thread with summary link + prompt
             ↓
             Thread auto-submits
             ↓
