@@ -1438,12 +1438,26 @@ async fn call_language_model(
 
 fn parse_response(text: &str) -> anyhow::Result<AutoPromptResponse> {
     let json_str = extract_json(text);
-    serde_json::from_str(json_str).with_context(|| {
-        format!(
-            "auto_prompt: failed to parse response as JSON: {}",
-            text.chars().take(500).collect::<String>()
-        )
-    })
+    match serde_json::from_str(json_str) {
+        Ok(response) => Ok(response),
+        Err(parse_err) => {
+            let preview = text.chars().take(200).collect::<String>();
+            log::warn!("auto_prompt: failed to parse response as JSON ({parse_err}): {preview:?}");
+            log::warn!("auto_prompt: synthesizing stop response to avoid retry loop");
+            Ok(AutoPromptResponse {
+                should_continue: false,
+                next_prompt: None,
+                reason: Some(format!(
+                    "unparseable response ({} bytes, {} extracted): {parse_err}",
+                    text.len(),
+                    json_str.len()
+                )),
+                all_plan_done: false,
+                confidence: Some(0.0),
+                first_prompt_summary: None,
+            })
+        }
+    }
 }
 
 fn extract_json(text: &str) -> &str {
