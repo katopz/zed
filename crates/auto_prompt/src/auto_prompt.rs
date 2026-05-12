@@ -1402,22 +1402,51 @@ async fn call_language_model(
                 });
                 anyhow::Ok(synthetic.to_string())
             } else {
-                anyhow::bail!(
-                    "auto_prompt: model returned no usable content ({} empty Text events, {} empty Thinking events, {} stream errors)",
+                log::warn!(
+                    "auto_prompt: model returned no usable content ({} empty Text events, {} empty Thinking events, {} stream errors), synthesizing stop",
                     text_parts.len(),
                     thinking_parts.len(),
                     stream_errors.len()
-                )
+                );
+                let synthetic = serde_json::json!({
+                    "should_continue": false,
+                    "next_prompt": null,
+                    "reason": format!("model returned no usable content ({} empty Text, {} empty Thinking, {} stream errors)", text_parts.len(), thinking_parts.len(), stream_errors.len()),
+                    "all_plan_done": false,
+                    "confidence": 0.0,
+                    "first_prompt_summary": null
+                });
+                anyhow::Ok(synthetic.to_string())
             }
         } else if !stream_errors.is_empty() {
-            anyhow::bail!(
-                "auto_prompt: model stream produced only errors ({} errors, {} text parts, {} thinking parts)",
+            log::warn!(
+                "auto_prompt: model stream produced only errors ({} errors, {} text parts, {} thinking parts), synthesizing stop",
                 stream_errors.len(),
                 text_parts.len(),
                 thinking_parts.len()
-            )
+            );
+            let synthetic = serde_json::json!({
+                "should_continue": false,
+                "next_prompt": null,
+                "reason": format!("model stream produced only errors ({})", stream_errors.len()),
+                "all_plan_done": false,
+                "confidence": 0.0,
+                "first_prompt_summary": null
+            });
+            anyhow::Ok(synthetic.to_string())
         } else {
-            anyhow::bail!("auto_prompt: model returned zero events (0 Text, 0 Thinking)")
+            log::warn!(
+                "auto_prompt: model returned zero events (0 Text, 0 Thinking), synthesizing stop"
+            );
+            let synthetic = serde_json::json!({
+                "should_continue": false,
+                "next_prompt": null,
+                "reason": "model returned zero events (0 Text, 0 Thinking)".to_string(),
+                "all_plan_done": false,
+                "confidence": 0.0,
+                "first_prompt_summary": null
+            });
+            anyhow::Ok(synthetic.to_string())
         }
     };
 
