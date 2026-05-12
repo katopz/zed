@@ -1333,10 +1333,14 @@ async fn call_language_model(
             .await
             .context("auto_prompt: failed to start completion stream")?;
 
-        let mut response_text = String::new();
+        let mut text_parts: Vec<String> = Vec::new();
+        let mut thinking_parts: Vec<String> = Vec::new();
         while let Some(event) = stream.next().await {
             match event {
-                Ok(LanguageModelCompletionEvent::Text(text)) => response_text.push_str(&text),
+                Ok(LanguageModelCompletionEvent::Text(text)) => text_parts.push(text),
+                Ok(LanguageModelCompletionEvent::Thinking { text, .. }) => {
+                    thinking_parts.push(text)
+                }
                 Ok(_) => {}
                 Err(err) => {
                     log::warn!("auto_prompt: stream error: {err}");
@@ -1344,6 +1348,17 @@ async fn call_language_model(
                 }
             }
         }
+        let response_text = if !text_parts.is_empty() {
+            text_parts.concat()
+        } else if !thinking_parts.is_empty() {
+            log::info!(
+                "auto_prompt: model returned 0 Text events, using {} Thinking events as fallback",
+                thinking_parts.len()
+            );
+            thinking_parts.concat()
+        } else {
+            String::new()
+        };
         anyhow::Ok(response_text)
     };
 
