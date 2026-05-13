@@ -930,18 +930,19 @@ pub async fn decide_with_llm(
                 "auto_prompt: model returned zero events — attempting last-paragraph recovery"
             );
 
-            let last_paragraph = data
+            let remaining_section = data
                 .last_assistant_message
                 .as_deref()
-                .and_then(extract_last_paragraph);
+                .and_then(|s| extract_remaining_section(s));
 
             let has_remaining_work =
                 detect_remaining_work(data.last_assistant_message.as_deref()).is_some();
 
-            match (last_paragraph, has_remaining_work) {
-                (Some(paragraph), true) => {
+            match (remaining_section, has_remaining_work) {
+                (Some(section), true) => {
                     log::info!(
-                        "auto_prompt: zero events recovery — remaining work detected in last paragraph, dispatching bounded continue"
+                        "auto_prompt: zero events recovery — remaining work detected, dispatching bounded continue ({} chars extracted)",
+                        section.len()
                     );
 
                     let prompt_summary = data
@@ -956,8 +957,8 @@ pub async fn decide_with_llm(
 
                     let recovery_prompt = format!(
                         "The orchestration model returned no response (zero events). \
-                         Here is the last paragraph from the previous assistant message:\n\n\
-                         {paragraph}\n\n\
+                         Here is the remaining section from the previous assistant message:\n\n\
+                         {section}\n\n\
                          If this describes specific actionable remaining work, continue with it. \
                          If you are unsure or the work appears already complete, stop."
                     );
@@ -1680,13 +1681,65 @@ fn is_doc_creation_prompt(prompt: &str) -> bool {
 /// Code-level remaining work detection: scans the last assistant message
 /// for patterns that explicitly indicate incomplete work. This is a safety
 /// net that catches cases where the LLM ignores its own Rule 10.
-fn extract_last_paragraph(text: &str) -> Option<&str> {
+fn extract_remaining_section(text: &str) -> Option<String> {
     let paragraphs: Vec<&str> = text
         .split("\n\n")
         .map(|p| p.trim())
         .filter(|p| !p.is_empty())
         .collect();
-    paragraphs.last().copied()
+
+    if paragraphs.is_empty() {
+        return None;
+    }
+
+    let trigger_words = [
+        "remaining work",
+        "remaining:",
+        "still need",
+        "still needs",
+        "next step",
+        "next steps",
+        "todo:",
+        "action items",
+        "left to do",
+    ];
+
+    let scan_count = 3.min(paragraphs.len());
+    let scan_start = paragraphs.len() - scan_count;
+
+    for i in (scan_start..paragraphs.len()).rev() {
+        let lower = paragraphs[i].to_lowercase();
+        for trigger in &trigger_words {
+            if lower.contains(trigger) {
+                return Some(paragraphs[i..].join("\n\n"));
+            }
+        }
+    }
+
+    for i in (scan_start..paragraphs.len()).rev() {
+        let has_checkbox = paragraphs[i].lines().any(|line| {
+            let trimmed = line.trim_start();
+            trimmed.starts_with("- [ ] ") || trimmed.starts_with("* [ ] ")
+        });
+        if has_checkbox {
+            let start = if i > 0 {
+                let prev_lower = paragraphs[i - 1].to_lowercase();
+                let prev_is_header = paragraphs[i - 1].starts_with('#')
+                    || (paragraphs[i - 1].len() < 80 && paragraphs[i - 1].ends_with(':'));
+                if trigger_words.iter().any(|t| prev_lower.contains(t)) || prev_is_header {
+                    i - 1
+                } else {
+                    i
+                }
+            } else {
+                i
+            };
+            return Some(paragraphs[start..].join("\n\n"));
+        }
+    }
+
+    let fallback_start = paragraphs.len().saturating_sub(2);
+    Some(paragraphs[fallback_start..].join("\n\n"))
 }
 
 fn detect_remaining_work(last_assistant_message: Option<&str>) -> Option<String> {
@@ -2012,75 +2065,106 @@ mod tests {
         assert_eq!(extracted, Some(original.to_string()));
     }
 
-    // --- extract_last_paragraph tests ---
+    // --- extract_remaining_section tests ---
 
     #[test]
-    fn test_extract_last_paragraph_single_paragraph() {
+    fn test_extract_remaining_section_single_paragraph_no_trigger() {
         let text = "This is a single paragraph.";
         assert_eq!(
-            extract_last_paragraph(text),
-            Some("This is a single paragraph.")
+            extract_remaining_section(text),
+            Some("This is a single paragraph.".to_string())
         );
     }
 
     #[test]
-    fn test_extract_last_paragraph_multiple_paragraphs() {
+    fn test_extract_remaining_section_trigger_includes_header_and_list() {
         let text = "First paragraph.\n\nSecond paragraph.\n\n### Remaining work:\n\n- Do thing A\n- Do thing B";
         assert_eq!(
-            extract_last_paragraph(text),
-            Some("- Do thing A\n- Do thing B")
+            extract_remaining_section(text),
+            Some("### Remaining work:\n\n- Do thing A\n- Do thing B".to_string())
         );
     }
 
     #[test]
-    fn test_extract_last_paragraph_real_world_remaining_work() {
+    fn test_extract_remaining_section_real_world_remaining_work() {
         let text = "What was accomplished:\n\n1. Fixed bug\n2. Added tests\n\n### Remaining work for next session:\n\n- Rebuild with Metal backend\n- Retest training\n- If NaN resolved: Run full benchmark";
         assert_eq!(
-            extract_last_paragraph(text),
-            Some(
-                "- Rebuild with Metal backend\n- Retest training\n- If NaN resolved: Run full benchmark"
-            )
+            extract_remaining_section(text),
+            Some("### Remaining work for next session:\n\n- Rebuild with Metal backend\n- Retest training\n- If NaN resolved: Run full benchmark".to_string())
         );
     }
 
     #[test]
-    fn test_extract_last_paragraph_trailing_whitespace() {
+    fn test_extract_remaining_section_trailing_whitespace_fallback_two() {
         let text = "First.\n\nLast.  \n\n";
-        assert_eq!(extract_last_paragraph(text), Some("Last."));
+        assert_eq!(
+            extract_remaining_section(text),
+            Some("First.\n\nLast.".to_string())
+        );
     }
 
     #[test]
-    fn test_extract_last_paragraph_empty() {
-        assert_eq!(extract_last_paragraph(""), None);
+    fn test_extract_remaining_section_empty() {
+        assert_eq!(extract_remaining_section(""), None);
     }
 
     #[test]
-    fn test_extract_last_paragraph_only_whitespace() {
-        assert_eq!(extract_last_paragraph("   \n\n  \n\n  "), None);
+    fn test_extract_remaining_section_only_whitespace() {
+        assert_eq!(extract_remaining_section("   \n\n  \n\n  "), None);
     }
 
     #[test]
-    fn test_extract_last_paragraph_two_paragraphs() {
+    fn test_extract_remaining_section_two_paragraphs_no_trigger() {
         let text = "First paragraph here.\n\nSecond paragraph here.";
-        assert_eq!(extract_last_paragraph(text), Some("Second paragraph here."));
+        assert_eq!(
+            extract_remaining_section(text),
+            Some("First paragraph here.\n\nSecond paragraph here.".to_string())
+        );
     }
 
     #[test]
-    fn test_extract_last_paragraph_single_line() {
+    fn test_extract_remaining_section_single_line() {
         let text = "Just one line no double breaks";
         assert_eq!(
-            extract_last_paragraph(text),
-            Some("Just one line no double breaks")
+            extract_remaining_section(text),
+            Some("Just one line no double breaks".to_string())
         );
     }
 
     #[test]
-    fn test_extract_last_paragraph_checkbox_list() {
+    fn test_extract_remaining_section_checkbox_with_header() {
         let text =
             "Summary of work done.\n\n### Remaining:\n\n- [ ] Task 1\n- [ ] Task 2\n- [ ] Task 3";
         assert_eq!(
-            extract_last_paragraph(text),
-            Some("- [ ] Task 1\n- [ ] Task 2\n- [ ] Task 3")
+            extract_remaining_section(text),
+            Some("### Remaining:\n\n- [ ] Task 1\n- [ ] Task 2\n- [ ] Task 3".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_remaining_section_checkbox_includes_preceding_header_like() {
+        let text = "Summary.\n\nPending items:\n\n- [ ] Task 1\n- [ ] Task 2";
+        assert_eq!(
+            extract_remaining_section(text),
+            Some("Pending items:\n\n- [ ] Task 1\n- [ ] Task 2".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_remaining_section_many_paragraphs_scans_last_3() {
+        let text = "P1.\n\nP2.\n\nP3.\n\nP4.\n\n### Next steps:\n\n- Do X";
+        assert_eq!(
+            extract_remaining_section(text),
+            Some("### Next steps:\n\n- Do X".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_remaining_section_trigger_in_middle_of_last_3() {
+        let text = "Accomplished A.\n\nAccomplished B.\n\n### TODO:\n\n- Fix bug\n- Add tests\n\nAlso mentioned in passing.";
+        assert_eq!(
+            extract_remaining_section(text),
+            Some("### TODO:\n\n- Fix bug\n- Add tests\n\nAlso mentioned in passing.".to_string())
         );
     }
 
