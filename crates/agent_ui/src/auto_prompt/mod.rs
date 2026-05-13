@@ -175,7 +175,15 @@ fn dispatch_action(
         .map(|c| c.same_thread_token_threshold)
         .unwrap_or(50_000);
 
-    let use_same_thread = action.approximate_token_count < same_thread_threshold;
+    let use_same_thread = action
+        .actual_input_tokens
+        .map(|t| (t as usize) < same_thread_threshold)
+        .unwrap_or(true);
+
+    log::info!(
+        "[auto_prompt] dispatch_action: token decision: actual_input_tokens={:?}, threshold={same_thread_threshold}, use_same_thread={use_same_thread}",
+        action.actual_input_tokens
+    );
 
     if !is_native_agent || use_same_thread {
         if let Some(active_tv) = conversation_view.active_thread() {
@@ -196,8 +204,8 @@ fn dispatch_action(
                 "low token count"
             };
             log::info!(
-                "[auto_prompt] dispatch_action: sent continuation to same thread ({reason}, tokens={})",
-                action.approximate_token_count
+                "[auto_prompt] dispatch_action: sent continuation to same thread ({reason}, tokens={:?})",
+                action.actual_input_tokens
             );
             return;
         }
@@ -207,9 +215,9 @@ fn dispatch_action(
     }
 
     log::info!(
-        "[auto_prompt] dispatch_action: dispatching AutoPromptNewThread (prompt {} chars, tokens={})",
+        "[auto_prompt] dispatch_action: dispatching AutoPromptNewThread (prompt {} chars, tokens={:?})",
         action.next_prompt.len(),
-        action.approximate_token_count
+        action.actual_input_tokens
     );
 
     let action = Box::new(AutoPromptNewThread {

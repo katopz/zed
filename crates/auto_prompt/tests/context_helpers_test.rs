@@ -18,6 +18,7 @@ fn default_context() -> AutoPromptContext {
         stop_reason: String::new(),
         had_error: false,
         approximate_token_count: 0,
+        actual_input_tokens: None,
         iteration_count: 1,
         stop_phase: StopPhase::Working,
         verification_count: 0,

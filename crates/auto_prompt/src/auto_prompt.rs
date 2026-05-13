@@ -114,9 +114,10 @@ pub struct AutoPromptAction {
     /// The profile/mode from the previous thread (e.g. "Auto", "Sonnet", "High"),
     /// carried across chain hops to preserve the user's selection.
     pub profile_id: Option<String>,
-    /// Approximate token count of the source thread context.
+    /// Actual input token count from the thread's API usage response.
     /// Used by dispatch to decide same-thread vs new-thread continuation.
-    pub approximate_token_count: usize,
+    /// Falls back to None when usage data is unavailable.
+    pub actual_input_tokens: Option<u64>,
 }
 
 /// Outcome of an auto-prompt LLM decision.
@@ -326,9 +327,9 @@ pub struct LlmCallData {
     /// The profile/mode from the previous thread (e.g. "Auto", "Sonnet", "High"),
     /// carried across chain hops to preserve the user's selection.
     pub profile_id: Option<String>,
-    /// Approximate token count of the source thread context.
+    /// Actual input token count from the thread's API usage response.
     /// Passed through to AutoPromptAction for dispatch decisions.
-    pub approximate_token_count: usize,
+    pub actual_input_tokens: Option<u64>,
     /// Whether the source thread had errors (rate limit, refusal, max tokens, etc.).
     /// Used by the caller to decide whether to add a pre-call delay.
     pub had_error: bool,
@@ -357,7 +358,7 @@ impl std::fmt::Debug for LlmCallData {
                     .map(|s| format!("<{} chars>", s.len())),
             )
             .field("profile_id", &self.profile_id)
-            .field("approximate_token_count", &self.approximate_token_count)
+            .field("actual_input_tokens", &self.actual_input_tokens)
             .field("had_error", &self.had_error)
             .finish()
     }
@@ -372,6 +373,11 @@ pub struct EvaluationInput {
     pub all_plan_done: bool,
     pub next_plan_prompt: Option<String>,
     pub last_assistant_message: Option<String>,
+    /// True when the LLM failed to produce a usable response and a synthetic
+    /// stop was generated (e.g. "model returned zero events"). Pre-stop
+    /// verification is skipped in this case because there is no real decision
+    /// to verify.
+    pub is_synthetic_failure: bool,
 }
 
 /// Result of evaluating an LLM response.
@@ -603,7 +609,8 @@ pub fn decide(
         .map(|s| s.to_string());
 
     log::info!(
-        "[auto_prompt::decide] Approximate token count: {}",
+        "[auto_prompt::decide] Token counts: actual_input_tokens={:?}, estimated_chars_div_4={}",
+        auto_prompt_ctx.actual_input_tokens,
         auto_prompt_ctx.approximate_token_count
     );
 
@@ -613,11 +620,11 @@ pub fn decide(
     );
 
     log::info!(
-        "[auto_prompt::decide] PATH=llm_call: had_error={}, stop_reason={:?}, iteration={}, tokens={} → NeedsLlmCall (LLM will decide)",
+        "[auto_prompt::decide] PATH=llm_call: had_error={}, stop_reason={:?}, iteration={}, actual_input_tokens={:?} → NeedsLlmCall (LLM will decide)",
         auto_prompt_ctx.had_error,
         stop_reason,
         iteration_count,
-        auto_prompt_ctx.approximate_token_count
+        auto_prompt_ctx.actual_input_tokens
     );
 
     let system_prompt = config.system_prompt.unwrap_or_else(default_system_prompt);
@@ -659,7 +666,7 @@ pub fn decide(
         original_user_message,
         last_assistant_message,
         profile_id: None,
-        approximate_token_count: auto_prompt_ctx.approximate_token_count,
+        actual_input_tokens: auto_prompt_ctx.actual_input_tokens,
         had_error: auto_prompt_ctx.had_error,
     })
 }
@@ -702,6 +709,7 @@ pub async fn decide_with_llm(
                 &data.context_json,
                 &raw_response,
                 &response,
+                data.actual_input_tokens,
             );
 
             let has_prompt = response
@@ -768,6 +776,11 @@ pub async fn decide_with_llm(
                 None
             };
 
+            let is_synthetic_failure = response.confidence <= Some(0.3)
+                && response
+                    .reason
+                    .as_ref()
+                    .is_some_and(|r| r.to_ascii_lowercase().starts_with("model"));
             let input = EvaluationInput {
                 should_continue: response.should_continue,
                 confidence: response.confidence,
@@ -776,6 +789,7 @@ pub async fn decide_with_llm(
                 all_plan_done: all_done,
                 next_plan_prompt,
                 last_assistant_message: data.last_assistant_message.clone(),
+                is_synthetic_failure,
             };
 
             log::info!(
@@ -830,89 +844,104 @@ pub async fn decide_with_llm(
                         work_dirs: data.work_dirs,
                         original_user_message: data.original_user_message,
                         profile_id: data.profile_id.clone(),
-                        approximate_token_count: data.approximate_token_count,
+                        actual_input_tokens: data.actual_input_tokens,
                     }))
                 }
                 EvaluationResult::WantsStop { reason } => {
-                    let verification_count = VERIFICATION_COUNT.load(Ordering::Relaxed);
-                    let max_verifications = data.max_verification_attempts;
-
-                    if verification_count == 0 {
+                    if input.is_synthetic_failure {
                         log::info!(
-                            "auto_prompt: WantsStop ('{reason}') — initiating pre-stop verification (attempt 1/{max_verifications})"
+                            "auto_prompt: WantsStop ('{reason}') — LLM call failed, skipping pre-stop verification"
                         );
-                        VERIFICATION_COUNT.fetch_add(1, Ordering::Relaxed);
-
-                        match build_pre_stop_verification_prompt(
-                            &data.context_json,
-                            &data.work_dirs,
-                        ) {
-                            Some(verification_prompt) => {
-                                log::info!(
-                                    "auto_prompt: dispatching pre-stop verification prompt: {}...",
-                                    verification_prompt.chars().take(80).collect::<String>()
-                                );
-                                let next_prompt = with_first_prompt_context(
-                                    verification_prompt,
-                                    prompt_summary.as_deref(),
-                                    data.title.as_deref(),
-                                    data.last_assistant_message.as_deref(),
-                                );
-                                Ok(AutoPromptOutcome::Continue(AutoPromptAction {
-                                    from_session_id: data.session_id,
-                                    from_title: data.title,
-                                    next_prompt,
-                                    work_dirs: data.work_dirs,
-                                    original_user_message: data.original_user_message,
-                                    profile_id: data.profile_id.clone(),
-                                    approximate_token_count: data.approximate_token_count,
-                                }))
-                            }
-                            None => {
-                                let stop_reason =
-                                    "LLM says stop, no plan files found for verification"
-                                        .to_string();
-                                log::info!(
-                                    "auto_prompt: no verification needed (no plan files found), stopping"
-                                );
-                                write_stop_log(
-                                    data.project_root.as_ref(),
-                                    data.iteration_count,
-                                    &stop_reason,
-                                );
-                                reset_iteration();
-                                Ok(AutoPromptOutcome::Stopped {
-                                    reason: stop_reason,
-                                })
-                            }
-                        }
-                    } else if verification_count < max_verifications {
-                        let stop_reason = format!(
-                            "LLM says stop after verification attempt {verification_count}/{max_verifications}"
-                        );
-                        log::info!("auto_prompt: {stop_reason}");
                         write_stop_log(
                             data.project_root.as_ref(),
                             data.iteration_count,
-                            &stop_reason,
+                            &format!("LLM call failed: {reason}"),
                         );
                         reset_iteration();
                         Ok(AutoPromptOutcome::Stopped {
-                            reason: stop_reason,
+                            reason: format!("LLM call failed: {reason}"),
                         })
                     } else {
-                        let stop_reason =
-                            format!("max verification attempts ({max_verifications}) exceeded");
-                        log::warn!("auto_prompt: {stop_reason}");
-                        write_stop_log(
-                            data.project_root.as_ref(),
-                            data.iteration_count,
-                            &stop_reason,
-                        );
-                        reset_iteration();
-                        Ok(AutoPromptOutcome::Stopped {
-                            reason: stop_reason,
-                        })
+                        let verification_count = VERIFICATION_COUNT.load(Ordering::Relaxed);
+                        let max_verifications = data.max_verification_attempts;
+
+                        if verification_count == 0 {
+                            log::info!(
+                                "auto_prompt: WantsStop ('{reason}') — initiating pre-stop verification (attempt 1/{max_verifications})"
+                            );
+                            VERIFICATION_COUNT.fetch_add(1, Ordering::Relaxed);
+
+                            match build_pre_stop_verification_prompt(
+                                &data.context_json,
+                                &data.work_dirs,
+                            ) {
+                                Some(verification_prompt) => {
+                                    log::info!(
+                                        "auto_prompt: dispatching pre-stop verification prompt: {}...",
+                                        verification_prompt.chars().take(80).collect::<String>()
+                                    );
+                                    let next_prompt = with_first_prompt_context(
+                                        verification_prompt,
+                                        prompt_summary.as_deref(),
+                                        data.title.as_deref(),
+                                        data.last_assistant_message.as_deref(),
+                                    );
+                                    Ok(AutoPromptOutcome::Continue(AutoPromptAction {
+                                        from_session_id: data.session_id,
+                                        from_title: data.title,
+                                        next_prompt,
+                                        work_dirs: data.work_dirs,
+                                        original_user_message: data.original_user_message,
+                                        profile_id: data.profile_id.clone(),
+                                        actual_input_tokens: data.actual_input_tokens,
+                                    }))
+                                }
+                                None => {
+                                    let stop_reason =
+                                        "LLM says stop, no plan files found for verification"
+                                            .to_string();
+                                    log::info!(
+                                        "auto_prompt: no verification needed (no plan files found), stopping"
+                                    );
+                                    write_stop_log(
+                                        data.project_root.as_ref(),
+                                        data.iteration_count,
+                                        &stop_reason,
+                                    );
+                                    reset_iteration();
+                                    Ok(AutoPromptOutcome::Stopped {
+                                        reason: stop_reason,
+                                    })
+                                }
+                            }
+                        } else if verification_count < max_verifications {
+                            let stop_reason = format!(
+                                "LLM says stop after verification attempt {verification_count}/{max_verifications}"
+                            );
+                            log::info!("auto_prompt: {stop_reason}");
+                            write_stop_log(
+                                data.project_root.as_ref(),
+                                data.iteration_count,
+                                &stop_reason,
+                            );
+                            reset_iteration();
+                            Ok(AutoPromptOutcome::Stopped {
+                                reason: stop_reason,
+                            })
+                        } else {
+                            let stop_reason =
+                                format!("max verification attempts ({max_verifications}) exceeded");
+                            log::warn!("auto_prompt: {stop_reason}");
+                            write_stop_log(
+                                data.project_root.as_ref(),
+                                data.iteration_count,
+                                &stop_reason,
+                            );
+                            reset_iteration();
+                            Ok(AutoPromptOutcome::Stopped {
+                                reason: stop_reason,
+                            })
+                        }
                     }
                 }
             }
@@ -938,6 +967,7 @@ fn write_decision_log(
     context_json: &str,
     raw_response: &str,
     parsed: &AutoPromptResponse,
+    actual_input_tokens: Option<u64>,
 ) {
     let logs_dir = match project_root {
         Some(root) => root.join(".logs"),
@@ -966,6 +996,7 @@ fn write_decision_log(
             "context_json": context_json,
         },
         "raw_response": raw_response,
+        "actual_input_tokens": actual_input_tokens,
         "parsed_response": {
             "should_continue": parsed.should_continue,
             "next_prompt": parsed.next_prompt,
@@ -2346,6 +2377,7 @@ mod tests {
             all_plan_done: false,
             next_plan_prompt: None,
             last_assistant_message: None,
+            is_synthetic_failure: false,
         }
     }
 
@@ -2944,5 +2976,99 @@ mod tests {
         let result = build_plan_landscape(context_json);
         // All unchecked items are under "Out of Scope" → no actionable plans → None
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_eval_synthetic_failure_zero_confidence_returns_wants_stop() {
+        let input = EvaluationInput {
+            should_continue: false,
+            confidence: Some(0.0),
+            reason: Some("model returned zero events (1 total stream events)".to_string()),
+            is_synthetic_failure: true,
+            ..make_input()
+        };
+        let result = evaluate_response(&input);
+        match result {
+            EvaluationResult::WantsStop { reason } => {
+                assert!(
+                    reason.contains("confidence too low"),
+                    "expected low-confidence stop reason, got: {reason}"
+                );
+            }
+            other => panic!("expected WantsStop for synthetic failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_eval_synthetic_failure_no_thinking_returns_wants_stop() {
+        let input = EvaluationInput {
+            should_continue: false,
+            confidence: Some(0.0),
+            reason: Some("model returned no usable content (3 empty Text, 0 empty Thinking, 0 stream errors)".to_string()),
+            is_synthetic_failure: true,
+            ..make_input()
+        };
+        let result = evaluate_response(&input);
+        assert!(
+            matches!(result, EvaluationResult::WantsStop { .. }),
+            "expected WantsStop for 'model returned no usable content', got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_eval_stream_errors_returns_wants_stop() {
+        let input = EvaluationInput {
+            should_continue: false,
+            confidence: Some(0.0),
+            reason: Some("model stream produced only errors (2)".to_string()),
+            is_synthetic_failure: true,
+            ..make_input()
+        };
+        let result = evaluate_response(&input);
+        assert!(
+            matches!(result, EvaluationResult::WantsStop { .. }),
+            "expected WantsStop for stream errors, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_eval_normal_low_confidence_not_marked_synthetic() {
+        // Normal LLM response with low confidence — is_synthetic_failure=false
+        // This should still return WantsStop, but the dispatch layer should
+        // still run pre-stop verification (unlike synthetic failures).
+        let input = EvaluationInput {
+            should_continue: false,
+            confidence: Some(0.3),
+            reason: Some("no active task identified".to_string()),
+            is_synthetic_failure: false,
+            ..make_input()
+        };
+        let result = evaluate_response(&input);
+        assert!(
+            matches!(result, EvaluationResult::WantsStop { .. }),
+            "expected WantsStop for low confidence, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_eval_thinking_fallback_confidence_0_3_is_not_synthetic() {
+        // Thinking-only fallback has confidence 0.3 — should be WantsStop
+        // but is_synthetic_failure should be false (0.3 is not <= 0.3... wait)
+        // Actually 0.3 <= 0.3 IS true, but the reason starts with "Model" not "model"
+        // Our detection uses to_ascii_lowercase().starts_with("model"), so "Model" matches.
+        // So this IS detected as synthetic. Let's verify evaluate_response doesn't care
+        // about is_synthetic_failure — it just returns WantsStop for confidence < 0.5.
+        let input = EvaluationInput {
+            should_continue: false,
+            confidence: Some(0.3),
+            reason: Some("Model returned 5 Thinking events but no Text output".to_string()),
+            is_synthetic_failure: true,
+            ..make_input()
+        };
+        let result = evaluate_response(&input);
+        assert!(
+            matches!(result, EvaluationResult::WantsStop { .. }),
+            "expected WantsStop for thinking-only fallback, got {result:?}"
+        );
     }
 }

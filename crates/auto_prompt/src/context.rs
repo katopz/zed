@@ -45,6 +45,10 @@ pub struct AutoPromptContext {
     pub had_error: bool,
     /// Approximate token count of this context (chars / 4).
     pub approximate_token_count: usize,
+    /// Actual input token count from the thread's API usage response.
+    /// This is the real token count shown in the UI, as opposed to the
+    /// rough chars/4 estimate in `approximate_token_count`.
+    pub actual_input_tokens: Option<u64>,
     /// Which auto-prompt iteration this is (starts at 1).
     pub iteration_count: u32,
     /// Current phase in the stop lifecycle (Working, PreStop, Verified).
@@ -229,6 +233,7 @@ impl AutoPromptContext {
             stop_reason,
             had_error,
             approximate_token_count: 0,
+            actual_input_tokens: thread.token_usage().map(|u| u.input_tokens),
             iteration_count,
             stop_phase: StopPhase::Working,
             verification_count: 0,
@@ -241,6 +246,12 @@ impl AutoPromptContext {
         };
 
         context.approximate_token_count = context.estimate_token_count();
+
+        log::info!(
+            "[auto_prompt::context] token counts: actual_input_tokens={:?}, estimated_chars_div_4={}",
+            context.actual_input_tokens,
+            context.approximate_token_count
+        );
 
         // Compute helper fields
         context.plan_has_checkboxes = context.compute_plan_has_checkboxes();
