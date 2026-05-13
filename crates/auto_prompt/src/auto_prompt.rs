@@ -1064,7 +1064,24 @@ fn write_error_log(
     model: &str,
     error: &anyhow::Error,
 ) {
-    let logs_dir = match project_root {
+    let timestamp = chrono::Local::now().format("%Y-%m-%dT%H-%M-%S%.3f");
+    let filename = format!("{timestamp}_{iteration}_error.json");
+    let log_entry = serde_json::json!({
+        "timestamp": chrono::Local::now().to_rfc3339(),
+        "iteration": iteration,
+        "model": model,
+        "error": format!("{error:#}"),
+    });
+
+    let json = match serde_json::to_string_pretty(&log_entry) {
+        Ok(json) => json,
+        Err(err) => {
+            log::warn!("auto_prompt: failed to serialize error log entry: {err}");
+            return;
+        }
+    };
+
+    let primary_dir = match project_root {
         Some(root) => root.join(".logs"),
         None => {
             log::info!(
@@ -1073,41 +1090,50 @@ fn write_error_log(
             PathBuf::from(FALLBACK_LOG_DIR)
         }
     };
-    if let Err(err) = std::fs::create_dir_all(&logs_dir) {
-        log::warn!("auto_prompt: failed to create .logs dir: {err}");
-        return;
-    }
 
-    let timestamp = chrono::Local::now().format("%Y-%m-%dT%H-%M-%S%.3f");
-    let filename = format!("{timestamp}_{iteration}_error.json");
-    let path = logs_dir.join(&filename);
+    let fallback_dir = PathBuf::from(FALLBACK_LOG_DIR);
 
-    let log_entry = serde_json::json!({
-        "timestamp": chrono::Local::now().to_rfc3339(),
-        "iteration": iteration,
-        "model": model,
-        "error": format!("{error:#}"),
-    });
-
-    match serde_json::to_string_pretty(&log_entry) {
-        Ok(json) => {
-            if let Err(err) = std::fs::write(&path, json) {
+    for (label, dir) in [("primary", &primary_dir), ("fallback", &fallback_dir)] {
+        if let Err(err) = std::fs::create_dir_all(dir) {
+            log::warn!(
+                "auto_prompt: failed to create {label} log dir {}: {err}",
+                dir.display()
+            );
+            continue;
+        }
+        let path = dir.join(&filename);
+        match std::fs::write(&path, &json) {
+            Ok(()) => {
+                log::info!("auto_prompt: wrote error log to {}", path.display());
+            }
+            Err(err) => {
                 log::warn!(
                     "auto_prompt: failed to write error log {}: {err}",
                     path.display()
                 );
-            } else {
-                log::info!("auto_prompt: wrote error log to {}", path.display());
             }
-        }
-        Err(err) => {
-            log::warn!("auto_prompt: failed to serialize error log entry: {err}");
         }
     }
 }
 
 fn write_stop_log(project_root: Option<&PathBuf>, iteration: u32, reason: &str) {
-    let logs_dir = match project_root {
+    let timestamp = chrono::Local::now().format("%Y-%m-%dT%H-%M-%S%.3f");
+    let filename = format!("{timestamp}_{iteration}_stop.json");
+    let log_entry = serde_json::json!({
+        "timestamp": chrono::Local::now().to_rfc3339(),
+        "iteration": iteration,
+        "reason": reason,
+    });
+
+    let json = match serde_json::to_string_pretty(&log_entry) {
+        Ok(json) => json,
+        Err(err) => {
+            log::warn!("auto_prompt: failed to serialize stop log: {err}");
+            return;
+        }
+    };
+
+    let primary_dir = match project_root {
         Some(root) => root.join(".logs"),
         None => {
             log::info!(
@@ -1116,31 +1142,28 @@ fn write_stop_log(project_root: Option<&PathBuf>, iteration: u32, reason: &str) 
             PathBuf::from(FALLBACK_LOG_DIR)
         }
     };
-    if let Err(err) = std::fs::create_dir_all(&logs_dir) {
-        log::warn!("auto_prompt: failed to create .logs dir: {err}");
-        return;
-    }
-    let timestamp = chrono::Local::now().format("%Y-%m-%dT%H-%M-%S%.3f");
-    let filename = format!("{timestamp}_{iteration}_stop.json");
-    let path = logs_dir.join(&filename);
-    let log_entry = serde_json::json!({
-        "timestamp": chrono::Local::now().to_rfc3339(),
-        "iteration": iteration,
-        "reason": reason,
-    });
-    match serde_json::to_string_pretty(&log_entry) {
-        Ok(json) => {
-            if let Err(err) = std::fs::write(&path, json) {
+
+    let fallback_dir = PathBuf::from(FALLBACK_LOG_DIR);
+
+    for (label, dir) in [("primary", &primary_dir), ("fallback", &fallback_dir)] {
+        if let Err(err) = std::fs::create_dir_all(dir) {
+            log::warn!(
+                "auto_prompt: failed to create {label} log dir {}: {err}",
+                dir.display()
+            );
+            continue;
+        }
+        let path = dir.join(&filename);
+        match std::fs::write(&path, &json) {
+            Ok(()) => {
+                log::info!("auto_prompt: wrote stop log to {}", path.display());
+            }
+            Err(err) => {
                 log::warn!(
                     "auto_prompt: failed to write stop log {}: {err}",
                     path.display()
                 );
-            } else {
-                log::info!("auto_prompt: wrote stop log to {}", path.display());
             }
-        }
-        Err(err) => {
-            log::warn!("auto_prompt: failed to serialize stop log: {err}");
         }
     }
 }

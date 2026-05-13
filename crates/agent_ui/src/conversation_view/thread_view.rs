@@ -4288,8 +4288,13 @@ impl ThreadView {
         );
         let is_failed = matches!(
             self.auto_prompt_state,
-            crate::auto_prompt::AutoPromptState::Failed
+            crate::auto_prompt::AutoPromptState::Failed(_)
         );
+
+        let failed_error_message = match &self.auto_prompt_state {
+            crate::auto_prompt::AutoPromptState::Failed(msg) => Some(msg.clone()),
+            _ => None,
+        };
 
         let (label, label_color) = if is_processing {
             ("Processing...", Color::Accent)
@@ -4315,7 +4320,15 @@ impl ThreadView {
             .disabled(!is_native_agent)
             .tooltip(move |_, cx| {
                 if is_native_agent {
-                    Tooltip::for_action("Auto-Prompt", &crate::auto_prompt::ToggleAutoPrompt, cx)
+                    if is_failed {
+                        if let Some(ref msg) = failed_error_message {
+                            Tooltip::simple(format!("Auto-prompt failed: {msg}"), cx)
+                        } else {
+                            Tooltip::simple("Auto-prompt failed — click to retry", cx)
+                        }
+                    } else {
+                        Tooltip::for_action("Auto-Prompt", &crate::auto_prompt::ToggleAutoPrompt, cx)
+                    }
                 } else {
                     Tooltip::simple("Auto-prompt is only available for Zed Agent", cx)
                 }
@@ -4428,7 +4441,7 @@ impl ThreadView {
                                     // Retry failed again - set back to Failed state and restore retry data
                                     if let Some(ref tv) = thread_weak {
                                         if let Err(update_err) = tv.update(cx, |tv, cx| {
-                                            tv.auto_prompt_state = crate::auto_prompt::AutoPromptState::Failed;
+                                            tv.auto_prompt_state = crate::auto_prompt::AutoPromptState::Failed(format!("{err:#}"));
                                             tv._auto_prompt_retry_data = Some(retry_data_for_restore);
                                             cx.notify();
                                         }) {

@@ -117,15 +117,15 @@ async fn load_auto_prompt_system_prompt(
 pub struct ToggleAutoPrompt;
 
 /// State of the auto-prompt system.
-#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum AutoPromptState {
     /// Auto-prompt is idle (not processing).
     #[default]
     Idle,
     /// Auto-prompt is waiting for LLM decision or dispatching.
     Processing,
-    /// Auto-prompt failed with an error.
-    Failed,
+    /// Auto-prompt failed with an error. Contains the error message for display.
+    Failed(String),
 }
 
 /// Action dispatched when the external LLM returns a next_prompt.
@@ -553,19 +553,45 @@ pub fn on_thread_stopped(
 
                     Err(err) => {
                         // Max retries exhausted (already tried in the loop above)
+                        let error_message = format!("{err:#}");
                         if let Some(ref tv) = thread_weak {
                             if let Err(update_err) = tv.update(cx, |tv, cx| {
-                                tv.auto_prompt_state = AutoPromptState::Failed;
+                                tv.auto_prompt_state =
+                                    AutoPromptState::Failed(error_message.clone());
                                 tv._auto_prompt_retry_data = Some(data.clone());
                                 cx.notify();
                             }) {
-                                log::warn!("[auto_prompt] failed to set Failed state: {update_err}");
+                                log::warn!(
+                                    "[auto_prompt] failed to set Failed state: {update_err}"
+                                );
                             }
                         }
                         log::warn!(
                             "[auto_prompt] LLM call failed after {} attempts: {err}",
                             config.max_llm_retries
                         );
+                        if let Some(ref workspace) = workspace_weak {
+                            let short_message = error_message
+                                .lines()
+                                .next()
+                                .unwrap_or(&error_message);
+                            let _ = workspace.update(cx, |workspace, cx| {
+                                let toast = StatusToast::new(
+                                    format!("Auto-prompt failed: {short_message}"),
+                                    cx,
+                                    |this, _| {
+                                        this.icon(
+                                            Icon::new(IconName::XCircle)
+                                                .size(IconSize::Small)
+                                                .color(Color::Error),
+                                        )
+                                        .auto_dismiss(false)
+                                        .dismiss_button(true)
+                                    },
+                                );
+                                workspace.toggle_status_toast(toast, cx);
+                            });
+                        }
                     }
                 }
             });
