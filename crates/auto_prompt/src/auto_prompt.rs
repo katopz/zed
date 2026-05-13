@@ -1748,28 +1748,46 @@ fn detect_remaining_work(last_assistant_message: Option<&str>) -> Option<String>
         return None;
     }
 
+    let section = extract_remaining_section(msg);
+
     let lower = msg.to_lowercase();
-    let patterns: &[(&str, &str)] = &[
-        ("remaining work", "remaining work"),
-        ("remaining:", "remaining:"),
-        ("still need", "still need"),
-        ("still needs", "still needs"),
-        ("next step", "next step"),
-        ("next steps", "next steps"),
-        ("todo:", "todo:"),
-        ("action items", "action items"),
-        ("left to do", "left to do"),
+    let patterns: &[&str] = &[
+        "remaining work",
+        "remaining:",
+        "still need",
+        "still needs",
+        "next step",
+        "next steps",
+        "todo:",
+        "action items",
+        "left to do",
     ];
 
-    for (pattern, label) in patterns {
+    for pattern in patterns {
         if lower.contains(pattern) {
             log::warn!(
-                "[auto_prompt::detect_remaining_work] Pattern found: {label} in last_assistant_message — overriding stop"
+                "[auto_prompt::detect_remaining_work] Pattern found: {pattern} in last_assistant_message — overriding stop"
             );
-            return Some(
-                "Continue with the remaining work described in the assistant's last message."
-                    .to_string(),
+            let section_text = section.as_deref().unwrap_or(msg);
+            let is_actionable = section_text.contains("- ")
+                || section_text.contains("* ")
+                || section_text.contains("1.")
+                || section_text.contains("TODO")
+                || section_text.contains("must")
+                || section_text.contains("need to");
+
+            if is_actionable {
+                return Some(format!(
+                    "Previous assistant mentioned remaining work. Extracted section:\n\n\
+                     {section_text}\n\n\
+                     If this describes specific actionable remaining work, continue with it. \
+                     If the work is already done or this is a false positive, stop."
+                ));
+            }
+            log::info!(
+                "[auto_prompt::detect_remaining_work] Pattern '{pattern}' found but no actionable items — skipping override"
             );
+            return None;
         }
     }
 
@@ -1779,10 +1797,13 @@ fn detect_remaining_work(last_assistant_message: Option<&str>) -> Option<String>
             log::warn!(
                 "[auto_prompt::detect_remaining_work] Pattern found: unchecked checkbox in last_assistant_message — overriding stop"
             );
-            return Some(
-                "Continue with the remaining work described in the assistant's last message."
-                    .to_string(),
-            );
+            let section_text = section.as_deref().unwrap_or(msg);
+            return Some(format!(
+                "Previous assistant left unchecked items. Extracted section:\n\n\
+                 {section_text}\n\n\
+                 If these are real remaining tasks, continue with them. \
+                 If already done or this is a false positive, stop."
+            ));
         }
     }
 
@@ -2288,6 +2309,43 @@ mod tests {
         };
         let result = evaluate_response(&input);
         assert!(matches!(result, EvaluationResult::WantsStop { .. }));
+    }
+
+    #[test]
+    fn test_eval_remaining_work_false_positive_no_actionable_items() {
+        let input = EvaluationInput {
+            should_continue: false,
+            last_assistant_message: Some(
+                "The remaining work section was already addressed in the previous commit."
+                    .to_string(),
+            ),
+            ..make_input()
+        };
+        let result = evaluate_response(&input);
+        assert!(
+            matches!(result, EvaluationResult::WantsStop { .. }),
+            "trigger word 'remaining work' but no actionable items should not override stop"
+        );
+    }
+
+    #[test]
+    fn test_eval_remaining_work_trigger_with_bullets_overrides_stop() {
+        let input = EvaluationInput {
+            should_continue: false,
+            last_assistant_message: Some(
+                "Done with part 1.\n\n### Remaining work:\n\n- Fix the bug\n- Add tests"
+                    .to_string(),
+            ),
+            ..make_input()
+        };
+        let result = evaluate_response(&input);
+        match result {
+            EvaluationResult::Continue { prompt, .. } => {
+                assert!(prompt.contains("Fix the bug"));
+                assert!(prompt.contains("false positive"));
+            }
+            _ => panic!("expected Continue override, got {result:?}"),
+        }
     }
 
     #[test]
