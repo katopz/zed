@@ -58,6 +58,7 @@ Respond ONLY with valid JSON:
 8. If all plan steps are [x]:
    - If diagnostics or test failures likely exist → next_prompt = "Fix all diagnostics and ensure test coverage. Production grade only — no mock, no TODO, no placeholder."
    - Else if doc_files is empty → next_prompt = "Create .docs/{NN}_summary.md documenting what was implemented, key decisions, file changes, and how to test."
+   - Else if plan involves perf keywords and no benchmarks were run → next_prompt = "Run relevant benchmarks (cargo bench) and record results before completing."
    - Else if no git feature branch was created for this plan in the conversation → next_prompt = "Create develop branch from main if it doesn't exist. Then create a git feature branch feature/{plan_number}_{description} from develop. Commit all changes with conventional commit messages."
    - Else → all_plan_done=true, should_continue=false
 
@@ -91,6 +92,9 @@ Before confirming stop, verify ALL of these:
 - All plan checkboxes are [x] (no [ ] remaining)
 - Code diagnostics are clean (no errors, no warnings)
 - Git is committed with conventional commit messages
+- If plan involves performance: benchmarks run and results recorded
+- If next plan exists: follow branch transition rules (related → direct, unrelated → through develop)
+- If last plan: merge feature to develop, resolve conflicts, clean develop ready for review
 If ANY check fails → should_continue=true with a fix prompt
 
 ## Quality (always enforce):
@@ -98,9 +102,24 @@ If ANY check fails → should_continue=true with a fix prompt
 - Fix all compiler diagnostics and warnings before marking done
 - Ensure test coverage for new code
 
+## Branch transition (when transitioning between plans):
+- Related features (same area e.g. both "auto_prompt"): merge current feature to develop (fast-forward), then create new feature branch from develop. Keeps context.
+- Unrelated features (different areas): MUST go through develop — merge current feature to develop, then new feature branch from develop. Reduces conflict risk.
+- Never switch directly between feature branches without going through develop first.
+
+## Last plan cleanup (when no more plans remain):
+- Merge this feature branch into develop (fast-forward, no interactive rebase)
+- Resolve any conflicts, ensure a clean develop branch ready for review
+- Do NOT push — leave local for user to review
+
+## Benchmarks (when plan involves performance):
+- If plan keywords include: benchmark, bench, perf, latency, throughput, optimize, speed, profile
+- Run `cargo bench` (or equivalent) BEFORE and AFTER implementation to measure impact
+- Record results for comparison
+
 ## Git flow (when applicable):
 - Develop: create from main if it doesn't exist — ALWAYS required before feature branches
 - Feature: feature/{plan_number}_description from develop ONLY (never from main)
 - Hotfix: hotfix/{plan_number}_description from main
-- Complete: rebase onto develop, merge to develop
+- Complete: fast-forward merge into develop (no interactive rebase)
 - Conventional commits: feat:, fix:, refactor:, test:, chore:, docs:

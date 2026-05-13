@@ -398,11 +398,11 @@ pub fn evaluate_response(input: &EvaluationInput) -> EvaluationResult {
                 reason: "current plan done, transitioning to next plan".to_string(),
             };
         }
-        // 2. all_done + should_continue → Continue (dispatch final gitflow commit)
+        // 2. all_done + should_continue → Continue (dispatch final gitflow commit + cleanup)
         if input.should_continue {
             return EvaluationResult::Continue {
-                prompt: "All plans are complete. Create develop branch from main if it doesn't exist. Then create or reuse a git feature branch from develop and commit all changes with conventional commit messages (feat/fix/refactor) if not committed yet. Do not merge — leave the branch for review.".to_string(),
-                reason: "all plans done but LLM says continue, dispatching final gitflow commit".to_string(),
+                prompt: "All plans are complete. Final cleanup: merge this feature branch into develop (fast-forward, no interactive rebase), resolve any conflicts, ensure a clean develop branch. Do NOT push — leave local for user to review.".to_string(),
+                reason: "all plans done but LLM says continue, dispatching final cleanup".to_string(),
             };
         }
         return EvaluationResult::WantsStop {
@@ -754,8 +754,9 @@ pub async fn decide_with_llm(
             let next_plan_prompt = if all_done {
                 find_next_plan_prompt(&data.context_json, data.work_dirs.as_deref()).map(
                     |next_plan| {
+                        let transition = build_transition_advice(&data.context_json, data.work_dirs.as_deref());
                         format!(
-                            "Create develop branch from main if it doesn't exist. Then create a git feature branch for the completed plan from develop and commit all changes with conventional commit messages. Then {next_plan}"
+                            "Create develop branch from main if it doesn't exist. Commit all changes with conventional commit messages. Then handle branch transition: {transition} Then {next_plan}"
                         )
                     },
                 )
@@ -1696,6 +1697,159 @@ fn make_plan_read_prompt(plan_dir: &str, filename: &str) -> String {
     )
 }
 
+/// Detect if the current or next plan involves performance-related work by scanning for keywords.
+fn is_perf_related(context_json: &str, work_dirs: Option<&[PathBuf]>) -> bool {
+    let perf_keywords = [
+        "benchmark",
+        "bench",
+        "performance",
+        "perf",
+        "latency",
+        "throughput",
+        "speed",
+        "optimize",
+        "optimization",
+        "memory usage",
+        "allocation",
+        "cache",
+        "profile",
+        "profiling",
+    ];
+
+    let check_content = |content: &str| -> bool {
+        let lower = content.to_lowercase();
+        perf_keywords.iter().any(|kw| lower.contains(kw))
+    };
+
+    if check_content(context_json) {
+        return true;
+    }
+
+    let Some(dirs) = work_dirs else {
+        return false;
+    };
+
+    for work_dir in dirs {
+        for plan_dir in [work_dir.join(".plan"), work_dir.join(".plans")] {
+            if !plan_dir.is_dir() {
+                continue;
+            }
+            let Ok(entries) = std::fs::read_dir(&plan_dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() && path.extension().is_some_and(|ext| ext == "md") {
+                    if let Ok(content) = std::fs::read_to_string(&path) {
+                        if has_unchecked_items(&content) && check_content(&content) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    false
+}
+
+/// Build branch transition advice based on whether current and next plans are related features.
+fn build_transition_advice(context_json: &str, work_dirs: Option<&[PathBuf]>) -> String {
+    let current_plan_area = extract_plan_area(context_json);
+    let next_plan_area = work_dirs
+        .and_then(|dirs| find_next_plan_on_disk(dirs))
+        .and_then(|path| extract_area_from_path(&path));
+
+    match (current_plan_area, next_plan_area) {
+        (Some(current), Some(next)) if current == next => {
+            format!(
+                "Related features (both '{current}'). Continue on current feature branch directly — do NOT go through develop. \
+                 Merge current feature into develop first (fast-forward), then create new feature branch from develop for the next plan. \
+                 This avoids losing work from branch switching conflicts."
+            )
+        }
+        (Some(current), Some(next)) => {
+            format!(
+                "Unrelated features ('{current}' vs '{next}'). Go through develop: merge current feature to develop (fast-forward), \
+                 then create new feature branch from develop. This keeps features isolated and reduces conflict risk."
+            )
+        }
+        _ => {
+            "Merge current feature to develop (fast-forward), then create new feature branch from develop for the next plan.".to_string()
+        }
+    }
+}
+
+/// Extract the feature area from plan content (e.g., "auto_prompt" from "03_auto_prompt_state_machine").
+fn extract_plan_area(context_json: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct ContextPlanFiles {
+        plan_files: Vec<context::PlanFileContent>,
+    }
+
+    let ctx: ContextPlanFiles = serde_json::from_str(context_json).ok()?;
+
+    for file in &ctx.plan_files {
+        let filename = file.path.rsplit('/').next()?;
+        if let Some(area) = extract_area_from_filename(filename) {
+            return Some(area);
+        }
+    }
+    None
+}
+
+/// Extract feature area from a plan filename like "03_auto_prompt_state_machine.md" → "auto_prompt".
+fn extract_area_from_filename(filename: &str) -> Option<String> {
+    let name = filename.strip_suffix(".md").unwrap_or(filename);
+    let parts: Vec<&str> = name.splitn(2, '_').collect();
+    if parts.len() >= 2 {
+        let rest = parts[1];
+        let area = rest.split('_').next().unwrap_or(rest);
+        if !area.is_empty() {
+            return Some(area.to_string());
+        }
+    }
+    None
+}
+
+/// Extract feature area from a plan file path on disk.
+fn extract_area_from_path(path: &std::path::Path) -> Option<String> {
+    let filename = path.file_name()?.to_str()?;
+    extract_area_from_filename(filename)
+}
+
+/// Find the path of the next plan with unchecked items on disk.
+fn find_next_plan_on_disk(dirs: &[PathBuf]) -> Option<std::path::PathBuf> {
+    for work_dir in dirs {
+        for plan_dir in [work_dir.join(".plan"), work_dir.join(".plans")] {
+            if !plan_dir.is_dir() {
+                continue;
+            }
+            let Ok(entries) = std::fs::read_dir(&plan_dir) else {
+                continue;
+            };
+            let mut md_files: Vec<_> = entries
+                .flatten()
+                .filter(|e| {
+                    e.path().is_file() && e.path().extension().is_some_and(|ext| ext == "md")
+                })
+                .collect();
+            md_files.sort_by_key(|e| e.file_name());
+
+            for entry in md_files {
+                let path = entry.path();
+                let Ok(content) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                if has_unchecked_items(&content) {
+                    return Some(path);
+                }
+            }
+        }
+    }
+    None
+}
+
 fn is_doc_creation_prompt(prompt: &str) -> bool {
     let lower = prompt.to_lowercase();
     lower.contains("documentation") || lower.contains(".docs/")
@@ -1850,9 +2004,27 @@ fn build_pre_stop_verification_prompt(
     checks.push("2. **Code diagnostics**: Run `cargo check` and `cargo clippy` (or equivalent). Fix ALL errors and warnings before stopping. No TODOs, no placeholders, no unwrap().".to_string());
     checks.push("3. **Git status**: Verify all changes are committed with conventional commit messages (feat/fix/refactor/test/chore/docs). Create develop from main if it doesn't exist. Then create or reuse a feature branch from develop if not done.".to_string());
 
-    if let Some(remaining) = find_next_plan_prompt(context_json, work_dirs.as_deref()) {
+    let next_plan = find_next_plan_prompt(context_json, work_dirs.as_deref());
+    let is_perf = is_perf_related(context_json, work_dirs.as_deref());
+
+    if is_perf {
+        checks.push(
+            "4. **Benchmarks**: This plan involves performance work. Run relevant benchmarks (`cargo bench` or equivalent) before proceeding. Record results.".to_string()
+        );
+    }
+
+    if let Some(remaining) = &next_plan {
+        let transition = build_transition_advice(context_json, work_dirs.as_deref());
         checks.push(format!(
-            "\n4. **Next plan found**: {remaining}\n   Complete the current plan verification first, then transition."
+            "\n{}. **Next plan found**: {}\n   Complete the current plan verification first, then transition.\n   **Branch transition**: {}",
+            if is_perf { 5 } else { 4 },
+            remaining,
+            transition
+        ));
+    } else {
+        checks.push(format!(
+            "\n{}. **Last plan — cleanup**: No more plans remain. Close this feature branch to develop: merge (fast-forward, no interactive rebase) into develop, resolve any conflicts, ensure a clean develop branch ready for review. Do NOT push — leave local for user to review.",
+            if is_perf { 5 } else { 4 }
         ));
     }
 
@@ -2253,7 +2425,7 @@ mod tests {
         let result = evaluate_response(&input);
         match result {
             EvaluationResult::Continue { reason, .. } => {
-                assert!(reason.contains("gitflow commit"));
+                assert!(reason.contains("final cleanup"));
             }
             _ => panic!("expected Continue, got {result:?}"),
         }
