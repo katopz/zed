@@ -752,14 +752,18 @@ pub async fn decide_with_llm(
                     .is_some_and(|p| p.contains("#ALL_PLAN_DONE"));
 
             let next_plan_prompt = if all_done {
-                find_next_plan_prompt(&data.context_json, data.work_dirs.as_deref()).map(
-                    |next_plan| {
-                        let transition = build_transition_advice(&data.context_json, data.work_dirs.as_deref());
-                        format!(
-                            "Create develop branch from main if it doesn't exist. Commit all changes with conventional commit messages. Then handle branch transition: {transition} Then {next_plan}"
-                        )
-                    },
-                )
+                build_plan_landscape(&data.context_json).map(|landscape| {
+                    format!(
+                        "All current plan tasks are checked. For your awareness, remaining plans:\n\n\
+                         {landscape}\n\n\
+                         IMPORTANT: Do NOT start a new plan automatically. Instead:\n\
+                         1. Re-read your last message — finish any remaining work described there first.\n\
+                         2. Commit current changes with conventional messages to feature branch.\n\
+                         3. Consider closing current feature branch (merge to develop, fast-forward).\n\
+                         4. Only THEN re-read this plan list and decide if any is genuinely related to what you just did.\n\
+                         5. Declare: \"Reviewed remaining plans: <staying on current feature | transitioning to X because Y | stopping, nothing related>\""
+                    )
+                })
             } else {
                 None
             };
@@ -1554,113 +1558,166 @@ fn extract_json(text: &str) -> &str {
     text.trim()
 }
 
-/// Checks if there are plan files with remaining unchecked `[ ]` items.
-/// First checks the context JSON, then falls back to scanning disk directories.
-/// Returns a prompt to start the next plan if found, or None if all plans are complete.
-fn find_next_plan_prompt(context_json: &str, work_dirs: Option<&[PathBuf]>) -> Option<String> {
-    if let Some(prompt) = find_remaining_in_context(context_json) {
-        return Some(prompt);
-    }
-
-    find_remaining_on_disk(work_dirs)
-}
-
-fn find_remaining_in_context(context_json: &str) -> Option<String> {
+/// Build a concise summary of remaining plans grouped by project folder.
+/// Lists actionable unchecked tasks (skipping "Out of Scope", "Deferred" sections).
+/// Returns None if no plans have actionable unchecked items.
+fn build_plan_landscape(context_json: &str) -> Option<String> {
     #[derive(serde::Deserialize)]
-    struct ContextPlanFiles {
+    struct Context {
         plan_files: Vec<context::PlanFileContent>,
     }
 
-    let ctx: ContextPlanFiles = serde_json::from_str(context_json)
-        .inspect_err(|e| {
-            log::warn!(
-                "[auto_prompt::find_remaining_in_context] Failed to parse context JSON: {e}"
-            );
-        })
-        .ok()?;
+    let ctx: Context = serde_json::from_str(context_json).ok()?;
+
+    type Project = String;
+    type PlanLine = String;
+    let mut groups: Vec<(Project, Vec<PlanLine>)> = Vec::new();
 
     for file in &ctx.plan_files {
-        if has_unchecked_items(&file.content) {
-            let filename = file.path.rsplit('/').next().unwrap_or(&file.path);
-            let plan_dir = file.path.rsplit('/').nth(1).unwrap_or(".plans");
-            log::info!(
-                "[auto_prompt::find_remaining_in_context] Found remaining plan: {plan_dir}/{filename}"
-            );
-            return Some(make_plan_read_prompt(plan_dir, filename));
+        let task_count = count_actionable_tasks(&file.content);
+        if task_count == 0 {
+            continue;
+        }
+
+        let project = std::path::Path::new(&file.path)
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown".into());
+
+        let filename = file.path.rsplit('/').next().unwrap_or(&file.path);
+        let plan_dir = file.path.rsplit('/').nth(1).unwrap_or(".plans");
+        let title = extract_plan_title(&file.content);
+
+        let line = format!("  - `{plan_dir}/{filename}` — {task_count} task(s): {title}");
+
+        if let Some(group) = groups.iter_mut().find(|(name, _)| *name == project) {
+            group.1.push(line);
+        } else {
+            groups.push((project, vec![line]));
         }
     }
 
-    None
-}
-
-fn find_remaining_on_disk(work_dirs: Option<&[PathBuf]>) -> Option<String> {
-    let dirs = work_dirs?;
-
-    for work_dir in dirs {
-        let plan_dir_candidates = [work_dir.join(".plan"), work_dir.join(".plans")];
-        let Some(plan_dir) = plan_dir_candidates.iter().find(|d| d.is_dir()) else {
-            continue;
-        };
-
-        let Ok(entries) = std::fs::read_dir(&plan_dir) else {
-            continue;
-        };
-
-        let mut md_files: Vec<_> = entries
-            .flatten()
-            .filter(|e| e.path().is_file() && e.path().extension().is_some_and(|ext| ext == "md"))
-            .collect();
-        md_files.sort_by_key(|e| e.file_name());
-
-        for entry in md_files {
-            let path = entry.path();
-            let Ok(metadata) = std::fs::metadata(&path) else {
-                continue;
-            };
-            if metadata.len() > 100_000 {
-                continue;
-            }
-            let Ok(content) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-
-            if has_unchecked_items(&content) {
-                let filename = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("unknown");
-                let plan_dir_str = path.parent().and_then(|p| p.to_str()).unwrap_or(".plans");
-                log::info!(
-                    "[auto_prompt::find_remaining_on_disk] Found remaining plan on disk: {plan_dir_str}/{filename}"
-                );
-                return Some(make_plan_read_prompt(plan_dir_str, filename));
-            }
-        }
+    if groups.is_empty() {
+        log::info!("[auto_prompt::build_plan_landscape] No actionable plans found");
+        return None;
     }
 
-    log::info!("[auto_prompt::find_remaining_on_disk] No remaining plans found on disk");
-    None
+    let total_plans: usize = groups.iter().map(|(_, plans)| plans.len()).sum();
+    log::info!(
+        "[auto_prompt::build_plan_landscape] Found {total_plans} actionable plan(s) across {} project(s)",
+        groups.len()
+    );
+
+    let mut lines = Vec::new();
+    for (project, plans) in &groups {
+        lines.push(format!("**{project}** ({} plan(s)):", plans.len()));
+        lines.extend(plans.iter().cloned());
+    }
+
+    Some(lines.join("\n"))
 }
 
-fn has_unchecked_items(content: &str) -> bool {
+/// Count actionable unchecked `- [ ]` items, skipping Out of Scope/Deferred sections and markers.
+fn count_actionable_tasks(content: &str) -> usize {
+    let mut count = 0;
     let mut in_code_block = false;
+    let mut skip_section = false;
+
     for line in content.lines() {
         let trimmed = line.trim_start();
         if trimmed.starts_with("```") {
             in_code_block = !in_code_block;
             continue;
         }
-        if !in_code_block && trimmed.contains("- [ ] ") {
+        if in_code_block {
+            continue;
+        }
+        if trimmed.starts_with("## ") {
+            let section_lower = trimmed.to_lowercase();
+            skip_section = SKIP_SECTION_KEYWORDS
+                .iter()
+                .any(|keyword| section_lower.contains(keyword));
+            continue;
+        }
+        if trimmed.starts_with("# ") {
+            skip_section = false;
+            continue;
+        }
+        if skip_section {
+            continue;
+        }
+        if trimmed.contains("- [ ] ") {
+            let line_lower = trimmed.to_lowercase();
+            if SKIP_ITEM_MARKERS
+                .iter()
+                .any(|marker| line_lower.contains(&marker.to_lowercase()))
+            {
+                continue;
+            }
+            count += 1;
+        }
+    }
+
+    count
+}
+
+/// Extract the plan title from the first `# ` heading.
+fn extract_plan_title(content: &str) -> String {
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if let Some(title) = trimmed.strip_prefix("# ") {
+            return title.to_string();
+        }
+    }
+    String::new()
+}
+
+/// Section header keywords (lowercase) that indicate non-actionable items.
+const SKIP_SECTION_KEYWORDS: &[&str] = &["out of scope", "future", "backlog", "wishlist"];
+
+/// Item-level markers that indicate a non-actionable checkbox despite being unchecked.
+const SKIP_ITEM_MARKERS: &[&str] = &["DEFERRED", "⏸️", "— deferred", "- deferred"];
+
+fn has_unchecked_items(content: &str) -> bool {
+    let mut in_code_block = false;
+    let mut skip_section = false;
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            in_code_block = !in_code_block;
+            continue;
+        }
+        if in_code_block {
+            continue;
+        }
+        if trimmed.starts_with("## ") {
+            let section_lower = trimmed.to_lowercase();
+            skip_section = SKIP_SECTION_KEYWORDS
+                .iter()
+                .any(|keyword| section_lower.contains(keyword));
+            continue;
+        }
+        if trimmed.starts_with("# ") {
+            skip_section = false;
+            continue;
+        }
+        if skip_section {
+            continue;
+        }
+        if trimmed.contains("- [ ] ") {
+            let line_lower = trimmed.to_lowercase();
+            if SKIP_ITEM_MARKERS
+                .iter()
+                .any(|marker| line_lower.contains(&marker.to_lowercase()))
+            {
+                continue;
+            }
             return true;
         }
     }
     false
-}
-
-fn make_plan_read_prompt(plan_dir: &str, filename: &str) -> String {
-    format!(
-        "Read {plan_dir}/{filename} and execute the plan starting from the first unchecked step."
-    )
 }
 
 /// Detect if the current or next plan involves performance-related work by scanning for keywords.
@@ -1717,103 +1774,6 @@ fn is_perf_related(context_json: &str, work_dirs: Option<&[PathBuf]>) -> bool {
     }
 
     false
-}
-
-/// Build branch transition advice based on whether current and next plans are related features.
-fn build_transition_advice(context_json: &str, work_dirs: Option<&[PathBuf]>) -> String {
-    let current_plan_area = extract_plan_area(context_json);
-    let next_plan_area = work_dirs
-        .and_then(|dirs| find_next_plan_on_disk(dirs))
-        .and_then(|path| extract_area_from_path(&path));
-
-    match (current_plan_area, next_plan_area) {
-        (Some(current), Some(next)) if current == next => {
-            format!(
-                "Related features (both '{current}'). Continue on current feature branch directly — do NOT go through develop. \
-                 Merge current feature into develop first (fast-forward), then create new feature branch from develop for the next plan. \
-                 This avoids losing work from branch switching conflicts."
-            )
-        }
-        (Some(current), Some(next)) => {
-            format!(
-                "Unrelated features ('{current}' vs '{next}'). Go through develop: merge current feature to develop (fast-forward), \
-                 then create new feature branch from develop. This keeps features isolated and reduces conflict risk."
-            )
-        }
-        _ => {
-            "Merge current feature to develop (fast-forward), then create new feature branch from develop for the next plan.".to_string()
-        }
-    }
-}
-
-/// Extract the feature area from plan content (e.g., "auto_prompt" from "03_auto_prompt_state_machine").
-fn extract_plan_area(context_json: &str) -> Option<String> {
-    #[derive(serde::Deserialize)]
-    struct ContextPlanFiles {
-        plan_files: Vec<context::PlanFileContent>,
-    }
-
-    let ctx: ContextPlanFiles = serde_json::from_str(context_json).ok()?;
-
-    for file in &ctx.plan_files {
-        let filename = file.path.rsplit('/').next()?;
-        if let Some(area) = extract_area_from_filename(filename) {
-            return Some(area);
-        }
-    }
-    None
-}
-
-/// Extract feature area from a plan filename like "03_auto_prompt_state_machine.md" → "auto_prompt".
-fn extract_area_from_filename(filename: &str) -> Option<String> {
-    let name = filename.strip_suffix(".md").unwrap_or(filename);
-    let parts: Vec<&str> = name.splitn(2, '_').collect();
-    if parts.len() >= 2 {
-        let rest = parts[1];
-        let area = rest.split('_').next().unwrap_or(rest);
-        if !area.is_empty() {
-            return Some(area.to_string());
-        }
-    }
-    None
-}
-
-/// Extract feature area from a plan file path on disk.
-fn extract_area_from_path(path: &std::path::Path) -> Option<String> {
-    let filename = path.file_name()?.to_str()?;
-    extract_area_from_filename(filename)
-}
-
-/// Find the path of the next plan with unchecked items on disk.
-fn find_next_plan_on_disk(dirs: &[PathBuf]) -> Option<std::path::PathBuf> {
-    for work_dir in dirs {
-        for plan_dir in [work_dir.join(".plan"), work_dir.join(".plans")] {
-            if !plan_dir.is_dir() {
-                continue;
-            }
-            let Ok(entries) = std::fs::read_dir(&plan_dir) else {
-                continue;
-            };
-            let mut md_files: Vec<_> = entries
-                .flatten()
-                .filter(|e| {
-                    e.path().is_file() && e.path().extension().is_some_and(|ext| ext == "md")
-                })
-                .collect();
-            md_files.sort_by_key(|e| e.file_name());
-
-            for entry in md_files {
-                let path = entry.path();
-                let Ok(content) = std::fs::read_to_string(&path) else {
-                    continue;
-                };
-                if has_unchecked_items(&content) {
-                    return Some(path);
-                }
-            }
-        }
-    }
-    None
 }
 
 fn is_doc_creation_prompt(prompt: &str) -> bool {
@@ -1957,52 +1917,79 @@ fn build_pre_stop_verification_prompt(
     context_json: &str,
     work_dirs: &Option<Vec<PathBuf>>,
 ) -> Option<String> {
-    let mut checks: Vec<String> = Vec::new();
+    let landscape = build_plan_landscape(context_json);
 
-    let has_plans = context_json.contains("plan_files") && context_json.contains("- [ ]");
+    log::info!(
+        "[auto_prompt::pre_stop_verification] work_dirs={:?}, has_landscape={}",
+        work_dirs.as_ref().map(|dirs| dirs
+            .iter()
+            .map(|d| d.display().to_string())
+            .collect::<Vec<_>>()),
+        landscape.is_some()
+    );
 
-    if has_plans {
-        checks.push(
-            "1. **Plan completeness**: Read ALL .plans/ and .plan/ files. Every '- [ ]' must be '- [x]' or explicitly inapplicable. If any unchecked item exists, continue working on it.".to_string()
+    #[derive(serde::Deserialize)]
+    struct Ctx {
+        #[serde(default)]
+        plan_files: Vec<context::PlanFileContent>,
+    }
+    if let Ok(ctx) = serde_json::from_str::<Ctx>(context_json) {
+        let summary: Vec<String> = ctx
+            .plan_files
+            .iter()
+            .map(|f| {
+                let tasks = count_actionable_tasks(&f.content);
+                let project = std::path::Path::new(&f.path)
+                    .parent()
+                    .and_then(|p| p.parent())
+                    .and_then(|p| p.file_name())
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let filename = f.path.rsplit('/').next().unwrap_or("?");
+                format!("{project}/{filename} (tasks={tasks})")
+            })
+            .collect();
+        log::info!(
+            "[auto_prompt::pre_stop_verification] plan_files=[{}]",
+            summary.join(", ")
         );
     }
 
-    checks.push("2. **Code diagnostics**: Run `cargo check` and `cargo clippy` (or equivalent). Fix ALL errors and warnings before stopping. No TODOs, no placeholders, no unwrap().".to_string());
-    checks.push("3. **Git status**: Verify all changes are committed with conventional commit messages (feat/fix/refactor/test/chore/docs). Create develop from main if it doesn't exist. Then create or reuse a feature branch from develop if not done.".to_string());
-
-    let next_plan = find_next_plan_prompt(context_json, work_dirs.as_deref());
     let is_perf = is_perf_related(context_json, work_dirs.as_deref());
 
+    let mut checks = vec![
+        "1. **Last message first**: Re-read your last message. Any remaining work, next steps, or unchecked items? Continue THAT before anything else.".to_string(),
+        "2. **Diagnostics**: `cargo check` and `cargo clippy`. Fix errors and warnings.".to_string(),
+        "3. **Git**: Commit with conventional messages to feature branch from develop.".to_string(),
+    ];
+
     if is_perf {
-        checks.push(
-            "4. **Benchmarks**: This plan involves performance work. Run relevant benchmarks (`cargo bench` or equivalent) before proceeding. Record results.".to_string()
-        );
+        checks.push("4. **Benchmarks**: Run relevant benchmarks and record results.".to_string());
     }
 
-    if let Some(remaining) = &next_plan {
-        let transition = build_transition_advice(context_json, work_dirs.as_deref());
-        checks.push(format!(
-            "\n{}. **Next plan found**: {}\n   Complete the current plan verification first, then transition.\n   **Branch transition**: {}",
-            if is_perf { 5 } else { 4 },
-            remaining,
-            transition
-        ));
-    } else {
-        checks.push(format!(
-            "\n{}. **Last plan — cleanup**: No more plans remain. Close this feature branch to develop: merge (fast-forward, no interactive rebase) into develop, resolve any conflicts, ensure a clean develop branch ready for review. Do NOT push — leave local for user to review.",
-            if is_perf { 5 } else { 4 }
+    let mut sections = vec![checks.join("\n")];
+
+    if let Some(landscape) = landscape {
+        sections.push(format!(
+            "## Remaining Plans (FYI — do NOT auto-pick)\n\n\
+             {landscape}\n\n\
+             Items may be deferred, out-of-scope, or unrelated. \
+             Read the list, then decide — do not start something new just because it exists."
         ));
     }
 
-    if !has_plans {
-        return None;
-    }
+    sections.push(
+        "## Declare\n\n\
+         Before stopping, state one of:\n\
+         - `continuing: <what remains from last message>`\n\
+         - `reviewed plans: transitioning to <path> because <relevance>` — close current feature first\n\
+         - `reviewed plans: stopping, nothing related to current work`".to_string()
+    );
 
     Some(format!(
-        "PRE-STOP VERIFICATION: Before stopping, verify ALL of the following are true.\n\n{}\n\n\
-         If ALL checks pass, respond that verification is complete and stop.\n\
-         If ANY check fails, fix the issue and continue working.",
-        checks.join("\n")
+        "PRE-STOP VERIFICATION — check state, then decide.\n\n{}\n\n\
+         Proceed with continuing/transitioning work, or stop if verification is complete.",
+        sections.join("\n\n")
     ))
 }
 
@@ -2767,5 +2754,195 @@ mod tests {
         // error, and Refusal bypassed the LLM with DispatchNow/DispatchAfterDelay.
         // Now they all go through the LLM evaluation pipeline.
         assert!(true, "documentation test — see comments above");
+    }
+
+    #[test]
+    fn test_build_plan_landscape_groups_by_project() {
+        let context_json = r##"{"plan_files":[
+            {"path":"/Users/katopz/git/microgpt-rs/.plans/033_bomberman.md","content":"# Plan 033\n- [ ] Task A\n"},
+            {"path":"/Users/katopz/git/microgpt-rs/.plans/034_wasm.md","content":"# Plan 034\n- [ ] Task B\n"},
+            {"path":"/Users/katopz/git/riir-burner/.plans/01_plan.md","content":"# Plan 01\n- [ ] Task C\n"}
+        ]}"##;
+        let result = build_plan_landscape(context_json);
+        assert!(result.is_some());
+        let landscape = result.unwrap();
+        assert!(landscape.contains("**microgpt-rs** (2 plan(s))"));
+        assert!(landscape.contains("**riir-burner** (1 plan(s))"));
+        assert!(landscape.contains("033_bomberman"));
+        assert!(landscape.contains("01_plan"));
+    }
+
+    #[test]
+    fn test_build_plan_landscape_returns_none_when_all_done() {
+        let context_json = r##"{"plan_files":[
+            {"path":"/Users/katopz/git/microgpt-rs/.plans/033_bomberman.md","content":"# Plan\n- [x] Done\n"}
+        ]}"##;
+        let result = build_plan_landscape(context_json);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_build_plan_landscape_skips_out_of_scope() {
+        let context_json = r##"{"plan_files":[
+            {"path":"/Users/katopz/git/microgpt-rs/.plans/033_bomberman.md","content":"# Plan\n\n## Tasks\n- [x] Done\n\n## Out of Scope\n- [ ] Future\n"}
+        ]}"##;
+        let result = build_plan_landscape(context_json);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_build_plan_landscape_no_plan_files() {
+        let context_json = r#"{"plan_files":[]}"#;
+        let result = build_plan_landscape(context_json);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_build_plan_landscape_invalid_json() {
+        let context_json = "not json";
+        let result = build_plan_landscape(context_json);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_build_plan_landscape_shows_task_count() {
+        let context_json = r##"{"plan_files":[
+            {"path":"/Users/katopz/git/zed/.plans/03_auto_prompt.md","content":"# Auto Prompt\n- [ ] Task 1\n- [ ] Task 2\n- [x] Done\n"}
+        ]}"##;
+        let result = build_plan_landscape(context_json);
+        assert!(result.is_some());
+        let landscape = result.unwrap();
+        assert!(landscape.contains("2 task(s)"));
+        assert!(landscape.contains("Auto Prompt"));
+    }
+
+    #[test]
+    fn test_build_plan_landscape_shows_title() {
+        let context_json = r##"{"plan_files":[
+            {"path":"/Users/katopz/git/zed/.plans/03_auto_prompt.md","content":"# Plan 003: Fix Cross-Project\n- [ ] Task\n"}
+        ]}"##;
+        let result = build_plan_landscape(context_json);
+        assert!(result.is_some());
+        let landscape = result.unwrap();
+        assert!(landscape.contains("Plan 003: Fix Cross-Project"));
+    }
+
+    #[test]
+    fn test_has_unchecked_items_skips_out_of_scope_section() {
+        let content = "\
+# Plan 033: Bomberman Arena
+
+## Tasks
+- [x] Task 1
+- [x] Task 2
+
+## Out of Scope
+- [ ] Real-time multiplayer
+- [ ] Network play
+- [ ] Complex bomb types
+";
+        assert!(!has_unchecked_items(content));
+    }
+
+    #[test]
+    fn test_has_unchecked_items_skips_future_section() {
+        let content = "\
+# Plan
+
+## Tasks
+- [x] Done
+
+## Future Work
+- [ ] Some future thing
+";
+        assert!(!has_unchecked_items(content));
+    }
+
+    #[test]
+    fn test_has_unchecked_items_skips_backlog_section() {
+        let content = "\
+# Plan
+
+## Tasks
+- [x] Done
+
+## Backlog
+- [ ] Backlog item
+";
+        assert!(!has_unchecked_items(content));
+    }
+
+    #[test]
+    fn test_has_unchecked_items_finds_real_tasks_after_skipped_section() {
+        let content = "\
+# Plan
+
+## Out of Scope
+- [ ] Future thing
+
+## Tasks
+- [x] Done task
+- [ ] Remaining task
+";
+        assert!(has_unchecked_items(content));
+    }
+
+    #[test]
+    fn test_has_unchecked_items_skips_deferred_markers() {
+        let content = "\
+# Plan
+
+## Tasks
+- [x] Done task
+- [ ] ⏸️ DEFERRED Some deferred thing
+- [ ] Another deferred — deferred item
+";
+        assert!(!has_unchecked_items(content));
+    }
+
+    #[test]
+    fn test_has_unchecked_items_real_tasks_with_deferred_mixed() {
+        let content = "\
+# Plan
+
+## Tasks
+- [x] Done task
+- [ ] ⏸️ DEFERRED Skip this
+- [ ] Real actionable task
+";
+        assert!(has_unchecked_items(content));
+    }
+
+    #[test]
+    fn test_has_unchecked_items_all_done_returns_false() {
+        let content = "\
+# Plan
+
+## Tasks
+- [x] Task 1
+- [x] Task 2
+- [x] Task 3
+";
+        assert!(!has_unchecked_items(content));
+    }
+
+    #[test]
+    fn test_benchmark_analysis_landscape_no_actionable_plans() {
+        // Real-world scenario: conversation about benchmark regression analysis
+        // Plan 033 has only "Out of Scope" unchecked items → not actionable
+        // Plan 036 same → landscape returns None
+        let context_json = r##"{"current_paths":["/Users/katopz/git/gist/anyrag","/Users/katopz/git/microgpt-rs","/Users/katopz/git/riir-ai"],"plan_files":[
+            {"path":"/Users/katopz/git/gist/anyrag/.plans/008_inference.md","content":"# Plan\n- [x] Done\n"},
+            {"path":"/Users/katopz/git/microgpt-rs/.plans/033_bomberman_arena.md","content":"# Plan\n\n## Tasks\n- [x] Build arena\n- [x] Run tournament\n\n## Out of Scope\n- [ ] Real-time multiplayer\n- [ ] Network play\n"},
+            {"path":"/Users/katopz/git/microgpt-rs/.plans/036_metrics.md","content":"# Plan\n\n## Out of Scope\n- [ ] LLM-based reviewer\n\n## Tasks\n- [x] Metrics done\n"}
+        ],"messages":[
+            {"role":"user","content":"we have a lot of regression"},
+            {"role":"assistant","content":"Let me check benchmarks in /Users/katopz/git/microgpt-rs"},
+            {"role":"tool","content":"cd /Users/katopz/git/microgpt-rs && cargo bench"},
+            {"role":"tool","content":"cd /Users/katopz/git/microgpt-rs && cat results.csv"}
+        ]}"##;
+        let result = build_plan_landscape(context_json);
+        // All unchecked items are under "Out of Scope" → no actionable plans → None
+        assert_eq!(result, None);
     }
 }
