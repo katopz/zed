@@ -919,8 +919,81 @@ pub async fn decide_with_llm(
                 &format!("{:?}", data.model.id()),
                 &err,
             );
-            log::warn!("auto_prompt: language model call failed: {err}");
-            Err(err)
+
+            let err_msg = format!("{err}");
+            if !err_msg.contains("model returned zero events") {
+                log::warn!("auto_prompt: language model call failed: {err}");
+                return Err(err);
+            }
+
+            log::warn!(
+                "auto_prompt: model returned zero events — attempting last-paragraph recovery"
+            );
+
+            let last_paragraph = data
+                .last_assistant_message
+                .as_deref()
+                .and_then(extract_last_paragraph);
+
+            let has_remaining_work =
+                detect_remaining_work(data.last_assistant_message.as_deref()).is_some();
+
+            match (last_paragraph, has_remaining_work) {
+                (Some(paragraph), true) => {
+                    log::info!(
+                        "auto_prompt: zero events recovery — remaining work detected in last paragraph, dispatching bounded continue"
+                    );
+
+                    let prompt_summary = data
+                        .original_user_message
+                        .clone()
+                        .filter(|s| !s.trim().is_empty())
+                        .or_else(|| {
+                            data.first_user_message
+                                .as_deref()
+                                .and_then(extract_original_user_message)
+                        });
+
+                    let recovery_prompt = format!(
+                        "The orchestration model returned no response (zero events). \
+                         Here is the last paragraph from the previous assistant message:\n\n\
+                         {paragraph}\n\n\
+                         If this describes specific actionable remaining work, continue with it. \
+                         If you are unsure or the work appears already complete, stop."
+                    );
+
+                    let next_prompt = with_first_prompt_context(
+                        recovery_prompt,
+                        prompt_summary.as_deref(),
+                        data.title.as_deref(),
+                        data.last_assistant_message.as_deref(),
+                    );
+
+                    Ok(AutoPromptOutcome::Continue(AutoPromptAction {
+                        from_session_id: data.session_id,
+                        from_title: data.title,
+                        next_prompt,
+                        work_dirs: data.work_dirs,
+                        original_user_message: data.original_user_message,
+                        profile_id: data.profile_id.clone(),
+                        approximate_token_count: data.approximate_token_count,
+                    }))
+                }
+                _ => {
+                    let stop_reason =
+                        "model returned zero events, no remaining work detected".to_string();
+                    log::warn!("auto_prompt: {stop_reason}");
+                    write_stop_log(
+                        data.project_root.as_ref(),
+                        data.iteration_count,
+                        &stop_reason,
+                    );
+                    reset_iteration();
+                    Ok(AutoPromptOutcome::Stopped {
+                        reason: stop_reason,
+                    })
+                }
+            }
         }
     }
 }
@@ -1430,18 +1503,7 @@ async fn call_language_model(
             });
             anyhow::Ok(synthetic.to_string())
         } else {
-            log::warn!(
-                "auto_prompt: model returned zero events (0 Text, 0 Thinking), synthesizing stop"
-            );
-            let synthetic = serde_json::json!({
-                "should_continue": false,
-                "next_prompt": null,
-                "reason": "model returned zero events (0 Text, 0 Thinking)".to_string(),
-                "all_plan_done": false,
-                "confidence": 0.0,
-                "first_prompt_summary": null
-            });
-            anyhow::Ok(synthetic.to_string())
+            anyhow::bail!("auto_prompt: model returned zero events (0 Text, 0 Thinking)")
         }
     };
 
@@ -1618,6 +1680,15 @@ fn is_doc_creation_prompt(prompt: &str) -> bool {
 /// Code-level remaining work detection: scans the last assistant message
 /// for patterns that explicitly indicate incomplete work. This is a safety
 /// net that catches cases where the LLM ignores its own Rule 10.
+fn extract_last_paragraph(text: &str) -> Option<&str> {
+    let paragraphs: Vec<&str> = text
+        .split("\n\n")
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .collect();
+    paragraphs.last().copied()
+}
+
 fn detect_remaining_work(last_assistant_message: Option<&str>) -> Option<String> {
     let msg = last_assistant_message?.trim();
     if msg.is_empty() {
@@ -1939,6 +2010,78 @@ mod tests {
         let chain_message = format!("## User\n\n[@Thread](zed:///agent/thread/abc)\n\n{wrapped}");
         let extracted = extract_original_user_message(&chain_message);
         assert_eq!(extracted, Some(original.to_string()));
+    }
+
+    // --- extract_last_paragraph tests ---
+
+    #[test]
+    fn test_extract_last_paragraph_single_paragraph() {
+        let text = "This is a single paragraph.";
+        assert_eq!(
+            extract_last_paragraph(text),
+            Some("This is a single paragraph.")
+        );
+    }
+
+    #[test]
+    fn test_extract_last_paragraph_multiple_paragraphs() {
+        let text = "First paragraph.\n\nSecond paragraph.\n\n### Remaining work:\n\n- Do thing A\n- Do thing B";
+        assert_eq!(
+            extract_last_paragraph(text),
+            Some("- Do thing A\n- Do thing B")
+        );
+    }
+
+    #[test]
+    fn test_extract_last_paragraph_real_world_remaining_work() {
+        let text = "What was accomplished:\n\n1. Fixed bug\n2. Added tests\n\n### Remaining work for next session:\n\n- Rebuild with Metal backend\n- Retest training\n- If NaN resolved: Run full benchmark";
+        assert_eq!(
+            extract_last_paragraph(text),
+            Some(
+                "- Rebuild with Metal backend\n- Retest training\n- If NaN resolved: Run full benchmark"
+            )
+        );
+    }
+
+    #[test]
+    fn test_extract_last_paragraph_trailing_whitespace() {
+        let text = "First.\n\nLast.  \n\n";
+        assert_eq!(extract_last_paragraph(text), Some("Last."));
+    }
+
+    #[test]
+    fn test_extract_last_paragraph_empty() {
+        assert_eq!(extract_last_paragraph(""), None);
+    }
+
+    #[test]
+    fn test_extract_last_paragraph_only_whitespace() {
+        assert_eq!(extract_last_paragraph("   \n\n  \n\n  "), None);
+    }
+
+    #[test]
+    fn test_extract_last_paragraph_two_paragraphs() {
+        let text = "First paragraph here.\n\nSecond paragraph here.";
+        assert_eq!(extract_last_paragraph(text), Some("Second paragraph here."));
+    }
+
+    #[test]
+    fn test_extract_last_paragraph_single_line() {
+        let text = "Just one line no double breaks";
+        assert_eq!(
+            extract_last_paragraph(text),
+            Some("Just one line no double breaks")
+        );
+    }
+
+    #[test]
+    fn test_extract_last_paragraph_checkbox_list() {
+        let text =
+            "Summary of work done.\n\n### Remaining:\n\n- [ ] Task 1\n- [ ] Task 2\n- [ ] Task 3";
+        assert_eq!(
+            extract_last_paragraph(text),
+            Some("- [ ] Task 1\n- [ ] Task 2\n- [ ] Task 3")
+        );
     }
 
     fn make_input() -> EvaluationInput {
