@@ -920,82 +920,8 @@ pub async fn decide_with_llm(
                 &format!("{:?}", data.model.id()),
                 &err,
             );
-
-            let err_msg = format!("{err}");
-            if !err_msg.contains("model returned zero events") {
-                log::warn!("auto_prompt: language model call failed: {err}");
-                return Err(err);
-            }
-
-            log::warn!(
-                "auto_prompt: model returned zero events — attempting last-paragraph recovery"
-            );
-
-            let remaining_section = data
-                .last_assistant_message
-                .as_deref()
-                .and_then(|s| extract_remaining_section(s));
-
-            let has_remaining_work =
-                detect_remaining_work(data.last_assistant_message.as_deref()).is_some();
-
-            match (remaining_section, has_remaining_work) {
-                (Some(section), true) => {
-                    log::info!(
-                        "auto_prompt: zero events recovery — remaining work detected, dispatching bounded continue ({} chars extracted)",
-                        section.len()
-                    );
-
-                    let prompt_summary = data
-                        .original_user_message
-                        .clone()
-                        .filter(|s| !s.trim().is_empty())
-                        .or_else(|| {
-                            data.first_user_message
-                                .as_deref()
-                                .and_then(extract_original_user_message)
-                        });
-
-                    let recovery_prompt = format!(
-                        "The orchestration model returned no response (zero events). \
-                         Here is the remaining section from the previous assistant message:\n\n\
-                         {section}\n\n\
-                         If this describes specific actionable remaining work, continue with it. \
-                         If you are unsure or the work appears already complete, stop."
-                    );
-
-                    let next_prompt = with_first_prompt_context(
-                        recovery_prompt,
-                        prompt_summary.as_deref(),
-                        data.title.as_deref(),
-                        data.last_assistant_message.as_deref(),
-                    );
-
-                    Ok(AutoPromptOutcome::Continue(AutoPromptAction {
-                        from_session_id: data.session_id,
-                        from_title: data.title,
-                        next_prompt,
-                        work_dirs: data.work_dirs,
-                        original_user_message: data.original_user_message,
-                        profile_id: data.profile_id.clone(),
-                        approximate_token_count: data.approximate_token_count,
-                    }))
-                }
-                _ => {
-                    let stop_reason =
-                        "model returned zero events, no remaining work detected".to_string();
-                    log::warn!("auto_prompt: {stop_reason}");
-                    write_stop_log(
-                        data.project_root.as_ref(),
-                        data.iteration_count,
-                        &stop_reason,
-                    );
-                    reset_iteration();
-                    Ok(AutoPromptOutcome::Stopped {
-                        reason: stop_reason,
-                    })
-                }
-            }
+            log::warn!("auto_prompt: language model call failed: {err}");
+            Err(err)
         }
     }
 }
@@ -1444,26 +1370,63 @@ async fn call_language_model(
         let mut text_parts: Vec<String> = Vec::new();
         let mut thinking_parts: Vec<String> = Vec::new();
         let mut stream_errors: Vec<anyhow::Error> = Vec::new();
+        let mut total_events: u32 = 0;
+        let mut other_event_types: Vec<String> = Vec::new();
         while let Some(event) = stream.next().await {
+            total_events += 1;
             match event {
-                Ok(LanguageModelCompletionEvent::Text(text)) => text_parts.push(text),
-                Ok(LanguageModelCompletionEvent::Thinking { text, .. }) => {
-                    thinking_parts.push(text)
+                Ok(LanguageModelCompletionEvent::Text(text)) => {
+                    log::debug!(
+                        "auto_prompt: stream event #{}: Text ({} chars)",
+                        total_events,
+                        text.len()
+                    );
+                    text_parts.push(text);
                 }
-                Ok(_) => {}
+                Ok(LanguageModelCompletionEvent::Thinking { text, .. }) => {
+                    log::debug!(
+                        "auto_prompt: stream event #{}: Thinking ({} chars)",
+                        total_events,
+                        text.len()
+                    );
+                    thinking_parts.push(text);
+                }
+                Ok(ref other) => {
+                    let type_name = format!("{other:?}");
+                    let short = type_name.chars().take(60).collect::<String>();
+                    log::debug!(
+                        "auto_prompt: stream event #{}: Other: {short}",
+                        total_events
+                    );
+                    other_event_types.push(short);
+                }
                 Err(err) => {
+                    log::warn!(
+                        "auto_prompt: stream event #{}: Error: {err:#}",
+                        total_events
+                    );
                     stream_errors.push(err.into());
                 }
             }
         }
 
-        if !stream_errors.is_empty() {
-            log::warn!(
-                "auto_prompt: {} stream errors, {} text parts, {} thinking parts",
-                stream_errors.len(),
-                text_parts.len(),
-                thinking_parts.len()
-            );
+        log::info!(
+            "auto_prompt: stream complete — {} total events: {} Text ({} chars), {} Thinking ({} chars), {} Other, {} Errors. Other types: {:?}",
+            total_events,
+            text_parts.len(),
+            text_parts.concat().len(),
+            thinking_parts.len(),
+            thinking_parts.concat().len(),
+            other_event_types.len(),
+            stream_errors.len(),
+            other_event_types,
+        );
+
+        if stream_errors
+            .iter()
+            .any(|e| format!("{e:#}").contains("rate_limit") || format!("{e:#}").contains("429"))
+        {
+            log::warn!("auto_prompt: rate limit detected in stream errors");
         }
 
         let text = text_parts.concat();
@@ -1478,13 +1441,6 @@ async fn call_language_model(
                     thinking_parts.len(),
                     thinking.len()
                 );
-                log::info!(
-                    "auto_prompt: Thinking content: {}",
-                    thinking.chars().take(500).collect::<String>()
-                );
-                // Thinking content is reasoning, not structured JSON.
-                // Synthesize a safe stop response to avoid parse_response failure
-                // which would trigger the retry loop and show "Retry" button.
                 let synthetic = serde_json::json!({
                     "should_continue": false,
                     "next_prompt": null,
@@ -1512,11 +1468,10 @@ async fn call_language_model(
                 anyhow::Ok(synthetic.to_string())
             }
         } else if !stream_errors.is_empty() {
+            let error_details: Vec<String> =
+                stream_errors.iter().map(|e| format!("{e:#}")).collect();
             log::warn!(
-                "auto_prompt: model stream produced only errors ({} errors, {} text parts, {} thinking parts), synthesizing stop",
-                stream_errors.len(),
-                text_parts.len(),
-                thinking_parts.len()
+                "auto_prompt: model stream produced only errors — details: {error_details:?}"
             );
             let synthetic = serde_json::json!({
                 "should_continue": false,
@@ -1528,7 +1483,18 @@ async fn call_language_model(
             });
             anyhow::Ok(synthetic.to_string())
         } else {
-            anyhow::bail!("auto_prompt: model returned zero events (0 Text, 0 Thinking)")
+            log::warn!(
+                "auto_prompt: model returned zero events (0 Text, 0 Thinking) out of {total_events} total events. Other types seen: {other_event_types:?}"
+            );
+            let synthetic = serde_json::json!({
+                "should_continue": false,
+                "next_prompt": null,
+                "reason": format!("model returned zero events ({} total stream events)", total_events),
+                "all_plan_done": false,
+                "confidence": 0.0,
+                "first_prompt_summary": null
+            });
+            anyhow::Ok(synthetic.to_string())
         }
     };
 
