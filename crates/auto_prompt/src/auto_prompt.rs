@@ -440,7 +440,11 @@ pub fn evaluate_response(input: &EvaluationInput) -> EvaluationResult {
     // 4. should_continue + non-empty prompt → Continue
     if input.should_continue && has_prompt {
         let prompt = input.next_prompt.as_ref().unwrap();
-        let cleaned = prompt.replace("#ALL_PLAN_DONE", "").trim().to_string();
+        let cleaned = prompt
+            .replace("#ALL_PLAN_DONE", "")
+            .replace("#SKIP", "")
+            .trim()
+            .to_string();
         if !cleaned.is_empty() {
             return EvaluationResult::Continue {
                 prompt: cleaned,
@@ -580,7 +584,16 @@ pub fn decide(
     let (auto_prompt_ctx, session_id, thread_title, work_dirs) = {
         let thread_ref = thread.read(cx);
         let stop_reason_str = format!("{stop_reason:?}").to_lowercase();
-        let plan_files = read_plan_files(thread_ref);
+        let first_user_msg = thread_ref.entries().iter().find_map(|entry| {
+            if let acp_thread::AgentThreadEntry::UserMessage(msg) = entry {
+                let content = msg.content.to_markdown(cx).to_string();
+                if !content.is_empty() {
+                    return Some(content);
+                }
+            }
+            None
+        });
+        let plan_files = read_plan_files(thread_ref, first_user_msg.as_deref());
         let doc_files = read_doc_files(thread_ref);
         let mut ctx = AutoPromptContext::collect(
             thread_ref,
@@ -849,18 +862,136 @@ pub async fn decide_with_llm(
                 }
                 EvaluationResult::WantsStop { reason } => {
                     if input.is_synthetic_failure {
-                        log::info!(
-                            "auto_prompt: WantsStop ('{reason}') — LLM call failed, skipping pre-stop verification"
+                        // Full-context LLM call failed (context too large or model error).
+                        // Retry with lightweight context: last message + incomplete plan names only.
+                        let lightweight_ctx = build_lightweight_retry_context(
+                            &data.context_json,
+                            data.last_assistant_message.as_deref(),
+                            data.title.as_deref(),
                         );
-                        write_stop_log(
-                            data.project_root.as_ref(),
-                            data.iteration_count,
-                            &format!("LLM call failed: {reason}"),
-                        );
-                        reset_iteration();
-                        Ok(AutoPromptOutcome::Stopped {
-                            reason: format!("LLM call failed: {reason}"),
-                        })
+
+                        let retry_system = "# version: retry\n\
+                            You decide what to do next based on the AI's last message.\n\
+                            Priority: the LAST ASSISTANT MESSAGE is the most important signal.\n\n\
+                            Respond ONLY with valid JSON:\n\
+                            {\"should_continue\": bool, \"next_prompt\": string | null, \"reason\": string | null, \
+                            \"all_plan_done\": bool, \"confidence\": float, \"first_prompt_summary\": null}\n\n\
+                            ## Rules (in order):\n\
+                            1. LAST MESSAGE IS KING — reason about it first, before looking at plans\n\
+                            2. If it asks \"would you like to continue?\" or \"want me to ...?\" → should_continue=true, \
+                               next_prompt=\"continue as you prefer\"\n\
+                            3. If it presents options to pick from → should_continue=true, \
+                               next_prompt=\"select best for performance, security, SOLID, DRY principles\"\n\
+                            4. If it reports plan done but mentions remaining phases/next steps → should_continue=true, \
+                               next_prompt=\"continue with the next phase/step\"\n\
+                            5. If it describes specific remaining work → should_continue=true, \
+                               next_prompt=continue that specific work\n\
+                            6. If genuinely complete with nothing left → should_continue=false\n\
+                            7. Struck-through / skipped tasks (~~text~~, \"Skipped\", \"Cancelled\") count as DONE — \
+                               do NOT continue them. If only skipped tasks remain → should_continue=false\n\
+                            8. If remaining tasks seem unjustified or low-value, include #SKIP in next_prompt to signal skip\n\
+                            9. confidence must be >= 0.7\n";
+
+                        let mut retry_ok = None;
+                        for attempt in 1..=3u32 {
+                            if attempt > 1 {
+                                let delay = 2000 * 2u64.pow(attempt - 1);
+                                log::info!(
+                                    "auto_prompt: lightweight retry attempt {attempt}, waiting {delay}ms"
+                                );
+                                cx.background_executor()
+                                    .timer(Duration::from_millis(delay))
+                                    .await;
+                            }
+                            match call_language_model(
+                                &data.model,
+                                retry_system,
+                                &lightweight_ctx,
+                                cx,
+                            )
+                            .await
+                            {
+                                Ok((_raw, parsed)) => {
+                                    let is_retry_synthetic = parsed.confidence.unwrap_or(1.0)
+                                        <= 0.3
+                                        && parsed.reason.as_ref().is_some_and(|r| {
+                                            r.to_ascii_lowercase().starts_with("model")
+                                        });
+                                    if is_retry_synthetic {
+                                        log::warn!(
+                                            "auto_prompt: lightweight retry attempt {attempt} got synthetic failure, retrying"
+                                        );
+                                        continue;
+                                    }
+                                    log::info!(
+                                        "auto_prompt: lightweight retry attempt {attempt} ok: should_continue={}, prompt={:?}",
+                                        parsed.should_continue,
+                                        parsed.next_prompt
+                                    );
+                                    retry_ok = Some(parsed);
+                                    break;
+                                }
+                                Err(err) => {
+                                    log::warn!(
+                                        "auto_prompt: lightweight retry attempt {attempt} failed: {err:#}"
+                                    );
+                                }
+                            }
+                        }
+
+                        match retry_ok {
+                            Some(parsed) if parsed.should_continue => {
+                                let prompt = parsed
+                                    .next_prompt
+                                    .unwrap_or_else(|| "Continue with remaining work.".to_string());
+                                let next_prompt = with_first_prompt_context(
+                                    prompt,
+                                    prompt_summary.as_deref(),
+                                    data.title.as_deref(),
+                                    data.last_assistant_message.as_deref(),
+                                );
+                                Ok(AutoPromptOutcome::Continue(AutoPromptAction {
+                                    from_session_id: data.session_id,
+                                    from_title: data.title,
+                                    next_prompt,
+                                    work_dirs: data.work_dirs,
+                                    original_user_message: data.original_user_message,
+                                    profile_id: data.profile_id.clone(),
+                                    actual_input_tokens: data.actual_input_tokens,
+                                }))
+                            }
+                            Some(parsed) => {
+                                let stop_reason = parsed
+                                    .reason
+                                    .unwrap_or_else(|| "lightweight retry says stop".to_string());
+                                log::info!(
+                                    "auto_prompt: lightweight retry says stop: {stop_reason}"
+                                );
+                                write_stop_log(
+                                    data.project_root.as_ref(),
+                                    data.iteration_count,
+                                    &format!("lightweight retry: {stop_reason}"),
+                                );
+                                reset_iteration();
+                                Ok(AutoPromptOutcome::Stopped {
+                                    reason: stop_reason,
+                                })
+                            }
+                            None => {
+                                log::warn!(
+                                    "auto_prompt: all 3 lightweight retries failed, stopping"
+                                );
+                                write_stop_log(
+                                    data.project_root.as_ref(),
+                                    data.iteration_count,
+                                    &format!("lightweight retry failed after 3 attempts: {reason}"),
+                                );
+                                reset_iteration();
+                                Ok(AutoPromptOutcome::Stopped {
+                                    reason: format!("lightweight retry failed: {reason}"),
+                                })
+                            }
+                        }
                     } else {
                         let verification_count = VERIFICATION_COUNT.load(Ordering::Relaxed);
                         let max_verifications = data.max_verification_attempts;
@@ -1227,7 +1358,10 @@ fn get_iteration() -> u32 {
     iteration
 }
 
-fn read_plan_files(thread: &acp_thread::AcpThread) -> Vec<PlanFileContent> {
+fn read_plan_files(
+    thread: &acp_thread::AcpThread,
+    first_user_message: Option<&str>,
+) -> Vec<PlanFileContent> {
     log::info!("[auto_prompt::read_plan_files] Starting to read plan files");
 
     let work_dirs = match thread.work_dirs() {
@@ -1301,6 +1435,53 @@ fn read_plan_files(thread: &acp_thread::AcpThread) -> Vec<PlanFileContent> {
                 content,
             });
         }
+    }
+
+    // Identify active project from first user message's file:// reference.
+    // This prioritizes the session's target project over other workspace projects.
+    let active_project = first_user_message.and_then(|msg| {
+        let file_url_start = msg.find("file:///")?;
+        let path = &msg[file_url_start + 7..];
+        let end = path
+            .find(|c: char| c == ')' || c == ' ' || c == '\n')
+            .unwrap_or(path.len());
+        let full_path = &path[..end];
+        if let Some(pos) = full_path.find("/.plans/") {
+            Some(full_path[..pos].to_string())
+        } else if let Some(pos) = full_path.find("/.plan/") {
+            Some(full_path[..pos].to_string())
+        } else {
+            None
+        }
+    });
+
+    if let Some(ref active) = active_project {
+        log::info!("[auto_prompt::read_plan_files] Active project: {active}");
+
+        // Sort: active project's plans first, then others by path
+        plan_files.sort_by(|a, b| {
+            let a_active = a.path.starts_with(active.as_str());
+            let b_active = b.path.starts_with(active.as_str());
+            match (a_active, b_active) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                _ => a.path.cmp(&b.path),
+            }
+        });
+
+        // Filter: keep all active project plans, only incomplete plans from other projects
+        let before = plan_files.len();
+        plan_files.retain(|f| {
+            if f.path.starts_with(active.as_str()) {
+                true
+            } else {
+                has_unchecked_items(&f.content)
+            }
+        });
+        log::info!(
+            "[auto_prompt::read_plan_files] Cross-project filter: {before} → {} plan files",
+            plan_files.len()
+        );
     }
 
     if !plan_files.is_empty() {
@@ -1650,6 +1831,35 @@ fn build_plan_landscape(context_json: &str) -> Option<String> {
     Some(lines.join("\n"))
 }
 
+fn build_lightweight_retry_context(
+    context_json: &str,
+    last_assistant_message: Option<&str>,
+    title: Option<&str>,
+) -> String {
+    let mut parts = Vec::new();
+
+    if let Some(title) = title {
+        parts.push(format!("Thread: {title}"));
+    }
+
+    if let Some(msg) = last_assistant_message {
+        let paragraphs: Vec<&str> = msg.split("\n\n").collect();
+        let start = paragraphs.len().saturating_sub(3);
+        let last_3 = &paragraphs[start..];
+        parts.push(format!(
+            "\nLast assistant message:\n{}",
+            last_3.join("\n\n")
+        ));
+    }
+
+    let landscape = build_plan_landscape(context_json);
+    if let Some(landscape) = landscape {
+        parts.push(format!("\nIncomplete plans:\n{landscape}"));
+    }
+
+    parts.join("\n")
+}
+
 /// Count actionable unchecked `- [ ]` items, skipping Out of Scope/Deferred sections and markers.
 fn count_actionable_tasks(content: &str) -> usize {
     let mut count = 0;
@@ -1679,14 +1889,7 @@ fn count_actionable_tasks(content: &str) -> usize {
         if skip_section {
             continue;
         }
-        if trimmed.contains("- [ ] ") {
-            let line_lower = trimmed.to_lowercase();
-            if SKIP_ITEM_MARKERS
-                .iter()
-                .any(|marker| line_lower.contains(&marker.to_lowercase()))
-            {
-                continue;
-            }
+        if is_actionable_checkbox(trimmed) {
             count += 1;
         }
     }
@@ -1709,7 +1912,35 @@ fn extract_plan_title(content: &str) -> String {
 const SKIP_SECTION_KEYWORDS: &[&str] = &["out of scope", "future", "backlog", "wishlist"];
 
 /// Item-level markers that indicate a non-actionable checkbox despite being unchecked.
-const SKIP_ITEM_MARKERS: &[&str] = &["DEFERRED", "⏸️", "— deferred", "- deferred"];
+/// Includes strikethrough (`~~`), skip/cancel keywords, and deferral markers.
+const SKIP_ITEM_MARKERS: &[&str] = &[
+    "DEFERRED",
+    "⏸️",
+    "— deferred",
+    "- deferred",
+    "~~",
+    "Skipped",
+    "skipped",
+    "Cancelled",
+    "cancelled",
+    "N/A",
+    "Won't fix",
+    "wontfix",
+    "NOT PLANNED",
+    "out of scope",
+];
+
+/// Returns true if line is an unchecked checkbox (`- [ ]` or `* [ ]`) without skip markers.
+fn is_actionable_checkbox(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if !trimmed.starts_with("- [ ] ") && !trimmed.starts_with("* [ ] ") {
+        return false;
+    }
+    let line_lower = trimmed.to_lowercase();
+    !SKIP_ITEM_MARKERS
+        .iter()
+        .any(|marker| line_lower.contains(&marker.to_lowercase()))
+}
 
 fn has_unchecked_items(content: &str) -> bool {
     let mut in_code_block = false;
@@ -1737,14 +1968,7 @@ fn has_unchecked_items(content: &str) -> bool {
         if skip_section {
             continue;
         }
-        if trimmed.contains("- [ ] ") {
-            let line_lower = trimmed.to_lowercase();
-            if SKIP_ITEM_MARKERS
-                .iter()
-                .any(|marker| line_lower.contains(&marker.to_lowercase()))
-            {
-                continue;
-            }
+        if is_actionable_checkbox(trimmed) {
             return true;
         }
     }
@@ -1851,11 +2075,8 @@ fn extract_remaining_section(text: &str) -> Option<String> {
     }
 
     for i in (scan_start..paragraphs.len()).rev() {
-        let has_checkbox = paragraphs[i].lines().any(|line| {
-            let trimmed = line.trim_start();
-            trimmed.starts_with("- [ ] ") || trimmed.starts_with("* [ ] ")
-        });
-        if has_checkbox {
+        let has_actionable_checkbox = paragraphs[i].lines().any(is_actionable_checkbox);
+        if has_actionable_checkbox {
             let start = if i > 0 {
                 let prev_lower = paragraphs[i - 1].to_lowercase();
                 let prev_is_header = paragraphs[i - 1].starts_with('#')
@@ -1927,7 +2148,7 @@ fn detect_remaining_work(last_assistant_message: Option<&str>) -> Option<String>
 
     for line in msg.lines() {
         let trimmed = line.trim_start();
-        if trimmed.starts_with("- [ ] ") || trimmed.starts_with("* [ ] ") {
+        if is_actionable_checkbox(trimmed) {
             log::warn!(
                 "[auto_prompt::detect_remaining_work] Pattern found: unchecked checkbox in last_assistant_message — overriding stop"
             );
@@ -2049,7 +2270,7 @@ fn build_checkbox_verification_prompt(context_json: &str) -> Option<String> {
             if in_code_block {
                 continue;
             }
-            if trimmed.contains("- [ ] ") {
+            if is_actionable_checkbox(trimmed) {
                 let filename = file.path.rsplit('/').next().unwrap_or(&file.path);
                 let plan_dir = file.path.rsplit('/').nth(1).unwrap_or(".plans");
                 log::info!(
@@ -3070,5 +3291,264 @@ mod tests {
             matches!(result, EvaluationResult::WantsStop { .. }),
             "expected WantsStop for thinking-only fallback, got {result:?}"
         );
+    }
+
+    // --- Cross-project plan filtering tests ---
+
+    #[test]
+    fn test_active_project_extraction_from_file_url() {
+        let msg = "do as a plan [@016_quantized_matmul.md](file:///Users/katopz/git/temp2/riir-burner/.plans/016_quantized_matmul.md)";
+        let file_url_start = msg.find("file:///").unwrap();
+        let path = &msg[file_url_start + 7..];
+        let end = path
+            .find(|c: char| c == ')' || c == ' ' || c == '\n')
+            .unwrap_or(path.len());
+        let full_path = &path[..end];
+        let active = if let Some(pos) = full_path.find("/.plans/") {
+            Some(full_path[..pos].to_string())
+        } else if let Some(pos) = full_path.find("/.plan/") {
+            Some(full_path[..pos].to_string())
+        } else {
+            None
+        };
+        assert_eq!(
+            active,
+            Some("/Users/katopz/git/temp2/riir-burner".to_string())
+        );
+    }
+
+    #[test]
+    fn test_active_project_extraction_no_file_url() {
+        let msg = "just a regular message with no file references";
+        let active = msg.find("file:///").and_then(|file_url_start| {
+            let path = &msg[file_url_start + 7..];
+            let end = path
+                .find(|c: char| c == ')' || c == ' ' || c == '\n')
+                .unwrap_or(path.len());
+            let full_path = &path[..end];
+            if let Some(pos) = full_path.find("/.plans/") {
+                Some(full_path[..pos].to_string())
+            } else {
+                None
+            }
+        });
+        assert_eq!(active, None);
+    }
+
+    #[test]
+    fn test_cross_project_sort_active_first() {
+        let active = "/Users/katopz/git/temp2/riir-burner";
+        let mut paths: Vec<String> = vec![
+            "/Users/katopz/git/microgpt-rs/.plans/033_bomberman.md".to_string(),
+            "/Users/katopz/git/temp2/riir-burner/.plans/016_quantized_matmul.md".to_string(),
+            "/Users/katopz/git/gist/anyrag/.plans/001_github.md".to_string(),
+            "/Users/katopz/git/temp2/riir-burner/.plans/015_fused_kernels.md".to_string(),
+        ];
+        paths.sort_by(|a, b| {
+            let a_active = a.starts_with(active);
+            let b_active = b.starts_with(active);
+            match (a_active, b_active) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                _ => a.cmp(b),
+            }
+        });
+        assert!(paths[0].starts_with(active));
+        assert!(paths[1].starts_with(active));
+        assert!(!paths[2].starts_with(active));
+        assert!(!paths[3].starts_with(active));
+        assert_eq!(
+            paths[0],
+            "/Users/katopz/git/temp2/riir-burner/.plans/015_fused_kernels.md"
+        );
+        assert_eq!(
+            paths[1],
+            "/Users/katopz/git/temp2/riir-burner/.plans/016_quantized_matmul.md"
+        );
+    }
+
+    #[test]
+    fn test_build_lightweight_retry_context_includes_last_message_and_plans() {
+        let context_json = r##"{"plan_files":[
+            {"path":"/project/.plans/016_test.md","content":"# Plan\n- [ ] Task 1\n- [ ] Task 2\n"}
+        ],"messages":[]}"##;
+        let result = build_lightweight_retry_context(
+            context_json,
+            Some("Would you like me to continue with Phase 3?"),
+            Some("Test Thread"),
+        );
+        assert!(result.contains("Thread: Test Thread"));
+        assert!(result.contains("Would you like me to continue with Phase 3?"));
+        assert!(result.contains("016_test.md"));
+    }
+
+    #[test]
+    fn test_build_lightweight_retry_context_truncates_to_last_3_paragraphs() {
+        let paragraphs: Vec<String> = (0..10).map(|i| format!("Paragraph {i}")).collect();
+        let long_msg = paragraphs.join("\n\n");
+        let context_json = r##"{"plan_files":[],"messages":[]}"##;
+        let result = build_lightweight_retry_context(context_json, Some(&long_msg), None);
+        assert!(result.contains("Paragraph 9"));
+        assert!(result.contains("Paragraph 8"));
+        assert!(result.contains("Paragraph 7"));
+        assert!(!result.contains("Paragraph 0"));
+        assert!(!result.contains("Paragraph 5"));
+    }
+
+    #[test]
+    fn test_build_lightweight_retry_context_no_plans_no_message() {
+        let context_json = r##"{"plan_files":[],"messages":[]}"##;
+        let result = build_lightweight_retry_context(context_json, None, Some("Empty Thread"));
+        assert!(result.contains("Thread: Empty Thread"));
+        assert!(!result.contains("Last assistant message"));
+        assert!(!result.contains("Incomplete plans"));
+    }
+
+    // --- Strikethrough / skipped task detection tests ---
+
+    #[test]
+    fn test_is_actionable_checkbox_strikethrough_skipped() {
+        assert!(!is_actionable_checkbox(
+            "- [ ] ~~T5: SIMD-accelerate stuff~~ Skipped — YAGNI"
+        ));
+    }
+
+    #[test]
+    fn test_is_actionable_checkbox_strikethrough_deferred() {
+        assert!(!is_actionable_checkbox(
+            "- [ ] ~~**Task 4.4:** Q4S training benchmark~~ — deferred to Phase 5"
+        ));
+    }
+
+    #[test]
+    fn test_is_actionable_checkbox_strikethrough_cancelled() {
+        assert!(!is_actionable_checkbox("- [ ] ~~Refactor API~~ Cancelled"));
+    }
+
+    #[test]
+    fn test_is_actionable_checkbox_wont_fix() {
+        assert!(!is_actionable_checkbox("- [ ] Fix edge case — Won't fix"));
+    }
+
+    #[test]
+    fn test_is_actionable_checkbox_normal_task() {
+        assert!(is_actionable_checkbox("- [ ] Implement the thing"));
+    }
+
+    #[test]
+    fn test_is_actionable_checkbox_star_variant() {
+        assert!(is_actionable_checkbox("* [ ] Another task"));
+    }
+
+    #[test]
+    fn test_is_actionable_checkbox_star_skipped() {
+        assert!(!is_actionable_checkbox("* [ ] ~~Old task~~ Skipped"));
+    }
+
+    #[test]
+    fn test_has_unchecked_items_ignores_strikethrough_skipped() {
+        let plan = "\
+# Plan
+
+- [x] Task 1 done
+- [ ] Task 2 in progress
+- [ ] ~~T5: SIMD stuff~~ Skipped — YAGNI
+";
+        assert!(has_unchecked_items(plan));
+    }
+
+    #[test]
+    fn test_has_unchecked_items_all_skipped_returns_false() {
+        let plan = "\
+# Plan
+
+- [x] Task 1 done
+- [x] Task 2 done
+- [ ] ~~T5: SIMD stuff~~ Skipped — YAGNI
+- [ ] ~~Task 4.4 benchmark~~ — deferred to Phase 5
+";
+        assert!(!has_unchecked_items(plan));
+    }
+
+    #[test]
+    fn test_count_actionable_tasks_ignores_strikethrough() {
+        let plan = "\
+# Plan
+
+- [x] Done task
+- [ ] Real task
+- [ ] ~~Skipped task~~ Skipped — YAGNI
+- [ ] ~~Deferred task~~ — deferred
+";
+        assert_eq!(count_actionable_tasks(plan), 1);
+    }
+
+    #[test]
+    fn test_detect_remaining_work_strikethrough_checkbox_not_actionable() {
+        let msg = "Summary of work done.\n\n- [ ] ~~T5: SIMD stuff~~ Skipped — YAGNI";
+        let result = detect_remaining_work(Some(msg));
+        assert!(
+            result.is_none(),
+            "struck-through checkbox should not trigger remaining work override, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_detect_remaining_work_mixed_checkboxes_only_actionable_triggers() {
+        let msg = "Work done.\n\n- [ ] ~~Skipped~~ Skipped\n\n- [ ] Real remaining task";
+        let result = detect_remaining_work(Some(msg));
+        assert!(
+            result.is_some(),
+            "real checkbox among skipped should trigger"
+        );
+        assert!(result.unwrap().contains("Real remaining task"));
+    }
+
+    #[test]
+    fn test_extract_remaining_section_only_skipped_checkboxes() {
+        let text =
+            "Summary.\n\n### Remaining:\n\n- [ ] ~~Task A~~ Skipped\n- [ ] ~~Task B~~ — deferred";
+        let result = extract_remaining_section(text);
+        // extract_remaining_section returns the trailing paragraphs regardless,
+        // but detect_remaining_work will filter — test the pipeline end-to-end instead
+        // Here we just verify no actionable checkbox is detected in those paragraphs
+        if let Some(section) = &result {
+            let has_actionable = section.lines().any(is_actionable_checkbox);
+            assert!(!has_actionable, "should have no actionable checkboxes");
+        }
+    }
+
+    #[test]
+    fn test_eval_remaining_work_strikethrough_in_last_message() {
+        let input = EvaluationInput {
+            should_continue: false,
+            last_assistant_message: Some(
+                "All phases complete.\n\n- [ ] ~~T5: SIMD accelerate~~ Skipped — YAGNI".to_string(),
+            ),
+            ..make_input()
+        };
+        let result = evaluate_response(&input);
+        assert!(
+            matches!(result, EvaluationResult::WantsStop { .. }),
+            "struck-through only items should not override stop, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_eval_remaining_work_real_plus_skipped_continues() {
+        let input = EvaluationInput {
+            should_continue: false,
+            last_assistant_message: Some(
+                "Phase 1 done.\n\n- [ ] Run benchmarks\n- [ ] ~~T5: SIMD~~ Skipped".to_string(),
+            ),
+            ..make_input()
+        };
+        let result = evaluate_response(&input);
+        match result {
+            EvaluationResult::Continue { reason, .. } => {
+                assert!(reason.contains("remaining work"));
+            }
+            _ => panic!("expected Continue override for real checkbox, got {result:?}"),
+        }
     }
 }
