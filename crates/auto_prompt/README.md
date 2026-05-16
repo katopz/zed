@@ -30,7 +30,7 @@ ConversationView::handle_thread_event()
       ├─ Call orchestration LLM with context JSON
       ├─ On success:
       │   ├─ Writes decision log to .logs/ in project root
-      │   ├─ Parse response (should_continue, next_prompt, confidence, all_plan_done, first_prompt_summary)
+      │   ├─ Parse response (should_continue, next_prompt, confidence, all_plan_done, thread_summary)
       │   ├─ #ALL_PLAN_DONE in prompt or response.all_plan_done?
       │   │   ├─ Find next plan file → yes → dispatch gitflow commit + next plan
       │   │   └─ no → should_continue? → gitflow commit : stop chain (reset_iteration)
@@ -40,7 +40,7 @@ ConversationView::handle_thread_event()
       │   │   ├─ verification_count < max_attempts? → stop (accept stop)
       │   │   └─ verification_count >= max_attempts? → stop (force stop)
       │   ├─ Doc creation prompt + unchecked plan items? → override with checkbox verification
-      │   ├─ Prepending first_prompt_summary to every prompt for context grounding
+      │   ├─ Prepending thread_summary to every prompt for context grounding
       │   ├─ Continuing during PreStop (verification_count>0)? → reset VERIFICATION_COUNT
       │   └─ Return AutoPromptAction with next_prompt
       └─ On error:
@@ -109,7 +109,7 @@ sequenceDiagram
                     decide_llm-->>CV: AutoPromptAction with verification
                     CV->>Workspace: dispatch_action(AutoPromptNewThread)
                 else Continue
-                    decide_llm->>decide_llm: Prepend first_prompt_summary
+                    decide_llm->>decide_llm: Prepend thread_summary
                     decide_llm-->>CV: AutoPromptAction with next_prompt
                     CV->>Workspace: dispatch_action(AutoPromptNewThread)
                 end
@@ -159,11 +159,11 @@ sequenceDiagram
 
 If more than 300 seconds (`CHAIN_TIMEOUT_SECS`) pass between iterations, the chain is considered stale and the iteration counter resets on the next call. This prevents stale chains from accumulating.
 
-### First prompt context grounding
+### Thread summary context grounding
 
-Every auto-prompt dispatch prepends a summary of the user's original message via `with_first_prompt_context()`. The source is either:
-- `first_prompt_summary` returned by the orchestration LLM (preferred), or
-- First line of `first_user_message` from the conversation context (fallback)
+Every auto-prompt dispatch prepends a comprehensive thread summary via `with_first_prompt_context()`. The orchestration LLM generates this summary with the active plan bolded, keeping long auto-prompt chains grounded in the full conversation context. The source is either:
+- `thread_summary` returned by the orchestration LLM (preferred), or
+- Raw `original_user_message` carried verbatim from thread 0 (fallback)
 
 This keeps long auto-prompt chains grounded in the user's actual intent.
 
@@ -235,7 +235,7 @@ Before marking `all_plan_done=true`, the system enforces:
 - `AutoPromptAction` — data needed to dispatch a follow-up prompt (`from_session_id`, `from_title`, `next_prompt`, `work_dirs`)
 - `LlmCallData` — data for async LLM call (`model`, `system_prompt`, `context_json`, `project_root`, `session_id`, `title`, `iteration_count`, `max_verification_attempts`, `work_dirs`, `first_user_message`); stored on failure for manual retry
 - `AutoPromptContext` — serializable context payload sent to the orchestration LLM (includes `plan_files`, `doc_files`, `first_user_message`, `stop_phase`, `verification_count`, `plan_has_checkboxes`, `first_plan_filename`, `plan_number`, `was_truncated`)
-- `AutoPromptResponse` — expected JSON response from the LLM (`should_continue`, `next_prompt`, `reason`, `all_plan_done`, `confidence`, `first_prompt_summary`)
+- `AutoPromptResponse` — expected JSON response from the LLM (`should_continue`, `next_prompt`, `reason`, `all_plan_done`, `confidence`, `thread_summary`)
 - `StopPhase` — lifecycle phase: `Working` (normal), `PreStop` (verification), `Verified` (terminal)
 - `AutoPromptConfig` — loaded from `~/.config/zed/auto_prompt.json` or env vars (cached with file-watcher invalidation)
 

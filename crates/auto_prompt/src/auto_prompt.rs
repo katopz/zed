@@ -131,33 +131,24 @@ pub enum AutoPromptOutcome {
 
 pub fn with_first_prompt_context(
     next_prompt: String,
-    original_user_message: Option<&str>,
-    thread_summary: Option<&str>,
+    prompt_summary: Option<&str>,
+    _thread_title: Option<&str>,
     last_assistant_message: Option<&str>,
 ) -> String {
-    match original_user_message {
+    match prompt_summary {
         Some(msg) if !msg.trim().is_empty() => {
             let msg = msg.trim();
             let mut parts = vec![
-                "## 1. First Prompt (original request)".to_string(),
+                "## 1. Thread Summary".to_string(),
                 String::new(),
                 msg.to_string(),
                 String::new(),
                 "---".to_string(),
             ];
 
-            if let Some(summary) = thread_summary.filter(|s| !s.trim().is_empty()) {
-                parts.push(String::new());
-                parts.push("## 2. Thread Summary".to_string());
-                parts.push(String::new());
-                parts.push(summary.trim().to_string());
-                parts.push(String::new());
-                parts.push("---".to_string());
-            }
-
             if let Some(last) = last_assistant_message.filter(|s| !s.trim().is_empty()) {
                 parts.push(String::new());
-                parts.push("## 3. Last Assistant Message".to_string());
+                parts.push("## 2. Last Assistant Message".to_string());
                 parts.push(String::new());
                 parts.push(last.trim().to_string());
                 parts.push(String::new());
@@ -165,7 +156,7 @@ pub fn with_first_prompt_context(
             }
 
             parts.push(String::new());
-            parts.push("## 4. Decision".to_string());
+            parts.push("## 3. Decision".to_string());
             parts.push(String::new());
             parts.push(next_prompt);
             parts.join("\n")
@@ -184,12 +175,18 @@ pub fn with_first_prompt_context(
 pub fn extract_original_user_message(first_user_message: &str) -> Option<String> {
     let stripped = first_user_message.trim();
 
-    // Try new 4-part structured format FIRST on raw input,
-    // before any header stripping removes the "## 1. First Prompt" marker.
-    if let Some(pos) = stripped.find("## 1. First Prompt (original request)") {
-        let after_header = &stripped[pos + "## 1. First Prompt (original request)".len()..];
+    // Try structured format — supports both current "## 1. Thread Summary"
+    // and legacy "## 1. First Prompt (original request)" headers.
+    let section1_header = if stripped.contains("## 1. Thread Summary") {
+        "## 1. Thread Summary"
+    } else {
+        "## 1. First Prompt (original request)"
+    };
+
+    if let Some(pos) = stripped.find(section1_header) {
+        let after_header = &stripped[pos + section1_header.len()..];
         let after_header = after_header.trim_start_matches('\n');
-        // Extract everything up to the first "---" separator (before section 2/3/4)
+        // Extract everything up to the first "---" separator (before section 2/3)
         if let Some(end_pos) = after_header.find("\n---") {
             let extracted = after_header[..end_pos].trim();
             if !extracted.is_empty() {
@@ -746,19 +743,19 @@ pub async fn decide_with_llm(
                 log::info!("[auto_prompt::decide_with_llm] Next prompt: {}", prompt);
             }
 
-            // Prefer the raw original user message over the LLM's summary.
-            // The LLM summary drifts across chain hops (telephone game),
-            // while `original_user_message` is carried verbatim from thread 0.
-            let prompt_summary = data
-                .original_user_message
-                .clone()
+            // Prefer the LLM-generated thread summary over the raw original message.
+            // For long threads, the original first prompt becomes misleading since
+            // the thread may have pivoted significantly. The LLM summary captures
+            // the full thread context with the active plan bolded.
+            let prompt_summary = response
+                .thread_summary
+                .as_deref()
                 .filter(|s| !s.trim().is_empty())
+                .map(|s| s.to_string())
                 .or_else(|| {
-                    response
-                        .first_prompt_summary
-                        .as_deref()
+                    data.original_user_message
+                        .clone()
                         .filter(|s| !s.trim().is_empty())
-                        .map(|s| s.to_string())
                 })
                 .or_else(|| {
                     data.first_user_message
@@ -875,7 +872,7 @@ pub async fn decide_with_llm(
                             Priority: the LAST ASSISTANT MESSAGE is the most important signal.\n\n\
                             Respond ONLY with valid JSON:\n\
                             {\"should_continue\": bool, \"next_prompt\": string | null, \"reason\": string | null, \
-                            \"all_plan_done\": bool, \"confidence\": float, \"first_prompt_summary\": null}\n\n\
+                            \"all_plan_done\": bool, \"confidence\": float, \"thread_summary\": null}\n\n\
                             ## Rules (in order):\n\
                             1. LAST MESSAGE IS KING — reason about it first, before looking at plans\n\
                             2. If it asks \"would you like to continue?\" or \"want me to ...?\" → should_continue=true, \
@@ -1663,7 +1660,7 @@ async fn call_language_model(
                     "reason": format!("Model returned {} Thinking events but no Text output", thinking_parts.len()),
                     "all_plan_done": false,
                     "confidence": 0.3,
-                    "first_prompt_summary": null
+                    "thread_summary": null
                 });
                 anyhow::Ok(synthetic.to_string())
             } else {
@@ -1679,7 +1676,7 @@ async fn call_language_model(
                     "reason": format!("model returned no usable content ({} empty Text, {} empty Thinking, {} stream errors)", text_parts.len(), thinking_parts.len(), stream_errors.len()),
                     "all_plan_done": false,
                     "confidence": 0.0,
-                    "first_prompt_summary": null
+                    "thread_summary": null
                 });
                 anyhow::Ok(synthetic.to_string())
             }
@@ -1695,7 +1692,7 @@ async fn call_language_model(
                 "reason": format!("model stream produced only errors ({})", stream_errors.len()),
                 "all_plan_done": false,
                 "confidence": 0.0,
-                "first_prompt_summary": null
+                "thread_summary": null
             });
             anyhow::Ok(synthetic.to_string())
         } else {
@@ -1708,7 +1705,7 @@ async fn call_language_model(
                 "reason": format!("model returned zero events ({} total stream events)", total_events),
                 "all_plan_done": false,
                 "confidence": 0.0,
-                "first_prompt_summary": null
+                "thread_summary": null
             });
             anyhow::Ok(synthetic.to_string())
         }
@@ -1747,7 +1744,7 @@ fn parse_response(text: &str) -> anyhow::Result<AutoPromptResponse> {
                 )),
                 all_plan_done: false,
                 confidence: Some(0.0),
-                first_prompt_summary: None,
+                thread_summary: None,
             })
         }
     }
@@ -2301,9 +2298,9 @@ mod tests {
     fn test_with_first_prompt_context_multiline() {
         let original = "check .plans against the code\n\nfile.rs\nanother.rs";
         let result = with_first_prompt_context("continue".to_string(), Some(original), None, None);
-        assert!(result.starts_with("## 1. First Prompt (original request)\n\n"));
+        assert!(result.starts_with("## 1. Thread Summary\n\n"));
         assert!(result.contains(original));
-        assert!(result.contains("## 4. Decision"));
+        assert!(result.contains("## 3. Decision"));
         assert!(result.ends_with("continue"));
     }
 
@@ -2321,50 +2318,45 @@ mod tests {
 
     #[test]
     fn test_with_first_prompt_context_with_thread_summary_and_last_message() {
-        let original = "fix the bug in auth";
-        let summary = "Auth Bug Fix Thread";
+        let summary = "Fixed auth bug in **plan 083** — the session validation was broken. All tests passing now.";
         let last_msg = "Fixed the auth bug, tests passing";
         let result = with_first_prompt_context(
             "commit the changes".to_string(),
-            Some(original),
             Some(summary),
+            None,
             Some(last_msg),
         );
-        assert!(result.starts_with("## 1. First Prompt (original request)\n\n"));
-        assert!(result.contains(original));
-        assert!(result.contains("## 2. Thread Summary"));
+        assert!(result.starts_with("## 1. Thread Summary\n\n"));
         assert!(result.contains(summary));
-        assert!(result.contains("## 3. Last Assistant Message"));
+        assert!(result.contains("## 2. Last Assistant Message"));
         assert!(result.contains(last_msg));
-        assert!(result.contains("## 4. Decision"));
+        assert!(result.contains("## 3. Decision"));
         assert!(result.ends_with("commit the changes"));
     }
 
     #[test]
-    fn test_with_first_prompt_context_4_part_structure() {
-        let original = "implement feature X";
-        let summary = "Feature X implementation thread";
+    fn test_with_first_prompt_context_3_part_structure() {
+        let summary =
+            "Implementing feature X in **plan 085** — completed steps 1-3, need to do step 4";
         let last_msg = "Completed steps 1-3, need to do step 4";
         let result = with_first_prompt_context(
             "do step 4 now".to_string(),
-            Some(original),
             Some(summary),
+            None,
             Some(last_msg),
         );
-        // Verify 4-part structure with section headers
-        assert!(result.contains("## 1. First Prompt (original request)"));
-        assert!(result.contains("## 2. Thread Summary"));
-        assert!(result.contains("## 3. Last Assistant Message"));
-        assert!(result.contains("## 4. Decision"));
+        // Verify 3-part structure with section headers
+        assert!(result.contains("## 1. Thread Summary"));
+        assert!(result.contains("## 2. Last Assistant Message"));
+        assert!(result.contains("## 3. Decision"));
+        assert!(!result.contains("## 4."));
 
         // Verify sections are in order
         let pos1 = result.find("## 1.").unwrap();
         let pos2 = result.find("## 2.").unwrap();
         let pos3 = result.find("## 3.").unwrap();
-        let pos4 = result.find("## 4.").unwrap();
         assert!(pos1 < pos2);
         assert!(pos2 < pos3);
-        assert!(pos3 < pos4);
     }
 
     #[test]
@@ -2461,7 +2453,17 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_original_user_message_new_4_part_format() {
+    fn test_extract_original_user_message_new_3_part_format() {
+        let input = "## 1. Thread Summary\n\nimplement the auth module\n\nsrc/auth.rs\n\n---\n\n## 2. Last Assistant Message\n\nDone\n\n---\n\n## 3. Decision\n\ncommit changes";
+        let result = extract_original_user_message(input);
+        assert_eq!(
+            result,
+            Some("implement the auth module\n\nsrc/auth.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_original_user_message_legacy_4_part_format() {
         let input = "## 1. First Prompt (original request)\n\nimplement the auth module\n\nsrc/auth.rs\n\n---\n\n## 2. Thread Summary\n\nAuth implementation\n\n---\n\n## 4. Decision\n\ncommit changes";
         let result = extract_original_user_message(input);
         assert_eq!(
@@ -2471,19 +2473,18 @@ mod tests {
     }
 
     #[test]
-    fn test_roundtrip_4_part_format_with_summary_and_last_message() {
-        let original = "implement feature X with files\n\nmod.rs\nlib.rs";
-        let summary = "Feature X Thread";
+    fn test_roundtrip_3_part_format_with_summary_and_last_message() {
+        let summary = "implement feature X with files\n\nmod.rs\nlib.rs";
         let last_msg = "Completed implementation";
         let wrapped = with_first_prompt_context(
             "do the next thing".to_string(),
-            Some(original),
             Some(summary),
+            None,
             Some(last_msg),
         );
         let chain_message = format!("## User\n\n[@Thread](zed:///agent/thread/abc)\n\n{wrapped}");
         let extracted = extract_original_user_message(&chain_message);
-        assert_eq!(extracted, Some(original.to_string()));
+        assert_eq!(extracted, Some(summary.to_string()));
     }
 
     // --- extract_remaining_section tests ---
