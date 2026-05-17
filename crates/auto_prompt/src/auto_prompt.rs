@@ -743,25 +743,14 @@ pub async fn decide_with_llm(
                 log::info!("[auto_prompt::decide_with_llm] Next prompt: {}", prompt);
             }
 
-            // Prefer the LLM-generated thread summary over the raw original message.
-            // For long threads, the original first prompt becomes misleading since
-            // the thread may have pivoted significantly. The LLM summary captures
-            // the full thread context with the active plan bolded.
-            let prompt_summary = response
-                .thread_summary
-                .as_deref()
-                .filter(|s| !s.trim().is_empty())
-                .map(|s| s.to_string())
-                .or_else(|| {
-                    data.original_user_message
-                        .clone()
-                        .filter(|s| !s.trim().is_empty())
-                })
-                .or_else(|| {
-                    data.first_user_message
-                        .as_deref()
-                        .and_then(extract_original_user_message)
-                });
+            let prompt_summary = build_prompt_summary(
+                response.thread_summary.as_deref(),
+                data.title.as_deref(),
+                response.reason.as_deref(),
+                data.last_assistant_message.as_deref(),
+                data.original_user_message.as_deref(),
+                data.first_user_message.as_deref(),
+            );
 
             let all_done = response.all_plan_done
                 || response
@@ -1256,6 +1245,65 @@ fn write_stop_log(project_root: Option<&PathBuf>, iteration: u32, reason: &str) 
             }
         }
     }
+}
+
+/// Build the prompt summary for the next chained thread.
+///
+/// Priority:
+/// 1. LLM-generated `thread_summary` (preferred — comprehensive, with active plan bolded)
+/// 2. Synthesized from title + reason + last assistant message (when LLM returns null)
+/// 3. Raw `original_user_message` carried from thread 0 (last resort before final fallback)
+/// 4. Extracted from `first_user_message` (absolute fallback)
+fn build_prompt_summary(
+    thread_summary: Option<&str>,
+    title: Option<&str>,
+    reason: Option<&str>,
+    last_assistant_message: Option<&str>,
+    original_user_message: Option<&str>,
+    first_user_message: Option<&str>,
+) -> Option<String> {
+    thread_summary
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            let mut parts = Vec::new();
+
+            if let Some(title) = title.filter(|s| !s.trim().is_empty()) {
+                parts.push(title.trim().to_string());
+            }
+
+            if let Some(reason) = reason.filter(|s| !s.trim().is_empty()) {
+                parts.push(reason.trim().to_string());
+            }
+
+            if let Some(last) = last_assistant_message.filter(|s| !s.trim().is_empty()) {
+                let truncated = last.trim();
+                let limit = 300;
+                let summary = if truncated.len() > limit {
+                    format!(
+                        "{}...",
+                        &truncated[..truncated
+                            .char_indices()
+                            .take(limit)
+                            .last()
+                            .map(|(i, _)| i)
+                            .unwrap_or(limit)]
+                    )
+                } else {
+                    truncated.to_string()
+                };
+                parts.push(summary);
+            }
+
+            if parts.is_empty() {
+                original_user_message
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| s.to_string())
+            } else {
+                Some(parts.join("\n"))
+            }
+        })
+        .or_else(|| first_user_message.and_then(extract_original_user_message))
 }
 
 fn default_system_prompt() -> String {
@@ -2485,6 +2533,108 @@ mod tests {
         let chain_message = format!("## User\n\n[@Thread](zed:///agent/thread/abc)\n\n{wrapped}");
         let extracted = extract_original_user_message(&chain_message);
         assert_eq!(extracted, Some(summary.to_string()));
+    }
+
+    // --- build_prompt_summary tests ---
+
+    #[test]
+    fn test_build_prompt_summary_prefers_llm_thread_summary() {
+        let result = build_prompt_summary(
+            Some("LLM generated summary about **plan 085**"),
+            Some("Thread Title"),
+            Some("continuing work"),
+            Some("Last assistant message"),
+            Some("raw first prompt"),
+            None,
+        );
+        assert_eq!(
+            result,
+            Some("LLM generated summary about **plan 085**".to_string())
+        );
+    }
+
+    #[test]
+    fn test_build_prompt_summary_synthesizes_from_title_reason_last() {
+        let result = build_prompt_summary(
+            None,
+            Some("Fix fusion rank mismatch"),
+            Some("plan has unchecked items"),
+            Some("Fixed the scale clamp in affine quantization"),
+            Some("so no way rust can beat python for gemma 2?"),
+            None,
+        );
+        let summary = result.expect("should synthesize summary");
+        assert!(summary.contains("Fix fusion rank mismatch"));
+        assert!(summary.contains("plan has unchecked items"));
+        assert!(summary.contains("Fixed the scale clamp in affine quantization"));
+        assert!(
+            !summary.contains("so no way rust can beat python"),
+            "should NOT contain raw first prompt"
+        );
+    }
+
+    #[test]
+    fn test_build_prompt_summary_synthesizes_truncates_long_last_message() {
+        let long_message: String = "x".repeat(500);
+        let result = build_prompt_summary(
+            None,
+            Some("Title"),
+            None,
+            Some(&long_message),
+            Some("fallback"),
+            None,
+        );
+        let summary = result.expect("should synthesize");
+        assert!(summary.len() < long_message.len(), "should be truncated");
+        assert!(
+            summary.ends_with("..."),
+            "truncated text should end with ..."
+        );
+    }
+
+    #[test]
+    fn test_build_prompt_summary_falls_back_to_original_user_message() {
+        let result = build_prompt_summary(
+            None,
+            None,
+            None,
+            None,
+            Some("raw first prompt as fallback"),
+            None,
+        );
+        assert_eq!(result, Some("raw first prompt as fallback".to_string()));
+    }
+
+    #[test]
+    fn test_build_prompt_summary_falls_back_to_first_user_message() {
+        let result = build_prompt_summary(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("## User\n\nextracted from first message"),
+        );
+        assert_eq!(result, Some("extracted from first message".to_string()));
+    }
+
+    #[test]
+    fn test_build_prompt_summary_returns_none_when_all_empty() {
+        let result = build_prompt_summary(None, None, None, None, None, None);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_build_prompt_summary_title_only_no_reason_no_last() {
+        let result = build_prompt_summary(
+            None,
+            Some("Implement auth flow"),
+            None,
+            None,
+            Some("old raw prompt"),
+            None,
+        );
+        assert_eq!(result, Some("Implement auth flow".to_string()));
     }
 
     // --- extract_remaining_section tests ---
