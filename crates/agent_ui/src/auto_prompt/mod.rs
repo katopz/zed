@@ -27,6 +27,30 @@ fn strip_first_prompt_wrapper(prompt: &str) -> String {
         }
     }
 
+    // Current 3-part format: "## 1. Thread Summary" → "## 3. Decision"
+    if prompt.starts_with("## 1. Thread Summary") {
+        const DECISION_HEADER: &str = "## 3. Decision\n\n";
+        if let Some(pos) = prompt.find(DECISION_HEADER) {
+            let instruction = &prompt[pos + DECISION_HEADER.len()..];
+            let trimmed = instruction.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+
+    // Fallback 2-part format (summary failed): "## 1. Last Assistant Message" → "## 2. Decision"
+    if prompt.starts_with("## 1. Last Assistant Message") {
+        const DECISION_HEADER: &str = "## 2. Decision\n\n";
+        if let Some(pos) = prompt.find(DECISION_HEADER) {
+            let instruction = &prompt[pos + DECISION_HEADER.len()..];
+            let trimmed = instruction.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+
     // Old structured format: "## User (checkpoint)" with "---\nrefer to first thread\n---"
     if prompt.starts_with("## User (checkpoint)") {
         const SEPARATOR: &str = "---\nrefer to first thread\n---\n";

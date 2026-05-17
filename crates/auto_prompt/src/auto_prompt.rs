@@ -161,7 +161,23 @@ pub fn with_first_prompt_context(
             parts.push(next_prompt);
             parts.join("\n")
         }
-        _ => next_prompt,
+        _ => match last_assistant_message.filter(|s| !s.trim().is_empty()) {
+            Some(last) => {
+                let parts = vec![
+                    "## 1. Last Assistant Message".to_string(),
+                    String::new(),
+                    last.trim().to_string(),
+                    String::new(),
+                    "---".to_string(),
+                    String::new(),
+                    "## 2. Decision".to_string(),
+                    String::new(),
+                    next_prompt,
+                ];
+                parts.join("\n")
+            }
+            None => next_prompt,
+        },
     }
 }
 
@@ -2362,6 +2378,29 @@ mod tests {
     fn test_with_first_prompt_context_empty() {
         let result = with_first_prompt_context("continue".to_string(), Some(""), None, None);
         assert_eq!(result, "continue");
+    }
+
+    #[test]
+    fn test_with_first_prompt_context_no_summary_includes_last_message() {
+        let last_msg = "Fixed the auth bug, tests passing. Still need to commit.";
+        let result =
+            with_first_prompt_context("commit the changes".to_string(), None, None, Some(last_msg));
+        assert!(result.starts_with("## 1. Last Assistant Message\n\n"));
+        assert!(result.contains(last_msg));
+        assert!(result.contains("## 2. Decision"));
+        assert!(result.ends_with("commit the changes"));
+        assert!(!result.contains("Thread Summary"));
+    }
+
+    #[test]
+    fn test_with_first_prompt_context_whitespace_summary_includes_last_message() {
+        let last_msg = "Completed steps 1-3";
+        let result =
+            with_first_prompt_context("do step 4".to_string(), Some("   "), None, Some(last_msg));
+        assert!(result.starts_with("## 1. Last Assistant Message\n\n"));
+        assert!(result.contains(last_msg));
+        assert!(result.contains("## 2. Decision"));
+        assert!(!result.contains("Thread Summary"));
     }
 
     #[test]
