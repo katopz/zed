@@ -409,6 +409,25 @@ pub fn evaluate_response(input: &EvaluationInput) -> EvaluationResult {
         .as_ref()
         .is_some_and(|p| !p.trim().is_empty());
 
+    // 0. Handbrake: worker AI explicitly declared stopping — force stop to break loops
+    if let Some(last_msg) = &input.last_assistant_message {
+        let lower = last_msg.to_lowercase();
+        let is_explicit_stop = lower.contains("stopping")
+            && (lower.contains("nothing related")
+                || lower.contains("no further action")
+                || lower.contains("nothing left")
+                || lower.contains("no further work"));
+        if is_explicit_stop {
+            log::warn!(
+                "[auto_prompt::evaluate_response] Handbrake: worker AI explicitly declared stopping, forcing stop"
+            );
+            return EvaluationResult::WantsStop {
+                reason: "worker AI explicitly declared stopping with nothing related — handbrake"
+                    .to_string(),
+            };
+        }
+    }
+
     // 1. all_done + next plan → Continue (transition to next plan)
     if input.all_plan_done {
         if let Some(next_plan_prompt) = &input.next_plan_prompt {
@@ -3116,6 +3135,89 @@ mod tests {
         };
         let result = evaluate_response(&input);
         assert!(matches!(result, EvaluationResult::WantsStop { .. }));
+    }
+
+    #[test]
+    fn test_handbrake_stopping_nothing_related_forces_stop() {
+        let input = EvaluationInput {
+            should_continue: true,
+            next_prompt: Some("continue the plan".to_string()),
+            last_assistant_message: Some(
+                "Declare: reviewed remaining plans: stopping, nothing related".to_string(),
+            ),
+            ..make_input()
+        };
+        let result = evaluate_response(&input);
+        assert!(
+            matches!(result, EvaluationResult::WantsStop { .. }),
+            "handbrake should force stop when worker declares 'stopping, nothing related'"
+        );
+    }
+
+    #[test]
+    fn test_handbrake_stopping_no_further_action_forces_stop() {
+        let input = EvaluationInput {
+            should_continue: true,
+            next_prompt: Some("continue work".to_string()),
+            last_assistant_message: Some(
+                "Reviewed plans: stopping — no further action needed.".to_string(),
+            ),
+            ..make_input()
+        };
+        let result = evaluate_response(&input);
+        assert!(
+            matches!(result, EvaluationResult::WantsStop { .. }),
+            "handbrake should force stop when worker declares 'stopping' with 'no further action'"
+        );
+    }
+
+    #[test]
+    fn test_handbrake_stopping_nothing_left_forces_stop() {
+        let input = EvaluationInput {
+            should_continue: true,
+            next_prompt: Some("continue".to_string()),
+            last_assistant_message: Some(
+                "Everything is done. Stopping, nothing left to do.".to_string(),
+            ),
+            ..make_input()
+        };
+        let result = evaluate_response(&input);
+        assert!(
+            matches!(result, EvaluationResult::WantsStop { .. }),
+            "handbrake should force stop when worker declares 'stopping' with 'nothing left'"
+        );
+    }
+
+    #[test]
+    fn test_handbrake_stopping_alone_does_not_trigger() {
+        let input = EvaluationInput {
+            should_continue: true,
+            next_prompt: Some("continue fixing bugs".to_string()),
+            last_assistant_message: Some(
+                "I'm stopping the current approach to try something else.".to_string(),
+            ),
+            ..make_input()
+        };
+        let result = evaluate_response(&input);
+        assert!(
+            matches!(result, EvaluationResult::Continue { .. }),
+            "'stopping' alone without qualifying phrase should NOT trigger handbrake"
+        );
+    }
+
+    #[test]
+    fn test_handbrake_normal_continue_not_affected() {
+        let input = EvaluationInput {
+            should_continue: true,
+            next_prompt: Some("implement the next feature".to_string()),
+            last_assistant_message: Some("I've completed step 1. Moving to step 2.".to_string()),
+            ..make_input()
+        };
+        let result = evaluate_response(&input);
+        assert!(
+            matches!(result, EvaluationResult::Continue { .. }),
+            "normal messages should not trigger handbrake"
+        );
     }
 
     #[derive(Debug, PartialEq)]
