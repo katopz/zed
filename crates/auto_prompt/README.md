@@ -161,11 +161,14 @@ If more than 300 seconds (`CHAIN_TIMEOUT_SECS`) pass between iterations, the cha
 
 ### Thread summary context grounding
 
-Every auto-prompt dispatch prepends a comprehensive thread summary via `with_first_prompt_context()`. The orchestration LLM generates this summary with the active plan bolded, keeping long auto-prompt chains grounded in the full conversation context. The source is either:
-- `thread_summary` returned by the orchestration LLM (preferred), or
-- Raw `original_user_message` carried verbatim from thread 0 (fallback)
+Every auto-prompt dispatch prepends a comprehensive thread summary via `with_first_prompt_context()`. The orchestration LLM generates this summary with the active plan bolded, keeping long auto-prompt chains grounded in the full conversation context. The `build_prompt_summary()` function selects the best source in priority order:
 
-This keeps long auto-prompt chains grounded in the user's actual intent.
+1. `thread_summary` returned by the orchestration LLM (preferred)
+2. Synthesized from `title` + `reason` + `last_assistant_message` (up to 2000 chars)
+3. `original_user_message` carried from thread 0 (fallback)
+4. `first_user_message` extracted via `extract_original_user_message` (last resort)
+
+The `last_assistant_message` field collects **all** consecutive assistant chunks from the end of the thread (not just the last single chunk), ensuring multi-part responses are fully captured in the summary.
 
 ### Debug logs
 
@@ -233,14 +236,17 @@ Before marking `all_plan_done=true`, the system enforces:
 
 When the worker AI explicitly declares stopping with phrases like `stopping, nothing related` or `stopping, no further action`, the `evaluate_response` function forces a `WantsStop` result regardless of what the orchestration LLM decided. This breaks loops where the orchestration LLM keeps seeing unchecked plan items and continuing despite the worker's explicit stop declaration.
 
-The handbrake triggers on `last_assistant_message` containing "stopping" combined with one of: "nothing related", "no further action", "nothing left", "no further work". The word "stopping" alone does **not** trigger the handbrake — it requires a qualifying phrase to avoid false positives.
+**Scoped to post-verification only** — the handbrake only triggers when `stop_phase` is `PreStop` or `Verified`, not during the normal `Working` phase. This prevents false positives where a worker AI mentioning "stopping" during normal work would accidentally terminate the chain.
+
+The handbrake matches `last_assistant_message` containing "stopping" combined with one of: "nothing related", "no further action", "nothing left", "no further work". The word "stopping" alone does **not** trigger the handbrake — it requires a qualifying phrase.
 
 ### Key types
 
 - `AutoPromptDecision` — sync result: `NoAction`, `DispatchNow(AutoPromptAction)`, `DispatchAfterDelay { action, delay_ms }`, `NeedsLlmCall(LlmCallData)`
 - `AutoPromptAction` — data needed to dispatch a follow-up prompt (`from_session_id`, `from_title`, `next_prompt`, `work_dirs`)
-- `LlmCallData` — data for async LLM call (`model`, `system_prompt`, `context_json`, `project_root`, `session_id`, `title`, `iteration_count`, `max_verification_attempts`, `work_dirs`, `first_user_message`); stored on failure for manual retry
+- `LlmCallData` — data for async LLM call (`model`, `system_prompt`, `context_json`, `project_root`, `session_id`, `title`, `iteration_count`, `max_verification_attempts`, `work_dirs`, `first_user_message`, `last_assistant_message`, `stop_phase`); stored on failure for manual retry
 - `AutoPromptContext` — serializable context payload sent to the orchestration LLM (includes `plan_files`, `doc_files`, `first_user_message`, `stop_phase`, `verification_count`, `plan_has_checkboxes`, `first_plan_filename`, `plan_number`, `was_truncated`)
+- `EvaluationInput` — input to the pure `evaluate_response()` function (`should_continue`, `confidence`, `next_prompt`, `reason`, `all_plan_done`, `next_plan_prompt`, `last_assistant_message`, `is_synthetic_failure`, `stop_phase`)
 - `AutoPromptResponse` — expected JSON response from the LLM (`should_continue`, `next_prompt`, `reason`, `all_plan_done`, `confidence`, `thread_summary`)
 - `StopPhase` — lifecycle phase: `Working` (normal), `PreStop` (verification), `Verified` (terminal)
 - `AutoPromptConfig` — loaded from `~/.config/zed/auto_prompt.json` or env vars (cached with file-watcher invalidation)
