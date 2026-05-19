@@ -345,6 +345,9 @@ pub struct LlmCallData {
     /// Whether the source thread had errors (rate limit, refusal, max tokens, etc.).
     /// Used by the caller to decide whether to add a pre-call delay.
     pub had_error: bool,
+    /// Current stop lifecycle phase (Working, PreStop, Verified).
+    /// Used to scope the handbrake to post-verification only.
+    pub stop_phase: context::StopPhase,
 }
 
 impl std::fmt::Debug for LlmCallData {
@@ -372,6 +375,7 @@ impl std::fmt::Debug for LlmCallData {
             .field("profile_id", &self.profile_id)
             .field("actual_input_tokens", &self.actual_input_tokens)
             .field("had_error", &self.had_error)
+            .field("stop_phase", &self.stop_phase)
             .finish()
     }
 }
@@ -390,6 +394,9 @@ pub struct EvaluationInput {
     /// verification is skipped in this case because there is no real decision
     /// to verify.
     pub is_synthetic_failure: bool,
+    /// Current stop lifecycle phase (Working, PreStop, Verified).
+    /// Used to scope the handbrake to post-verification only.
+    pub stop_phase: context::StopPhase,
 }
 
 /// Result of evaluating an LLM response.
@@ -408,22 +415,26 @@ pub fn evaluate_response(input: &EvaluationInput) -> EvaluationResult {
         .as_ref()
         .is_some_and(|p| !p.trim().is_empty());
 
-    // 0. Handbrake: worker AI explicitly declared stopping — force stop to break loops
-    if let Some(last_msg) = &input.last_assistant_message {
-        let lower = last_msg.to_lowercase();
-        let is_explicit_stop = lower.contains("stopping")
-            && (lower.contains("nothing related")
-                || lower.contains("no further action")
-                || lower.contains("nothing left")
-                || lower.contains("no further work"));
-        if is_explicit_stop {
-            log::warn!(
-                "[auto_prompt::evaluate_response] Handbrake: worker AI explicitly declared stopping, forcing stop"
-            );
-            return EvaluationResult::WantsStop {
-                reason: "worker AI explicitly declared stopping with nothing related — handbrake"
-                    .to_string(),
-            };
+    // 0. Handbrake (post-verification only): worker AI explicitly declared stopping
+    //    after pre-stop verification — force stop to break loops.
+    //    Only triggers when stop_phase != Working to avoid false positives during normal work.
+    if input.stop_phase != context::StopPhase::Working {
+        if let Some(last_msg) = &input.last_assistant_message {
+            let lower = last_msg.to_lowercase();
+            let is_explicit_stop = lower.contains("stopping")
+                && (lower.contains("nothing related")
+                    || lower.contains("no further action")
+                    || lower.contains("nothing left")
+                    || lower.contains("no further work"));
+            if is_explicit_stop {
+                log::warn!(
+                    "[auto_prompt::evaluate_response] Handbrake: worker AI explicitly declared stopping after verification, forcing stop"
+                );
+                return EvaluationResult::WantsStop {
+                    reason: "worker AI explicitly declared stopping after pre-stop verification — handbrake"
+                        .to_string(),
+                };
+            }
         }
     }
 
@@ -634,7 +645,7 @@ pub fn decide(
             doc_files,
             iteration_count,
         );
-        ctx.stop_phase = stop_phase;
+        ctx.stop_phase = stop_phase.clone();
         ctx.verification_count = verification_count;
         let sid = thread_ref.session_id().clone();
         let title = thread_ref.title().map(|t| t.to_string());
@@ -736,6 +747,7 @@ pub fn decide(
         profile_id: None,
         actual_input_tokens: auto_prompt_ctx.actual_input_tokens,
         had_error: auto_prompt_ctx.had_error,
+        stop_phase,
     })
 }
 
@@ -847,6 +859,7 @@ pub async fn decide_with_llm(
                 next_plan_prompt,
                 last_assistant_message: data.last_assistant_message.clone(),
                 is_synthetic_failure,
+                stop_phase: data.stop_phase.clone(),
             };
 
             log::info!(
@@ -2831,6 +2844,7 @@ mod tests {
             next_plan_prompt: None,
             last_assistant_message: None,
             is_synthetic_failure: false,
+            stop_phase: context::StopPhase::Working,
         }
     }
 
@@ -3168,12 +3182,13 @@ mod tests {
             last_assistant_message: Some(
                 "Declare: reviewed remaining plans: stopping, nothing related".to_string(),
             ),
+            stop_phase: context::StopPhase::PreStop,
             ..make_input()
         };
         let result = evaluate_response(&input);
         assert!(
             matches!(result, EvaluationResult::WantsStop { .. }),
-            "handbrake should force stop when worker declares 'stopping, nothing related'"
+            "handbrake should force stop when worker declares 'stopping, nothing related' after pre-stop"
         );
     }
 
@@ -3185,12 +3200,13 @@ mod tests {
             last_assistant_message: Some(
                 "Reviewed plans: stopping — no further action needed.".to_string(),
             ),
+            stop_phase: context::StopPhase::PreStop,
             ..make_input()
         };
         let result = evaluate_response(&input);
         assert!(
             matches!(result, EvaluationResult::WantsStop { .. }),
-            "handbrake should force stop when worker declares 'stopping' with 'no further action'"
+            "handbrake should force stop when worker declares 'stopping' with 'no further action' after pre-stop"
         );
     }
 
@@ -3202,12 +3218,13 @@ mod tests {
             last_assistant_message: Some(
                 "Everything is done. Stopping, nothing left to do.".to_string(),
             ),
+            stop_phase: context::StopPhase::Verified,
             ..make_input()
         };
         let result = evaluate_response(&input);
         assert!(
             matches!(result, EvaluationResult::WantsStop { .. }),
-            "handbrake should force stop when worker declares 'stopping' with 'nothing left'"
+            "handbrake should force stop when worker declares 'stopping' with 'nothing left' after verification"
         );
     }
 
@@ -3219,6 +3236,7 @@ mod tests {
             last_assistant_message: Some(
                 "I'm stopping the current approach to try something else.".to_string(),
             ),
+            stop_phase: context::StopPhase::PreStop,
             ..make_input()
         };
         let result = evaluate_response(&input);
@@ -3234,12 +3252,31 @@ mod tests {
             should_continue: true,
             next_prompt: Some("implement the next feature".to_string()),
             last_assistant_message: Some("I've completed step 1. Moving to step 2.".to_string()),
+            stop_phase: context::StopPhase::PreStop,
             ..make_input()
         };
         let result = evaluate_response(&input);
         assert!(
             matches!(result, EvaluationResult::Continue { .. }),
-            "normal messages should not trigger handbrake"
+            "normal messages should not trigger handbrake even in pre-stop phase"
+        );
+    }
+
+    #[test]
+    fn test_handbrake_does_not_trigger_during_working_phase() {
+        let input = EvaluationInput {
+            should_continue: true,
+            next_prompt: Some("continue the plan".to_string()),
+            last_assistant_message: Some(
+                "Declare: reviewed remaining plans: stopping, nothing related".to_string(),
+            ),
+            stop_phase: context::StopPhase::Working,
+            ..make_input()
+        };
+        let result = evaluate_response(&input);
+        assert!(
+            matches!(result, EvaluationResult::Continue { .. }),
+            "handbrake should NOT trigger during Working phase, only after pre-stop verification"
         );
     }
 
