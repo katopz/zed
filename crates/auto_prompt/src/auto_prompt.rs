@@ -1294,7 +1294,7 @@ fn build_prompt_summary(
 
             if let Some(last) = last_assistant_message.filter(|s| !s.trim().is_empty()) {
                 let truncated = last.trim();
-                let limit = 300;
+                let limit = 2000;
                 let summary = if truncated.len() > limit {
                     format!(
                         "{}...",
@@ -2614,7 +2614,7 @@ mod tests {
 
     #[test]
     fn test_build_prompt_summary_synthesizes_truncates_long_last_message() {
-        let long_message: String = "x".repeat(500);
+        let long_message: String = "x".repeat(3000);
         let result = build_prompt_summary(
             None,
             Some("Title"),
