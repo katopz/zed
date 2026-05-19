@@ -293,11 +293,20 @@ impl AutoPromptContext {
     }
 
     pub fn compute_last_assistant_message(&self) -> Option<String> {
-        self.messages
+        let mut chunks: Vec<&str> = self
+            .messages
             .iter()
             .rev()
-            .find(|m| matches!(m.role, ContextMessageRole::Assistant))
-            .map(|m| m.content.clone())
+            .skip_while(|m| !matches!(m.role, ContextMessageRole::Assistant))
+            .take_while(|m| matches!(m.role, ContextMessageRole::Assistant))
+            .map(|m| m.content.as_str())
+            .collect();
+        chunks.reverse();
+        if chunks.is_empty() {
+            None
+        } else {
+            Some(chunks.join("\n"))
+        }
     }
 
     /// Returns the count of plan items by status.

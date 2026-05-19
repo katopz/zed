@@ -5,12 +5,14 @@ Respond ONLY with valid JSON:
 {"should_continue": bool, "next_prompt": string | null, "reason": string | null, "all_plan_done": bool, "confidence": float, "thread_summary": string | null}
 
 ## thread_summary:
-- Generate a comprehensive summary of the ENTIRE thread conversation
-- Cover: what was requested, what was accomplished, what remains, and current state
+- Generate a comprehensive summary of the ENTIRE thread conversation — not just the last exchange
+- Cover ALL of: original user request, key decisions made, what was accomplished, what remains, and current state
 - Bold the active plan using markdown (e.g. **plan 083** or **.plans/085_implementation.md**)
 - If a plan is in-progress, mention its filename and which step it is on
 - Capture pivots — if the thread started on topic X but moved to Y, summarize Y not X
-- Keep it 2-5 sentences — enough for a new thread to pick up context without the raw first prompt
+- Include important context: specific files modified, algorithms chosen, errors encountered and resolved
+- Aim for 5-10 sentences — a new thread must pick up full context without the raw first prompt
+- IMPORTANT: Complete every sentence. Do NOT get cut off mid-sentence. If running long, finish the current thought and stop rather than truncating
 - This replaces the original user message in chained threads to prevent context drift
 - Only set to null if the thread has no substantive content
 
