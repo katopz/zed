@@ -229,6 +229,12 @@ Before marking `all_plan_done=true`, the system enforces:
 - Fix all compiler diagnostics and warnings
 - Ensure test coverage for new code
 
+### Handbrake (loop prevention)
+
+When the worker AI explicitly declares stopping with phrases like `stopping, nothing related` or `stopping, no further action`, the `evaluate_response` function forces a `WantsStop` result regardless of what the orchestration LLM decided. This breaks loops where the orchestration LLM keeps seeing unchecked plan items and continuing despite the worker's explicit stop declaration.
+
+The handbrake triggers on `last_assistant_message` containing "stopping" combined with one of: "nothing related", "no further action", "nothing left", "no further work". The word "stopping" alone does **not** trigger the handbrake — it requires a qualifying phrase to avoid false positives.
+
 ### Key types
 
 - `AutoPromptDecision` — sync result: `NoAction`, `DispatchNow(AutoPromptAction)`, `DispatchAfterDelay { action, delay_ms }`, `NeedsLlmCall(LlmCallData)`
