@@ -3414,6 +3414,8 @@ impl AgentPanel {
         Some(AgentInitialContent::ThreadSummary {
             session_id: thread.id,
             title: Some(thread.title),
+            follow_up: None,
+            auto_submit: false,
         })
     }
 
@@ -10873,12 +10875,19 @@ mod tests {
             .expect("initial content should be produced for a root thread");
 
         match content {
-            AgentInitialContent::ThreadSummary { session_id, title } => {
+            AgentInitialContent::ThreadSummary {
+                session_id,
+                title,
+                follow_up,
+                auto_submit,
+            } => {
                 assert_eq!(
                     session_id, source_session_id,
                     "thread-summary mention should use the source thread's own session id"
                 );
                 assert_eq!(title, Some(source_title.clone()));
+                assert_eq!(follow_up, None);
+                assert!(!auto_submit);
             }
             _ => panic!("expected AgentInitialContent::ThreadSummary"),
         }
