@@ -416,52 +416,7 @@ pub fn evaluate_response(input: &EvaluationInput) -> EvaluationResult {
         .as_ref()
         .is_some_and(|p| !p.trim().is_empty());
 
-    // 0. Handbrake: worker AI explicitly declared stopping — force stop to break loops.
-    //    Post-verification (stop_phase != Working): always active.
-    //    Working phase: only active when LLM also says should_continue=false (mutual stop agreement).
-    let handbrake_active =
-        input.stop_phase != context::StopPhase::Working || !input.should_continue;
-    if handbrake_active {
-        if let Some(last_msg) = &input.last_assistant_message {
-            let lower = last_msg.to_lowercase();
-            let is_explicit_stop = lower.contains("stopping")
-                && (lower.contains("nothing related")
-                    || lower.contains("no further action")
-                    || lower.contains("nothing left")
-                    || lower.contains("no further work"));
-            if is_explicit_stop {
-                log::warn!(
-                    "[auto_prompt::evaluate_response] Handbrake: worker AI explicitly declared stopping after verification, forcing stop"
-                );
-                return EvaluationResult::WantsStop {
-                    reason: "worker AI explicitly declared stopping after pre-stop verification — handbrake"
-                        .to_string(),
-                };
-            }
-        }
-    }
-
-    // 1. all_done + should_continue → transition to next plan or final cleanup
-    if input.all_plan_done {
-        if input.should_continue {
-            if let Some(next_plan_prompt) = &input.next_plan_prompt {
-                return EvaluationResult::Continue {
-                    prompt: next_plan_prompt.clone(),
-                    reason: "current plan done, LLM wants to continue with next plan".to_string(),
-                };
-            }
-            // all_done + should_continue + no next plan → dispatch final gitflow cleanup
-            return EvaluationResult::Continue {
-                prompt: "All plans are complete. Final cleanup: merge this feature branch into develop (fast-forward, no interactive rebase), resolve any conflicts, ensure a clean develop branch. Do NOT push — leave local for user to review.".to_string(),
-                reason: "all plans done but LLM says continue, dispatching final cleanup".to_string(),
-            };
-        }
-        // all_done but LLM says stop — respect it, don't force landscape transition.
-        return EvaluationResult::WantsStop {
-            reason: "all plans done, LLM says stop".to_string(),
-        };
-    }
-
+    // Universal gate: low confidence overrides everything.
     if input.confidence.is_some_and(|c| c < 0.5) {
         return EvaluationResult::WantsStop {
             reason: format!(
@@ -471,35 +426,76 @@ pub fn evaluate_response(input: &EvaluationInput) -> EvaluationResult {
         };
     }
 
-    // 3. detect_remaining_work override
-    if !input.should_continue {
-        if let Some(remaining_prompt) =
-            detect_remaining_work(input.last_assistant_message.as_deref())
-        {
+    if input.should_continue {
+        // ── LLM says continue ──────────────────────────────────
+        // Handbrake: last resort, post-verification only.
+        // Worker AI explicitly declared stopping but LLM wants to continue → force stop.
+        if input.stop_phase != context::StopPhase::Working {
+            if let Some(last_msg) = &input.last_assistant_message {
+                let lower = last_msg.to_lowercase();
+                let is_explicit_stop = lower.contains("stopping")
+                    && (lower.contains("nothing related")
+                        || lower.contains("no further action")
+                        || lower.contains("nothing left")
+                        || lower.contains("no further work"));
+                if is_explicit_stop {
+                    log::warn!(
+                        "[auto_prompt::evaluate_response] Handbrake: worker AI declared stop despite LLM wanting to continue"
+                    );
+                    return EvaluationResult::WantsStop {
+                        reason: "handbrake: worker AI explicitly declared stopping after pre-stop verification".to_string(),
+                    };
+                }
+            }
+        }
+
+        // all_plan_done chooses WHICH continuation prompt, not WHETHER to continue.
+        if input.all_plan_done {
+            if let Some(next_plan_prompt) = &input.next_plan_prompt {
+                return EvaluationResult::Continue {
+                    prompt: next_plan_prompt.clone(),
+                    reason: "current plan done, transitioning to next plan".to_string(),
+                };
+            }
             return EvaluationResult::Continue {
-                prompt: remaining_prompt,
-                reason: "LLM says stop but last_assistant_message contains remaining work — overriding to continue".to_string(),
+                prompt: "All plans are complete. Final cleanup: merge this feature branch into develop (fast-forward, no interactive rebase), resolve any conflicts, ensure a clean develop branch. Do NOT push — leave local for user to review.".to_string(),
+                reason: "all plans done, dispatching final cleanup".to_string(),
             };
         }
-    }
 
-    // 4. should_continue + non-empty prompt → Continue
-    if input.should_continue && has_prompt {
-        let prompt = input.next_prompt.as_ref().unwrap();
-        let cleaned = prompt
-            .replace("#ALL_PLAN_DONE", "")
-            .replace("#SKIP", "")
-            .trim()
-            .to_string();
-        if !cleaned.is_empty() {
-            return EvaluationResult::Continue {
-                prompt: cleaned,
-                reason: "LLM says continue with next prompt".to_string(),
-            };
+        // Normal continuation with LLM-provided prompt.
+        if has_prompt {
+            let prompt = input.next_prompt.as_ref().unwrap();
+            let cleaned = prompt
+                .replace("#ALL_PLAN_DONE", "")
+                .replace("#SKIP", "")
+                .trim()
+                .to_string();
+            if !cleaned.is_empty() {
+                return EvaluationResult::Continue {
+                    prompt: cleaned,
+                    reason: "LLM says continue with next prompt".to_string(),
+                };
+            }
         }
+
+        // should_continue=true but no usable prompt.
+        return EvaluationResult::WantsStop {
+            reason: "LLM says continue but provided no usable prompt".to_string(),
+        };
     }
 
-    // 5. Everything else → WantsStop
+    // ── LLM says stop ──────────────────────────────────────────
+
+    // Override: detect_remaining_work flips stop → continue.
+    if let Some(remaining_prompt) = detect_remaining_work(input.last_assistant_message.as_deref()) {
+        return EvaluationResult::Continue {
+            prompt: remaining_prompt,
+            reason: "LLM says stop but last_assistant_message contains remaining work — overriding to continue".to_string(),
+        };
+    }
+
+    // Default: respect LLM's stop decision.
     let reason = match (&input.reason, has_prompt) {
         (Some(r), _) => r.clone(),
         (None, false) => "LLM says stop, no next prompt".to_string(),
@@ -2843,7 +2839,7 @@ mod tests {
             result,
             EvaluationResult::Continue {
                 prompt: "do next plan work".to_string(),
-                reason: "current plan done, LLM wants to continue with next plan".to_string(),
+                reason: "current plan done, transitioning to next plan".to_string(),
             }
         );
     }
@@ -2851,8 +2847,8 @@ mod tests {
     #[test]
     fn test_eval_all_done_should_continue_no_next_plan() {
         let input = EvaluationInput {
-            all_plan_done: true,
             should_continue: true,
+            all_plan_done: true,
             ..make_input()
         };
         let result = evaluate_response(&input);
@@ -2875,7 +2871,7 @@ mod tests {
         assert_eq!(
             result,
             EvaluationResult::WantsStop {
-                reason: "all plans done, LLM says stop".to_string(),
+                reason: "LLM says stop, no next prompt".to_string(),
             }
         );
     }
@@ -3093,7 +3089,7 @@ mod tests {
         assert_eq!(
             result,
             EvaluationResult::WantsStop {
-                reason: "all plans done, LLM says stop".to_string(),
+                reason: "LLM says stop, no next prompt".to_string(),
             }
         );
     }
@@ -3110,7 +3106,7 @@ mod tests {
         assert_eq!(
             result,
             EvaluationResult::WantsStop {
-                reason: "all plans done, LLM says stop".to_string(),
+                reason: "LLM says stop, no next prompt".to_string(),
             }
         );
     }
@@ -3261,7 +3257,7 @@ mod tests {
     }
 
     #[test]
-    fn test_handbrake_triggers_during_working_phase_when_should_continue_false() {
+    fn test_should_continue_false_respected_without_handbrake() {
         let input = EvaluationInput {
             should_continue: false,
             next_prompt: None,
@@ -3274,7 +3270,7 @@ mod tests {
         let result = evaluate_response(&input);
         assert!(
             matches!(result, EvaluationResult::WantsStop { .. }),
-            "handbrake SHOULD trigger during Working phase when LLM also says should_continue=false and worker declared stopping"
+            "should_continue=false should be respected directly — no handbrake needed when LLM already says stop"
         );
     }
 
