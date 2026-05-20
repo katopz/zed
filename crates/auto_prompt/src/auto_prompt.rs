@@ -407,6 +407,12 @@ pub enum EvaluationResult {
     Continue { prompt: String, reason: String },
     /// LLM wants to stop — must go through verification gate.
     WantsStop { reason: String },
+    /// Rules-based detection found potential remaining work — needs LLM second opinion
+    /// before deciding. Contains the extracted section and what the rule matched on.
+    NeedsSecondOpinion {
+        extracted_section: String,
+        rule_reason: String,
+    },
 }
 
 /// Pure function — no side effects, no atomics, fully testable.
@@ -487,11 +493,14 @@ pub fn evaluate_response(input: &EvaluationInput) -> EvaluationResult {
 
     // ── LLM says stop ──────────────────────────────────────────
 
-    // Override: detect_remaining_work flips stop → continue.
+    // Rules-based detection found potential remaining work — defer to LLM second opinion
+    // instead of force-overriding. The extracted section goes to a lightweight LLM call
+    // that decides whether this is real remaining work or a false positive.
     if let Some(remaining_prompt) = detect_remaining_work(input.last_assistant_message.as_deref()) {
-        return EvaluationResult::Continue {
-            prompt: remaining_prompt,
-            reason: "LLM says stop but last_assistant_message contains remaining work — overriding to continue".to_string(),
+        return EvaluationResult::NeedsSecondOpinion {
+            extracted_section: remaining_prompt,
+            rule_reason: "LLM says stop but last_assistant_message contains remaining work pattern"
+                .to_string(),
         };
     }
 
@@ -892,6 +901,100 @@ pub async fn decide_with_llm(
                         profile_id: data.profile_id.clone(),
                         actual_input_tokens: data.actual_input_tokens,
                     }))
+                }
+                EvaluationResult::NeedsSecondOpinion {
+                    extracted_section,
+                    rule_reason,
+                } => {
+                    log::info!(
+                        "[auto_prompt::decide_with_llm] Evaluation: NeedsSecondOpinion — {rule_reason}"
+                    );
+
+                    let second_opinion_system = "# version: second_opinion\n\
+                        You are a second-opinion judge. The main orchestration LLM said 'stop' \
+                        but pattern detection found potential remaining work in the worker AI's last message.\n\n\
+                        Respond ONLY with valid JSON:\n\
+                        {\"should_continue\": bool, \"next_prompt\": null, \"reason\": string, \"all_plan_done\": false, \"confidence\": 0.8, \"thread_summary\": null}\n\n\
+                        ## Rules:\n\
+                        1. Read the extracted section carefully — is there SPECIFIC, ACTIONABLE remaining work?\n\
+                        2. Generic statements like 'remaining work:' followed by nothing actionable → should_continue=false\n\
+                        3. Summary/completion messages that happen to contain trigger words → should_continue=false\n\
+                        4. Actual unchecked tasks, bugs to fix, features to implement → should_continue=true\n\
+                        5. When in doubt, favor stopping (should_continue=false) — the main LLM already said stop";
+
+                    let second_opinion_context = format!(
+                        "## Main LLM decision\n- should_continue: false\n- reason: {}\n\n\
+                         ## Pattern detection\n- rule: {}\n\n\
+                         ## Extracted section\n{}\n\n\
+                         ## Last assistant message (for context)\n{}",
+                        input.reason.as_deref().unwrap_or("(none)"),
+                        rule_reason,
+                        extracted_section,
+                        data.last_assistant_message.as_deref().unwrap_or("(none)"),
+                    );
+
+                    match call_language_model(
+                        &data.model,
+                        second_opinion_system,
+                        &second_opinion_context,
+                        cx,
+                    )
+                    .await
+                    {
+                        Ok((_raw, response)) => {
+                            if response.should_continue {
+                                log::info!(
+                                    "[auto_prompt::decide_with_llm] Second opinion: Continue — {:?}",
+                                    response.reason
+                                );
+                                let next_prompt = with_first_prompt_context(
+                                    extracted_section,
+                                    prompt_summary.as_deref(),
+                                    data.title.as_deref(),
+                                    data.last_assistant_message.as_deref(),
+                                );
+                                Ok(AutoPromptOutcome::Continue(AutoPromptAction {
+                                    from_session_id: data.session_id,
+                                    from_title: data.title,
+                                    next_prompt,
+                                    work_dirs: data.work_dirs,
+                                    original_user_message: data.original_user_message,
+                                    profile_id: data.profile_id.clone(),
+                                    actual_input_tokens: data.actual_input_tokens,
+                                }))
+                            } else {
+                                let stop_reason = format!(
+                                    "second opinion confirmed stop: {}",
+                                    response.reason.as_deref().unwrap_or("no reason given")
+                                );
+                                log::info!("[auto_prompt::decide_with_llm] {stop_reason}");
+                                write_stop_log(
+                                    data.project_root.as_ref(),
+                                    data.iteration_count,
+                                    &stop_reason,
+                                );
+                                reset_iteration();
+                                Ok(AutoPromptOutcome::Stopped {
+                                    reason: stop_reason,
+                                })
+                            }
+                        }
+                        Err(err) => {
+                            let stop_reason = format!(
+                                "second opinion LLM call failed: {err:#} — defaulting to stop"
+                            );
+                            log::warn!("[auto_prompt::decide_with_llm] {stop_reason}");
+                            write_stop_log(
+                                data.project_root.as_ref(),
+                                data.iteration_count,
+                                &stop_reason,
+                            );
+                            reset_iteration();
+                            Ok(AutoPromptOutcome::Stopped {
+                                reason: stop_reason,
+                            })
+                        }
+                    }
                 }
                 EvaluationResult::WantsStop { reason } => {
                     if input.is_synthetic_failure {
@@ -2884,12 +2987,10 @@ mod tests {
             ..make_input()
         };
         let result = evaluate_response(&input);
-        match result {
-            EvaluationResult::Continue { reason, .. } => {
-                assert!(reason.contains("remaining work"));
-            }
-            _ => panic!("expected Continue override, got {result:?}"),
-        }
+        assert!(
+            matches!(result, EvaluationResult::NeedsSecondOpinion { .. }),
+            "expected NeedsSecondOpinion for remaining work pattern, got {result:?}"
+        );
     }
 
     #[test]
@@ -2900,12 +3001,10 @@ mod tests {
             ..make_input()
         };
         let result = evaluate_response(&input);
-        match result {
-            EvaluationResult::Continue { reason, .. } => {
-                assert!(reason.contains("remaining work"));
-            }
-            _ => panic!("expected Continue override, got {result:?}"),
-        }
+        assert!(
+            matches!(result, EvaluationResult::NeedsSecondOpinion { .. }),
+            "expected NeedsSecondOpinion for unchecked checkbox pattern, got {result:?}"
+        );
     }
 
     #[test]
@@ -2916,12 +3015,10 @@ mod tests {
             ..make_input()
         };
         let result = evaluate_response(&input);
-        match result {
-            EvaluationResult::Continue { reason, .. } => {
-                assert!(reason.contains("remaining work"));
-            }
-            _ => panic!("expected Continue override, got {result:?}"),
-        }
+        assert!(
+            matches!(result, EvaluationResult::NeedsSecondOpinion { .. }),
+            "expected NeedsSecondOpinion for TODO pattern, got {result:?}"
+        );
     }
 
     #[test]
@@ -2964,11 +3061,13 @@ mod tests {
         };
         let result = evaluate_response(&input);
         match result {
-            EvaluationResult::Continue { prompt, .. } => {
-                assert!(prompt.contains("Fix the bug"));
-                assert!(prompt.contains("false positive"));
+            EvaluationResult::NeedsSecondOpinion {
+                extracted_section, ..
+            } => {
+                assert!(extracted_section.contains("Fix the bug"));
+                assert!(extracted_section.contains("false positive"));
             }
-            _ => panic!("expected Continue override, got {result:?}"),
+            _ => panic!("expected NeedsSecondOpinion, got {result:?}"),
         }
     }
 
@@ -3890,11 +3989,9 @@ mod tests {
             ..make_input()
         };
         let result = evaluate_response(&input);
-        match result {
-            EvaluationResult::Continue { reason, .. } => {
-                assert!(reason.contains("remaining work"));
-            }
-            _ => panic!("expected Continue override for real checkbox, got {result:?}"),
-        }
+        assert!(
+            matches!(result, EvaluationResult::NeedsSecondOpinion { .. }),
+            "expected NeedsSecondOpinion for real checkbox with skipped, got {result:?}"
+        );
     }
 }
