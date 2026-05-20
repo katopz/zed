@@ -342,6 +342,8 @@ pub enum AgentInitialContent {
     ThreadSummary {
         session_id: acp::SessionId,
         title: Option<SharedString>,
+        follow_up: Option<String>,
+        auto_submit: bool,
     },
     ContentBlock {
         blocks: Vec<acp::ContentBlock>,

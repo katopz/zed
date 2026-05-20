@@ -408,8 +408,14 @@ impl ThreadView {
             );
             if let Some(content) = initial_content {
                 match content {
-                    AgentInitialContent::ThreadSummary { session_id, title } => {
-                        editor.insert_thread_summary(session_id, title, window, cx);
+                    AgentInitialContent::ThreadSummary {
+                        session_id,
+                        title,
+                        follow_up,
+                        auto_submit,
+                    } => {
+                        editor.insert_thread_summary(session_id, title, follow_up, window, cx);
+                        should_auto_submit = auto_submit;
                     }
                     AgentInitialContent::ContentBlock {
                         blocks,
@@ -4407,6 +4413,8 @@ impl ThreadView {
                                             work_dirs: action.work_dirs,
                                             original_user_message: action.original_user_message,
                                             profile_id: action.profile_id,
+                                            last_assistant_message: None,
+                                            decision_prompt: None,
                                         });
                                         window.dispatch_action(action, cx);
                                     }) {
@@ -5598,7 +5606,7 @@ impl ThreadView {
         let continue_prompt = "Review your progress and continue any remaining work. If everything is complete, commit all changes with conventional commit messages.".to_string();
 
         let next_prompt = auto_prompt::with_first_prompt_context(
-            continue_prompt,
+            continue_prompt.clone(),
             original_user_message.as_deref(),
             title.as_deref(),
             last_assistant_message.as_deref(),
@@ -5611,6 +5619,8 @@ impl ThreadView {
             work_dirs,
             original_user_message,
             profile_id,
+            last_assistant_message,
+            decision_prompt: Some(continue_prompt),
         });
 
         window.dispatch_action(action, cx);

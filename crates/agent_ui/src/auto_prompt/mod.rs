@@ -183,6 +183,14 @@ pub struct AutoPromptNewThread {
     /// carried across chain hops to preserve the user's selection.
     #[serde(default)]
     pub profile_id: Option<String>,
+    /// The last assistant message from the previous thread, used to build
+    /// the follow-up section after the LLM-generated summary.
+    #[serde(default)]
+    pub last_assistant_message: Option<String>,
+    /// The decision/continue prompt for the new thread, used to build
+    /// the follow-up section after the LLM-generated summary.
+    #[serde(default)]
+    pub decision_prompt: Option<String>,
 }
 
 fn dispatch_action(
@@ -251,6 +259,8 @@ fn dispatch_action(
         work_dirs: action.work_dirs,
         original_user_message: action.original_user_message,
         profile_id: action.profile_id,
+        last_assistant_message: None,
+        decision_prompt: None,
     });
 
     window.dispatch_action(action, cx);

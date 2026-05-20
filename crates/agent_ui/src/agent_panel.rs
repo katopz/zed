@@ -1444,6 +1444,10 @@ impl AgentPanel {
 
     /// Handler for `AutoPromptNewThread` — creates a new thread with the
     /// previous thread's summary link + the external LLM's next_prompt, auto-submits.
+    ///
+    /// When `last_assistant_message` or `decision_prompt` are provided (manual click),
+    /// uses `ThreadSummary` which shows a loading indicator while the LLM generates
+    /// a summary, then appends the follow-up sections and auto-submits.
     fn auto_prompt_new_thread(
         &mut self,
         action: &AutoPromptNewThread,
@@ -1458,33 +1462,60 @@ impl AgentPanel {
 
         let from_session_id = action.from_session_id.clone();
         let from_title = action.from_title.clone();
-        let next_prompt = action.next_prompt.clone();
-
-        // Strip nested [@...](zed:///...) markdown links from the title to avoid
-        // [@[@...]()]() when auto_prompt chains multiple times.
-        let raw_title = from_title.as_deref().unwrap_or("Thread");
-        let mut clean_title = raw_title.to_string();
-        while let Some(rest) = clean_title.strip_prefix("[@") {
-            if let Some(end) = rest.find("](zed:///agent/thread/") {
-                clean_title = rest[..end].to_string();
-            } else {
-                break;
-            }
-        }
-
-        let mention_uri = MentionUri::Thread {
-            id: from_session_id,
-            name: clean_title,
-        };
-        let summary_link = format!("{}\n\n", mention_uri.as_link());
-
-        let full_prompt = format!("{summary_link}{next_prompt}");
-
-        let blocks = vec![agent_client_protocol::schema::ContentBlock::Text(
-            agent_client_protocol::schema::TextContent::new(full_prompt),
-        )];
-
         let work_dirs = action.work_dirs.as_ref().map(|dirs| PathList::new(dirs));
+
+        let initial_content = if action.last_assistant_message.is_some()
+            || action.decision_prompt.is_some()
+        {
+            let follow_up = Self::build_auto_prompt_follow_up(
+                action.last_assistant_message.as_deref(),
+                action.decision_prompt.as_deref(),
+            );
+
+            log::info!(
+                "[auto_prompt] auto_prompt_new_thread: using ThreadSummary with follow_up ({} chars)",
+                follow_up.as_ref().map_or(0, |s| s.len())
+            );
+
+            AgentInitialContent::ThreadSummary {
+                session_id: from_session_id,
+                title: from_title.map(SharedString::from),
+                follow_up,
+                auto_submit: true,
+            }
+        } else {
+            let next_prompt = action.next_prompt.clone();
+
+            // Strip nested [@...](zed:///...) markdown links from the title to avoid
+            // [@[@...]()]() when auto_prompt chains multiple times.
+            let raw_title = from_title.as_deref().unwrap_or("Thread");
+            let mut clean_title = raw_title.to_string();
+            while let Some(rest) = clean_title.strip_prefix("[@") {
+                if let Some(end) = rest.find("](zed:///agent/thread/") {
+                    clean_title = rest[..end].to_string();
+                } else {
+                    break;
+                }
+            }
+
+            let mention_uri = MentionUri::Thread {
+                id: from_session_id,
+                name: clean_title,
+            };
+            let summary_link = format!("{}\n\n", mention_uri.as_link());
+            let full_prompt = format!("{summary_link}{next_prompt}");
+
+            let blocks = vec![agent_client_protocol::schema::ContentBlock::Text(
+                agent_client_protocol::schema::TextContent::new(full_prompt),
+            )];
+
+            AgentInitialContent::ContentBlock {
+                blocks,
+                auto_submit: true,
+                auto_prompt_enabled: true,
+                profile_id: action.profile_id.clone(),
+            }
+        };
 
         log::info!(
             "[auto_prompt] auto_prompt_new_thread: calling external_thread with auto_submit=true"
@@ -1495,12 +1526,7 @@ impl AgentPanel {
             None,
             work_dirs,
             None,
-            Some(AgentInitialContent::ContentBlock {
-                blocks,
-                auto_submit: true,
-                auto_prompt_enabled: true,
-                profile_id: action.profile_id.clone(),
-            }),
+            Some(initial_content),
             true,
             "auto_prompt",
             window,
@@ -1508,6 +1534,36 @@ impl AgentPanel {
         );
 
         log::info!("[auto_prompt] auto_prompt_new_thread: thread created successfully");
+    }
+
+    /// Build the follow-up sections (Last Assistant Message + Decision) for the
+    /// `ThreadSummary` initial content used by manual auto_prompt clicks.
+    fn build_auto_prompt_follow_up(
+        last_assistant_message: Option<&str>,
+        decision_prompt: Option<&str>,
+    ) -> Option<String> {
+        let mut parts = Vec::new();
+
+        if let Some(last) = last_assistant_message.filter(|s| !s.trim().is_empty()) {
+            parts.push("## 2. Last Assistant Message".to_string());
+            parts.push(String::new());
+            parts.push(last.trim().to_string());
+            parts.push(String::new());
+            parts.push("---".to_string());
+        }
+
+        if let Some(decision) = decision_prompt.filter(|s| !s.trim().is_empty()) {
+            parts.push(String::new());
+            parts.push("## 3. Decision".to_string());
+            parts.push(String::new());
+            parts.push(decision.trim().to_string());
+        }
+
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join("\n"))
+        }
     }
 
     fn initial_content_for_thread_summary(
@@ -1522,6 +1578,8 @@ impl AgentPanel {
         Some(AgentInitialContent::ThreadSummary {
             session_id: thread.id,
             title: Some(thread.title),
+            follow_up: None,
+            auto_submit: false,
         })
     }
 
@@ -5157,12 +5215,19 @@ mod tests {
             .expect("initial content should be produced for a root thread");
 
         match content {
-            AgentInitialContent::ThreadSummary { session_id, title } => {
+            AgentInitialContent::ThreadSummary {
+                session_id,
+                title,
+                follow_up,
+                auto_submit,
+            } => {
                 assert_eq!(
                     session_id, source_session_id,
                     "thread-summary mention should use the source thread's own session id"
                 );
                 assert_eq!(title, Some(source_title.clone()));
+                assert_eq!(follow_up, None);
+                assert!(!auto_submit);
             }
             _ => panic!("expected AgentInitialContent::ThreadSummary"),
         }

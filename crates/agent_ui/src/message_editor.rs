@@ -616,6 +616,7 @@ impl MessageEditor {
         &mut self,
         session_id: acp::SessionId,
         title: Option<SharedString>,
+        follow_up: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -632,15 +633,22 @@ impl MessageEditor {
             id: session_id,
             name: thread_title.to_string(),
         };
-        let content = format!("{}\n", uri.as_link());
-
-        let content_len = content.len() - 1;
+        let mention_text = format!("{}\n", uri.as_link());
+        let mention_len = mention_text.len() - 1;
+        let (content, mention_start_row) = match &follow_up {
+            Some(follow_up_text) => (
+                format!("## 1. Summary\n\n{mention_text}\n{follow_up_text}"),
+                2,
+            ),
+            None => (mention_text, 0),
+        };
 
         let start = self.editor.update(cx, |editor, cx| {
             editor.set_text(content, window, cx);
             let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let start_point = Point::new(mention_start_row, 0);
             snapshot
-                .anchor_to_buffer_anchor(snapshot.anchor_before(Point::zero()))
+                .anchor_to_buffer_anchor(snapshot.anchor_before(start_point))
                 .unwrap()
                 .0
         });
@@ -652,7 +660,7 @@ impl MessageEditor {
                 mention_set.confirm_mention_completion(
                     thread_title,
                     start,
-                    content_len,
+                    mention_len,
                     uri,
                     supports_images,
                     self.editor.clone(),
@@ -3150,7 +3158,7 @@ mod tests {
                     window,
                     cx,
                 );
-                editor.insert_thread_summary(session_id.clone(), title.clone(), window, cx);
+                editor.insert_thread_summary(session_id.clone(), title.clone(), None, window, cx);
                 editor
             })
         });
@@ -3222,6 +3230,7 @@ mod tests {
                 editor.insert_thread_summary(
                     acp::SessionId::new("thread-123"),
                     Some("Previous Conversation".into()),
+                    None,
                     window,
                     cx,
                 );
