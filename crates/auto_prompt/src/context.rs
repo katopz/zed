@@ -3,6 +3,9 @@ use chrono::Local;
 use gpui::App;
 use serde::{Deserialize, Serialize};
 
+const MAX_ASSISTANT_CHUNK_BYTES: usize = 10000;
+const MAX_TOOL_CONTENT_BYTES: usize = 5000;
+
 /// Phase of the auto-prompt stop lifecycle.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -181,6 +184,19 @@ impl AutoPromptContext {
                     for chunk in &msg.chunks {
                         let content = chunk.block().to_markdown(cx).to_string();
                         if !content.is_empty() {
+                            let content = if content.len() > MAX_ASSISTANT_CHUNK_BYTES {
+                                let mut end = MAX_ASSISTANT_CHUNK_BYTES;
+                                while !content.is_char_boundary(end) {
+                                    end -= 1;
+                                }
+                                format!(
+                                    "{}…\n[truncated: {} bytes total]",
+                                    &content[..end],
+                                    content.len()
+                                )
+                            } else {
+                                content
+                            };
                             messages.push(ContextMessage {
                                 role: ContextMessageRole::Assistant,
                                 content,
@@ -481,7 +497,7 @@ fn serialize_tool_call(tool: &ToolCall, cx: &App) -> String {
     } else if let Some(raw_input) = &tool.raw_input {
         let input_str =
             serde_json::to_string_pretty(raw_input).unwrap_or_else(|_| raw_input.to_string());
-        if input_str.len() < 2000 {
+        if input_str.len() < MAX_TOOL_CONTENT_BYTES {
             parts.push(format!("Input: {input_str}"));
         }
     }
@@ -489,8 +505,18 @@ fn serialize_tool_call(tool: &ToolCall, cx: &App) -> String {
     if let Some(raw_output) = &tool.raw_output {
         let output_str =
             serde_json::to_string_pretty(raw_output).unwrap_or_else(|_| raw_output.to_string());
-        if output_str.len() < 2000 {
+        if output_str.len() < MAX_TOOL_CONTENT_BYTES {
             parts.push(format!("Output: {output_str}"));
+        } else {
+            let mut end = MAX_TOOL_CONTENT_BYTES;
+            while !output_str.is_char_boundary(end) {
+                end -= 1;
+            }
+            parts.push(format!(
+                "Output: {}…\n[truncated: {} bytes total]",
+                &output_str[..end],
+                output_str.len()
+            ));
         }
     }
 

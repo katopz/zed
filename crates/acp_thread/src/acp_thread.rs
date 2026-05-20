@@ -2122,6 +2122,7 @@ impl AcpThread {
                     sandbox_authorization_details: None,
                 };
                 self.push_entry(AgentThreadEntry::ToolCall(failed_tool_call), cx);
+                self.had_error = true;
                 return Ok(());
             }
         };
@@ -2156,6 +2157,12 @@ impl AcpThread {
         }
 
         cx.emit(AcpThreadEvent::EntryUpdated(ix));
+
+        if let AgentThreadEntry::ToolCall(call) = &self.entries[ix] {
+            if matches!(call.status, ToolCallStatus::Failed) {
+                self.had_error = true;
+            }
+        }
 
         Ok(())
     }

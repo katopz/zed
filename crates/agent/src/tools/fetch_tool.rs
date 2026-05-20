@@ -55,9 +55,35 @@ impl FetchTool {
             .context("error reading response body")?;
 
         if response.status().is_client_error() {
-            let text = String::from_utf8_lossy(body.as_slice());
+            let text = if response
+                .headers()
+                .get("content-type")
+                .and_then(|ct| ct.to_str().ok())
+                .is_some_and(|ct| ct.starts_with("text/html"))
+            {
+                let mut handlers: Vec<TagHandler> = vec![
+                    Rc::new(RefCell::new(markdown::WebpageChromeRemover)),
+                    Rc::new(RefCell::new(markdown::ParagraphHandler)),
+                ];
+                convert_html_to_markdown(&body[..], &mut handlers)
+                    .unwrap_or_else(|_| String::from_utf8_lossy(&body).into_owned())
+            } else {
+                String::from_utf8_lossy(body.as_slice()).into_owned()
+            };
+
+            const MAX_ERROR_BODY_CHARS: usize = 1000;
+            let text = if text.len() > MAX_ERROR_BODY_CHARS {
+                let mut end = MAX_ERROR_BODY_CHARS;
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                format!("{}… [truncated]", &text[..end])
+            } else {
+                text
+            };
+
             bail!(
-                "status error {}, response: {text:?}",
+                "status error {}, response: {text}",
                 response.status().as_u16()
             );
         }
