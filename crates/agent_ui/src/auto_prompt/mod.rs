@@ -259,7 +259,7 @@ fn dispatch_action(
         work_dirs: action.work_dirs,
         original_user_message: action.original_user_message,
         profile_id: action.profile_id,
-        last_assistant_message: None,
+        last_assistant_message: action.last_assistant_message,
         decision_prompt: None,
     });
 
