@@ -117,6 +117,9 @@ pub struct AutoPromptAction {
     /// Used by dispatch to decide same-thread vs new-thread continuation.
     /// Falls back to None when usage data is unavailable.
     pub actual_input_tokens: Option<u64>,
+    /// The last assistant message from the previous thread,
+    /// passed to ThreadSummary for loading indicator + summary flow.
+    pub last_assistant_message: Option<String>,
 }
 
 /// Outcome of an auto-prompt LLM decision.
@@ -923,6 +926,7 @@ pub async fn decide_with_llm(
                         original_user_message: data.original_user_message,
                         profile_id: data.profile_id.clone(),
                         actual_input_tokens: data.actual_input_tokens,
+                        last_assistant_message: data.last_assistant_message.clone(),
                     }))
                 }
                 EvaluationResult::NeedsSecondOpinion {
@@ -984,6 +988,7 @@ pub async fn decide_with_llm(
                                     original_user_message: data.original_user_message,
                                     profile_id: data.profile_id.clone(),
                                     actual_input_tokens: data.actual_input_tokens,
+                                    last_assistant_message: data.last_assistant_message.clone(),
                                 }))
                             } else {
                                 let stop_reason = format!(
@@ -1117,6 +1122,7 @@ pub async fn decide_with_llm(
                                     original_user_message: data.original_user_message,
                                     profile_id: data.profile_id.clone(),
                                     actual_input_tokens: data.actual_input_tokens,
+                                    last_assistant_message: data.last_assistant_message.clone(),
                                 }))
                             }
                             Some(parsed) => {
@@ -1184,6 +1190,7 @@ pub async fn decide_with_llm(
                                         original_user_message: data.original_user_message,
                                         profile_id: data.profile_id.clone(),
                                         actual_input_tokens: data.actual_input_tokens,
+                                        last_assistant_message: data.last_assistant_message.clone(),
                                     }))
                                 }
                                 None => {
