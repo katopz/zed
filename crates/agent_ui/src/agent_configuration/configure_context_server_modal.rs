@@ -22,7 +22,10 @@ use project::{
 };
 use serde::Deserialize;
 use settings::{Settings as _, update_settings_file};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use theme_settings::ThemeSettings;
 use ui::{
     CommonAnimationExt, KeyBinding, Modal, ModalFooter, ModalHeader, Section, Tooltip,
@@ -1289,6 +1292,7 @@ fn wait_for_context_server(
 
     let (tx, rx) = futures::channel::oneshot::channel();
     let tx = Arc::new(Mutex::new(Some(tx)));
+    let has_started = Arc::new(AtomicBool::new(false));
 
     let context_server_id_for_timeout = context_server_id.clone();
     let subscription = cx.subscribe(context_server_store, move |_, event, _cx| {
@@ -1307,8 +1311,10 @@ fn wait_for_context_server(
                 }
             }
             ContextServerStatus::Stopped => {
-                if let Some(tx) = tx.lock().take() {
-                    let _ = tx.send(Err("Context server stopped running".into()));
+                if has_started.load(Ordering::Relaxed) {
+                    if let Some(tx) = tx.lock().take() {
+                        let _ = tx.send(Err("Context server stopped running".into()));
+                    }
                 }
             }
             ContextServerStatus::Error(error) => {
@@ -1316,7 +1322,10 @@ fn wait_for_context_server(
                     let _ = tx.send(Err(error.clone()));
                 }
             }
-            ContextServerStatus::Starting | ContextServerStatus::Authenticating => {}
+            ContextServerStatus::Starting => {
+                has_started.store(true, Ordering::Relaxed);
+            }
+            ContextServerStatus::Authenticating => {}
         }
     });
 
