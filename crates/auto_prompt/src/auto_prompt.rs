@@ -1200,9 +1200,31 @@ pub async fn decide_with_llm(
                                         actual_input_tokens: data.actual_input_tokens,
                                         last_assistant_message: data.last_assistant_message.clone(),
                                     }))
+                                } else if let Some(plan_prompt) =
+                                    detect_remaining_plan_tasks(&data.context_json)
+                                {
+                                    log::warn!(
+                                        "auto_prompt: PLAN TASK FALLBACK — detect_remaining_work found nothing but plan files have unchecked tasks"
+                                    );
+                                    let next_prompt = with_first_prompt_context(
+                                        plan_prompt,
+                                        prompt_summary.as_deref(),
+                                        data.title.as_deref(),
+                                        data.last_assistant_message.as_deref(),
+                                    );
+                                    Ok(AutoPromptOutcome::Continue(AutoPromptAction {
+                                        from_session_id: data.session_id,
+                                        from_title: data.title,
+                                        next_prompt,
+                                        work_dirs: data.work_dirs,
+                                        original_user_message: data.original_user_message,
+                                        profile_id: data.profile_id.clone(),
+                                        actual_input_tokens: data.actual_input_tokens,
+                                        last_assistant_message: data.last_assistant_message.clone(),
+                                    }))
                                 } else {
                                     log::info!(
-                                        "auto_prompt: safety net found no remaining work patterns — accepting retry stop"
+                                        "auto_prompt: all safety nets exhausted — no remaining work patterns and no unchecked plan tasks, accepting retry stop"
                                     );
                                     write_stop_log(
                                         data.project_root.as_ref(),
@@ -1242,15 +1264,37 @@ pub async fn decide_with_llm(
                                         actual_input_tokens: data.actual_input_tokens,
                                         last_assistant_message: data.last_assistant_message.clone(),
                                     }))
+                                } else if let Some(plan_prompt) =
+                                    detect_remaining_plan_tasks(&data.context_json)
+                                {
+                                    log::warn!(
+                                        "auto_prompt: PLAN TASK FALLBACK — all retries failed but plan files have unchecked tasks"
+                                    );
+                                    let next_prompt = with_first_prompt_context(
+                                        plan_prompt,
+                                        prompt_summary.as_deref(),
+                                        data.title.as_deref(),
+                                        data.last_assistant_message.as_deref(),
+                                    );
+                                    Ok(AutoPromptOutcome::Continue(AutoPromptAction {
+                                        from_session_id: data.session_id,
+                                        from_title: data.title,
+                                        next_prompt,
+                                        work_dirs: data.work_dirs,
+                                        original_user_message: data.original_user_message,
+                                        profile_id: data.profile_id.clone(),
+                                        actual_input_tokens: data.actual_input_tokens,
+                                        last_assistant_message: data.last_assistant_message.clone(),
+                                    }))
                                 } else {
                                     log::warn!(
-                                        "auto_prompt: safety net found no remaining work — last_assistant_message had no actionable patterns, giving up"
+                                        "auto_prompt: all safety nets exhausted — no remaining work patterns and no unchecked plan tasks, giving up"
                                     );
                                     write_stop_log(
                                         data.project_root.as_ref(),
                                         data.iteration_count,
                                         &format!(
-                                            "lightweight retry failed after 3 attempts, no remaining work detected: {reason}"
+                                            "lightweight retry failed after 3 attempts, no remaining work or plan tasks detected: {reason}"
                                         ),
                                     );
                                     reset_iteration();
@@ -2493,6 +2537,36 @@ fn detect_remaining_work(last_assistant_message: Option<&str>) -> Option<String>
     }
 
     None
+}
+
+fn detect_remaining_plan_tasks(context_json: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Ctx {
+        #[serde(default)]
+        plan_files: Vec<context::PlanFileContent>,
+    }
+    let ctx = serde_json::from_str::<Ctx>(context_json).ok()?;
+    let mut remaining = Vec::new();
+    for plan in &ctx.plan_files {
+        let count = count_actionable_tasks(&plan.content);
+        if count > 0 {
+            let filename = plan.path.rsplit('/').next().unwrap_or("?");
+            remaining.push(format!("- {filename}: {count} unchecked task(s)"));
+        }
+    }
+    if remaining.is_empty() {
+        return None;
+    }
+    log::warn!(
+        "[auto_prompt::detect_remaining_plan_tasks] Found {} plan file(s) with unchecked tasks:\n{}",
+        remaining.len(),
+        remaining.join("\n")
+    );
+    Some(format!(
+        "LLM orchestration failed but plan files have remaining unchecked tasks:\n\n{}\n\n\
+         Continue with the next unchecked task. Mark completed steps as [x].",
+        remaining.join("\n")
+    ))
 }
 
 fn build_pre_stop_verification_prompt(
@@ -4127,6 +4201,74 @@ mod tests {
         assert!(
             matches!(result, EvaluationResult::NeedsSecondOpinion { .. }),
             "expected NeedsSecondOpinion for real checkbox with skipped, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_detect_remaining_plan_tasks_no_plan_files() {
+        let context_json = r#"{"messages":[]}"#;
+        let result = detect_remaining_plan_tasks(context_json);
+        assert!(result.is_none(), "no plan_files field => None");
+    }
+
+    #[test]
+    fn test_detect_remaining_plan_tasks_all_checked() {
+        let context_json = r##"{"plan_files":[{"path":".plans/001_test.md","content":"# Plan\n\n- [x] Done task\n- [x] Another done task"}]}"##;
+        let result = detect_remaining_plan_tasks(context_json);
+        assert!(result.is_none(), "all tasks checked => None");
+    }
+
+    #[test]
+    fn test_detect_remaining_plan_tasks_has_unchecked() {
+        let context_json = r##"{"plan_files":[{"path":".plans/001_test.md","content":"# Plan\n\n- [x] Done\n- [ ] Remaining task\n"}]}"##;
+        let result = detect_remaining_plan_tasks(context_json);
+        assert!(result.is_some(), "unchecked task should return Some");
+        let prompt = result.unwrap();
+        assert!(
+            prompt.contains("001_test.md"),
+            "should mention plan filename"
+        );
+        assert!(
+            prompt.contains("1 unchecked"),
+            "should report 1 unchecked task"
+        );
+        assert!(
+            prompt.contains("Continue with the next unchecked task"),
+            "should instruct to continue"
+        );
+    }
+
+    #[test]
+    fn test_detect_remaining_plan_tasks_multiple_plans() {
+        let context_json = r##"{"plan_files":[
+            {"path":".plans/001_alpha.md","content":"- [x] Done\n- [ ] T2: Fix bug"},
+            {"path":".plans/002_beta.md","content":"- [ ] T1: New feature"},
+            {"path":".plans/003_done.md","content":"- [x] All done"}
+        ]}"##;
+        let result = detect_remaining_plan_tasks(context_json);
+        assert!(result.is_some(), "plans with unchecked tasks => Some");
+        let prompt = result.unwrap();
+        assert!(prompt.contains("001_alpha.md"), "should list alpha");
+        assert!(prompt.contains("002_beta.md"), "should list beta");
+        assert!(
+            !prompt.contains("003_done.md"),
+            "should NOT list fully-done plan"
+        );
+    }
+
+    #[test]
+    fn test_detect_remaining_plan_tasks_invalid_json() {
+        let result = detect_remaining_plan_tasks("not json at all");
+        assert!(result.is_none(), "invalid json => None");
+    }
+
+    #[test]
+    fn test_detect_remaining_plan_tasks_skipped_only_is_not_actionable() {
+        let context_json = r##"{"plan_files":[{"path":".plans/004_skip.md","content":"- [ ] ~~Task A~~ Skipped\n- [ ] ~~Task B~~ — deferred"}]}"##;
+        let result = detect_remaining_plan_tasks(context_json);
+        assert!(
+            result.is_none(),
+            "only skipped/strikethrough checkboxes should not be actionable"
         );
     }
 }
