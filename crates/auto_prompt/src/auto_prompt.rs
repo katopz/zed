@@ -403,6 +403,21 @@ pub struct EvaluationInput {
     pub stop_phase: context::StopPhase,
 }
 
+/// Provenance of the final `should_continue` decision — answers "who decided this?"
+#[derive(Debug, Clone, PartialEq)]
+pub enum DecisionSource {
+    /// LLM produced a real response with confidence >= 0.5.
+    LlmResponse,
+    /// Code overrode because confidence < 0.5 (universal gate).
+    ConfidenceGate,
+    /// Code detected worker AI explicitly declared stopping (handbrake).
+    Handbrake,
+    /// Code detected remaining work patterns via rules (`detect_remaining_work`).
+    RuleRemainingWork,
+    /// LLM said continue but provided no usable prompt.
+    LlmNoPrompt,
+}
+
 /// Result of evaluating an LLM response.
 #[derive(Debug, PartialEq)]
 pub enum EvaluationResult {
@@ -418,7 +433,26 @@ pub enum EvaluationResult {
     },
 }
 
-/// Pure function — no side effects, no atomics, fully testable.
+impl EvaluationResult {
+    pub fn source(&self) -> DecisionSource {
+        match self {
+            EvaluationResult::Continue { .. } => DecisionSource::LlmResponse,
+            EvaluationResult::WantsStop { reason } => {
+                if reason.starts_with("confidence too low") {
+                    DecisionSource::ConfidenceGate
+                } else if reason.starts_with("handbrake") {
+                    DecisionSource::Handbrake
+                } else if reason.contains("no usable prompt") {
+                    DecisionSource::LlmNoPrompt
+                } else {
+                    DecisionSource::LlmResponse
+                }
+            }
+            EvaluationResult::NeedsSecondOpinion { .. } => DecisionSource::RuleRemainingWork,
+        }
+    }
+}
+
 pub fn evaluate_response(input: &EvaluationInput) -> EvaluationResult {
     let has_prompt = input
         .next_prompt
@@ -769,6 +803,23 @@ pub async fn decide_with_llm(
 
     match result {
         Ok((raw_response, mut response)) => {
+            let has_prompt = response
+                .next_prompt
+                .as_ref()
+                .is_some_and(|p| !p.trim().is_empty());
+
+            let is_synthetic_failure = response.confidence <= Some(0.3)
+                && response
+                    .reason
+                    .as_ref()
+                    .is_some_and(|r| r.to_ascii_lowercase().starts_with("model"));
+
+            let response_origin = if is_synthetic_failure {
+                "synthetic"
+            } else {
+                "llm"
+            };
+
             write_decision_log(
                 data.project_root.as_ref(),
                 data.iteration_count,
@@ -778,12 +829,8 @@ pub async fn decide_with_llm(
                 &raw_response,
                 &response,
                 data.actual_input_tokens,
+                response_origin,
             );
-
-            let has_prompt = response
-                .next_prompt
-                .as_ref()
-                .is_some_and(|p| !p.trim().is_empty());
 
             log::info!(
                 "[auto_prompt::decide_with_llm] Response received: should_continue={}, has_next_prompt={}, all_plan_done={}, confidence={:?}",
@@ -833,11 +880,14 @@ pub async fn decide_with_llm(
                 None
             };
 
-            let is_synthetic_failure = response.confidence <= Some(0.3)
-                && response
-                    .reason
-                    .as_ref()
-                    .is_some_and(|r| r.to_ascii_lowercase().starts_with("model"));
+            if is_synthetic_failure {
+                log::warn!(
+                    "[auto_prompt::decide_with_llm] Synthetic failure detected: confidence={:?}, reason={:?} — model did not produce a real response, entering lightweight retry path with detect_remaining_work safety net",
+                    response.confidence,
+                    response.reason
+                );
+            }
+
             let input = EvaluationInput {
                 should_continue: response.should_continue,
                 confidence: response.confidence,
@@ -861,7 +911,8 @@ pub async fn decide_with_llm(
             let evaluation = evaluate_response(&input);
 
             log::info!(
-                "[auto_prompt::decide_with_llm] evaluate_response result: {:?}",
+                "[auto_prompt::decide_with_llm] evaluate_response: source={:?}, result={:?}",
+                evaluation.source(),
                 evaluation
             );
 
@@ -1005,10 +1056,24 @@ pub async fn decide_with_llm(
                     if input.is_synthetic_failure {
                         // Full-context LLM call failed (context too large or model error).
                         // Retry with lightweight context: last message + incomplete plan names only.
+                        log::info!(
+                            "[auto_prompt::decide_with_llm] Building lightweight retry context — last_assistant_message={} chars, has_title={}, reason for WantsStop: {}",
+                            data.last_assistant_message
+                                .as_ref()
+                                .map(|m| m.len())
+                                .unwrap_or(0),
+                            data.title.is_some(),
+                            reason
+                        );
                         let lightweight_ctx = build_lightweight_retry_context(
                             &data.context_json,
                             data.last_assistant_message.as_deref(),
                             data.title.as_deref(),
+                        );
+                        log::info!(
+                            "[auto_prompt::decide_with_llm] Lightweight retry context built ({} chars):\n---\n{}\n---",
+                            lightweight_ctx.len(),
+                            lightweight_ctx.chars().take(800).collect::<String>()
                         );
 
                         let retry_system = "# version: retry\n\
@@ -1109,29 +1174,90 @@ pub async fn decide_with_llm(
                                 log::info!(
                                     "auto_prompt: lightweight retry says stop: {stop_reason}"
                                 );
-                                write_stop_log(
-                                    data.project_root.as_ref(),
-                                    data.iteration_count,
-                                    &format!("lightweight retry: {stop_reason}"),
+                                log::info!(
+                                    "auto_prompt: checking detect_remaining_work safety net before accepting retry stop"
                                 );
-                                reset_iteration();
-                                Ok(AutoPromptOutcome::Stopped {
-                                    reason: stop_reason,
-                                })
+                                if let Some(remaining_prompt) =
+                                    detect_remaining_work(data.last_assistant_message.as_deref())
+                                {
+                                    log::warn!(
+                                        "auto_prompt: SAFETY NET OVERRIDE — detect_remaining_work found actionable work despite retry saying stop. Extracted prompt:\n---\n{}\n---",
+                                        remaining_prompt.chars().take(500).collect::<String>()
+                                    );
+                                    let next_prompt = with_first_prompt_context(
+                                        remaining_prompt,
+                                        prompt_summary.as_deref(),
+                                        data.title.as_deref(),
+                                        data.last_assistant_message.as_deref(),
+                                    );
+                                    Ok(AutoPromptOutcome::Continue(AutoPromptAction {
+                                        from_session_id: data.session_id,
+                                        from_title: data.title,
+                                        next_prompt,
+                                        work_dirs: data.work_dirs,
+                                        original_user_message: data.original_user_message,
+                                        profile_id: data.profile_id.clone(),
+                                        actual_input_tokens: data.actual_input_tokens,
+                                        last_assistant_message: data.last_assistant_message.clone(),
+                                    }))
+                                } else {
+                                    log::info!(
+                                        "auto_prompt: safety net found no remaining work patterns — accepting retry stop"
+                                    );
+                                    write_stop_log(
+                                        data.project_root.as_ref(),
+                                        data.iteration_count,
+                                        &format!("lightweight retry: {stop_reason}"),
+                                    );
+                                    reset_iteration();
+                                    Ok(AutoPromptOutcome::Stopped {
+                                        reason: stop_reason,
+                                    })
+                                }
                             }
                             None => {
                                 log::warn!(
-                                    "auto_prompt: all 3 lightweight retries failed, stopping"
+                                    "auto_prompt: all 3 lightweight retries failed, checking detect_remaining_work safety net"
                                 );
-                                write_stop_log(
-                                    data.project_root.as_ref(),
-                                    data.iteration_count,
-                                    &format!("lightweight retry failed after 3 attempts: {reason}"),
-                                );
-                                reset_iteration();
-                                Ok(AutoPromptOutcome::Stopped {
-                                    reason: format!("lightweight retry failed: {reason}"),
-                                })
+                                if let Some(remaining_prompt) =
+                                    detect_remaining_work(data.last_assistant_message.as_deref())
+                                {
+                                    log::warn!(
+                                        "auto_prompt: SAFETY NET OVERRIDE — detect_remaining_work found actionable work after all retries failed. Extracted prompt:\n---\n{}\n---",
+                                        remaining_prompt.chars().take(500).collect::<String>()
+                                    );
+                                    let next_prompt = with_first_prompt_context(
+                                        remaining_prompt,
+                                        prompt_summary.as_deref(),
+                                        data.title.as_deref(),
+                                        data.last_assistant_message.as_deref(),
+                                    );
+                                    Ok(AutoPromptOutcome::Continue(AutoPromptAction {
+                                        from_session_id: data.session_id,
+                                        from_title: data.title,
+                                        next_prompt,
+                                        work_dirs: data.work_dirs,
+                                        original_user_message: data.original_user_message,
+                                        profile_id: data.profile_id.clone(),
+                                        actual_input_tokens: data.actual_input_tokens,
+                                        last_assistant_message: data.last_assistant_message.clone(),
+                                    }))
+                                } else {
+                                    log::warn!(
+                                        "auto_prompt: safety net found no remaining work — last_assistant_message had no actionable patterns, giving up"
+                                    );
+                                    write_stop_log(
+                                        data.project_root.as_ref(),
+                                        data.iteration_count,
+                                        &format!(
+                                            "lightweight retry failed after 3 attempts, no remaining work detected: {reason}"
+                                        ),
+                                    );
+                                    reset_iteration();
+                                    Ok(AutoPromptOutcome::Stopped {
+                                        reason: format!("lightweight retry failed: {reason}"),
+                                    })
+                                }
                             }
                         }
                     } else {
@@ -1242,6 +1368,7 @@ fn write_decision_log(
     raw_response: &str,
     parsed: &AutoPromptResponse,
     actual_input_tokens: Option<u64>,
+    response_origin: &str,
 ) {
     let logs_dir = match project_root {
         Some(root) => root.join(".logs"),
@@ -1265,6 +1392,7 @@ fn write_decision_log(
         "timestamp": chrono::Local::now().to_rfc3339(),
         "iteration": iteration,
         "model": model,
+        "response_origin": response_origin,
         "request": {
             "system_prompt": system_prompt,
             "context_json": context_json,
