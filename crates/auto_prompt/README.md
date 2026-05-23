@@ -28,21 +28,40 @@ ConversationView::handle_thread_event()
   │
   └─ decide_with_llm() — async LLM call
       ├─ Call orchestration LLM with context JSON
-      ├─ On success:
-      │   ├─ Writes decision log to .logs/ in project root
-      │   ├─ Parse response (should_continue, next_prompt, confidence, all_plan_done, thread_summary)
-      │   ├─ #ALL_PLAN_DONE in prompt or response.all_plan_done?
-      │   │   ├─ Find next plan file → yes → dispatch gitflow commit + next plan
-      │   │   └─ no → should_continue? → gitflow commit : stop chain (reset_iteration)
-      │   ├─ Confidence < 0.5? → stop chain (reset_iteration)
-      │   ├─ should_continue=false AND no next_prompt?
-      │   │   ├─ verification_count=0? → pre-stop verification prompt, increment VERIFICATION_COUNT
-      │   │   ├─ verification_count < max_attempts? → stop (accept stop)
-      │   │   └─ verification_count >= max_attempts? → stop (force stop)
-      │   ├─ Doc creation prompt + unchecked plan items? → override with checkbox verification
-      │   ├─ Prepending thread_summary to every prompt for context grounding
-      │   ├─ Continuing during PreStop (verification_count>0)? → reset VERIFICATION_COUNT
-      │   └─ Return AutoPromptAction with next_prompt
+      ├─ On stream failure (no Text/Thinking content):
+      │   └─ Synthesize: should_continue=false, confidence=0.0, reason="model returned zero events..."
+      ├─ Write decision log with response_origin ("llm" or "synthetic")
+      │
+      ├─ evaluate_response() — pure function, no side effects:
+      │   ├─ Confidence < 0.5? → WantsStop (source: ConfidenceGate)
+      │   ├─ Handbrake (post-verification, worker declared stop)? → WantsStop (source: Handbrake)
+      │   ├─ all_plan_done? → Continue with next plan or cleanup (source: LlmResponse)
+      │   ├─ should_continue + has prompt? → Continue (source: LlmResponse)
+      │   ├─ should_continue + no prompt? → WantsStop (source: LlmNoPrompt)
+      │   ├─ should_continue=false + detect_remaining_work match? → NeedsSecondOpinion (source: RuleRemainingWork)
+      │   └─ should_continue=false, no remaining work? → WantsStop (source: LlmResponse)
+      │
+      ├─ Match evaluation result:
+      │   ├─ Continue → dispatch next thread
+      │   ├─ NeedsSecondOpinion → call LLM again with extracted section
+      │   │   ├─ Second opinion says continue → dispatch
+      │   │   └─ Second opinion says stop → stop
+      │   └─ WantsStop:
+      │       ├─ is_synthetic_failure=true:
+      │       │   ├─ Build lightweight context (last message + plan landscape)
+      │       │   ├─ Retry up to 3x with exponential backoff
+      │       │   ├─ Retry says continue → dispatch
+      │       │   ├─ Retry says stop → detect_remaining_work safety net:
+      │       │   │   ├─ Found actionable work → SAFETY NET OVERRIDE → dispatch
+      │       │   │   └─ No remaining work → accept stop
+      │       │   └─ All retries failed → detect_remaining_work safety net:
+      │       │       ├─ Found actionable work → SAFETY NET OVERRIDE → dispatch
+      │       │       └─ No remaining work → accept stop
+      │       └─ is_synthetic_failure=false (real LLM decision):
+      │           ├─ verification_count=0 → pre-stop verification prompt
+      │           ├─ verification_count < max → accept stop
+      │           └─ verification_count >= max → force stop
+      │
       └─ On error:
           ├─ Auto-retry with exponential backoff (up to max_llm_retries)
           ├─ If retries exhausted:
@@ -59,6 +78,7 @@ sequenceDiagram
     participant CV as ConversationView
     participant decide as decide()
     participant decide_llm as decide_with_llm()
+    participant eval as evaluate_response()
     participant LLM as Orchestration LLM
     participant Workspace as Workspace
 
@@ -92,54 +112,77 @@ sequenceDiagram
             Note over CV,decide_llm: Async LLM Call
             decide_llm->>LLM: Call with context JSON
             
-            alt Success
-                LLM-->>decide_llm: Return response
-                decide_llm->>decide_llm: Write decision log
-                decide_llm->>decide_llm: Parse response
-                
-                alt #ALL_PLAN_DONE
-                    decide_llm->>decide_llm: Find next plan
-                    decide_llm-->>CV: AutoPromptAction with next plan
-                    CV->>Workspace: dispatch_action(AutoPromptNewThread)
-                else Confidence < 0.5
-                    decide_llm-->>CV: None (stop chain, reset_iteration)
-                else Pre-stop verification
-                    decide_llm->>decide_llm: Build verification prompt
-                    decide_llm->>decide_llm: Increment VERIFICATION_COUNT
-                    decide_llm-->>CV: AutoPromptAction with verification
-                    CV->>Workspace: dispatch_action(AutoPromptNewThread)
-                else Continue
-                    decide_llm->>decide_llm: Prepend thread_summary
-                    decide_llm-->>CV: AutoPromptAction with next_prompt
-                    CV->>Workspace: dispatch_action(AutoPromptNewThread)
+            alt Stream success (Text/Thinking received)
+                LLM-->>decide_llm: Real response
+                decide_llm->>decide_llm: response_origin="llm"
+            else Stream failure (no usable content)
+                LLM-->>decide_llm: Zero events or only errors
+                decide_llm->>decide_llm: Synthesize: should_continue=false, confidence=0.0
+                decide_llm->>decide_llm: response_origin="synthetic"
+            end
+            
+            decide_llm->>decide_llm: Write decision log
+            decide_llm->>eval: evaluate_response()
+            
+            alt Confidence < 0.5
+                eval-->>decide_llm: WantsStop (source=ConfidenceGate)
+            else Handbrake triggered
+                eval-->>decide_llm: WantsStop (source=Handbrake)
+            else NeedsSecondOpinion
+                eval-->>decide_llm: NeedsSecondOpinion (source=RuleRemainingWork)
+                decide_llm->>LLM: Second opinion call
+                alt Second opinion says continue
+                    decide_llm-->>CV: AutoPromptAction
+                else Second opinion says stop
+                    decide_llm-->>CV: Stopped
                 end
-            else Error (auto-retry with backoff)
-                decide_llm->>decide_llm: Increment failure count
-                decide_llm->>LLM: Retry with exponential backoff
+            else Continue with prompt
+                eval-->>decide_llm: Continue (source=LlmResponse)
+            else WantsStop (real LLM decision)
+                eval-->>decide_llm: WantsStop (source=LlmResponse)
                 
-                alt Max retries exhausted
-                    decide_llm->>decide_llm: Write error log
-                    decide_llm->>decide_llm: Store LlmCallData in ThreadView
-                    decide_llm-->>CV: Error
-                    CV->>CV: State = Failed
-                    CV->>Button: Show "Retry"
+                alt is_synthetic_failure
+                    Note over decide_llm: Lightweight retry path
+                    decide_llm->>decide_llm: Build lightweight context
+                    loop Up to 3 retries
+                        decide_llm->>LLM: Retry with lightweight context
+                        alt Success
+                            LLM-->>decide_llm: Parsed response
+                        else Failed
+                            LLM-->>decide_llm: Error or synthetic
+                        end
+                    end
                     
-                    Note over User,Button: Manual Retry Flow
-                    User->>Button: Click "Retry"
-                    Button->>CV: Reset failure count, spawn retry task
-                    CV->>CV: State = Processing
-                    CV->>decide_llm: decide_with_llm(stored_data)
-                    
-                    alt Retry success
+                    alt Retry says continue
                         decide_llm-->>CV: AutoPromptAction
-                        CV->>CV: State = Idle, clear retry data
+                    else Retry says stop or all retries failed
+                        decide_llm->>decide_llm: detect_remaining_work() safety net
+                        alt Safety net found actionable work
+                            Note over decide_llm: SAFETY NET OVERRIDE
+                            decide_llm-->>CV: AutoPromptAction
+                        else No remaining work detected
+                            decide_llm-->>CV: Stopped
+                        end
+                    end
+                    
+                else Real LLM decision (not synthetic)
+                    Note over decide_llm: Pre-stop verification path
+                    alt verification_count=0
+                        decide_llm->>decide_llm: Build verification prompt
+                        decide_llm->>decide_llm: Increment VERIFICATION_COUNT
+                        decide_llm-->>CV: AutoPromptAction with verification
                         CV->>Workspace: dispatch_action(AutoPromptNewThread)
-                    else Retry fails again
-                        decide_llm->>CV: Error
-                        CV->>CV: State = Failed, restore retry data
-                        CV->>Button: Show "Retry"
+                    else verification_count < max
+                        decide_llm-->>CV: Stopped
+                    else verification_count >= max
+                        decide_llm-->>CV: Stopped (force)
                     end
                 end
+            end
+            
+            alt Action dispatched
+                decide_llm-->>CV: AutoPromptAction
+                CV->>Workspace: dispatch_action(AutoPromptNewThread)
             end
         end
     end
@@ -188,11 +231,14 @@ Each log file contains:
 | `timestamp` | ISO 8601 timestamp |
 | `iteration` | Auto-prompt cycle number |
 | `model` | LLM model identifier |
+| `response_origin` | **`"llm"`** (real model response) or **`"synthetic"`** (code-generated fallback when model stream failed) |
 | `request.system_prompt` | The system prompt sent to the LLM |
 | `request.context_json` | The full context JSON (messages, plan files, doc files) |
-| `raw_response` | Raw text returned by the LLM |
+| `raw_response` | Raw text returned by the LLM, or synthetic JSON when stream failed |
 | `parsed_response` | Parsed `should_continue`, `next_prompt`, `reason`, `all_plan_done`, `confidence` |
 | `error` | Error message (error logs only) |
+
+**How to read `response_origin`**: When `"synthetic"`, the `parsed_response` was NOT generated by the LLM — it was fabricated by the code because the model stream produced no usable content. The `confidence` will be `0.0` and the `reason` will start with `"model"`. The decision then enters the synthetic failure path (lightweight retry + safety net).
 
 Add `.logs/` to `.gitignore` — these are for local debugging only.
 
@@ -209,9 +255,54 @@ The orchestration LLM follows a simple priority order:
 7. **Confidence < 0.5** → stop
 8. **iteration_count > 15** → consider stopping
 
+### Decision provenance (DecisionSource)
+
+Every evaluation result carries a `DecisionSource` that answers "who decided this?":
+
+| Source | Meaning |
+|--------|---------|
+| `LlmResponse` | LLM produced a real response with confidence ≥ 0.5 — its decision used directly |
+| `ConfidenceGate` | Code overrode because confidence < 0.5 (universal gate) |
+| `Handbrake` | Worker AI explicitly declared stopping after verification |
+| `RuleRemainingWork` | `detect_remaining_work` found patterns ("Next Steps", "remaining work", unchecked checkboxes) → second opinion requested |
+| `LlmNoPrompt` | LLM said continue but provided no usable prompt |
+
+Logged as `evaluate_response: source=ConfidenceGate, result=WantsStop { ... }` in `RUST_LOG=info` output.
+
+### Synthetic failure path
+
+When the orchestration LLM stream produces no usable content (zero Text/Thinking events), `call_language_model` synthesizes a fallback response:
+
+```json
+{"should_continue": false, "confidence": 0.0, "reason": "model returned zero events (N total stream events)"}
+```
+
+This triggers the synthetic failure path in `decide_with_llm`:
+
+1. `evaluate_response` hits the confidence gate (`0.0 < 0.5` → `WantsStop`, source=`ConfidenceGate`)
+2. `is_synthetic_failure=true` is detected (confidence ≤ 0.3 + reason starts with "model")
+3. **Lightweight retry**: builds a smaller context (last 3 paragraphs of assistant message + plan landscape) and retries up to 3 times with exponential backoff (2s, 4s, 8s)
+4. If any retry succeeds and says continue → dispatch
+5. If retry says stop or all retries fail → **safety net** (see below)
+
+### Safety net (detect_remaining_work)
+
+Before accepting any stop from the synthetic failure path, `detect_remaining_work` runs against `last_assistant_message` as a final safety net:
+
+1. Scans for trigger patterns: `"remaining work"`, `"next step"`, `"next steps"`, `"todo:"`, `"action items"`, `"left to do"`, `"still need"`, unchecked `- [ ]` checkboxes
+2. Validates that extracted section has actionable content (`- `, `* `, `1.`, `TODO`, `must`, `need to`)
+3. If actionable work found → **SAFETY NET OVERRIDE**: forces continuation with the extracted section as the prompt
+4. If no remaining work found → accepts stop
+
+This prevents the chain from stopping when the model is temporarily broken but the last assistant message clearly describes unfinished work (e.g. "### Next Steps" listing T2.4, T2.5, T2.6).
+
+The safety net runs in two places:
+- **Retry says stop**: LLM returned a real response but decided to stop
+- **All retries failed**: Model completely unreachable, all 3 attempts produced no usable content
+
 ### Pre-stop verification
 
-When the LLM indicates work is complete (`should_continue=false` with no prompt), the system enters a pre-stop verification phase:
+When the LLM indicates work is complete (`should_continue=false` with no prompt) and the response is NOT synthetic, the system enters a pre-stop verification phase:
 
 1. First attempt (`verification_count=0`): Build verification prompt to check:
    - All plan checkboxes are `[x]` (no `[ ]` remaining)
@@ -223,6 +314,8 @@ When the LLM indicates work is complete (`should_continue=false` with no prompt)
 5. Max attempts exceeded: Force stop
 
 If no plan files exist, verification is skipped and the chain stops immediately.
+
+**Not triggered for synthetic failures** — pre-stop verification only runs when the LLM produced a real decision. Synthetic failures go through the lightweight retry + safety net path instead.
 
 ### Quality gates
 
@@ -240,6 +333,15 @@ When the worker AI explicitly declares stopping with phrases like `stopping, not
 
 The handbrake matches `last_assistant_message` containing "stopping" combined with one of: "nothing related", "no further action", "nothing left", "no further work". The word "stopping" alone does **not** trigger the handbrake — it requires a qualifying phrase.
 
+### Remaining work detection
+
+The `detect_remaining_work` function extracts potential remaining work from the last assistant message. It scans for trigger phrases ("next steps", "remaining work", "todo:", etc.) and unchecked checkboxes, then validates that the extracted section contains actionable items. Used in two contexts:
+
+1. **evaluate_response (normal path)**: When LLM says stop with confidence ≥ 0.5, `detect_remaining_work` triggers `NeedsSecondOpinion` — a second LLM call decides whether the remaining work is real or a false positive.
+2. **Safety net (synthetic failure path)**: When lightweight retries fail or say stop, `detect_remaining_work` runs as a final check before accepting stop — no second opinion, direct override.
+
+The `extract_remaining_section` helper scans the last 3 paragraphs of the message for trigger words or actionable checkboxes, including the preceding paragraph if it looks like a header.
+
 ### Key types
 
 - `AutoPromptDecision` — sync result: `NoAction`, `DispatchNow(AutoPromptAction)`, `DispatchAfterDelay { action, delay_ms }`, `NeedsLlmCall(LlmCallData)`
@@ -247,6 +349,8 @@ The handbrake matches `last_assistant_message` containing "stopping" combined wi
 - `LlmCallData` — data for async LLM call (`model`, `system_prompt`, `context_json`, `project_root`, `session_id`, `title`, `iteration_count`, `max_verification_attempts`, `work_dirs`, `first_user_message`, `last_assistant_message`, `stop_phase`); stored on failure for manual retry
 - `AutoPromptContext` — serializable context payload sent to the orchestration LLM (includes `plan_files`, `doc_files`, `first_user_message`, `stop_phase`, `verification_count`, `plan_has_checkboxes`, `first_plan_filename`, `plan_number`, `was_truncated`)
 - `EvaluationInput` — input to the pure `evaluate_response()` function (`should_continue`, `confidence`, `next_prompt`, `reason`, `all_plan_done`, `next_plan_prompt`, `last_assistant_message`, `is_synthetic_failure`, `stop_phase`)
+- `EvaluationResult` — output of `evaluate_response()`: `Continue { prompt, reason }`, `WantsStop { reason }`, `NeedsSecondOpinion { extracted_section, rule_reason }`; carries `DecisionSource` via `.source()` method
+- `DecisionSource` — provenance enum: `LlmResponse`, `ConfidenceGate`, `Handbrake`, `RuleRemainingWork`, `LlmNoPrompt`
 - `AutoPromptResponse` — expected JSON response from the LLM (`should_continue`, `next_prompt`, `reason`, `all_plan_done`, `confidence`, `thread_summary`)
 - `StopPhase` — lifecycle phase: `Working` (normal), `PreStop` (verification), `Verified` (terminal)
 - `AutoPromptConfig` — loaded from `~/.config/zed/auto_prompt.json` or env vars (cached with file-watcher invalidation)
@@ -255,7 +359,7 @@ The handbrake matches `last_assistant_message` containing "stopping" combined wi
 
 | File | Purpose |
 |------|---------|
-| `src/auto_prompt.rs` | `decide()` (sync), `decide_with_llm()` (async), system prompt, iteration tracking, plan/doc reading, LLM client, verification prompts, config caching |
+| `src/auto_prompt.rs` | `decide()` (sync), `decide_with_llm()` (async), `evaluate_response()`, `detect_remaining_work()`, system prompt, iteration tracking, plan/doc reading, LLM client, verification prompts, config caching |
 | `src/config.rs` | `AutoPromptConfig` from `~/.config/zed/auto_prompt.json` or env vars |
 | `src/context.rs` | `AutoPromptContext`, `AutoPromptResponse`, `StopPhase`, plan/message serialization |
 
@@ -377,4 +481,3 @@ Runs 12 checks: branches, tags, tests, conventional commits, version bumps, plan
 script/test-auto-prompt-e2e status /tmp/hw-test      # show git state
 script/test-auto-prompt-e2e inject-bug /tmp/hw-test   # inject bug for Step 7
 script/test-auto-prompt-e2e teardown /tmp/hw-test     # cleanup
-```
