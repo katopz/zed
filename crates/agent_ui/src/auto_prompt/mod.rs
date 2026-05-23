@@ -250,6 +250,8 @@ fn dispatch_action(
         action.actual_input_tokens
     );
 
+    let decision_prompt = auto_prompt::extract_decision_prompt(&action.next_prompt);
+
     let action = Box::new(AutoPromptNewThread {
         from_session_id: action.from_session_id,
         from_title: action.from_title,
@@ -258,7 +260,7 @@ fn dispatch_action(
         original_user_message: action.original_user_message,
         profile_id: action.profile_id,
         last_assistant_message: action.last_assistant_message,
-        decision_prompt: None,
+        decision_prompt,
     });
 
     window.dispatch_action(action, cx);

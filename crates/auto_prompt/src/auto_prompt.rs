@@ -42,6 +42,18 @@ static VERIFICATION_COUNT: AtomicU32 = AtomicU32::new(0);
 /// LLM orchestration call failure counter for the current chain.
 static AUTO_PROMPT_LLM_FAILURE_COUNT: AtomicU32 = AtomicU32::new(0);
 
+/// Short git commit hash for log provenance.
+/// Uses compile-time ZED_COMMIT_SHA when available (main binary build),
+/// falls back to package version for standalone dev builds.
+static COMMIT_HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+fn get_commit_hash() -> &'static str {
+    COMMIT_HASH.get_or_init(|| match option_env!("ZED_COMMIT_SHA") {
+        Some(hash) => hash.to_string(),
+        None => format!("{}-{}", env!("CARGO_PKG_VERSION"), "dev"),
+    })
+}
+
 use std::sync::RwLock;
 use std::time::SystemTime;
 
@@ -129,6 +141,20 @@ pub enum AutoPromptOutcome {
     Continue(AutoPromptAction),
     /// Chain stopped with a reason (shown to user as info toast).
     Stopped { reason: String },
+}
+
+/// Extract the decision text from a `with_first_prompt_context`-formatted string.
+/// Returns the content after the last `## N. Decision` header, or None if not found.
+pub fn extract_decision_prompt(prompt: &str) -> Option<String> {
+    let marker = "## 3. Decision";
+    let alt_marker = "## 2. Decision";
+    let start = prompt
+        .find(marker)
+        .map(|i| i + marker.len())
+        .or_else(|| prompt.find(alt_marker).map(|i| i + alt_marker.len()));
+    start
+        .map(|i| prompt[i..].trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 pub fn with_first_prompt_context(
@@ -1457,6 +1483,7 @@ fn write_decision_log(
 
     let log_entry = serde_json::json!({
         "timestamp": chrono::Local::now().to_rfc3339(),
+        "commit": get_commit_hash(),
         "iteration": iteration,
         "model": model,
         "response_origin": response_origin,
@@ -1499,6 +1526,7 @@ fn write_error_log(
     let filename = format!("{timestamp}_{iteration}_error.json");
     let log_entry = serde_json::json!({
         "timestamp": chrono::Local::now().to_rfc3339(),
+        "commit": get_commit_hash(),
         "iteration": iteration,
         "model": model,
         "error": format!("{error:#}"),
@@ -1552,6 +1580,7 @@ fn write_stop_log(project_root: Option<&PathBuf>, iteration: u32, reason: &str) 
     let filename = format!("{timestamp}_{iteration}_stop.json");
     let log_entry = serde_json::json!({
         "timestamp": chrono::Local::now().to_rfc3339(),
+        "commit": get_commit_hash(),
         "iteration": iteration,
         "reason": reason,
     });
@@ -4293,5 +4322,45 @@ mod tests {
             result.is_none(),
             "only skipped/strikethrough checkboxes should not be actionable"
         );
+    }
+
+    #[test]
+    fn test_extract_decision_prompt_3_part_format() {
+        let prompt = "## 1. Thread Summary\n\nSummary here\n\n---\n\n## 2. Last Assistant Message\n\nLast msg\n\n---\n\n## 3. Decision\n\nContinue with step 4";
+        let result = extract_decision_prompt(prompt);
+        assert_eq!(result, Some("Continue with step 4".to_string()));
+    }
+
+    #[test]
+    fn test_extract_decision_prompt_2_part_format() {
+        let prompt =
+            "## 1. Last Assistant Message\n\nLast msg\n\n---\n\n## 2. Decision\n\nDo the thing";
+        let result = extract_decision_prompt(prompt);
+        assert_eq!(result, Some("Do the thing".to_string()));
+    }
+
+    #[test]
+    fn test_extract_decision_prompt_no_marker() {
+        let prompt = "## 1. Thread Summary\n\nNo decision here";
+        let result = extract_decision_prompt(prompt);
+        assert!(result.is_none(), "no Decision header => None");
+    }
+
+    #[test]
+    fn test_extract_decision_prompt_empty_after_marker() {
+        let prompt = "## 3. Decision\n\n";
+        let result = extract_decision_prompt(prompt);
+        assert!(result.is_none(), "empty decision text => None");
+    }
+
+    #[test]
+    fn test_extract_decision_prompt_roundtrip_with_first_prompt_context() {
+        let summary = "Implementing feature X in **plan 085**";
+        let last_msg = "Completed steps 1-3, need to do step 4";
+        let decision = "do step 4 now and commit";
+        let full =
+            with_first_prompt_context(decision.to_string(), Some(summary), None, Some(last_msg));
+        let extracted = extract_decision_prompt(&full);
+        assert_eq!(extracted, Some(decision.to_string()));
     }
 }
