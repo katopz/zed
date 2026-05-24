@@ -7955,11 +7955,10 @@ fn all_thread_infos_for_workspace(
 
             let status = if has_pending_tool_call {
                 AgentThreadStatus::WaitingForConfirmation
-            } else if thread.had_error() {
-                AgentThreadStatus::Error
             } else {
                 match thread.status() {
                     ThreadStatus::Generating => AgentThreadStatus::Running,
+                    ThreadStatus::Idle if thread.had_error() => AgentThreadStatus::Error,
                     ThreadStatus::Idle => AgentThreadStatus::Completed,
                 }
             };

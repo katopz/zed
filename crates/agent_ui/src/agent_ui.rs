@@ -159,6 +159,7 @@ const PARALLEL_AGENT_LAYOUT_BACKFILL_KEY: &str = "parallel_agent_layout_backfill
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AgentThreadSource {
     AgentPanel,
+    AutoPrompt,
     GitPanel,
     Sidebar,
 }
@@ -167,6 +168,7 @@ impl AgentThreadSource {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::AgentPanel => "agent_panel",
+            Self::AutoPrompt => "auto_prompt",
             Self::GitPanel => "git_panel",
             Self::Sidebar => "sidebar",
         }
