@@ -7,9 +7,11 @@
 
 mod config;
 pub mod context;
+pub mod plan_registry;
 
 pub use config::AutoPromptConfig;
 pub use context::{AutoPromptContext, AutoPromptResponse, PlanFileContent, StopPhase};
+pub use plan_registry::ActivePlanClaim;
 
 use agent_client_protocol as acp;
 use anyhow::Context as _;
@@ -670,7 +672,7 @@ pub fn decide(
             iteration_count,
             &format!("max iterations ({}) reached", config.max_iterations),
         );
-        reset_iteration();
+        reset_iteration_with_session(&thread.read(cx).session_id().to_string());
         return AutoPromptDecision::NoAction;
     }
 
@@ -995,6 +997,13 @@ pub async fn decide_with_llm(
                         data.last_assistant_message.as_deref(),
                     );
 
+                    auto_claim_plan(
+                        &next_prompt,
+                        &data.context_json,
+                        &data.session_id,
+                        data.title.as_deref(),
+                    );
+
                     Ok(AutoPromptOutcome::Continue(AutoPromptAction {
                         from_session_id: data.session_id,
                         from_title: data.title,
@@ -1057,6 +1066,12 @@ pub async fn decide_with_llm(
                                     data.title.as_deref(),
                                     data.last_assistant_message.as_deref(),
                                 );
+                                auto_claim_plan(
+                                    &next_prompt,
+                                    &data.context_json,
+                                    &data.session_id,
+                                    data.title.as_deref(),
+                                );
                                 Ok(AutoPromptOutcome::Continue(AutoPromptAction {
                                     from_session_id: data.session_id,
                                     from_title: data.title,
@@ -1078,7 +1093,7 @@ pub async fn decide_with_llm(
                                     data.iteration_count,
                                     &stop_reason,
                                 );
-                                reset_iteration();
+                                reset_iteration_with_session(&data.session_id.to_string());
                                 Ok(AutoPromptOutcome::Stopped {
                                     reason: stop_reason,
                                 })
@@ -1094,7 +1109,7 @@ pub async fn decide_with_llm(
                                 data.iteration_count,
                                 &stop_reason,
                             );
-                            reset_iteration();
+                            reset_iteration_with_session(&data.session_id.to_string());
                             Ok(AutoPromptOutcome::Stopped {
                                 reason: stop_reason,
                             })
@@ -1205,6 +1220,12 @@ pub async fn decide_with_llm(
                                     data.title.as_deref(),
                                     data.last_assistant_message.as_deref(),
                                 );
+                                auto_claim_plan(
+                                    &next_prompt,
+                                    &data.context_json,
+                                    &data.session_id,
+                                    data.title.as_deref(),
+                                );
                                 Ok(AutoPromptOutcome::Continue(AutoPromptAction {
                                     from_session_id: data.session_id,
                                     from_title: data.title,
@@ -1239,6 +1260,12 @@ pub async fn decide_with_llm(
                                         data.title.as_deref(),
                                         data.last_assistant_message.as_deref(),
                                     );
+                                    auto_claim_plan(
+                                        &next_prompt,
+                                        &data.context_json,
+                                        &data.session_id,
+                                        data.title.as_deref(),
+                                    );
                                     Ok(AutoPromptOutcome::Continue(AutoPromptAction {
                                         from_session_id: data.session_id,
                                         from_title: data.title,
@@ -1261,6 +1288,12 @@ pub async fn decide_with_llm(
                                         data.title.as_deref(),
                                         data.last_assistant_message.as_deref(),
                                     );
+                                    auto_claim_plan(
+                                        &next_prompt,
+                                        &data.context_json,
+                                        &data.session_id,
+                                        data.title.as_deref(),
+                                    );
                                     Ok(AutoPromptOutcome::Continue(AutoPromptAction {
                                         from_session_id: data.session_id,
                                         from_title: data.title,
@@ -1280,7 +1313,7 @@ pub async fn decide_with_llm(
                                         data.iteration_count,
                                         &format!("lightweight retry: {stop_reason}"),
                                     );
-                                    reset_iteration();
+                                    reset_iteration_with_session(&data.session_id.to_string());
                                     Ok(AutoPromptOutcome::Stopped {
                                         reason: stop_reason,
                                     })
@@ -1302,6 +1335,12 @@ pub async fn decide_with_llm(
                                         prompt_summary.as_deref(),
                                         data.title.as_deref(),
                                         data.last_assistant_message.as_deref(),
+                                    );
+                                    auto_claim_plan(
+                                        &next_prompt,
+                                        &data.context_json,
+                                        &data.session_id,
+                                        data.title.as_deref(),
                                     );
                                     Ok(AutoPromptOutcome::Continue(AutoPromptAction {
                                         from_session_id: data.session_id,
@@ -1325,6 +1364,12 @@ pub async fn decide_with_llm(
                                         data.title.as_deref(),
                                         data.last_assistant_message.as_deref(),
                                     );
+                                    auto_claim_plan(
+                                        &next_prompt,
+                                        &data.context_json,
+                                        &data.session_id,
+                                        data.title.as_deref(),
+                                    );
                                     Ok(AutoPromptOutcome::Continue(AutoPromptAction {
                                         from_session_id: data.session_id,
                                         from_title: data.title,
@@ -1346,7 +1391,7 @@ pub async fn decide_with_llm(
                                             "lightweight retry failed after 3 attempts, no remaining work or plan tasks detected: {reason}"
                                         ),
                                     );
-                                    reset_iteration();
+                                    reset_iteration_with_session(&data.session_id.to_string());
                                     Ok(AutoPromptOutcome::Stopped {
                                         reason: format!("lightweight retry failed: {reason}"),
                                     })
@@ -1401,7 +1446,7 @@ pub async fn decide_with_llm(
                                         data.iteration_count,
                                         &stop_reason,
                                     );
-                                    reset_iteration();
+                                    reset_iteration_with_session(&data.session_id.to_string());
                                     Ok(AutoPromptOutcome::Stopped {
                                         reason: stop_reason,
                                     })
@@ -1417,7 +1462,7 @@ pub async fn decide_with_llm(
                                 data.iteration_count,
                                 &stop_reason,
                             );
-                            reset_iteration();
+                            reset_iteration_with_session(&data.session_id.to_string());
                             Ok(AutoPromptOutcome::Stopped {
                                 reason: stop_reason,
                             })
@@ -1430,7 +1475,7 @@ pub async fn decide_with_llm(
                                 data.iteration_count,
                                 &stop_reason,
                             );
-                            reset_iteration();
+                            reset_iteration_with_session(&data.session_id.to_string());
                             Ok(AutoPromptOutcome::Stopped {
                                 reason: stop_reason,
                             })
@@ -1751,6 +1796,14 @@ pub fn reset_iteration() {
     AUTO_PROMPT_ITERATION.store(0, Ordering::Relaxed);
     VERIFICATION_COUNT.store(0, Ordering::Relaxed);
     AUTO_PROMPT_LLM_FAILURE_COUNT.store(0, Ordering::Relaxed);
+}
+
+/// Reset the auto-prompt chain counters **and** release any plan claims held by
+/// the given session. Call this at every chain stop point so competing agents
+/// can pick up the released plans.
+pub fn reset_iteration_with_session(session_id: &str) {
+    reset_iteration();
+    plan_registry::release_all_for_session(session_id);
 }
 
 pub fn increment_llm_failure_count() -> u32 {
@@ -2202,10 +2255,13 @@ fn extract_json(text: &str) -> &str {
 fn build_plan_landscape(context_json: &str) -> Option<String> {
     #[derive(serde::Deserialize)]
     struct Context {
+        #[serde(default)]
+        session_id: Option<String>,
         plan_files: Vec<context::PlanFileContent>,
     }
 
     let ctx: Context = serde_json::from_str(context_json).ok()?;
+    let session_id = ctx.session_id.as_deref().unwrap_or("");
 
     type Project = String;
     type PlanLine = String;
@@ -2214,6 +2270,14 @@ fn build_plan_landscape(context_json: &str) -> Option<String> {
     for file in &ctx.plan_files {
         let task_count = count_actionable_tasks(&file.content);
         if task_count == 0 {
+            continue;
+        }
+
+        if plan_registry::is_claimed_by_other(&file.path, session_id) {
+            log::info!(
+                "[auto_prompt::build_plan_landscape] Skipping plan claimed by another agent: {}",
+                file.path
+            );
             continue;
         }
 
@@ -2591,17 +2655,57 @@ fn detect_remaining_work(last_assistant_message: Option<&str>) -> Option<String>
     None
 }
 
-fn detect_remaining_plan_tasks(context_json: &str) -> Option<String> {
+fn extract_plan_paths_from_context(context_json: &str) -> Vec<String> {
     #[derive(serde::Deserialize)]
     struct Ctx {
         #[serde(default)]
         plan_files: Vec<context::PlanFileContent>,
     }
+    serde_json::from_str::<Ctx>(context_json)
+        .ok()
+        .map(|ctx| ctx.plan_files.iter().map(|f| f.path.clone()).collect())
+        .unwrap_or_default()
+}
+
+fn auto_claim_plan(
+    next_prompt: &str,
+    context_json: &str,
+    session_id: &SessionId,
+    title: Option<&str>,
+) {
+    let plan_paths = extract_plan_paths_from_context(context_json);
+    let session_id_str = session_id.to_string();
+    if let Some(claimed) = plan_registry::auto_claim_from_prompt(
+        next_prompt,
+        &plan_paths,
+        &session_id_str,
+        title.unwrap_or("auto_prompt continuation"),
+    ) {
+        log::info!("[auto_prompt] Auto-claimed plan {claimed} for session {session_id_str}");
+    }
+}
+
+fn detect_remaining_plan_tasks(context_json: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Ctx {
+        #[serde(default)]
+        session_id: Option<String>,
+        #[serde(default)]
+        plan_files: Vec<context::PlanFileContent>,
+    }
     let ctx = serde_json::from_str::<Ctx>(context_json).ok()?;
+    let session_id = ctx.session_id.as_deref().unwrap_or("");
     let mut remaining = Vec::new();
     for plan in &ctx.plan_files {
         let count = count_actionable_tasks(&plan.content);
         if count > 0 {
+            if plan_registry::is_claimed_by_other(&plan.path, session_id) {
+                log::info!(
+                    "[auto_prompt::detect_remaining_plan_tasks] Skipping plan claimed by another agent: {}",
+                    plan.path
+                );
+                continue;
+            }
             let filename = plan.path.rsplit('/').next().unwrap_or("?");
             remaining.push(format!("- {filename}: {count} unchecked task(s)"));
         }
@@ -2610,13 +2714,16 @@ fn detect_remaining_plan_tasks(context_json: &str) -> Option<String> {
         return None;
     }
     log::warn!(
-        "[auto_prompt::detect_remaining_plan_tasks] Found {} plan file(s) with unchecked tasks:\n{}",
+        "[auto_prompt::detect_remaining_plan_tasks] Found {} unclaimed plan file(s) with unchecked tasks:\n{}",
         remaining.len(),
         remaining.join("\n")
     );
+    let claims_note = plan_registry::format_claims_for_context(session_id)
+        .map(|claims| format!("\n\n{claims}"))
+        .unwrap_or_default();
     Some(format!(
         "LLM orchestration failed but plan files have remaining unchecked tasks:\n\n{}\n\n\
-         Continue with the next unchecked task. Mark completed steps as [x].",
+         Continue with the next unchecked task. Mark completed steps as [x].{claims_note}",
         remaining.join("\n")
     ))
 }

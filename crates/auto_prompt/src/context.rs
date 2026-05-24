@@ -74,6 +74,11 @@ pub struct AutoPromptContext {
     /// The last assistant message, surfaced for remaining-work detection.
     #[serde(default)]
     pub last_assistant_message: Option<String>,
+    /// Plans currently claimed by other agent threads. The orchestration LLM
+    /// should avoid picking these plans since another agent is already working
+    /// on them.
+    #[serde(default)]
+    pub active_plan_claims: Vec<crate::plan_registry::ActivePlanClaim>,
 }
 
 /// A plan entry with its status.
@@ -235,6 +240,8 @@ impl AutoPromptContext {
             .find(|m| matches!(m.role, ContextMessageRole::User))
             .map(|m| m.content.clone());
 
+        let active_plan_claims = crate::plan_registry::active_claims_for_others(&session_id);
+
         let mut context = Self {
             current_datetime,
             current_paths,
@@ -259,6 +266,7 @@ impl AutoPromptContext {
             plan_number: String::new(),
             first_user_message,
             last_assistant_message: None,
+            active_plan_claims,
         };
 
         context.approximate_token_count = context.estimate_token_count();

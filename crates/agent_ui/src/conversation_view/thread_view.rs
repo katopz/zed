@@ -1516,6 +1516,8 @@ impl ThreadView {
             log::info!("[auto_prompt] Cancelling auto_prompt: user message takes priority");
             self._auto_prompt_task = None;
             self.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;
+            let cancelled_session_id = self.thread.read(cx).session_id().to_string();
+            auto_prompt::reset_iteration_with_session(&cancelled_session_id);
         }
 
         let session_id = self.thread.read(cx).session_id().clone();
@@ -5146,7 +5148,8 @@ impl ThreadView {
                     log::info!("[auto_prompt] Cancelling auto-prompt processing");
                     this._auto_prompt_task = None;
                     this.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;
-                    auto_prompt::reset_iteration();
+                    let session_id = this.thread.read(cx).session_id().to_string();
+                    auto_prompt::reset_iteration_with_session(&session_id);
                     cx.notify();
                     return;
                 }

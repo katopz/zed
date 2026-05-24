@@ -28,6 +28,7 @@ fn default_context() -> AutoPromptContext {
         plan_number: String::new(),
         first_user_message: None,
         last_assistant_message: None,
+        active_plan_claims: vec![],
     }
 }
 
