@@ -3871,6 +3871,17 @@ impl ThreadView {
                                             }),
                                     )
                                 })
+                                .when(is_done && is_canceled_or_failed, |this| {
+                                    this.child(
+                                        IconButton::new("continue_subagent", IconName::RotateCw)
+                                            .icon_size(IconSize::Small)
+                                            .icon_color(Color::Warning)
+                                            .tooltip(Tooltip::text("Continue Subagent"))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.retry_generation(cx);
+                                            })),
+                                    )
+                                })
                                 .child(
                                     IconButton::new("minimize_subagent", IconName::Dash)
                                         .icon_size(IconSize::Small)
@@ -9363,7 +9374,32 @@ impl ThreadView {
                                     },
                                 ),
                         )
-                    }),
+                    })
+                    .when(
+                        (is_failed || is_cancelled) && thread_view.is_some(),
+                        |buttons| {
+                            let subagent_view = thread_view.cloned();
+                            buttons.when_some(subagent_view, |this, subagent_view| {
+                                this.child(
+                                    IconButton::new(
+                                        format!("continue-subagent-{}", entry_ix),
+                                        IconName::RotateCw,
+                                    )
+                                    .icon_size(IconSize::Small)
+                                    .icon_color(Color::Warning)
+                                    .tooltip(Tooltip::text("Continue Subagent"))
+                                    .on_click(
+                                        move |_, _, cx| {
+                                            telemetry::event!("Subagent Retried");
+                                            subagent_view.update(cx, |view, cx| {
+                                                view.retry_generation(cx);
+                                            });
+                                        },
+                                    ),
+                                )
+                            })
+                        },
+                    ),
             )
             .when_some(thread_view, |this, thread_view| {
                 let thread = &thread_view.read(cx).thread;
