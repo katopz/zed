@@ -43,12 +43,12 @@ static VERIFICATION_COUNT: AtomicU32 = AtomicU32::new(0);
 static AUTO_PROMPT_LLM_FAILURE_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// Short git commit hash for log provenance.
-/// Uses compile-time ZED_COMMIT_SHA when available (main binary build),
-/// falls back to package version for standalone dev builds.
+/// Set by build.rs via `AUTO_PROMPT_COMMIT_SHA` at compile time.
+/// Falls back to package version when built outside a git repo.
 static COMMIT_HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 fn get_commit_hash() -> &'static str {
-    COMMIT_HASH.get_or_init(|| match option_env!("ZED_COMMIT_SHA") {
+    COMMIT_HASH.get_or_init(|| match option_env!("AUTO_PROMPT_COMMIT_SHA") {
         Some(hash) => hash.to_string(),
         None => format!("{}-{}", env!("CARGO_PKG_VERSION"), "dev"),
     })
