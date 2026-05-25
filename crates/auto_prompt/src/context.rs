@@ -1,4 +1,4 @@
-use acp_thread::{AcpThread, AgentThreadEntry, ContentBlock, ToolCall, ToolCallStatus};
+use acp_thread::{AcpThread, AgentThreadEntry, ToolCall, ToolCallStatus};
 use chrono::Local;
 use gpui::App;
 use serde::{Deserialize, Serialize};
@@ -40,8 +40,8 @@ pub struct AutoPromptContext {
     pub current_plan: Vec<PlanEntryContext>,
     /// Contents of `.plan` folder files found in work directories.
     pub plan_files: Vec<PlanFileContent>,
-    /// Contents of `.doc` folder files found in work directories.
-    pub doc_files: Vec<PlanFileContent>,
+    /// Filenames of `.docs` folder files found in work directories.
+    pub doc_files: Vec<String>,
     /// Why the thread stopped (end_turn, max_tokens, cancelled, refusal).
     pub stop_reason: String,
     /// Whether the thread encountered an error.
@@ -74,6 +74,9 @@ pub struct AutoPromptContext {
     /// The last assistant message, surfaced for remaining-work detection.
     #[serde(default)]
     pub last_assistant_message: Option<String>,
+    /// File paths modified by Edit/Write tool calls in this thread.
+    #[serde(default)]
+    pub modified_files: Vec<String>,
     /// Plans currently claimed by other agent threads. The orchestration LLM
     /// should avoid picking these plans since another agent is already working
     /// on them.
@@ -142,14 +145,14 @@ impl AutoPromptContext {
     ///
     /// `stop_reason` comes from `AcpThreadEvent::Stopped`.
     /// `plan_files` should be pre-read from `.plan` folders on disk.
-    /// `doc_files` should be pre-read from `.doc` folders on disk.
+    /// `doc_files` should be pre-read filenames from `.docs` folders on disk.
     /// `iteration_count` tracks how many auto-prompt cycles have occurred.
     pub fn collect(
         thread: &AcpThread,
         cx: &App,
         stop_reason: String,
         plan_files: Vec<PlanFileContent>,
-        doc_files: Vec<PlanFileContent>,
+        doc_files: Vec<String>,
         iteration_count: u32,
     ) -> Self {
         let current_datetime = Local::now().to_rfc3339();
@@ -173,6 +176,7 @@ impl AutoPromptContext {
 
         let mut used_tools = false;
         let mut messages = Vec::with_capacity(entry_count);
+        let mut modified_files = Vec::new();
 
         for entry in entries {
             match entry {
@@ -187,7 +191,12 @@ impl AutoPromptContext {
                 }
                 AgentThreadEntry::AssistantMessage(msg) => {
                     for chunk in &msg.chunks {
-                        let content = chunk.block().to_markdown(cx).to_string();
+                        let content = match chunk {
+                            acp_thread::AssistantMessageChunk::Message { block } => {
+                                strip_code_blocks(block.to_markdown(cx))
+                            }
+                            acp_thread::AssistantMessageChunk::Thought { .. } => continue,
+                        };
                         if !content.is_empty() {
                             let content = if content.len() > MAX_ASSISTANT_CHUNK_BYTES {
                                 let mut end = MAX_ASSISTANT_CHUNK_BYTES;
@@ -211,6 +220,7 @@ impl AutoPromptContext {
                 }
                 AgentThreadEntry::ToolCall(tool) => {
                     used_tools = true;
+                    collect_modified_file(tool, cx, &mut modified_files);
                     let content = serialize_tool_call(tool, cx);
                     messages.push(ContextMessage {
                         role: ContextMessageRole::Tool,
@@ -266,6 +276,7 @@ impl AutoPromptContext {
             plan_number: String::new(),
             first_user_message,
             last_assistant_message: None,
+            modified_files,
             active_plan_claims,
         };
 
@@ -294,7 +305,7 @@ impl AutoPromptContext {
             .map(|m| m.content.len())
             .chain(self.current_plan.iter().map(|p| p.content.len()))
             .chain(self.plan_files.iter().map(|f| f.content.len()))
-            .chain(self.doc_files.iter().map(|f| f.content.len()))
+            .chain(self.doc_files.iter().map(|f| f.len()))
             .sum();
 
         total_chars / 4
@@ -482,6 +493,60 @@ fn collect_plan_entries(thread: &AcpThread, cx: &App) -> Vec<PlanEntryContext> {
         .collect()
 }
 
+/// Strip fenced code blocks (```...```) from markdown content.
+fn strip_code_blocks(content: &str) -> String {
+    let mut result = String::with_capacity(content.len());
+    let mut in_code_block = false;
+    for line in content.lines() {
+        if line.trim_start().starts_with("```") {
+            in_code_block = !in_code_block;
+            continue;
+        }
+        if !in_code_block {
+            if !result.is_empty() {
+                result.push('\n');
+            }
+            result.push_str(line);
+        }
+    }
+    result
+}
+
+/// Extract file path from an Edit/Write tool call label and add to the list.
+fn collect_modified_file(tool: &ToolCall, cx: &App, modified_files: &mut Vec<String>) {
+    if !matches!(tool.kind, agent_client_protocol::schema::ToolKind::Edit) {
+        return;
+    }
+    let label = tool.label.read(cx).source().to_string();
+    for path in extract_backtick_paths(&label) {
+        if !modified_files.contains(&path) {
+            modified_files.push(path);
+        }
+    }
+}
+
+/// Extract backtick-enclosed paths from a string.
+fn extract_backtick_paths(text: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut in_backtick = false;
+    let mut current = String::new();
+    for ch in text.chars() {
+        if ch == '`' {
+            if in_backtick {
+                let trimmed = current.trim();
+                if !trimmed.is_empty() && !paths.iter().any(|p| p == trimmed) {
+                    paths.push(trimmed.to_string());
+                }
+                current.clear();
+            }
+            in_backtick = !in_backtick;
+        } else if in_backtick {
+            current.push(ch);
+        }
+    }
+    paths
+}
+
 /// Serialize a tool call into a readable string for context.
 fn serialize_tool_call(tool: &ToolCall, cx: &App) -> String {
     let status_label = match &tool.status {
@@ -529,18 +594,4 @@ fn serialize_tool_call(tool: &ToolCall, cx: &App) -> String {
     }
 
     parts.join("\n")
-}
-
-/// Helper trait to get the content block from an AssistantMessageChunk.
-trait AssistantMessageChunkExt {
-    fn block(&self) -> &ContentBlock;
-}
-
-impl AssistantMessageChunkExt for acp_thread::AssistantMessageChunk {
-    fn block(&self) -> &ContentBlock {
-        match self {
-            Self::Message { block } => block,
-            Self::Thought { block } => block,
-        }
-    }
 }

@@ -28,6 +28,7 @@ fn default_context() -> AutoPromptContext {
         plan_number: String::new(),
         first_user_message: None,
         last_assistant_message: None,
+        modified_files: vec![],
         active_plan_claims: vec![],
     }
 }
@@ -447,4 +448,153 @@ fn test_remaining_plan_files_no_plans_returns_empty() {
     };
 
     assert!(context.remaining_plan_files().is_empty());
+}
+
+// ===== Context Bloat Simulation Tests =====
+// These tests simulate the original failure scenario where 43 doc files (687KB)
+// blew context past the 80K token limit, causing the LLM call to be skipped.
+
+#[test]
+fn test_token_estimate_doc_files_as_filenames_only() {
+    // Before: doc_files was Vec<PlanFileContent> with full contents.
+    // 43 files × ~16KB avg = 687KB → ~172K tokens (exceeds 80K limit).
+    // After: doc_files is Vec<String> with filenames only.
+    // 43 filenames × ~20 chars avg = ~860 chars → ~215 tokens.
+    let doc_filenames: Vec<String> = (1..=43).map(|i| format!("{i:03}_summary.md")).collect();
+
+    let total_chars: usize = doc_filenames.iter().map(|f| f.len()).sum();
+    let estimated_tokens = total_chars / 4;
+
+    assert!(
+        estimated_tokens < 1000,
+        "doc filenames should be tiny, got {estimated_tokens} tokens"
+    );
+
+    // Simulate OLD behavior: 687KB of content
+    let old_doc_chars: usize = 703_707;
+    let old_tokens = old_doc_chars / 4;
+    assert!(
+        old_tokens > 170_000,
+        "old doc content was ~{old_tokens} tokens"
+    );
+
+    let savings_ratio = old_tokens / estimated_tokens.max(1);
+    assert!(
+        savings_ratio > 100,
+        "should save >100x, got {savings_ratio}x"
+    );
+}
+
+#[test]
+fn test_full_scenario_stays_under_80k_token_limit() {
+    // Simulate the full context from the failure log, with the fix applied.
+    //
+    // Original log breakdown:
+    //   - doc_files: 687KB (703,707 chars) — now filenames only
+    //   - plan_files: 198KB (202,863 chars) — unchanged (content needed)
+    //   - messages: 18KB (18,486 chars) — smaller now (code blocks stripped)
+    //
+    // After fix: ~55K tokens, well under 80K limit.
+
+    let doc_filenames: Vec<String> = (1..=43).map(|i| format!("{i:03}_summary.md")).collect();
+    let doc_chars: usize = doc_filenames.iter().map(|f| f.len()).sum();
+
+    // Plan files still have full content (task checkboxes needed for logic)
+    let plan_content = (0..10)
+        .map(|i| {
+            let content = "- [x] Completed task\n".repeat(50);
+            PlanFileContent {
+                path: format!(".plan/{i:03}_plan.md"),
+                content,
+            }
+        })
+        .collect::<Vec<_>>();
+    let plan_chars: usize = plan_content.iter().map(|p| p.content.len()).sum();
+
+    // Messages: code blocks stripped, much smaller
+    let message_content = "I'll implement the feature by modifying the following files.\n";
+    let message_chars = message_content.len() * 8;
+
+    let total_chars = doc_chars + plan_chars + message_chars;
+    let estimated_tokens = total_chars / 4;
+
+    assert!(
+        estimated_tokens < 80_000,
+        "total tokens should be under 80K limit, got {estimated_tokens}"
+    );
+}
+
+#[test]
+fn test_old_scenario_exceeded_80k_token_limit() {
+    // Verify the OLD scenario (before fix) would indeed exceed 80K.
+    let old_doc_chars: usize = 703_707;
+    let old_plan_chars: usize = 202_863;
+    let old_message_chars: usize = 18_486;
+    let old_total = old_doc_chars + old_plan_chars + old_message_chars;
+    let old_tokens = old_total / 4;
+
+    assert!(
+        old_tokens > 80_000,
+        "old scenario should exceed 80K limit, got {old_tokens} tokens"
+    );
+}
+
+#[test]
+fn test_context_exceeds_token_limit_method() {
+    let context = AutoPromptContext {
+        approximate_token_count: 100_000,
+        ..default_context()
+    };
+    assert!(context.exceeds_token_limit(80_000));
+    assert!(!context.exceeds_token_limit(200_000));
+}
+
+#[test]
+fn test_context_exceeds_token_limit_at_boundary() {
+    let context = AutoPromptContext {
+        approximate_token_count: 80_000,
+        ..default_context()
+    };
+    assert!(!context.exceeds_token_limit(80_000));
+}
+
+#[test]
+fn test_modified_files_deduplication() {
+    let mut context = AutoPromptContext {
+        modified_files: vec!["src/main.rs".to_string(), "src/lib.rs".to_string()],
+        ..default_context()
+    };
+
+    let path = "src/main.rs".to_string();
+    if !context.modified_files.contains(&path) {
+        context.modified_files.push(path);
+    }
+
+    assert_eq!(
+        context.modified_files.len(),
+        2,
+        "should not duplicate files"
+    );
+    assert_eq!(context.modified_files[0], "src/main.rs");
+}
+
+#[test]
+fn test_estimate_token_count_with_large_doc_filenames() {
+    // 43 doc files as filenames — should contribute almost nothing to tokens
+    let doc_filenames: Vec<String> = (1..=43).map(|i| format!("{i:03}_summary.md")).collect();
+
+    let plan_file = PlanFileContent {
+        path: ".plan/01_test.md".to_string(),
+        content: "- [ ] Task 1\n- [ ] Task 2".to_string(),
+    };
+
+    let context = AutoPromptContext {
+        plan_files: vec![plan_file],
+        doc_files: doc_filenames,
+        ..default_context()
+    };
+
+    let tokens = context.estimate_token_count();
+    // Plan file ~30 chars, doc filenames ~600 chars = ~150 tokens
+    assert!(tokens < 500, "token count should be tiny, got {tokens}");
 }

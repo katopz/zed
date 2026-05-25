@@ -2019,7 +2019,7 @@ fn read_plan_files(
     plan_files
 }
 
-fn read_doc_files(thread: &acp_thread::AcpThread) -> Vec<PlanFileContent> {
+fn read_doc_files(thread: &acp_thread::AcpThread) -> Vec<String> {
     let work_dirs = match thread.work_dirs() {
         Some(dirs) => dirs.paths().to_vec(),
         None => return Vec::new(),
@@ -2044,31 +2044,23 @@ fn read_doc_files(thread: &acp_thread::AcpThread) -> Vec<PlanFileContent> {
                 continue;
             }
 
-            let metadata = match std::fs::metadata(&path) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            if metadata.len() > 100_000 {
+            let filename = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if filename.is_empty() {
                 continue;
             }
 
-            let content = match std::fs::read_to_string(&path) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-
-            doc_files.push(PlanFileContent {
-                path: path.to_string_lossy().to_string(),
-                content,
-            });
+            doc_files.push(filename);
         }
     }
 
     if !doc_files.is_empty() {
         log::info!(
-            "[auto_prompt::read_doc_files] Loaded {} doc file(s): {:?}",
+            "[auto_prompt::read_doc_files] Found {} doc file(s): {:?}",
             doc_files.len(),
-            doc_files.iter().map(|p| &p.path).collect::<Vec<_>>()
+            doc_files
         );
     }
 
