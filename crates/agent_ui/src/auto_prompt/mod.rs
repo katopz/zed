@@ -528,6 +528,9 @@ pub fn on_thread_stopped(
                         auto_prompt::reset_llm_failure_count();
                         if let Some(ref tv) = thread_weak {
                             if let Err(err) = tv.update(cx, |tv, cx| {
+                                // Clear the task BEFORE dispatch so send_content() doesn't
+                                // see a stale task and reset iteration/verification counters.
+                                tv._auto_prompt_task = None;
                                 tv.auto_prompt_state = AutoPromptState::Idle;
                                 cx.notify();
                             }) {
