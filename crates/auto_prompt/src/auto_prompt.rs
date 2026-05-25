@@ -379,6 +379,9 @@ pub struct LlmCallData {
     /// Current stop lifecycle phase (Working, PreStop, Verified).
     /// Used to scope the handbrake to post-verification only.
     pub stop_phase: context::StopPhase,
+    /// Whether the context exceeds `max_context_tokens` — skip the expensive
+    /// full-context LLM call and go directly to the lightweight retry path.
+    pub context_exceeds_limit: bool,
 }
 
 impl std::fmt::Debug for LlmCallData {
@@ -407,6 +410,7 @@ impl std::fmt::Debug for LlmCallData {
             .field("actual_input_tokens", &self.actual_input_tokens)
             .field("had_error", &self.had_error)
             .field("stop_phase", &self.stop_phase)
+            .field("context_exceeds_limit", &self.context_exceeds_limit)
             .finish()
     }
 }
@@ -803,6 +807,15 @@ pub fn decide(
         .last_assistant_message()
         .map(|s| s.to_string());
 
+    let context_exceeds_limit = auto_prompt_ctx.approximate_token_count > config.max_context_tokens;
+    if context_exceeds_limit {
+        log::info!(
+            "[auto_prompt::decide] Context exceeds limit ({} > {} tokens) — will use lightweight path",
+            auto_prompt_ctx.approximate_token_count,
+            config.max_context_tokens
+        );
+    }
+
     log::info!("[auto_prompt::decide] Returning NeedsLlmCall decision");
     AutoPromptDecision::NeedsLlmCall(LlmCallData {
         model,
@@ -821,6 +834,7 @@ pub fn decide(
         actual_input_tokens: auto_prompt_ctx.actual_input_tokens,
         had_error: auto_prompt_ctx.had_error,
         stop_phase,
+        context_exceeds_limit,
     })
 }
 
@@ -844,8 +858,25 @@ pub async fn decide_with_llm(
         data.session_id
     );
 
-    let result =
-        call_language_model(&data.model, &data.system_prompt, &data.context_json, cx).await;
+    let result = if data.context_exceeds_limit {
+        log::info!(
+            "[auto_prompt::decide_with_llm] Context exceeds token limit — skipping full LLM call, using lightweight retry path"
+        );
+        let skipped_response = AutoPromptResponse {
+            should_continue: false,
+            next_prompt: None,
+            reason: Some("model skipped: context exceeds token limit".to_string()),
+            all_plan_done: false,
+            confidence: Some(0.0),
+            thread_summary: None,
+        };
+        Ok((
+            "skipped: context exceeds token limit".to_string(),
+            skipped_response,
+        ))
+    } else {
+        call_language_model(&data.model, &data.system_prompt, &data.context_json, cx).await
+    };
 
     log::info!(
         "[auto_prompt::decide_with_llm] LLM call completed with result: {:?}",
@@ -1937,14 +1968,14 @@ fn read_plan_files(
     if let Some(ref active) = active_project {
         log::info!("[auto_prompt::read_plan_files] Active project: {active}");
 
-        // Sort: active project's plans first, then others by path
+        // Sort: active project's plans first, then newest (highest index) first within each group
         plan_files.sort_by(|a, b| {
             let a_active = a.path.starts_with(active.as_str());
             let b_active = b.path.starts_with(active.as_str());
             match (a_active, b_active) {
                 (true, false) => std::cmp::Ordering::Less,
                 (false, true) => std::cmp::Ordering::Greater,
-                _ => a.path.cmp(&b.path),
+                _ => b.path.cmp(&a.path),
             }
         });
 
@@ -1959,6 +1990,18 @@ fn read_plan_files(
         });
         log::info!(
             "[auto_prompt::read_plan_files] Cross-project filter: {before} → {} plan files",
+            plan_files.len()
+        );
+    } else {
+        plan_files.sort_by(|a, b| b.path.cmp(&a.path));
+    }
+
+    let max_plan_files = 10;
+    if plan_files.len() > max_plan_files {
+        let before = plan_files.len();
+        plan_files.truncate(max_plan_files);
+        log::info!(
+            "[auto_prompt::read_plan_files] Truncated to {max_plan_files} most recent plan files: {before} → {}",
             plan_files.len()
         );
     }
@@ -4469,5 +4512,20 @@ mod tests {
             with_first_prompt_context(decision.to_string(), Some(summary), None, Some(last_msg));
         let extracted = extract_decision_prompt(&full);
         assert_eq!(extracted, Some(decision.to_string()));
+    }
+
+    #[test]
+    fn test_context_overflow_synthetic_failure_routes_to_wants_stop() {
+        let input = EvaluationInput {
+            should_continue: false,
+            confidence: Some(0.0),
+            reason: Some("model skipped: context exceeds token limit".to_string()),
+            ..make_input()
+        };
+        let result = evaluate_response(&input);
+        assert!(
+            matches!(result, EvaluationResult::WantsStop { .. }),
+            "synthetic failure from context overflow should route to WantsStop → lightweight retry"
+        );
     }
 }
