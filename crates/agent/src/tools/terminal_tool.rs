@@ -18,6 +18,14 @@ use crate::{AgentTool, ThreadEnvironment, ToolCallEventStream, ToolInput};
 
 const COMMAND_OUTPUT_LIMIT: u64 = 16 * 1024;
 
+/// Maximum time to wait for a terminal command to complete when no explicit timeout is set.
+/// This prevents indefinite hangs from commands that block waiting for input or other edge cases.
+const DEFAULT_TERMINAL_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Maximum time to wait for a killed terminal process to exit after sending SIGKILL.
+/// If the process hasn't exited by this point, we proceed anyway rather than blocking forever.
+const KILL_GRACE_PERIOD: Duration = Duration::from_secs(5);
+
 /// Executes a shell one-liner and returns the combined output.
 ///
 /// This tool spawns a process using the user's shell, reads from stdout and stderr (preserving the order of writes), and returns a string with the combined output result.
@@ -50,6 +58,7 @@ pub struct TerminalToolInput {
     /// Working directory for the command. This must be one of the root directories of the project.
     pub cd: String,
     /// Optional maximum runtime (in milliseconds). If exceeded, the running terminal task is killed.
+    /// When not specified, a default timeout of 120 seconds is used.
     pub timeout_ms: Option<u64>,
     /// Return only the first N lines of terminal output to the model after the command finishes. Do not pipe output to `head`; use this parameter instead so the user can still see live output. Avoid requesting too many lines, or the response may waste tokens or exceed the context window.
     #[serde(default)]
