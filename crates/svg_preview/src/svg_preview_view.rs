@@ -162,7 +162,7 @@ impl SvgPreviewView {
             .filter(|buffer| Self::is_svg_file(&buffer, cx))
     }
 
-    fn create_svg_view(
+    pub fn create_svg_view(
         mode: SvgPreviewMode,
         workspace: &mut Workspace,
         buffer: Entity<MultiBuffer>,
@@ -188,6 +188,10 @@ impl SvgPreviewView {
                 _ => {}
             },
         )
+    }
+
+    pub fn buffer_entity_id(&self, _cx: &App) -> Option<gpui::EntityId> {
+        self.buffer.as_ref().map(|b| b.entity_id())
     }
 
     pub fn is_svg_file(buffer: &Entity<MultiBuffer>, cx: &App) -> bool {
