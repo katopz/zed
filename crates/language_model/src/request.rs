@@ -134,6 +134,7 @@ fn language_model_image_from_dynamic_image(
 
     Ok(Some(LanguageModelImage {
         source: source.into(),
+        uri: None,
     }))
 }
 

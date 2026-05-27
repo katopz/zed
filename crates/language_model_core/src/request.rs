@@ -16,6 +16,9 @@ pub struct ImageSize {
 pub struct LanguageModelImage {
     /// A base64-encoded PNG image.
     pub source: SharedString,
+    /// The original URI of the image (e.g. file:// path), if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uri: Option<String>,
 }
 
 impl LanguageModelImage {
@@ -28,7 +31,10 @@ impl LanguageModelImage {
     }
 
     pub fn empty() -> Self {
-        Self { source: "".into() }
+        Self {
+            source: "".into(),
+            uri: None,
+        }
     }
 
     /// Parse Self from a JSON object with case-insensitive field names
@@ -43,8 +49,14 @@ impl LanguageModelImage {
         }
 
         let source = source?;
+        let uri = obj
+            .iter()
+            .find(|(k, _)| k.to_lowercase() == "uri")
+            .and_then(|(_, v)| v.as_str())
+            .map(|s| s.to_string());
         Some(Self {
             source: SharedString::from(source.to_string()),
+            uri,
         })
     }
 
@@ -57,6 +69,7 @@ impl std::fmt::Debug for LanguageModelImage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LanguageModelImage")
             .field("source", &format!("<{} bytes>", self.source.len()))
+            .field("uri", &self.uri)
             .finish()
     }
 }

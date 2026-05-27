@@ -248,8 +248,12 @@ impl UserMessage {
                     markdown.push_str(text);
                     markdown.push('\n');
                 }
-                UserMessageContent::Image(_) => {
-                    markdown.push_str("<image />\n");
+                UserMessageContent::Image(image) => {
+                    if let Some(uri) = &image.uri {
+                        let _ = writeln!(&mut markdown, "<image src=\"{}\" />", uri);
+                    } else {
+                        markdown.push_str("<image />\n");
+                    }
                 }
                 UserMessageContent::Mention { uri, content } => {
                     if !content.is_empty() {
@@ -5373,7 +5377,11 @@ impl From<UserMessageContent> for acp::ContentBlock {
         match content {
             UserMessageContent::Text(text) => text.into(),
             UserMessageContent::Image(image) => {
-                acp::ContentBlock::Image(acp::ImageContent::new(image.source, "image/png"))
+                let mut content = acp::ImageContent::new(image.source, "image/png");
+                if let Some(uri) = image.uri {
+                    content = content.uri(uri);
+                }
+                acp::ContentBlock::Image(content)
             }
             UserMessageContent::Mention { uri, content } => acp::ContentBlock::Resource(
                 acp::EmbeddedResource::new(acp::EmbeddedResourceResource::TextResourceContents(
@@ -5387,6 +5395,7 @@ impl From<UserMessageContent> for acp::ContentBlock {
 fn convert_image(image_content: acp::ImageContent) -> LanguageModelImage {
     LanguageModelImage {
         source: image_content.data.into(),
+        uri: image_content.uri,
     }
 }
 
@@ -5959,6 +5968,7 @@ mod tests {
         let image_data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
         let image = LanguageModelImage {
             source: image_data.into(),
+            uri: None,
         };
 
         let mut replay_events = cx.update(|cx| {
