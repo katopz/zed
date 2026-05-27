@@ -1834,6 +1834,21 @@ impl ThreadView {
             return;
         }
 
+        if let Some(parent_session_id) = &self.parent_session_id {
+            let my_session_id = thread.read(cx).session_id().clone();
+            if let Some(parent_view) = self
+                .server_view
+                .upgrade()
+                .and_then(|sv| sv.read(cx).thread_view(parent_session_id))
+            {
+                parent_view.update(cx, |parent_view, cx| {
+                    parent_view.thread.update(cx, |parent_thread, cx| {
+                        parent_thread.restart_subagent_tool_call(&my_session_id, cx);
+                    });
+                });
+            }
+        }
+
         let task = thread.update(cx, |thread, cx| thread.retry(cx));
         cx.emit(AcpThreadViewEvent::Interacted);
         self.sync_generating_indicator(cx);

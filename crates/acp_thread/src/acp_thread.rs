@@ -2303,6 +2303,33 @@ impl AcpThread {
         })
     }
 
+    pub fn restart_subagent_tool_call(
+        &mut self,
+        subagent_session_id: &acp::SessionId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((ix, tool_call)) =
+            self.entries
+                .iter_mut()
+                .enumerate()
+                .find_map(|(index, entry)| {
+                    if let AgentThreadEntry::ToolCall(tool_call) = entry {
+                        if let Some(subagent_session_info) = &tool_call.subagent_session_info
+                            && &subagent_session_info.session_id == subagent_session_id
+                        {
+                            return Some((index, tool_call));
+                        }
+                    }
+                    None
+                })
+        else {
+            return;
+        };
+
+        tool_call.status = ToolCallStatus::InProgress;
+        cx.emit(AcpThreadEvent::EntryUpdated(ix));
+    }
+
     pub fn resolve_locations(&mut self, id: acp::ToolCallId, cx: &mut Context<Self>) {
         let project = self.project.clone();
         let should_update_agent_location = self.parent_session_id.is_none();
