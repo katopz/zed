@@ -660,7 +660,7 @@ impl OpenAiEventMapper {
                         Err(error) => Ok(LanguageModelCompletionEvent::ToolUseJsonParseError {
                             id: tool_call.id.into(),
                             tool_name: tool_call.name.into(),
-                            raw_input: tool_call.arguments.clone().into(),
+                            raw_input: tool_call.arguments.into(),
                             json_parse_error: error.to_string(),
                         }),
                     }
@@ -1360,6 +1360,7 @@ mod tests {
         };
         let user_image = LanguageModelImage {
             source: SharedString::from("aGVsbG8="),
+            uri: None,
         };
         let expected_image_url = user_image.to_base64_url();
 

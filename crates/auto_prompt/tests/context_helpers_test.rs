@@ -647,7 +647,7 @@ fn test_paragraph_budget_single_huge_paragraph_included() {
     let context = AutoPromptContext {
         messages: vec![auto_prompt::context::ContextMessage {
             role: auto_prompt::context::ContextMessageRole::Assistant,
-            content: big.clone(),
+            content: big,
         }],
         ..default_context()
     };

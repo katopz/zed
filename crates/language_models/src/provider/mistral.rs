@@ -1008,6 +1008,7 @@ mod tests {
                     MessageContent::Text("What's in this image?".into()),
                     MessageContent::Image(LanguageModelImage {
                         source: "base64data".into(),
+                        uri: None,
                     }),
                 ],
                 cache: false,
