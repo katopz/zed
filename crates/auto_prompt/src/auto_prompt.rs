@@ -7,6 +7,7 @@
 
 mod config;
 pub mod context;
+pub mod lightweight_context;
 pub mod plan_registry;
 
 pub use config::AutoPromptConfig;
@@ -415,14 +416,19 @@ impl std::fmt::Debug for LlmCallData {
     }
 }
 
+/// Confidence threshold below which we stop during the Working phase.
+/// Low threshold = biased toward continuing.
+const WORKING_CONFIDENCE_THRESHOLD: f64 = 0.2;
+
+/// Confidence threshold below which we stop during the PreStop phase.
+/// High threshold = biased toward stopping (hard to restart).
+const PRESTOP_CONFIDENCE_THRESHOLD: f64 = 0.8;
+
 /// Input for the pure evaluation function.
 pub struct EvaluationInput {
-    pub should_continue: bool,
     pub confidence: Option<f64>,
     pub next_prompt: Option<String>,
     pub reason: Option<String>,
-    pub all_plan_done: bool,
-    pub next_plan_prompt: Option<String>,
     pub last_assistant_message: Option<String>,
     /// True when the LLM failed to produce a usable response and a synthetic
     /// stop was generated (e.g. "model returned zero events"). Pre-stop
@@ -430,23 +436,23 @@ pub struct EvaluationInput {
     /// to verify.
     pub is_synthetic_failure: bool,
     /// Current stop lifecycle phase (Working, PreStop, Verified).
-    /// Used to scope the handbrake to post-verification only.
+    /// Determines which confidence threshold to apply.
     pub stop_phase: context::StopPhase,
 }
 
-/// Provenance of the final `should_continue` decision — answers "who decided this?"
+/// Provenance of the final decision — answers "who decided this?"
 #[derive(Debug, Clone, PartialEq)]
 pub enum DecisionSource {
-    /// LLM produced a real response with confidence >= 0.5.
+    /// LLM produced a real response that crossed the confidence threshold.
     LlmResponse,
-    /// Code overrode because confidence < 0.5 (universal gate).
+    /// Confidence below phase threshold (Working < 0.2, PreStop < 0.8).
     ConfidenceGate,
-    /// Code detected worker AI explicitly declared stopping (handbrake).
-    Handbrake,
     /// Code detected remaining work patterns via rules (`detect_remaining_work`).
     RuleRemainingWork,
-    /// LLM said continue but provided no usable prompt.
+    /// LLM crossed threshold but provided no usable prompt.
     LlmNoPrompt,
+    /// Plan files have unchecked tasks despite LLM wanting to stop.
+    PlanTaskFallback,
 }
 
 /// Result of evaluating an LLM response.
@@ -469,10 +475,8 @@ impl EvaluationResult {
         match self {
             EvaluationResult::Continue { .. } => DecisionSource::LlmResponse,
             EvaluationResult::WantsStop { reason } => {
-                if reason.starts_with("confidence too low") {
+                if reason.contains("< ") || reason.contains("confidence") {
                     DecisionSource::ConfidenceGate
-                } else if reason.starts_with("handbrake") {
-                    DecisionSource::Handbrake
                 } else if reason.contains("no usable prompt") {
                     DecisionSource::LlmNoPrompt
                 } else {
@@ -485,59 +489,22 @@ impl EvaluationResult {
 }
 
 pub fn evaluate_response(input: &EvaluationInput) -> EvaluationResult {
+    let confidence = input.confidence.unwrap_or(0.0);
     let has_prompt = input
         .next_prompt
         .as_ref()
-        .is_some_and(|p| !p.trim().is_empty());
+        .is_some_and(|prompt| !prompt.trim().is_empty());
 
-    // Universal gate: low confidence overrides everything.
-    if input.confidence.is_some_and(|c| c < 0.5) {
-        return EvaluationResult::WantsStop {
-            reason: format!(
-                "confidence too low ({:.2} < 0.5)",
-                input.confidence.unwrap()
-            ),
-        };
-    }
+    // Phase-dependent confidence thresholds.
+    // Working: low threshold (0.2) — biased toward continuing.
+    // PreStop: high threshold (0.8) — biased toward stopping.
+    let threshold = match input.stop_phase {
+        context::StopPhase::Working => WORKING_CONFIDENCE_THRESHOLD,
+        context::StopPhase::PreStop | context::StopPhase::Verified => PRESTOP_CONFIDENCE_THRESHOLD,
+    };
 
-    if input.should_continue {
-        // ── LLM says continue ──────────────────────────────────
-        // Handbrake: last resort, post-verification only.
-        // Worker AI explicitly declared stopping but LLM wants to continue → force stop.
-        if input.stop_phase != context::StopPhase::Working {
-            if let Some(last_msg) = &input.last_assistant_message {
-                let lower = last_msg.to_lowercase();
-                let is_explicit_stop = lower.contains("stopping")
-                    && (lower.contains("nothing related")
-                        || lower.contains("no further action")
-                        || lower.contains("nothing left")
-                        || lower.contains("no further work"));
-                if is_explicit_stop {
-                    log::warn!(
-                        "[auto_prompt::evaluate_response] Handbrake: worker AI declared stop despite LLM wanting to continue"
-                    );
-                    return EvaluationResult::WantsStop {
-                        reason: "handbrake: worker AI explicitly declared stopping after pre-stop verification".to_string(),
-                    };
-                }
-            }
-        }
-
-        // all_plan_done chooses WHICH continuation prompt, not WHETHER to continue.
-        if input.all_plan_done {
-            if let Some(next_plan_prompt) = &input.next_plan_prompt {
-                return EvaluationResult::Continue {
-                    prompt: next_plan_prompt.clone(),
-                    reason: "current plan done, transitioning to next plan".to_string(),
-                };
-            }
-            return EvaluationResult::Continue {
-                prompt: "All plans are complete. Final cleanup: merge this feature branch into develop (fast-forward, no interactive rebase), resolve any conflicts, ensure a clean develop branch. Do NOT push — leave local for user to review.".to_string(),
-                reason: "all plans done, dispatching final cleanup".to_string(),
-            };
-        }
-
-        // Normal continuation with LLM-provided prompt.
+    if confidence >= threshold {
+        // ── Confidence crosses threshold → continue ─────────────────
         if has_prompt {
             let prompt = input.next_prompt.as_ref().unwrap();
             let cleaned = prompt
@@ -548,35 +515,43 @@ pub fn evaluate_response(input: &EvaluationInput) -> EvaluationResult {
             if !cleaned.is_empty() {
                 return EvaluationResult::Continue {
                     prompt: cleaned,
-                    reason: "LLM says continue with next prompt".to_string(),
+                    reason: format!(
+                        "confidence {confidence:.2} >= {threshold:.2} ({:?} phase), LLM provided prompt",
+                        input.stop_phase
+                    ),
                 };
             }
         }
 
-        // should_continue=true but no usable prompt.
+        // Confidence is high enough but no usable prompt.
         return EvaluationResult::WantsStop {
-            reason: "LLM says continue but provided no usable prompt".to_string(),
+            reason: format!("confidence {confidence:.2} >= {threshold:.2} but no usable prompt"),
         };
     }
 
-    // ── LLM says stop ──────────────────────────────────────────
+    // ── Confidence below threshold → check safety nets before stopping ──
 
-    // Rules-based detection found potential remaining work — defer to LLM second opinion
-    // instead of force-overriding. The extracted section goes to a lightweight LLM call
-    // that decides whether this is real remaining work or a false positive.
+    // Safety net: last assistant message contains remaining work patterns.
     if let Some(remaining_prompt) = detect_remaining_work(input.last_assistant_message.as_deref()) {
         return EvaluationResult::NeedsSecondOpinion {
             extracted_section: remaining_prompt,
-            rule_reason: "LLM says stop but last_assistant_message contains remaining work pattern"
-                .to_string(),
+            rule_reason: format!(
+                "confidence {confidence:.2} < {threshold:.2} but last_assistant_message contains remaining work pattern"
+            ),
         };
     }
 
-    // Default: respect LLM's stop decision.
+    // Default: respect the low-confidence stop.
     let reason = match (&input.reason, has_prompt) {
-        (Some(r), _) => r.clone(),
-        (None, false) => "LLM says stop, no next prompt".to_string(),
-        (None, true) => "LLM says stop despite having prompt".to_string(),
+        (Some(reason), _) => reason.clone(),
+        (None, false) => format!(
+            "confidence {confidence:.2} < {threshold:.2} ({:?} phase), no prompt",
+            input.stop_phase
+        ),
+        (None, true) => format!(
+            "confidence {confidence:.2} < {threshold:.2} ({:?} phase) despite having prompt",
+            input.stop_phase
+        ),
     };
     EvaluationResult::WantsStop { reason }
 }
@@ -863,10 +838,8 @@ pub async fn decide_with_llm(
             "[auto_prompt::decide_with_llm] Context exceeds token limit — skipping full LLM call, using lightweight retry path"
         );
         let skipped_response = AutoPromptResponse {
-            should_continue: false,
             next_prompt: None,
             reason: Some("model skipped: context exceeds token limit".to_string()),
-            all_plan_done: false,
             confidence: Some(0.0),
             thread_summary: None,
         };
@@ -875,7 +848,20 @@ pub async fn decide_with_llm(
             skipped_response,
         ))
     } else {
-        call_language_model(&data.model, &data.system_prompt, &data.context_json, cx).await
+        // Use lightweight context: last assistant message + plan summaries only.
+        // Reduces token usage from ~80K to ~500 tokens.
+        let lightweight_context = lightweight_context::build_lightweight_orchestration_context(
+            &data.context_json,
+            &data.stop_phase,
+            data.iteration_count,
+            data.had_error,
+        );
+        log::info!(
+            "[auto_prompt::decide_with_llm] Using lightweight context ({} chars) instead of full context ({} chars)",
+            lightweight_context.len(),
+            data.context_json.len()
+        );
+        call_language_model(&data.model, &data.system_prompt, &lightweight_context, cx).await
     };
 
     log::info!(
@@ -915,19 +901,17 @@ pub async fn decide_with_llm(
             );
 
             log::info!(
-                "[auto_prompt::decide_with_llm] Response received: should_continue={}, has_next_prompt={}, all_plan_done={}, confidence={:?}",
-                response.should_continue,
+                "[auto_prompt::decide_with_llm] Response received: confidence={:?}, has_next_prompt={:?}",
+                response.confidence,
                 has_prompt,
-                response.all_plan_done,
-                response.confidence
             );
 
             if let Some(reason) = &response.reason {
-                log::info!("[auto_prompt::decide_with_llm] Reason: {}", reason);
+                log::info!("[auto_prompt::decide_with_llm] Reason: {reason}");
             }
 
             if let Some(prompt) = &response.next_prompt {
-                log::info!("[auto_prompt::decide_with_llm] Next prompt: {}", prompt);
+                log::info!("[auto_prompt::decide_with_llm] Next prompt: {prompt}");
             }
 
             let prompt_summary = build_prompt_summary(
@@ -939,55 +923,27 @@ pub async fn decide_with_llm(
                 data.first_user_message.as_deref(),
             );
 
-            let all_done = response.all_plan_done
-                || response
-                    .next_prompt
-                    .as_ref()
-                    .is_some_and(|p| p.contains("#ALL_PLAN_DONE"));
-
-            let next_plan_prompt = if all_done {
-                build_plan_landscape(&data.context_json).map(|landscape| {
-                    format!(
-                        "All current plan tasks are checked. For your awareness, remaining plans:\n\n\
-                         {landscape}\n\n\
-                         IMPORTANT: Do NOT start a new plan automatically. Instead:\n\
-                         1. Re-read your last message — finish any remaining work described there first.\n\
-                         2. Commit current changes with conventional messages to feature branch.\n\
-                         3. Consider closing current feature branch (merge to develop, fast-forward).\n\
-                         4. Only THEN re-read this plan list and decide if any is genuinely related to what you just did.\n\
-                         5. Declare: \"Reviewed remaining plans: <staying on current feature | transitioning to X because Y | stopping, nothing related>\""
-                    )
-                })
-            } else {
-                None
-            };
-
             if is_synthetic_failure {
                 log::warn!(
-                    "[auto_prompt::decide_with_llm] Synthetic failure detected: confidence={:?}, reason={:?} — model did not produce a real response, entering lightweight retry path with detect_remaining_work safety net",
+                    "[auto_prompt::decide_with_llm] Synthetic failure detected: confidence={:?}, reason={:?} — entering lightweight retry path",
                     response.confidence,
                     response.reason
                 );
             }
 
             let input = EvaluationInput {
-                should_continue: response.should_continue,
                 confidence: response.confidence,
                 next_prompt: std::mem::take(&mut response.next_prompt),
                 reason: std::mem::take(&mut response.reason),
-                all_plan_done: all_done,
-                next_plan_prompt,
                 last_assistant_message: data.last_assistant_message.clone(),
                 is_synthetic_failure,
                 stop_phase: data.stop_phase.clone(),
             };
 
             log::info!(
-                "[auto_prompt::decide_with_llm] evaluate_response input: should_continue={}, all_plan_done={}, confidence={:?}, has_next_plan={}",
-                input.should_continue,
-                input.all_plan_done,
+                "[auto_prompt::decide_with_llm] evaluate_response input: confidence={:?}, stop_phase={:?}",
                 input.confidence,
-                input.next_plan_prompt.is_some()
+                input.stop_phase,
             );
 
             let evaluation = evaluate_response(&input);
@@ -1055,19 +1011,19 @@ pub async fn decide_with_llm(
                     );
 
                     let second_opinion_system = "# version: second_opinion\n\
-                        You are a second-opinion judge. The main orchestration LLM said 'stop' \
+                        You are a second-opinion judge. The main orchestration LLM returned low confidence \n\
                         but pattern detection found potential remaining work in the worker AI's last message.\n\n\
                         Respond ONLY with valid JSON:\n\
-                        {\"should_continue\": bool, \"next_prompt\": null, \"reason\": string, \"all_plan_done\": false, \"confidence\": 0.8, \"thread_summary\": null}\n\n\
+                        {\"confidence\": float, \"next_prompt\": string | null, \"reason\": string, \"thread_summary\": null}\n\n\
                         ## Rules:\n\
                         1. Read the extracted section carefully — is there SPECIFIC, ACTIONABLE remaining work?\n\
-                        2. Generic statements like 'remaining work:' followed by nothing actionable → should_continue=false\n\
-                        3. Summary/completion messages that happen to contain trigger words → should_continue=false\n\
-                        4. Actual unchecked tasks, bugs to fix, features to implement → should_continue=true\n\
-                        5. When in doubt, favor stopping (should_continue=false) — the main LLM already said stop";
+                        2. Generic statements like 'remaining work:' followed by nothing actionable → confidence <= 0.2\n\
+                        3. Summary/completion messages that happen to contain trigger words → confidence <= 0.2\n\
+                        4. Actual unchecked tasks, bugs to fix, features to implement → confidence >= 0.8\n\
+                        5. When in doubt, favor stopping (low confidence) — the main LLM already said stop";
 
                     let second_opinion_context = format!(
-                        "## Main LLM decision\n- should_continue: false\n- reason: {}\n\n\
+                        "## Main LLM decision\n- confidence: low (below threshold)\n- reason: {}\n\n\
                          ## Pattern detection\n- rule: {}\n\n\
                          ## Extracted section\n{}\n\n\
                          ## Last assistant message (for context)\n{}",
@@ -1086,9 +1042,10 @@ pub async fn decide_with_llm(
                     .await
                     {
                         Ok((_raw, response)) => {
-                            if response.should_continue {
+                            let second_opinion_confidence = response.confidence.unwrap_or(0.5);
+                            if second_opinion_confidence >= WORKING_CONFIDENCE_THRESHOLD {
                                 log::info!(
-                                    "[auto_prompt::decide_with_llm] Second opinion: Continue — {:?}",
+                                    "[auto_prompt::decide_with_llm] Second opinion: Continue (confidence={second_opinion_confidence:.2}) — {:?}",
                                     response.reason
                                 );
                                 let next_prompt = with_first_prompt_context(
@@ -1115,7 +1072,7 @@ pub async fn decide_with_llm(
                                 }))
                             } else {
                                 let stop_reason = format!(
-                                    "second opinion confirmed stop: {}",
+                                    "second opinion confirmed stop (confidence={second_opinion_confidence:.2}): {}",
                                     response.reason.as_deref().unwrap_or("no reason given")
                                 );
                                 log::info!("[auto_prompt::decide_with_llm] {stop_reason}");
@@ -1175,23 +1132,22 @@ pub async fn decide_with_llm(
                             You decide what to do next based on the AI's last message.\n\
                             Priority: the LAST ASSISTANT MESSAGE is the most important signal.\n\n\
                             Respond ONLY with valid JSON:\n\
-                            {\"should_continue\": bool, \"next_prompt\": string | null, \"reason\": string | null, \
-                            \"all_plan_done\": bool, \"confidence\": float, \"thread_summary\": null}\n\n\
+                            {\"confidence\": float, \"next_prompt\": string | null, \"reason\": string | null, \"thread_summary\": null}\n\n\
                             ## Rules (in order):\n\
                             1. LAST MESSAGE IS KING — reason about it first, before looking at plans\n\
-                            2. If it asks \"would you like to continue?\" or \"want me to ...?\" → should_continue=true, \
+                            2. If it asks \"would you like to continue?\" or \"want me to ...?\" → confidence >= 0.8, \n\
                                next_prompt=\"continue as you prefer\"\n\
-                            3. If it presents options to pick from → should_continue=true, \
+                            3. If it presents options to pick from → confidence >= 0.8, \n\
                                next_prompt=\"select best for performance, security, SOLID, DRY principles\"\n\
-                            4. If it reports plan done but mentions remaining phases/next steps → should_continue=true, \
+                            4. If it reports plan done but mentions remaining phases/next steps → confidence >= 0.7, \n\
                                next_prompt=\"continue with the next phase/step\"\n\
-                            5. If it describes specific remaining work → should_continue=true, \
+                            5. If it describes specific remaining work → confidence >= 0.7, \n\
                                next_prompt=continue that specific work\n\
-                            6. If genuinely complete with nothing left → should_continue=false\n\
-                            7. Struck-through / skipped tasks (~~text~~, \"Skipped\", \"Cancelled\") count as DONE — \
-                               do NOT continue them. If only skipped tasks remain → should_continue=false\n\
+                            6. If genuinely complete with nothing left → confidence <= 0.2\n\
+                            7. Struck-through / skipped tasks (~~text~~, \"Skipped\", \"Cancelled\") count as DONE — \n\
+                               do NOT continue them. If only skipped tasks remain → confidence <= 0.2\n\
                             8. If remaining tasks seem unjustified or low-value, include #SKIP in next_prompt to signal skip\n\
-                            9. confidence must be >= 0.7\n";
+                            9. confidence must be >= 0.7 to continue\n";
 
                         let mut retry_ok = None;
                         for attempt in 1..=3u32 {
@@ -1225,8 +1181,8 @@ pub async fn decide_with_llm(
                                         continue;
                                     }
                                     log::info!(
-                                        "auto_prompt: lightweight retry attempt {attempt} ok: should_continue={}, prompt={:?}",
-                                        parsed.should_continue,
+                                        "auto_prompt: lightweight retry attempt {attempt} ok: confidence={:?}, prompt={:?}",
+                                        parsed.confidence,
                                         parsed.next_prompt
                                     );
                                     retry_ok = Some(parsed);
@@ -1241,7 +1197,10 @@ pub async fn decide_with_llm(
                         }
 
                         match retry_ok {
-                            Some(parsed) if parsed.should_continue => {
+                            Some(parsed)
+                                if parsed.confidence.unwrap_or(0.0)
+                                    >= WORKING_CONFIDENCE_THRESHOLD =>
+                            {
                                 let prompt = parsed
                                     .next_prompt
                                     .unwrap_or_else(|| "Continue with remaining work.".to_string());
@@ -1430,6 +1389,35 @@ pub async fn decide_with_llm(
                             }
                         }
                     } else {
+                        // Before accepting stop, check plan files for unchecked tasks.
+                        if let Some(plan_prompt) = detect_remaining_plan_tasks(&data.context_json) {
+                            log::warn!(
+                                "auto_prompt: PLAN TASK FALLBACK — confidence below threshold but plan files have unchecked tasks, continuing"
+                            );
+                            let next_prompt = with_first_prompt_context(
+                                plan_prompt,
+                                prompt_summary.as_deref(),
+                                data.title.as_deref(),
+                                data.last_assistant_message.as_deref(),
+                            );
+                            auto_claim_plan(
+                                &next_prompt,
+                                &data.context_json,
+                                &data.session_id,
+                                data.title.as_deref(),
+                            );
+                            return Ok(AutoPromptOutcome::Continue(AutoPromptAction {
+                                from_session_id: data.session_id,
+                                from_title: data.title,
+                                next_prompt,
+                                work_dirs: data.work_dirs,
+                                original_user_message: data.original_user_message,
+                                profile_id: data.profile_id.clone(),
+                                actual_input_tokens: data.actual_input_tokens,
+                                last_assistant_message: data.last_assistant_message.clone(),
+                            }));
+                        }
+
                         let verification_count = VERIFICATION_COUNT.load(Ordering::Relaxed);
                         let max_verifications = data.max_verification_attempts;
 
@@ -1467,7 +1455,7 @@ pub async fn decide_with_llm(
                                 }
                                 None => {
                                     let stop_reason =
-                                        "LLM says stop, no plan files found for verification"
+                                        "confidence below threshold, no plan files found for verification"
                                             .to_string();
                                     log::info!(
                                         "auto_prompt: no verification needed (no plan files found), stopping"
@@ -1485,7 +1473,7 @@ pub async fn decide_with_llm(
                             }
                         } else if verification_count < max_verifications {
                             let stop_reason = format!(
-                                "LLM says stop after verification attempt {verification_count}/{max_verifications}"
+                                "confidence below threshold after verification attempt {verification_count}/{max_verifications}"
                             );
                             log::info!("auto_prompt: {stop_reason}");
                             write_stop_log(
@@ -1570,10 +1558,8 @@ fn write_decision_log(
         "raw_response": raw_response,
         "actual_input_tokens": actual_input_tokens,
         "parsed_response": {
-            "should_continue": parsed.should_continue,
             "next_prompt": parsed.next_prompt,
             "reason": parsed.reason,
-            "all_plan_done": parsed.all_plan_done,
             "confidence": parsed.confidence,
         },
     });
@@ -2172,10 +2158,8 @@ async fn call_language_model(
                     thinking.len()
                 );
                 let synthetic = serde_json::json!({
-                    "should_continue": false,
                     "next_prompt": null,
                     "reason": format!("Model returned {} Thinking events but no Text output", thinking_parts.len()),
-                    "all_plan_done": false,
                     "confidence": 0.3,
                     "thread_summary": null
                 });
@@ -2188,10 +2172,8 @@ async fn call_language_model(
                     stream_errors.len()
                 );
                 let synthetic = serde_json::json!({
-                    "should_continue": false,
                     "next_prompt": null,
                     "reason": format!("model returned no usable content ({} empty Text, {} empty Thinking, {} stream errors)", text_parts.len(), thinking_parts.len(), stream_errors.len()),
-                    "all_plan_done": false,
                     "confidence": 0.0,
                     "thread_summary": null
                 });
@@ -2204,10 +2186,8 @@ async fn call_language_model(
                 "auto_prompt: model stream produced only errors — details: {error_details:?}"
             );
             let synthetic = serde_json::json!({
-                "should_continue": false,
                 "next_prompt": null,
                 "reason": format!("model stream produced only errors ({})", stream_errors.len()),
-                "all_plan_done": false,
                 "confidence": 0.0,
                 "thread_summary": null
             });
@@ -2217,10 +2197,8 @@ async fn call_language_model(
                 "auto_prompt: model returned zero events (0 Text, 0 Thinking) out of {total_events} total events. Other types seen: {other_event_types:?}"
             );
             let synthetic = serde_json::json!({
-                "should_continue": false,
                 "next_prompt": null,
                 "reason": format!("model returned zero events ({} total stream events)", total_events),
-                "all_plan_done": false,
                 "confidence": 0.0,
                 "thread_summary": null
             });
@@ -2252,14 +2230,12 @@ fn parse_response(text: &str) -> anyhow::Result<AutoPromptResponse> {
             log::warn!("auto_prompt: failed to parse response as JSON ({parse_err}): {preview:?}");
             log::warn!("auto_prompt: synthesizing stop response to avoid retry loop");
             Ok(AutoPromptResponse {
-                should_continue: false,
                 next_prompt: None,
                 reason: Some(format!(
                     "unparseable response ({} bytes, {} extracted): {parse_err}",
                     text.len(),
                     json_str.len()
                 )),
-                all_plan_done: false,
                 confidence: Some(0.0),
                 thread_summary: None,
             })
@@ -3318,12 +3294,9 @@ mod tests {
 
     fn make_input() -> EvaluationInput {
         EvaluationInput {
-            should_continue: false,
             confidence: Some(0.8),
             next_prompt: None,
             reason: None,
-            all_plan_done: false,
-            next_plan_prompt: None,
             last_assistant_message: None,
             is_synthetic_failure: false,
             stop_phase: context::StopPhase::Working,
@@ -3333,59 +3306,59 @@ mod tests {
     // --- Task 4: evaluate_response() state machine tests ---
 
     #[test]
-    fn test_eval_all_done_with_next_plan() {
+    fn test_eval_high_confidence_with_prompt_continues() {
         let input = EvaluationInput {
-            should_continue: true,
-            all_plan_done: true,
-            next_plan_prompt: Some("do next plan work".to_string()),
-            ..make_input()
-        };
-        let result = evaluate_response(&input);
-        assert_eq!(
-            result,
-            EvaluationResult::Continue {
-                prompt: "do next plan work".to_string(),
-                reason: "current plan done, transitioning to next plan".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn test_eval_all_done_should_continue_no_next_plan() {
-        let input = EvaluationInput {
-            should_continue: true,
-            all_plan_done: true,
+            confidence: Some(0.9),
+            next_prompt: Some("commit changes".to_string()),
             ..make_input()
         };
         let result = evaluate_response(&input);
         match result {
-            EvaluationResult::Continue { reason, .. } => {
-                assert!(reason.contains("final cleanup"));
+            EvaluationResult::Continue { prompt, reason } => {
+                assert_eq!(prompt, "commit changes");
+                assert!(reason.contains("confidence 0.90 >= 0.20"));
             }
             _ => panic!("expected Continue, got {result:?}"),
         }
     }
 
     #[test]
-    fn test_eval_all_done_should_stop_no_next_plan() {
+    fn test_eval_high_confidence_no_prompt_wants_stop() {
         let input = EvaluationInput {
-            all_plan_done: true,
-            should_continue: false,
+            confidence: Some(0.9),
+            next_prompt: None,
             ..make_input()
         };
         let result = evaluate_response(&input);
-        assert_eq!(
-            result,
-            EvaluationResult::WantsStop {
-                reason: "LLM says stop, no next prompt".to_string(),
+        match result {
+            EvaluationResult::WantsStop { reason } => {
+                assert!(reason.contains("confidence 0.90 >= 0.20"));
+                assert!(reason.contains("no usable prompt"));
             }
-        );
+            _ => panic!("expected WantsStop, got {result:?}"),
+        }
+    }
+
+    #[test]
+    fn test_eval_low_confidence_wants_stop() {
+        let input = EvaluationInput {
+            confidence: Some(0.1),
+            next_prompt: None,
+            ..make_input()
+        };
+        let result = evaluate_response(&input);
+        match result {
+            EvaluationResult::WantsStop { reason } => {
+                assert!(reason.contains("confidence 0.10 < 0.20"));
+            }
+            _ => panic!("expected WantsStop, got {result:?}"),
+        }
     }
 
     #[test]
     fn test_eval_remaining_work_remaining_work_pattern() {
         let input = EvaluationInput {
-            should_continue: false,
+            confidence: Some(0.1),
             last_assistant_message: Some("## Remaining Work\n- fix tests".to_string()),
             ..make_input()
         };
@@ -3399,7 +3372,7 @@ mod tests {
     #[test]
     fn test_eval_remaining_work_unchecked_checkbox() {
         let input = EvaluationInput {
-            should_continue: false,
+            confidence: Some(0.1),
             last_assistant_message: Some("- [ ] do thing".to_string()),
             ..make_input()
         };
@@ -3413,7 +3386,7 @@ mod tests {
     #[test]
     fn test_eval_remaining_work_todo_pattern() {
         let input = EvaluationInput {
-            should_continue: false,
+            confidence: Some(0.1),
             last_assistant_message: Some("TODO: fix this".to_string()),
             ..make_input()
         };
@@ -3427,7 +3400,7 @@ mod tests {
     #[test]
     fn test_eval_remaining_work_no_match() {
         let input = EvaluationInput {
-            should_continue: false,
+            confidence: Some(0.1),
             last_assistant_message: Some("all done, nothing left".to_string()),
             ..make_input()
         };
@@ -3438,7 +3411,7 @@ mod tests {
     #[test]
     fn test_eval_remaining_work_false_positive_no_actionable_items() {
         let input = EvaluationInput {
-            should_continue: false,
+            confidence: Some(0.1),
             last_assistant_message: Some(
                 "The remaining work section was already addressed in the previous commit."
                     .to_string(),
@@ -3455,7 +3428,7 @@ mod tests {
     #[test]
     fn test_eval_remaining_work_trigger_with_bullets_overrides_stop() {
         let input = EvaluationInput {
-            should_continue: false,
+            confidence: Some(0.1),
             last_assistant_message: Some(
                 "Done with part 1.\n\n### Remaining work:\n\n- Fix the bug\n- Add tests"
                     .to_string(),
@@ -3475,148 +3448,171 @@ mod tests {
     }
 
     #[test]
-    fn test_eval_should_continue_with_valid_prompt() {
+    fn test_eval_high_confidence_with_valid_prompt_continues() {
         let input = EvaluationInput {
-            should_continue: true,
+            confidence: Some(0.8),
             next_prompt: Some("commit changes".to_string()),
             ..make_input()
         };
         let result = evaluate_response(&input);
-        assert_eq!(
-            result,
-            EvaluationResult::Continue {
-                prompt: "commit changes".to_string(),
-                reason: "LLM says continue with next prompt".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn test_eval_should_continue_empty_prompt() {
-        let input = EvaluationInput {
-            should_continue: true,
-            next_prompt: Some("".to_string()),
-            ..make_input()
-        };
-        let result = evaluate_response(&input);
-        assert!(matches!(result, EvaluationResult::WantsStop { .. }));
-    }
-
-    #[test]
-    fn test_eval_should_continue_whitespace_prompt() {
-        let input = EvaluationInput {
-            should_continue: true,
-            next_prompt: Some("   ".to_string()),
-            ..make_input()
-        };
-        let result = evaluate_response(&input);
-        assert!(matches!(result, EvaluationResult::WantsStop { .. }));
-    }
-
-    #[test]
-    fn test_eval_should_continue_no_prompt() {
-        let input = EvaluationInput {
-            should_continue: true,
-            next_prompt: None,
-            ..make_input()
-        };
-        let result = evaluate_response(&input);
-        assert!(matches!(result, EvaluationResult::WantsStop { .. }));
-    }
-
-    #[test]
-    fn test_eval_should_stop_with_prompt_ignored() {
-        let input = EvaluationInput {
-            should_continue: false,
-            next_prompt: Some("review code".to_string()),
-            ..make_input()
-        };
-        let result = evaluate_response(&input);
-        assert!(matches!(result, EvaluationResult::WantsStop { .. }));
-    }
-
-    #[test]
-    fn test_eval_low_confidence_with_should_continue_and_prompt() {
-        let input = EvaluationInput {
-            should_continue: true,
-            confidence: Some(0.3),
-            next_prompt: Some("go".to_string()),
-            ..make_input()
-        };
-        let result = evaluate_response(&input);
         match result {
-            EvaluationResult::WantsStop { reason } => {
-                assert!(reason.contains("confidence too low"));
+            EvaluationResult::Continue { prompt, reason } => {
+                assert_eq!(prompt, "commit changes");
+                assert!(reason.contains("confidence 0.80 >= 0.20"));
             }
-            _ => panic!("expected WantsStop for low confidence, got {result:?}"),
+            _ => panic!("expected Continue, got {result:?}"),
         }
     }
 
     #[test]
-    fn test_eval_low_confidence_should_stop() {
+    fn test_eval_high_confidence_empty_prompt_wants_stop() {
         let input = EvaluationInput {
-            should_continue: false,
-            confidence: Some(0.3),
+            confidence: Some(0.8),
+            next_prompt: Some("".to_string()),
             ..make_input()
         };
         let result = evaluate_response(&input);
         match result {
             EvaluationResult::WantsStop { reason } => {
-                assert!(reason.contains("confidence too low"));
+                assert!(reason.contains("confidence 0.80 >= 0.20"));
+                assert!(reason.contains("no usable prompt"));
             }
             _ => panic!("expected WantsStop, got {result:?}"),
         }
     }
 
     #[test]
-    fn test_eval_high_confidence_should_stop() {
+    fn test_eval_high_confidence_whitespace_prompt_wants_stop() {
         let input = EvaluationInput {
-            should_continue: false,
+            confidence: Some(0.8),
+            next_prompt: Some("   ".to_string()),
+            ..make_input()
+        };
+        let result = evaluate_response(&input);
+        match result {
+            EvaluationResult::WantsStop { reason } => {
+                assert!(reason.contains("confidence 0.80 >= 0.20"));
+                assert!(reason.contains("no usable prompt"));
+            }
+            _ => panic!("expected WantsStop, got {result:?}"),
+        }
+    }
+
+    #[test]
+    fn test_eval_high_confidence_no_prompt_wants_stop_working() {
+        let input = EvaluationInput {
+            confidence: Some(0.8),
+            next_prompt: None,
+            ..make_input()
+        };
+        let result = evaluate_response(&input);
+        match result {
+            EvaluationResult::WantsStop { reason } => {
+                assert!(reason.contains("confidence 0.80 >= 0.20"));
+                assert!(reason.contains("no usable prompt"));
+            }
+            _ => panic!("expected WantsStop, got {result:?}"),
+        }
+    }
+
+    #[test]
+    fn test_eval_low_confidence_with_prompt_still_stops() {
+        let input = EvaluationInput {
+            confidence: Some(0.1),
+            next_prompt: Some("review code".to_string()),
+            ..make_input()
+        };
+        let result = evaluate_response(&input);
+        match result {
+            EvaluationResult::WantsStop { reason } => {
+                assert!(reason.contains("confidence 0.10 < 0.20"));
+            }
+            _ => panic!("expected WantsStop, got {result:?}"),
+        }
+    }
+
+    #[test]
+    fn test_eval_confidence_0_3_working_phase_continues_with_prompt() {
+        let input = EvaluationInput {
+            confidence: Some(0.3),
+            next_prompt: Some("go".to_string()),
+            ..make_input()
+        };
+        let result = evaluate_response(&input);
+        match result {
+            EvaluationResult::Continue { prompt, reason } => {
+                assert_eq!(prompt, "go");
+                assert!(reason.contains("confidence 0.30 >= 0.20"));
+            }
+            _ => panic!("expected Continue for confidence 0.3 in Working phase, got {result:?}"),
+        }
+    }
+
+    #[test]
+    fn test_eval_confidence_0_1_working_phase_stops() {
+        let input = EvaluationInput {
+            confidence: Some(0.1),
+            ..make_input()
+        };
+        let result = evaluate_response(&input);
+        match result {
+            EvaluationResult::WantsStop { reason } => {
+                assert!(reason.contains("confidence 0.10 < 0.20"));
+            }
+            _ => panic!("expected WantsStop, got {result:?}"),
+        }
+    }
+
+    #[test]
+    fn test_eval_high_confidence_default_no_prompt_wants_stop() {
+        let input = EvaluationInput {
             confidence: Some(0.8),
             ..make_input()
         };
         let result = evaluate_response(&input);
-        assert!(matches!(result, EvaluationResult::WantsStop { .. }));
+        match result {
+            EvaluationResult::WantsStop { reason } => {
+                assert!(reason.contains("confidence 0.80 >= 0.20"));
+                assert!(reason.contains("no usable prompt"));
+            }
+            _ => panic!("expected WantsStop, got {result:?}"),
+        }
     }
 
     #[test]
-    fn test_eval_all_done_next_plan_respects_should_stop() {
+    fn test_eval_prestop_confidence_below_threshold_stops() {
         let input = EvaluationInput {
-            all_plan_done: true,
-            should_continue: false,
-            next_plan_prompt: Some("start next plan".to_string()),
+            confidence: Some(0.7),
+            stop_phase: context::StopPhase::PreStop,
             ..make_input()
         };
         let result = evaluate_response(&input);
-        assert_eq!(
-            result,
-            EvaluationResult::WantsStop {
-                reason: "LLM says stop, no next prompt".to_string(),
+        match result {
+            EvaluationResult::WantsStop { reason } => {
+                assert!(reason.contains("confidence 0.70 < 0.80"));
             }
+            _ => panic!("expected WantsStop for confidence 0.7 in PreStop phase, got {result:?}"),
+        }
+    }
+
+    #[test]
+    fn test_eval_low_confidence_remaining_work_needs_second_opinion() {
+        let input = EvaluationInput {
+            confidence: Some(0.1),
+            last_assistant_message: Some("Remaining work:\n- fix test".to_string()),
+            ..make_input()
+        };
+        let result = evaluate_response(&input);
+        assert!(
+            matches!(result, EvaluationResult::NeedsSecondOpinion { .. }),
+            "expected NeedsSecondOpinion for low confidence with remaining work pattern, got {result:?}"
         );
     }
 
     #[test]
-    fn test_eval_all_done_no_next_plan_remaining_work_still_stops() {
+    fn test_eval_high_confidence_all_plan_done_tag_stripped_from_prompt() {
         let input = EvaluationInput {
-            all_plan_done: true,
-            should_continue: false,
-            last_assistant_message: Some("remaining: fix test".to_string()),
-            ..make_input()
-        };
-        let result = evaluate_response(&input);
-        assert_eq!(
-            result,
-            EvaluationResult::WantsStop {
-                reason: "LLM says stop, no next prompt".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn test_eval_all_plan_done_in_prompt_stripped() {
-        let input = EvaluationInput {
-            should_continue: true,
+            confidence: Some(0.8),
             next_prompt: Some("done #ALL_PLAN_DONE".to_string()),
             ..make_input()
         };
@@ -3631,9 +3627,9 @@ mod tests {
     }
 
     #[test]
-    fn test_eval_last_assistant_message_none() {
+    fn test_eval_last_assistant_message_none_low_confidence() {
         let input = EvaluationInput {
-            should_continue: false,
+            confidence: Some(0.1),
             last_assistant_message: None,
             ..make_input()
         };
@@ -3642,9 +3638,9 @@ mod tests {
     }
 
     #[test]
-    fn test_eval_last_assistant_message_empty() {
+    fn test_eval_last_assistant_message_empty_low_confidence() {
         let input = EvaluationInput {
-            should_continue: false,
+            confidence: Some(0.1),
             last_assistant_message: Some("".to_string()),
             ..make_input()
         };
@@ -3653,127 +3649,88 @@ mod tests {
     }
 
     #[test]
-    fn test_handbrake_stopping_nothing_related_forces_stop() {
+    fn test_phase_threshold_working_uses_0_2() {
         let input = EvaluationInput {
-            should_continue: true,
-            next_prompt: Some("continue the plan".to_string()),
-            last_assistant_message: Some(
-                "Declare: reviewed remaining plans: stopping, nothing related".to_string(),
-            ),
+            confidence: Some(0.2),
+            next_prompt: Some("keep going".to_string()),
+            stop_phase: context::StopPhase::Working,
+            ..make_input()
+        };
+        let result = evaluate_response(&input);
+        match result {
+            EvaluationResult::Continue { reason, .. } => {
+                assert!(reason.contains("confidence 0.20 >= 0.20"));
+            }
+            _ => panic!("expected Continue for confidence 0.2 in Working phase, got {result:?}"),
+        }
+    }
+
+    #[test]
+    fn test_phase_threshold_prestop_uses_0_8() {
+        let input = EvaluationInput {
+            confidence: Some(0.8),
+            next_prompt: Some("keep going".to_string()),
             stop_phase: context::StopPhase::PreStop,
             ..make_input()
         };
         let result = evaluate_response(&input);
-        assert!(
-            matches!(result, EvaluationResult::WantsStop { .. }),
-            "handbrake should force stop when worker declares 'stopping, nothing related' after pre-stop"
-        );
+        match result {
+            EvaluationResult::Continue { reason, .. } => {
+                assert!(reason.contains("confidence 0.80 >= 0.80"));
+            }
+            _ => panic!("expected Continue for confidence 0.8 in PreStop phase, got {result:?}"),
+        }
     }
 
     #[test]
-    fn test_handbrake_stopping_no_further_action_forces_stop() {
+    fn test_phase_threshold_prestop_below_threshold_stops() {
         let input = EvaluationInput {
-            should_continue: true,
-            next_prompt: Some("continue work".to_string()),
-            last_assistant_message: Some(
-                "Reviewed plans: stopping — no further action needed.".to_string(),
-            ),
+            confidence: Some(0.79),
+            next_prompt: Some("please continue".to_string()),
             stop_phase: context::StopPhase::PreStop,
             ..make_input()
         };
         let result = evaluate_response(&input);
-        assert!(
-            matches!(result, EvaluationResult::WantsStop { .. }),
-            "handbrake should force stop when worker declares 'stopping' with 'no further action' after pre-stop"
-        );
+        match result {
+            EvaluationResult::WantsStop { reason } => {
+                assert!(reason.contains("confidence 0.79 < 0.80"));
+            }
+            _ => panic!("expected WantsStop for confidence 0.79 in PreStop phase, got {result:?}"),
+        }
     }
 
     #[test]
-    fn test_handbrake_stopping_nothing_left_forces_stop() {
+    fn test_phase_threshold_verified_uses_0_8() {
         let input = EvaluationInput {
-            should_continue: true,
-            next_prompt: Some("continue".to_string()),
-            last_assistant_message: Some(
-                "Everything is done. Stopping, nothing left to do.".to_string(),
-            ),
+            confidence: Some(0.9),
+            next_prompt: Some("one more thing".to_string()),
             stop_phase: context::StopPhase::Verified,
             ..make_input()
         };
         let result = evaluate_response(&input);
-        assert!(
-            matches!(result, EvaluationResult::WantsStop { .. }),
-            "handbrake should force stop when worker declares 'stopping' with 'nothing left' after verification"
-        );
+        match result {
+            EvaluationResult::Continue { reason, .. } => {
+                assert!(reason.contains("confidence 0.90 >= 0.80"));
+            }
+            _ => panic!("expected Continue for confidence 0.9 in Verified phase, got {result:?}"),
+        }
     }
 
     #[test]
-    fn test_handbrake_stopping_alone_does_not_trigger() {
+    fn test_phase_threshold_working_0_19_stops() {
         let input = EvaluationInput {
-            should_continue: true,
-            next_prompt: Some("continue fixing bugs".to_string()),
-            last_assistant_message: Some(
-                "I'm stopping the current approach to try something else.".to_string(),
-            ),
-            stop_phase: context::StopPhase::PreStop,
-            ..make_input()
-        };
-        let result = evaluate_response(&input);
-        assert!(
-            matches!(result, EvaluationResult::Continue { .. }),
-            "'stopping' alone without qualifying phrase should NOT trigger handbrake"
-        );
-    }
-
-    #[test]
-    fn test_handbrake_normal_continue_not_affected() {
-        let input = EvaluationInput {
-            should_continue: true,
-            next_prompt: Some("implement the next feature".to_string()),
-            last_assistant_message: Some("I've completed step 1. Moving to step 2.".to_string()),
-            stop_phase: context::StopPhase::PreStop,
-            ..make_input()
-        };
-        let result = evaluate_response(&input);
-        assert!(
-            matches!(result, EvaluationResult::Continue { .. }),
-            "normal messages should not trigger handbrake even in pre-stop phase"
-        );
-    }
-
-    #[test]
-    fn test_handbrake_does_not_trigger_during_working_phase() {
-        let input = EvaluationInput {
-            should_continue: true,
-            next_prompt: Some("continue the plan".to_string()),
-            last_assistant_message: Some(
-                "Declare: reviewed remaining plans: stopping, nothing related".to_string(),
-            ),
+            confidence: Some(0.19),
+            next_prompt: Some("please continue".to_string()),
             stop_phase: context::StopPhase::Working,
             ..make_input()
         };
         let result = evaluate_response(&input);
-        assert!(
-            matches!(result, EvaluationResult::Continue { .. }),
-            "handbrake should NOT trigger during Working phase, only after pre-stop verification"
-        );
-    }
-
-    #[test]
-    fn test_should_continue_false_respected_without_handbrake() {
-        let input = EvaluationInput {
-            should_continue: false,
-            next_prompt: None,
-            last_assistant_message: Some(
-                "Reviewed remaining plans: stopping, nothing related to current work".to_string(),
-            ),
-            stop_phase: context::StopPhase::Working,
-            ..make_input()
-        };
-        let result = evaluate_response(&input);
-        assert!(
-            matches!(result, EvaluationResult::WantsStop { .. }),
-            "should_continue=false should be respected directly — no handbrake needed when LLM already says stop"
-        );
+        match result {
+            EvaluationResult::WantsStop { reason } => {
+                assert!(reason.contains("confidence 0.19 < 0.20"));
+            }
+            _ => panic!("expected WantsStop for confidence 0.19 in Working phase, got {result:?}"),
+        }
     }
 
     #[derive(Debug, PartialEq)]
@@ -4050,7 +4007,6 @@ mod tests {
     #[test]
     fn test_eval_synthetic_failure_zero_confidence_returns_wants_stop() {
         let input = EvaluationInput {
-            should_continue: false,
             confidence: Some(0.0),
             reason: Some("model returned zero events (1 total stream events)".to_string()),
             is_synthetic_failure: true,
@@ -4060,8 +4016,8 @@ mod tests {
         match result {
             EvaluationResult::WantsStop { reason } => {
                 assert!(
-                    reason.contains("confidence too low"),
-                    "expected low-confidence stop reason, got: {reason}"
+                    reason.contains("model returned zero events"),
+                    "expected synthetic failure reason, got: {reason}"
                 );
             }
             other => panic!("expected WantsStop for synthetic failure, got {other:?}"),
@@ -4071,7 +4027,6 @@ mod tests {
     #[test]
     fn test_eval_synthetic_failure_no_thinking_returns_wants_stop() {
         let input = EvaluationInput {
-            should_continue: false,
             confidence: Some(0.0),
             reason: Some("model returned no usable content (3 empty Text, 0 empty Thinking, 0 stream errors)".to_string()),
             is_synthetic_failure: true,
@@ -4087,7 +4042,6 @@ mod tests {
     #[test]
     fn test_eval_stream_errors_returns_wants_stop() {
         let input = EvaluationInput {
-            should_continue: false,
             confidence: Some(0.0),
             reason: Some("model stream produced only errors (2)".to_string()),
             is_synthetic_failure: true,
@@ -4106,7 +4060,6 @@ mod tests {
         // This should still return WantsStop, but the dispatch layer should
         // still run pre-stop verification (unlike synthetic failures).
         let input = EvaluationInput {
-            should_continue: false,
             confidence: Some(0.3),
             reason: Some("no active task identified".to_string()),
             is_synthetic_failure: false,
@@ -4128,7 +4081,6 @@ mod tests {
         // So this IS detected as synthetic. Let's verify evaluate_response doesn't care
         // about is_synthetic_failure — it just returns WantsStop for confidence < 0.5.
         let input = EvaluationInput {
-            should_continue: false,
             confidence: Some(0.3),
             reason: Some("Model returned 5 Thinking events but no Text output".to_string()),
             is_synthetic_failure: true,
@@ -4369,7 +4321,7 @@ mod tests {
     #[test]
     fn test_eval_remaining_work_strikethrough_in_last_message() {
         let input = EvaluationInput {
-            should_continue: false,
+            confidence: Some(0.1),
             last_assistant_message: Some(
                 "All phases complete.\n\n- [ ] ~~T5: SIMD accelerate~~ Skipped — YAGNI".to_string(),
             ),
@@ -4385,7 +4337,7 @@ mod tests {
     #[test]
     fn test_eval_remaining_work_real_plus_skipped_continues() {
         let input = EvaluationInput {
-            should_continue: false,
+            confidence: Some(0.1),
             last_assistant_message: Some(
                 "Phase 1 done.\n\n- [ ] Run benchmarks\n- [ ] ~~T5: SIMD~~ Skipped".to_string(),
             ),
@@ -4509,7 +4461,6 @@ mod tests {
     #[test]
     fn test_context_overflow_synthetic_failure_routes_to_wants_stop() {
         let input = EvaluationInput {
-            should_continue: false,
             confidence: Some(0.0),
             reason: Some("model skipped: context exceeds token limit".to_string()),
             ..make_input()
