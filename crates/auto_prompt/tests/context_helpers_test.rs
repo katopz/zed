@@ -598,3 +598,72 @@ fn test_estimate_token_count_with_large_doc_filenames() {
     // Plan file ~30 chars, doc filenames ~600 chars = ~150 tokens
     assert!(tokens < 500, "token count should be tiny, got {tokens}");
 }
+
+// ===== Paragraph Budget Tests =====
+
+#[test]
+fn test_paragraph_budget_single_short_paragraph() {
+    let context = AutoPromptContext {
+        messages: vec![
+            auto_prompt::context::ContextMessage {
+                role: auto_prompt::context::ContextMessageRole::User,
+                content: "do stuff".to_string(),
+            },
+            auto_prompt::context::ContextMessage {
+                role: auto_prompt::context::ContextMessageRole::Assistant,
+                content: "Short reply.".to_string(),
+            },
+        ],
+        ..default_context()
+    };
+    let result = context.compute_last_assistant_message().unwrap();
+    assert_eq!(result, "Short reply.");
+}
+
+#[test]
+fn test_paragraph_budget_takes_paragraphs_until_over_budget() {
+    let p1: String = "a".repeat(1_000);
+    let p2: String = "b".repeat(5_000);
+    let p3 = "c third paragraph";
+    let full = format!("{p1}\n\n{p2}\n\n{p3}");
+
+    let context = AutoPromptContext {
+        messages: vec![auto_prompt::context::ContextMessage {
+            role: auto_prompt::context::ContextMessageRole::Assistant,
+            content: full,
+        }],
+        ..default_context()
+    };
+    let result = context.compute_last_assistant_message().unwrap();
+    // p1(1000) + p2(5000) = 6000 > 5000 → take both p1 + p2
+    assert!(result.contains(&p1), "should contain p1");
+    assert!(result.contains(&p2), "should contain p2");
+    assert!(!result.contains(p3), "should not contain p3");
+}
+
+#[test]
+fn test_paragraph_budget_single_huge_paragraph_included() {
+    let big = "x".repeat(10_000);
+    let context = AutoPromptContext {
+        messages: vec![auto_prompt::context::ContextMessage {
+            role: auto_prompt::context::ContextMessageRole::Assistant,
+            content: big.clone(),
+        }],
+        ..default_context()
+    };
+    let result = context.compute_last_assistant_message().unwrap();
+    // Single paragraph always included even if > budget
+    assert_eq!(result.len(), 10_000);
+}
+
+#[test]
+fn test_paragraph_budget_no_assistant_message() {
+    let context = AutoPromptContext {
+        messages: vec![auto_prompt::context::ContextMessage {
+            role: auto_prompt::context::ContextMessageRole::User,
+            content: "hello".to_string(),
+        }],
+        ..default_context()
+    };
+    assert!(context.compute_last_assistant_message().is_none());
+}

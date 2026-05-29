@@ -321,6 +321,11 @@ impl AutoPromptContext {
         })
     }
 
+    /// Maximum character budget for `last_assistant_message`. Paragraphs accumulate
+    /// from the start; the paragraph that crosses this threshold is included so we
+    /// always return complete paragraphs (no mid-sentence cut-off).
+    const LAST_MESSAGE_PARAGRAPH_BUDGET: usize = 5_000;
+
     pub fn compute_last_assistant_message(&self) -> Option<String> {
         let mut chunks: Vec<&str> = self
             .messages
@@ -332,10 +337,31 @@ impl AutoPromptContext {
             .collect();
         chunks.reverse();
         if chunks.is_empty() {
-            None
-        } else {
-            Some(chunks.join("\n"))
+            return None;
         }
+        let full = chunks.join("\n");
+        Some(Self::truncate_to_paragraph_budget(&full))
+    }
+
+    /// Take complete paragraphs until total exceeds the budget.
+    /// The paragraph that crosses the threshold is included — this ensures we
+    /// always return complete paragraphs (1-4 typically) without mid-sentence cuts.
+    fn truncate_to_paragraph_budget(text: &str) -> String {
+        let paragraphs: Vec<&str> = text.split("\n\n").collect();
+        let mut total = 0usize;
+        let mut taken = 0;
+        for paragraph in &paragraphs {
+            total += paragraph.len();
+            taken += 1;
+            if total > Self::LAST_MESSAGE_PARAGRAPH_BUDGET {
+                break;
+            }
+        }
+        // If nothing was taken (shouldn't happen), fall back to the full text.
+        if taken == 0 {
+            return text.to_string();
+        }
+        paragraphs[..taken].join("\n\n")
     }
 
     /// Returns the count of plan items by status.
