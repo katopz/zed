@@ -5739,7 +5739,11 @@ impl ThreadView {
                 let mut is_blank = true;
                 let is_last = entry_ix + 1 == total_entries;
 
-                let style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
+                let is_generating = self.thread.read(cx).status() == ThreadStatus::Generating;
+                let mut style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
+                if is_generating {
+                    style.prevent_mouse_interaction = true;
+                }
                 let message_body = v_flex()
                     .w_full()
                     .gap_3()
@@ -9184,6 +9188,14 @@ impl ThreadView {
                 | ToolCallStatus::InProgress
                 | ToolCallStatus::WaitingForConfirmation { .. }
         );
+
+        let is_expanded = self.expanded_tool_calls.contains(&tool_call.id) || is_running;
+        let files_changed = changed_buffers.len();
+        let diff_stats = if is_running {
+            DiffStats::default()
+        } else {
+            DiffStats::all_files(&changed_buffers, cx)
+        };
 
         let is_failed = matches!(
             tool_call.status,
