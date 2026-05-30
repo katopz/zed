@@ -191,12 +191,36 @@ pub struct AutoPromptNewThread {
     pub decision_prompt: Option<String>,
 }
 
-/// Build a same-thread continuation prompt that combines `/compact` with reasoning
-/// from the last assistant message and the decision for next steps.
+/// Build a same-thread continuation prompt for ACP agents (e.g. Claude) that
+/// support the `/compact` command to summarize conversation history.
 ///
 /// Format: `/compact` + newline + last message reasoning (if present) + newline + decision.
 fn build_compact_prompt(last_assistant_message: Option<&str>, decision: &str) -> String {
     let mut parts = vec!["/compact".to_string()];
+
+    if let Some(last) = last_assistant_message.filter(|s| !s.trim().is_empty()) {
+        parts.push(String::new());
+        parts.push(last.trim().to_string());
+    }
+
+    if !decision.trim().is_empty() {
+        parts.push(String::new());
+        parts.push(decision.trim().to_string());
+    }
+
+    parts.join("\n")
+}
+
+/// Build a same-thread continuation prompt for the native Zed agent which does not
+/// support `/compact` as a slash command. Uses plain-text instructions instead.
+fn build_native_continuation_prompt(
+    last_assistant_message: Option<&str>,
+    decision: &str,
+) -> String {
+    let mut parts = vec![
+        "Continue from where we left off. Summarize prior context internally and proceed."
+            .to_string(),
+    ];
 
     if let Some(last) = last_assistant_message.filter(|s| !s.trim().is_empty()) {
         parts.push(String::new());
@@ -228,10 +252,14 @@ fn dispatch_action(
     );
 
     // Always continue in the same thread.
-    // Build a combined prompt: /compact + reasoning from last assistant message + decision.
+    // ACP agents (e.g. Claude) support /compact; native Zed agent does not.
     if let Some(active_tv) = conversation_view.active_thread() {
         let decision = strip_first_prompt_wrapper(&action.next_prompt);
-        let prompt = build_compact_prompt(action.last_assistant_message.as_deref(), &decision);
+        let prompt = if is_native_agent {
+            build_native_continuation_prompt(action.last_assistant_message.as_deref(), &decision)
+        } else {
+            build_compact_prompt(action.last_assistant_message.as_deref(), &decision)
+        };
         active_tv.update(cx, |tv, cx| {
             tv.message_editor.update(cx, |editor, cx| {
                 editor.set_message(
@@ -243,7 +271,12 @@ fn dispatch_action(
             tv.send(window, cx);
         });
         log::info!(
-            "[auto_prompt] dispatch_action: sent /compact continuation to same thread (tokens={:?})",
+            "[auto_prompt] dispatch_action: sent {} continuation to same thread (tokens={:?})",
+            if is_native_agent {
+                "native"
+            } else {
+                "/compact"
+            },
             action.actual_input_tokens
         );
         return;
