@@ -6436,6 +6436,7 @@ impl ThreadView {
             original_user_message: first_user_message,
             profile_id,
             actual_input_tokens,
+            approximate_token_count: 0,
             last_assistant_message,
         };
 

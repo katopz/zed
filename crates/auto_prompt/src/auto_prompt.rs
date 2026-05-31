@@ -140,6 +140,11 @@ pub struct AutoPromptAction {
     /// Used by dispatch to decide same-thread vs new-thread continuation.
     /// Falls back to None when usage data is unavailable.
     pub actual_input_tokens: Option<u64>,
+    /// Approximate token count (chars/4) of the auto_prompt context JSON.
+    /// Used as fallback when `actual_input_tokens` is `None` (e.g. model
+    /// doesn't report usage) to avoid the same-thread infinite loop during
+    /// ContextOverflow flow.
+    pub approximate_token_count: usize,
     /// The last assistant message from the previous thread,
     /// passed to ThreadSummary for loading indicator + summary flow.
     pub last_assistant_message: Option<String>,
@@ -395,6 +400,10 @@ pub struct LlmCallData {
     /// Whether the context exceeds `max_context_tokens` — skip the expensive
     /// full-context LLM call and go directly to the lightweight retry path.
     pub context_exceeds_limit: bool,
+    /// Approximate token count (chars/4) of the auto_prompt context JSON.
+    /// Passed through to AutoPromptAction as fallback when actual_input_tokens
+    /// is None.
+    pub approximate_token_count: usize,
 }
 
 impl std::fmt::Debug for LlmCallData {
@@ -424,6 +433,7 @@ impl std::fmt::Debug for LlmCallData {
             .field("had_error", &self.had_error)
             .field("stop_phase", &self.stop_phase)
             .field("context_exceeds_limit", &self.context_exceeds_limit)
+            .field("approximate_token_count", &self.approximate_token_count)
             .finish()
     }
 }
@@ -831,6 +841,7 @@ pub fn decide(
         had_error: auto_prompt_ctx.had_error,
         stop_phase,
         context_exceeds_limit,
+        approximate_token_count: auto_prompt_ctx.approximate_token_count,
     })
 }
 
@@ -889,6 +900,7 @@ pub async fn decide_with_llm(
                 original_user_message: data.original_user_message,
                 profile_id: data.profile_id.clone(),
                 actual_input_tokens: data.actual_input_tokens,
+                approximate_token_count: data.approximate_token_count,
                 last_assistant_message: data.last_assistant_message.clone(),
             }));
         } else if summary_state == 1 {
@@ -933,6 +945,7 @@ pub async fn decide_with_llm(
                 original_user_message: data.original_user_message,
                 profile_id: data.profile_id.clone(),
                 actual_input_tokens: data.actual_input_tokens,
+                approximate_token_count: data.approximate_token_count,
                 last_assistant_message: data.last_assistant_message.clone(),
             }));
         } else {
@@ -1101,6 +1114,7 @@ pub async fn decide_with_llm(
                         original_user_message: data.original_user_message,
                         profile_id: data.profile_id.clone(),
                         actual_input_tokens: data.actual_input_tokens,
+                        approximate_token_count: data.approximate_token_count,
                         last_assistant_message: data.last_assistant_message.clone(),
                     }))
                 }
@@ -1170,6 +1184,7 @@ pub async fn decide_with_llm(
                                     original_user_message: data.original_user_message,
                                     profile_id: data.profile_id.clone(),
                                     actual_input_tokens: data.actual_input_tokens,
+                                    approximate_token_count: data.approximate_token_count,
                                     last_assistant_message: data.last_assistant_message.clone(),
                                 }))
                             } else {
@@ -1326,6 +1341,7 @@ pub async fn decide_with_llm(
                                     original_user_message: data.original_user_message,
                                     profile_id: data.profile_id.clone(),
                                     actual_input_tokens: data.actual_input_tokens,
+                                    approximate_token_count: data.approximate_token_count,
                                     last_assistant_message: data.last_assistant_message.clone(),
                                 }))
                             }
@@ -1366,6 +1382,7 @@ pub async fn decide_with_llm(
                                         original_user_message: data.original_user_message,
                                         profile_id: data.profile_id.clone(),
                                         actual_input_tokens: data.actual_input_tokens,
+                                        approximate_token_count: data.approximate_token_count,
                                         last_assistant_message: data.last_assistant_message.clone(),
                                     }))
                                 } else if let Some(plan_prompt) =
@@ -1394,6 +1411,7 @@ pub async fn decide_with_llm(
                                         original_user_message: data.original_user_message,
                                         profile_id: data.profile_id.clone(),
                                         actual_input_tokens: data.actual_input_tokens,
+                                        approximate_token_count: data.approximate_token_count,
                                         last_assistant_message: data.last_assistant_message.clone(),
                                     }))
                                 } else {
@@ -1442,6 +1460,7 @@ pub async fn decide_with_llm(
                                         original_user_message: data.original_user_message,
                                         profile_id: data.profile_id.clone(),
                                         actual_input_tokens: data.actual_input_tokens,
+                                        approximate_token_count: data.approximate_token_count,
                                         last_assistant_message: data.last_assistant_message.clone(),
                                     }))
                                 } else if let Some(plan_prompt) =
@@ -1470,6 +1489,7 @@ pub async fn decide_with_llm(
                                         original_user_message: data.original_user_message,
                                         profile_id: data.profile_id.clone(),
                                         actual_input_tokens: data.actual_input_tokens,
+                                        approximate_token_count: data.approximate_token_count,
                                         last_assistant_message: data.last_assistant_message.clone(),
                                     }))
                                 } else {
@@ -1516,6 +1536,7 @@ pub async fn decide_with_llm(
                                 original_user_message: data.original_user_message,
                                 profile_id: data.profile_id.clone(),
                                 actual_input_tokens: data.actual_input_tokens,
+                                approximate_token_count: data.approximate_token_count,
                                 last_assistant_message: data.last_assistant_message.clone(),
                             }));
                         }
@@ -1552,6 +1573,7 @@ pub async fn decide_with_llm(
                                         original_user_message: data.original_user_message,
                                         profile_id: data.profile_id.clone(),
                                         actual_input_tokens: data.actual_input_tokens,
+                                        approximate_token_count: data.approximate_token_count,
                                         last_assistant_message: data.last_assistant_message.clone(),
                                     }))
                                 }

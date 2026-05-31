@@ -249,16 +249,23 @@ pub(crate) fn dispatch_action(
         .map(|config| config.same_thread_token_threshold)
         .unwrap_or(60_000);
 
-    let exceeds_same_thread = action
+    // Use actual API-reported tokens when available; fall back to the
+    // chars/4 estimate. Without the fallback, models that don't report
+    // usage (actual_input_tokens=None) would always stay in the same
+    // thread, creating an infinite ContextOverflow loop.
+    let effective_tokens = action
         .actual_input_tokens
-        .is_some_and(|tokens| (tokens as usize) >= same_thread_threshold);
+        .map(|t| t as usize)
+        .unwrap_or(action.approximate_token_count);
+    let exceeds_same_thread = effective_tokens >= same_thread_threshold;
 
     let use_new_thread = is_native_agent && exceeds_same_thread;
 
     log::info!(
-        "[auto_prompt] dispatch_action: is_native_agent={}, tokens={:?}, threshold={same_thread_threshold}, use_new_thread={use_new_thread}",
+        "[auto_prompt] dispatch_action: is_native_agent={}, actual={:?}, approx={}, effective={effective_tokens}, threshold={same_thread_threshold}, use_new_thread={use_new_thread}",
         is_native_agent,
-        action.actual_input_tokens
+        action.actual_input_tokens,
+        action.approximate_token_count
     );
 
     // Native agent with high token count must use new thread (no /compact support).
