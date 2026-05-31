@@ -575,6 +575,9 @@ pub struct ThreadView {
     /// Tracks which tool calls have their content/output expanded.
     /// Used for showing/hiding tool call results, terminal output, etc.
     pub expanded_tool_calls: HashSet<acp::ToolCallId>,
+    /// Tracks running subagents the user explicitly collapsed, overriding
+    /// the default forced-expand-while-running behavior.
+    user_collapsed_subagents: HashSet<acp::ToolCallId>,
     pub expanded_tool_call_raw_inputs: HashSet<acp::ToolCallId>,
     collapsed_sandbox_authorization_details: HashSet<acp::ToolCallId>,
     pub expanded_thinking_blocks: HashSet<(usize, usize)>,
@@ -971,6 +974,7 @@ impl ThreadView {
             _auto_prompt_task: None,
             _auto_prompt_retry_data: None,
             expanded_tool_calls: HashSet::default(),
+            user_collapsed_subagents: HashSet::default(),
             expanded_tool_call_raw_inputs: HashSet::default(),
             collapsed_sandbox_authorization_details: HashSet::default(),
             expanded_thinking_blocks: HashSet::default(),
@@ -6396,7 +6400,7 @@ impl ThreadView {
                 if content.is_empty() {
                     None
                 } else {
-                    Some(content)
+                    Some(auto_prompt::truncate_to_paragraph_budget(&content, 2_500))
                 }
             }
             _ => None,
@@ -9189,7 +9193,8 @@ impl ThreadView {
                 | ToolCallStatus::WaitingForConfirmation { .. }
         );
 
-        let is_expanded = self.expanded_tool_calls.contains(&tool_call.id) || is_running;
+        let is_expanded = (self.expanded_tool_calls.contains(&tool_call.id) || is_running)
+            && !self.user_collapsed_subagents.contains(&tool_call.id);
         let files_changed = changed_buffers.len();
         let diff_stats = if is_running {
             DiffStats::default()
@@ -9368,14 +9373,19 @@ impl ThreadView {
                                     .on_click(cx.listener({
                                         let tool_call_id = tool_call.id.clone();
                                         move |this, _, _, cx| {
-                                            if this.expanded_tool_calls.contains(&tool_call_id) {
-                                                this.expanded_tool_calls.remove(&tool_call_id);
-                                            } else {
+                                            if this.user_collapsed_subagents.contains(&tool_call_id)
+                                            {
+                                                this.user_collapsed_subagents.remove(&tool_call_id);
                                                 this.expanded_tool_calls
                                                     .insert(tool_call_id.clone());
+                                            } else {
+                                                this.expanded_tool_calls.remove(&tool_call_id);
+                                                this.user_collapsed_subagents
+                                                    .insert(tool_call_id.clone());
                                             }
-                                            let expanded =
-                                                this.expanded_tool_calls.contains(&tool_call_id);
+                                            let expanded = !this
+                                                .user_collapsed_subagents
+                                                .contains(&tool_call_id);
                                             telemetry::event!("Subagent Toggled", expanded);
                                             cx.notify();
                                         }

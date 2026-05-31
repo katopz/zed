@@ -667,3 +667,33 @@ fn test_paragraph_budget_no_assistant_message() {
     };
     assert!(context.compute_last_assistant_message().is_none());
 }
+
+// ===== Public truncate_to_paragraph_budget Tests =====
+
+#[test]
+fn test_public_truncate_custom_budget_2500() {
+    let p1: String = "a".repeat(800);
+    let p2: String = "b".repeat(2_000);
+    let p3 = "c third paragraph";
+    let full = format!("{p1}\n\n{p2}\n\n{p3}");
+
+    let result = auto_prompt::truncate_to_paragraph_budget(&full, 2_500);
+    // p1(800) + p2(2000) = 2800 > 2500 → take both p1 + p2
+    assert!(result.contains(&p1), "should contain p1");
+    assert!(result.contains(&p2), "should contain p2");
+    assert!(!result.contains(p3), "should not contain p3");
+}
+
+#[test]
+fn test_public_truncate_single_huge_paragraph_included() {
+    let big = "x".repeat(10_000);
+    let result = auto_prompt::truncate_to_paragraph_budget(&big, 2_500);
+    // Single paragraph always included even if > budget
+    assert_eq!(result.len(), 10_000);
+}
+
+#[test]
+fn test_public_truncate_empty_string() {
+    let result = auto_prompt::truncate_to_paragraph_budget("", 2_500);
+    assert_eq!(result, "");
+}

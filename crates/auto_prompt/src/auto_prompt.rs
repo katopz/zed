@@ -11,7 +11,9 @@ pub mod lightweight_context;
 pub mod plan_registry;
 
 pub use config::AutoPromptConfig;
-pub use context::{AutoPromptContext, AutoPromptResponse, PlanFileContent, StopPhase};
+pub use context::{
+    AutoPromptContext, AutoPromptResponse, PlanFileContent, StopPhase, truncate_to_paragraph_budget,
+};
 pub use plan_registry::ActivePlanClaim;
 
 use agent_client_protocol as acp;

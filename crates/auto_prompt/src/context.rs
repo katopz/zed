@@ -134,6 +134,27 @@ pub struct AutoPromptResponse {
     pub thread_summary: Option<String>,
 }
 
+/// Take complete paragraphs until total exceeds `budget` chars.
+/// The paragraph that crosses the threshold is included — this ensures we
+/// always return complete paragraphs without mid-sentence cuts.
+/// A single huge paragraph is always included.
+pub fn truncate_to_paragraph_budget(text: &str, budget: usize) -> String {
+    let paragraphs: Vec<&str> = text.split("\n\n").collect();
+    let mut total = 0usize;
+    let mut taken = 0;
+    for paragraph in &paragraphs {
+        total += paragraph.len();
+        taken += 1;
+        if total > budget {
+            break;
+        }
+    }
+    if taken == 0 {
+        return text.to_string();
+    }
+    paragraphs[..taken].join("\n\n")
+}
+
 impl AutoPromptContext {
     /// Collect context from the given AcpThread.
     ///
@@ -347,21 +368,7 @@ impl AutoPromptContext {
     /// The paragraph that crosses the threshold is included — this ensures we
     /// always return complete paragraphs (1-4 typically) without mid-sentence cuts.
     fn truncate_to_paragraph_budget(text: &str) -> String {
-        let paragraphs: Vec<&str> = text.split("\n\n").collect();
-        let mut total = 0usize;
-        let mut taken = 0;
-        for paragraph in &paragraphs {
-            total += paragraph.len();
-            taken += 1;
-            if total > Self::LAST_MESSAGE_PARAGRAPH_BUDGET {
-                break;
-            }
-        }
-        // If nothing was taken (shouldn't happen), fall back to the full text.
-        if taken == 0 {
-            return text.to_string();
-        }
-        paragraphs[..taken].join("\n\n")
+        truncate_to_paragraph_budget(text, Self::LAST_MESSAGE_PARAGRAPH_BUDGET)
     }
 
     /// Returns the count of plan items by status.
