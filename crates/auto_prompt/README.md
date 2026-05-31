@@ -27,7 +27,15 @@ ConversationView::handle_thread_event()
   │       └─ Otherwise → NeedsLlmCall(data)
   │
   └─ decide_with_llm() — async LLM call
-      ├─ Call orchestration LLM with context JSON
+      ├─ context_exceeds_limit? Yes → ContextOverflow two-phase path:
+      │   ├─ SUMMARY_REQUESTED==0 (Phase 1): send summary prompt to current thread
+      │   ├─ SUMMARY_REQUESTED==1 (Phase 2): create new thread with summary + continuation
+      │   └─ Unexpected state → reset and stop
+      │
+      ├─ context_exceeds_limit? No → Lightweight context path:
+      │   ├─ Build lightweight context (last msg + plan summaries)
+      │   └─ Call orchestration LLM with lightweight context
+      │
       ├─ On stream failure (no Text/Thinking content):
       │   └─ Synthesize: should_continue=false, confidence=0.0, reason="model returned zero events..."
       ├─ Write decision log with response_origin ("llm" or "synthetic")
@@ -109,80 +117,95 @@ sequenceDiagram
             CV->>CV: State = Processing
             CV->>decide_llm: decide_with_llm(data)
             
-            Note over CV,decide_llm: Async LLM Call
-            decide_llm->>LLM: Call with context JSON
-            
-            alt Stream success (Text/Thinking received)
-                LLM-->>decide_llm: Real response
-                decide_llm->>decide_llm: response_origin="llm"
-            else Stream failure (no usable content)
-                LLM-->>decide_llm: Zero events or only errors
-                decide_llm->>decide_llm: Synthesize: should_continue=false, confidence=0.0
-                decide_llm->>decide_llm: response_origin="synthetic"
-            end
-            
-            decide_llm->>decide_llm: Write decision log
-            decide_llm->>eval: evaluate_response()
-            
-            alt Confidence < 0.5
-                eval-->>decide_llm: WantsStop (source=ConfidenceGate)
-            else Handbrake triggered
-                eval-->>decide_llm: WantsStop (source=Handbrake)
-            else NeedsSecondOpinion
-                eval-->>decide_llm: NeedsSecondOpinion (source=RuleRemainingWork)
-                decide_llm->>LLM: Second opinion call
-                alt Second opinion says continue
-                    decide_llm-->>CV: AutoPromptAction
-                else Second opinion says stop
-                    decide_llm-->>CV: Stopped
+            Note over CV,decide_llm: Context overflow check
+            alt context_exceeds_limit=true
+                alt SUMMARY_REQUESTED==0 (Phase 1)
+                    decide_llm->>decide_llm: SUMMARY_REQUESTED=1
+                    decide_llm-->>CV: ContextOverflow (summary prompt)
+                    CV->>CV: dispatch summary prompt to current thread
+                    Note over CV: AI responds with summary, thread stops again
+                else SUMMARY_REQUESTED==1 (Phase 2)
+                    decide_llm->>decide_llm: SUMMARY_REQUESTED=0
+                    decide_llm->>decide_llm: Build continuation from summary + remaining work
+                    decide_llm-->>CV: AutoPromptAction (new thread)
+                    CV->>Workspace: dispatch_action(AutoPromptNewThread)
                 end
-            else Continue with prompt
-                eval-->>decide_llm: Continue (source=LlmResponse)
-            else WantsStop (real LLM decision)
-                eval-->>decide_llm: WantsStop (source=LlmResponse)
+            else context_exceeds_limit=false
+                Note over CV,decide_llm: Lightweight context path
+                decide_llm->>LLM: Call with lightweight context (last msg + plan summaries)
                 
-                alt is_synthetic_failure
-                    Note over decide_llm: Lightweight retry path
-                    decide_llm->>decide_llm: Build lightweight context
-                    loop Up to 3 retries
-                        decide_llm->>LLM: Retry with lightweight context
-                        alt Success
-                            LLM-->>decide_llm: Parsed response
-                        else Failed
-                            LLM-->>decide_llm: Error or synthetic
-                        end
-                    end
-                    
-                    alt Retry says continue
+                alt Stream success (Text/Thinking received)
+                    LLM-->>decide_llm: Real response
+                    decide_llm->>decide_llm: response_origin="llm"
+                else Stream failure (no usable content)
+                    LLM-->>decide_llm: Zero events or only errors
+                    decide_llm->>decide_llm: Synthesize: should_continue=false, confidence=0.0
+                    decide_llm->>decide_llm: response_origin="synthetic"
+                end
+                
+                decide_llm->>decide_llm: Write decision log
+                decide_llm->>eval: evaluate_response()
+                
+                alt Confidence < 0.5
+                    eval-->>decide_llm: WantsStop (source=ConfidenceGate)
+                else Handbrake triggered
+                    eval-->>decide_llm: WantsStop (source=Handbrake)
+                else NeedsSecondOpinion
+                    eval-->>decide_llm: NeedsSecondOpinion (source=RuleRemainingWork)
+                    decide_llm->>LLM: Second opinion call
+                    alt Second opinion says continue
                         decide_llm-->>CV: AutoPromptAction
-                    else Retry says stop or all retries failed
-                        decide_llm->>decide_llm: detect_remaining_work() safety net
-                        alt Safety net found actionable work
-                            Note over decide_llm: SAFETY NET OVERRIDE
-                            decide_llm-->>CV: AutoPromptAction
-                        else No remaining work detected
-                            decide_llm-->>CV: Stopped
-                        end
-                    end
-                    
-                else Real LLM decision (not synthetic)
-                    Note over decide_llm: Pre-stop verification path
-                    alt verification_count=0
-                        decide_llm->>decide_llm: Build verification prompt
-                        decide_llm->>decide_llm: Increment VERIFICATION_COUNT
-                        decide_llm-->>CV: AutoPromptAction with verification
-                        CV->>Workspace: dispatch_action(AutoPromptNewThread)
-                    else verification_count < max
+                    else Second opinion says stop
                         decide_llm-->>CV: Stopped
-                    else verification_count >= max
-                        decide_llm-->>CV: Stopped (force)
+                    end
+                else Continue with prompt
+                    eval-->>decide_llm: Continue (source=LlmResponse)
+                else WantsStop (real LLM decision)
+                    eval-->>decide_llm: WantsStop (source=LlmResponse)
+                    
+                    alt is_synthetic_failure
+                        Note over decide_llm: Lightweight retry path
+                        decide_llm->>decide_llm: Build lightweight context
+                        loop Up to 3 retries
+                            decide_llm->>LLM: Retry with lightweight context
+                            alt Success
+                                LLM-->>decide_llm: Parsed response
+                            else Failed
+                                LLM-->>decide_llm: Error or synthetic
+                            end
+                        end
+                        
+                        alt Retry says continue
+                            decide_llm-->>CV: AutoPromptAction
+                        else Retry says stop or all retries failed
+                            decide_llm->>decide_llm: detect_remaining_work() safety net
+                            alt Safety net found actionable work
+                                Note over decide_llm: SAFETY NET OVERRIDE
+                                decide_llm-->>CV: AutoPromptAction
+                            else No remaining work detected
+                                decide_llm-->>CV: Stopped
+                            end
+                        end
+                        
+                    else Real LLM decision (not synthetic)
+                        Note over decide_llm: Pre-stop verification path
+                        alt verification_count=0
+                            decide_llm->>decide_llm: Build verification prompt
+                            decide_llm->>decide_llm: Increment VERIFICATION_COUNT
+                            decide_llm-->>CV: AutoPromptAction with verification
+                            CV->>Workspace: dispatch_action(AutoPromptNewThread)
+                        else verification_count < max
+                            decide_llm-->>CV: Stopped
+                        else verification_count >= max
+                            decide_llm-->>CV: Stopped (force)
+                        end
                     end
                 end
-            end
-            
-            alt Action dispatched
-                decide_llm-->>CV: AutoPromptAction
-                CV->>Workspace: dispatch_action(AutoPromptNewThread)
+                
+                alt Action dispatched
+                    decide_llm-->>CV: AutoPromptAction
+                    CV->>Workspace: dispatch_action(AutoPromptNewThread)
+                end
             end
         end
     end
@@ -317,6 +340,23 @@ If no plan files exist, verification is skipped and the chain stops immediately.
 
 **Not triggered for synthetic failures** — pre-stop verification only runs when the LLM produced a real decision. Synthetic failures go through the lightweight retry + safety net path instead.
 
+### Context overflow
+
+When token count exceeds `max_context_tokens` (default 80K), the system uses a two-phase mechanism tracked by the global `SUMMARY_REQUESTED` atomic counter:
+
+1. **Phase 1** (`SUMMARY_REQUESTED == 0`): Send a summarization prompt to the **current thread** asking the AI to summarize progress, accomplishments, remaining work, and active plan state. Set `SUMMARY_REQUESTED = 1`.
+2. The AI responds with a summary. The thread stops, triggering `on_thread_stopped` again.
+3. **Phase 2** (`SUMMARY_REQUESTED == 1`): The AI's summary is now `last_assistant_message`. Create a **new thread** with the summary + detected remaining work (from plan files or message patterns). Reset `SUMMARY_REQUESTED = 0`.
+
+**Phase tracking survives `reset_iteration()`** — `SUMMARY_REQUESTED` is NOT included in the general counter reset. It is only cleared by:
+- Phase 2 completion (new thread created)
+- Thread cancellation
+- Max iterations reached
+- Chain timeout (300s)
+- Unexpected state
+
+This prevents re-requesting summaries when the AI has already responded with one.
+
 ### Quality gates
 
 Before marking `all_plan_done=true`, the system enforces:
@@ -345,6 +385,7 @@ The `extract_remaining_section` helper scans the last 3 paragraphs of the messag
 ### Key types
 
 - `AutoPromptDecision` — sync result: `NoAction`, `DispatchNow(AutoPromptAction)`, `DispatchAfterDelay { action, delay_ms }`, `NeedsLlmCall(LlmCallData)`
+- `AutoPromptOutcome` — async result from LLM: `Continue(AutoPromptAction)`, `Stopped { reason }`, `ContextOverflow(AutoPromptAction)`
 - `AutoPromptAction` — data needed to dispatch a follow-up prompt (`from_session_id`, `from_title`, `next_prompt`, `work_dirs`)
 - `LlmCallData` — data for async LLM call (`model`, `system_prompt`, `context_json`, `project_root`, `session_id`, `title`, `iteration_count`, `max_verification_attempts`, `work_dirs`, `first_user_message`, `last_assistant_message`, `stop_phase`); stored on failure for manual retry
 - `AutoPromptContext` — serializable context payload sent to the orchestration LLM (includes `plan_files`, `doc_files` (filenames only), `modified_files`, `first_user_message`, `stop_phase`, `verification_count`, `plan_has_checkboxes`, `first_plan_filename`, `plan_number`, `was_truncated`)
@@ -427,7 +468,7 @@ Config file: `~/.config/zed/auto_prompt.json`
 |-------|---------|-------------|
 | `system_prompt` | built-in | Override the orchestration LLM system prompt |
 | `max_iterations` | `20` | Hard stop after this many auto-prompt cycles |
-| `max_context_tokens` | `80000` | Token threshold to force "continue" without LLM |
+| `max_context_tokens` | `80000` | Token threshold to trigger context overflow two-phase (summary → new thread) |
 | `backoff_base_ms` | `2000` | Base delay for exponential backoff on errors (capped at 60s) |
 | `max_llm_retries` | `3` | Max automatic retry attempts for LLM calls before showing "Retry" button |
 | `max_verification_attempts` | `2` | Max verification prompts in PreStop phase before accepting stop |

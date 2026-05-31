@@ -663,6 +663,7 @@ pub fn decide(
             iteration_count,
             &format!("max iterations ({}) reached", config.max_iterations),
         );
+        SUMMARY_REQUESTED.store(0, Ordering::Relaxed);
         reset_iteration_with_session(&thread.read(cx).session_id().to_string());
         return AutoPromptDecision::NoAction;
     }
@@ -1906,7 +1907,9 @@ pub fn reset_iteration() {
     AUTO_PROMPT_ITERATION.store(0, Ordering::Relaxed);
     VERIFICATION_COUNT.store(0, Ordering::Relaxed);
     AUTO_PROMPT_LLM_FAILURE_COUNT.store(0, Ordering::Relaxed);
-    SUMMARY_REQUESTED.store(0, Ordering::Relaxed);
+    // Intentionally NOT resetting SUMMARY_REQUESTED here.
+    // The ContextOverflow phase tracking must survive across iterations
+    // to prevent re-requesting summaries when the AI already responded with one.
 }
 
 /// Reset the auto-prompt chain counters **and** release any plan claims held by
@@ -1939,6 +1942,7 @@ fn get_iteration() -> u32 {
             now.saturating_sub(last)
         );
         AUTO_PROMPT_ITERATION.store(0, Ordering::Relaxed);
+        SUMMARY_REQUESTED.store(0, Ordering::Relaxed);
     }
 
     let iteration = AUTO_PROMPT_ITERATION.fetch_add(1, Ordering::Relaxed) + 1;
