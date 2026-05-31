@@ -245,46 +245,60 @@ pub(crate) fn dispatch_action(
         .active_thread()
         .is_some_and(|tv| tv.read(cx).thread.read(cx).connection().agent_id() == *ZED_AGENT_ID);
 
+    let same_thread_threshold = auto_prompt::load_config_cached()
+        .map(|config| config.same_thread_token_threshold)
+        .unwrap_or(60_000);
+
+    let exceeds_same_thread = action
+        .actual_input_tokens
+        .is_some_and(|tokens| (tokens as usize) >= same_thread_threshold);
+
+    let use_new_thread = is_native_agent && exceeds_same_thread;
+
     log::info!(
-        "[auto_prompt] dispatch_action: is_native_agent={}, tokens={:?}",
+        "[auto_prompt] dispatch_action: is_native_agent={}, tokens={:?}, threshold={same_thread_threshold}, use_new_thread={use_new_thread}",
         is_native_agent,
         action.actual_input_tokens
     );
 
-    // Always continue in the same thread.
-    // ACP agents (e.g. Claude) support /compact; native Zed agent does not.
-    if let Some(active_tv) = conversation_view.active_thread() {
-        let decision = strip_first_prompt_wrapper(&action.next_prompt);
-        let prompt = if is_native_agent {
-            build_native_continuation_prompt(action.last_assistant_message.as_deref(), &decision)
-        } else {
-            build_compact_prompt(action.last_assistant_message.as_deref(), &decision)
-        };
-        active_tv.update(cx, |tv, cx| {
-            tv.message_editor.update(cx, |editor, cx| {
-                editor.set_message(
-                    vec![ContentBlock::Text(TextContent::new(prompt))],
-                    window,
-                    cx,
-                );
-            });
-            tv.send(window, cx);
-        });
-        log::info!(
-            "[auto_prompt] dispatch_action: sent {} continuation to same thread (tokens={:?})",
-            if is_native_agent {
-                "native"
+    // Native agent with high token count must use new thread (no /compact support).
+    // ACP agents (e.g. Claude) always use same-thread /compact.
+    if !use_new_thread {
+        if let Some(active_tv) = conversation_view.active_thread() {
+            let decision = strip_first_prompt_wrapper(&action.next_prompt);
+            let prompt = if is_native_agent {
+                build_native_continuation_prompt(
+                    action.last_assistant_message.as_deref(),
+                    &decision,
+                )
             } else {
-                "/compact"
-            },
-            action.actual_input_tokens
+                build_compact_prompt(action.last_assistant_message.as_deref(), &decision)
+            };
+            active_tv.update(cx, |tv, cx| {
+                tv.message_editor.update(cx, |editor, cx| {
+                    editor.set_message(
+                        vec![ContentBlock::Text(TextContent::new(prompt))],
+                        window,
+                        cx,
+                    );
+                });
+                tv.send(window, cx);
+            });
+            log::info!(
+                "[auto_prompt] dispatch_action: sent {} continuation to same thread (tokens={:?})",
+                if is_native_agent {
+                    "native"
+                } else {
+                    "/compact"
+                },
+                action.actual_input_tokens
+            );
+            return;
+        }
+        log::warn!(
+            "[auto_prompt] dispatch_action: no active thread for same-thread continuation, falling back to new thread"
         );
-        return;
     }
-
-    log::warn!(
-        "[auto_prompt] dispatch_action: no active thread for same-thread continuation, falling back to new thread"
-    );
 
     log::info!(
         "[auto_prompt] dispatch_action: dispatching AutoPromptNewThread (prompt {} chars, tokens={:?})",

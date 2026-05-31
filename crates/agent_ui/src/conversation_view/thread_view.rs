@@ -6388,6 +6388,7 @@ impl ThreadView {
         let title = thread.title().map(|t| t.to_string());
         let work_dirs = thread.work_dirs().map(|pl| pl.paths().to_vec());
         let profile_id = self.current_mode_id(cx).map(|id| id.to_string());
+        let actual_input_tokens = thread.token_usage().map(|u| u.input_tokens);
 
         let first_user_message = thread.entries().iter().find_map(|entry| match entry {
             AgentThreadEntry::UserMessage(msg) => {
@@ -6425,32 +6426,26 @@ impl ThreadView {
             _ => None,
         });
 
-        let original_user_message = first_user_message
-            .as_deref()
-            .and_then(auto_prompt::extract_original_user_message)
-            .or(first_user_message.filter(|s| !s.trim().is_empty()));
+        let decision = "Review your progress and continue any remaining work. If everything is complete, commit all changes with conventional commit messages.".to_string();
 
-        let continue_prompt = "Review your progress and continue any remaining work. If everything is complete, commit all changes with conventional commit messages.".to_string();
-
-        let next_prompt = auto_prompt::with_first_prompt_context(
-            continue_prompt.clone(),
-            original_user_message.as_deref(),
-            title.as_deref(),
-            last_assistant_message.as_deref(),
-        );
-
-        let action = Box::new(crate::auto_prompt::AutoPromptNewThread {
+        let action = auto_prompt::AutoPromptAction {
             from_session_id: session_id,
             from_title: title,
-            next_prompt,
+            next_prompt: decision,
             work_dirs,
-            original_user_message,
+            original_user_message: first_user_message,
             profile_id,
+            actual_input_tokens,
             last_assistant_message,
-            decision_prompt: Some(continue_prompt),
-        });
+        };
 
-        window.dispatch_action(action, cx);
+        // Reuse the same dispatch logic: same-thread when below threshold,
+        // new thread when native agent exceeds token limit.
+        if let Some(conversation_view) = self.server_view.upgrade() {
+            conversation_view.update(cx, |cv, cx| {
+                crate::auto_prompt::dispatch_action(action, cv, window, cx);
+            });
+        }
     }
 
     pub(crate) fn sync_editor_mode_for_empty_state(&mut self, cx: &mut Context<Self>) {

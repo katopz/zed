@@ -795,12 +795,20 @@ pub fn decide(
         .last_assistant_message()
         .map(|s| s.to_string());
 
-    let context_exceeds_limit = auto_prompt_ctx.approximate_token_count > config.max_context_tokens;
+    // Use actual_input_tokens from the API when available, falling back to
+    // the approximate chars/4 estimate. The approximate count only reflects
+    // the auto_prompt context JSON, not the full thread — so it underestimates.
+    let effective_token_count = auto_prompt_ctx
+        .actual_input_tokens
+        .map(|t| t as usize)
+        .unwrap_or(auto_prompt_ctx.approximate_token_count);
+    let context_exceeds_limit = effective_token_count > config.max_context_tokens;
     if context_exceeds_limit {
         log::info!(
-            "[auto_prompt::decide] Context exceeds limit ({} > {} tokens) — will use lightweight path",
-            auto_prompt_ctx.approximate_token_count,
-            config.max_context_tokens
+            "[auto_prompt::decide] Context exceeds limit (effective={effective_token_count} > {} tokens, actual={:?}, approx={}) — will use lightweight path",
+            config.max_context_tokens,
+            auto_prompt_ctx.actual_input_tokens,
+            auto_prompt_ctx.approximate_token_count
         );
     }
 

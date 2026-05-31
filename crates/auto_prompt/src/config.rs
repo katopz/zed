@@ -43,9 +43,9 @@ pub struct AutoPromptConfig {
     pub max_llm_retries: u32,
 
     /// Token count threshold below which auto-prompt continues in the same thread
-    /// instead of creating a new thread with summary. When the conversation's
-    /// approximate token count is below this value, the next_prompt is injected
-    /// as a user message in the current thread, preserving full context.
+    /// instead of creating a new thread with summary. Only applies to native Zed agent;
+    /// ACP agents (e.g. Claude) always use same-thread /compact regardless of token count.
+    /// When the actual input token count exceeds this value, a new thread is created.
     #[serde(default = "default_same_thread_token_threshold")]
     pub same_thread_token_threshold: usize,
 }
@@ -71,7 +71,7 @@ fn default_max_llm_retries() -> u32 {
 }
 
 fn default_same_thread_token_threshold() -> usize {
-    50_000
+    60_000
 }
 
 impl Default for AutoPromptConfig {
