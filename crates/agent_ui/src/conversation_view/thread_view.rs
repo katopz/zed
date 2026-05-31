@@ -6442,11 +6442,19 @@ impl ThreadView {
 
         // Reuse the same dispatch logic: same-thread when below threshold,
         // new thread when native agent exceeds token limit.
-        if let Some(conversation_view) = self.server_view.upgrade() {
-            conversation_view.update(cx, |cv, cx| {
-                crate::auto_prompt::dispatch_action(action, cv, window, cx);
-            });
-        }
+        //
+        // Must use `window.defer` to avoid a GPUI panic: this function runs
+        // inside a `Context<ThreadView>` update. `dispatch_action` for the
+        // same-thread path calls `active_tv.update(cx, ...)` on the *same*
+        // ThreadView, which would be a recursive entity update.
+        let conversation_view = self.server_view.upgrade();
+        window.defer(cx, move |window, cx| {
+            if let Some(conversation_view) = conversation_view {
+                conversation_view.update(cx, |cv, cx| {
+                    crate::auto_prompt::dispatch_action(action, cv, window, cx);
+                });
+            }
+        });
     }
 
     pub(crate) fn sync_editor_mode_for_empty_state(&mut self, cx: &mut Context<Self>) {
