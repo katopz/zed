@@ -235,7 +235,7 @@ fn build_native_continuation_prompt(
     parts.join("\n")
 }
 
-fn dispatch_action(
+pub(crate) fn dispatch_action(
     action: auto_prompt::AutoPromptAction,
     conversation_view: &crate::ConversationView,
     window: &mut Window,
@@ -593,6 +593,34 @@ pub fn on_thread_stopped(
                             Err(err) => {
                                 log::warn!(
                                     "[auto_prompt] FAILED to dispatch new thread (view may have been dropped): {err}"
+                                );
+                            }
+                        }
+                    }
+                    Ok(auto_prompt::AutoPromptOutcome::ContextOverflow(action)) => {
+                        auto_prompt::reset_llm_failure_count();
+                        if let Some(ref tv) = thread_weak {
+                            if let Err(err) = tv.update(cx, |tv, cx| {
+                                tv._auto_prompt_task = None;
+                                tv.auto_prompt_state = AutoPromptState::Idle;
+                                cx.notify();
+                            }) {
+                                log::warn!("[auto_prompt] failed to reset state before context overflow dispatch: {err}");
+                            }
+                        }
+
+                        log::info!(
+                            "[auto_prompt] ContextOverflow — dispatching summarization prompt to current thread"
+                        );
+                        match _view.update_in(cx, |_view, window, cx| {
+                            dispatch_action(action, _view, window, cx);
+                        }) {
+                            Ok(()) => {
+                                log::info!("[auto_prompt] ContextOverflow summarization dispatch submitted");
+                            }
+                            Err(err) => {
+                                log::warn!(
+                                    "[auto_prompt] FAILED to dispatch context overflow (view may have been dropped): {err}"
                                 );
                             }
                         }

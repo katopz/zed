@@ -47,6 +47,12 @@ static VERIFICATION_COUNT: AtomicU32 = AtomicU32::new(0);
 /// LLM orchestration call failure counter for the current chain.
 static AUTO_PROMPT_LLM_FAILURE_COUNT: AtomicU32 = AtomicU32::new(0);
 
+/// Tracks whether a context-overflow summarization request has been sent.
+/// 0 = no summary requested yet.
+/// 1 = summary requested, waiting for AI response.
+/// 2 = summary received, ready to create new thread.
+static SUMMARY_REQUESTED: AtomicU32 = AtomicU32::new(0);
+
 /// Short git commit hash for log provenance.
 /// Set by build.rs via `AUTO_PROMPT_COMMIT_SHA` at compile time.
 /// Falls back to package version when built outside a git repo.
@@ -146,6 +152,10 @@ pub enum AutoPromptOutcome {
     Continue(AutoPromptAction),
     /// Chain stopped with a reason (shown to user as info toast).
     Stopped { reason: String },
+    /// Context exceeds token limit. The caller should send a summarization
+    /// prompt to the current thread so the AI produces a summary as its last
+    /// message, then on the next cycle a new thread is created with that summary.
+    ContextOverflow(AutoPromptAction),
 }
 
 /// Extract the decision text from a `with_first_prompt_context`-formatted string.
@@ -836,19 +846,100 @@ pub async fn decide_with_llm(
     );
 
     let result = if data.context_exceeds_limit {
+        let summary_state = SUMMARY_REQUESTED.load(Ordering::Relaxed);
         log::info!(
-            "[auto_prompt::decide_with_llm] Context exceeds token limit — skipping full LLM call, using lightweight retry path"
+            "[auto_prompt::decide_with_llm] Context exceeds token limit — SUMMARY_REQUESTED={summary_state}"
         );
-        let skipped_response = AutoPromptResponse {
-            next_prompt: None,
-            reason: Some("model skipped: context exceeds token limit".to_string()),
-            confidence: Some(0.0),
-            thread_summary: None,
-        };
-        Ok((
-            "skipped: context exceeds token limit".to_string(),
-            skipped_response,
-        ))
+
+        if summary_state == 0 {
+            // Phase 1: Request summarization. Return ContextOverflow so the
+            // UI sends a "summarize" message to the current thread.
+            let prompt_summary = build_prompt_summary(
+                None,
+                data.title.as_deref(),
+                None,
+                data.last_assistant_message.as_deref(),
+                data.original_user_message.as_deref(),
+                data.first_user_message.as_deref(),
+            );
+            let next_prompt = with_first_prompt_context(
+                "Stop what you are doing and provide a concise summary of your progress. Include: (1) what was the original task, (2) what was accomplished, (3) what remains to be done, (4) the current state of any active plans (reference by filename). Be thorough — this summary will be used to continue in a fresh context.".to_string(),
+                prompt_summary.as_deref(),
+                data.title.as_deref(),
+                data.last_assistant_message.as_deref(),
+            );
+            SUMMARY_REQUESTED.store(1, Ordering::Relaxed);
+            log::info!(
+                "[auto_prompt::decide_with_llm] Returning ContextOverflow — requesting summary from AI"
+            );
+            return Ok(AutoPromptOutcome::ContextOverflow(AutoPromptAction {
+                from_session_id: data.session_id,
+                from_title: data.title,
+                next_prompt,
+                work_dirs: data.work_dirs,
+                original_user_message: data.original_user_message,
+                profile_id: data.profile_id.clone(),
+                actual_input_tokens: data.actual_input_tokens,
+                last_assistant_message: data.last_assistant_message.clone(),
+            }));
+        } else if summary_state == 1 {
+            // Phase 2: AI has responded with summary. The last_assistant_message
+            // IS the summary. Create a new thread with ThreadSummary flow.
+            SUMMARY_REQUESTED.store(0, Ordering::Relaxed);
+            log::info!(
+                "[auto_prompt::decide_with_llm] Summary received — creating new thread with ThreadSummary flow"
+            );
+
+            let prompt_summary = build_prompt_summary(
+                None,
+                data.title.as_deref(),
+                Some("context overflow: continuing in new thread with summary"),
+                data.last_assistant_message.as_deref(),
+                data.original_user_message.as_deref(),
+                data.first_user_message.as_deref(),
+            );
+
+            // Check for remaining plan tasks to build a continuation prompt
+            let continuation = detect_remaining_plan_tasks(&data.context_json)
+                .or_else(|| detect_remaining_work(data.last_assistant_message.as_deref()))
+                .unwrap_or_else(|| "Continue from where we left off.".to_string());
+
+            let next_prompt = with_first_prompt_context(
+                continuation,
+                prompt_summary.as_deref(),
+                data.title.as_deref(),
+                data.last_assistant_message.as_deref(),
+            );
+            auto_claim_plan(
+                &next_prompt,
+                &data.context_json,
+                &data.session_id,
+                data.title.as_deref(),
+            );
+            return Ok(AutoPromptOutcome::Continue(AutoPromptAction {
+                from_session_id: data.session_id,
+                from_title: data.title,
+                next_prompt,
+                work_dirs: data.work_dirs,
+                original_user_message: data.original_user_message,
+                profile_id: data.profile_id.clone(),
+                actual_input_tokens: data.actual_input_tokens,
+                last_assistant_message: data.last_assistant_message.clone(),
+            }));
+        } else {
+            // Unexpected state — reset and stop
+            SUMMARY_REQUESTED.store(0, Ordering::Relaxed);
+            let stop_reason = "context overflow: unexpected summary state".to_string();
+            write_stop_log(
+                data.project_root.as_ref(),
+                data.iteration_count,
+                &stop_reason,
+            );
+            reset_iteration_with_session(&data.session_id.to_string());
+            return Ok(AutoPromptOutcome::Stopped {
+                reason: stop_reason,
+            });
+        }
     } else {
         // Use lightweight context: last assistant message + plan summaries only.
         // Reduces token usage from ~80K to ~500 tokens.
@@ -1815,6 +1906,7 @@ pub fn reset_iteration() {
     AUTO_PROMPT_ITERATION.store(0, Ordering::Relaxed);
     VERIFICATION_COUNT.store(0, Ordering::Relaxed);
     AUTO_PROMPT_LLM_FAILURE_COUNT.store(0, Ordering::Relaxed);
+    SUMMARY_REQUESTED.store(0, Ordering::Relaxed);
 }
 
 /// Reset the auto-prompt chain counters **and** release any plan claims held by
@@ -4470,7 +4562,7 @@ mod tests {
         let result = evaluate_response(&input);
         assert!(
             matches!(result, EvaluationResult::WantsStop { .. }),
-            "synthetic failure from context overflow should route to WantsStop → lightweight retry"
+            "synthetic failure from context overflow should route to WantsStop"
         );
     }
 }

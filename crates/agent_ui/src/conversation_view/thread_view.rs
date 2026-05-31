@@ -5269,6 +5269,29 @@ impl ThreadView {
                                     }
                                     log::info!("[auto_prompt] Retry chain stopped: {reason}");
                                 }
+                                Ok(auto_prompt::AutoPromptOutcome::ContextOverflow(action)) => {
+                                    auto_prompt::reset_llm_failure_count();
+                                    if let Some(ref tv) = thread_weak {
+                                        if let Err(err) = tv.update(cx, |tv, cx| {
+                                            tv.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;
+                                            tv._auto_prompt_retry_data = None;
+                                            cx.notify();
+                                        }) {
+                                            log::warn!("[auto_prompt] failed to reset state on retry context overflow: {err}");
+                                        }
+                                    }
+                                    log::info!("[auto_prompt] Retry context overflow — dispatching summarization");
+                                    match conversation_view.update_in(cx, |_cv, window, cx| {
+                                        crate::auto_prompt::dispatch_action(action, _cv, window, cx);
+                                    }) {
+                                        Ok(()) => {
+                                            log::info!("[auto_prompt] Retry context overflow dispatch submitted");
+                                        }
+                                        Err(err) => {
+                                            log::warn!("[auto_prompt] FAILED to dispatch retry context overflow: {err}");
+                                        }
+                                    }
+                                }
                                 Err(err) => {
                                     // Retry failed again - set back to Failed state and restore retry data
                                     if let Some(ref tv) = thread_weak {
