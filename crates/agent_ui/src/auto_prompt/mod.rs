@@ -623,15 +623,36 @@ pub fn on_thread_stopped(
                             }
                         }
 
+                        // ContextOverflow Phase 1 must always send to the SAME thread
+                        // so the AI can produce a summary. We bypass dispatch_action
+                        // because it would redirect to a new thread when tokens >= threshold.
                         log::info!(
-                            "[auto_prompt] ContextOverflow — dispatching summarization prompt to current thread"
+                            "[auto_prompt] ContextOverflow — sending summarization prompt to same thread (tokens={:?})",
+                            action.actual_input_tokens
                         );
                         match _view.update_in(cx, |_view, window, cx| {
-                            dispatch_action(action, _view, window, cx);
-                        }) {
-                            Ok(()) => {
-                                log::info!("[auto_prompt] ContextOverflow summarization dispatch submitted");
+                            if let Some(active_tv) = _view.active_thread() {
+                                let prompt = action.next_prompt.clone();
+                                active_tv.update(cx, |tv, cx| {
+                                    tv.message_editor.update(cx, |editor, cx| {
+                                        editor.set_message(
+                                            vec![ContentBlock::Text(TextContent::new(prompt))],
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                    tv.send(window, cx);
+                                });
+                                log::info!(
+                                    "[auto_prompt] ContextOverflow summarization sent to same thread"
+                                );
+                            } else {
+                                log::warn!(
+                                    "[auto_prompt] ContextOverflow: no active thread for summarization"
+                                );
                             }
+                        }) {
+                            Ok(()) => {}
                             Err(err) => {
                                 log::warn!(
                                     "[auto_prompt] FAILED to dispatch context overflow (view may have been dropped): {err}"
