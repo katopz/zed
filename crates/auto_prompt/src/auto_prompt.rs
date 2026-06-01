@@ -47,11 +47,59 @@ static VERIFICATION_COUNT: AtomicU32 = AtomicU32::new(0);
 /// LLM orchestration call failure counter for the current chain.
 static AUTO_PROMPT_LLM_FAILURE_COUNT: AtomicU32 = AtomicU32::new(0);
 
-/// Tracks whether a context-overflow summarization request has been sent.
-/// 0 = no summary requested yet.
-/// 1 = summary requested, waiting for AI response.
-/// 2 = summary received, ready to create new thread.
-static SUMMARY_REQUESTED: AtomicU32 = AtomicU32::new(0);
+/// Per-session summary tracking for the context-overflow flow.
+///
+/// Replaces the former global `SUMMARY_REQUESTED` atomic to prevent race
+/// conditions when multiple auto_prompt chains overlap.
+///
+/// State values:
+///   0 = no summary requested yet.
+///   1 = summary requested, waiting for AI response.
+static SUMMARY_REGISTRY: std::sync::RwLock<Option<std::collections::HashMap<String, u32>>> =
+    std::sync::RwLock::new(None);
+
+fn with_summary_registry<F, R>(f: F) -> R
+where
+    F: FnOnce(&mut std::collections::HashMap<String, u32>) -> R,
+{
+    let mut guard = SUMMARY_REGISTRY
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let map = guard.get_or_insert_with(std::collections::HashMap::new);
+    f(map)
+}
+
+fn read_summary_registry<F, R>(f: F) -> R
+where
+    F: FnOnce(&std::collections::HashMap<String, u32>) -> R,
+{
+    let guard = SUMMARY_REGISTRY
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let empty = std::collections::HashMap::new();
+    let map = guard.as_ref().unwrap_or(&empty);
+    f(map)
+}
+
+fn summary_state_for(session_id: &str) -> u32 {
+    read_summary_registry(|map| map.get(session_id).copied().unwrap_or(0))
+}
+
+fn set_summary_state(session_id: &str, state: u32) {
+    with_summary_registry(|map| {
+        if state == 0 {
+            map.remove(session_id);
+        } else {
+            map.insert(session_id.to_string(), state);
+        }
+    })
+}
+
+fn clear_summary_for_session(session_id: &str) {
+    with_summary_registry(|map| {
+        map.remove(session_id);
+    })
+}
 
 /// Short git commit hash for log provenance.
 /// Set by build.rs via `AUTO_PROMPT_COMMIT_SHA` at compile time.
@@ -673,8 +721,8 @@ pub fn decide(
             iteration_count,
             &format!("max iterations ({}) reached", config.max_iterations),
         );
-        SUMMARY_REQUESTED.store(0, Ordering::Relaxed);
-        reset_iteration_with_session(&thread.read(cx).session_id().to_string());
+        clear_summary_for_session(&session_id);
+        reset_iteration_with_session(&session_id);
         return AutoPromptDecision::NoAction;
     }
 
@@ -865,10 +913,12 @@ pub async fn decide_with_llm(
         data.session_id
     );
 
+    let session_id_str = data.session_id.to_string();
+
     let result = if data.context_exceeds_limit {
-        let summary_state = SUMMARY_REQUESTED.load(Ordering::Relaxed);
+        let summary_state = summary_state_for(&session_id_str);
         log::info!(
-            "[auto_prompt::decide_with_llm] Context exceeds token limit — SUMMARY_REQUESTED={summary_state}"
+            "[auto_prompt::decide_with_llm] Context exceeds token limit — session={session_id_str} summary_state={summary_state}"
         );
 
         if summary_state == 0 {
@@ -888,9 +938,9 @@ pub async fn decide_with_llm(
                 data.title.as_deref(),
                 data.last_assistant_message.as_deref(),
             );
-            SUMMARY_REQUESTED.store(1, Ordering::Relaxed);
+            set_summary_state(&session_id_str, 1);
             log::info!(
-                "[auto_prompt::decide_with_llm] Returning ContextOverflow — requesting summary from AI"
+                "[auto_prompt::decide_with_llm] Returning ContextOverflow — requesting summary from AI (session={session_id_str})"
             );
             return Ok(AutoPromptOutcome::ContextOverflow(AutoPromptAction {
                 from_session_id: data.session_id,
@@ -906,9 +956,9 @@ pub async fn decide_with_llm(
         } else if summary_state == 1 {
             // Phase 2: AI has responded with summary. The last_assistant_message
             // IS the summary. Create a new thread with ThreadSummary flow.
-            SUMMARY_REQUESTED.store(0, Ordering::Relaxed);
+            clear_summary_for_session(&session_id_str);
             log::info!(
-                "[auto_prompt::decide_with_llm] Summary received — creating new thread with ThreadSummary flow"
+                "[auto_prompt::decide_with_llm] Summary received — creating new thread with ThreadSummary flow (session={session_id_str})"
             );
 
             let prompt_summary = build_prompt_summary(
@@ -950,7 +1000,7 @@ pub async fn decide_with_llm(
             }));
         } else {
             // Unexpected state — reset and stop
-            SUMMARY_REQUESTED.store(0, Ordering::Relaxed);
+            clear_summary_for_session(&session_id_str);
             let stop_reason = "context overflow: unexpected summary state".to_string();
             write_stop_log(
                 data.project_root.as_ref(),
@@ -1937,9 +1987,8 @@ pub fn reset_iteration() {
     AUTO_PROMPT_ITERATION.store(0, Ordering::Relaxed);
     VERIFICATION_COUNT.store(0, Ordering::Relaxed);
     AUTO_PROMPT_LLM_FAILURE_COUNT.store(0, Ordering::Relaxed);
-    // Intentionally NOT resetting SUMMARY_REQUESTED here.
-    // The ContextOverflow phase tracking must survive across iterations
-    // to prevent re-requesting summaries when the AI already responded with one.
+    // Summary state is now per-session in SUMMARY_REGISTRY and cleared
+    // via clear_summary_for_session / reset_iteration_with_session.
 }
 
 /// Reset the auto-prompt chain counters **and** release any plan claims held by
@@ -1947,6 +1996,7 @@ pub fn reset_iteration() {
 /// can pick up the released plans.
 pub fn reset_iteration_with_session(session_id: &str) {
     reset_iteration();
+    clear_summary_for_session(session_id);
     plan_registry::release_all_for_session(session_id);
 }
 
@@ -1972,7 +2022,8 @@ fn get_iteration() -> u32 {
             now.saturating_sub(last)
         );
         AUTO_PROMPT_ITERATION.store(0, Ordering::Relaxed);
-        SUMMARY_REQUESTED.store(0, Ordering::Relaxed);
+        // Clear all stale summary states on chain timeout
+        with_summary_registry(|map| map.clear());
     }
 
     let iteration = AUTO_PROMPT_ITERATION.fetch_add(1, Ordering::Relaxed) + 1;
