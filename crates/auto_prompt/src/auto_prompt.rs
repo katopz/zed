@@ -452,6 +452,11 @@ pub struct LlmCallData {
     /// Passed through to AutoPromptAction as fallback when actual_input_tokens
     /// is None.
     pub approximate_token_count: usize,
+    /// Whether the agent supports /compact (ACP agents like Claude).
+    /// When true and context exceeds limit, skip the ContextOverflow flow
+    /// and use lightweight context instead — the agent's /compact handles
+    /// context compression natively.
+    pub supports_compact: bool,
 }
 
 impl std::fmt::Debug for LlmCallData {
@@ -482,6 +487,7 @@ impl std::fmt::Debug for LlmCallData {
             .field("stop_phase", &self.stop_phase)
             .field("context_exceeds_limit", &self.context_exceeds_limit)
             .field("approximate_token_count", &self.approximate_token_count)
+            .field("supports_compact", &self.supports_compact)
             .finish()
     }
 }
@@ -890,6 +896,7 @@ pub fn decide(
         stop_phase,
         context_exceeds_limit,
         approximate_token_count: auto_prompt_ctx.approximate_token_count,
+        supports_compact: false,
     })
 }
 
@@ -915,7 +922,7 @@ pub async fn decide_with_llm(
 
     let session_id_str = data.session_id.to_string();
 
-    let result = if data.context_exceeds_limit {
+    let result = if data.context_exceeds_limit && !data.supports_compact {
         let summary_state = summary_state_for(&session_id_str);
         log::info!(
             "[auto_prompt::decide_with_llm] Context exceeds token limit — session={session_id_str} summary_state={summary_state}"
@@ -1022,9 +1029,14 @@ pub async fn decide_with_llm(
             data.had_error,
         );
         log::info!(
-            "[auto_prompt::decide_with_llm] Using lightweight context ({} chars) instead of full context ({} chars)",
+            "[auto_prompt::decide_with_llm] Using lightweight context ({} chars) instead of full context ({} chars){}",
             lightweight_context.len(),
-            data.context_json.len()
+            data.context_json.len(),
+            if data.supports_compact && data.context_exceeds_limit {
+                " (agent supports /compact, skipping ContextOverflow)"
+            } else {
+                ""
+            }
         );
         call_language_model(&data.model, &data.system_prompt, &lightweight_context, cx).await
     };

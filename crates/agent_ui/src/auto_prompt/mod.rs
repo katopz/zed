@@ -462,6 +462,7 @@ pub fn on_thread_stopped(
 
         auto_prompt::AutoPromptDecision::NeedsLlmCall(mut data) => {
             data.profile_id = profile_id.take();
+            data.supports_compact = thread.read(cx).connection().agent_id() != *ZED_AGENT_ID;
             log::info!(
                 "[auto_prompt] NeedsLlmCall - spawning task to call LLM with model: {:?}",
                 data.model.id()
