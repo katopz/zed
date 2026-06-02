@@ -412,8 +412,41 @@ The `extract_remaining_section` helper scans the last 3 paragraphs of the messag
 - Defines `AutoPromptNewThread` GPUI action (creates follow-up thread with `from_session_id`, `from_title`, `next_prompt`, `work_dirs`)
 - Defines `AutoPromptState` enum: `Idle`, `Processing`, `Failed`
 - `on_thread_stopped()` delegates to `auto_prompt::decide()`, handles async LLM path with retry loop
+- `dispatch_action()` routes to same-thread continuation (native/compact) or new thread
+- `extract_decision_prompt()` extracts `## 3. Decision` section from `next_prompt` for the `AutoPromptNewThread.decision_prompt` field
 
 Called from `conversation_view.rs` in the `AcpThreadEvent::Stopped` handler (and error handler), only when `auto_prompt_enabled` is `true` on the active `ThreadView`.
+
+### New thread content (auto_prompt_new_thread)
+
+When `AutoPromptNewThread` is dispatched, `AgentPanel::auto_prompt_new_thread()` (in `agent_panel.rs`) builds a 3-section `ContentBlock` prompt:
+
+```
+## 1. Summary
+[crease mention — expandable, full last_assistant_message]
+
+## 2. Last Assistant Message
+{truncate_to_paragraph_budget(last_assistant_message, 4000)}
+
+---
+
+## 3. Decision
+{build_continuation_prompt(last_assistant_message)}
+```
+
+**Functions involved:**
+
+| Function | Location | Purpose |
+|----------|----------|---------|
+| `auto_prompt_new_thread()` | `agent_ui/agent_panel.rs` | Builds 3-section ContentBlock, creates external thread with auto_submit |
+| `build_continuation_prompt()` | `auto_prompt/auto_prompt.rs` | Checks `detect_remaining_work()` for actionable items, falls back to static prompt |
+| `detect_remaining_work()` | `auto_prompt/auto_prompt.rs` | Scans last_assistant_message for "remaining work", "todo:", unchecked `- [ ]` |
+| `truncate_to_paragraph_budget()` | `auto_prompt/context.rs` | Truncates text to N chars, splitting at paragraph boundaries |
+| `extract_decision_prompt()` | `auto_prompt/auto_prompt.rs` | Extracts `## 3. Decision` section from `with_first_prompt_context` formatted text |
+
+**Why no duplication:** The orchestration LLM's `next_prompt` (from `with_first_prompt_context`) is NOT included in the new thread. It already contains `## 1. Thread Summary` + `## 2. Last Assistant Message` + `## 3. Decision` which would duplicate the mention content. Instead, `build_continuation_prompt()` generates the decision independently from `last_assistant_message` only.
+
+**Static fallback:** When `detect_remaining_work()` finds nothing, the decision section becomes: `"Make good decision based on above information or stop if no action needed."` — letting the worker LLM decide autonomously from the context.
 
 ### User Interface - Retry and Cancel
 
