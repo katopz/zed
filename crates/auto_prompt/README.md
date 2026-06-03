@@ -41,13 +41,13 @@ ConversationView::handle_thread_event()
       ├─ Write decision log with response_origin ("llm" or "synthetic")
       │
       ├─ evaluate_response() — pure function, no side effects:
-      │   ├─ Confidence < 0.5? → WantsStop (source: ConfidenceGate)
-      │   ├─ Handbrake (post-verification, worker declared stop)? → WantsStop (source: Handbrake)
+      │   ├─ Confidence < threshold (0.2 Working / 0.8 PreStop)? → WantsStop (source: ConfidenceGate)
+      │   ├─ Handbrake (PreStop/Verified, worker declared stop)? → WantsStop (source: Handbrake)
       │   ├─ all_plan_done? → Continue with next plan or cleanup (source: LlmResponse)
-      │   ├─ should_continue + has prompt? → Continue (source: LlmResponse)
-      │   ├─ should_continue + no prompt? → WantsStop (source: LlmNoPrompt)
-      │   ├─ should_continue=false + detect_remaining_work match? → NeedsSecondOpinion (source: RuleRemainingWork)
-      │   └─ should_continue=false, no remaining work? → WantsStop (source: LlmResponse)
+      │   ├─ Confidence >= threshold + has prompt? → Continue (source: LlmResponse)
+      │   ├─ Confidence >= threshold + no prompt? → WantsStop (source: LlmNoPrompt)
+      │   ├─ Confidence < threshold + detect_remaining_work match? → NeedsSecondOpinion (source: RuleRemainingWork)
+      │   └─ Confidence < threshold, no remaining work? → WantsStop (source: LlmResponse)
       │
       ├─ Match evaluation result:
       │   ├─ Continue → dispatch next thread
@@ -61,11 +61,20 @@ ConversationView::handle_thread_event()
       │       │   ├─ Retry says continue → dispatch
       │       │   ├─ Retry says stop → detect_remaining_work safety net:
       │       │   │   ├─ Found actionable work → SAFETY NET OVERRIDE → dispatch
+      │       │   │   ├─ No remaining work → detect_remaining_plan_tasks:
+      │       │   │   │   ├─ Unchecked tasks found → PLAN TASK FALLBACK → dispatch
+      │       │   │   │   └─ No unchecked tasks → accept stop
       │       │   │   └─ No remaining work → accept stop
       │       │   └─ All retries failed → detect_remaining_work safety net:
       │       │       ├─ Found actionable work → SAFETY NET OVERRIDE → dispatch
+      │       │       ├─ No remaining work → detect_remaining_plan_tasks:
+      │       │       │   ├─ Unchecked tasks found → PLAN TASK FALLBACK → dispatch
+      │       │       │   └─ No unchecked tasks → accept stop
       │       │       └─ No remaining work → accept stop
       │       └─ is_synthetic_failure=false (real LLM decision):
+      │           ├─ detect_remaining_plan_tasks?
+      │           │   ├─ Unchecked tasks + LLM did NOT acknowledge block → PLAN TASK FALLBACK → dispatch
+      │           │   └─ LLM acknowledged blocked tasks (e.g. "requires GPU") → respect stop
       │           ├─ verification_count=0 → pre-stop verification prompt
       │           ├─ verification_count < max → accept stop
       │           └─ verification_count >= max → force stop
@@ -146,9 +155,9 @@ sequenceDiagram
                 decide_llm->>decide_llm: Write decision log
                 decide_llm->>eval: evaluate_response()
                 
-                alt Confidence < 0.5
+                alt Confidence < threshold (0.2 Working / 0.8 PreStop)
                     eval-->>decide_llm: WantsStop (source=ConfidenceGate)
-                else Handbrake triggered
+                else Handbrake (PreStop/Verified, worker declared stop)
                     eval-->>decide_llm: WantsStop (source=Handbrake)
                 else NeedsSecondOpinion
                     eval-->>decide_llm: NeedsSecondOpinion (source=RuleRemainingWork)
@@ -183,11 +192,27 @@ sequenceDiagram
                                 Note over decide_llm: SAFETY NET OVERRIDE
                                 decide_llm-->>CV: AutoPromptAction
                             else No remaining work detected
-                                decide_llm-->>CV: Stopped
+                                decide_llm->>decide_llm: detect_remaining_plan_tasks() fallback
+                                alt Unchecked plan tasks found
+                                    Note over decide_llm: PLAN TASK FALLBACK
+                                    decide_llm-->>CV: AutoPromptAction
+                                else No unchecked tasks
+                                    decide_llm-->>CV: Stopped
+                                end
                             end
                         end
                         
                     else Real LLM decision (not synthetic)
+                        Note over decide_llm: Plan task fallback check
+                        alt detect_remaining_plan_tasks found unchecked tasks
+                            alt llm_acknowledged_blocked_tasks (e.g. "requires GPU")
+                                decide_llm->>decide_llm: Respect stop — LLM explained why tasks are blocked
+                            else LLM did NOT acknowledge block
+                                Note over decide_llm: PLAN TASK FALLBACK
+                                decide_llm-->>CV: AutoPromptAction
+                            end
+                        end
+                        
                         Note over decide_llm: Pre-stop verification path
                         alt verification_count=0
                             decide_llm->>decide_llm: Build verification prompt
@@ -283,12 +308,13 @@ The orchestration LLM follows a simple priority order:
 Every evaluation result carries a `DecisionSource` that answers "who decided this?":
 
 | Source | Meaning |
-|--------|---------|
-| `LlmResponse` | LLM produced a real response with confidence ≥ 0.5 — its decision used directly |
-| `ConfidenceGate` | Code overrode because confidence < 0.5 (universal gate) |
-| `Handbrake` | Worker AI explicitly declared stopping after verification |
+|--------|----------|
+| `LlmResponse` | LLM produced a real response with confidence ≥ threshold — its decision used directly |
+| `ConfidenceGate` | Code overrode because confidence < threshold (phase-dependent: 0.2 Working, 0.8 PreStop) |
+| `Handbrake` | Worker AI explicitly declared stopping after verification ("stopping, nothing related") |
 | `RuleRemainingWork` | `detect_remaining_work` found patterns ("Next Steps", "remaining work", unchecked checkboxes) → second opinion requested |
 | `LlmNoPrompt` | LLM said continue but provided no usable prompt |
+| `PlanTaskFallback` | `detect_remaining_plan_tasks` found unchecked plan tasks — overrides stop to continue them |
 
 Logged as `evaluate_response: source=ConfidenceGate, result=WantsStop { ... }` in `RUST_LOG=info` output.
 
@@ -302,7 +328,7 @@ When the orchestration LLM stream produces no usable content (zero Text/Thinking
 
 This triggers the synthetic failure path in `decide_with_llm`:
 
-1. `evaluate_response` hits the confidence gate (`0.0 < 0.5` → `WantsStop`, source=`ConfidenceGate`)
+1. `evaluate_response` hits the confidence gate (`0.0 < 0.2` → `WantsStop`, source=`ConfidenceGate`)
 2. `is_synthetic_failure=true` is detected (confidence ≤ 0.3 + reason starts with "model")
 3. **Lightweight retry**: builds a smaller context (last 3 paragraphs of assistant message + plan landscape) and retries up to 3 times with exponential backoff (2s, 4s, 8s)
 4. If any retry succeeds and says continue → dispatch
@@ -315,13 +341,25 @@ Before accepting any stop from the synthetic failure path, `detect_remaining_wor
 1. Scans for trigger patterns: `"remaining work"`, `"next step"`, `"next steps"`, `"todo:"`, `"action items"`, `"left to do"`, `"still need"`, unchecked `- [ ]` checkboxes
 2. Validates that extracted section has actionable content (`- `, `* `, `1.`, `TODO`, `must`, `need to`)
 3. If actionable work found → **SAFETY NET OVERRIDE**: forces continuation with the extracted section as the prompt
-4. If no remaining work found → accepts stop
+4. If no remaining work found → check `detect_remaining_plan_tasks` (see below)
 
 This prevents the chain from stopping when the model is temporarily broken but the last assistant message clearly describes unfinished work (e.g. "### Next Steps" listing T2.4, T2.5, T2.6).
 
 The safety net runs in two places:
 - **Retry says stop**: LLM returned a real response but decided to stop
 - **All retries failed**: Model completely unreachable, all 3 attempts produced no usable content
+
+### Plan task fallback (detect_remaining_plan_tasks)
+
+When the safety net finds no remaining work in the last assistant message, `detect_remaining_plan_tasks` checks plan file contents for unchecked `[ ]` tasks. It:
+
+1. Parses `context_json` for plan file paths and contents
+2. Skips plans claimed by other sessions (multi-agent coordination)
+3. Skips non-actionable items: strikethrough (`~~`), "Skipped", "Cancelled", "Deferred", "Out of Scope" sections
+4. If actionable unchecked tasks found → **PLAN TASK FALLBACK**: continues with "Plan files have remaining unchecked tasks: ..."
+5. If no actionable tasks → accepts stop
+
+**Blocked-task acknowledgment**: When `is_synthetic_failure=false` (real LLM decision), the fallback checks `llm_acknowledged_blocked_tasks()` before overriding. If the LLM's last message already acknowledges remaining tasks AND explains why they can't proceed (e.g., "requires GPU hardware", "blocked by external dependency", "nothing actionable without access"), the system respects the stop instead of blindly forcing a continue. This prevents false overrides when the LLM correctly identified that tasks are blocked by hardware, permissions, or external factors.
 
 ### Pre-stop verification
 
@@ -357,14 +395,6 @@ When token count exceeds `max_context_tokens` (default 80K), the system uses a t
 
 This prevents re-requesting summaries when the AI has already responded with one.
 
-### Quality gates
-
-Before marking `all_plan_done=true`, the system enforces:
-
-- Production grade: no mock, no TODO, no placeholder, no `unwrap()`
-- Fix all compiler diagnostics and warnings
-- Ensure test coverage for new code
-
 ### Handbrake (loop prevention)
 
 When the worker AI explicitly declares stopping with phrases like `stopping, nothing related` or `stopping, no further action`, the `evaluate_response` function forces a `WantsStop` result regardless of what the orchestration LLM decided. This breaks loops where the orchestration LLM keeps seeing unchecked plan items and continuing despite the worker's explicit stop declaration.
@@ -373,14 +403,33 @@ When the worker AI explicitly declares stopping with phrases like `stopping, not
 
 The handbrake matches `last_assistant_message` containing "stopping" combined with one of: "nothing related", "no further action", "nothing left", "no further work". The word "stopping" alone does **not** trigger the handbrake — it requires a qualifying phrase.
 
+The handbrake fires **before** `detect_remaining_work` and `detect_remaining_plan_tasks`, so it takes priority over both safety nets.
+
+### Quality gates
+
+Before marking `all_plan_done=true`, the system enforces:
+
+- Production grade: no mock, no TODO, no placeholder, no `unwrap()`
+- Fix all compiler diagnostics and warnings
+- Ensure test coverage for new code
+
 ### Remaining work detection
 
 The `detect_remaining_work` function extracts potential remaining work from the last assistant message. It scans for trigger phrases ("next steps", "remaining work", "todo:", etc.) and unchecked checkboxes, then validates that the extracted section contains actionable items. Used in two contexts:
 
-1. **evaluate_response (normal path)**: When LLM says stop with confidence ≥ 0.5, `detect_remaining_work` triggers `NeedsSecondOpinion` — a second LLM call decides whether the remaining work is real or a false positive.
+1. **evaluate_response (normal path)**: When LLM says stop with confidence below threshold, `detect_remaining_work` triggers `NeedsSecondOpinion` — a second LLM call decides whether the remaining work is real or a false positive.
 2. **Safety net (synthetic failure path)**: When lightweight retries fail or say stop, `detect_remaining_work` runs as a final check before accepting stop — no second opinion, direct override.
 
 The `extract_remaining_section` helper scans the last 3 paragraphs of the message for trigger words or actionable checkboxes, including the preceding paragraph if it looks like a header.
+
+### Blocked-task acknowledgment (llm_acknowledged_blocked_tasks)
+
+When `detect_remaining_plan_tasks` finds unchecked plan tasks in the real LLM decision path, `llm_acknowledged_blocked_tasks` checks whether the LLM's last message already acknowledged those tasks AND explained why they can't proceed. The function requires both conditions:
+
+1. **Acknowledges remaining tasks**: message contains "remaining", "unchecked", "nothing actionable", "still need", etc.
+2. **Explains blockage**: message contains "requires", "blocked", "hardware", "GPU", "external", "depend", "no access", etc.
+
+When both conditions are met, the PLAN TASK FALLBACK is skipped and the stop is respected. This prevents the system from blindly forcing a continue when the LLM correctly identified that tasks are blocked by hardware, permissions, or external factors.
 
 ### Key types
 
@@ -391,7 +440,7 @@ The `extract_remaining_section` helper scans the last 3 paragraphs of the messag
 - `AutoPromptContext` — serializable context payload sent to the orchestration LLM (includes `plan_files`, `doc_files` (filenames only), `modified_files`, `first_user_message`, `stop_phase`, `verification_count`, `plan_has_checkboxes`, `first_plan_filename`, `plan_number`, `was_truncated`)
 - `EvaluationInput` — input to the pure `evaluate_response()` function (`should_continue`, `confidence`, `next_prompt`, `reason`, `all_plan_done`, `next_plan_prompt`, `last_assistant_message`, `is_synthetic_failure`, `stop_phase`)
 - `EvaluationResult` — output of `evaluate_response()`: `Continue { prompt, reason }`, `WantsStop { reason }`, `NeedsSecondOpinion { extracted_section, rule_reason }`; carries `DecisionSource` via `.source()` method
-- `DecisionSource` — provenance enum: `LlmResponse`, `ConfidenceGate`, `Handbrake`, `RuleRemainingWork`, `LlmNoPrompt`
+- `DecisionSource` — provenance enum: `LlmResponse`, `ConfidenceGate`, `Handbrake`, `RuleRemainingWork`, `LlmNoPrompt`, `PlanTaskFallback`
 - `AutoPromptResponse` — expected JSON response from the LLM (`should_continue`, `next_prompt`, `reason`, `all_plan_done`, `confidence`, `thread_summary`)
 - `StopPhase` — lifecycle phase: `Working` (normal), `PreStop` (verification), `Verified` (terminal)
 - `AutoPromptConfig` — loaded from `~/.config/zed/auto_prompt.json` or env vars (cached with file-watcher invalidation)
@@ -399,10 +448,12 @@ The `extract_remaining_section` helper scans the last 3 paragraphs of the messag
 ### Files
 
 | File | Purpose |
-|------|---------|
-| `src/auto_prompt.rs` | `decide()` (sync), `decide_with_llm()` (async), `evaluate_response()`, `detect_remaining_work()`, system prompt, iteration tracking, plan/doc reading, LLM client, verification prompts, config caching |
+|------|----------|
+| `src/auto_prompt.rs` | `decide()` (sync), `decide_with_llm()` (async), `evaluate_response()`, `detect_remaining_work()`, `detect_remaining_plan_tasks()`, `llm_acknowledged_blocked_tasks()`, system prompt, iteration tracking, plan/doc reading, LLM client, verification prompts, config caching |
 | `src/config.rs` | `AutoPromptConfig` from `~/.config/zed/auto_prompt.json` or env vars |
 | `src/context.rs` | `AutoPromptContext`, `AutoPromptResponse`, `StopPhase`, plan/message serialization |
+| `src/lightweight_context.rs` | `build_lightweight_orchestration_context()` — compact context (last message + plan summaries) to reduce token usage from ~80K to ~500 |
+| `src/plan_registry.rs` | Plan claim tracking for multi-agent coordination — `try_claim()`, `release()`, `heartbeat()`, `auto_claim_from_prompt()` |
 
 ### Bridge in agent_ui
 
@@ -412,7 +463,9 @@ The `extract_remaining_section` helper scans the last 3 paragraphs of the messag
 - Defines `AutoPromptNewThread` GPUI action (creates follow-up thread with `from_session_id`, `from_title`, `next_prompt`, `work_dirs`)
 - Defines `AutoPromptState` enum: `Idle`, `Processing`, `Failed`
 - `on_thread_stopped()` delegates to `auto_prompt::decide()`, handles async LLM path with retry loop
-- `dispatch_action()` routes to same-thread continuation (native/compact) or new thread
+- `dispatch_action()` routes to same-thread continuation (native/compact) or new thread:
+  - **Same-thread**: decision-only prompt (no last assistant message repeat — it's already visible in thread history)
+  - **New thread**: full 3-part format via `auto_prompt_new_thread()` with summary + last assistant message + decision
 - `extract_decision_prompt()` extracts `## 3. Decision` section from `next_prompt` for the `AutoPromptNewThread.decision_prompt` field
 
 Called from `conversation_view.rs` in the `AcpThreadEvent::Stopped` handler (and error handler), only when `auto_prompt_enabled` is `true` on the active `ThreadView`.
@@ -447,6 +500,24 @@ When `AutoPromptNewThread` is dispatched, `AgentPanel::auto_prompt_new_thread()`
 **Why no duplication:** The orchestration LLM's `next_prompt` (from `with_first_prompt_context`) is NOT included in the new thread. It already contains `## 1. Thread Summary` + `## 2. Last Assistant Message` + `## 3. Decision` which would duplicate the mention content. Instead, `build_continuation_prompt()` generates the decision independently from `last_assistant_message` only.
 
 **Static fallback:** When `detect_remaining_work()` finds nothing, the decision section becomes: `"Make good decision based on above information or stop if no action needed."` — letting the worker LLM decide autonomously from the context.
+
+### Same-thread continuation
+
+When the token count is below the `same_thread_token_threshold` (default 60K), continuations are sent to the **same thread** instead of creating a new one:
+
+- **Native Zed agent**: `"Continue from where we left off. Summarize prior context internally and proceed."` + decision only
+- **ACP agents (Claude, etc.)**: `/compact` + decision only
+
+The last assistant message is **not** repeated — it's already visible in the thread history. Only the orchestration LLM's decision is appended, keeping the continuation concise.
+
+**Routing rules** (hard invariant — enforced in `dispatch_action`):
+
+| Agent type | Tokens < threshold | Tokens >= threshold | Active thread gone |
+|------------|-------------------|--------------------|--------------------|
+| Native Zed agent | Same thread (native prompt) | **New thread** | New thread (fallback) |
+| ACP agents (Claude, etc.) | Same thread (`/compact`) | Same thread (`/compact`) | **Stop** (no new thread) |
+
+ACP agents **never** create new threads — they rely on conversation history in the same thread. If the active thread is gone when `dispatch_action` runs, the chain stops instead of falling back to a new thread.
 
 ### User Interface - Retry and Cancel
 
@@ -493,7 +564,8 @@ Config file: `~/.config/zed/auto_prompt.json`
   "max_context_tokens": 80000,
   "backoff_base_ms": 2000,
   "max_verification_attempts": 2,
-  "max_llm_retries": 3
+  "max_llm_retries": 3,
+  "same_thread_token_threshold": 60000
 }
 ```
 
@@ -505,10 +577,11 @@ Config file: `~/.config/zed/auto_prompt.json`
 | `backoff_base_ms` | `2000` | Base delay for exponential backoff on errors (capped at 60s) |
 | `max_llm_retries` | `3` | Max automatic retry attempts for LLM calls before showing "Retry" button |
 | `max_verification_attempts` | `2` | Max verification prompts in PreStop phase before accepting stop |
+| `same_thread_token_threshold` | `60000` | Token count below which auto-prompt continues in the same thread instead of creating a new thread |
 
 Note: Enable/disable is controlled by the UI toggle (sparkle button) per thread, not by the config file.
 
-Environment variable overrides: `ZED_AUTO_PROMPT_MAX_ITERATIONS`, `ZED_AUTO_PROMPT_MAX_CONTEXT_TOKENS`, `ZED_AUTO_PROMPT_BACKOFF_BASE_MS`, `ZED_AUTO_PROMPT_SYSTEM_PROMPT`, `ZED_AUTO_PROMPT_MAX_LLM_RETRIES`, `ZED_AUTO_PROMPT_MAX_VERIFICATION_ATTEMPTS`.
+Environment variable overrides: `ZED_AUTO_PROMPT_MAX_ITERATIONS`, `ZED_AUTO_PROMPT_MAX_CONTEXT_TOKENS`, `ZED_AUTO_PROMPT_BACKOFF_BASE_MS`, `ZED_AUTO_PROMPT_SYSTEM_PROMPT`, `ZED_AUTO_PROMPT_MAX_LLM_RETRIES`, `ZED_AUTO_PROMPT_MAX_VERIFICATION_ATTEMPTS`, `ZED_AUTO_PROMPT_SAME_THREAD_TOKEN_THRESHOLD`.
 
 ## E2E Testing
 

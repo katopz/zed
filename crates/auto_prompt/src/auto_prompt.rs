@@ -443,7 +443,7 @@ pub struct LlmCallData {
     /// Used by the caller to decide whether to add a pre-call delay.
     pub had_error: bool,
     /// Current stop lifecycle phase (Working, PreStop, Verified).
-    /// Used to scope the handbrake to post-verification only.
+    /// Controls confidence thresholds and scopes the handbrake to post-verification.
     pub stop_phase: context::StopPhase,
     /// Whether the context exceeds `max_context_tokens` — skip the expensive
     /// full-context LLM call and go directly to the lightweight retry path.
@@ -523,6 +523,8 @@ pub enum DecisionSource {
     LlmResponse,
     /// Confidence below phase threshold (Working < 0.2, PreStop < 0.8).
     ConfidenceGate,
+    /// Worker AI explicitly declared stopping after verification (handbrake).
+    Handbrake,
     /// Code detected remaining work patterns via rules (`detect_remaining_work`).
     RuleRemainingWork,
     /// LLM crossed threshold but provided no usable prompt.
@@ -551,7 +553,9 @@ impl EvaluationResult {
         match self {
             EvaluationResult::Continue { .. } => DecisionSource::LlmResponse,
             EvaluationResult::WantsStop { reason } => {
-                if reason.contains("< ") || reason.contains("confidence") {
+                if reason.contains("handbrake") {
+                    DecisionSource::Handbrake
+                } else if reason.contains("< ") || reason.contains("confidence") {
                     DecisionSource::ConfidenceGate
                 } else if reason.contains("no usable prompt") {
                     DecisionSource::LlmNoPrompt
@@ -606,6 +610,32 @@ pub fn evaluate_response(input: &EvaluationInput) -> EvaluationResult {
     }
 
     // ── Confidence below threshold → check safety nets before stopping ──
+
+    // Handbrake: worker AI explicitly declared stopping after verification.
+    // This overrides everything — breaks loops where orchestration keeps seeing
+    // unchecked plan items and continuing despite the worker's explicit stop.
+    // Scoped to PreStop/Verified only to prevent false positives during normal work.
+    if matches!(
+        input.stop_phase,
+        context::StopPhase::PreStop | context::StopPhase::Verified
+    ) {
+        if let Some(msg) = input.last_assistant_message.as_deref() {
+            let lower = msg.to_lowercase();
+            let has_stopping = lower.contains("stopping");
+            let has_qualifier = lower.contains("nothing related")
+                || lower.contains("no further action")
+                || lower.contains("nothing left")
+                || lower.contains("no further work");
+            if has_stopping && has_qualifier {
+                return EvaluationResult::WantsStop {
+                    reason: format!(
+                        "confidence {confidence:.2} < {threshold:.2}, handbrake: worker declared stop ({:?} phase)",
+                        input.stop_phase
+                    ),
+                };
+            }
+        }
+    }
 
     // Safety net: last assistant message contains remaining work patterns.
     if let Some(remaining_prompt) = detect_remaining_work(input.last_assistant_message.as_deref()) {
@@ -748,6 +778,8 @@ pub fn decide(
     let verification_count = VERIFICATION_COUNT.load(Ordering::Relaxed);
     let stop_phase = if verification_count == 0 {
         StopPhase::Working
+    } else if verification_count >= config.max_verification_attempts {
+        StopPhase::Verified
     } else {
         StopPhase::PreStop
     };
@@ -766,6 +798,11 @@ pub fn decide(
         });
         let plan_files = read_plan_files(thread_ref, first_user_msg.as_deref());
         let doc_files = read_doc_files(thread_ref);
+        let sid = thread_ref.session_id().clone();
+        let sid_str = sid.to_string();
+        for plan in &plan_files {
+            plan_registry::heartbeat(&plan.path, &sid_str);
+        }
         let mut ctx = AutoPromptContext::collect(
             thread_ref,
             cx,
@@ -776,7 +813,6 @@ pub fn decide(
         );
         ctx.stop_phase = stop_phase.clone();
         ctx.verification_count = verification_count;
-        let sid = thread_ref.session_id().clone();
         let title = thread_ref.title().map(|t| t.to_string());
         let dirs = thread_ref.work_dirs().map(|pl| pl.paths().to_vec());
         (ctx, sid, title, dirs)
@@ -978,9 +1014,18 @@ pub async fn decide_with_llm(
             );
 
             // Check for remaining plan tasks to build a continuation prompt
-            let continuation = detect_remaining_plan_tasks(&data.context_json)
-                .or_else(|| detect_remaining_work(data.last_assistant_message.as_deref()))
-                .unwrap_or_else(|| "Continue from where we left off.".to_string());
+            let continuation = if llm_acknowledged_blocked_tasks(
+                data.last_assistant_message.as_deref(),
+            ) {
+                log::info!(
+                    "auto_prompt: ContextOverflow — LLM acknowledged blocked tasks, using generic continuation"
+                );
+                "Continue from where we left off.".to_string()
+            } else {
+                detect_remaining_plan_tasks(&data.context_json)
+                    .or_else(|| detect_remaining_work(data.last_assistant_message.as_deref()))
+                    .unwrap_or_else(|| "Continue from where we left off.".to_string())
+            };
 
             let next_prompt = with_first_prompt_context(
                 continuation,
@@ -1053,11 +1098,11 @@ pub async fn decide_with_llm(
                 .as_ref()
                 .is_some_and(|p| !p.trim().is_empty());
 
-            let is_synthetic_failure = response.confidence <= Some(0.3)
-                && response
-                    .reason
-                    .as_ref()
-                    .is_some_and(|r| r.to_ascii_lowercase().starts_with("model"));
+            let is_synthetic_failure = response.confidence.unwrap_or(1.0) <= 0.3
+                && response.reason.as_ref().is_some_and(|r| {
+                    let lower = r.to_ascii_lowercase();
+                    lower.starts_with("model returned") || lower.starts_with("model stream")
+                });
 
             let response_origin = if is_synthetic_failure {
                 "synthetic"
@@ -1574,41 +1619,66 @@ pub async fn decide_with_llm(
                         }
                     } else {
                         // Before accepting stop, check plan files for unchecked tasks.
+                        // But if the LLM already acknowledged remaining tasks and explained
+                        // why they can't proceed (blocked by hardware, external dependency, etc.),
+                        // respect that assessment instead of blindly forcing a continue.
                         if let Some(plan_prompt) = detect_remaining_plan_tasks(&data.context_json) {
-                            log::warn!(
-                                "auto_prompt: PLAN TASK FALLBACK — confidence below threshold but plan files have unchecked tasks, continuing"
-                            );
-                            let next_prompt = with_first_prompt_context(
-                                plan_prompt,
-                                prompt_summary.as_deref(),
-                                data.title.as_deref(),
+                            if llm_acknowledged_blocked_tasks(
                                 data.last_assistant_message.as_deref(),
-                            );
-                            auto_claim_plan(
-                                &next_prompt,
-                                &data.context_json,
-                                &data.session_id,
-                                data.title.as_deref(),
-                            );
-                            return Ok(AutoPromptOutcome::Continue(AutoPromptAction {
-                                from_session_id: data.session_id,
-                                from_title: data.title,
-                                next_prompt,
-                                work_dirs: data.work_dirs,
-                                original_user_message: data.original_user_message,
-                                profile_id: data.profile_id.clone(),
-                                actual_input_tokens: data.actual_input_tokens,
-                                approximate_token_count: data.approximate_token_count,
-                                last_assistant_message: data.last_assistant_message.clone(),
-                            }));
+                            ) {
+                                log::info!(
+                                    "auto_prompt: LLM already acknowledged blocked tasks, respecting stop decision"
+                                );
+                            } else {
+                                log::warn!(
+                                    "auto_prompt: PLAN TASK FALLBACK — confidence below threshold but plan files have unchecked tasks, continuing"
+                                );
+                                let next_prompt = with_first_prompt_context(
+                                    plan_prompt,
+                                    prompt_summary.as_deref(),
+                                    data.title.as_deref(),
+                                    data.last_assistant_message.as_deref(),
+                                );
+                                auto_claim_plan(
+                                    &next_prompt,
+                                    &data.context_json,
+                                    &data.session_id,
+                                    data.title.as_deref(),
+                                );
+                                return Ok(AutoPromptOutcome::Continue(AutoPromptAction {
+                                    from_session_id: data.session_id,
+                                    from_title: data.title,
+                                    next_prompt,
+                                    work_dirs: data.work_dirs,
+                                    original_user_message: data.original_user_message,
+                                    profile_id: data.profile_id.clone(),
+                                    actual_input_tokens: data.actual_input_tokens,
+                                    approximate_token_count: data.approximate_token_count,
+                                    last_assistant_message: data.last_assistant_message.clone(),
+                                }));
+                            }
                         }
 
                         let verification_count = VERIFICATION_COUNT.load(Ordering::Relaxed);
                         let max_verifications = data.max_verification_attempts;
 
-                        if verification_count == 0 {
+                        if verification_count >= max_verifications {
+                            let stop_reason =
+                                format!("max verification attempts ({max_verifications}) exceeded");
+                            log::warn!("auto_prompt: {stop_reason}");
+                            write_stop_log(
+                                data.project_root.as_ref(),
+                                data.iteration_count,
+                                &stop_reason,
+                            );
+                            reset_iteration_with_session(&data.session_id.to_string());
+                            Ok(AutoPromptOutcome::Stopped {
+                                reason: stop_reason,
+                            })
+                        } else {
+                            let attempt = verification_count + 1;
                             log::info!(
-                                "auto_prompt: WantsStop ('{reason}') — initiating pre-stop verification (attempt 1/{max_verifications})"
+                                "auto_prompt: WantsStop ('{reason}') — initiating pre-stop verification (attempt {attempt}/{max_verifications})"
                             );
                             VERIFICATION_COUNT.fetch_add(1, Ordering::Relaxed);
 
@@ -1657,33 +1727,6 @@ pub async fn decide_with_llm(
                                     })
                                 }
                             }
-                        } else if verification_count < max_verifications {
-                            let stop_reason = format!(
-                                "confidence below threshold after verification attempt {verification_count}/{max_verifications}"
-                            );
-                            log::info!("auto_prompt: {stop_reason}");
-                            write_stop_log(
-                                data.project_root.as_ref(),
-                                data.iteration_count,
-                                &stop_reason,
-                            );
-                            reset_iteration_with_session(&data.session_id.to_string());
-                            Ok(AutoPromptOutcome::Stopped {
-                                reason: stop_reason,
-                            })
-                        } else {
-                            let stop_reason =
-                                format!("max verification attempts ({max_verifications}) exceeded");
-                            log::warn!("auto_prompt: {stop_reason}");
-                            write_stop_log(
-                                data.project_root.as_ref(),
-                                data.iteration_count,
-                                &stop_reason,
-                            );
-                            reset_iteration_with_session(&data.session_id.to_string());
-                            Ok(AutoPromptOutcome::Stopped {
-                                reason: stop_reason,
-                            })
                         }
                     }
                 }
@@ -1880,14 +1923,14 @@ fn write_stop_log(project_root: Option<&PathBuf>, iteration: u32, reason: &str) 
 ///
 /// Priority:
 /// 1. LLM-generated `thread_summary` (preferred — comprehensive, with active plan bolded)
-/// 2. Synthesized from title + reason + last assistant message (when LLM returns null)
+/// 2. Synthesized from title + reason (when LLM returns null)
 /// 3. Raw `original_user_message` carried from thread 0 (last resort before final fallback)
 /// 4. Extracted from `first_user_message` (absolute fallback)
 fn build_prompt_summary(
     thread_summary: Option<&str>,
     title: Option<&str>,
     reason: Option<&str>,
-    last_assistant_message: Option<&str>,
+    _last_assistant_message: Option<&str>,
     original_user_message: Option<&str>,
     first_user_message: Option<&str>,
 ) -> Option<String> {
@@ -1903,25 +1946,6 @@ fn build_prompt_summary(
 
             if let Some(reason) = reason.filter(|s| !s.trim().is_empty()) {
                 parts.push(reason.trim().to_string());
-            }
-
-            if let Some(last) = last_assistant_message.filter(|s| !s.trim().is_empty()) {
-                let truncated = last.trim();
-                let limit = 2000;
-                let summary = if truncated.len() > limit {
-                    format!(
-                        "{}...",
-                        &truncated[..truncated
-                            .char_indices()
-                            .take(limit)
-                            .last()
-                            .map(|(i, _)| i)
-                            .unwrap_or(limit)]
-                    )
-                } else {
-                    truncated.to_string()
-                };
-                parts.push(summary);
             }
 
             if parts.is_empty() {
@@ -2816,12 +2840,13 @@ fn detect_remaining_work(last_assistant_message: Option<&str>) -> Option<String>
                 "[auto_prompt::detect_remaining_work] Pattern found: {pattern} in last_assistant_message — overriding stop"
             );
             let section_text = section.as_deref().unwrap_or(msg);
+            let section_lower = section_text.to_lowercase();
             let is_actionable = section_text.contains("- ")
                 || section_text.contains("* ")
                 || section_text.contains("1.")
-                || section_text.contains("TODO")
-                || section_text.contains("must")
-                || section_text.contains("need to");
+                || section_lower.contains("todo")
+                || section_lower.contains("must")
+                || section_lower.contains("need to");
 
             if is_actionable {
                 return Some(format!(
@@ -2855,6 +2880,45 @@ fn detect_remaining_work(last_assistant_message: Option<&str>) -> Option<String>
     }
 
     None
+}
+
+/// Check if the LLM's last message already acknowledges remaining tasks and explains
+/// why they can't proceed (blocked by hardware, external dependency, permissions, etc.).
+/// When true, the PLAN TASK FALLBACK should respect the LLM's assessment instead of
+/// blindly forcing a continue.
+fn llm_acknowledged_blocked_tasks(last_assistant_message: Option<&str>) -> bool {
+    let msg = match last_assistant_message {
+        Some(m) if !m.trim().is_empty() => m.trim(),
+        _ => return false,
+    };
+    let lower = msg.to_lowercase();
+
+    // The LLM must mention remaining tasks/unchecked items AND give a reason they're blocked.
+    let acknowledges_remaining = lower.contains("remaining")
+        || lower.contains("unchecked")
+        || lower.contains("left to do")
+        || lower.contains("still need")
+        || lower.contains("not yet done")
+        || lower.contains("not complete")
+        || lower.contains("nothing actionable");
+
+    let explains_blocked = lower.contains("requires")
+        || lower.contains("require")
+        || lower.contains("blocked")
+        || lower.contains("blocker")
+        || lower.contains("depend")
+        || lower.contains("cannot proceed")
+        || lower.contains("can't proceed")
+        || lower.contains("no access")
+        || lower.contains("hardware")
+        || lower.contains("gpu")
+        || lower.contains("external")
+        || lower.contains("manual")
+        || lower.contains("need access")
+        || lower.contains("need permission")
+        || lower.contains("out of scope");
+
+    acknowledges_remaining && explains_blocked
 }
 
 fn extract_plan_paths_from_context(context_json: &str) -> Vec<String> {
@@ -2924,7 +2988,7 @@ fn detect_remaining_plan_tasks(context_json: &str) -> Option<String> {
         .map(|claims| format!("\n\n{claims}"))
         .unwrap_or_default();
     Some(format!(
-        "LLM orchestration failed but plan files have remaining unchecked tasks:\n\n{}\n\n\
+        "Plan files have remaining unchecked tasks:\n\n{}\n\n\
          Continue with the next unchecked task. Mark completed steps as [x].{claims_note}",
         remaining.join("\n")
     ))
@@ -3309,7 +3373,11 @@ mod tests {
         let summary = result.expect("should synthesize summary");
         assert!(summary.contains("Fix fusion rank mismatch"));
         assert!(summary.contains("plan has unchecked items"));
-        assert!(summary.contains("Fixed the scale clamp in affine quantization"));
+        // last_assistant_message is excluded from summary (added separately by with_first_prompt_context)
+        assert!(
+            !summary.contains("Fixed the scale clamp in affine quantization"),
+            "should NOT contain last assistant message"
+        );
         assert!(
             !summary.contains("so no way rust can beat python"),
             "should NOT contain raw first prompt"
@@ -3317,7 +3385,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_prompt_summary_synthesizes_truncates_long_last_message() {
+    fn test_build_prompt_summary_synthesizes_title_only_when_last_message_present() {
         let long_message: String = "x".repeat(3000);
         let result = build_prompt_summary(
             None,
@@ -3328,11 +3396,8 @@ mod tests {
             None,
         );
         let summary = result.expect("should synthesize");
-        assert!(summary.len() < long_message.len(), "should be truncated");
-        assert!(
-            summary.ends_with("..."),
-            "truncated text should end with ..."
-        );
+        // last_assistant_message is excluded from summary; only title is used
+        assert_eq!(summary, "Title");
     }
 
     #[test]
@@ -3924,6 +3989,74 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_handbrake_prestop_worker_declared_stop() {
+        let input = EvaluationInput {
+            confidence: Some(0.1),
+            last_assistant_message: Some(
+                "All tasks complete. stopping, nothing related to current work.".to_string(),
+            ),
+            stop_phase: context::StopPhase::PreStop,
+            ..make_input()
+        };
+        let result = evaluate_response(&input);
+        assert!(
+            matches!(result, EvaluationResult::WantsStop { .. }),
+            "handbrake should force stop when worker declares stop in PreStop, got {result:?}"
+        );
+        assert_eq!(result.source(), DecisionSource::Handbrake);
+    }
+
+    #[test]
+    fn test_handbrake_verified_worker_declared_stop() {
+        let input = EvaluationInput {
+            confidence: Some(0.1),
+            last_assistant_message: Some(
+                "Reviewed all plans. stopping, no further action needed.".to_string(),
+            ),
+            stop_phase: context::StopPhase::Verified,
+            ..make_input()
+        };
+        let result = evaluate_response(&input);
+        assert!(
+            matches!(result, EvaluationResult::WantsStop { .. }),
+            "handbrake should force stop in Verified phase, got {result:?}"
+        );
+        assert_eq!(result.source(), DecisionSource::Handbrake);
+    }
+
+    #[test]
+    fn test_handbrake_not_triggered_in_working_phase() {
+        let input = EvaluationInput {
+            confidence: Some(0.1),
+            last_assistant_message: Some("stopping, nothing related to current work.".to_string()),
+            stop_phase: context::StopPhase::Working,
+            ..make_input()
+        };
+        let result = evaluate_response(&input);
+        assert!(
+            matches!(result, EvaluationResult::WantsStop { .. }),
+            "handbrake should NOT trigger in Working phase, got {result:?}"
+        );
+        assert_ne!(result.source(), DecisionSource::Handbrake);
+    }
+
+    #[test]
+    fn test_handbrake_not_triggered_without_qualifier() {
+        let input = EvaluationInput {
+            confidence: Some(0.1),
+            last_assistant_message: Some("I am stopping now.".to_string()),
+            stop_phase: context::StopPhase::PreStop,
+            ..make_input()
+        };
+        let result = evaluate_response(&input);
+        assert!(
+            matches!(result, EvaluationResult::WantsStop { .. }),
+            "stopping alone should not trigger handbrake, got {result:?}"
+        );
+        assert_ne!(result.source(), DecisionSource::Handbrake);
+    }
+
     #[derive(Debug, PartialEq)]
     enum VerificationGateResult {
         DispatchVerification,
@@ -3937,14 +4070,12 @@ mod tests {
         max_verifications: u32,
         has_verification_prompt: bool,
     ) -> VerificationGateResult {
-        if verification_count == 0 && has_verification_prompt {
-            VerificationGateResult::DispatchVerification
-        } else if verification_count == 0 && !has_verification_prompt {
-            VerificationGateResult::StopNoPlanFiles
-        } else if verification_count < max_verifications {
-            VerificationGateResult::StopAfterVerification
-        } else {
+        if verification_count >= max_verifications {
             VerificationGateResult::StopMaxExceeded
+        } else if has_verification_prompt {
+            VerificationGateResult::DispatchVerification
+        } else {
+            VerificationGateResult::StopNoPlanFiles
         }
     }
 
@@ -3963,7 +4094,7 @@ mod tests {
     #[test]
     fn test_gate_after_one_verification() {
         let result = handle_wants_stop(1, 2, true);
-        assert_eq!(result, VerificationGateResult::StopAfterVerification);
+        assert_eq!(result, VerificationGateResult::DispatchVerification);
     }
 
     #[test]
@@ -4265,12 +4396,10 @@ mod tests {
 
     #[test]
     fn test_eval_thinking_fallback_confidence_0_3_is_not_synthetic() {
-        // Thinking-only fallback has confidence 0.3 — should be WantsStop
-        // but is_synthetic_failure should be false (0.3 is not <= 0.3... wait)
-        // Actually 0.3 <= 0.3 IS true, but the reason starts with "Model" not "model"
-        // Our detection uses to_ascii_lowercase().starts_with("model"), so "Model" matches.
-        // So this IS detected as synthetic. Let's verify evaluate_response doesn't care
-        // about is_synthetic_failure — it just returns WantsStop for confidence < 0.5.
+        // "Model returned X Thinking events but no Text output" IS a synthetic failure
+        // (starts with "model returned"), but the test name reflects the original intent.
+        // evaluate_response just reads is_synthetic_failure from the input — it returns WantsStop
+        // for confidence < 0.5 regardless.
         let input = EvaluationInput {
             confidence: Some(0.3),
             reason: Some("Model returned 5 Thinking events but no Text output".to_string()),
@@ -4660,6 +4789,66 @@ mod tests {
         assert!(
             matches!(result, EvaluationResult::WantsStop { .. }),
             "synthetic failure from context overflow should route to WantsStop"
+        );
+    }
+
+    #[test]
+    fn test_llm_acknowledged_blocked_tasks_gpu() {
+        assert!(
+            llm_acknowledged_blocked_tasks(Some("5 remaining tasks require GPU hardware")),
+            "remaining + gpu should be detected as blocked"
+        );
+    }
+
+    #[test]
+    fn test_llm_acknowledged_blocked_tasks_nothing_actionable() {
+        assert!(
+            llm_acknowledged_blocked_tasks(Some(
+                "Nothing actionable to implement without hardware access"
+            )),
+            "nothing actionable + hardware should be detected as blocked"
+        );
+    }
+
+    #[test]
+    fn test_llm_acknowledged_blocked_tasks_blocked_dependency() {
+        assert!(
+            llm_acknowledged_blocked_tasks(Some(
+                "Remaining tasks are blocked by external API dependency"
+            )),
+            "remaining + blocked + external should be detected as blocked"
+        );
+    }
+
+    #[test]
+    fn test_llm_acknowledged_blocked_tasks_just_remaining() {
+        assert!(
+            !llm_acknowledged_blocked_tasks(Some("5 remaining tasks to implement")),
+            "remaining without blocked reason should NOT be detected as blocked"
+        );
+    }
+
+    #[test]
+    fn test_llm_acknowledged_blocked_tasks_just_blocked() {
+        assert!(
+            !llm_acknowledged_blocked_tasks(Some("The build is blocked by a missing dependency")),
+            "blocked without remaining tasks should NOT be detected as blocked"
+        );
+    }
+
+    #[test]
+    fn test_llm_acknowledged_blocked_tasks_none() {
+        assert!(
+            !llm_acknowledged_blocked_tasks(None),
+            "None should not be blocked"
+        );
+    }
+
+    #[test]
+    fn test_llm_acknowledged_blocked_tasks_empty() {
+        assert!(
+            !llm_acknowledged_blocked_tasks(Some("")),
+            "empty string should not be blocked"
         );
     }
 }

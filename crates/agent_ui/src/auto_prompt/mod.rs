@@ -194,14 +194,12 @@ pub struct AutoPromptNewThread {
 /// Build a same-thread continuation prompt for ACP agents (e.g. Claude) that
 /// support the `/compact` command to summarize conversation history.
 ///
-/// Format: `/compact` + newline + last message reasoning (if present) + newline + decision.
-fn build_compact_prompt(last_assistant_message: Option<&str>, decision: &str) -> String {
+/// Format: `/compact` + newline + decision.
+///
+/// For same-thread continuations the last assistant message is already visible in the
+/// thread history, so we only include the decision prompt — not a verbatim repeat.
+fn build_compact_prompt(_last_assistant_message: Option<&str>, decision: &str) -> String {
     let mut parts = vec!["/compact".to_string()];
-
-    if let Some(last) = last_assistant_message.filter(|s| !s.trim().is_empty()) {
-        parts.push(String::new());
-        parts.push(last.trim().to_string());
-    }
 
     if !decision.trim().is_empty() {
         parts.push(String::new());
@@ -213,19 +211,17 @@ fn build_compact_prompt(last_assistant_message: Option<&str>, decision: &str) ->
 
 /// Build a same-thread continuation prompt for the native Zed agent which does not
 /// support `/compact` as a slash command. Uses plain-text instructions instead.
+///
+/// For same-thread continuations the last assistant message is already visible in the
+/// thread history, so we only include the decision prompt — not a verbatim repeat.
 fn build_native_continuation_prompt(
-    last_assistant_message: Option<&str>,
+    _last_assistant_message: Option<&str>,
     decision: &str,
 ) -> String {
     let mut parts = vec![
         "Continue from where we left off. Summarize prior context internally and proceed."
             .to_string(),
     ];
-
-    if let Some(last) = last_assistant_message.filter(|s| !s.trim().is_empty()) {
-        parts.push(String::new());
-        parts.push(last.trim().to_string());
-    }
 
     if !decision.trim().is_empty() {
         parts.push(String::new());
@@ -302,8 +298,17 @@ pub(crate) fn dispatch_action(
             );
             return;
         }
+        // ACP agents (Claude, etc.) must NEVER create new threads — they rely on
+        // conversation history in the same thread. If the active thread is gone,
+        // stop instead of falling through to the new-thread path.
+        if !is_native_agent {
+            log::warn!(
+                "[auto_prompt] dispatch_action: no active thread for ACP agent continuation, stopping (ACP agents cannot use new threads)"
+            );
+            return;
+        }
         log::warn!(
-            "[auto_prompt] dispatch_action: no active thread for same-thread continuation, falling back to new thread"
+            "[auto_prompt] dispatch_action: no active thread for native agent continuation, falling back to new thread"
         );
     }
 
