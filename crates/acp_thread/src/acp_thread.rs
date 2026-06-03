@@ -3219,6 +3219,7 @@ impl AcpThread {
                                 args: task_args,
                                 cwd: cwd.clone(),
                                 env,
+                                hide: task::HideStrategy::Always,
                                 ..Default::default()
                             },
                             cx,

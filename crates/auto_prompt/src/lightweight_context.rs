@@ -24,6 +24,8 @@ const SKIP_SECTION_KEYWORDS: &[&str] = &["out of scope", "future", "backlog", "w
 #[derive(serde::Deserialize)]
 struct Context {
     #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
     last_assistant_message: Option<String>,
     #[serde(default)]
     plan_files: Vec<crate::context::PlanFileContent>,
@@ -60,15 +62,19 @@ pub fn build_lightweight_orchestration_context(
                 "[lightweight_context] Failed to parse context_json: {error}, using empty defaults"
             );
             Context {
+                session_id: None,
                 last_assistant_message: None,
                 plan_files: Vec::new(),
             }
         }
     };
 
+    let session_id = context.session_id.as_deref().unwrap_or("");
+
     let plan_summary: Vec<PlanSummaryEntry> = context
         .plan_files
         .iter()
+        .filter(|file| !crate::plan_registry::is_claimed_by_other(&file.path, session_id))
         .filter_map(|file| {
             let unchecked = count_actionable_tasks(&file.content);
             if unchecked > 0 {

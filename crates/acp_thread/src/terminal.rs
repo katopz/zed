@@ -335,6 +335,7 @@ pub async fn create_terminal_entity(
                     args: task_args,
                     cwd,
                     env,
+                    hide: task::HideStrategy::Always,
                     ..Default::default()
                 },
                 cx,

@@ -2075,6 +2075,8 @@ fn read_plan_files(
 ) -> Vec<PlanFileContent> {
     log::info!("[auto_prompt::read_plan_files] Starting to read plan files");
 
+    let session_id = thread.session_id().to_string();
+
     let work_dirs = match thread.work_dirs() {
         Some(dirs) => {
             let paths = dirs.paths().to_vec();
@@ -2136,13 +2138,22 @@ fn read_plan_files(
                 continue;
             }
 
+            let path_str = path.to_string_lossy().to_string();
+            if plan_registry::is_claimed_by_other(&path_str, &session_id) {
+                log::info!(
+                    "[auto_prompt::read_plan_files] Skipping plan claimed by another agent: {}",
+                    path_str
+                );
+                continue;
+            }
+
             let content = match std::fs::read_to_string(&path) {
                 Ok(c) => c,
                 Err(_) => continue,
             };
 
             plan_files.push(PlanFileContent {
-                path: path.to_string_lossy().to_string(),
+                path: path_str,
                 content,
             });
         }
