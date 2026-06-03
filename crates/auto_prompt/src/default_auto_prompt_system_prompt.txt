@@ -33,6 +33,7 @@ Respond ONLY with valid JSON:
 
 2. Check plan_summary for unchecked tasks:
    - If any plan has unchecked tasks → confidence >= 0.6, next_prompt = continue the next unchecked task
+   - Prioritize plans in the SAME repo/project as current_paths first; only suggest cross-repo plans when same-repo plans are all done
    - Include "Mark completed steps as [x]" referencing the actual plan file path
 
 3. Permission-seeking questions — answer them automatically:

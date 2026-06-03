@@ -28,6 +28,8 @@ struct Context {
     #[serde(default)]
     last_assistant_message: Option<String>,
     #[serde(default)]
+    current_paths: Vec<String>,
+    #[serde(default)]
     plan_files: Vec<crate::context::PlanFileContent>,
 }
 
@@ -43,6 +45,7 @@ struct LightweightContext {
     iteration_count: u32,
     had_error: bool,
     last_assistant_message: Option<String>,
+    current_paths: Vec<String>,
     plan_summary: Vec<PlanSummaryEntry>,
 }
 
@@ -64,6 +67,7 @@ pub fn build_lightweight_orchestration_context(
             Context {
                 session_id: None,
                 last_assistant_message: None,
+                current_paths: Vec::new(),
                 plan_files: Vec::new(),
             }
         }
@@ -93,6 +97,7 @@ pub fn build_lightweight_orchestration_context(
         iteration_count,
         had_error,
         last_assistant_message: context.last_assistant_message,
+        current_paths: context.current_paths,
         plan_summary,
     };
 
