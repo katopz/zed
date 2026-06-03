@@ -219,7 +219,9 @@ fn build_native_continuation_prompt(
     decision: &str,
 ) -> String {
     let mut parts = vec![
-        "Continue from where we left off. Summarize prior context internally and proceed."
+        "Continue from where we left off. Summarize prior context internally and proceed.\n\
+         Review your progress and continue any remaining work in the current repo or context first.\n\
+         If everything is complete, commit all changes with conventional commit messages."
             .to_string(),
     ];
 
