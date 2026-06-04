@@ -1591,9 +1591,6 @@ impl ConversationView {
                     });
                 }
                 if is_subagent {
-                    log::info!(
-                        "[auto_prompt] *** Early return: is_subagent=true, skipping auto-prompt"
-                    );
                     if *stop_reason == acp::StopReason::EndTurn {
                         thread.update(cx, |thread, cx| {
                             thread.mark_as_subagent_output(cx);
@@ -1641,39 +1638,32 @@ impl ConversationView {
                         window,
                         cx,
                     );
-                } else {
-                    self.send_queued_message_at_index(0, false, window, cx);
-                } else if auto_prompt_enabled {
-                    let has_in_progress = thread.read(cx).has_in_progress_tool_calls();
-                    if has_in_progress {
-                        log::info!(
-                            "[auto_prompt] Skipping: tools still in progress, agent has not finished"
-                        );
-                    }
-                    // Only run auto_prompt when no queued messages are waiting
-                    // and the agent has no tools still running.
-                    if !has_in_progress {
-                        log::info!(
-                            "[auto_prompt] Stopped event: stop_reason={:?}, used_tools={}, calling on_thread_stopped",
-                            stop_reason,
-                            used_tools
-                        );
-                        if let Some(task) = crate::auto_prompt::on_thread_stopped(
-                            self,
-                            &thread,
-                            used_tools,
-                            stop_reason,
-                            window,
-                            cx,
-                        ) {
-                            if let Some(active) = self.active_thread() {
-                                active.update(cx, |active, cx| {
-                                    active._auto_prompt_task = Some(task);
-                                    cx.notify();
-                                });
+
+                    let auto_prompt_enabled = self
+                        .active_thread()
+                        .is_some_and(|tv| tv.read(cx).auto_prompt_enabled);
+                    if auto_prompt_enabled {
+                        let has_in_progress = thread.read(cx).has_in_progress_tool_calls();
+                        if !has_in_progress {
+                            if let Some(task) = crate::auto_prompt::on_thread_stopped(
+                                self,
+                                &thread,
+                                used_tools,
+                                stop_reason,
+                                window,
+                                cx,
+                            ) {
+                                if let Some(active) = self.active_thread() {
+                                    active.update(cx, |active, cx| {
+                                        active._auto_prompt_task = Some(task);
+                                        cx.notify();
+                                    });
+                                }
                             }
                         }
                     }
+                } else {
+                    self.send_queued_message_at_index(0, false, window, cx);
                 }
             }
             AcpThreadEvent::Refusal => {

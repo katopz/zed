@@ -38,6 +38,7 @@ use zed_actions::{
 use crate::ExpandMessageEditor;
 use crate::ManageProfiles;
 use crate::agent_connection_store::AgentConnectionStore;
+use crate::auto_prompt::{AutoPromptNewThread, ToggleAutoPrompt};
 use crate::completion_provider::{AgentContextSelection, AgentContextSource};
 use crate::terminal_thread_metadata_store::{
     TerminalThreadMetadata, TerminalThreadMetadataStore, compose_terminal_thread_title,

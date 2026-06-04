@@ -146,7 +146,7 @@ impl Model {
                 budget_tokens: Some(4_096),
             }
         } else {
-            AnthropicModelMode::Default
+            AnthropicModelMode::Auto
         };
 
         let supports_speed = matches!(

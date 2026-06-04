@@ -1393,7 +1393,7 @@ dependencies = [
  "language_model",
  "log",
  "paths",
- "schemars",
+ "prompt_store",
  "serde",
  "serde_json",
 ]
