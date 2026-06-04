@@ -3,16 +3,16 @@
 ## Status
 
 - [x] Step 1: Initialize git repo with Cargo project structure on `main`
-- [ ] Step 2: Quick auto-prompt verification — simple text change and stop
-- [ ] Step 3: Implement hello world with passing tests on `develop`
-- [ ] Step 4: Add greet-by-name feature on `feature/01_greet_by_name` branch
-- [ ] Step 5: Merge feature to `develop`, verify tests pass
-- [ ] Step 6: Release v0.1.0 — bump version, tag, merge to `main`
-- [ ] Step 7: Verify git history matches expected flow
-- [ ] Step 8: Inject bug, ask AI to diagnose and fix
-- [ ] Step 9: Verify fix commit uses `fix:` conventional commit prefix
-- [ ] Step 10: Release v0.2.0 — bump version, tag, merge to `main`
-- [ ] Step 11: Final verification of complete git history
+- [x] Step 2: Quick auto-prompt verification — simple text change and stop
+- [x] Step 3: Implement hello world with passing tests on `develop`
+- [x] Step 4: Add greet-by-name feature on `feature/01_greet_by_name` branch
+- [x] Step 5: Merge feature to `develop`, verify tests pass
+- [x] Step 6: Release v0.1.0 — bump version, tag, merge to `main`
+- [x] Step 7: Verify git history matches expected flow
+- [x] Step 8: Inject bug, ask AI to diagnose and fix
+- [x] Step 9: Verify fix commit uses `fix:` conventional commit prefix
+- [x] Step 10: Release v0.2.0 — bump version, tag, merge to `main`
+- [x] Step 11: Final verification of complete git history
 
 ---
 
