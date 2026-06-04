@@ -5805,6 +5805,7 @@ mod tests {
     fn test_truncate_keeps_fitting_images() {
         let image = LanguageModelImage {
             source: "image".into(),
+            uri: None,
         };
         let message = LanguageModelRequestMessage {
             role: Role::User,

@@ -16,7 +16,7 @@ pub use context::{
 };
 pub use plan_registry::ActivePlanClaim;
 
-use agent_client_protocol as acp;
+use agent_client_protocol::schema as acp;
 use anyhow::Context as _;
 use futures::{StreamExt, future, pin_mut};
 use gpui::App;
@@ -24,6 +24,7 @@ use language_model::{
     LanguageModel, LanguageModelCompletionEvent, LanguageModelRequest, LanguageModelRequestMessage,
     Role,
 };
+use lightweight_context::{count_actionable_tasks, has_unchecked_items, is_actionable_checkbox};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -773,8 +774,9 @@ pub fn decide(
             iteration_count,
             &format!("max iterations ({}) reached", config.max_iterations),
         );
-        clear_summary_for_session(&session_id);
-        reset_iteration_with_session(&session_id);
+        let session_id_str = thread.read(cx).session_id().to_string();
+        clear_summary_for_session(&session_id_str);
+        reset_iteration_with_session(&session_id_str);
         return AutoPromptDecision::NoAction;
     }
 
@@ -861,20 +863,68 @@ pub fn decide(
         log::info!(
             "auto_prompt: MaxTokens reached (context limit), dispatching new thread immediately"
         );
-        return AutoPromptDecision::DispatchNow(make_action(make_continue_prompt()));
+        let next_prompt = with_first_prompt_context(
+            "Context limit reached. Continue from where we left off.".to_string(),
+            build_prompt_summary(
+                None,
+                thread_title.as_deref(),
+                Some("context limit reached (MaxTokens)"),
+                _last_assistant_msg.as_deref(),
+                original_user_message.as_deref(),
+                auto_prompt_ctx.first_user_message.as_deref(),
+            )
+            .as_deref(),
+            thread_title.as_deref(),
+            _last_assistant_msg.as_deref(),
+        );
+        return AutoPromptDecision::DispatchNow(AutoPromptAction {
+            from_session_id: session_id,
+            from_title: thread_title,
+            next_prompt,
+            work_dirs,
+            original_user_message,
+            profile_id: None,
+            actual_input_tokens: auto_prompt_ctx.actual_input_tokens,
+            approximate_token_count: auto_prompt_ctx.approximate_token_count,
+            last_assistant_message: _last_assistant_msg,
+        });
     }
 
     if auto_prompt_ctx.had_error || matches!(stop_reason, acp::StopReason::Refusal) {
         let delay = config.backoff_delay_ms(iteration_count);
         log::warn!(
-            "[auto_prompt::decide] PATH=error_bypass: had_error={}, stop_reason={:?}, iteration={} → DispatchAfterDelay({}ms) with make_continue_prompt (LLM bypassed)",
+            "[auto_prompt::decide] PATH=error_bypass: had_error={}, stop_reason={:?}, iteration={} → DispatchAfterDelay({}ms) with error bypass (LLM bypassed)",
             auto_prompt_ctx.had_error,
             stop_reason,
             iteration_count,
             delay
         );
+        let next_prompt = with_first_prompt_context(
+            "An error occurred. Retry from where we left off.".to_string(),
+            build_prompt_summary(
+                None,
+                thread_title.as_deref(),
+                Some("error or refusal, retrying"),
+                _last_assistant_msg.as_deref(),
+                original_user_message.as_deref(),
+                auto_prompt_ctx.first_user_message.as_deref(),
+            )
+            .as_deref(),
+            thread_title.as_deref(),
+            _last_assistant_msg.as_deref(),
+        );
         return AutoPromptDecision::DispatchAfterDelay {
-            action: make_action(make_continue_prompt()),
+            action: AutoPromptAction {
+                from_session_id: session_id,
+                from_title: thread_title,
+                next_prompt,
+                work_dirs,
+                original_user_message,
+                profile_id: None,
+                actual_input_tokens: auto_prompt_ctx.actual_input_tokens,
+                approximate_token_count: auto_prompt_ctx.approximate_token_count,
+                last_assistant_message: _last_assistant_msg,
+            },
             delay_ms: delay,
         };
     }
@@ -2753,7 +2803,7 @@ fn extract_plan_paths_from_context(context_json: &str) -> Vec<String> {
 fn auto_claim_plan(
     next_prompt: &str,
     context_json: &str,
-    session_id: &SessionId,
+    session_id: &acp::SessionId,
     title: Option<&str>,
 ) {
     let plan_paths = extract_plan_paths_from_context(context_json);

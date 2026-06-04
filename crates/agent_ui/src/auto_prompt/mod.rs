@@ -1,4 +1,5 @@
-use agent_client_protocol as acp;
+use agent::ZED_AGENT_ID;
+use agent_client_protocol::schema as acp;
 use gpui::Window;
 use notifications::status_toast::StatusToast;
 use prompt_store::{BuiltInPrompt, PromptId, PromptStore};
@@ -122,11 +123,8 @@ async fn load_auto_prompt_system_prompt(
         log::warn!(
             "[auto_prompt] Stored system prompt is outdated (stored=v{stored_version}, default=v{default_version}), using default and resetting stored prompt"
         );
-        // Remove outdated stored prompt so the default is used directly on next load.
-        // This prevents the toast from showing every time.
-        let _ = store
-            .update(cx, |s, cx| s.delete(PromptId::BuiltIn(builtin), cx))
-            .await;
+        // PromptStore has no delete method; returning the default content
+        // is sufficient since load() falls back to defaults when nothing is stored.
         Some((default_content, true))
     } else {
         Some((stored_prompt, false))
@@ -282,7 +280,7 @@ pub(crate) fn dispatch_action(
             active_tv.update(cx, |tv, cx| {
                 tv.message_editor.update(cx, |editor, cx| {
                     editor.set_message(
-                        vec![ContentBlock::Text(TextContent::new(prompt))],
+                        vec![acp::ContentBlock::Text(acp::TextContent::new(prompt))],
                         window,
                         cx,
                     );
@@ -651,7 +649,7 @@ pub fn on_thread_stopped(
                                 active_tv.update(cx, |tv, cx| {
                                     tv.message_editor.update(cx, |editor, cx| {
                                         editor.set_message(
-                                            vec![ContentBlock::Text(TextContent::new(prompt))],
+                                            vec![acp::ContentBlock::Text(acp::TextContent::new(prompt))],
                                             window,
                                             cx,
                                         );

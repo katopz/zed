@@ -9206,10 +9206,6 @@ impl ThreadView {
             })
             .is_some();
 
-        let is_expanded = self.expanded_tool_calls.contains(&tool_call.id);
-        let files_changed = changed_buffers.len();
-        let diff_stats = DiffStats::all_files(changed_buffers, cx);
-
         let is_running = matches!(
             tool_call.status,
             ToolCallStatus::Pending
@@ -9222,7 +9218,7 @@ impl ThreadView {
         let diff_stats = if is_running {
             DiffStats::default()
         } else {
-            DiffStats::all_files(&changed_buffers, cx)
+            DiffStats::all_files(changed_buffers, cx)
         };
 
         let is_failed = matches!(

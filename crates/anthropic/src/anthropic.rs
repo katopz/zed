@@ -1087,7 +1087,7 @@ mod tests {
         let model = Model::from_listed(entry);
         assert!(!model.supports_thinking);
         assert!(!model.supports_adaptive_thinking);
-        assert_eq!(model.mode, AnthropicModelMode::Default);
+        assert_eq!(model.mode, AnthropicModelMode::Auto);
     }
 
     #[test]

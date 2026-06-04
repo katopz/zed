@@ -571,11 +571,11 @@ mod tests {
             "claude-3-5-sonnet".to_string(),
             0.7,
             4096,
-            AnthropicModelMode::Default,
+            AnthropicModelMode::Auto,
             AnthropicPromptCacheMode::Automatic,
         );
 
-        // No message content block should carry cache_control anymore; the
+        // No message content block should carry cache_control anymore
         // conversation breakpoint is set via top-level automatic caching.
         assert_eq!(anthropic_request.messages.len(), 1);
         for block in &anthropic_request.messages[0].content {
@@ -675,7 +675,7 @@ mod tests {
             "claude-3-5-sonnet".to_string(),
             0.7,
             4096,
-            AnthropicModelMode::Default,
+            AnthropicModelMode::Auto,
             AnthropicPromptCacheMode::Legacy,
         );
 
@@ -783,7 +783,7 @@ mod tests {
             "claude-3-5-sonnet".to_string(),
             0.7,
             4096,
-            AnthropicModelMode::Default,
+            AnthropicModelMode::Auto,
             AnthropicPromptCacheMode::Automatic,
         );
 

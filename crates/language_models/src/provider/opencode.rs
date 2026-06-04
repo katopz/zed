@@ -658,7 +658,7 @@ impl LanguageModel for OpenCodeLanguageModel {
                 let mode = if self.supports_thinking() && request.thinking_allowed {
                     anthropic::AnthropicModelMode::AdaptiveThinking
                 } else {
-                    anthropic::AnthropicModelMode::Default
+                    anthropic::AnthropicModelMode::Auto
                 };
                 let anthropic_request = into_anthropic(
                     request,

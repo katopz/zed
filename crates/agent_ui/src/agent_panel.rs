@@ -404,10 +404,34 @@ pub fn init(cx: &mut App) {
                         action.from_session_id
                     );
                     if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
-                        panel.update(cx, |panel, cx| {
-                            panel.auto_prompt_new_thread(action, window, cx)
-                        });
                         workspace.focus_panel::<AgentPanel>(window, cx);
+
+                        let work_dirs = action
+                            .work_dirs
+                            .clone()
+                            .map(|dirs| PathList::new(&dirs));
+                        let initial_content = AgentInitialContent::ContentBlock {
+                            blocks: vec![acp::ContentBlock::Text(acp::TextContent::new(
+                                action.next_prompt.clone(),
+                            ))],
+                            auto_submit: true,
+                            auto_prompt_enabled: true,
+                            profile_id: action.profile_id.clone(),
+                        };
+
+                        panel.update(cx, |panel, cx| {
+                            panel.external_thread(
+                                None,
+                                None,
+                                work_dirs,
+                                action.from_title.clone().map(Into::into),
+                                Some(initial_content),
+                                true,
+                                AgentThreadSource::AgentPanel,
+                                window,
+                                cx,
+                            );
+                        });
                     } else {
                         log::warn!(
                             "[auto_prompt] AutoPromptNewThread DROPPED: AgentPanel not found in workspace"
@@ -1949,6 +1973,8 @@ impl AgentPanel {
             AgentInitialContent::ContentBlock {
                 blocks,
                 auto_submit: false,
+                auto_prompt_enabled: self.auto_prompt_enabled,
+                profile_id: None,
             }
         });
         let thread = self.create_agent_thread_with_server(
@@ -4530,6 +4556,8 @@ impl AgentPanel {
             .map(|blocks| AgentInitialContent::ContentBlock {
                 blocks,
                 auto_submit: false,
+                auto_prompt_enabled: self.auto_prompt_enabled,
+                profile_id: None,
             });
 
         self.external_thread(
@@ -4860,6 +4888,10 @@ impl agent::SiblingThreadHost for AgentPanelSiblingHost {
                     request.prompt.clone(),
                 ))],
                 auto_submit: true,
+                auto_prompt_enabled: panel
+                    .read_with(cx, |panel, _| panel.auto_prompt_enabled)
+                    .unwrap_or(true),
+                profile_id: None,
             };
 
             let title: SharedString = request.title.clone();
@@ -5338,6 +5370,8 @@ impl AgentPanel {
         Some(AgentInitialContent::ContentBlock {
             blocks,
             auto_submit: false,
+            auto_prompt_enabled: self.auto_prompt_enabled,
+            profile_id: None,
         })
     }
 
