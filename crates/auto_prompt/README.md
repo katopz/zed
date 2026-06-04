@@ -73,8 +73,8 @@ ConversationView::handle_thread_event()
       │       │       └─ No remaining work → accept stop
       │       └─ is_synthetic_failure=false (real LLM decision):
       │           ├─ detect_remaining_plan_tasks?
-      │           │   ├─ Unchecked tasks + LLM did NOT acknowledge block → PLAN TASK FALLBACK → dispatch
-      │           │   └─ LLM acknowledged blocked tasks (e.g. "requires GPU") → respect stop
+      │           │   ├─ Unchecked tasks + LLM did NOT declare ALL tasks blocked → PLAN TASK FALLBACK → dispatch
+      │           │   └─ LLM declared ALL tasks blocked (e.g. "nothing actionable") → respect stop
       │           ├─ verification_count=0 → pre-stop verification prompt
       │           ├─ verification_count < max → accept stop
       │           └─ verification_count >= max → force stop
@@ -205,9 +205,9 @@ sequenceDiagram
                     else Real LLM decision (not synthetic)
                         Note over decide_llm: Plan task fallback check
                         alt detect_remaining_plan_tasks found unchecked tasks
-                            alt llm_acknowledged_blocked_tasks (e.g. "requires GPU")
-                                decide_llm->>decide_llm: Respect stop — LLM explained why tasks are blocked
-                            else LLM did NOT acknowledge block
+                            alt llm_acknowledged_all_tasks_blocked (e.g. "nothing actionable")
+                                decide_llm->>decide_llm: Respect stop — LLM declared all tasks blocked
+                            else LLM did NOT declare all blocked
                                 Note over decide_llm: PLAN TASK FALLBACK
                                 decide_llm-->>CV: AutoPromptAction
                             end
@@ -346,8 +346,8 @@ Before accepting any stop from the synthetic failure path, `detect_remaining_wor
 This prevents the chain from stopping when the model is temporarily broken but the last assistant message clearly describes unfinished work (e.g. "### Next Steps" listing T2.4, T2.5, T2.6).
 
 The safety net runs in two places:
-- **Retry says stop**: LLM returned a real response but decided to stop
-- **All retries failed**: Model completely unreachable, all 3 attempts produced no usable content
+- **Retry says stop** (synthetic failure path): LLM returned a real response but decided to stop
+- **All retries failed** (synthetic failure path): Model completely unreachable, all 3 attempts produced no usable content
 
 ### Plan task fallback (detect_remaining_plan_tasks)
 
@@ -359,7 +359,7 @@ When the safety net finds no remaining work in the last assistant message, `dete
 4. If actionable unchecked tasks found → **PLAN TASK FALLBACK**: continues with "Plan files have remaining unchecked tasks: ..."
 5. If no actionable tasks → accepts stop
 
-**Blocked-task acknowledgment**: When `is_synthetic_failure=false` (real LLM decision), the fallback checks `llm_acknowledged_blocked_tasks()` before overriding. If the LLM's last message already acknowledges remaining tasks AND explains why they can't proceed (e.g., "requires GPU hardware", "blocked by external dependency", "nothing actionable without access"), the system respects the stop instead of blindly forcing a continue. This prevents false overrides when the LLM correctly identified that tasks are blocked by hardware, permissions, or external factors.
+**All-tasks-blocked check**: When `is_synthetic_failure=false` (real LLM decision), the fallback checks `llm_acknowledged_all_tasks_blocked()` before overriding. Only when the LLM explicitly declares that ALL remaining work is blocked (e.g., "nothing actionable", "all remaining tasks are blocked", "no further action") does the system respect the stop. This is intentionally strict — a message mentioning "remaining" and "blocked" somewhere does NOT qualify, since that could describe a summary with some blocked tasks and other actionable ones.
 
 ### Pre-stop verification
 
@@ -369,10 +369,13 @@ When the LLM indicates work is complete (`should_continue=false` with no prompt)
    - All plan checkboxes are `[x]` (no `[ ]` remaining)
    - All compiler diagnostics and warnings fixed
    - Git committed with conventional commit messages
+   - Same-repo plans with unchecked tasks should be continued, not stopped
 2. Increment `VERIFICATION_COUNT`
 3. If verification fails or LLM continues: Reset `VERIFICATION_COUNT` to 0 (new cycle)
 4. Subsequent attempts (`verification_count < max_verification_attempts`): Accept the stop
 5. Max attempts exceeded: Force stop
+
+The verification prompt lists remaining plans with unchecked tasks and instructs the worker to continue same-repo plans rather than stopping. The "stopping" declare option is qualified with "only when NO same-repo plans have unchecked tasks."
 
 If no plan files exist, verification is skipped and the chain stops immediately.
 
@@ -422,14 +425,19 @@ The `detect_remaining_work` function extracts potential remaining work from the 
 
 The `extract_remaining_section` helper scans the last 3 paragraphs of the message for trigger words or actionable checkboxes, including the preceding paragraph if it looks like a header.
 
-### Blocked-task acknowledgment (llm_acknowledged_blocked_tasks)
+### All-tasks-blocked check (llm_acknowledged_all_tasks_blocked)
 
-When `detect_remaining_plan_tasks` finds unchecked plan tasks in the real LLM decision path, `llm_acknowledged_blocked_tasks` checks whether the LLM's last message already acknowledged those tasks AND explained why they can't proceed. The function requires both conditions:
+When `detect_remaining_plan_tasks` finds unchecked plan tasks in the real LLM decision path, `llm_acknowledged_all_tasks_blocked` checks whether the LLM's last message explicitly declares that ALL remaining work is blocked. This replaced the older `llm_acknowledged_blocked_tasks` which was too broad — it matched any message containing "remaining" + any blocking keyword ("blocked", "hardware", "external", etc.), which frequently caused false stops on summary messages.
 
-1. **Acknowledges remaining tasks**: message contains "remaining", "unchecked", "nothing actionable", "still need", etc.
-2. **Explains blockage**: message contains "requires", "blocked", "hardware", "GPU", "external", "depend", "no access", etc.
+The function only returns `true` for explicit all-blocked declarations:
 
-When both conditions are met, the PLAN TASK FALLBACK is skipped and the stop is respected. This prevents the system from blindly forcing a continue when the LLM correctly identified that tasks are blocked by hardware, permissions, or external factors.
+- "nothing actionable"
+- "nothing left to do" / "nothing left to implement"
+- "all remaining" + "blocked"
+- "no further action" / "no further work"
+- "cannot proceed further" / "can't proceed further"
+
+Messages like "5 remaining tasks require GPU hardware" or "Remaining Work (blocked or needs real .mlmodelc)" do **not** qualify — they describe some blocked tasks among potentially actionable ones, and the system should still check for non-blocked work.
 
 ### Key types
 
@@ -449,7 +457,7 @@ When both conditions are met, the PLAN TASK FALLBACK is skipped and the stop is 
 
 | File | Purpose |
 |------|----------|
-| `src/auto_prompt.rs` | `decide()` (sync), `decide_with_llm()` (async), `evaluate_response()`, `detect_remaining_work()`, `detect_remaining_plan_tasks()`, `llm_acknowledged_blocked_tasks()`, system prompt, iteration tracking, plan/doc reading, LLM client, verification prompts, config caching |
+| `src/auto_prompt.rs` | `decide()` (sync), `decide_with_llm()` (async), `evaluate_response()`, `detect_remaining_work()`, `detect_remaining_plan_tasks()`, `llm_acknowledged_all_tasks_blocked()`, system prompt, iteration tracking, plan/doc reading, LLM client, verification prompts, config caching |
 | `src/config.rs` | `AutoPromptConfig` from `~/.config/zed/auto_prompt.json` or env vars |
 | `src/context.rs` | `AutoPromptContext`, `AutoPromptResponse`, `StopPhase`, plan/message serialization |
 | `src/lightweight_context.rs` | `build_lightweight_orchestration_context()` — compact context (last message + plan summaries) to reduce token usage from ~80K to ~500 |

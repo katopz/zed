@@ -1,7 +1,7 @@
 use serde::Serialize;
 
 /// Item-level markers that indicate a non-actionable checkbox despite being unchecked.
-const SKIP_ITEM_MARKERS: &[&str] = &[
+pub(crate) const SKIP_ITEM_MARKERS: &[&str] = &[
     "DEFERRED",
     "\u{23f8}\u{fe0f}",
     "\u{2014} deferred",
@@ -19,7 +19,8 @@ const SKIP_ITEM_MARKERS: &[&str] = &[
 ];
 
 /// Section header keywords (lowercase) that indicate non-actionable items.
-const SKIP_SECTION_KEYWORDS: &[&str] = &["out of scope", "future", "backlog", "wishlist"];
+pub(crate) const SKIP_SECTION_KEYWORDS: &[&str] =
+    &["out of scope", "future", "backlog", "wishlist"];
 
 #[derive(serde::Deserialize)]
 struct Context {
@@ -107,7 +108,7 @@ pub fn build_lightweight_orchestration_context(
     })
 }
 
-fn is_actionable_checkbox(line: &str) -> bool {
+pub(crate) fn is_actionable_checkbox(line: &str) -> bool {
     let trimmed = line.trim_start();
     if !trimmed.starts_with("- [ ] ") && !trimmed.starts_with("* [ ] ") {
         return false;
@@ -118,7 +119,7 @@ fn is_actionable_checkbox(line: &str) -> bool {
         .any(|marker| line_lower.contains(&marker.to_lowercase()))
 }
 
-fn count_actionable_tasks(content: &str) -> usize {
+pub(crate) fn count_actionable_tasks(content: &str) -> usize {
     let mut count = 0;
     let mut in_code_block = false;
     let mut skip_section = false;
@@ -152,6 +153,11 @@ fn count_actionable_tasks(content: &str) -> usize {
     }
 
     count
+}
+
+/// Returns true if the content has any unchecked actionable task items.
+pub(crate) fn has_unchecked_items(content: &str) -> bool {
+    count_actionable_tasks(content) > 0
 }
 
 #[cfg(test)]

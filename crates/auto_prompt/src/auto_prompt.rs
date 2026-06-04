@@ -492,6 +492,22 @@ impl std::fmt::Debug for LlmCallData {
     }
 }
 
+impl LlmCallData {
+    fn make_continue(&self, next_prompt: String) -> AutoPromptOutcome {
+        AutoPromptOutcome::Continue(AutoPromptAction {
+            from_session_id: self.session_id.clone(),
+            from_title: self.title.clone(),
+            next_prompt,
+            work_dirs: self.work_dirs.clone(),
+            original_user_message: self.original_user_message.clone(),
+            profile_id: self.profile_id.clone(),
+            actual_input_tokens: self.actual_input_tokens,
+            approximate_token_count: self.approximate_token_count,
+            last_assistant_message: self.last_assistant_message.clone(),
+        })
+    }
+}
+
 /// Confidence threshold below which we stop during the Working phase.
 /// Low threshold = biased toward continuing.
 const WORKING_CONFIDENCE_THRESHOLD: f64 = 0.2;
@@ -1014,7 +1030,7 @@ pub async fn decide_with_llm(
             );
 
             // Check for remaining plan tasks to build a continuation prompt
-            let continuation = if llm_acknowledged_blocked_tasks(
+            let continuation = if llm_acknowledged_all_tasks_blocked(
                 data.last_assistant_message.as_deref(),
             ) {
                 log::info!(
@@ -1039,17 +1055,7 @@ pub async fn decide_with_llm(
                 &data.session_id,
                 data.title.as_deref(),
             );
-            return Ok(AutoPromptOutcome::Continue(AutoPromptAction {
-                from_session_id: data.session_id,
-                from_title: data.title,
-                next_prompt,
-                work_dirs: data.work_dirs,
-                original_user_message: data.original_user_message,
-                profile_id: data.profile_id.clone(),
-                actual_input_tokens: data.actual_input_tokens,
-                approximate_token_count: data.approximate_token_count,
-                last_assistant_message: data.last_assistant_message.clone(),
-            }));
+            return Ok(data.make_continue(next_prompt));
         } else {
             // Unexpected state — reset and stop
             clear_summary_for_session(&session_id_str);
@@ -1213,17 +1219,7 @@ pub async fn decide_with_llm(
                         data.title.as_deref(),
                     );
 
-                    Ok(AutoPromptOutcome::Continue(AutoPromptAction {
-                        from_session_id: data.session_id,
-                        from_title: data.title,
-                        next_prompt,
-                        work_dirs: data.work_dirs,
-                        original_user_message: data.original_user_message,
-                        profile_id: data.profile_id.clone(),
-                        actual_input_tokens: data.actual_input_tokens,
-                        approximate_token_count: data.approximate_token_count,
-                        last_assistant_message: data.last_assistant_message.clone(),
-                    }))
+                    Ok(data.make_continue(next_prompt))
                 }
                 EvaluationResult::NeedsSecondOpinion {
                     extracted_section,
@@ -1283,17 +1279,7 @@ pub async fn decide_with_llm(
                                     &data.session_id,
                                     data.title.as_deref(),
                                 );
-                                Ok(AutoPromptOutcome::Continue(AutoPromptAction {
-                                    from_session_id: data.session_id,
-                                    from_title: data.title,
-                                    next_prompt,
-                                    work_dirs: data.work_dirs,
-                                    original_user_message: data.original_user_message,
-                                    profile_id: data.profile_id.clone(),
-                                    actual_input_tokens: data.actual_input_tokens,
-                                    approximate_token_count: data.approximate_token_count,
-                                    last_assistant_message: data.last_assistant_message.clone(),
-                                }))
+                                Ok(data.make_continue(next_prompt))
                             } else {
                                 let stop_reason = format!(
                                     "second opinion confirmed stop (confidence={second_opinion_confidence:.2}): {}",
@@ -1440,17 +1426,7 @@ pub async fn decide_with_llm(
                                     &data.session_id,
                                     data.title.as_deref(),
                                 );
-                                Ok(AutoPromptOutcome::Continue(AutoPromptAction {
-                                    from_session_id: data.session_id,
-                                    from_title: data.title,
-                                    next_prompt,
-                                    work_dirs: data.work_dirs,
-                                    original_user_message: data.original_user_message,
-                                    profile_id: data.profile_id.clone(),
-                                    actual_input_tokens: data.actual_input_tokens,
-                                    approximate_token_count: data.approximate_token_count,
-                                    last_assistant_message: data.last_assistant_message.clone(),
-                                }))
+                                Ok(data.make_continue(next_prompt))
                             }
                             Some(parsed) => {
                                 let stop_reason = parsed
@@ -1481,17 +1457,7 @@ pub async fn decide_with_llm(
                                         &data.session_id,
                                         data.title.as_deref(),
                                     );
-                                    Ok(AutoPromptOutcome::Continue(AutoPromptAction {
-                                        from_session_id: data.session_id,
-                                        from_title: data.title,
-                                        next_prompt,
-                                        work_dirs: data.work_dirs,
-                                        original_user_message: data.original_user_message,
-                                        profile_id: data.profile_id.clone(),
-                                        actual_input_tokens: data.actual_input_tokens,
-                                        approximate_token_count: data.approximate_token_count,
-                                        last_assistant_message: data.last_assistant_message.clone(),
-                                    }))
+                                    Ok(data.make_continue(next_prompt))
                                 } else if let Some(plan_prompt) =
                                     detect_remaining_plan_tasks(&data.context_json)
                                 {
@@ -1510,17 +1476,7 @@ pub async fn decide_with_llm(
                                         &data.session_id,
                                         data.title.as_deref(),
                                     );
-                                    Ok(AutoPromptOutcome::Continue(AutoPromptAction {
-                                        from_session_id: data.session_id,
-                                        from_title: data.title,
-                                        next_prompt,
-                                        work_dirs: data.work_dirs,
-                                        original_user_message: data.original_user_message,
-                                        profile_id: data.profile_id.clone(),
-                                        actual_input_tokens: data.actual_input_tokens,
-                                        approximate_token_count: data.approximate_token_count,
-                                        last_assistant_message: data.last_assistant_message.clone(),
-                                    }))
+                                    Ok(data.make_continue(next_prompt))
                                 } else {
                                     log::info!(
                                         "auto_prompt: all safety nets exhausted — no remaining work patterns and no unchecked plan tasks, accepting retry stop"
@@ -1559,17 +1515,7 @@ pub async fn decide_with_llm(
                                         &data.session_id,
                                         data.title.as_deref(),
                                     );
-                                    Ok(AutoPromptOutcome::Continue(AutoPromptAction {
-                                        from_session_id: data.session_id,
-                                        from_title: data.title,
-                                        next_prompt,
-                                        work_dirs: data.work_dirs,
-                                        original_user_message: data.original_user_message,
-                                        profile_id: data.profile_id.clone(),
-                                        actual_input_tokens: data.actual_input_tokens,
-                                        approximate_token_count: data.approximate_token_count,
-                                        last_assistant_message: data.last_assistant_message.clone(),
-                                    }))
+                                    Ok(data.make_continue(next_prompt))
                                 } else if let Some(plan_prompt) =
                                     detect_remaining_plan_tasks(&data.context_json)
                                 {
@@ -1588,17 +1534,7 @@ pub async fn decide_with_llm(
                                         &data.session_id,
                                         data.title.as_deref(),
                                     );
-                                    Ok(AutoPromptOutcome::Continue(AutoPromptAction {
-                                        from_session_id: data.session_id,
-                                        from_title: data.title,
-                                        next_prompt,
-                                        work_dirs: data.work_dirs,
-                                        original_user_message: data.original_user_message,
-                                        profile_id: data.profile_id.clone(),
-                                        actual_input_tokens: data.actual_input_tokens,
-                                        approximate_token_count: data.approximate_token_count,
-                                        last_assistant_message: data.last_assistant_message.clone(),
-                                    }))
+                                    Ok(data.make_continue(next_prompt))
                                 } else {
                                     log::warn!(
                                         "auto_prompt: all safety nets exhausted — no remaining work patterns and no unchecked plan tasks, giving up"
@@ -1619,15 +1555,14 @@ pub async fn decide_with_llm(
                         }
                     } else {
                         // Before accepting stop, check plan files for unchecked tasks.
-                        // But if the LLM already acknowledged remaining tasks and explained
-                        // why they can't proceed (blocked by hardware, external dependency, etc.),
-                        // respect that assessment instead of blindly forcing a continue.
+                        // If the LLM explicitly declared ALL tasks blocked (not just some),
+                        // respect that assessment.
                         if let Some(plan_prompt) = detect_remaining_plan_tasks(&data.context_json) {
-                            if llm_acknowledged_blocked_tasks(
+                            if llm_acknowledged_all_tasks_blocked(
                                 data.last_assistant_message.as_deref(),
                             ) {
                                 log::info!(
-                                    "auto_prompt: LLM already acknowledged blocked tasks, respecting stop decision"
+                                    "auto_prompt: LLM declared all remaining tasks blocked, respecting stop decision"
                                 );
                             } else {
                                 log::warn!(
@@ -1645,17 +1580,7 @@ pub async fn decide_with_llm(
                                     &data.session_id,
                                     data.title.as_deref(),
                                 );
-                                return Ok(AutoPromptOutcome::Continue(AutoPromptAction {
-                                    from_session_id: data.session_id,
-                                    from_title: data.title,
-                                    next_prompt,
-                                    work_dirs: data.work_dirs,
-                                    original_user_message: data.original_user_message,
-                                    profile_id: data.profile_id.clone(),
-                                    actual_input_tokens: data.actual_input_tokens,
-                                    approximate_token_count: data.approximate_token_count,
-                                    last_assistant_message: data.last_assistant_message.clone(),
-                                }));
+                                return Ok(data.make_continue(next_prompt));
                             }
                         }
 
@@ -1697,17 +1622,7 @@ pub async fn decide_with_llm(
                                         data.title.as_deref(),
                                         data.last_assistant_message.as_deref(),
                                     );
-                                    Ok(AutoPromptOutcome::Continue(AutoPromptAction {
-                                        from_session_id: data.session_id,
-                                        from_title: data.title,
-                                        next_prompt,
-                                        work_dirs: data.work_dirs,
-                                        original_user_message: data.original_user_message,
-                                        profile_id: data.profile_id.clone(),
-                                        actual_input_tokens: data.actual_input_tokens,
-                                        approximate_token_count: data.approximate_token_count,
-                                        last_assistant_message: data.last_assistant_message.clone(),
-                                    }))
+                                    Ok(data.make_continue(next_prompt))
                                 }
                                 None => {
                                     let stop_reason =
@@ -2587,43 +2502,6 @@ fn build_lightweight_retry_context(
     parts.join("\n")
 }
 
-/// Count actionable unchecked `- [ ]` items, skipping Out of Scope/Deferred sections and markers.
-fn count_actionable_tasks(content: &str) -> usize {
-    let mut count = 0;
-    let mut in_code_block = false;
-    let mut skip_section = false;
-
-    for line in content.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("```") {
-            in_code_block = !in_code_block;
-            continue;
-        }
-        if in_code_block {
-            continue;
-        }
-        if trimmed.starts_with("## ") {
-            let section_lower = trimmed.to_lowercase();
-            skip_section = SKIP_SECTION_KEYWORDS
-                .iter()
-                .any(|keyword| section_lower.contains(keyword));
-            continue;
-        }
-        if trimmed.starts_with("# ") {
-            skip_section = false;
-            continue;
-        }
-        if skip_section {
-            continue;
-        }
-        if is_actionable_checkbox(trimmed) {
-            count += 1;
-        }
-    }
-
-    count
-}
-
 /// Extract the plan title from the first `# ` heading.
 fn extract_plan_title(content: &str) -> String {
     for line in content.lines() {
@@ -2633,73 +2511,6 @@ fn extract_plan_title(content: &str) -> String {
         }
     }
     String::new()
-}
-
-/// Section header keywords (lowercase) that indicate non-actionable items.
-const SKIP_SECTION_KEYWORDS: &[&str] = &["out of scope", "future", "backlog", "wishlist"];
-
-/// Item-level markers that indicate a non-actionable checkbox despite being unchecked.
-/// Includes strikethrough (`~~`), skip/cancel keywords, and deferral markers.
-const SKIP_ITEM_MARKERS: &[&str] = &[
-    "DEFERRED",
-    "⏸️",
-    "— deferred",
-    "- deferred",
-    "~~",
-    "Skipped",
-    "skipped",
-    "Cancelled",
-    "cancelled",
-    "N/A",
-    "Won't fix",
-    "wontfix",
-    "NOT PLANNED",
-    "out of scope",
-];
-
-/// Returns true if line is an unchecked checkbox (`- [ ]` or `* [ ]`) without skip markers.
-fn is_actionable_checkbox(line: &str) -> bool {
-    let trimmed = line.trim_start();
-    if !trimmed.starts_with("- [ ] ") && !trimmed.starts_with("* [ ] ") {
-        return false;
-    }
-    let line_lower = trimmed.to_lowercase();
-    !SKIP_ITEM_MARKERS
-        .iter()
-        .any(|marker| line_lower.contains(&marker.to_lowercase()))
-}
-
-fn has_unchecked_items(content: &str) -> bool {
-    let mut in_code_block = false;
-    let mut skip_section = false;
-    for line in content.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("```") {
-            in_code_block = !in_code_block;
-            continue;
-        }
-        if in_code_block {
-            continue;
-        }
-        if trimmed.starts_with("## ") {
-            let section_lower = trimmed.to_lowercase();
-            skip_section = SKIP_SECTION_KEYWORDS
-                .iter()
-                .any(|keyword| section_lower.contains(keyword));
-            continue;
-        }
-        if trimmed.starts_with("# ") {
-            skip_section = false;
-            continue;
-        }
-        if skip_section {
-            continue;
-        }
-        if is_actionable_checkbox(trimmed) {
-            return true;
-        }
-    }
-    false
 }
 
 /// Detect if the current or next plan involves performance-related work by scanning for keywords.
@@ -2893,43 +2704,38 @@ fn detect_remaining_work(last_assistant_message: Option<&str>) -> Option<String>
     None
 }
 
-/// Check if the LLM's last message already acknowledges remaining tasks and explains
-/// why they can't proceed (blocked by hardware, external dependency, permissions, etc.).
-/// When true, the PLAN TASK FALLBACK should respect the LLM's assessment instead of
-/// blindly forcing a continue.
-fn llm_acknowledged_blocked_tasks(last_assistant_message: Option<&str>) -> bool {
+/// Check if the LLM explicitly declares that ALL remaining tasks are blocked,
+/// not just that some tasks happen to mention blocking keywords.
+///
+/// This is a stricter version of the old `llm_acknowledged_blocked_tasks` — it requires
+/// the LLM to state that the work as a whole cannot proceed (e.g. "nothing actionable",
+/// "all remaining tasks are blocked", "nothing left to do"), not just that some tasks
+/// mention blocking in their descriptions.
+///
+/// The old version was too broad: any summary containing "remaining" + "blocked" anywhere
+/// (even in a table row describing one blocked task among many actionable ones) would
+/// suppress the plan task fallback, causing premature stops.
+fn llm_acknowledged_all_tasks_blocked(last_assistant_message: Option<&str>) -> bool {
     let msg = match last_assistant_message {
         Some(m) if !m.trim().is_empty() => m.trim(),
         _ => return false,
     };
     let lower = msg.to_lowercase();
 
-    // The LLM must mention remaining tasks/unchecked items AND give a reason they're blocked.
-    let acknowledges_remaining = lower.contains("remaining")
-        || lower.contains("unchecked")
-        || lower.contains("left to do")
-        || lower.contains("still need")
-        || lower.contains("not yet done")
-        || lower.contains("not complete")
-        || lower.contains("nothing actionable");
+    // The LLM must explicitly say everything is blocked / nothing can proceed.
+    // Broad patterns like just "remaining" + "blocked" are NOT sufficient — they
+    // fire on summary messages that auto_prompt itself requested, which naturally
+    // contain headings like "Remaining Work" and rows mentioning "blocked".
+    let all_blocked = lower.contains("nothing actionable")
+        || lower.contains("nothing left to do")
+        || lower.contains("nothing left to implement")
+        || lower.contains("all remaining") && lower.contains("blocked")
+        || lower.contains("no further action")
+        || lower.contains("no further work")
+        || lower.contains("cannot proceed further")
+        || lower.contains("can't proceed further");
 
-    let explains_blocked = lower.contains("requires")
-        || lower.contains("require")
-        || lower.contains("blocked")
-        || lower.contains("blocker")
-        || lower.contains("depend")
-        || lower.contains("cannot proceed")
-        || lower.contains("can't proceed")
-        || lower.contains("no access")
-        || lower.contains("hardware")
-        || lower.contains("gpu")
-        || lower.contains("external")
-        || lower.contains("manual")
-        || lower.contains("need access")
-        || lower.contains("need permission")
-        || lower.contains("out of scope");
-
-    acknowledges_remaining && explains_blocked
+    all_blocked
 }
 
 fn extract_plan_paths_from_context(context_json: &str) -> Vec<String> {
@@ -3063,10 +2869,11 @@ fn build_pre_stop_verification_prompt(
 
     if let Some(landscape) = landscape {
         sections.push(format!(
-            "## Remaining Plans (FYI — do NOT auto-pick)\n\n\
+            "## Remaining Plans\n\n\
              {landscape}\n\n\
-             Items may be deferred, out-of-scope, or unrelated. \
-             Read the list, then decide — do not start something new just because it exists."
+             If any plan is in the SAME repo as the current work and has unchecked tasks, \
+             continue with it by declaring `transitioning to <path>`.\n\
+             Only declare `stopping` if ALL remaining plans are in different repos or out of scope."
         ));
     }
 
@@ -3075,7 +2882,7 @@ fn build_pre_stop_verification_prompt(
          Before stopping, state one of:\n\
          - `continuing: <what remains from last message>`\n\
          - `reviewed plans: transitioning to <path> because <relevance>` — close current feature first\n\
-         - `reviewed plans: stopping, nothing related to current work`".to_string()
+         - `reviewed plans: stopping, nothing related to current work` — only when NO same-repo plans have unchecked tasks".to_string()
     );
 
     Some(format!(
@@ -4804,61 +4611,102 @@ mod tests {
     }
 
     #[test]
-    fn test_llm_acknowledged_blocked_tasks_gpu() {
+    fn test_llm_acknowledged_all_tasks_blocked_gpu() {
+        // Old pattern: "remaining + gpu" was a false positive — the worker might have
+        // 5 remaining tasks where only 1 needs GPU and 4 are actionable.
+        // New function requires explicit "all remaining ... blocked" language.
         assert!(
-            llm_acknowledged_blocked_tasks(Some("5 remaining tasks require GPU hardware")),
-            "remaining + gpu should be detected as blocked"
+            !llm_acknowledged_all_tasks_blocked(Some("5 remaining tasks require GPU hardware")),
+            "remaining + gpu should NOT suppress fallback — some tasks may still be actionable"
+        );
+        assert!(
+            llm_acknowledged_all_tasks_blocked(Some(
+                "All remaining tasks are blocked by GPU hardware requirement"
+            )),
+            "all remaining + blocked should suppress fallback"
         );
     }
 
     #[test]
-    fn test_llm_acknowledged_blocked_tasks_nothing_actionable() {
+    fn test_llm_acknowledged_all_tasks_blocked_nothing_actionable() {
         assert!(
-            llm_acknowledged_blocked_tasks(Some(
+            llm_acknowledged_all_tasks_blocked(Some(
                 "Nothing actionable to implement without hardware access"
             )),
-            "nothing actionable + hardware should be detected as blocked"
+            "nothing actionable should suppress fallback"
         );
     }
 
     #[test]
-    fn test_llm_acknowledged_blocked_tasks_blocked_dependency() {
+    fn test_llm_acknowledged_all_tasks_blocked_nothing_left() {
         assert!(
-            llm_acknowledged_blocked_tasks(Some(
-                "Remaining tasks are blocked by external API dependency"
+            llm_acknowledged_all_tasks_blocked(Some(
+                "Nothing left to do, all tasks complete or blocked"
             )),
-            "remaining + blocked + external should be detected as blocked"
+            "nothing left to do should suppress fallback"
         );
     }
 
     #[test]
-    fn test_llm_acknowledged_blocked_tasks_just_remaining() {
+    fn test_llm_acknowledged_all_tasks_blocked_no_further() {
         assert!(
-            !llm_acknowledged_blocked_tasks(Some("5 remaining tasks to implement")),
-            "remaining without blocked reason should NOT be detected as blocked"
+            llm_acknowledged_all_tasks_blocked(Some(
+                "No further action possible without external API"
+            )),
+            "no further action should suppress fallback"
+        );
+        assert!(
+            llm_acknowledged_all_tasks_blocked(Some("No further work can be done at this time")),
+            "no further work should suppress fallback"
         );
     }
 
     #[test]
-    fn test_llm_acknowledged_blocked_tasks_just_blocked() {
+    fn test_llm_acknowledged_all_tasks_blocked_remaining_work_heading() {
+        // This is the key test case from the user's bug report:
+        // The summary contains "Remaining Work" as a heading AND mentions "blocked",
+        // but NOT all tasks are blocked — some are just not started yet.
         assert!(
-            !llm_acknowledged_blocked_tasks(Some("The build is blocked by a missing dependency")),
-            "blocked without remaining tasks should NOT be detected as blocked"
+            !llm_acknowledged_all_tasks_blocked(Some(
+                "## Remaining Work (blocked or needs real .mlmodelc)\n\
+                 - Refactor main.rs: Not started\n\
+                 - Stateful KV cache: Blocked on macOS 15+\n\
+                 - FP16 tensor: Blocked on conversion pipeline"
+            )),
+            "summary with Remaining Work heading + some blocked tasks should NOT suppress fallback"
         );
     }
 
     #[test]
-    fn test_llm_acknowledged_blocked_tasks_none() {
+    fn test_llm_acknowledged_all_tasks_blocked_just_remaining() {
         assert!(
-            !llm_acknowledged_blocked_tasks(None),
+            !llm_acknowledged_all_tasks_blocked(Some("5 remaining tasks to implement")),
+            "remaining without all-blocked language should NOT be detected as blocked"
+        );
+    }
+
+    #[test]
+    fn test_llm_acknowledged_all_tasks_blocked_just_blocked() {
+        assert!(
+            !llm_acknowledged_all_tasks_blocked(Some(
+                "The build is blocked by a missing dependency"
+            )),
+            "blocked without all-tasks-are-blocked language should NOT be detected as blocked"
+        );
+    }
+
+    #[test]
+    fn test_llm_acknowledged_all_tasks_blocked_none() {
+        assert!(
+            !llm_acknowledged_all_tasks_blocked(None),
             "None should not be blocked"
         );
     }
 
     #[test]
-    fn test_llm_acknowledged_blocked_tasks_empty() {
+    fn test_llm_acknowledged_all_tasks_blocked_empty() {
         assert!(
-            !llm_acknowledged_blocked_tasks(Some("")),
+            !llm_acknowledged_all_tasks_blocked(Some("")),
             "empty string should not be blocked"
         );
     }
