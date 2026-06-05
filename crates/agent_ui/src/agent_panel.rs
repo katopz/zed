@@ -410,14 +410,61 @@ pub fn init(cx: &mut App) {
                             .work_dirs
                             .clone()
                             .map(|dirs| PathList::new(&dirs));
-                        let initial_content = AgentInitialContent::ContentBlock {
-                            blocks: vec![acp::ContentBlock::Text(acp::TextContent::new(
-                                action.next_prompt.clone(),
-                            ))],
-                            auto_submit: true,
-                            auto_prompt_enabled: true,
-                            profile_id: action.profile_id.clone(),
-                        };
+
+                        let from_session_id = action.from_session_id.clone();
+                        let from_title = action.from_title.clone();
+
+                        let initial_content =
+                            if action.last_assistant_message.is_some()
+                                || action.decision_prompt.is_some()
+                            {
+                                let follow_up = AgentPanel::build_auto_prompt_follow_up(
+                                    action.last_assistant_message.as_deref(),
+                                    action.decision_prompt.as_deref(),
+                                );
+
+                                log::info!(
+                                    "[auto_prompt] auto_prompt_new_thread: using ThreadSummary with follow_up ({} chars)",
+                                    follow_up.as_ref().map_or(0, |s| s.len())
+                                );
+
+                                AgentInitialContent::ThreadSummary {
+                                    session_id: from_session_id,
+                                    title: from_title.map(SharedString::from),
+                                    follow_up,
+                                    auto_submit: true,
+                                }
+                            } else {
+                                let next_prompt = action.next_prompt.clone();
+
+                                let raw_title = from_title.as_deref().unwrap_or("Thread");
+                                let mut clean_title = raw_title.to_string();
+                                while let Some(rest) = clean_title.strip_prefix("[@") {
+                                    if let Some(end) = rest.find("](zed:///agent/thread/") {
+                                        clean_title = rest[..end].to_string();
+                                    } else {
+                                        break;
+                                    }
+                                }
+
+                                let mention_uri = MentionUri::Thread {
+                                    id: from_session_id,
+                                    name: clean_title,
+                                };
+                                let summary_link = format!("{}\n\n", mention_uri.as_link());
+                                let full_prompt = format!("{summary_link}{next_prompt}");
+
+                                let blocks = vec![acp::ContentBlock::Text(acp::TextContent::new(
+                                    full_prompt,
+                                ))];
+
+                                AgentInitialContent::ContentBlock {
+                                    blocks,
+                                    auto_submit: true,
+                                    auto_prompt_enabled: true,
+                                    profile_id: action.profile_id.clone(),
+                                }
+                            };
 
                         panel.update(cx, |panel, cx| {
                             panel.external_thread(
@@ -3427,6 +3474,34 @@ impl AgentPanel {
             })
         })
         .detach_and_log_err(cx);
+    }
+
+    fn build_auto_prompt_follow_up(
+        last_assistant_message: Option<&str>,
+        decision_prompt: Option<&str>,
+    ) -> Option<String> {
+        let mut parts = Vec::new();
+
+        if let Some(last) = last_assistant_message.filter(|s| !s.trim().is_empty()) {
+            parts.push("## 2. Last Assistant Message".to_string());
+            parts.push(String::new());
+            parts.push(last.trim().to_string());
+            parts.push(String::new());
+            parts.push("---".to_string());
+        }
+
+        if let Some(decision) = decision_prompt.filter(|s| !s.trim().is_empty()) {
+            parts.push(String::new());
+            parts.push("## 3. Decision".to_string());
+            parts.push(String::new());
+            parts.push(decision.trim().to_string());
+        }
+
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join("\n"))
+        }
     }
 
     fn initial_content_for_thread_summary(
