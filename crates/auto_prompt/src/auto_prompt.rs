@@ -890,21 +890,20 @@ pub fn decide(
         });
     }
 
-    if auto_prompt_ctx.had_error || matches!(stop_reason, acp::StopReason::Refusal) {
+    if matches!(stop_reason, acp::StopReason::Refusal) {
         let delay = config.backoff_delay_ms(iteration_count);
         log::warn!(
-            "[auto_prompt::decide] PATH=error_bypass: had_error={}, stop_reason={:?}, iteration={} → DispatchAfterDelay({}ms) with error bypass (LLM bypassed)",
-            auto_prompt_ctx.had_error,
+            "[auto_prompt::decide] PATH=refusal_bypass: stop_reason={:?}, iteration={} → DispatchAfterDelay({}ms) (LLM bypassed)",
             stop_reason,
             iteration_count,
             delay
         );
         let next_prompt = with_first_prompt_context(
-            "An error occurred. Retry from where we left off.".to_string(),
+            "The model refused the request. Retry from where we left off.".to_string(),
             build_prompt_summary(
                 None,
                 thread_title.as_deref(),
-                Some("error or refusal, retrying"),
+                Some("refusal, retrying"),
                 _last_assistant_msg.as_deref(),
                 original_user_message.as_deref(),
                 auto_prompt_ctx.first_user_message.as_deref(),
@@ -927,6 +926,12 @@ pub fn decide(
             },
             delay_ms: delay,
         };
+    }
+
+    if auto_prompt_ctx.had_error {
+        log::info!(
+            "[auto_prompt::decide] had_error=true but proceeding to LLM call (error is non-fatal, LLM decides)"
+        );
     }
 
     log::info!(
