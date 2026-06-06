@@ -1599,6 +1599,29 @@ pub async fn decide_with_llm(
                             }
                         }
                     } else {
+                        // Decisive stop: when the LLM is very confident about stopping
+                        // (low confidence + no prompt), skip verification entirely.
+                        // Verification is for catching premature stops, not confirming
+                        // obvious ones.
+                        let is_decisive = input.confidence.unwrap_or(0.0) <= 0.15
+                            && input
+                                .next_prompt
+                                .as_ref()
+                                .is_none_or(|p| p.trim().is_empty());
+                        if is_decisive {
+                            log::info!(
+                                "auto_prompt: decisive stop (confidence={:?}), skipping verification",
+                                input.confidence
+                            );
+                            write_stop_log(
+                                data.project_root.as_ref(),
+                                data.iteration_count,
+                                &format!("decisive stop: {reason}"),
+                            );
+                            reset_iteration_with_session(&data.session_id.to_string());
+                            return Ok(AutoPromptOutcome::Stopped { reason });
+                        }
+
                         // Before accepting stop, check plan files for unchecked tasks.
                         // If the LLM explicitly declared ALL tasks blocked (not just some),
                         // respect that assessment.
@@ -2901,13 +2924,15 @@ fn build_pre_stop_verification_prompt(
     let is_perf = is_perf_related(context_json, work_dirs.as_deref());
 
     let mut checks = vec![
-        "1. **Last message first**: Re-read your last message. Any remaining work, next steps, or unchecked items? Continue THAT before anything else.".to_string(),
-        "2. **Diagnostics**: `cargo check` and `cargo clippy`. Fix errors and warnings.".to_string(),
-        "3. **Git**: Commit with conventional messages to feature branch from develop.".to_string(),
+        "1. **Last message**: Re-read your last message. Any remaining work or unchecked items?"
+            .to_string(),
+        "2. **Diagnostics**: Are there any errors or warnings from `cargo check` / `cargo clippy`?"
+            .to_string(),
+        "3. **Git**: Any uncommitted changes?".to_string(),
     ];
 
     if is_perf {
-        checks.push("4. **Benchmarks**: Run relevant benchmarks and record results.".to_string());
+        checks.push("4. **Benchmarks**: Did you run relevant benchmarks?".to_string());
     }
 
     let mut sections = vec![checks.join("\n")];
@@ -2917,22 +2942,22 @@ fn build_pre_stop_verification_prompt(
             "## Remaining Plans\n\n\
              {landscape}\n\n\
              If any plan is in the SAME repo as the current work and has unchecked tasks, \
-             continue with it by declaring `transitioning to <path>`.\n\
-             Only declare `stopping` if ALL remaining plans are in different repos or out of scope."
+             declare `continuing`. Otherwise declare `stopping`."
         ));
     }
 
     sections.push(
         "## Declare\n\n\
-         Before stopping, state one of:\n\
-         - `continuing: <what remains from last message>`\n\
-         - `reviewed plans: transitioning to <path> because <relevance>` — close current feature first\n\
-         - `reviewed plans: stopping, nothing related to current work` — only when NO same-repo plans have unchecked tasks".to_string()
+         State one of:\n\
+         - `continuing: <what remains>`\n\
+         - `stopping: <reason>` — when nothing remains in this repo"
+            .to_string(),
     );
 
     Some(format!(
         "PRE-STOP VERIFICATION — check state, then decide.\n\n{}\n\n\
-         Proceed with continuing/transitioning work, or stop if verification is complete.",
+         IMPORTANT: This is a read-only check. Do NOT run commands, do NOT fix anything, do NOT commit. \
+         Just review your state and declare continuing or stopping.",
         sections.join("\n\n")
     ))
 }
