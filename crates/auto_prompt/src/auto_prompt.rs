@@ -679,6 +679,23 @@ pub fn evaluate_response(input: &EvaluationInput) -> EvaluationResult {
     EvaluationResult::WantsStop { reason }
 }
 
+/// Confidence threshold below which the orchestration LLM is considered "decisive"
+/// about stopping. When confidence is this low AND no prompt is provided,
+/// the LLM is certain the chain should stop — verification is pointless.
+const DECISIVE_STOP_THRESHOLD: f64 = 0.15;
+
+/// Returns true when the orchestration LLM is decisively stopping.
+/// A decisive stop has very low confidence and no prompt — the LLM is
+/// certain, so verification would just create wasted work.
+pub fn is_decisive_stop(input: &EvaluationInput) -> bool {
+    let confidence = input.confidence.unwrap_or(0.0);
+    let has_prompt = input
+        .next_prompt
+        .as_ref()
+        .is_some_and(|p| !p.trim().is_empty());
+    confidence <= DECISIVE_STOP_THRESHOLD && !has_prompt
+}
+
 /// Synchronous pre-check and decision.
 ///
 /// Returns `NoAction` if auto-prompt should not fire (disabled, no tools,
@@ -1598,30 +1615,19 @@ pub async fn decide_with_llm(
                                 }
                             }
                         }
+                    } else if is_decisive_stop(&input) {
+                        log::info!(
+                            "auto_prompt: decisive stop (confidence={:?}), skipping verification",
+                            input.confidence
+                        );
+                        write_stop_log(
+                            data.project_root.as_ref(),
+                            data.iteration_count,
+                            &format!("decisive stop: {reason}"),
+                        );
+                        reset_iteration_with_session(&data.session_id.to_string());
+                        return Ok(AutoPromptOutcome::Stopped { reason });
                     } else {
-                        // Decisive stop: when the LLM is very confident about stopping
-                        // (low confidence + no prompt), skip verification entirely.
-                        // Verification is for catching premature stops, not confirming
-                        // obvious ones.
-                        let is_decisive = input.confidence.unwrap_or(0.0) <= 0.15
-                            && input
-                                .next_prompt
-                                .as_ref()
-                                .is_none_or(|p| p.trim().is_empty());
-                        if is_decisive {
-                            log::info!(
-                                "auto_prompt: decisive stop (confidence={:?}), skipping verification",
-                                input.confidence
-                            );
-                            write_stop_log(
-                                data.project_root.as_ref(),
-                                data.iteration_count,
-                                &format!("decisive stop: {reason}"),
-                            );
-                            reset_iteration_with_session(&data.session_id.to_string());
-                            return Ok(AutoPromptOutcome::Stopped { reason });
-                        }
-
                         // Before accepting stop, check plan files for unchecked tasks.
                         // If the LLM explicitly declared ALL tasks blocked (not just some),
                         // respect that assessment.
@@ -4778,6 +4784,173 @@ mod tests {
         assert!(
             !llm_acknowledged_all_tasks_blocked(Some("")),
             "empty string should not be blocked"
+        );
+    }
+
+    // --- Decisive stop tests ---
+
+    #[test]
+    fn test_decisive_stop_low_confidence_no_prompt() {
+        let input = EvaluationInput {
+            confidence: Some(0.10),
+            next_prompt: None,
+            ..make_input()
+        };
+        assert!(
+            is_decisive_stop(&input),
+            "confidence 0.10 with no prompt should be decisive"
+        );
+    }
+
+    #[test]
+    fn test_decisive_stop_at_threshold() {
+        let input = EvaluationInput {
+            confidence: Some(0.15),
+            next_prompt: None,
+            ..make_input()
+        };
+        assert!(
+            is_decisive_stop(&input),
+            "confidence 0.15 with no prompt should be decisive"
+        );
+    }
+
+    #[test]
+    fn test_decisive_stop_above_threshold() {
+        let input = EvaluationInput {
+            confidence: Some(0.16),
+            next_prompt: None,
+            ..make_input()
+        };
+        assert!(
+            !is_decisive_stop(&input),
+            "confidence 0.16 should NOT be decisive"
+        );
+    }
+
+    #[test]
+    fn test_decisive_stop_with_prompt() {
+        let input = EvaluationInput {
+            confidence: Some(0.05),
+            next_prompt: Some("continue with next task".to_string()),
+            ..make_input()
+        };
+        assert!(
+            !is_decisive_stop(&input),
+            "having a prompt should prevent decisive stop even at 0.05"
+        );
+    }
+
+    #[test]
+    fn test_decisive_stop_with_empty_prompt() {
+        let input = EvaluationInput {
+            confidence: Some(0.10),
+            next_prompt: Some("   ".to_string()),
+            ..make_input()
+        };
+        assert!(
+            is_decisive_stop(&input),
+            "whitespace-only prompt should count as no prompt"
+        );
+    }
+
+    #[test]
+    fn test_decisive_stop_none_confidence() {
+        let input = EvaluationInput {
+            confidence: None,
+            next_prompt: None,
+            ..make_input()
+        };
+        assert!(
+            is_decisive_stop(&input),
+            "None confidence defaults to 0.0, should be decisive"
+        );
+    }
+
+    // --- Verification prompt content tests ---
+    // These catch the bug where the prompt told the AI to DO work
+    // (cargo check, fix errors, commit) instead of just asking about state.
+
+    #[test]
+    fn test_verification_prompt_is_read_only() {
+        let context_json = r#"{"plan_files":[{"path":"plans/001.md","content":"- [ ] task 1"}]}"#;
+        let prompt = build_pre_stop_verification_prompt(context_json, &None)
+            .expect("should return Some with plan files");
+
+        // Must contain the read-only disclaimer
+        let lower = prompt.to_lowercase();
+        assert!(
+            lower.contains("do not run commands"),
+            "verification prompt must be read-only, got:\n{prompt}"
+        );
+        assert!(
+            lower.contains("do not fix anything"),
+            "verification prompt must be read-only, got:\n{prompt}"
+        );
+        assert!(
+            lower.contains("do not commit"),
+            "verification prompt must be read-only, got:\n{prompt}"
+        );
+    }
+
+    #[test]
+    fn test_verification_prompt_no_action_imperatives() {
+        let context_json = r#"{"plan_files":[{"path":"plans/001.md","content":"- [ ] task 1"}]}"#;
+        let prompt = build_pre_stop_verification_prompt(context_json, &None)
+            .expect("should return Some with plan files");
+
+        let lower = prompt.to_lowercase();
+
+        // Check items should be questions, not commands
+        assert!(
+            !lower.contains("fix errors"),
+            "prompt should not command 'fix errors', got:\n{prompt}"
+        );
+        assert!(
+            !lower.contains("fix warnings"),
+            "prompt should not command 'fix warnings', got:\n{prompt}"
+        );
+        assert!(
+            !lower.contains("commit with"),
+            "prompt should not command 'commit with', got:\n{prompt}"
+        );
+        assert!(
+            !lower.contains("run relevant benchmarks"),
+            "prompt should not command 'run relevant benchmarks', got:\n{prompt}"
+        );
+    }
+
+    #[test]
+    fn test_verification_prompt_uses_questions_not_commands() {
+        let context_json = r#"{"plan_files":[{"path":"plans/001.md","content":"- [ ] task 1"}]}"#;
+        let prompt = build_pre_stop_verification_prompt(context_json, &None)
+            .expect("should return Some with plan files");
+
+        // Check items should be questions
+        assert!(
+            prompt.contains("Are there any errors"),
+            "diagnostics check should be a question, got:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("Any uncommitted changes"),
+            "git check should be a question, got:\n{prompt}"
+        );
+    }
+
+    #[test]
+    fn test_verification_prompt_no_plan_files_still_returns_prompt() {
+        // Even without plan files, the function returns Some with just
+        // the checklist (no Remaining Plans section).
+        let context_json = r#"{"plan_files":[]}"#;
+        let result = build_pre_stop_verification_prompt(context_json, &None);
+        assert!(
+            result.is_some(),
+            "should return Some even with empty plan files"
+        );
+        let prompt = result.unwrap();
+        assert!(
+            !prompt.contains("## Remaining Plans"),
+            "should not have Remaining Plans section when no plan files"
         );
     }
 }
