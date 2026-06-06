@@ -1038,20 +1038,10 @@ pub async fn decide_with_llm(
         if summary_state == 0 {
             // Phase 1: Request summarization. Return ContextOverflow so the
             // UI sends a "summarize" message to the current thread.
-            let prompt_summary = build_prompt_summary(
-                None,
-                data.title.as_deref(),
-                None,
-                data.last_assistant_message.as_deref(),
-                data.original_user_message.as_deref(),
-                data.first_user_message.as_deref(),
-            );
-            let next_prompt = with_first_prompt_context(
-                "Stop what you are doing and provide a concise summary of your progress. Include: (1) what was the original task, (2) what was accomplished, (3) what remains to be done, (4) the current state of any active plans (reference by filename). Be thorough — this summary will be used to continue in a fresh context.".to_string(),
-                prompt_summary.as_deref(),
-                data.title.as_deref(),
-                data.last_assistant_message.as_deref(),
-            );
+            //
+            // Always goes to the SAME thread — no need for ## 1/## 2/## 3 headers
+            // since the AI already has full conversation context. Raw instruction only.
+            let next_prompt = "Stop what you are doing and provide a concise summary of your progress. Include: (1) what was the original task, (2) what was accomplished, (3) what remains to be done, (4) the current state of any active plans (reference by filename). Be thorough — this summary will be used to continue in a fresh context.".to_string();
             set_summary_state(&session_id_str, 1);
             log::info!(
                 "[auto_prompt::decide_with_llm] Returning ContextOverflow — requesting summary from AI (session={session_id_str})"

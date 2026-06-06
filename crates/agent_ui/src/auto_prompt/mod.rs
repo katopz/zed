@@ -331,8 +331,15 @@ pub(crate) fn dispatch_action(
         decision_prompt,
     });
 
+    let focus_handle = window.focused(cx);
+    log::info!(
+        "[auto_prompt] dispatch_action: about to dispatch, focus_handle={:?}, window_handle={:?}",
+        focus_handle.is_some(),
+        window.window_handle()
+    );
+
     window.dispatch_action(action, cx);
-    log::info!("[auto_prompt] dispatch_action: action dispatched");
+    log::info!("[auto_prompt] dispatch_action: window.dispatch_action returned (deferred)");
 }
 
 fn is_cancelled(

@@ -364,6 +364,13 @@ struct SerializedActiveThread {
 }
 
 pub fn init(cx: &mut App) {
+    cx.on_action(|action: &AutoPromptNewThread, _cx| {
+        log::warn!(
+            "[auto_prompt] GLOBAL on_action: AutoPromptNewThread reached App-level listener (from_session_id={:?})",
+            action.from_session_id
+        );
+    });
+
     cx.observe_new(
         |workspace: &mut Workspace, _window, _cx: &mut Context<Workspace>| {
             workspace
