@@ -3887,6 +3887,15 @@ impl ThreadView {
                                                 });
                                             }),
                                     )
+                                    .child(
+                                        IconButton::new("continue_subagent", IconName::RotateCw)
+                                            .icon_size(IconSize::Small)
+                                            .icon_color(Color::Warning)
+                                            .tooltip(Tooltip::text("Retry Subagent"))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.retry_generation(cx);
+                                            })),
+                                    )
                                 })
                                 .when(is_done && is_canceled_or_failed, |this| {
                                     this.child(
