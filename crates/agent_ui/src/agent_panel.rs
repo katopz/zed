@@ -4339,11 +4339,8 @@ impl AgentPanel {
             .iter()
             .filter(|(_id, view)| {
                 let view = view.read(cx);
-                if view.is_loading() {
-                    return false;
-                }
                 let Some(thread_view) = view.root_thread_view() else {
-                    return true;
+                    return false;
                 };
                 let thread = thread_view.read(cx).thread.read(cx);
                 thread.connection().supports_load_session() && thread.status() == ThreadStatus::Idle
