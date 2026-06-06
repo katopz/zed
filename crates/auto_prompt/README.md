@@ -467,7 +467,7 @@ Messages like "5 remaining tasks require GPU hardware" or "Remaining Work (block
 
 `crates/agent_ui/src/auto_prompt/mod.rs` — thin bridge that:
 
-- Defines `ToggleAutoPrompt` GPUI action (toolbar sparkle button)
+- Defines `ToggleAutoPrompt` GPUI action (toolbar toggle button: Auto/Off/Processing.../Retry)
 - Defines `AutoPromptNewThread` GPUI action (creates follow-up thread with `from_session_id`, `from_title`, `next_prompt`, `work_dirs`)
 - Defines `AutoPromptState` enum: `Idle`, `Processing`, `Failed`
 - `on_thread_stopped()` delegates to `auto_prompt::decide()`, handles async LLM path with retry loop
@@ -476,7 +476,23 @@ Messages like "5 remaining tasks require GPU hardware" or "Remaining Work (block
   - **New thread**: full 3-part format via `auto_prompt_new_thread()` with summary + last assistant message + decision
 - `extract_decision_prompt()` extracts `## 3. Decision` section from `next_prompt` for the `AutoPromptNewThread.decision_prompt` field
 
-Called from `conversation_view.rs` in the `AcpThreadEvent::Stopped` handler (and error handler), only when `auto_prompt_enabled` is `true` on the active `ThreadView`.
+**Two entry points** call into the bridge:
+
+1. **Automatic flow** (`conversation_view.rs` `AcpThreadEvent::Stopped` handler):
+   Only fires when `auto_prompt_enabled` is `true` on the active `ThreadView`.
+   Calls `on_thread_stopped()` → full LLM decision pipeline.
+
+2. **Manual sparkle button** (`thread_view.rs` `manual_auto_prompt()`):
+   Always available in thread controls (bottom-right sparkle icon).
+   Bypasses the LLM decision pipeline — directly calls `dispatch_action()` with
+   `actual_input_tokens` from `thread.token_usage()`. This ensures the token
+   threshold check works correctly (no async LLM call that might lose the real
+   token count). Also enables `auto_prompt_enabled` so subsequent automatic
+   cycles can complete (e.g., ContextOverflow Phase 2).
+
+   The manual sparkle button is for "kick the AI to keep working now" — it sends
+   a simple continuation prompt and lets `dispatch_action` decide same-thread
+   vs new-thread based on the token threshold.
 
 ### New thread content (auto_prompt_new_thread)
 

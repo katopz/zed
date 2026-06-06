@@ -6383,26 +6383,83 @@ impl ThreadView {
     }
 
     fn manual_auto_prompt(&self, window: &mut Window, cx: &mut Context<Self>) {
-        let used_tools = self.thread.read(cx).has_tool_calls();
-        let thread = self.thread.clone();
+        let thread = self.thread.read(cx);
+        let actual_input_tokens = thread.token_usage().map(|u| u.input_tokens);
+        let session_id = thread.session_id().clone();
+        let title = thread.title().map(|t| t.to_string());
+        let work_dirs = thread.work_dirs().map(|pl| pl.paths().to_vec());
+        let profile_id = self.current_mode_id(cx).map(|id| id.to_string());
+
+        let first_user_message = thread.entries().iter().find_map(|entry| {
+            if let acp_thread::AgentThreadEntry::UserMessage(msg) = entry {
+                let content = msg.content.to_markdown(cx).to_string();
+                if !content.is_empty() {
+                    return Some(content);
+                }
+            }
+            None
+        });
+
+        let last_assistant_message = thread.entries().iter().rev().find_map(|entry| {
+            if let acp_thread::AgentThreadEntry::AssistantMessage(msg) = entry {
+                let content = msg
+                    .chunks
+                    .iter()
+                    .filter_map(|chunk| {
+                        let block = match chunk {
+                            acp_thread::AssistantMessageChunk::Message { block } => block,
+                            acp_thread::AssistantMessageChunk::Thought { block } => block,
+                        };
+                        let text = block.to_markdown(cx).to_string();
+                        if text.is_empty() { None } else { Some(text) }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if content.is_empty() {
+                    None
+                } else {
+                    Some(auto_prompt::truncate_to_paragraph_budget(&content, 2_500))
+                }
+            } else {
+                None
+            }
+        });
+
+        let original_user_message = first_user_message
+            .as_deref()
+            .and_then(auto_prompt::extract_original_user_message)
+            .or_else(|| first_user_message.filter(|s| !s.trim().is_empty()));
+
+        let next_prompt = "Continue from where we left off.".to_string();
+
+        let action = auto_prompt::AutoPromptAction {
+            from_session_id: session_id,
+            from_title: title,
+            next_prompt,
+            work_dirs,
+            original_user_message,
+            profile_id,
+            actual_input_tokens,
+            approximate_token_count: 0,
+            last_assistant_message,
+        };
 
         let conversation_view = self.server_view.upgrade();
         let thread_view_weak = cx.weak_entity();
         window.defer(cx, move |window, cx| {
             if let Some(conversation_view) = conversation_view {
                 conversation_view.update(cx, |cv, cx| {
-                    if let Some(task) = crate::auto_prompt::on_thread_stopped(
-                        cv,
-                        &thread,
-                        used_tools,
-                        &acp::StopReason::EndTurn,
-                        window,
-                        cx,
-                    ) {
-                        if let Some(tv) = thread_view_weak.upgrade() {
-                            tv.update(cx, |tv, cx| {
-                                tv._auto_prompt_task = Some(task);
-                                cx.notify();
+                    crate::auto_prompt::dispatch_action(action, cv, window, cx);
+                    if let Some(tv) = thread_view_weak.upgrade() {
+                        tv.update(cx, |tv, cx| {
+                            tv.auto_prompt_enabled = true;
+                            cx.notify();
+                        });
+                    }
+                    if let Some(workspace) = cv.workspace.upgrade() {
+                        if let Some(panel) = workspace.read(cx).panel::<crate::AgentPanel>(cx) {
+                            panel.update(cx, |panel, _| {
+                                panel.set_auto_prompt_enabled(true);
                             });
                         }
                     }
