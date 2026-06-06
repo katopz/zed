@@ -4338,7 +4338,11 @@ impl AgentPanel {
             .retained_threads
             .iter()
             .filter(|(_id, view)| {
-                let Some(thread_view) = view.read(cx).root_thread_view() else {
+                let view = view.read(cx);
+                if view.is_loading() {
+                    return false;
+                }
+                let Some(thread_view) = view.root_thread_view() else {
                     return true;
                 };
                 let thread = thread_view.read(cx).thread.read(cx);
@@ -10807,6 +10811,106 @@ mod tests {
             weak_view_a.upgrade().is_some(),
             "Idle non-loadable ConnectionView should still be retained"
         );
+    }
+
+    /// Regression test: auto_prompt creates a new thread that starts in
+    /// Loading state. If the user clicks another thread in the sidebar before
+    /// the new thread's connection establishes, `cleanup_retained_threads`
+    /// must not remove the loading thread (which would cancel its async load
+    /// task and lose the thread entirely).
+    #[gpui::test]
+    async fn test_loading_thread_retained_and_not_cleaned_up(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+
+        // Create a thread that's fully connected and idle, then retain it.
+        let connection_a = StubAgentConnection::new()
+            .with_supports_load_session(true)
+            .with_agent_id("loadable-stub".into())
+            .with_telemetry_id("loadable-stub".into());
+        let (_session_id_a, thread_id_a) =
+            open_generating_thread_with_loadable_connection(&panel, &connection_a, &mut cx);
+        let session_id_a = active_session_id(&panel, &cx);
+
+        // End turn so thread A becomes idle.
+        cx.update(|_, _cx| {
+            connection_a.end_turn(session_id_a.clone(), acp::StopReason::EndTurn);
+        });
+        cx.run_until_parked();
+
+        // Open a second thread — this pushes thread A into retained_threads.
+        let connection_b = StubAgentConnection::new();
+        open_thread_with_custom_connection(&panel, connection_b, &mut cx);
+        cx.run_until_parked();
+
+        // Confirm thread A is retained.
+        panel.read_with(&cx, |panel, _cx| {
+            assert!(panel.retained_threads.contains_key(&thread_id_a));
+        });
+
+        // Now create a new thread C, but DON'T let it connect yet.
+        // We do this by calling external_thread without running_until_parked.
+        let thread_id_c = panel.update_in(&mut cx, |panel, window, cx| {
+            panel.external_thread(
+                None,
+                None,
+                None,
+                None,
+                None,
+                true,
+                AgentThreadSource::AgentPanel,
+                window,
+                cx,
+            );
+            panel.active_thread_id(cx).unwrap()
+        });
+        // Do NOT call cx.run_until_parked() — thread C stays in Loading.
+
+        // Verify the loading view C has no root_thread_view.
+        panel.read_with(&cx, |panel, cx| {
+            let base = panel.active_conversation_view().unwrap();
+            assert!(base.read(cx).is_loading());
+            assert!(base.read(cx).root_thread_view().is_none());
+        });
+
+        // Set max_idle to 0 for aggressive cleanup.
+        cx.update(|_, cx| {
+            cx.set_global(MaxIdleRetainedThreads(0));
+        });
+
+        // Move the loading thread C into retained_threads by switching to thread A.
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.load_agent_thread(
+                crate::Agent::NativeAgent,
+                thread_id_a,
+                None,
+                None,
+                true,
+                AgentThreadSource::Sidebar,
+                window,
+                cx,
+            );
+        });
+        // Don't run_until_parked to keep thread C loading.
+
+        // Thread C should now be in retained_threads.
+        panel.read_with(&cx, |panel, _cx| {
+            assert!(
+                panel.retained_threads.contains_key(&thread_id_c),
+                "loading thread C should be in retained_threads after navigating away"
+            );
+        });
+
+        // Run cleanup — the loading thread C should NOT be removed.
+        panel.update(&mut cx, |panel, cx| {
+            panel.cleanup_retained_threads(cx);
+        });
+
+        panel.read_with(&cx, |panel, _cx| {
+            assert!(
+                panel.retained_threads.contains_key(&thread_id_c),
+                "loading thread C should survive cleanup_retained_threads"
+            );
+        });
     }
 
     #[gpui::test]
