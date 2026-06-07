@@ -19,6 +19,7 @@ use collections::HashSet;
 use db::kvp::{Dismissable, KeyValueStore};
 use itertools::Itertools;
 use project::{AgentId, ProjectItem};
+use prompt_store::BuiltInPrompt;
 use serde::{Deserialize, Serialize};
 use settings::{LanguageModelProviderSetting, LanguageModelSelection};
 
@@ -30,8 +31,9 @@ use zed_actions::{
         ResolveConflictsWithAgent, ReviewBranchDiff,
     },
     assistant::{
-        CreateSkillFromUrl, FocusAgent, OpenGlobalAgentsMdRules, OpenProjectAgentsMdRules,
-        OpenRulesLibrary, OpenSkillCreator, Toggle, ToggleFocus,
+        CreateSkillFromUrl, FocusAgent, OpenGlobalAgentsMdRules, OpenGlobalAutoPromptMd,
+        OpenProjectAgentsMdRules, OpenProjectAutoPromptMd, OpenRulesLibrary, OpenSkillCreator,
+        Toggle, ToggleFocus,
     },
 };
 
@@ -250,6 +252,79 @@ fn project_agents_md_path(
 
             Some(worktree.absolutize(rel_path))
         })
+}
+
+fn project_auto_prompt_md_path(
+    project: &Entity<Project>,
+    require_existing_file: bool,
+    cx: &App,
+) -> Option<PathBuf> {
+    let rel_path = util::rel_path::RelPath::unix("AUTO_PROMPT.md").ok()?;
+    project
+        .read(cx)
+        .visible_worktrees(cx)
+        .next()
+        .and_then(|worktree| {
+            let worktree = worktree.read(cx);
+
+            if require_existing_file {
+                let entry = worktree.entry_for_path(rel_path)?;
+                if !entry.is_file() {
+                    return None;
+                }
+            }
+
+            Some(worktree.absolutize(rel_path))
+        })
+}
+
+fn open_global_auto_prompt(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let path = paths::auto_prompt_file().clone();
+    if !path.exists() {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).log_err();
+        }
+        std::fs::write(
+            &path,
+            BuiltInPrompt::AutoPromptSystemPrompt.default_content(),
+        )
+        .log_err();
+    }
+    workspace
+        .open_abs_path(
+            path,
+            workspace::OpenOptions {
+                focus: Some(true),
+                ..Default::default()
+            },
+            window,
+            cx,
+        )
+        .detach_and_log_err(cx);
+}
+
+fn open_project_auto_prompt(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    if let Some(path) = project_auto_prompt_md_path(workspace.project(), false, cx) {
+        workspace
+            .open_abs_path(
+                path,
+                workspace::OpenOptions {
+                    focus: Some(true),
+                    ..Default::default()
+                },
+                window,
+                cx,
+            )
+            .detach_and_log_err(cx);
+    }
 }
 
 fn open_global_rules(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
@@ -547,6 +622,12 @@ pub fn init(cx: &mut App) {
                 })
                 .register_action(|workspace, _: &OpenProjectAgentsMdRules, window, cx| {
                     open_project_rules(workspace, window, cx);
+                })
+                .register_action(|workspace, _: &OpenGlobalAutoPromptMd, window, cx| {
+                    open_global_auto_prompt(workspace, window, cx);
+                })
+                .register_action(|workspace, _: &OpenProjectAutoPromptMd, window, cx| {
+                    open_project_auto_prompt(workspace, window, cx);
                 })
                 .register_action(|workspace, action: &OpenSkillCreator, window, cx| {
                     if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
@@ -5777,6 +5858,8 @@ impl AgentPanel {
 
         let project_agents_md_path = project_agents_md_path(&self.project, true, cx);
 
+        let project_auto_prompt_md_path = project_auto_prompt_md_path(&self.project, true, cx);
+
         let global_agents_md_loaded = UserAgentsMd::global(cx)
             .and_then(|md| md.content())
             .is_some();
@@ -5915,6 +5998,59 @@ impl AgentPanel {
 
                                 menu = menu.separator();
                             }
+
+                            // Auto Prompt section
+                            {
+                                let workspace = workspace.clone();
+                                menu = menu.header("Auto Prompt").custom_entry(
+                                    |_window, _cx| {
+                                        h_flex()
+                                            .w_full()
+                                            .gap_1()
+                                            .child(Label::new("Open Global System Prompt"))
+                                            .child(
+                                                Label::new("(AUTO_PROMPT.md)")
+                                                    .color(Color::Muted)
+                                                    .size(LabelSize::Small),
+                                            )
+                                            .into_any_element()
+                                    },
+                                    move |window, cx| {
+                                        workspace
+                                            .update(cx, |workspace, cx| {
+                                                open_global_auto_prompt(workspace, window, cx);
+                                            })
+                                            .log_err();
+                                    },
+                                );
+                            }
+
+                            if project_auto_prompt_md_path.is_some() {
+                                let workspace = workspace.clone();
+                                menu = menu.custom_entry(
+                                    |_window, _cx| {
+                                        h_flex()
+                                            .w_full()
+                                            .gap_1()
+                                            .child(Label::new("Open Project System Prompt"))
+                                            .child(
+                                                Label::new("(AUTO_PROMPT.md)")
+                                                    .color(Color::Muted)
+                                                    .size(LabelSize::Small),
+                                            )
+                                            .into_any_element()
+                                    },
+                                    move |window, cx| {
+                                        workspace
+                                            .update(cx, |workspace, cx| {
+                                                open_project_auto_prompt(workspace, window, cx);
+                                            })
+                                            .log_err();
+                                    },
+                                );
+                            }
+
+                            menu = menu.separator();
 
                             menu = menu.action("Profiles", Box::new(ManageProfiles::default()));
                         }

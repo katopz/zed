@@ -586,6 +586,12 @@ pub mod assistant {
             /// Opens the project AGENTS.md rules file.
             #[action(name = "OpenProjectAGENTS.mdRules")]
             OpenProjectAgentsMdRules,
+            /// Opens the user-global AUTO_PROMPT.md file.
+            #[action(name = "OpenGlobalAUTO_PROMPT")]
+            OpenGlobalAutoPromptMd,
+            /// Opens the project AUTO_PROMPT.md file.
+            #[action(name = "OpenProjectAUTO_PROMPT")]
+            OpenProjectAutoPromptMd,
         ]
     );
 

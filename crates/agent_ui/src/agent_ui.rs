@@ -997,6 +997,14 @@ mod tests {
                 !filter.is_hidden(&zed_actions::assistant::OpenProjectAgentsMdRules),
                 "OpenProjectAgentsMdRules should be visible by default"
             );
+            assert!(
+                !filter.is_hidden(&zed_actions::assistant::OpenGlobalAutoPromptMd),
+                "OpenGlobalAutoPromptMd should be visible by default"
+            );
+            assert!(
+                !filter.is_hidden(&zed_actions::assistant::OpenProjectAutoPromptMd),
+                "OpenProjectAutoPromptMd should be visible by default"
+            );
         });
 
         // Disable agent
@@ -1027,6 +1035,14 @@ mod tests {
             assert!(
                 filter.is_hidden(&zed_actions::assistant::OpenProjectAgentsMdRules),
                 "OpenProjectAgentsMdRules should be hidden when agent is disabled"
+            );
+            assert!(
+                filter.is_hidden(&zed_actions::assistant::OpenGlobalAutoPromptMd),
+                "OpenGlobalAutoPromptMd should be hidden when agent is disabled"
+            );
+            assert!(
+                filter.is_hidden(&zed_actions::assistant::OpenProjectAutoPromptMd),
+                "OpenProjectAutoPromptMd should be hidden when agent is disabled"
             );
         });
 

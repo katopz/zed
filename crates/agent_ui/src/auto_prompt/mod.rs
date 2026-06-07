@@ -105,12 +105,39 @@ fn skip_context_metadata(text: &str) -> String {
 async fn load_auto_prompt_system_prompt(
     cx: &mut gpui::AsyncWindowContext,
 ) -> Option<(String, bool)> {
-    let store_future = cx.update(|_window, cx| PromptStore::global(cx)).ok()?;
-    let store = store_future.await.ok()?;
-
     let builtin = BuiltInPrompt::AutoPromptSystemPrompt;
     let default_version = builtin.default_version();
     let default_content = builtin.default_content().to_string();
+
+    // Check global AUTO_PROMPT.md file first
+    let global_auto_prompt_path = paths::auto_prompt_file();
+    if global_auto_prompt_path.exists() {
+        match std::fs::read_to_string(global_auto_prompt_path) {
+            Ok(content) => {
+                let trimmed = content.trim();
+                if !trimmed.is_empty() {
+                    let file_version = prompt_store::parse_prompt_version(trimmed);
+                    if file_version < default_version {
+                        log::warn!(
+                            "[auto_prompt] Global AUTO_PROMPT.md is outdated (file=v{file_version}, default=v{default_version}), using default"
+                        );
+                        return Some((default_content, true));
+                    }
+                    log::info!("[auto_prompt] Using global AUTO_PROMPT.md (v{file_version})");
+                    return Some((trimmed.to_string(), false));
+                }
+            }
+            Err(err) => {
+                log::warn!(
+                    "[auto_prompt] Failed to read global AUTO_PROMPT.md: {err}, falling back to PromptStore"
+                );
+            }
+        }
+    }
+
+    // Fall back to PromptStore
+    let store_future = cx.update(|_window, cx| PromptStore::global(cx)).ok()?;
+    let store = store_future.await.ok()?;
 
     let stored_prompt = store
         .update(cx, |s, cx| s.load(PromptId::BuiltIn(builtin), cx))
@@ -123,8 +150,6 @@ async fn load_auto_prompt_system_prompt(
         log::warn!(
             "[auto_prompt] Stored system prompt is outdated (stored=v{stored_version}, default=v{default_version}), using default and resetting stored prompt"
         );
-        // PromptStore has no delete method; returning the default content
-        // is sufficient since load() falls back to defaults when nothing is stored.
         Some((default_content, true))
     } else {
         Some((stored_prompt, false))
@@ -515,13 +540,31 @@ pub fn on_thread_stopped(
                 match config.system_prompt.as_ref() {
                     Some(prompt) => data.system_prompt = prompt.clone(),
                     None => {
-                        if let Some((store_prompt, is_outdated)) = store_prompt_result {
+                        // Check project AUTO_PROMPT.md first (project overrides global)
+                        let project_auto_prompt = data.work_dirs.as_ref().and_then(|dirs| {
+                            for dir in dirs {
+                                let path = dir.join("AUTO_PROMPT.md");
+                                if path.exists() {
+                                    if let Ok(content) = std::fs::read_to_string(&path) {
+                                        let trimmed = content.trim();
+                                        if !trimmed.is_empty() {
+                                            return Some(trimmed.to_string());
+                                        }
+                                    }
+                                }
+                            }
+                            None
+                        });
+
+                        if let Some(project_prompt) = project_auto_prompt {
+                            data.system_prompt = project_prompt;
+                        } else if let Some((store_prompt, is_outdated)) = store_prompt_result {
                             data.system_prompt = store_prompt;
                             if is_outdated {
                                 if let Some(ref workspace) = workspace_weak {
                                     let _ = workspace.update(cx, |workspace, cx| {
                                         let toast = notifications::status_toast::StatusToast::new(
-                                            gpui::SharedString::from("Auto-prompt system prompt updated to a newer version. You can customize it in Settings > Prompts."),
+                                            gpui::SharedString::from("Auto-prompt system prompt updated to a newer version. You can customize it via AUTO_PROMPT.md."),
                                             cx,
                                             |this, _| {
                                                 this.icon(ui::Icon::new(ui::IconName::Info)

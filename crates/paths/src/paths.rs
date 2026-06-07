@@ -325,6 +325,16 @@ pub fn agents_file() -> &'static PathBuf {
     AGENTS_FILE.get_or_init(|| config_dir().join("AGENTS.md"))
 }
 
+/// Returns the path to the user-global `AUTO_PROMPT.md` file.
+///
+/// This file holds the auto-prompt system prompt that controls how the
+/// auto-prompt LLM decides whether to continue working. When present, it
+/// overrides the built-in default system prompt.
+pub fn auto_prompt_file() -> &'static PathBuf {
+    static AUTO_PROMPT_FILE: OnceLock<PathBuf> = OnceLock::new();
+    AUTO_PROMPT_FILE.get_or_init(|| config_dir().join("AUTO_PROMPT.md"))
+}
+
 /// User-facing display form of the user-global `AGENTS.md` file path —
 /// i.e. what a human should see in messages and prompts, with the
 /// platform's native path separator and home/config directory shorthand.
