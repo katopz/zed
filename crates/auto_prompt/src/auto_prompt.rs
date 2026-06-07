@@ -2148,23 +2148,10 @@ fn read_plan_files(
         }
     }
 
-    // Identify active project from first user message's file:// reference.
+    // Identify active project from first user message.
     // This prioritizes the session's target project over other workspace projects.
-    let active_project = first_user_message.and_then(|msg| {
-        let file_url_start = msg.find("file:///")?;
-        let path = &msg[file_url_start + 7..];
-        let end = path
-            .find(|c: char| c == ')' || c == ' ' || c == '\n')
-            .unwrap_or(path.len());
-        let full_path = &path[..end];
-        if let Some(pos) = full_path.find("/.plans/") {
-            Some(full_path[..pos].to_string())
-        } else if let Some(pos) = full_path.find("/.plan/") {
-            Some(full_path[..pos].to_string())
-        } else {
-            None
-        }
-    });
+    // Supports: file:///... URLs, zed:///... URLs, and plain absolute paths containing /.plans/ or /.plan/
+    let active_project = first_user_message.and_then(|msg| extract_active_project(msg));
 
     if let Some(ref active) = active_project {
         log::info!("[auto_prompt::read_plan_files] Active project: {active}");
@@ -2493,6 +2480,16 @@ fn build_plan_landscape(context_json: &str) -> Option<String> {
     type PlanLine = String;
     let mut groups: Vec<(Project, Vec<PlanLine>)> = Vec::new();
 
+    // Extract the active project from the first plan file's path prefix,
+    // then use it to sort same-repo plans first.
+    let active_project = ctx.plan_files.first().and_then(|f| {
+        let path = std::path::Path::new(&f.path);
+        path.parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().to_string())
+    });
+
     for file in &ctx.plan_files {
         let task_count = count_actionable_tasks(&file.content);
         if task_count == 0 {
@@ -2530,6 +2527,21 @@ fn build_plan_landscape(context_json: &str) -> Option<String> {
     if groups.is_empty() {
         log::info!("[auto_prompt::build_plan_landscape] No actionable plans found");
         return None;
+    }
+
+    // Sort groups: active project's repo first, then alphabetical.
+    // Within each group, plans are already in the order from read_plan_files
+    // (active project first, then newest plan index first).
+    if let Some(ref active) = active_project {
+        groups.sort_by(|a, b| {
+            let a_active = a.0 == *active;
+            let b_active = b.0 == *active;
+            match (a_active, b_active) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                _ => a.0.cmp(&b.0),
+            }
+        });
     }
 
     let total_plans: usize = groups.iter().map(|(_, plans)| plans.len()).sum();
@@ -2585,6 +2597,59 @@ fn extract_plan_title(content: &str) -> String {
         }
     }
     String::new()
+}
+
+/// Extract the active project path from a user message.
+///
+/// Recognizes three patterns:
+/// 1. `file:///abs/path/.plans/xxx.md` — file URL
+/// 2. `zed:///agent/thread/...` followed elsewhere by a plain path with `/.plans/` or `/.plan/`
+/// 3. Bare absolute paths like `/Users/foo/proj/.plans/239_bar.md`
+///
+/// Returns the project root (e.g. `/Users/foo/proj`) on success.
+fn extract_active_project(msg: &str) -> Option<String> {
+    // Strategy 1: find `file:///` URL
+    if let Some(idx) = msg.find("file:///") {
+        let path = &msg[idx + 7..];
+        let end = path
+            .find(|c: char| c == ')' || c == ' ' || c == '\n' || c == '"' || c == '`')
+            .unwrap_or(path.len());
+        let full_path = &path[..end];
+        if let Some(pos) = full_path.rfind("/.plans/") {
+            return Some(full_path[..pos].to_string());
+        }
+        if let Some(pos) = full_path.rfind("/.plan/") {
+            return Some(full_path[..pos].to_string());
+        }
+    }
+
+    // Strategy 2: scan for any absolute path containing `/.plans/` or `/.plan/`.
+    // This catches bare paths like `/Users/katopz/git/riir-ai/.plans/239_fol_game_rule_extraction.md`
+    // and markdown links like `riir-ai/.plans/239_fol_game_rule_extraction.md`.
+    let plan_dir_patterns = ["/.plans/", "/.plan/"];
+    let mut best_match: Option<&str> = None;
+    let mut best_len = 0;
+
+    for pattern in &plan_dir_patterns {
+        let mut search_from = 0;
+        while let Some(idx) = msg[search_from..].find(pattern) {
+            let abs_start = search_from + idx;
+            // Walk backwards to find the start of the path (either start of string, whitespace, or common delimiters)
+            let path_start = msg[..abs_start]
+                .rfind(|c: char| matches!(c, ' ' | '\n' | '(' | '`' | '"' | '>' | '['))
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            let candidate = &msg[path_start..abs_start];
+            // Prefer longer prefixes — more specific project paths win
+            if candidate.len() > best_len {
+                best_len = candidate.len();
+                best_match = Some(candidate);
+            }
+            search_from = abs_start + pattern.len();
+        }
+    }
+
+    best_match.map(|s| s.to_string())
 }
 
 /// Detect if the current or next plan involves performance-related work by scanning for keywords.
@@ -3955,6 +4020,7 @@ mod tests {
     enum VerificationGateResult {
         DispatchVerification,
         StopNoPlanFiles,
+        #[expect(dead_code)]
         StopAfterVerification,
         StopMaxExceeded,
     }
@@ -4312,19 +4378,7 @@ mod tests {
     #[test]
     fn test_active_project_extraction_from_file_url() {
         let msg = "do as a plan [@016_quantized_matmul.md](file:///Users/katopz/git/temp2/riir-burner/.plans/016_quantized_matmul.md)";
-        let file_url_start = msg.find("file:///").unwrap();
-        let path = &msg[file_url_start + 7..];
-        let end = path
-            .find(|c: char| c == ')' || c == ' ' || c == '\n')
-            .unwrap_or(path.len());
-        let full_path = &path[..end];
-        let active = if let Some(pos) = full_path.find("/.plans/") {
-            Some(full_path[..pos].to_string())
-        } else if let Some(pos) = full_path.find("/.plan/") {
-            Some(full_path[..pos].to_string())
-        } else {
-            None
-        };
+        let active = extract_active_project(msg);
         assert_eq!(
             active,
             Some("/Users/katopz/git/temp2/riir-burner".to_string())
@@ -4334,19 +4388,32 @@ mod tests {
     #[test]
     fn test_active_project_extraction_no_file_url() {
         let msg = "just a regular message with no file references";
-        let active = msg.find("file:///").and_then(|file_url_start| {
-            let path = &msg[file_url_start + 7..];
-            let end = path
-                .find(|c: char| c == ')' || c == ' ' || c == '\n')
-                .unwrap_or(path.len());
-            let full_path = &path[..end];
-            if let Some(pos) = full_path.find("/.plans/") {
-                Some(full_path[..pos].to_string())
-            } else {
-                None
-            }
-        });
+        let active = extract_active_project(msg);
         assert_eq!(active, None);
+    }
+
+    #[test]
+    fn test_active_project_extraction_from_plain_path() {
+        // Simulates the chain prompt format which includes bare paths (no file:/// prefix)
+        let msg = "Continue with plan 239. Check the plan file at /Users/katopz/git/riir-ai/.plans/239_fol_game_rule_extraction.md and proceed.";
+        let active = extract_active_project(msg);
+        assert_eq!(active, Some("/Users/katopz/git/riir-ai".to_string()));
+    }
+
+    #[test]
+    fn test_active_project_extraction_prefers_file_url_over_plain() {
+        let msg = "file:///Users/katopz/git/project-a/.plans/001.md and also /Users/katopz/git/project-b/.plans/002.md";
+        let active = extract_active_project(msg);
+        // file:/// should take priority
+        assert_eq!(active, Some("/Users/katopz/git/project-a".to_string()));
+    }
+
+    #[test]
+    fn test_active_project_extraction_longest_path_wins() {
+        // When multiple plain paths exist, longest (most specific) wins
+        let msg = "Check /Users/katopz/git/riir-ai/.plans/239_fol.md in /Users/katopz/git/riir-ai/.plans/240_eql.md";
+        let active = extract_active_project(msg);
+        assert_eq!(active, Some("/Users/katopz/git/riir-ai".to_string()));
     }
 
     #[test]
