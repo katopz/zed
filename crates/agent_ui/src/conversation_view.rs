@@ -564,6 +564,10 @@ pub struct ConversationView {
 }
 
 impl ConversationView {
+    pub fn workspace(&self) -> WeakEntity<Workspace> {
+        self.workspace.clone()
+    }
+
     pub fn has_auth_methods(&self) -> bool {
         self.as_connected().map_or(false, |connected| {
             !connected.connection.auth_methods().is_empty()

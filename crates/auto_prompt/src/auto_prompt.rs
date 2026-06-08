@@ -494,8 +494,8 @@ impl std::fmt::Debug for LlmCallData {
 }
 
 impl LlmCallData {
-    fn make_continue(&self, next_prompt: String) -> AutoPromptOutcome {
-        AutoPromptOutcome::Continue(AutoPromptAction {
+    fn make_continue_action(&self, next_prompt: String) -> AutoPromptAction {
+        AutoPromptAction {
             from_session_id: self.session_id.clone(),
             from_title: self.title.clone(),
             next_prompt,
@@ -505,7 +505,11 @@ impl LlmCallData {
             actual_input_tokens: self.actual_input_tokens,
             approximate_token_count: self.approximate_token_count,
             last_assistant_message: self.last_assistant_message.clone(),
-        })
+        }
+    }
+
+    fn make_continue(&self, next_prompt: String) -> AutoPromptOutcome {
+        AutoPromptOutcome::Continue(self.make_continue_action(next_prompt))
     }
 }
 
@@ -1117,7 +1121,14 @@ pub async fn decide_with_llm(
                 &data.session_id,
                 data.title.as_deref(),
             );
-            return Ok(data.make_continue(next_prompt));
+            // Reset token counts — the new thread starts from a summary, not the
+            // bloated old context. Carrying the old token counts forward causes
+            // dispatch_action to always choose new-thread AND can re-trigger
+            // ContextOverflow on the fresh thread.
+            let mut action = data.make_continue_action(next_prompt);
+            action.actual_input_tokens = None;
+            action.approximate_token_count = 0;
+            return Ok(AutoPromptOutcome::Continue(action));
         } else {
             // Unexpected state — reset and stop
             clear_summary_for_session(&session_id_str);

@@ -1,3 +1,4 @@
+use acp_thread::MentionUri;
 use agent::ZED_AGENT_ID;
 use agent_client_protocol::schema as acp;
 use gpui::Window;
@@ -5,6 +6,7 @@ use notifications::status_toast::StatusToast;
 use prompt_store::{BuiltInPrompt, PromptId, PromptStore};
 use std::path::PathBuf;
 use ui::prelude::*;
+use workspace::PathList;
 
 /// Strip the context wrapper produced by `with_first_prompt_context`.
 /// For same-thread continuation (ACP agents) the AI already has full
@@ -338,33 +340,102 @@ pub(crate) fn dispatch_action(
     }
 
     log::info!(
-        "[auto_prompt] dispatch_action: dispatching AutoPromptNewThread (prompt {} chars, tokens={:?})",
+        "[auto_prompt] dispatch_action: creating new thread directly (prompt {} chars, tokens={:?})",
         action.next_prompt.len(),
         action.actual_input_tokens
     );
 
     let decision_prompt = auto_prompt::extract_decision_prompt(&action.next_prompt);
 
-    let action = Box::new(AutoPromptNewThread {
-        from_session_id: action.from_session_id,
-        from_title: action.from_title,
-        next_prompt: action.next_prompt,
-        work_dirs: action.work_dirs,
-        original_user_message: action.original_user_message,
-        profile_id: action.profile_id,
-        last_assistant_message: action.last_assistant_message,
-        decision_prompt,
+    // Create the new thread directly via AgentPanel instead of dispatching
+    // a GPUI action. window.dispatch_action is unreliable when the user is
+    // idle (no focused element in the Workspace focus chain) — the action
+    // reaches the App-level listener but never the Workspace handler.
+    let workspace_handle = conversation_view.workspace();
+    let Some(workspace) = workspace_handle.upgrade() else {
+        log::warn!("[auto_prompt] dispatch_action: workspace dropped, cannot create new thread");
+        return;
+    };
+
+    // Focus the panel and create the thread inside workspace.update so we
+    // have the correct Context<Workspace> for focus_panel.
+    let _ = workspace.update(cx, |workspace, cx| {
+        workspace.focus_panel::<crate::AgentPanel>(window, cx);
+
+        let Some(panel) = workspace.panel::<crate::AgentPanel>(cx) else {
+            log::warn!("[auto_prompt] dispatch_action: AgentPanel not found in workspace");
+            return;
+        };
+
+        let work_dirs = action.work_dirs.clone().map(|dirs| PathList::new(&dirs));
+
+        let from_session_id = action.from_session_id.clone();
+        let from_title = action.from_title.clone();
+
+        let initial_content =
+            if action.last_assistant_message.is_some() || decision_prompt.is_some() {
+                let follow_up = crate::AgentPanel::build_auto_prompt_follow_up(
+                    action.last_assistant_message.as_deref(),
+                    decision_prompt.as_deref(),
+                );
+
+                log::info!(
+                    "[auto_prompt] dispatch_action: using ThreadSummary with follow_up ({} chars)",
+                    follow_up.as_ref().map_or(0, |s| s.len())
+                );
+
+                crate::AgentInitialContent::ThreadSummary {
+                    session_id: from_session_id,
+                    title: from_title.map(gpui::SharedString::from),
+                    follow_up,
+                    auto_submit: true,
+                }
+            } else {
+                let next_prompt = action.next_prompt.clone();
+
+                let raw_title = from_title.as_deref().unwrap_or("Thread");
+                let mut clean_title = raw_title.to_string();
+                while let Some(rest) = clean_title.strip_prefix("[@") {
+                    if let Some(end) = rest.find("](zed:///agent/thread/") {
+                        clean_title = rest[..end].to_string();
+                    } else {
+                        break;
+                    }
+                }
+
+                let mention_uri = MentionUri::Thread {
+                    id: from_session_id,
+                    name: clean_title,
+                };
+                let summary_link = format!("{}\n\n", mention_uri.as_link());
+                let full_prompt = format!("{summary_link}{next_prompt}");
+
+                let blocks = vec![acp::ContentBlock::Text(acp::TextContent::new(full_prompt))];
+
+                crate::AgentInitialContent::ContentBlock {
+                    blocks,
+                    auto_submit: true,
+                    auto_prompt_enabled: true,
+                    profile_id: action.profile_id.clone(),
+                }
+            };
+
+        panel.update(cx, |panel, cx| {
+            panel.external_thread(
+                None,
+                None,
+                work_dirs,
+                action.from_title.clone().map(Into::into),
+                Some(initial_content),
+                true,
+                crate::AgentThreadSource::AgentPanel,
+                window,
+                cx,
+            );
+        });
     });
 
-    let focus_handle = window.focused(cx);
-    log::info!(
-        "[auto_prompt] dispatch_action: about to dispatch, focus_handle={:?}, window_handle={:?}",
-        focus_handle.is_some(),
-        window.window_handle()
-    );
-
-    window.dispatch_action(action, cx);
-    log::info!("[auto_prompt] dispatch_action: window.dispatch_action returned (deferred)");
+    log::info!("[auto_prompt] dispatch_action: new thread created directly via AgentPanel");
 }
 
 fn is_cancelled(

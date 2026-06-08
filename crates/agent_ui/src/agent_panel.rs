@@ -506,7 +506,7 @@ pub fn init(cx: &mut App) {
                                 );
 
                                 log::info!(
-                                    "[auto_prompt] auto_prompt_new_thread: using ThreadSummary with follow_up ({} chars)",
+                                    "[auto_prompt] AutoPromptNewThread action: using ThreadSummary with follow_up ({} chars)",
                                     follow_up.as_ref().map_or(0, |s| s.len())
                                 );
 
@@ -3564,7 +3564,7 @@ impl AgentPanel {
         .detach_and_log_err(cx);
     }
 
-    fn build_auto_prompt_follow_up(
+    pub(crate) fn build_auto_prompt_follow_up(
         last_assistant_message: Option<&str>,
         decision_prompt: Option<&str>,
     ) -> Option<String> {
@@ -3609,7 +3609,7 @@ impl AgentPanel {
         })
     }
 
-    fn external_thread(
+    pub(crate) fn external_thread(
         &mut self,
         agent_choice: Option<crate::Agent>,
         resume_thread_id: Option<ThreadId>,
