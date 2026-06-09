@@ -2929,6 +2929,10 @@ mod tests {
     }
 
     fn init_test(cx: &mut TestAppContext) {
+        // Disable conflict detection in tests — the global registry
+        // causes interference between parallel test instances.
+        crate::tools::edit_conflict::EditConflictRegistry::global().set_enabled(false);
+
         cx.update(|cx| {
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);

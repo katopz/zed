@@ -12,7 +12,12 @@ use serde::{Deserialize, Serialize};
 use settings::Settings;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 use util::markdown::MarkdownCodeBlock;
+
+use super::edit_conflict::EditConflictRegistry;
+
+const CONFLICT_MAX_IDLE: Duration = Duration::from_secs(60);
 
 fn tool_content_err(e: impl std::fmt::Display) -> LanguageModelToolResultContent {
     LanguageModelToolResultContent::from(e.to_string())
@@ -416,7 +421,7 @@ impl AgentTool for ReadFileTool {
             let mut is_outline_response = false;
 
             // Check if specific line ranges are provided
-            let result = if input.start_line.is_some() || input.end_line.is_some() {
+            let mut result = if input.start_line.is_some() || input.end_line.is_some() {
                 let result_text = buffer.read_with(cx, |buffer, _cx| {
                     let (start, end) = resolve_line_range(input.start_line, input.end_line);
                     let start_row = start - 1;
@@ -482,6 +487,21 @@ impl AgentTool for ReadFileTool {
                     Ok(format_with_line_numbers(&buffer_content.text, 1).into())
                 }
             };
+
+            // Check if another agent is actively editing this file
+            if let Ok(LanguageModelToolResultContent::Text(text)) = &result {
+                if let Some(_lock) =
+                    EditConflictRegistry::global().is_file_busy(&abs_path, CONFLICT_MAX_IDLE)
+                {
+                    let warned = format!(
+                        "⚠️ WARNING: Another agent session is actively editing this file. \
+                         Content may change. Consider working on a different file first.\
+                        \n\n{}",
+                        text
+                    );
+                    result = Ok(warned.into());
+                }
+            }
 
             project.update(cx, |project, cx| {
                 if self.update_agent_location {

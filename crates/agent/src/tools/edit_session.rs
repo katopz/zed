@@ -3,6 +3,7 @@ mod streaming_fuzzy_matcher;
 mod streaming_parser;
 
 use super::tool_permissions::resolve_creatable_global_skill_path;
+use crate::tools::edit_conflict::EditConflictRegistry;
 use crate::{Thread, ToolCallEventStream};
 use acp_thread::Diff;
 use action_log::ActionLog;
@@ -691,6 +692,31 @@ impl EditSession {
             .await
             .map_err(|e| e.to_string())?;
 
+        // Check if another agent is actively editing this file, wait up to 60s
+        if let Some(session_id) = context
+            .thread
+            .read_with(cx, |thread, _| thread.id().clone())
+            .ok()
+        {
+            let registry = EditConflictRegistry::global();
+            let max_idle = std::time::Duration::from_secs(60);
+            let wait_interval = std::time::Duration::from_secs(5);
+            let deadline = std::time::Instant::now() + max_idle;
+
+            while let Some(conflict) = registry.check_conflict(&abs_path, &session_id, max_idle) {
+                if std::time::Instant::now() >= deadline {
+                    return Err(format!(
+                        "File {} is being edited by another agent session ({}). \
+                         Timed out waiting for edit to complete. \
+                         Please re-read the file and try again.",
+                        abs_path.display(),
+                        conflict.session_id
+                    ));
+                }
+                cx.background_executor().timer(wait_interval).await;
+            }
+        }
+
         let buffer = match project_path {
             Some(project_path) => context
                 .project
@@ -711,13 +737,29 @@ impl EditSession {
 
         let diff = cx.new(|cx| Diff::new(buffer.clone(), cx));
         event_stream.update_diff(diff.clone());
+
+        let session_id = context
+            .thread
+            .read_with(cx, |thread, _| thread.id().clone())
+            .ok();
+
+        let release_path = abs_path.clone();
+        let release_session_id = session_id.clone();
         let finalize_diff_guard = util::defer(Box::new({
             let diff = diff.downgrade();
             let mut cx = cx.clone();
             move || {
                 diff.update(&mut cx, |diff, cx| diff.finalize(cx)).ok();
+                if let Some(ref sid) = release_session_id {
+                    EditConflictRegistry::global().release(&release_path, sid);
+                }
             }
         }) as Box<dyn FnOnce()>);
+
+        // Register edit lock in the global conflict registry
+        if let Some(ref sid) = session_id {
+            EditConflictRegistry::global().register(abs_path.clone(), sid.clone());
+        }
 
         context.action_log.update(cx, |log, cx| match mode {
             EditSessionMode::Write => log.buffer_created(buffer.clone(), cx),
@@ -859,6 +901,7 @@ impl EditSession {
                 cx,
             )?;
         }
+        EditConflictRegistry::global().heartbeat(abs_path);
         Ok(())
     }
 

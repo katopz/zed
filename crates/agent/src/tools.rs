@@ -5,6 +5,7 @@ mod create_directory_tool;
 mod create_thread_tool;
 mod delete_path_tool;
 mod diagnostics_tool;
+mod edit_conflict;
 mod edit_file_tool;
 mod edit_session;
 #[cfg(all(test, feature = "unit-eval"))]
