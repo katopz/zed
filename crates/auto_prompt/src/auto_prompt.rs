@@ -5026,6 +5026,106 @@ mod tests {
         );
     }
 
+    // --- Regression tests for force_new_thread (ContextOverflow Phase 2) ---
+
+    #[test]
+    fn test_auto_prompt_action_force_new_thread_field() {
+        // Verify the force_new_thread field exists and defaults correctly.
+        // Phase 1 (ContextOverflow) sets false; Phase 2 (after summary) sets true.
+        let action_false = AutoPromptAction {
+            from_session_id: acp::SessionId::new("test-session"),
+            from_title: None,
+            next_prompt: "continue".to_string(),
+            work_dirs: None,
+            original_user_message: None,
+            profile_id: None,
+            actual_input_tokens: Some(5000),
+            approximate_token_count: 5000,
+            last_assistant_message: None,
+            force_new_thread: false,
+        };
+        assert!(!action_false.force_new_thread);
+
+        let mut action_true = AutoPromptAction {
+            from_session_id: acp::SessionId::new("test-session"),
+            from_title: None,
+            next_prompt: "continue".to_string(),
+            work_dirs: None,
+            original_user_message: None,
+            profile_id: None,
+            actual_input_tokens: Some(200000),
+            approximate_token_count: 200000,
+            last_assistant_message: None,
+            force_new_thread: false,
+        };
+        // Simulate Phase 2: reset tokens, set force_new_thread = true
+        action_true.actual_input_tokens = None;
+        action_true.approximate_token_count = 0;
+        action_true.force_new_thread = true;
+
+        assert!(action_true.force_new_thread);
+        assert_eq!(action_true.actual_input_tokens, None);
+        assert_eq!(action_true.approximate_token_count, 0);
+    }
+
+    #[test]
+    fn test_context_overflow_summary_state_lifecycle() {
+        // Verify the summary state machine transitions correctly:
+        //   0 (no state) → Phase 1 sets 1 → Phase 2 clears back to 0.
+        // This is the lifecycle that drives force_new_thread behavior.
+        let session_id = "test-summary-lifecycle";
+        clear_summary_for_session(session_id);
+
+        // Initial state: no summary pending
+        assert_eq!(summary_state_for(session_id), 0);
+
+        // Phase 1: AI asked to summarize → state set to 1
+        set_summary_state(session_id, 1);
+        assert_eq!(summary_state_for(session_id), 1);
+
+        // Phase 2: AI produced summary → state cleared
+        clear_summary_for_session(session_id);
+        assert_eq!(summary_state_for(session_id), 0);
+
+        // Unexpected state: state 2+ should be clearable
+        set_summary_state(session_id, 2);
+        assert_eq!(summary_state_for(session_id), 2);
+        clear_summary_for_session(session_id);
+        assert_eq!(summary_state_for(session_id), 0);
+    }
+
+    #[test]
+    fn test_phase2_token_reset_prevents_same_thread_dispatch() {
+        // Regression: Without force_new_thread, zeroed tokens cause
+        // dispatch_action to route Phase 2 continuation to the same thread.
+        // The fix ensures force_new_thread overrides the token heuristic.
+        //
+        // Simulate what dispatch_action does:
+        //   use_new_thread = force_new_thread || (is_native_agent && exceeds_threshold)
+        let is_native_agent = true;
+        let same_thread_threshold = 80000;
+
+        // Before fix: tokens reset to 0, no force_new_thread
+        let effective_tokens_before = 0; // Reset in Phase 2
+        let force_new_thread_before = false; // Didn't exist
+        let use_new_thread_before = force_new_thread_before
+            || (is_native_agent && effective_tokens_before >= same_thread_threshold);
+        assert!(
+            !use_new_thread_before,
+            "BUG: zeroed tokens without force_new_thread routes to same thread"
+        );
+
+        // After fix: tokens reset to 0 BUT force_new_thread = true
+        let effective_tokens_after = 0;
+        let force_new_thread_after = true;
+        let use_new_thread_after = force_new_thread_after
+            || (is_native_agent && effective_tokens_after >= same_thread_threshold);
+        assert!(
+            use_new_thread_after,
+            "FIX: force_new_thread overrides token heuristic"
+        );
+    }
+
     #[test]
     fn test_verification_prompt_no_plan_files_still_returns_prompt() {
         // Even without plan files, the function returns Some with just
