@@ -1686,13 +1686,24 @@ impl Sidebar {
                 }
                 threads.retain(|thread| thread.draft.is_none() || thread.metadata.title.is_some());
 
-                // Keep empty drafts only while their thread is active; preserve
-                // drafts with content because they hold user-typed state.
+                // Keep empty drafts only while their thread is active or retained;
+                // preserve drafts with content because they hold user-typed state.
+                // Retained threads include loading threads (e.g. auto_prompt) that
+                // haven't produced entries yet — filtering them out would make the
+                // thread disappear from the sidebar until its async load completes.
                 let pending_activation = self.pending_thread_activation;
-                let active_panel_thread_id = active_workspace
+                let (active_panel_thread_id, retained_thread_ids) = active_workspace
                     .as_ref()
-                    .and_then(|ws| ws.read(cx).panel::<AgentPanel>(cx))
-                    .and_then(|panel| panel.read(cx).active_thread_id(cx));
+                    .map(|ws| {
+                        let panel = ws.read(cx).panel::<AgentPanel>(cx);
+                        let panel = panel.as_ref();
+                        let active = panel.and_then(|p| p.read(cx).active_thread_id(cx));
+                        let retained: HashSet<agent_ui::ThreadId> = panel
+                            .map(|p| p.read(cx).retained_threads().keys().copied().collect())
+                            .unwrap_or_default();
+                        (active, retained)
+                    })
+                    .unwrap_or((None, HashSet::default()));
                 threads.retain(|thread| {
                     if thread.draft != Some(DraftKind::Empty) {
                         return true;
@@ -1701,6 +1712,7 @@ impl Sidebar {
                         return false;
                     }
                     Some(thread.metadata.thread_id) == active_panel_thread_id
+                        || retained_thread_ids.contains(&thread.metadata.thread_id)
                 });
 
                 // Build a lookup from live_infos and compute running/waiting
