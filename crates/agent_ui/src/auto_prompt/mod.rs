@@ -243,16 +243,21 @@ fn build_native_continuation_prompt(
     _last_assistant_message: Option<&str>,
     decision: &str,
 ) -> String {
-    let mut parts = vec![
-        "Continue from where we left off. Summarize prior context internally and proceed.\n\
+    let preamble = "Continue from where we left off. Summarize prior context internally and proceed.\n\
          Review your progress and continue any remaining work in the current repo or context first.\n\
-         If everything is complete, commit all changes with conventional commit messages."
-            .to_string(),
-    ];
+         If everything is complete, commit all changes with conventional commit messages.";
+    let mut parts = vec![preamble.to_string()];
 
-    if !decision.trim().is_empty() {
+    let trimmed = decision.trim();
+    // Skip appending the decision when it is just a generic restatement of the preamble
+    // (e.g. "Continue from where we left off." from manual_auto_prompt).
+    let is_generic_continuation = trimmed
+        .strip_prefix("Continue from where we left off")
+        .map_or(false, |rest| rest.trim().trim_end_matches('.').is_empty());
+
+    if !trimmed.is_empty() && !is_generic_continuation {
         parts.push(String::new());
-        parts.push(decision.trim().to_string());
+        parts.push(trimmed.to_string());
     }
 
     parts.join("\n")
