@@ -282,13 +282,14 @@ pub(crate) fn dispatch_action(
         .unwrap_or(action.approximate_token_count);
     let exceeds_same_thread = effective_tokens >= same_thread_threshold;
 
-    let use_new_thread = is_native_agent && exceeds_same_thread;
+    let use_new_thread = action.force_new_thread || (is_native_agent && exceeds_same_thread);
 
     log::info!(
-        "[auto_prompt] dispatch_action: is_native_agent={}, actual={:?}, approx={}, effective={effective_tokens}, threshold={same_thread_threshold}, use_new_thread={use_new_thread}",
+        "[auto_prompt] dispatch_action: is_native_agent={}, actual={:?}, approx={}, effective={effective_tokens}, threshold={same_thread_threshold}, use_new_thread={use_new_thread}, force_new_thread={}",
         is_native_agent,
         action.actual_input_tokens,
-        action.approximate_token_count
+        action.approximate_token_count,
+        action.force_new_thread
     );
 
     // Native agent with high token count must use new thread (no /compact support).

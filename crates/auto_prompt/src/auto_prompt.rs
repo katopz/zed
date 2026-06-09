@@ -197,6 +197,10 @@ pub struct AutoPromptAction {
     /// The last assistant message from the previous thread,
     /// passed to ThreadSummary for loading indicator + summary flow.
     pub last_assistant_message: Option<String>,
+    /// When true, `dispatch_action` must create a new thread regardless
+    /// of token counts. Set after ContextOverflow Phase 2 (AI produced
+    /// a summary) so the continuation always lands in a fresh thread.
+    pub force_new_thread: bool,
 }
 
 /// Outcome of an auto-prompt LLM decision.
@@ -505,6 +509,7 @@ impl LlmCallData {
             actual_input_tokens: self.actual_input_tokens,
             approximate_token_count: self.approximate_token_count,
             last_assistant_message: self.last_assistant_message.clone(),
+            force_new_thread: false,
         }
     }
 
@@ -908,6 +913,7 @@ pub fn decide(
             actual_input_tokens: auto_prompt_ctx.actual_input_tokens,
             approximate_token_count: auto_prompt_ctx.approximate_token_count,
             last_assistant_message: _last_assistant_msg,
+            force_new_thread: false,
         });
     }
 
@@ -944,6 +950,7 @@ pub fn decide(
                 actual_input_tokens: auto_prompt_ctx.actual_input_tokens,
                 approximate_token_count: auto_prompt_ctx.approximate_token_count,
                 last_assistant_message: _last_assistant_msg,
+                force_new_thread: false,
             },
             delay_ms: delay,
         };
@@ -1077,6 +1084,7 @@ pub async fn decide_with_llm(
                 actual_input_tokens: data.actual_input_tokens,
                 approximate_token_count: data.approximate_token_count,
                 last_assistant_message: data.last_assistant_message.clone(),
+                force_new_thread: false,
             }));
         } else if summary_state == 1 {
             // Phase 2: AI has responded with summary. The last_assistant_message
@@ -1125,9 +1133,12 @@ pub async fn decide_with_llm(
             // bloated old context. Carrying the old token counts forward causes
             // dispatch_action to always choose new-thread AND can re-trigger
             // ContextOverflow on the fresh thread.
+            // Force new-thread creation regardless of token counts — after Phase 2
+            // the old thread's context is full and the summary must go to a fresh thread.
             let mut action = data.make_continue_action(next_prompt);
             action.actual_input_tokens = None;
             action.approximate_token_count = 0;
+            action.force_new_thread = true;
             return Ok(AutoPromptOutcome::Continue(action));
         } else {
             // Unexpected state — reset and stop
