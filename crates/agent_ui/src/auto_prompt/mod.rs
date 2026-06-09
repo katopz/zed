@@ -352,29 +352,35 @@ pub(crate) fn dispatch_action(
     // a GPUI action. window.dispatch_action is unreliable when the user is
     // idle (no focused element in the Workspace focus chain) — the action
     // reaches the App-level listener but never the Workspace handler.
+    //
+    // We must defer the workspace update to avoid a recursive entity
+    // update panic. dispatch_action is called inside
+    // conversation_view.update(cx, ...), and external_thread creates a new
+    // ConversationView whose observers may re-enter the one still on the
+    // update stack.
     let workspace_handle = conversation_view.workspace();
     let Some(workspace) = workspace_handle.upgrade() else {
         log::warn!("[auto_prompt] dispatch_action: workspace dropped, cannot create new thread");
         return;
     };
 
-    // Focus the panel and create the thread inside workspace.update so we
-    // have the correct Context<Workspace> for focus_panel.
-    let _ = workspace.update(cx, |workspace, cx| {
-        workspace.focus_panel::<crate::AgentPanel>(window, cx);
+    window.defer(cx, move |window, cx| {
+        let _ = workspace.update(cx, |workspace, cx| {
+            workspace.focus_panel::<crate::AgentPanel>(window, cx);
 
-        let Some(panel) = workspace.panel::<crate::AgentPanel>(cx) else {
-            log::warn!("[auto_prompt] dispatch_action: AgentPanel not found in workspace");
-            return;
-        };
+            let Some(panel) = workspace.panel::<crate::AgentPanel>(cx) else {
+                log::warn!("[auto_prompt] dispatch_action: AgentPanel not found in workspace");
+                return;
+            };
 
-        let work_dirs = action.work_dirs.clone().map(|dirs| PathList::new(&dirs));
+            let work_dirs = action.work_dirs.clone().map(|dirs| PathList::new(&dirs));
 
-        let from_session_id = action.from_session_id.clone();
-        let from_title = action.from_title.clone();
+            let from_session_id = action.from_session_id.clone();
+            let from_title = action.from_title.clone();
 
-        let initial_content =
-            if action.last_assistant_message.is_some() || decision_prompt.is_some() {
+            let initial_content = if action.last_assistant_message.is_some()
+                || decision_prompt.is_some()
+            {
                 let follow_up = crate::AgentPanel::build_auto_prompt_follow_up(
                     action.last_assistant_message.as_deref(),
                     decision_prompt.as_deref(),
@@ -421,22 +427,23 @@ pub(crate) fn dispatch_action(
                 }
             };
 
-        panel.update(cx, |panel, cx| {
-            panel.external_thread(
-                None,
-                None,
-                work_dirs,
-                action.from_title.clone().map(Into::into),
-                Some(initial_content),
-                true,
-                crate::AgentThreadSource::AgentPanel,
-                window,
-                cx,
-            );
+            panel.update(cx, |panel, cx| {
+                panel.external_thread(
+                    None,
+                    None,
+                    work_dirs,
+                    action.from_title.clone().map(Into::into),
+                    Some(initial_content),
+                    true,
+                    crate::AgentThreadSource::AgentPanel,
+                    window,
+                    cx,
+                );
+            });
         });
     });
 
-    log::info!("[auto_prompt] dispatch_action: new thread created directly via AgentPanel");
+    log::info!("[auto_prompt] dispatch_action: new thread creation deferred");
 }
 
 fn is_cancelled(
