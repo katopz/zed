@@ -5241,18 +5241,7 @@ impl ThreadView {
 
                                     log::info!("[auto_prompt] Retry succeeded - dispatching action");
                                     match conversation_view.update_in(cx, |_cv, window, cx| {
-                                        let decision_prompt = auto_prompt::extract_decision_prompt(&action.next_prompt);
-                                        let action = Box::new(crate::auto_prompt::AutoPromptNewThread {
-                                            from_session_id: action.from_session_id,
-                                            from_title: action.from_title,
-                                            next_prompt: action.next_prompt,
-                                            work_dirs: action.work_dirs,
-                                            original_user_message: action.original_user_message,
-                                            profile_id: action.profile_id,
-                                            last_assistant_message: action.last_assistant_message,
-                                            decision_prompt,
-                                        });
-                                        window.dispatch_action(action, cx);
+                                        crate::auto_prompt::dispatch_action(action, _cv, window, cx);
                                     }) {
                                         Ok(()) => {
                                             log::info!("[auto_prompt] Retry dispatch submitted");

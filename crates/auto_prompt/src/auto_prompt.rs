@@ -5295,4 +5295,108 @@ mod tests {
             "should not have Remaining Plans section when no plan files"
         );
     }
+
+    // --- Regression tests for retry dispatch path (## 3. Decision roundtrip) ---
+
+    /// Simulates what `dispatch_action` does when it receives a `Continue(action)`:
+    /// 1. `with_first_prompt_context` wraps the decision in structured format
+    /// 2. `extract_decision_prompt` extracts the decision back out
+    /// 3. The result must be non-None (used by `build_auto_prompt_follow_up` to
+    ///    produce `## 3. Decision` in the new thread's follow-up)
+    ///
+    /// If this test fails, either the prompt format changed or extraction broke.
+    #[test]
+    fn test_dispatch_action_decision_roundtrip_3_part() {
+        let summary = "Implementing feature X in plan 085";
+        let last_msg = "Completed steps 1-3, need to do step 4";
+        let decision = "do step 4 now and commit";
+
+        // This is what decide_with_llm produces via make_continue
+        let next_prompt =
+            with_first_prompt_context(decision.to_string(), Some(summary), None, Some(last_msg));
+
+        // Verify the structured format is correct
+        assert!(
+            next_prompt.contains("## 1. Thread Summary"),
+            "3-part format should start with Thread Summary"
+        );
+        assert!(
+            next_prompt.contains("## 2. Last Assistant Message"),
+            "3-part format should have Last Assistant Message"
+        );
+        assert!(
+            next_prompt.contains("## 3. Decision"),
+            "3-part format MUST have Decision section"
+        );
+
+        // This is what dispatch_action does
+        let extracted = extract_decision_prompt(&next_prompt);
+        assert_eq!(
+            extracted,
+            Some(decision.to_string()),
+            "dispatch_action must be able to extract the decision for build_auto_prompt_follow_up"
+        );
+    }
+
+    /// Same roundtrip but for the 2-part fallback (no summary, only last assistant message).
+    #[test]
+    fn test_dispatch_action_decision_roundtrip_2_part() {
+        let last_msg = "Completed steps 1-3";
+        let decision = "continue with step 4";
+
+        let next_prompt = with_first_prompt_context(
+            decision.to_string(),
+            None, // no summary
+            None,
+            Some(last_msg),
+        );
+
+        assert!(
+            next_prompt.contains("## 1. Last Assistant Message"),
+            "2-part format should start with Last Assistant Message"
+        );
+        assert!(
+            next_prompt.contains("## 2. Decision"),
+            "2-part format MUST have Decision section"
+        );
+        assert!(
+            !next_prompt.contains("## 3. Decision"),
+            "2-part format should NOT have ## 3. Decision"
+        );
+
+        let extracted = extract_decision_prompt(&next_prompt);
+        assert_eq!(
+            extracted,
+            Some(decision.to_string()),
+            "extract_decision_prompt must find ## 2. Decision via alt_marker fallback"
+        );
+    }
+
+    /// Regression: when both summary and last_assistant_message are None,
+    /// with_first_prompt_context returns raw text (no Decision header).
+    /// extract_decision_prompt returns None, so dispatch_action falls through
+    /// to ContentBlock path instead of ThreadSummary. This is correct behavior
+    /// but should be documented.
+    #[test]
+    fn test_dispatch_action_decision_none_when_no_context() {
+        let decision = "just do the thing";
+
+        let next_prompt = with_first_prompt_context(
+            decision.to_string(),
+            None, // no summary
+            None,
+            None, // no last assistant message
+        );
+
+        assert_eq!(
+            next_prompt, decision,
+            "no context => raw prompt, no structured headers"
+        );
+
+        let extracted = extract_decision_prompt(&next_prompt);
+        assert_eq!(
+            extracted, None,
+            "raw prompt has no Decision header => extract returns None"
+        );
+    }
 }
