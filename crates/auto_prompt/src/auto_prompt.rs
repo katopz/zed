@@ -768,6 +768,13 @@ pub fn decide(
 
     if matches!(stop_reason, acp::StopReason::Cancelled) {
         log::info!("[auto_prompt::decide] Thread was cancelled, skipping auto-prompt");
+        write_stop_log(
+            project_root.as_ref(),
+            iteration_count,
+            "thread cancelled by user or system",
+        );
+        let session_id_str = thread.read(cx).session_id().to_string();
+        reset_iteration_with_session(&session_id_str);
         return AutoPromptDecision::NoAction;
     }
 
@@ -2802,6 +2809,19 @@ fn detect_remaining_work(last_assistant_message: Option<&str>) -> Option<String>
         return None;
     }
 
+    // Skip auto_prompt's own ContextOverflow Phase 1 summary responses.
+    // The Phase 1 prompt asks the worker to summarize with sections:
+    //   ### 1. Original Task / ### 2. What Was Accomplished / ### 3. What Remains / ### 4. Active Plan State
+    // The summary naturally contains "What Remains" with unchecked items — those
+    // were already evaluated by the worker as deferred/blocked, not actionable.
+    // Firing the safety net on these creates a re-summarization loop.
+    if is_auto_prompt_summary_response(msg) {
+        log::info!(
+            "[auto_prompt::detect_remaining_work] Skipping — message is an auto_prompt summary response"
+        );
+        return None;
+    }
+
     let section = extract_remaining_section(msg);
 
     let lower = msg.to_lowercase();
@@ -2865,36 +2885,74 @@ fn detect_remaining_work(last_assistant_message: Option<&str>) -> Option<String>
     None
 }
 
+/// Detect auto_prompt's own ContextOverflow Phase 1 summary responses.
+///
+/// When context overflows, auto_prompt sends:
+///   "Stop what you are doing and provide a concise summary of your progress.
+///    Include: (1) what was the original task, (2) what was accomplished,
+///    (3) what remains to be done, (4) the current state of any active plans."
+///
+/// The worker responds with a structured summary that naturally has "What Remains"
+/// sections with unchecked items. Both `detect_remaining_work` and
+/// `llm_acknowledged_all_tasks_blocked` must skip these to avoid false positives.
+fn is_auto_prompt_summary_response(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    // Phase 1 prompt asks for exactly these 4 sections
+    let has_original_task = lower.contains("original task");
+    let has_accomplished =
+        lower.contains("what was accomplished") || lower.contains("accomplished");
+    let has_remains = lower.contains("what remains") || lower.contains("what remain");
+    let has_active_plan = lower.contains("active plan") || lower.contains("plan state");
+    let section_matches = [
+        has_original_task,
+        has_accomplished,
+        has_remains,
+        has_active_plan,
+    ]
+    .iter()
+    .filter(|&&b| b)
+    .count();
+    // Need at least 3 of 4 to avoid false positives on random text
+    section_matches >= 3
+}
+
 /// Check if the LLM explicitly declares that ALL remaining tasks are blocked,
 /// not just that some tasks happen to mention blocking keywords.
 ///
 /// This is a stricter version of the old `llm_acknowledged_blocked_tasks` — it requires
 /// the LLM to state that the work as a whole cannot proceed (e.g. "nothing actionable",
-/// "all remaining tasks are blocked", "nothing left to do"), not just that some tasks
-/// mention blocking in their descriptions.
-///
-/// The old version was too broad: any summary containing "remaining" + "blocked" anywhere
-/// (even in a table row describing one blocked task among many actionable ones) would
-/// suppress the plan task fallback, causing premature stops.
+/// "no further action"). Summary responses from auto_prompt's own Phase 1 are excluded
+/// because they naturally mention "blocked" items as part of their structured output.
 fn llm_acknowledged_all_tasks_blocked(last_assistant_message: Option<&str>) -> bool {
     let msg = match last_assistant_message {
         Some(m) if !m.trim().is_empty() => m.trim(),
         _ => return false,
     };
+
+    // Never match on auto_prompt's own summary responses — they always mention
+    // "blocked" items as part of the Phase 1 summary structure.
+    if is_auto_prompt_summary_response(msg) {
+        log::info!(
+            "[auto_prompt::llm_acknowledged_all_tasks_blocked] Skipping — message is an auto_prompt summary response"
+        );
+        return false;
+    }
+
     let lower = msg.to_lowercase();
 
     // The LLM must explicitly say everything is blocked / nothing can proceed.
-    // Broad patterns like just "remaining" + "blocked" are NOT sufficient — they
-    // fire on summary messages that auto_prompt itself requested, which naturally
-    // contain headings like "Remaining Work" and rows mentioning "blocked".
+    // Requires BOTH a qualifier (nothing/no further/can't) AND "blocked"/"deferred" together.
+    // Bare "all remaining" + "blocked" is excluded because summary sections naturally
+    // contain both words without meaning the worker is declaring a hard stop.
     let all_blocked = lower.contains("nothing actionable")
         || lower.contains("nothing left to do")
         || lower.contains("nothing left to implement")
-        || lower.contains("all remaining") && lower.contains("blocked")
         || lower.contains("no further action")
         || lower.contains("no further work")
         || lower.contains("cannot proceed further")
-        || lower.contains("can't proceed further");
+        || lower.contains("can't proceed further")
+        || lower.contains("all remaining tasks are blocked")
+        || lower.contains("all remaining work is blocked");
 
     all_blocked
 }
@@ -4873,6 +4931,101 @@ mod tests {
         assert!(
             !llm_acknowledged_all_tasks_blocked(Some("")),
             "empty string should not be blocked"
+        );
+    }
+
+    // --- Summary response detection tests ---
+
+    #[test]
+    fn test_is_auto_prompt_summary_response_real_summary() {
+        let summary = "## Session Summary\n\
+             \n### 1. Original Task\n\
+             User asked to implement Plan 264.\n\
+             \n### 2. What Was Accomplished\n\
+             Phases 1-4 complete with 38 tests.\n\
+             \n### 3. What Remains\n\
+             Phase 5-7 deferred.\n\
+             \n### 4. Active Plan State\n\
+             Plan 264 is in progress.";
+        assert!(
+            is_auto_prompt_summary_response(summary),
+            "real Phase 1 summary should be detected"
+        );
+    }
+
+    #[test]
+    fn test_is_auto_prompt_summary_response_real_summary_from_bug() {
+        // Actual text from bug.md L7968-8059
+        let summary = "## Session Summary\n\
+             \n### 1. Original Task\n\
+             \nUser asked to continue where previous session left off.\n\
+             \n### 2. What Was Accomplished\n\
+             \n6 commits on develop.\n\
+             \n### 3. What Remains\n\
+             \nPhase 5-7 need GPU.\n\
+             \n### 4. Active Plan State\n\
+             \nPlan 264 complete through Phase 4.";
+        assert!(
+            is_auto_prompt_summary_response(summary),
+            "bug.md summary should be detected"
+        );
+    }
+
+    #[test]
+    fn test_is_auto_prompt_summary_response_not_summary() {
+        assert!(
+            !is_auto_prompt_summary_response("I implemented the feature and committed."),
+            "normal assistant response should NOT be detected as summary"
+        );
+        assert!(
+            !is_auto_prompt_summary_response(""),
+            "empty string should NOT be detected"
+        );
+    }
+
+    #[test]
+    fn test_is_auto_prompt_summary_response_partial_not_enough() {
+        // Only 2 of 4 markers
+        let text = "### Original Task\nSome task\n\n### What Remains\nTodo items";
+        assert!(
+            !is_auto_prompt_summary_response(text),
+            "only 2 of 4 markers should NOT be detected (need >= 3)"
+        );
+    }
+
+    #[test]
+    fn test_detect_remaining_work_skips_summary_response() {
+        let summary = "## Session Summary\n\
+             \n### 1. Original Task\n\
+             Implement Plan 264.\n\
+             \n### 2. What Was Accomplished\n\
+             Phases 1-4 done.\n\
+             \n### 3. What Remains\n\
+             - [ ] Phase 5: GPU training\n\
+             - [ ] Phase 6: Benchmarks\n\
+             \n### 4. Active Plan State\n\
+             Plan 264 in progress.";
+        assert_eq!(
+            detect_remaining_work(Some(summary)),
+            None,
+            "should NOT detect remaining work in auto_prompt Phase 1 summary"
+        );
+    }
+
+    #[test]
+    fn test_llm_acknowledged_all_tasks_blocked_skips_summary_response() {
+        let summary = "## Session Summary\n\
+             \n### 1. Original Task\n\
+             Implement Plan 264.\n\
+             \n### 2. What Was Accomplished\n\
+             Phases 1-4 done.\n\
+             \n### 3. What Remains\n\
+             All remaining tasks are blocked by GPU.\n\
+             \n### 4. Active Plan State\n\
+             Plan 264 in progress.";
+        assert!(
+            !llm_acknowledged_all_tasks_blocked(Some(summary)),
+            "should NOT match 'all tasks blocked' inside auto_prompt Phase 1 summary"
         );
     }
 
