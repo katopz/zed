@@ -1691,6 +1691,9 @@ impl Sidebar {
                 // Retained threads include loading threads (e.g. auto_prompt) that
                 // haven't produced entries yet — filtering them out would make the
                 // thread disappear from the sidebar until its async load completes.
+                // The retained check runs before the pending_activation guard so that
+                // retained empty drafts survive the brief window where a pending
+                // activation would otherwise hide all empty drafts.
                 let pending_activation = self.pending_thread_activation;
                 let (active_panel_thread_id, retained_thread_ids) = active_workspace
                     .as_ref()
@@ -1708,11 +1711,13 @@ impl Sidebar {
                     if thread.draft != Some(DraftKind::Empty) {
                         return true;
                     }
+                    if retained_thread_ids.contains(&thread.metadata.thread_id) {
+                        return true;
+                    }
                     if pending_activation.is_some() {
                         return false;
                     }
                     Some(thread.metadata.thread_id) == active_panel_thread_id
-                        || retained_thread_ids.contains(&thread.metadata.thread_id)
                 });
 
                 // Build a lookup from live_infos and compute running/waiting
