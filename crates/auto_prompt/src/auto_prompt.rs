@@ -896,8 +896,24 @@ pub fn decide(
         log::info!(
             "auto_prompt: MaxTokens reached (context limit), dispatching new thread immediately"
         );
+
+        // Preserve slash commands through context overflow so the new thread
+        // re-activates the skill and continues the loop.
+        let max_tokens_continuation = match original_user_message.as_deref() {
+            Some(msg) if msg.trim().starts_with('/') => {
+                let cmd = msg.trim();
+                log::info!(
+                    "auto_prompt: MaxTokens — original message is slash command '{cmd}', preserving it"
+                );
+                format!(
+                    "{cmd}\n\nContext limit reached. Pick up where we left off. \
+                     Do NOT summarize — continue working immediately."
+                )
+            }
+            _ => "Context limit reached. Continue from where we left off.".to_string(),
+        };
         let next_prompt = with_first_prompt_context(
-            "Context limit reached. Continue from where we left off.".to_string(),
+            max_tokens_continuation,
             build_prompt_summary(
                 None,
                 thread_title.as_deref(),
@@ -1122,6 +1138,22 @@ pub async fn decide_with_llm(
                 detect_remaining_plan_tasks(&data.context_json)
                     .or_else(|| detect_remaining_work(data.last_assistant_message.as_deref()))
                     .unwrap_or_else(|| "Continue from where we left off.".to_string())
+            };
+
+            // Preserve slash commands (e.g. /optimize) through context overflow
+            // so the new thread re-activates the skill and continues the loop.
+            let continuation = match data.original_user_message.as_deref() {
+                Some(msg) if msg.trim().starts_with('/') => {
+                    let cmd = msg.trim();
+                    log::info!(
+                        "auto_prompt: ContextOverflow — original message is slash command '{cmd}', preserving it"
+                    );
+                    format!(
+                        "{cmd}\n\nContext overflowed mid-task. Pick up where the summary left off. \
+                         Do NOT summarize again — continue working immediately."
+                    )
+                }
+                _ => continuation,
             };
 
             let next_prompt = with_first_prompt_context(
