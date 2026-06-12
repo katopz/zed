@@ -1976,7 +1976,7 @@ fn write_stop_log(project_root: Option<&PathBuf>, iteration: u32, reason: &str) 
 /// 2. Synthesized from title + reason (when LLM returns null)
 /// 3. Raw `original_user_message` carried from thread 0 (last resort before final fallback)
 /// 4. Extracted from `first_user_message` (absolute fallback)
-fn build_prompt_summary(
+pub fn build_prompt_summary(
     thread_summary: Option<&str>,
     title: Option<&str>,
     reason: Option<&str>,

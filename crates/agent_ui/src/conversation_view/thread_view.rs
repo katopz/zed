@@ -6426,9 +6426,25 @@ impl ThreadView {
         let original_user_message = first_user_message
             .as_deref()
             .and_then(auto_prompt::extract_original_user_message)
-            .or_else(|| first_user_message.filter(|s| !s.trim().is_empty()));
+            .or_else(|| first_user_message.clone().filter(|s| !s.trim().is_empty()));
 
-        let next_prompt = "Continue from where we left off.".to_string();
+        let raw_prompt = "Continue from where we left off.".to_string();
+
+        let prompt_summary = auto_prompt::build_prompt_summary(
+            None,
+            title.as_deref(),
+            Some("manual auto-prompt continuation"),
+            last_assistant_message.as_deref(),
+            original_user_message.as_deref(),
+            first_user_message.as_deref(),
+        );
+
+        let next_prompt = auto_prompt::with_first_prompt_context(
+            raw_prompt,
+            prompt_summary.as_deref(),
+            title.as_deref(),
+            last_assistant_message.as_deref(),
+        );
 
         let action = auto_prompt::AutoPromptAction {
             from_session_id: session_id,
