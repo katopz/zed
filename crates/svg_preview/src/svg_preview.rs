@@ -1,4 +1,4 @@
-use gpui::{App, actions};
+use gpui::{App, Entity, actions};
 use multi_buffer::MultiBuffer;
 use workspace::{Pane, SplitDirection, Workspace};
 
@@ -26,10 +26,13 @@ pub fn init(cx: &mut App) {
             &workspace_entity,
             window,
             |workspace, _workspace_entity, event: &workspace::Event, window, cx| {
-                let workspace::Event::ActiveItemChanged = event else {
+                let workspace::Event::ItemAdded { item } = event else {
                     return;
                 };
-                auto_open_svg_preview(workspace, window, cx);
+                let Some(buffer) = item.act_as::<MultiBuffer>(cx) else {
+                    return;
+                };
+                auto_open_svg_preview(workspace, buffer, window, cx);
             },
         )
         .detach();
@@ -39,36 +42,23 @@ pub fn init(cx: &mut App) {
 
 fn auto_open_svg_preview(
     workspace: &mut Workspace,
+    buffer: Entity<MultiBuffer>,
     window: &mut gpui::Window,
     cx: &mut gpui::Context<Workspace>,
 ) {
-    let active_item = workspace.active_item(cx);
-    let Some(active_item) = active_item else {
-        return;
-    };
-    let Some(buffer) = active_item.act_as::<MultiBuffer>(cx) else {
-        return;
-    };
     if !svg_preview_view::SvgPreviewView::is_svg_file(&buffer, cx) {
         return;
     }
 
-    // Check if there's already a preview for this buffer in any pane
-    let singleton = buffer.read(cx).as_singleton();
-    if let Some(ref singleton_buffer) = singleton {
-        let entity_id = singleton_buffer.entity_id();
-        let already_has_preview = workspace.panes().iter().any(|pane| {
-            pane.read(cx)
-                .items_of_type::<svg_preview_view::SvgPreviewView>()
-                .any(|view| {
-                    view.read(cx)
-                        .buffer_entity_id(cx)
-                        .is_some_and(|id| id == entity_id)
-                })
-        });
-        if already_has_preview {
-            return;
-        }
+    // If a Follow-mode preview already exists, it updates via its own
+    // workspace subscription — no need to create another one.
+    let has_following_preview = workspace.panes().iter().any(|pane| {
+        pane.read(cx)
+            .items_of_type::<svg_preview_view::SvgPreviewView>()
+            .any(|view| view.read(cx).is_following())
+    });
+    if has_following_preview {
+        return;
     }
 
     let preview = svg_preview_view::SvgPreviewView::create_svg_view(

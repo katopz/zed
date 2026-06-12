@@ -194,6 +194,10 @@ impl SvgPreviewView {
         self.buffer.as_ref().map(|b| b.entity_id())
     }
 
+    pub fn is_following(&self) -> bool {
+        self._workspace_subscription.is_some()
+    }
+
     pub fn is_svg_file(buffer: &Entity<MultiBuffer>, cx: &App) -> bool {
         buffer
             .read(cx)
