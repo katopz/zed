@@ -1319,6 +1319,12 @@ pub async fn decide_with_llm(
                             }
                             None => prompt,
                         }
+                    } else if let Some(lowest_plan) = detect_plan_skip(&prompt, &data.context_json)
+                    {
+                        log::info!(
+                            "auto_prompt: overriding plan-skip with correction prompt for {lowest_plan}"
+                        );
+                        build_plan_correction_prompt(&lowest_plan)
                     } else {
                         prompt
                     };
@@ -2903,6 +2909,95 @@ fn is_perf_related(context_json: &str, work_dirs: Option<&[PathBuf]>) -> bool {
 fn is_doc_creation_prompt(prompt: &str) -> bool {
     let lower = prompt.to_lowercase();
     lower.contains("documentation") || lower.contains(".docs/")
+}
+
+/// Detect if the LLM's next_prompt references a plan number that is HIGHER than
+/// an existing plan with unchecked tasks. This catches the pattern where the
+/// orchestration LLM skips blocked/easy plans to work on a shiny new plan.
+///
+/// Returns the lowest-numbered plan file with unchecked tasks if the LLM is
+/// trying to skip it, or None if the prompt is fine.
+fn detect_plan_skip(prompt: &str, context_json: &str) -> Option<String> {
+    let prompt_lower = prompt.to_lowercase();
+
+    // Extract all plan numbers mentioned in the prompt
+    let prompt_plan_numbers: Vec<u32> = extract_plan_numbers(&prompt_lower);
+    if prompt_plan_numbers.is_empty() {
+        return None;
+    }
+    let highest_prompt_plan = *prompt_plan_numbers.iter().max()?;
+
+    // Parse plan files from context
+    #[derive(serde::Deserialize)]
+    struct PlanFile {
+        path: String,
+        content: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct Ctx {
+        #[serde(default)]
+        plan_files: Vec<PlanFile>,
+    }
+    let ctx: Ctx = serde_json::from_str(context_json).ok()?;
+
+    let mut lowest_unchecked: Option<(u32, String)> = None;
+
+    for plan in &ctx.plan_files {
+        let numbers = extract_plan_numbers(&plan.path.to_lowercase());
+        let Some(plan_num) = numbers.first() else {
+            continue;
+        };
+
+        if has_unchecked_items(&plan.content) {
+            match &lowest_unchecked {
+                None => lowest_unchecked = Some((*plan_num, plan.path.clone())),
+                Some((current_low, _)) if plan_num < current_low => {
+                    lowest_unchecked = Some((*plan_num, plan.path.clone()));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let Some((lowest_num, lowest_path)) = &lowest_unchecked else {
+        return None;
+    };
+
+    if *lowest_num < highest_prompt_plan {
+        log::info!(
+            "auto_prompt: PLAN SKIP DETECTED — prompt references plan {highest_prompt_plan} but plan {lowest_num} ({lowest_path}) has unchecked tasks"
+        );
+        Some(lowest_path.clone())
+    } else {
+        None
+    }
+}
+
+/// Extract plan numbers from a string (e.g. "plan 292" → 292, "292_worms" → 292).
+fn extract_plan_numbers(text: &str) -> Vec<u32> {
+    let mut numbers = Vec::new();
+    // Match patterns like "plan 292", "plan_292", "292_foo", ".plans/292_"
+    for part in text.split(|c: char| !c.is_ascii_alphanumeric()) {
+        if let Ok(num) = part.parse::<u32>() {
+            if num >= 100 {
+                // Only consider plan numbers >= 100 to avoid false positives
+                numbers.push(num);
+            }
+        }
+    }
+    numbers
+}
+
+/// Build a correction prompt that redirects to the lowest-numbered plan with
+/// unchecked tasks, explicitly overriding the LLM's plan-skip attempt.
+fn build_plan_correction_prompt(plan_path: &str) -> String {
+    format!(
+        "Do NOT start a new plan. Continue with the lowest-numbered remaining plan: {}. \
+         Read the plan file, identify the next unchecked task, and implement it. \
+         GPU training, benchmarks, WASM, and external dependencies are NOT valid reasons to skip — implement them. \
+         Mark completed steps as [x].",
+        plan_path
+    )
 }
 
 /// Code-level remaining work detection: scans the last assistant message
@@ -5608,5 +5703,111 @@ mod tests {
             serde_json::from_str(&result).expect("should be valid JSON");
         assert_eq!(parsed["thread_summary"], "long summary here");
         assert_eq!(parsed["confidence"], 0.75);
+    }
+
+    #[test]
+    fn test_detect_plan_skip_catches_higher_plan_jump() {
+        let context = serde_json::json!({
+            "plan_files": [
+                {
+                    "path": "/repo/.plans/284_plan.md",
+                    "content": "- [ ] Task 1\n- [x] Task 2\n- [ ] Task 3"
+                },
+                {
+                    "path": "/repo/.plans/292_worms.md",
+                    "content": "- [ ] Task A\n- [ ] Task B"
+                }
+            ]
+        })
+        .to_string();
+
+        let result = detect_plan_skip("Start with plan 292 — it has pure code tasks", &context);
+        assert_eq!(
+            result,
+            Some("/repo/.plans/284_plan.md".to_string()),
+            "should detect skip from 292 to lower plan 284"
+        );
+    }
+
+    #[test]
+    fn test_detect_plan_skip_allows_same_plan() {
+        let context = serde_json::json!({
+            "plan_files": [
+                {
+                    "path": "/repo/.plans/284_plan.md",
+                    "content": "- [ ] Task 1\n- [x] Task 2"
+                }
+            ]
+        })
+        .to_string();
+
+        let result = detect_plan_skip("Continue with plan 284 — implement Task 1", &context);
+        assert_eq!(result, None, "should allow continuing the same plan");
+    }
+
+    #[test]
+    fn test_detect_plan_skip_allows_when_no_lower_plan_has_unchecked() {
+        let context = serde_json::json!({
+            "plan_files": [
+                {
+                    "path": "/repo/.plans/284_plan.md",
+                    "content": "- [x] Task 1\n- [x] Task 2"
+                },
+                {
+                    "path": "/repo/.plans/292_worms.md",
+                    "content": "- [ ] Task A\n- [ ] Task B"
+                }
+            ]
+        })
+        .to_string();
+
+        let result = detect_plan_skip("Start with plan 292", &context);
+        assert_eq!(result, None, "lower plan is all done, skip is fine");
+    }
+
+    #[test]
+    fn test_detect_plan_skip_returns_none_for_no_plan_numbers() {
+        let context = serde_json::json!({
+            "plan_files": [
+                {
+                    "path": "/repo/.plans/284_plan.md",
+                    "content": "- [ ] Task 1"
+                }
+            ]
+        })
+        .to_string();
+
+        let result = detect_plan_skip("Continue working on the current task", &context);
+        assert_eq!(result, None, "no plan number in prompt => no skip detected");
+    }
+
+    #[test]
+    fn test_extract_plan_numbers() {
+        assert_eq!(
+            extract_plan_numbers("start with plan 292 worms fft"),
+            vec![292]
+        );
+        assert_eq!(
+            extract_plan_numbers(".plans/284_plan.md and plan 290"),
+            vec![284, 290]
+        );
+        assert_eq!(
+            extract_plan_numbers("no plan numbers here"),
+            Vec::<u32>::new()
+        );
+        assert_eq!(
+            extract_plan_numbers("plan 42 is too small"),
+            Vec::<u32>::new(),
+            "numbers < 100 should be ignored"
+        );
+    }
+
+    #[test]
+    fn test_build_plan_correction_prompt() {
+        let result = build_plan_correction_prompt("/repo/.plans/284_plan.md");
+        assert!(result.contains("284_plan.md"));
+        assert!(result.contains("NOT valid reasons to skip"));
+        assert!(result.contains("GPU training"));
+        assert!(result.contains("benchmarks"));
     }
 }
