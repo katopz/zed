@@ -1558,6 +1558,13 @@ impl AcpThread {
         }
     }
 
+    /// Returns the current turn ID, which increments each time a new turn starts
+    /// (via `send`, `retry`, or `resume`). Useful for detecting whether a turn
+    /// was replaced by a newer one (e.g. a retry).
+    pub fn turn_id(&self) -> u32 {
+        self.turn_id
+    }
+
     pub fn had_error(&self) -> bool {
         self.had_error
     }

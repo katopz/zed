@@ -25,8 +25,9 @@ pub use tool_permissions::*;
 pub use tools::*;
 
 use acp_thread::{
-    AcpThread, AgentModelId, AgentModelSelector, AgentSessionInfo, AgentSessionList,
-    AgentSessionListRequest, AgentSessionListResponse, TokenUsageRatio, UserMessageId,
+    AcpThread, AcpThreadEvent, AgentModelId, AgentModelSelector, AgentSessionInfo,
+    AgentSessionList, AgentSessionListRequest, AgentSessionListResponse, ThreadStatus,
+    TokenUsageRatio, UserMessageId,
 };
 use agent_client_protocol::schema as acp;
 use agent_skills::{
@@ -3053,7 +3054,7 @@ impl SubagentHandle for NativeSubagentHandle {
         let parent_thread = self.parent_thread.clone();
 
         cx.spawn(async move |cx| {
-            let (task, _subscription) = cx.update(|cx| {
+            let (task, _subscription, turn_id_at_send) = cx.update(|cx| {
                 let ratio_before_prompt = thread
                     .read(cx)
                     .latest_token_usage()
@@ -3068,6 +3069,11 @@ impl SubagentHandle for NativeSubagentHandle {
                 let task = acp_thread.update(cx, |acp_thread, cx| {
                     acp_thread.send(vec![message.into()], cx)
                 });
+
+                // Record the turn_id AFTER send, since send() calls run_turn()
+                // which increments turn_id. This gives us the baseline for the
+                // current turn. A subsequent retry would increment it further.
+                let turn_id_at_send = acp_thread.read(cx).turn_id();
 
                 let (token_limit_tx, token_limit_rx) = oneshot::channel::<()>();
                 let mut token_limit_tx = Some(token_limit_tx);
@@ -3111,10 +3117,43 @@ impl SubagentHandle for NativeSubagentHandle {
                         }
                     });
 
-                (wait_for_prompt, subscription)
+                (wait_for_prompt, subscription, turn_id_at_send)
             });
 
-            let result = match task.await {
+            let mut prompt_result = task.await;
+
+            // When a subagent is retried, its current turn is cancelled so a new
+            // turn can start. This cancellation would otherwise propagate to the
+            // parent as "User canceled", causing the parent to give up prematurely.
+            // Detect the retry by checking if the turn_id has increased beyond
+            // the turn that produced the Cancelled result, then wait for the
+            // retry turn to complete instead of reporting cancellation.
+            //
+            // `expected_turn_id` tracks the latest turn we know about. It starts
+            // at the turn created by send(), and is updated each time we detect
+            // a retry (since retry creates a new turn with a higher id).
+            let mut expected_turn_id = turn_id_at_send;
+
+            while matches!(prompt_result, SubagentPromptResult::Cancelled) {
+                let current_turn_id =
+                    acp_thread.read_with(cx, |t, _| t.turn_id());
+
+                if current_turn_id <= expected_turn_id {
+                    // No new turn started since the one that produced this
+                    // Cancelled result. This is a genuine user cancellation.
+                    break;
+                }
+
+                // A new turn (retry) started. Track it so we can detect if
+                // yet another retry happens, or if this turn is genuinely
+                // cancelled by the parent.
+                expected_turn_id = current_turn_id;
+
+                prompt_result =
+                    Self::wait_for_turn_completion(&acp_thread, cx).await;
+            }
+
+            let result = match prompt_result {
                 SubagentPromptResult::Completed => thread.read_with(cx, |thread, _cx| {
                     thread
                         .last_message()
@@ -3155,6 +3194,58 @@ impl SubagentHandle for NativeSubagentHandle {
 
             result
         })
+    }
+}
+
+impl NativeSubagentHandle {
+    /// Waits for the current turn on the given `acp_thread` to complete and
+    /// returns its result. Subscribes to `AcpThreadEvent::Stopped` before
+    /// checking whether a turn is running, so the event cannot be missed due
+    /// to a race between the status check and the subscription.
+    async fn wait_for_turn_completion(
+        acp_thread: &Entity<AcpThread>,
+        cx: &mut AsyncApp,
+    ) -> SubagentPromptResult {
+        let (stopped_tx, stopped_rx) = oneshot::channel::<acp::StopReason>();
+        let mut stopped_tx = Some(stopped_tx);
+
+        let _stopped_subscription = cx.update(|cx| {
+            cx.subscribe(acp_thread, move |_entity, event: &AcpThreadEvent, _cx| {
+                if let AcpThreadEvent::Stopped(reason) = event
+                    && let Some(tx) = stopped_tx.take()
+                {
+                    tx.send(*reason).ok();
+                }
+            })
+        });
+
+        // If the turn already finished before we subscribed, we will not receive
+        // a Stopped event. Check the status to decide whether to wait.
+        let is_generating =
+            acp_thread.read_with(cx, |t, _| t.status() == ThreadStatus::Generating);
+
+        if !is_generating {
+            // Turn already completed and we missed the event. Best-effort: treat
+            // as completed since the subagent finished its work.
+            return SubagentPromptResult::Completed;
+        }
+
+        match stopped_rx.await {
+            Ok(reason) => match reason {
+                acp::StopReason::Cancelled => SubagentPromptResult::Cancelled,
+                acp::StopReason::MaxTokens => SubagentPromptResult::Error(
+                    "The agent reached the maximum number of tokens.".into(),
+                ),
+                acp::StopReason::MaxTurnRequests => SubagentPromptResult::Error(
+                    "The agent reached the maximum number of allowed requests between user turns. Try again.".into(),
+                ),
+                acp::StopReason::Refusal => SubagentPromptResult::Error(
+                    "The agent refused to process that prompt. Try again.".into(),
+                ),
+                acp::StopReason::EndTurn | _ => SubagentPromptResult::Completed,
+            },
+            Err(_) => SubagentPromptResult::Error("Subagent was dropped".into()),
+        }
     }
 }
 

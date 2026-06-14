@@ -5568,6 +5568,156 @@ async fn test_subagent_tool_call_cancellation_during_task_prompt(cx: &mut TestAp
 }
 
 #[gpui::test]
+async fn test_subagent_retry_does_not_signal_parent_cancel(cx: &mut TestAppContext) {
+    // Regression test: when a subagent is retried (via the retry button), the
+    // retry cancels the subagent's current turn and starts a new one. Without
+    // the fix, this cancellation propagated to the parent as "User canceled",
+    // causing the parent to give up prematurely. The parent should instead keep
+    // waiting for the retried subagent turn to complete.
+    init_test(cx);
+    cx.update(|cx| {
+        LanguageModelRegistry::test(cx);
+    });
+    cx.update(|cx| {
+        cx.update_flags(true, vec!["subagents".to_string()]);
+    });
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/",
+        json!({
+            "a": {
+                "b.md": "Lorem"
+            }
+        }),
+    )
+    .await;
+    let project = Project::test(fs.clone(), [path!("/a").as_ref()], cx).await;
+    let thread_store = cx.new(|cx| ThreadStore::new(cx));
+    let agent =
+        cx.update(|cx| NativeAgent::new(thread_store.clone(), Templates::new(), fs.clone(), cx));
+    let connection = Rc::new(NativeAgentConnection(agent.clone()));
+
+    let acp_thread = cx
+        .update(|cx| {
+            connection
+                .clone()
+                .new_session(project.clone(), PathList::new(&[Path::new("")]), cx)
+        })
+        .await
+        .unwrap();
+    let session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+    let thread = agent.read_with(cx, |agent, _| {
+        agent.sessions.get(&session_id).unwrap().thread.clone()
+    });
+    let model = Arc::new(FakeLanguageModel::default());
+
+    thread.update(cx, |thread, cx| {
+        thread.set_model(model.clone(), cx);
+    });
+    cx.run_until_parked();
+
+    // === Start parent turn that spawns a subagent ===
+    let send = acp_thread.update(cx, |thread, cx| thread.send_raw("Prompt", cx));
+    cx.run_until_parked();
+    model.send_last_completion_stream_text_chunk("spawning subagent");
+    let subagent_tool_input = SpawnAgentToolInput {
+        label: "label".to_string(),
+        message: "subagent task prompt".to_string(),
+        session_id: None,
+    };
+    let subagent_tool_use = LanguageModelToolUse {
+        id: "subagent_1".into(),
+        name: SpawnAgentTool::NAME.into(),
+        raw_input: serde_json::to_string(&subagent_tool_input).unwrap(),
+        input: serde_json::to_value(&subagent_tool_input).unwrap(),
+        is_input_complete: true,
+        thought_signature: None,
+    };
+    model.send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(
+        subagent_tool_use,
+    ));
+    model.end_last_completion_stream();
+
+    cx.run_until_parked();
+
+    let subagent_session_id = thread.read_with(cx, |thread, cx| {
+        thread
+            .running_subagent_ids(cx)
+            .get(0)
+            .expect("subagent thread should be running")
+            .clone()
+    });
+    let subagent_acp_thread = agent.read_with(cx, |agent, _cx| {
+        agent
+            .sessions
+            .get(&subagent_session_id)
+            .expect("subagent session should exist")
+            .acp_thread
+            .clone()
+    });
+
+    // Subagent starts working (model is generating, not yet ended)
+    model.send_last_completion_stream_text_chunk("partial work");
+    cx.run_until_parked();
+
+    // === Retry the subagent ===
+    // This cancels the subagent's current turn and starts a new one.
+    // The parent should NOT see this as a cancellation.
+    let _retry_task = subagent_acp_thread.update(cx, |thread, cx| thread.retry(cx));
+    cx.run_until_parked();
+
+    // The subagent should still be registered as running in the parent.
+    // Before the fix, the parent would have already given up.
+    thread.read_with(cx, |thread, cx| {
+        assert_eq!(
+            thread.running_subagent_ids(cx).len(),
+            1,
+            "subagent should still be running in parent after retry"
+        );
+    });
+
+    // Subagent's retry turn produces a response
+    model.send_last_completion_stream_text_chunk("subagent task response");
+    model.end_last_completion_stream();
+
+    cx.run_until_parked();
+
+    // Parent model responds to complete its turn
+    model.send_last_completion_stream_text_chunk("Parent response");
+    model.end_last_completion_stream();
+
+    // The parent's send should complete successfully (not error out).
+    send.await.expect("parent turn should complete successfully after subagent retry");
+
+    // Verify the parent's tool call completed (not canceled)
+    acp_thread.read_with(cx, |thread, cx| {
+        assert_eq!(
+            thread.to_markdown(cx),
+            indoc! {"
+                ## User
+
+                Prompt
+
+                ## Assistant
+
+                spawning subagent
+
+                **Tool Call: label**
+                Status: Completed
+
+                subagent task response
+
+                ## Assistant
+
+                Parent response
+
+            "}
+        );
+    });
+}
+
+#[gpui::test]
 async fn test_subagent_tool_resume_session(cx: &mut TestAppContext) {
     init_test(cx);
     cx.update(|cx| {
