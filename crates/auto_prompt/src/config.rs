@@ -46,6 +46,9 @@ pub struct AutoPromptConfig {
     /// instead of creating a new thread with summary. Only applies to native Zed agent;
     /// ACP agents (e.g. Claude) always use same-thread /compact regardless of token count.
     /// When the actual input token count exceeds this value, a new thread is created.
+    ///
+    /// `0` (the default) = "auto": the threshold is 50% of the active model's max input
+    /// tokens, capped at 100_000. Any positive value overrides this with a fixed threshold.
     #[serde(default = "default_same_thread_token_threshold")]
     pub same_thread_token_threshold: usize,
 }
@@ -71,7 +74,8 @@ fn default_max_llm_retries() -> u32 {
 }
 
 fn default_same_thread_token_threshold() -> usize {
-    60_000
+    // 0 means "auto" (50% of model max input tokens, capped at 100k); see dispatch_action.
+    0
 }
 
 impl Default for AutoPromptConfig {

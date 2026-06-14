@@ -273,9 +273,33 @@ pub(crate) fn dispatch_action(
         .active_thread()
         .is_some_and(|tv| tv.read(cx).thread.read(cx).connection().agent_id() == *ZED_AGENT_ID);
 
-    let same_thread_threshold = auto_prompt::load_config_cached()
+    let same_thread_threshold = match auto_prompt::load_config_cached()
         .map(|config| config.same_thread_token_threshold)
-        .unwrap_or(60_000);
+        .unwrap_or(0)
+    {
+        // Explicit positive override from config/env.
+        threshold if threshold > 0 => threshold,
+        // Auto: 50% of the active model's max input tokens, capped at 100k.
+        // 60k fallback applies only before the first usage report populates token_usage.
+        _ => {
+            let max_input: usize = conversation_view
+                .active_thread()
+                .and_then(|tv| {
+                    tv.read(cx)
+                        .thread
+                        .read(cx)
+                        .token_usage()
+                        .and_then(|usage| {
+                            let max_input = usage
+                                .max_tokens
+                                .saturating_sub(usage.max_output_tokens.unwrap_or_default());
+                            (max_input > 0).then(|| max_input as usize)
+                        })
+                })
+                .unwrap_or(60_000);
+            (max_input / 2).clamp(1, 100_000)
+        }
+    };
 
     // Use actual API-reported tokens when available; fall back to the
     // chars/4 estimate. Without the fallback, models that don't report
