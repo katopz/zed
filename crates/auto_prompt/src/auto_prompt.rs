@@ -1090,6 +1090,15 @@ pub async fn decide_with_llm(
             log::info!(
                 "[auto_prompt::decide_with_llm] Returning ContextOverflow — requesting summary from AI (session={session_id_str})"
             );
+            write_overflow_log(
+                data.project_root.as_ref(),
+                data.iteration_count,
+                1,
+                summary_state,
+                OverflowContinuationSource::Phase1RequestSummary,
+                &next_prompt,
+                data.last_assistant_message.as_deref(),
+            );
             return Ok(AutoPromptOutcome::ContextOverflow(AutoPromptAction {
                 from_session_id: data.session_id,
                 from_title: data.title,
@@ -1119,34 +1128,82 @@ pub async fn decide_with_llm(
                 data.first_user_message.as_deref(),
             );
 
-            // Check for remaining plan tasks to build a continuation prompt
-            let continuation = if llm_acknowledged_all_tasks_blocked(
+            // Build the continuation prompt in priority order:
+            //   1. Summary's own Recommended Next Steps (the AI just wrote them —
+            //      they're the most authoritative source of what to do next).
+            //   2. Unchecked tasks in current-repo plan files (the session's
+            //      actual target project, not a noisy neighbour repo).
+            //   3. Unchecked tasks in other-repo plan files (last-resort).
+            //   4. Generic "continue" fallback.
+            //
+            // `detect_remaining_work` is intentionally NOT consulted here: it
+            // skips auto_prompt summary responses (see its guard) to avoid
+            // re-summarization loops in the safety-net path. Phase 2 wants the
+            // summary's guidance, so we use `extract_summary_next_steps` instead.
+            let (continuation, continuation_source) = if llm_acknowledged_all_tasks_blocked(
                 data.last_assistant_message.as_deref(),
             ) {
                 log::info!(
                     "auto_prompt: ContextOverflow — LLM acknowledged blocked tasks, using generic continuation"
                 );
-                "Continue from where we left off.".to_string()
+                (
+                    "Continue from where we left off.".to_string(),
+                    OverflowContinuationSource::AllBlockedGeneric,
+                )
+            } else if let Some(steps) = data
+                .last_assistant_message
+                .as_deref()
+                .and_then(extract_summary_next_steps)
+            {
+                log::warn!(
+                    "auto_prompt: ContextOverflow Phase 2 — using summary's Recommended Next Steps as continuation"
+                );
+                (steps, OverflowContinuationSource::SummaryNextSteps)
+            } else if let Some(plan_prompt) = detect_remaining_plan_tasks(
+                &data.context_json,
+                PlanRepoFilter::CurrentRepo,
+                data.work_dirs.as_deref(),
+            ) {
+                log::warn!(
+                    "auto_prompt: ContextOverflow Phase 2 — no summary next steps, falling back to current-repo plan tasks"
+                );
+                (plan_prompt, OverflowContinuationSource::PlanTasksCurrentRepo)
+            } else if let Some(plan_prompt) = detect_remaining_plan_tasks(
+                &data.context_json,
+                PlanRepoFilter::OtherRepos,
+                data.work_dirs.as_deref(),
+            ) {
+                log::warn!(
+                    "auto_prompt: ContextOverflow Phase 2 — no current-repo tasks, falling back to other-repo plan tasks"
+                );
+                (plan_prompt, OverflowContinuationSource::PlanTasksOtherRepos)
             } else {
-                detect_remaining_plan_tasks(&data.context_json)
-                    .or_else(|| detect_remaining_work(data.last_assistant_message.as_deref()))
-                    .unwrap_or_else(|| "Continue from where we left off.".to_string())
+                log::info!(
+                    "auto_prompt: ContextOverflow Phase 2 — no detectors matched, generic continuation"
+                );
+                (
+                    "Continue from where we left off.".to_string(),
+                    OverflowContinuationSource::GenericFallback,
+                )
             };
 
             // Preserve slash commands (e.g. /optimize) through context overflow
             // so the new thread re-activates the skill and continues the loop.
-            let continuation = match data.original_user_message.as_deref() {
+            let (continuation, continuation_source) = match data.original_user_message.as_deref() {
                 Some(msg) if msg.trim().starts_with('/') => {
                     let cmd = msg.trim();
                     log::info!(
                         "auto_prompt: ContextOverflow — original message is slash command '{cmd}', preserving it"
                     );
-                    format!(
-                        "{cmd}\n\nContext overflowed mid-task. Pick up where the summary left off. \
-                         Do NOT summarize again — continue working immediately."
+                    (
+                        format!(
+                            "{cmd}\n\nContext overflowed mid-task. Pick up where the summary left off. \
+                             Do NOT summarize again — continue working immediately."
+                        ),
+                        OverflowContinuationSource::SlashCommandPreserved,
                     )
                 }
-                _ => continuation,
+                _ => (continuation, continuation_source),
             };
 
             let next_prompt = with_first_prompt_context(
@@ -1155,6 +1212,17 @@ pub async fn decide_with_llm(
                 data.title.as_deref(),
                 data.last_assistant_message.as_deref(),
             );
+
+            write_overflow_log(
+                data.project_root.as_ref(),
+                data.iteration_count,
+                2,
+                summary_state,
+                continuation_source,
+                &next_prompt,
+                data.last_assistant_message.as_deref(),
+            );
+
             auto_claim_plan(
                 &next_prompt,
                 &data.context_json,
@@ -1176,6 +1244,15 @@ pub async fn decide_with_llm(
             // Unexpected state — reset and stop
             clear_summary_for_session(&session_id_str);
             let stop_reason = "context overflow: unexpected summary state".to_string();
+            write_overflow_log(
+                data.project_root.as_ref(),
+                data.iteration_count,
+                0,
+                summary_state,
+                OverflowContinuationSource::UnexpectedState,
+                &stop_reason,
+                data.last_assistant_message.as_deref(),
+            );
             write_stop_log(
                 data.project_root.as_ref(),
                 data.iteration_count,
@@ -1576,7 +1653,11 @@ pub async fn decide_with_llm(
                                     );
                                     Ok(data.make_continue(next_prompt))
                                 } else if let Some(plan_prompt) =
-                                    detect_remaining_plan_tasks(&data.context_json)
+                                    detect_remaining_plan_tasks(
+                                        &data.context_json,
+                                        PlanRepoFilter::All,
+                                        data.work_dirs.as_deref(),
+                                    )
                                 {
                                     log::warn!(
                                         "auto_prompt: PLAN TASK FALLBACK — detect_remaining_work found nothing but plan files have unchecked tasks"
@@ -1634,7 +1715,11 @@ pub async fn decide_with_llm(
                                     );
                                     Ok(data.make_continue(next_prompt))
                                 } else if let Some(plan_prompt) =
-                                    detect_remaining_plan_tasks(&data.context_json)
+                                    detect_remaining_plan_tasks(
+                                        &data.context_json,
+                                        PlanRepoFilter::All,
+                                        data.work_dirs.as_deref(),
+                                    )
                                 {
                                     log::warn!(
                                         "auto_prompt: PLAN TASK FALLBACK — all retries failed but plan files have unchecked tasks"
@@ -1686,7 +1771,11 @@ pub async fn decide_with_llm(
                         // Before accepting stop, check plan files for unchecked tasks.
                         // If the LLM explicitly declared ALL tasks blocked (not just some),
                         // respect that assessment.
-                        if let Some(plan_prompt) = detect_remaining_plan_tasks(&data.context_json) {
+                        if let Some(plan_prompt) = detect_remaining_plan_tasks(
+                            &data.context_json,
+                            PlanRepoFilter::All,
+                            data.work_dirs.as_deref(),
+                        ) {
                             if llm_acknowledged_all_tasks_blocked(
                                 data.last_assistant_message.as_deref(),
                             ) {
@@ -1847,6 +1936,128 @@ fn write_decision_log(
         }
         Err(err) => {
             log::warn!("auto_prompt: failed to serialize log entry: {err}");
+        }
+    }
+}
+
+/// What source produced the continuation prompt in a ContextOverflow phase.
+///
+/// Recorded in overflow logs so the reason a particular continuation was
+/// chosen is auditable without re-running the chain.
+#[derive(Clone, Copy, Debug)]
+enum OverflowContinuationSource {
+    /// Worker AI declared all tasks blocked — generic "continue" sent.
+    AllBlockedGeneric,
+    /// `extract_summary_next_steps` found a Recommended Next Steps section.
+    SummaryNextSteps,
+    /// `detect_remaining_plan_tasks(CurrentRepo)` found unclaimed same-repo tasks.
+    PlanTasksCurrentRepo,
+    /// `detect_remaining_plan_tasks(OtherRepos)` found unclaimed cross-repo tasks.
+    PlanTasksOtherRepos,
+    /// No detector matched — sent the generic "continue from where we left off".
+    GenericFallback,
+    /// Phase 1 — asking the worker to produce a summary. No continuation yet.
+    Phase1RequestSummary,
+    /// Phase 2 — slash command preserved (e.g. /optimize) regardless of detectors.
+    SlashCommandPreserved,
+    /// Unexpected summary state — chain stopped.
+    UnexpectedState,
+}
+
+impl OverflowContinuationSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AllBlockedGeneric => "all_blocked_generic",
+            Self::SummaryNextSteps => "summary_next_steps",
+            Self::PlanTasksCurrentRepo => "plan_tasks_current_repo",
+            Self::PlanTasksOtherRepos => "plan_tasks_other_repos",
+            Self::GenericFallback => "generic_fallback",
+            Self::Phase1RequestSummary => "phase1_request_summary",
+            Self::SlashCommandPreserved => "slash_command_preserved",
+            Self::UnexpectedState => "unexpected_state",
+        }
+    }
+}
+
+/// Log a ContextOverflow phase decision. Mirrors `write_decision_log` shape
+/// but adds overflow-specific fields (phase, summary_state, continuation source).
+///
+/// Without this, the entire overflow path was invisible: all three branches
+/// (Phase 1, Phase 2, unexpected) `return` early before `write_decision_log`
+/// at the bottom of `decide_with_llm`, so only the pre-call `write_stop_log`
+/// ("evaluation started") marker survived — no record of *why* the chosen
+/// continuation was produced.
+fn write_overflow_log(
+    project_root: Option<&PathBuf>,
+    iteration: u32,
+    phase: u8,
+    summary_state: u32,
+    continuation_source: OverflowContinuationSource,
+    next_prompt: &str,
+    last_assistant_message: Option<&str>,
+) {
+    let logs_dir = match project_root {
+        Some(root) => root.join(".logs"),
+        None => {
+            log::info!(
+                "[auto_prompt] overflow log: using fallback {FALLBACK_LOG_DIR} (no project root)"
+            );
+            PathBuf::from(FALLBACK_LOG_DIR)
+        }
+    };
+    if let Err(err) = std::fs::create_dir_all(&logs_dir) {
+        log::warn!("auto_prompt: failed to create .logs dir: {err}");
+        return;
+    }
+
+    let timestamp = chrono::Local::now().format("%Y-%m-%dT%H-%M-%S%.3f");
+    let filename = format!("{timestamp}_{iteration}_overflow.json");
+    let path = logs_dir.join(&filename);
+
+    // Truncate the last assistant message so log files stay manageable —
+    // we only need enough to identify which summary produced this decision.
+    let last_msg_preview = last_assistant_message
+        .map(|m| {
+            let trimmed = m.trim();
+            if trimmed.len() > 2000 {
+                format!("{}...[truncated]", &trimmed[..2000])
+            } else {
+                trimmed.to_string()
+            }
+        })
+        .unwrap_or_default();
+
+    let next_prompt_preview = {
+        let trimmed = next_prompt.trim();
+        if trimmed.len() > 4000 {
+            format!("{}...[truncated]", &trimmed[..4000])
+        } else {
+            trimmed.to_string()
+        }
+    };
+
+    let log_entry = serde_json::json!({
+        "timestamp": chrono::Local::now().to_rfc3339(),
+        "commit": get_commit_hash(),
+        "iteration": iteration,
+        "response_origin": "context_overflow",
+        "phase": phase,
+        "summary_state": summary_state,
+        "continuation_source": continuation_source.as_str(),
+        "next_prompt": next_prompt_preview,
+        "last_assistant_message_preview": last_msg_preview,
+    });
+
+    match serde_json::to_string_pretty(&log_entry) {
+        Ok(json) => {
+            if let Err(err) = std::fs::write(&path, json) {
+                log::warn!("auto_prompt: failed to write overflow log {}: {err}", path.display());
+            } else {
+                log::info!("auto_prompt: wrote overflow log to {}", path.display());
+            }
+        }
+        Err(err) => {
+            log::warn!("auto_prompt: failed to serialize overflow log entry: {err}");
         }
     }
 }
@@ -3049,6 +3260,124 @@ fn extract_remaining_section(text: &str) -> Option<String> {
     Some(paragraphs[fallback_start..].join("\n\n"))
 }
 
+/// Extract the "what to do next" section from a ContextOverflow Phase 1 summary.
+///
+/// Unlike `detect_remaining_work`, which deliberately skips auto_prompt
+/// summary responses to avoid re-summarization loops in the safety-net path,
+/// this function is called from the Phase 2 continuation builder where the
+/// summary IS the authoritative source of what should happen next.
+///
+/// Looks for the first section whose heading contains a next-steps indicator:
+///   "recommended next steps", "next steps", "what remains", "remaining",
+///   "what's left", "todo", "action items", "follow-up", "pending".
+/// Returns the heading + body (everything until the next same-or-higher level
+/// heading or end of message), so the continuation prompt keeps full context.
+/// Falls back to the last 3 paragraphs (matching `extract_remaining_section` semantics)
+/// when no explicit section is found, then to None when nothing actionable remains.
+fn extract_summary_next_steps(summary: &str) -> Option<String> {
+    let trimmed = summary.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let trigger_phrases = [
+        "recommended next steps",
+        "next steps",
+        "what remains",
+        "what is left",
+        "what's left",
+        "remaining",
+        "to do",
+        "todo",
+        "action items",
+        "follow-up",
+        "follow up",
+        "pending",
+        "when resuming",
+        "need to",
+    ];
+
+    // Collect every heading that mentions a trigger phrase, paired with its
+    // section body. We scan ALL of them (not just the first) because a summary
+    // may have a "## What Remains" section that just says "some tasks left"
+    // (no actionable markers) followed by a "## Recommended Next Steps" section
+    // that actually lists what to do.
+    let all_lines: Vec<&str> = trimmed.lines().collect();
+    let mut candidate_sections: Vec<String> = Vec::new();
+    for (idx, line) in all_lines.iter().enumerate() {
+        let lower = line.to_lowercase();
+        if !lower.starts_with('#') {
+            continue;
+        }
+        if !trigger_phrases.iter().any(|t| lower.contains(t)) {
+            continue;
+        }
+        let heading_level = line.chars().take_while(|c| *c == '#').count();
+        let mut end_idx = all_lines.len();
+        for (j, l) in all_lines.iter().enumerate().skip(idx + 1) {
+            let lvl = l.chars().take_while(|c| *c == '#').count();
+            if lvl > 0 && lvl <= heading_level {
+                end_idx = j;
+                break;
+            }
+        }
+        candidate_sections.push(all_lines[idx..end_idx].join("\n").trim().to_string());
+    }
+
+    // Prefer the first trigger heading whose body has actionable markers.
+    // If none qualify, fall back to prose scan of the last 3 paragraphs.
+    let section: Option<String> = candidate_sections.into_iter().find(|sec| {
+        let lower = sec.to_lowercase();
+        sec.contains("- ")
+            || sec.contains("* ")
+            || sec.contains("1.")
+            || sec.contains("2.")
+            || lower.contains("must")
+            || lower.contains("need to")
+            || lower.contains("should")
+            || lower.contains("want me to")
+            || lower.contains("decide")
+    });
+
+    let section = match section {
+        Some(s) => s,
+        None => {
+            // No actionable trigger heading. Fall back to scanning the last
+            // 3 paragraphs for trigger words (same heuristic as extract_remaining_section)
+            // so a summary that embeds next steps in prose is still picked up.
+            let paragraphs: Vec<&str> = trimmed
+                .split("\n\n")
+                .map(|p| p.trim())
+                .filter(|p| !p.is_empty())
+                .collect();
+            let scan = 3.min(paragraphs.len());
+            let scan_start = paragraphs.len() - scan;
+            let mut hit: Option<usize> = None;
+            for i in (scan_start..paragraphs.len()).rev() {
+                let lower = paragraphs[i].to_lowercase();
+                if trigger_phrases.iter().any(|t| lower.contains(t)) {
+                    hit = Some(i);
+                    break;
+                }
+            }
+            match hit {
+                Some(i) => paragraphs[i..].join("\n\n").trim().to_string(),
+                None => return None,
+            }
+        }
+    };
+
+    if section.trim().is_empty() {
+        return None;
+    }
+
+    Some(format!(
+        "Continuing from the previous session's summary. Recommended next steps:\n\n\
+         {section}\n\n\
+         Pick up from here. Do NOT summarize again — start working immediately."
+    ))
+}
+
 fn detect_remaining_work(last_assistant_message: Option<&str>) -> Option<String> {
     let msg = last_assistant_message?.trim();
     if msg.is_empty() {
@@ -3233,7 +3562,34 @@ fn auto_claim_plan(
     }
 }
 
-fn detect_remaining_plan_tasks(context_json: &str) -> Option<String> {
+/// Scope filter for `detect_remaining_plan_tasks`.
+///
+/// When context overflows and auto_prompt must build a continuation prompt
+/// without an LLM round-trip, plan files are consulted in priority order:
+/// current-repo unclaimed plans first, then other-repo unclaimed plans.
+/// This prevents a noisy workspace from hijacking the continuation away from
+/// the session's actual target project.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PlanRepoFilter {
+    /// All unclaimed plans regardless of which repo they live in.
+    All,
+    /// Only plans whose path is under one of `work_dirs` (the session's own repos).
+    CurrentRepo,
+    /// Only plans whose path is NOT under any of `work_dirs`.
+    OtherRepos,
+}
+
+fn plan_belongs_to_current_repo(plan_path: &str, work_dirs: &[PathBuf]) -> bool {
+    work_dirs
+        .iter()
+        .any(|dir| plan_path.starts_with(dir.to_string_lossy().as_ref()))
+}
+
+fn detect_remaining_plan_tasks(
+    context_json: &str,
+    filter: PlanRepoFilter,
+    work_dirs: Option<&[PathBuf]>,
+) -> Option<String> {
     #[derive(serde::Deserialize)]
     struct Ctx {
         #[serde(default)]
@@ -3243,26 +3599,58 @@ fn detect_remaining_plan_tasks(context_json: &str) -> Option<String> {
     }
     let ctx = serde_json::from_str::<Ctx>(context_json).ok()?;
     let session_id = ctx.session_id.as_deref().unwrap_or("");
+
+    // For CurrentRepo / OtherRepos filters, use the session's actual work_dirs
+    // (passed in from the caller) to classify each plan. When work_dirs is None
+    // or empty, fall back to All-filter behaviour — we can't classify without
+    // knowing which repos the session is targeting.
+    let dirs: Vec<PathBuf> = match (filter, work_dirs) {
+        (PlanRepoFilter::All, _) | (_, None | Some(&[])) => Vec::new(),
+        (PlanRepoFilter::CurrentRepo | PlanRepoFilter::OtherRepos, Some(dirs)) => {
+            dirs.to_vec()
+        }
+    };
+    let can_classify = !dirs.is_empty();
+
     let mut remaining = Vec::new();
     for plan in &ctx.plan_files {
         let count = count_actionable_tasks(&plan.content);
-        if count > 0 {
-            if plan_registry::is_claimed_by_other(&plan.path, session_id) {
-                log::info!(
-                    "[auto_prompt::detect_remaining_plan_tasks] Skipping plan claimed by another agent: {}",
-                    plan.path
-                );
-                continue;
-            }
-            let filename = plan.path.rsplit('/').next().unwrap_or("?");
-            remaining.push(format!("- {filename}: {count} unchecked task(s)"));
+        if count == 0 {
+            continue;
         }
+        if plan_registry::is_claimed_by_other(&plan.path, session_id) {
+            log::info!(
+                "[auto_prompt::detect_remaining_plan_tasks] Skipping plan claimed by another agent: {}",
+                plan.path
+            );
+            continue;
+        }
+        match filter {
+            PlanRepoFilter::All => {}
+            PlanRepoFilter::CurrentRepo => {
+                if can_classify && !plan_belongs_to_current_repo(&plan.path, &dirs) {
+                    continue;
+                }
+            }
+            PlanRepoFilter::OtherRepos => {
+                if can_classify && plan_belongs_to_current_repo(&plan.path, &dirs) {
+                    continue;
+                }
+            }
+        }
+        let filename = plan.path.rsplit('/').next().unwrap_or("?");
+        remaining.push(format!("- {filename}: {count} unchecked task(s)"));
     }
     if remaining.is_empty() {
         return None;
     }
+    let scope_label = match filter {
+        PlanRepoFilter::All => "",
+        PlanRepoFilter::CurrentRepo => " (current repo)",
+        PlanRepoFilter::OtherRepos => " (other repos)",
+    };
     log::warn!(
-        "[auto_prompt::detect_remaining_plan_tasks] Found {} unclaimed plan file(s) with unchecked tasks:\n{}",
+        "[auto_prompt::detect_remaining_plan_tasks{scope_label}] Found {} unclaimed plan file(s) with unchecked tasks:\n{}",
         remaining.len(),
         remaining.join("\n")
     );
@@ -3270,7 +3658,7 @@ fn detect_remaining_plan_tasks(context_json: &str) -> Option<String> {
         .map(|claims| format!("\n\n{claims}"))
         .unwrap_or_default();
     Some(format!(
-        "Plan files have remaining unchecked tasks:\n\n{}\n\n\
+        "Plan files have remaining unchecked tasks{scope_label}:\n\n{}\n\n\
          Continue with the next unchecked task. Mark completed steps as [x].{claims_note}",
         remaining.join("\n")
     ))
@@ -4960,21 +5348,21 @@ mod tests {
     #[test]
     fn test_detect_remaining_plan_tasks_no_plan_files() {
         let context_json = r#"{"messages":[]}"#;
-        let result = detect_remaining_plan_tasks(context_json);
+        let result = detect_remaining_plan_tasks(context_json, PlanRepoFilter::All, None);
         assert!(result.is_none(), "no plan_files field => None");
     }
 
     #[test]
     fn test_detect_remaining_plan_tasks_all_checked() {
         let context_json = r##"{"plan_files":[{"path":".plans/001_test.md","content":"# Plan\n\n- [x] Done task\n- [x] Another done task"}]}"##;
-        let result = detect_remaining_plan_tasks(context_json);
+        let result = detect_remaining_plan_tasks(context_json, PlanRepoFilter::All, None);
         assert!(result.is_none(), "all tasks checked => None");
     }
 
     #[test]
     fn test_detect_remaining_plan_tasks_has_unchecked() {
         let context_json = r##"{"plan_files":[{"path":".plans/001_test.md","content":"# Plan\n\n- [x] Done\n- [ ] Remaining task\n"}]}"##;
-        let result = detect_remaining_plan_tasks(context_json);
+        let result = detect_remaining_plan_tasks(context_json, PlanRepoFilter::All, None);
         assert!(result.is_some(), "unchecked task should return Some");
         let prompt = result.unwrap();
         assert!(
@@ -4998,7 +5386,7 @@ mod tests {
             {"path":".plans/002_beta.md","content":"- [ ] T1: New feature"},
             {"path":".plans/003_done.md","content":"- [x] All done"}
         ]}"##;
-        let result = detect_remaining_plan_tasks(context_json);
+        let result = detect_remaining_plan_tasks(context_json, PlanRepoFilter::All, None);
         assert!(result.is_some(), "plans with unchecked tasks => Some");
         let prompt = result.unwrap();
         assert!(prompt.contains("001_alpha.md"), "should list alpha");
@@ -5011,17 +5399,186 @@ mod tests {
 
     #[test]
     fn test_detect_remaining_plan_tasks_invalid_json() {
-        let result = detect_remaining_plan_tasks("not json at all");
+        let result = detect_remaining_plan_tasks("not json at all", PlanRepoFilter::All, None);
         assert!(result.is_none(), "invalid json => None");
     }
 
     #[test]
     fn test_detect_remaining_plan_tasks_skipped_only_is_not_actionable() {
         let context_json = r##"{"plan_files":[{"path":".plans/004_skip.md","content":"- [ ] ~~Task A~~ Skipped\n- [ ] ~~Task B~~ — deferred"}]}"##;
-        let result = detect_remaining_plan_tasks(context_json);
+        let result = detect_remaining_plan_tasks(context_json, PlanRepoFilter::All, None);
         assert!(
             result.is_none(),
             "only skipped/strikethrough checkboxes should not be actionable"
+        );
+    }
+
+    #[test]
+    fn test_detect_remaining_plan_tasks_current_repo_filters_other_repos() {
+        // Two repos, each with an unclaimed plan. CurrentRepo filter should
+        // pick up only the plan whose path is under the session's work_dirs.
+        let context_json = r##"{"plan_files":[
+            {"path":"/Users/me/proj-a/.plans/001_current.md","content":"- [ ] T1"},
+            {"path":"/Users/me/proj-b/.plans/002_other.md","content":"- [ ] T2"}
+        ]}"##;
+        let work_dirs = vec![PathBuf::from("/Users/me/proj-a")];
+        let current =
+            detect_remaining_plan_tasks(context_json, PlanRepoFilter::CurrentRepo, Some(&work_dirs))
+                .expect("current-repo plan should be found");
+        assert!(
+            current.contains("001_current.md"),
+            "current-repo plan should be listed"
+        );
+        assert!(
+            !current.contains("002_other.md"),
+            "other-repo plan should be filtered out"
+        );
+    }
+
+    #[test]
+    fn test_detect_remaining_plan_tasks_other_repos_excludes_current() {
+        let context_json = r##"{"plan_files":[
+            {"path":"/Users/me/proj-a/.plans/001_current.md","content":"- [ ] T1"},
+            {"path":"/Users/me/proj-b/.plans/002_other.md","content":"- [ ] T2"}
+        ]}"##;
+        let work_dirs = vec![PathBuf::from("/Users/me/proj-a")];
+        let other =
+            detect_remaining_plan_tasks(context_json, PlanRepoFilter::OtherRepos, Some(&work_dirs))
+                .expect("other-repo plan should be found");
+        assert!(
+            other.contains("002_other.md"),
+            "other-repo plan should be listed"
+        );
+        assert!(
+            !other.contains("001_current.md"),
+            "current-repo plan should be excluded"
+        );
+    }
+
+    #[test]
+    fn test_detect_remaining_plan_tasks_current_repo_none_falls_through() {
+        // Only other-repo plans exist — CurrentRepo returns None.
+        let context_json = r##"{"plan_files":[
+            {"path":"/Users/me/proj-b/.plans/002_other.md","content":"- [ ] T2"}
+        ]}"##;
+        let work_dirs = vec![PathBuf::from("/Users/me/proj-a")];
+        assert!(
+            detect_remaining_plan_tasks(context_json, PlanRepoFilter::CurrentRepo, Some(&work_dirs))
+                .is_none(),
+            "no current-repo plans => None"
+        );
+        assert!(
+            detect_remaining_plan_tasks(context_json, PlanRepoFilter::OtherRepos, Some(&work_dirs))
+                .is_some(),
+            "other-repo plan should be found"
+        );
+    }
+
+    #[test]
+    fn test_plan_belongs_to_current_repo_uses_work_dirs() {
+        let work_dirs = vec![PathBuf::from("/Users/me/proj-a")];
+        assert!(
+            plan_belongs_to_current_repo("/Users/me/proj-a/.plans/001.md", &work_dirs),
+            "plan under a work_dir is current-repo"
+        );
+        assert!(
+            !plan_belongs_to_current_repo("/Users/me/proj-b/.plans/002.md", &work_dirs),
+            "plan outside all work_dirs is NOT current-repo"
+        );
+    }
+
+    #[test]
+    fn test_extract_summary_next_steps_recommended_heading() {
+        let summary = "# Session Summary\n\n## What Was Accomplished\n\nDid X.\n\n\
+                       ## Recommended Next Steps (When Resuming)\n\n\
+                       1. Fix the riir-gpu build break\n\
+                       2. Finish the Cargo.toml cleanup\n\
+                       3. Commit on develop\n\n\
+                       ## Active Plan Files\n\n\n- .plans/302_*";
+        let result =
+            extract_summary_next_steps(summary).expect("recommended next steps should be found");
+        assert!(
+            result.contains("Fix the riir-gpu build break"),
+            "should contain the first recommended step"
+        );
+        assert!(
+            result.contains("Commit on develop"),
+            "should contain the last recommended step"
+        );
+        assert!(
+            !result.contains("Active Plan Files"),
+            "should NOT bleed into the next section"
+        );
+    }
+
+    #[test]
+    fn test_extract_summary_next_steps_what_remains_heading() {
+        let summary = "# Summary\n\n## Original Task\n\nRefactor X.\n\n## What Remains\n\n\
+                       - [ ] T2: verify build\n\
+                       - [ ] T3: commit\n";
+        let result =
+            extract_summary_next_steps(summary).expect("What Remains section should be found");
+        assert!(
+            result.contains("T2: verify build"),
+            "should contain the unchecked task"
+        );
+    }
+
+    #[test]
+    fn test_extract_summary_next_steps_ignores_heading_without_actionable_body() {
+        let summary = "# Summary\n\n## Next Steps\n\nSee the plan file for details.\n\n## Done\n\nAll good.";
+        let result = extract_summary_next_steps(summary);
+        assert!(
+            result.is_none(),
+            "heading with no actionable markers should be ignored"
+        );
+    }
+
+    #[test]
+    fn test_extract_summary_next_steps_no_heading_falls_back_to_prose() {
+        // Summary embeds next steps in the last paragraph without a dedicated heading.
+        let summary = "# Summary\n\nDid A.\n\nDid B.\n\nStill need to run the benchmark and commit the results.";
+        let result =
+            extract_summary_next_steps(summary).expect("prose trigger 'need to' should match");
+        assert!(
+            result.contains("run the benchmark"),
+            "fallback should pick up the prose next-step"
+        );
+    }
+
+    #[test]
+    fn test_extract_summary_next_steps_empty_returns_none() {
+        assert!(extract_summary_next_steps("").is_none());
+        assert!(extract_summary_next_steps("   ").is_none());
+    }
+
+    #[test]
+    fn test_extract_summary_next_steps_user_real_world_summary() {
+        // Reproduces the exact structure from the user's reported bug:
+        // the summary had "Recommended Next Steps (When Resuming)" with 3 numbered
+        // items. Before the fix, auto_prompt's Phase 2 ignored this entirely and
+        // continued with "plan files have remaining unchecked tasks" instead.
+        let summary = "# Session Summary\n\n## Original Task\n\nRefactor.\n\n\
+                       ## What Was Accomplished\n\nSplit done.\n\n\
+                       ## What Remains\n\nSome tasks left.\n\n\
+                       ## Recommended Next Steps (When Resuming)\n\n\
+                       1. Decide on the riir-gpu build break first\n\
+                       2. Skip verification and finish cleanup\n\
+                       3. Revert the in-flight work\n\n\
+                       ## Active Plan / Issue Files\n\n- .plans/302_* complete";
+        let result = extract_summary_next_steps(summary)
+            .expect("recommended next steps must be extracted for Phase 2");
+        assert!(
+            result.contains("Decide on the riir-gpu build break"),
+            "must contain step 1"
+        );
+        assert!(
+            result.contains("Revert the in-flight work"),
+            "must contain step 3"
+        );
+        assert!(
+            result.contains("Pick up from here"),
+            "continuation framing should be present"
         );
     }
 

@@ -383,13 +383,24 @@ If no plan files exist, verification is skipped and the chain stops immediately.
 
 ### Context overflow
 
-When token count exceeds `max_context_tokens` (default 80K), the system uses a two-phase mechanism tracked by the global `SUMMARY_REQUESTED` atomic counter:
+When token count exceeds `max_context_tokens` (default 80K), the system uses a two-phase mechanism tracked by the per-session summary registry:
 
-1. **Phase 1** (`SUMMARY_REQUESTED == 0`): Send a summarization prompt to the **current thread** asking the AI to summarize progress, accomplishments, remaining work, and active plan state. Set `SUMMARY_REQUESTED = 1`.
+1. **Phase 1** (`summary_state == 0`): Send a summarization prompt to the **current thread** asking the AI to summarize progress, accomplishments, remaining work, and active plan state. Set `summary_state = 1`.
 2. The AI responds with a summary. The thread stops, triggering `on_thread_stopped` again.
-3. **Phase 2** (`SUMMARY_REQUESTED == 1`): The AI's summary is now `last_assistant_message`. Create a **new thread** with the summary + detected remaining work (from plan files or message patterns). Reset `SUMMARY_REQUESTED = 0`.
+3. **Phase 2** (`summary_state == 1`): The AI's summary is now `last_assistant_message`. Create a **new thread** with the summary + continuation prompt. Reset `summary_state = 0`.
 
-**Phase tracking survives `reset_iteration()`** — `SUMMARY_REQUESTED` is NOT included in the general counter reset. It is only cleared by:
+**Phase 2 continuation priority** (most-recently-fixed):
+
+1. **Summary's own next-steps section** (`extract_summary_next_steps`) — scans the summary for a `## Recommended Next Steps` / `## What Remains` / `## Next Steps` heading (or prose trigger in the last 3 paragraphs) and uses it verbatim. This is the authoritative source: the worker AI just wrote these steps knowing the full context.
+2. **Current-repo unclaimed plans** (`detect_remaining_plan_tasks(CurrentRepo)`) — unchecked `[ ]` tasks in plan files under the session's own `work_dirs`. Uses `plan_belongs_to_current_repo` to classify.
+3. **Other-repo unclaimed plans** (`detect_remaining_plan_tasks(OtherRepos)`) — last-resort cross-repo fallback.
+4. **Generic** — `"Continue from where we left off."`
+
+The `llm_acknowledged_all_tasks_blocked` short-circuit (all-blocked declaration → generic continuation) still takes priority over everything above.
+
+`detect_remaining_work` is intentionally NOT consulted in Phase 2: it skips auto_prompt summary responses (see its guard) to avoid re-summarization loops in the safety-net path. Phase 2 uses `extract_summary_next_steps` instead, which is purpose-built for summary messages.
+
+**Phase tracking survives `reset_iteration()`** — the summary registry is per-session and NOT included in the general counter reset. It is only cleared by:
 - Phase 2 completion (new thread created)
 - Thread cancellation
 - Max iterations reached
@@ -397,6 +408,8 @@ When token count exceeds `max_context_tokens` (default 80K), the system uses a t
 - Unexpected state
 
 This prevents re-requesting summaries when the AI has already responded with one.
+
+**Overflow logging**: Every overflow-phase decision is written to `.logs/{timestamp}_{iteration}_overflow.json` via `write_overflow_log`, recording `phase`, `summary_state`, `continuation_source` (one of `phase1_request_summary`, `summary_next_steps`, `plan_tasks_current_repo`, `plan_tasks_other_repos`, `all_blocked_generic`, `slash_command_preserved`, `generic_fallback`, `unexpected_state`), the resulting `next_prompt`, and a truncated preview of `last_assistant_message`. Without this, the overflow path was invisible — all three branches `return` early before `write_decision_log` at the bottom of `decide_with_llm`, so only the pre-call `write_stop_log` ("evaluation started") marker survived.
 
 ### Handbrake (loop prevention)
 
