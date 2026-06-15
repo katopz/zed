@@ -4423,8 +4423,29 @@ impl AgentPanel {
                 let Some(thread_view) = view.root_thread_view() else {
                     return false;
                 };
-                let thread = thread_view.read(cx).thread.read(cx);
-                thread.connection().supports_load_session() && thread.status() == ThreadStatus::Idle
+                let thread_view = thread_view.read(cx);
+                let acp_thread = thread_view.thread.read(cx);
+                // Only consider truly-idle, loadable threads for cleanup.
+                // Threads that are Generating, Loading, generating a title or
+                // summary in the background, or have a queued message must not
+                // be evicted — evicting them cancels in-flight work and loses
+                // the thread entirely (the user-facing regression where a new
+                // thread vanishes while waiting for summary/title processing).
+                if !acp_thread.connection().supports_load_session()
+                    || acp_thread.status() != ThreadStatus::Idle
+                {
+                    return false;
+                }
+                if let Some(native_thread) = thread_view.as_native_thread(cx) {
+                    let native = native_thread.read(cx);
+                    if native.is_generating_title()
+                        || native.is_generating_summary()
+                        || native.has_queued_message()
+                    {
+                        return false;
+                    }
+                }
+                true
             })
             .collect::<Vec<_>>();
 
