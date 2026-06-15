@@ -3614,7 +3614,10 @@ impl ThreadView {
                         .border_color(self.tool_card_border_color(cx))
                         .child(self.render_markdown(
                             summary,
-                            MarkdownStyle::themed(MarkdownFont::Agent, window, cx),
+                            self.markdown_style_for_thread(
+                                MarkdownStyle::themed(MarkdownFont::Agent, window, cx),
+                                cx,
+                            ),
                             cx,
                         )),
                 )
@@ -5761,11 +5764,10 @@ impl ThreadView {
                 let mut is_blank = true;
                 let is_last = entry_ix + 1 == total_entries;
 
-                let is_generating = self.thread.read(cx).status() == ThreadStatus::Generating;
-                let mut style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
-                if is_generating {
-                    style.prevent_mouse_interaction = true;
-                }
+                let style = self.markdown_style_for_thread(
+                    MarkdownStyle::themed(MarkdownFont::Agent, window, cx),
+                    cx,
+                );
                 let message_body = v_flex()
                     .w_full()
                     .gap_3()
@@ -6816,7 +6818,10 @@ impl ThreadView {
                                 .overflow_hidden()
                                 .child(self.render_markdown(
                                     chunk,
-                                    MarkdownStyle::themed(MarkdownFont::Agent, window, cx),
+                                    self.markdown_style_for_thread(
+                                        MarkdownStyle::themed(MarkdownFont::Agent, window, cx),
+                                        cx,
+                                    ),
                                     cx,
                                 )),
                         )
@@ -7063,7 +7068,11 @@ impl ThreadView {
             .unwrap_or(&command_source)
             .to_string();
 
-        let mut style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx).with_buffer_font(cx);
+        let mut style = self
+            .markdown_style_for_thread(
+                MarkdownStyle::themed(MarkdownFont::Agent, window, cx).with_buffer_font(cx),
+                cx,
+            );
         style.container_style.text.font_size = Some(rems_from_px(12.).into());
         style.container_style.text.line_height = Some(rems_from_px(17.).into());
         style.height_is_multiple_of_line_height = true;
@@ -7614,9 +7623,12 @@ impl ThreadView {
                                         |input| {
                                             self.render_markdown(
                                                 input,
-                                                MarkdownStyle::themed(
-                                                    MarkdownFont::Agent,
-                                                    window,
+                                                self.markdown_style_for_thread(
+                                                    MarkdownStyle::themed(
+                                                        MarkdownFont::Agent,
+                                                        window,
+                                                        cx,
+                                                    ),
                                                     cx,
                                                 ),
                                                 cx,
@@ -7662,7 +7674,10 @@ impl ThreadView {
                                     div().id(("tool-call-raw-input-markdown", entry_ix)).child(
                                         self.render_markdown(
                                             input,
-                                            MarkdownStyle::themed(MarkdownFont::Agent, window, cx),
+                                            self.markdown_style_for_thread(
+                                                MarkdownStyle::themed(MarkdownFont::Agent, window, cx),
+                                                cx,
+                                            ),
                                             cx,
                                         ),
                                     )
@@ -8790,7 +8805,10 @@ impl ThreadView {
                     .w_full()
                     .child(self.render_markdown(
                         tool_call.label.clone(),
-                        MarkdownStyle::themed(MarkdownFont::Agent, window, cx).with_muted_text(cx),
+                        self.markdown_style_for_thread(
+                            MarkdownStyle::themed(MarkdownFont::Agent, window, cx).with_muted_text(cx),
+                            cx,
+                        ),
                         cx,
                     ))
                     .into_any()
@@ -9039,7 +9057,10 @@ impl ThreadView {
         window: &Window,
         cx: &Context<Self>,
     ) -> AnyElement {
-        let markdown_style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
+        let markdown_style = self.markdown_style_for_thread(
+            MarkdownStyle::themed(MarkdownFont::Agent, window, cx),
+            cx,
+        );
         let output = self
             .render_numbered_read_file_output(
                 markdown.clone(),
@@ -10005,8 +10026,10 @@ impl ThreadView {
             markdown
         };
 
-        let markdown_style =
-            MarkdownStyle::themed(MarkdownFont::Agent, window, cx).with_muted_text(cx);
+        let markdown_style = self.markdown_style_for_thread(
+            MarkdownStyle::themed(MarkdownFont::Agent, window, cx).with_muted_text(cx),
+            cx,
+        );
         let description = self
             .render_markdown(markdown, markdown_style, cx)
             .into_any_element();
@@ -10047,6 +10070,26 @@ impl ThreadView {
             &self.code_span_resolver,
             cx,
         )
+    }
+
+    /// Applies the thread-generation gate to a markdown style.
+    ///
+    /// While the thread (or any of its running subagents) is generating, all
+    /// rendered text/code/markdown bodies are forced into static, non-interactive
+    /// mode (`prevent_mouse_interaction = true`). This kills the per-frame
+    /// hit-testing / hover / selection machinery on large streamed bodies
+    /// (e.g. GLM 5.2 thinking streams up to 1M tokens), which is the main GPU
+    /// choke during subagent spawns. Sibling buttons (stop / retry / permission)
+    /// are rendered outside the markdown subtree, so they remain clickable.
+    fn markdown_style_for_thread(
+        &self,
+        mut style: MarkdownStyle,
+        cx: &App,
+    ) -> MarkdownStyle {
+        if self.thread.read(cx).status() == ThreadStatus::Generating {
+            style.prevent_mouse_interaction = true;
+        }
+        style
     }
 
     fn create_copy_button(&self, message: impl Into<String>) -> impl IntoElement {
