@@ -216,30 +216,14 @@ pub struct AutoPromptNewThread {
     pub decision_prompt: Option<String>,
 }
 
-/// Build a same-thread continuation prompt for ACP agents (e.g. Claude) that
-/// support the `/compact` command to summarize conversation history.
-///
-/// Format: `/compact` + newline + decision.
-///
-/// For same-thread continuations the last assistant message is already visible in the
-/// thread history, so we only include the decision prompt — not a verbatim repeat.
-fn build_compact_prompt(_last_assistant_message: Option<&str>, decision: &str) -> String {
-    let mut parts = vec!["/compact".to_string()];
-
-    if !decision.trim().is_empty() {
-        parts.push(String::new());
-        parts.push(decision.trim().to_string());
-    }
-
-    parts.join("\n")
-}
-
-/// Build a same-thread continuation prompt for the native Zed agent which does not
-/// support `/compact` as a slash command. Uses plain-text instructions instead.
+/// Build a same-thread continuation prompt. Used for all agents — the LLM
+/// orchestration call already reasoned about the last assistant message and
+/// plan state to decide whether to continue, pre-stop, or stop. This function
+/// only formats the instruction; it does not second-guess that decision.
 ///
 /// For same-thread continuations the last assistant message is already visible in the
 /// thread history, so we only include the decision prompt — not a verbatim repeat.
-fn build_native_continuation_prompt(
+fn build_continuation_prompt(
     _last_assistant_message: Option<&str>,
     decision: &str,
 ) -> String {
@@ -321,19 +305,19 @@ pub(crate) fn dispatch_action(
         action.force_new_thread
     );
 
-    // Native agent with high token count must use new thread (no /compact support).
-    // ACP agents (e.g. Claude) always use same-thread /compact.
+    // Same-thread continuation for all agents. The LLM orchestration already
+    // decided to continue based on the last assistant message + plan state —
+    // we just format the instruction. No /compact: it caused infinite loops
+    // (succeed once, then fail "not enough messages" forever) and the
+    // orchestration call already handles context overflow via ContextOverflow
+    // → summarize → new thread when tokens exceed the limit.
     if !use_new_thread {
         if let Some(active_tv) = conversation_view.active_thread() {
             let decision = strip_first_prompt_wrapper(&action.next_prompt);
-            let prompt = if is_native_agent {
-                build_native_continuation_prompt(
-                    action.last_assistant_message.as_deref(),
-                    &decision,
-                )
-            } else {
-                build_compact_prompt(action.last_assistant_message.as_deref(), &decision)
-            };
+            let prompt = build_continuation_prompt(
+                action.last_assistant_message.as_deref(),
+                &decision,
+            );
             active_tv.update(cx, |tv, cx| {
                 tv.message_editor.update(cx, |editor, cx| {
                     editor.set_message(
@@ -345,13 +329,8 @@ pub(crate) fn dispatch_action(
                 tv.send(window, cx);
             });
             log::info!(
-                "[auto_prompt] dispatch_action: sent {} continuation to same thread (tokens={:?})",
-                if is_native_agent {
-                    "native"
-                } else {
-                    "/compact"
-                },
-                action.actual_input_tokens
+                "[auto_prompt] dispatch_action: sent continuation to same thread (tokens={:?})",
+                action.actual_input_tokens,
             );
             return;
         }
@@ -607,7 +586,6 @@ pub fn on_thread_stopped(
 
         auto_prompt::AutoPromptDecision::NeedsLlmCall(mut data) => {
             data.profile_id = profile_id.take();
-            data.supports_compact = thread.read(cx).connection().agent_id() != *ZED_AGENT_ID;
             log::info!(
                 "[auto_prompt] NeedsLlmCall - spawning task to call LLM with model: {:?}",
                 data.model.id()
