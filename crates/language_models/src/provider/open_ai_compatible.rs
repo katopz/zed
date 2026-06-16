@@ -16,6 +16,7 @@ use open_ai::{
     responses::{Request as ResponseRequest, StreamEvent as ResponsesStreamEvent, stream_response},
     stream_completion,
 };
+use rand::seq::IndexedRandom;
 use settings::{Settings, SettingsStore};
 use std::sync::Arc;
 use ui::{ElevationIndex, Tooltip, prelude::*};
@@ -45,13 +46,19 @@ pub struct OpenAiCompatibleLanguageModelProvider {
 pub struct State {
     id: Arc<str>,
     api_key_state: ApiKeyState,
+    api_key_state_2: ApiKeyState,
     settings: OpenAiCompatibleSettings,
     credentials_provider: Arc<dyn CredentialsProvider>,
 }
 
+/// Derives a distinct keychain identifier for the secondary API key from the provider URL.
+fn secondary_key_url(api_url: &str) -> SharedString {
+    SharedString::new(format!("{api_url}#secondary"))
+}
+
 impl State {
     fn is_authenticated(&self) -> bool {
-        self.api_key_state.has_key()
+        self.api_key_state.has_key() || self.api_key_state_2.has_key()
     }
 
     fn set_api_key(&mut self, api_key: Option<String>, cx: &mut Context<Self>) -> Task<Result<()>> {
@@ -66,15 +73,59 @@ impl State {
         )
     }
 
-    fn authenticate(&mut self, cx: &mut Context<Self>) -> Task<Result<(), AuthenticateError>> {
+    fn set_api_key_2(&mut self, api_key: Option<String>, cx: &mut Context<Self>) -> Task<Result<()>> {
         let credentials_provider = self.credentials_provider.clone();
-        let api_url = SharedString::new(self.settings.api_url.clone());
-        self.api_key_state.load_if_needed(
+        let api_url = secondary_key_url(&self.settings.api_url);
+        self.api_key_state_2.store(
             api_url,
-            |this| &mut this.api_key_state,
+            api_key,
+            |this| &mut this.api_key_state_2,
             credentials_provider,
             cx,
         )
+    }
+
+    fn authenticate(&mut self, cx: &mut Context<Self>) -> Task<Result<(), AuthenticateError>> {
+        let credentials_provider = self.credentials_provider.clone();
+        let api_url = SharedString::new(self.settings.api_url.clone());
+        let secondary_url = secondary_key_url(&api_url);
+
+        let task1 = self.api_key_state.load_if_needed(
+            api_url,
+            |this| &mut this.api_key_state,
+            credentials_provider.clone(),
+            cx,
+        );
+        let task2 = self.api_key_state_2.load_if_needed(
+            secondary_url,
+            |this| &mut this.api_key_state_2,
+            credentials_provider,
+            cx,
+        );
+
+        cx.background_spawn(async move {
+            let result1 = task1.await;
+            let result2 = task2.await;
+            if result1.is_ok() || result2.is_ok() {
+                Ok(())
+            } else {
+                result1
+            }
+        })
+    }
+
+    /// Collects all available API keys (primary and secondary) for load-balanced selection.
+    fn available_keys(&self) -> Vec<Arc<str>> {
+        let mut keys = Vec::new();
+        let api_url = &self.settings.api_url;
+        if let Some(key) = self.api_key_state.key(api_url) {
+            keys.push(key);
+        }
+        let secondary_url = secondary_key_url(api_url);
+        if let Some(key) = self.api_key_state_2.key(&secondary_url) {
+            keys.push(key);
+        }
+        keys
     }
 }
 
@@ -92,6 +143,7 @@ impl OpenAiCompatibleLanguageModelProvider {
         }
 
         let api_key_env_var_name = format!("{}_API_KEY", id).to_case(Case::UpperSnake).into();
+        let api_key_env_var_name_2 = format!("{}_API_KEY_2", id).to_case(Case::UpperSnake).into();
         let state = cx.new(|cx| {
             cx.observe_global::<SettingsStore>(|this: &mut State, cx| {
                 let Some(settings) = resolve_settings(&this.id, cx).cloned() else {
@@ -100,9 +152,16 @@ impl OpenAiCompatibleLanguageModelProvider {
                 if &this.settings != &settings {
                     let credentials_provider = this.credentials_provider.clone();
                     let api_url = SharedString::new(settings.api_url.as_str());
+                    let secondary_url = secondary_key_url(&api_url);
                     this.api_key_state.handle_url_change(
                         api_url,
                         |this| &mut this.api_key_state,
+                        credentials_provider.clone(),
+                        cx,
+                    );
+                    this.api_key_state_2.handle_url_change(
+                        secondary_url,
+                        |this| &mut this.api_key_state_2,
                         credentials_provider,
                         cx,
                     );
@@ -117,6 +176,10 @@ impl OpenAiCompatibleLanguageModelProvider {
                 api_key_state: ApiKeyState::new(
                     SharedString::new(settings.api_url.as_str()),
                     EnvVar::new(api_key_env_var_name),
+                ),
+                api_key_state_2: ApiKeyState::new(
+                    secondary_key_url(&settings.api_url),
+                    EnvVar::new(api_key_env_var_name_2),
                 ),
                 settings,
                 credentials_provider,
@@ -207,8 +270,14 @@ impl LanguageModelProvider for OpenAiCompatibleLanguageModelProvider {
     }
 
     fn reset_credentials(&self, cx: &mut App) -> Task<Result<()>> {
-        self.state
-            .update(cx, |state, cx| state.set_api_key(None, cx))
+        self.state.update(cx, |state, cx| {
+            let task1 = state.set_api_key(None, cx);
+            let task2 = state.set_api_key_2(None, cx);
+            cx.background_spawn(async move {
+                task1.await?;
+                task2.await
+            })
+        })
     }
 }
 
@@ -236,10 +305,9 @@ impl OpenAiCompatibleLanguageModel {
     > {
         let http_client = self.http_client.clone();
 
-        let (api_key, api_url, extra_headers) = self.state.read_with(cx, |state, _cx| {
-            let api_url = &state.settings.api_url;
+        let (api_keys, api_url, extra_headers) = self.state.read_with(cx, |state, _cx| {
             (
-                state.api_key_state.key(api_url),
+                state.available_keys(),
                 state.settings.api_url.clone(),
                 state.settings.custom_headers.clone(),
             )
@@ -247,7 +315,7 @@ impl OpenAiCompatibleLanguageModel {
 
         let provider = self.provider_name.clone();
         let future = self.request_limiter.stream(async move {
-            let Some(api_key) = api_key else {
+            let Some(api_key) = api_keys.choose(&mut rand::rng()).cloned() else {
                 return Err(LanguageModelCompletionError::NoApiKey { provider });
             };
             let request = stream_completion(
@@ -273,10 +341,9 @@ impl OpenAiCompatibleLanguageModel {
     {
         let http_client = self.http_client.clone();
 
-        let (api_key, api_url, extra_headers) = self.state.read_with(cx, |state, _cx| {
-            let api_url = &state.settings.api_url;
+        let (api_keys, api_url, extra_headers) = self.state.read_with(cx, |state, _cx| {
             (
-                state.api_key_state.key(api_url),
+                state.available_keys(),
                 state.settings.api_url.clone(),
                 state.settings.custom_headers.clone(),
             )
@@ -284,7 +351,7 @@ impl OpenAiCompatibleLanguageModel {
 
         let provider = self.provider_name.clone();
         let future = self.request_limiter.stream(async move {
-            let Some(api_key) = api_key else {
+            let Some(api_key) = api_keys.choose(&mut rand::rng()).cloned() else {
                 return Err(LanguageModelCompletionError::NoApiKey { provider });
             };
             let request = stream_response(
@@ -419,6 +486,7 @@ impl LanguageModel for OpenAiCompatibleLanguageModel {
 
 struct ConfigurationView {
     api_key_editor: Entity<InputField>,
+    api_key_editor_2: Entity<InputField>,
     state: Entity<State>,
     load_credentials_task: Option<Task<()>>,
 }
@@ -426,6 +494,13 @@ struct ConfigurationView {
 impl ConfigurationView {
     fn new(state: Entity<State>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let api_key_editor = cx.new(|cx| {
+            InputField::new(
+                window,
+                cx,
+                "000000000000000000000000000000000000000000000000000",
+            )
+        });
+        let api_key_editor_2 = cx.new(|cx| {
             InputField::new(
                 window,
                 cx,
@@ -455,6 +530,7 @@ impl ConfigurationView {
 
         Self {
             api_key_editor,
+            api_key_editor_2,
             state,
             load_credentials_task,
         }
@@ -479,6 +555,24 @@ impl ConfigurationView {
         .detach_and_log_err(cx);
     }
 
+    fn save_api_key_2(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        let api_key = self.api_key_editor_2.read(cx).text(cx).trim().to_string();
+        if api_key.is_empty() {
+            return;
+        }
+
+        self.api_key_editor_2
+            .update(cx, |input, cx| input.set_text("", window, cx));
+
+        let state = self.state.clone();
+        cx.spawn_in(window, async move |_, cx| {
+            state
+                .update(cx, |state, cx| state.set_api_key_2(Some(api_key), cx))
+                .await
+        })
+        .detach_and_log_err(cx);
+    }
+
     fn reset_api_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.api_key_editor
             .update(cx, |input, cx| input.set_text("", window, cx));
@@ -492,18 +586,36 @@ impl ConfigurationView {
         .detach_and_log_err(cx);
     }
 
-    fn should_render_editor(&self, cx: &Context<Self>) -> bool {
-        !self.state.read(cx).is_authenticated()
+    fn reset_api_key_2(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.api_key_editor_2
+            .update(cx, |input, cx| input.set_text("", window, cx));
+
+        let state = self.state.clone();
+        cx.spawn_in(window, async move |_, cx| {
+            state
+                .update(cx, |state, cx| state.set_api_key_2(None, cx))
+                .await
+        })
+        .detach_and_log_err(cx);
     }
 }
 
 impl Render for ConfigurationView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let state = self.state.read(cx);
-        let env_var_set = state.api_key_state.is_from_env_var();
-        let env_var_name = state.api_key_state.env_var_name();
 
-        let api_key_section = if self.should_render_editor(cx) {
+        let primary_env_var_set = state.api_key_state.is_from_env_var();
+        let primary_env_var_name = state.api_key_state.env_var_name().clone();
+        let primary_has_key = state.api_key_state.has_key();
+
+        let secondary_env_var_set = state.api_key_state_2.is_from_env_var();
+        let secondary_env_var_name = state.api_key_state_2.env_var_name().clone();
+        let secondary_has_key = state.api_key_state_2.has_key();
+
+        let api_url = state.settings.api_url.clone();
+
+        // Primary API key section
+        let primary_section = if !primary_has_key {
             v_flex()
                 .on_action(cx.listener(Self::save_api_key))
                 .child(Label::new("To use Zed's agent with an OpenAI-compatible provider, you need to add an API key."))
@@ -514,7 +626,7 @@ impl Render for ConfigurationView {
                 )
                 .child(
                     Label::new(
-                        format!("You can also set the {env_var_name} environment variable and restart Zed."),
+                        format!("You can also set the {primary_env_var_name} environment variable and restart Zed."),
                     )
                     .size(LabelSize::Small).color(Color::Muted),
                 )
@@ -540,10 +652,10 @@ impl Render for ConfigurationView {
                                 .overflow_x_hidden()
                                 .text_ellipsis()
                                 .child(Label::new(
-                                    if env_var_set {
-                                        format!("API key set in {env_var_name} environment variable")
+                                    if primary_env_var_set {
+                                        format!("Primary API key set in {primary_env_var_name} environment variable")
                                     } else {
-                                        format!("API key configured for {}", &state.settings.api_url)
+                                        format!("Primary API key configured for {api_url}")
                                     }
                                 ))
                         ),
@@ -556,10 +668,85 @@ impl Render for ConfigurationView {
                                 .label_size(LabelSize::Small)
                                 .start_icon(Icon::new(IconName::Undo).size(IconSize::Small))
                                 .layer(ElevationIndex::ModalSurface)
-                                .when(env_var_set, |this| {
-                                    this.tooltip(Tooltip::text(format!("To reset your API key, unset the {env_var_name} environment variable.")))
+                                .when(primary_env_var_set, |this| {
+                                    this.tooltip(Tooltip::text(format!("To reset your API key, unset the {primary_env_var_name} environment variable.")))
                                 })
                                 .on_click(cx.listener(|this, _, window, cx| this.reset_api_key(window, cx))),
+                        ),
+                )
+                .into_any()
+        };
+
+        // Secondary API key section (optional, for load balancing)
+        let secondary_section = if !secondary_has_key {
+            v_flex()
+                .on_action(cx.listener(Self::save_api_key_2))
+                .mt_2()
+                .child(
+                    Label::new("Additional API Key (optional)")
+                        .size(LabelSize::Small)
+                )
+                .child(
+                    Label::new(
+                        "Add a second key to enable random load balancing across both keys.",
+                    )
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+                )
+                .child(
+                    div()
+                        .pt(DynamicSpacing::Base04.rems(cx))
+                        .child(self.api_key_editor_2.clone())
+                )
+                .child(
+                    Label::new(
+                        format!("You can also set the {secondary_env_var_name} environment variable and restart Zed."),
+                    )
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+                )
+                .into_any()
+        } else {
+            h_flex()
+                .mt_1()
+                .p_1()
+                .justify_between()
+                .rounded_md()
+                .border_1()
+                .border_color(cx.theme().colors().border)
+                .bg(cx.theme().colors().background)
+                .child(
+                    h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap_1()
+                        .child(Icon::new(IconName::Check).color(Color::Success))
+                        .child(
+                            div()
+                                .w_full()
+                                .overflow_x_hidden()
+                                .text_ellipsis()
+                                .child(Label::new(
+                                    if secondary_env_var_set {
+                                        format!("Secondary API key set in {secondary_env_var_name} environment variable")
+                                    } else {
+                                        "Secondary API key configured for load balancing".to_string()
+                                    }
+                                ))
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .flex_shrink_0()
+                        .child(
+                            Button::new("reset-api-key-2", "Reset")
+                                .label_size(LabelSize::Small)
+                                .start_icon(Icon::new(IconName::Undo).size(IconSize::Small))
+                                .layer(ElevationIndex::ModalSurface)
+                                .when(secondary_env_var_set, |this| {
+                                    this.tooltip(Tooltip::text(format!("To reset your API key, unset the {secondary_env_var_name} environment variable.")))
+                                })
+                                .on_click(cx.listener(|this, _, window, cx| this.reset_api_key_2(window, cx))),
                         ),
                 )
                 .into_any()
@@ -568,7 +755,11 @@ impl Render for ConfigurationView {
         if self.load_credentials_task.is_some() {
             div().child(Label::new("Loading credentials…")).into_any()
         } else {
-            v_flex().size_full().child(api_key_section).into_any()
+            v_flex()
+                .size_full()
+                .child(primary_section)
+                .child(secondary_section)
+                .into_any()
         }
     }
 }
