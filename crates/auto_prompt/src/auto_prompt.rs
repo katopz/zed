@@ -1979,6 +1979,25 @@ impl OverflowContinuationSource {
     }
 }
 
+/// Truncate `s` to at most `max_bytes`, never splitting a multi-byte UTF-8
+/// character. If byte index `max_bytes` lands inside a character, the slice is
+/// rolled back to the preceding char boundary. Returns the truncated string
+/// with a `...[truncated]` marker when truncation actually occurs.
+///
+/// This exists because `&s[..n]` panics if `n` is not on a char boundary, and
+/// log previews of AI output (which frequently contains em-dashes, smart
+/// quotes, CJK, emoji) would otherwise crash the process.
+fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...[truncated]", &s[..end])
+}
+
 /// Log a ContextOverflow phase decision. Mirrors `write_decision_log` shape
 /// but adds overflow-specific fields (phase, summary_state, continuation source).
 ///
@@ -2016,25 +2035,15 @@ fn write_overflow_log(
 
     // Truncate the last assistant message so log files stay manageable —
     // we only need enough to identify which summary produced this decision.
+    // Use char-boundary-safe truncation: slicing a &str at a byte index that
+    // lands inside a multi-byte UTF-8 sequence panics, and AI assistant
+    // messages routinely contain non-ASCII (em-dashes, smart quotes, CJK),
+    // so a naive &s[..2000] would crash the process.
     let last_msg_preview = last_assistant_message
-        .map(|m| {
-            let trimmed = m.trim();
-            if trimmed.len() > 2000 {
-                format!("{}...[truncated]", &trimmed[..2000])
-            } else {
-                trimmed.to_string()
-            }
-        })
+        .map(|m| truncate_at_char_boundary(m.trim(), 2000))
         .unwrap_or_default();
 
-    let next_prompt_preview = {
-        let trimmed = next_prompt.trim();
-        if trimmed.len() > 4000 {
-            format!("{}...[truncated]", &trimmed[..4000])
-        } else {
-            trimmed.to_string()
-        }
-    };
+    let next_prompt_preview = truncate_at_char_boundary(next_prompt.trim(), 4000);
 
     let log_entry = serde_json::json!({
         "timestamp": chrono::Local::now().to_rfc3339(),
@@ -5580,6 +5589,72 @@ mod tests {
             result.contains("Pick up from here"),
             "continuation framing should be present"
         );
+    }
+
+    #[test]
+    fn test_truncate_at_char_boundary_ascii_short() {
+        // Short string is returned unchanged (no truncation marker).
+        let out = truncate_at_char_boundary("hello", 100);
+        assert_eq!(out, "hello");
+    }
+
+    #[test]
+    fn test_truncate_at_char_boundary_ascii_exact() {
+        // Exactly at the limit: no truncation marker.
+        let out = truncate_at_char_boundary("abcdefghij", 10);
+        assert_eq!(out, "abcdefghij");
+    }
+
+    #[test]
+    fn test_truncate_at_char_boundary_ascii_long() {
+        let out = truncate_at_char_boundary("abcdefghij", 5);
+        assert_eq!(out, "abcde...[truncated]");
+    }
+
+    #[test]
+    fn test_truncate_at_char_boundary_multibyte_no_panic() {
+        // Regression test for the crash on 2026-06-17: `&s[..2000]` panicked
+        // because byte index 2000 landed inside a multi-byte UTF-8 sequence.
+        // Fill with em-dashes (3 bytes each) so any byte boundary is almost
+        // certainly mid-character.
+        let em_dash = "\u{2014}"; // '—', 3 bytes
+        let big: String = em_dash.repeat(10_000);
+        // Must not panic and must be marked truncated.
+        let out = truncate_at_char_boundary(&big, 2000);
+        assert!(
+            out.ends_with("...[truncated]"),
+            "should be marked truncated, got trailing bytes: {:?}",
+            &out[out.len().min(40)..]
+        );
+        // Truncated output must be valid UTF-8 and end on a char boundary.
+        assert!(out.is_char_boundary(out.len() - "...[truncated]".len()));
+    }
+
+    #[test]
+    fn test_truncate_at_char_boundary_multibyte_rolls_back_to_boundary() {
+        // Force the requested byte index to land INSIDE a multi-byte character.
+        // Layout of "aXX": byte 0 = 'a', bytes 1,2,3 = first '—', bytes 4,5,6
+        // = second '—'. Asking for byte index 5 lands mid-character inside the
+        // second em-dash, so the slice must roll back to byte 4 (the start of
+        // that em-dash) and STOP there — the truncated body is bytes 0..4,
+        // i.e. "a—" (one em-dash). This is the regression that crashed Zed:
+        // a naive &s[..5] would panic.
+        let s = "a\u{2014}\u{2014}";
+        let out = truncate_at_char_boundary(s, 5);
+        assert_eq!(out, "a—...[truncated]");
+    }
+
+    #[test]
+    fn test_truncate_at_char_boundary_empty() {
+        assert_eq!(truncate_at_char_boundary("", 100), "");
+        assert_eq!(truncate_at_char_boundary("", 0), "");
+    }
+
+    #[test]
+    fn test_truncate_at_char_boundary_zero_max_bytes() {
+        // max_bytes=0 with non-empty input: rolls back to 0, no slice body.
+        let out = truncate_at_char_boundary("abc", 0);
+        assert_eq!(out, "...[truncated]");
     }
 
     #[test]
