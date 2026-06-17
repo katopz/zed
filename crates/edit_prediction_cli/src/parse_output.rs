@@ -67,6 +67,10 @@ fn parse_zeta2_output(
     let range_in_excerpt = parsed.range_in_excerpt.clone();
     let excerpt = prompt_inputs.cursor_excerpt.as_ref();
     let editable_region_offset = range_in_excerpt.start;
+    // `range_in_excerpt` is computed by `parse_zeta2_model_output` from offsets
+    // in the model's response. A malformed response could in principle produce
+    // a start that lands inside a multi-byte UTF-8 sequence in `excerpt`.
+    debug_assert!(excerpt.is_char_boundary(editable_region_offset));
     let editable_region_start_line = excerpt[..editable_region_offset].matches('\n').count();
 
     let mut new_text = parsed.new_editable_region.clone();

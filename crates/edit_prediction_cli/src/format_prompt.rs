@@ -529,6 +529,16 @@ impl TeacherMultiRegionPrompt {
         let excerpt = prompt_inputs.cursor_excerpt.as_ref();
         let cursor_offset = prompt_inputs.cursor_offset_in_excerpt;
 
+        // `editable_range` / `context_range` come from `resolve_cursor_region`
+        // and `cursor_offset` from deserialized `ZetaPromptInput`. All three
+        // are byte offsets into `excerpt`; a mis-aligned value would panic
+        // the slices below. Validate at the entry point.
+        debug_assert!(excerpt.is_char_boundary(editable_range.start));
+        debug_assert!(excerpt.is_char_boundary(editable_range.end));
+        debug_assert!(excerpt.is_char_boundary(context_range.start));
+        debug_assert!(excerpt.is_char_boundary(context_range.end));
+        debug_assert!(excerpt.is_char_boundary(cursor_offset));
+
         let editable_text = &excerpt[editable_range.clone()];
         let cursor_in_editable = cursor_offset - editable_range.start;
 
@@ -583,6 +593,11 @@ pub fn extract_cursor_excerpt_from_example(example: &Example) -> Option<String> 
     let prompt_inputs = example.prompt_inputs.as_ref()?;
     let excerpt = prompt_inputs.cursor_excerpt.as_ref();
     let cursor_offset = prompt_inputs.cursor_offset_in_excerpt;
+
+    // `cursor_offset` comes from deserialized `ZetaPromptInput` (e.g. snowflake
+    // JSON). Validate before slicing to catch a mis-aligned payload in debug
+    // builds rather than panicking mid-character in release.
+    debug_assert!(excerpt.is_char_boundary(cursor_offset));
 
     // Simple fallback: just show content around cursor with markers
     let path_str = example.spec.cursor_path.to_string_lossy();

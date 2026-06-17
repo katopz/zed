@@ -2019,8 +2019,15 @@ fn build_example_from_snowflake(
 }
 
 fn build_cursor_position(excerpt: &str, cursor_offset: usize) -> String {
-    let before = &excerpt[..cursor_offset.min(excerpt.len())];
-    let after = &excerpt[cursor_offset.min(excerpt.len())..];
+    // `cursor_offset` flows in from deserialized snowflake input (JSON). A
+    // corrupted or schema-mismatched payload could supply a value that lands
+    // inside a multi-byte UTF-8 sequence; clamping to `excerpt.len()` keeps
+    // the bounds check safe, but we still need a char-boundary check to
+    // prevent a mid-character slice panic.
+    let cursor_offset = cursor_offset.min(excerpt.len());
+    debug_assert!(excerpt.is_char_boundary(cursor_offset));
+    let before = &excerpt[..cursor_offset];
+    let after = &excerpt[cursor_offset..];
     format!("{}[CURSOR_POSITION]{}", before, after)
 }
 

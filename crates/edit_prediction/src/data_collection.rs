@@ -266,6 +266,11 @@ pub fn format_cursor_excerpt(
     cursor_offset: usize,
     line_comment_prefix: &str,
 ) -> String {
+    // `cursor_offset` is a public-API byte offset into `excerpt`. If a caller
+    // passes a value that lands inside a multi-byte UTF-8 sequence, every
+    // slice below would panic. Catch it here once instead of at each slice.
+    debug_assert!(excerpt.is_char_boundary(cursor_offset));
+
     let cursor_line_start = excerpt[..cursor_offset]
         .rfind('\n')
         .map(|pos| pos + 1)
