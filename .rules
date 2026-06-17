@@ -5,6 +5,7 @@
 * Prefer implementing functionality in existing files unless it is a new logical component. Avoid creating many small files.
 * Avoid using functions that panic like `unwrap()`, instead use mechanisms like `?` to propagate errors.
 * Be careful with operations like indexing which may panic if the indexes are out of bounds.
+* Never slice a `&str` by byte index without a char-boundary check — `&s[..n]` panics if `n` falls inside a multi-byte UTF-8 sequence. This is a **process-killing** trap: AI output, user text, and file contents routinely contain em-dashes (`—`), smart quotes, CJK, and emoji, so byte `n` lands mid-character with high probability. `s.len()` returns bytes, not chars, so a `len() > N` guard does NOT make `&s[..N]` safe. Use `s.is_char_boundary(n)` to roll back to the previous boundary, or the canonical `auto_prompt::truncate_at_char_boundary(s, max_bytes)` helper (in `crates/auto_prompt/src/auto_prompt.rs`) when truncating for logs/previews. For char-count truncation, use `s.chars().take(n).collect::<String>()`.
 * Never silently discard errors with `let _ =` on fallible operations. Always handle errors appropriately:
   - Propagate errors with `?` when the calling function should handle them
   - Use `.log_err()` or similar when you need to ignore errors but want visibility
