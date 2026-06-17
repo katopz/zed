@@ -830,7 +830,12 @@ fn truncate_name(name: &str, max_len: usize) -> String {
     if name.len() <= max_len {
         name.to_string()
     } else {
-        format!("{}...", &name[..max_len - 3])
+        // `&name[..n]` panics if byte `n` lands inside a multi-byte UTF-8
+        // sequence. Names can be file/repo paths with non-ASCII, so roll
+        // back to the nearest char boundary. `saturating_sub(3)` also
+        // guards against underflow when max_len < 3.
+        let end = name.floor_char_boundary(max_len.saturating_sub(3));
+        format!("{}...", &name[..end])
     }
 }
 
@@ -866,4 +871,39 @@ pub fn write_summary_json(examples: &[Example], path: &Path) -> anyhow::Result<(
         .with_context(|| format!("Failed to write summary JSON to: {}", path.display()))?;
     eprintln!("Wrote summary JSON to: {}", path.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_name;
+
+    #[test]
+    fn truncate_name_short_returns_unchanged() {
+        assert_eq!(truncate_name("abc", 40), "abc");
+        assert_eq!(truncate_name("abc", 3), "abc");
+    }
+
+    #[test]
+    fn truncate_name_long_appends_ellipsis() {
+        assert_eq!(truncate_name("abcdefghij", 8), "abcde...");
+    }
+
+    #[test]
+    fn truncate_name_multibyte_does_not_panic() {
+        // Regression: `&name[..max_len - 3]` panicked when the byte index
+        // landed inside a multi-byte UTF-8 sequence. Fill with em-dashes so
+        // the target byte index is almost certainly mid-character.
+        let em_dash = "\u{2014}";
+        let name: String = em_dash.repeat(100);
+        // Must not panic.
+        let out = truncate_name(&name, 10);
+        assert!(out.ends_with("..."), "should end with ellipsis marker");
+    }
+
+    #[test]
+    fn truncate_name_tiny_max_len_does_not_underflow() {
+        // `max_len - 3` would underflow for max_len < 3 without saturating_sub.
+        let out = truncate_name("abcdefghij", 2);
+        assert!(out.ends_with("..."));
+    }
 }

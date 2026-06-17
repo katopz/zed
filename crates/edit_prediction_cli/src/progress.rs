@@ -611,7 +611,11 @@ fn truncate_with_ellipsis(s: &str, max_len: usize) -> Cow<'_, str> {
     if s.len() <= max_len {
         Cow::Borrowed(s)
     } else {
-        Cow::Owned(format!("{}…", &s[..max_len.saturating_sub(1)]))
+        // `&s[..n]` panics if byte `n` lands inside a multi-byte UTF-8
+        // sequence. Example names can be repo/file paths with non-ASCII
+        // (CJK, accented dirs), so roll back to the nearest char boundary.
+        let end = s.floor_char_boundary(max_len.saturating_sub(1));
+        Cow::Owned(format!("{}…", &s[..end]))
     }
 }
 
@@ -647,5 +651,32 @@ fn format_duration(duration: Duration) -> String {
         format!("{:.1}s", millis / 1_000.0)
     } else {
         format!("{:.1}m", millis / MINUTE_IN_MILLIS)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_with_ellipsis;
+
+    #[test]
+    fn truncate_with_ellipsis_short_borrows() {
+        assert_eq!(truncate_with_ellipsis("abc", 10), "abc");
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_long_truncates() {
+        assert_eq!(truncate_with_ellipsis("abcdefghij", 5), "abcd…");
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_multibyte_does_not_panic() {
+        // Regression: `&s[..max_len - 1]` panicked when the byte index landed
+        // inside a multi-byte UTF-8 sequence. Em-dashes force any byte index
+        // off a char boundary.
+        let em_dash = "\u{2014}";
+        let s: String = em_dash.repeat(100);
+        // Must not panic.
+        let out = truncate_with_ellipsis(&s, 10);
+        assert!(out.ends_with('…'), "should end with ellipsis char");
     }
 }

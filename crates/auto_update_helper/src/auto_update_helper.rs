@@ -108,7 +108,12 @@ mod windows_impl {
 
     pub(crate) fn show_error(mut content: String) {
         if content.len() > 600 {
-            content.truncate(600);
+            // `String::truncate` panics if the byte index lands inside a
+            // multi-byte UTF-8 sequence. Error text can contain non-ASCII
+            // (translated messages, file paths), so roll back to the nearest
+            // char boundary before truncating.
+            let boundary = content.floor_char_boundary(600);
+            content.truncate(boundary);
             content.push_str("...\n");
         }
         let _ = unsafe {

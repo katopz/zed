@@ -3382,7 +3382,12 @@ impl Thread {
         fn truncate(tool_name: &SharedString) -> SharedString {
             if tool_name.len() > MAX_TOOL_NAME_LENGTH {
                 let mut truncated = tool_name.to_string();
-                truncated.truncate(MAX_TOOL_NAME_LENGTH);
+                // Tool names can come from external MCP/context servers and
+                // may contain non-ASCII bytes. `String::truncate` panics if
+                // the byte index lands inside a multi-byte UTF-8 sequence, so
+                // roll back to the nearest char boundary first.
+                let boundary = truncated.floor_char_boundary(MAX_TOOL_NAME_LENGTH);
+                truncated.truncate(boundary);
                 truncated.into()
             } else {
                 tool_name.clone()
