@@ -1853,10 +1853,55 @@ impl ThreadView {
         cx.emit(AcpThreadViewEvent::Interacted);
         self.sync_generating_indicator(cx);
         cx.notify();
+
+        // Capture handles needed to update the parent's tool_call after the
+        // retry completes. For retry-after-completion, the original send()
+        // future has already returned, so process_tool_result (which normally
+        // transitions the parent's tool_call to Completed/Failed) does not fire.
+        // Without this, the parent's tool_call stays InProgress forever — its
+        // loading spinner never clears and the stop button (which calls cancel,
+        // which returns early when there's no running_turn) cannot fix it.
+        let parent_session_id = self.parent_session_id.clone();
+        let my_session_id = self.session_id.clone();
+        let server_view = self.server_view.clone();
+        let subagent_thread = self.thread.clone();
+
         cx.spawn(async move |this, cx| {
             let result = task.await;
 
             this.update(cx, |this, cx| {
+                if let Some(parent_session_id) = &parent_session_id {
+                    let (output, is_error) = match &result {
+                        Ok(Some(response)) => {
+                            let is_end_turn =
+                                matches!(response.stop_reason, acp::StopReason::EndTurn);
+                            let output = if is_end_turn {
+                                subagent_thread.read(cx).last_assistant_message_text(cx)
+                            } else {
+                                None
+                            };
+                            (output, !is_end_turn)
+                        }
+                        Ok(None) | Err(_) => (None, true),
+                    };
+
+                    if let Some(parent_view) = server_view
+                        .upgrade()
+                        .and_then(|sv| sv.read(cx).thread_view(parent_session_id))
+                    {
+                        parent_view.update(cx, |parent_view, cx| {
+                            parent_view.thread.update(cx, |parent_thread, cx| {
+                                parent_thread.complete_subagent_tool_call(
+                                    &my_session_id,
+                                    output,
+                                    is_error,
+                                    cx,
+                                );
+                            });
+                        });
+                    }
+                }
+
                 if let Err(err) = result {
                     this.handle_thread_error(err, cx);
                 }

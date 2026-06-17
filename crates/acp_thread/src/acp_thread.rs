@@ -1513,6 +1513,30 @@ impl AcpThread {
         &self.entries
     }
 
+    /// Returns the text content of the last assistant message, if any.
+    /// Used to extract a subagent's final output after a retry.
+    pub fn last_assistant_message_text(&self, cx: &App) -> Option<String> {
+        for entry in self.entries.iter().rev() {
+            if let AgentThreadEntry::AssistantMessage(message) = entry {
+                let text: String = message
+                    .chunks
+                    .iter()
+                    .filter_map(|chunk| match chunk {
+                        AssistantMessageChunk::Message {
+                            block: ContentBlock::Markdown { markdown },
+                        } => {
+                            let source = markdown.read(cx).source().to_string();
+                            (!source.is_empty()).then_some(source)
+                        }
+                        _ => None,
+                    })
+                    .join("\n\n");
+                return (!text.is_empty()).then_some(text);
+            }
+        }
+        None
+    }
+
     pub fn invalidate_mermaid_caches(&self, cx: &mut App) {
         for entry in &self.entries {
             let chunks = match entry {
@@ -2334,6 +2358,61 @@ impl AcpThread {
         };
 
         tool_call.status = ToolCallStatus::InProgress;
+        cx.emit(AcpThreadEvent::EntryUpdated(ix));
+    }
+
+    /// Transitions a subagent's tool call to a terminal state (`Completed` or
+    /// `Failed`) and replaces its rendered content with the given output.
+    ///
+    /// This is used when a subagent is retried *after* its initial turn has
+    /// already completed. In that case, the original `send` future has already
+    /// returned, so the normal `process_tool_result` path (which updates the
+    /// parent's tool call via the event stream) does not fire for the retry.
+    /// Without this call, the parent's tool call remains `InProgress` forever
+    /// (loading indicator stuck) and the parent LLM never sees the new result.
+    pub fn complete_subagent_tool_call(
+        &mut self,
+        subagent_session_id: &acp::SessionId,
+        output: Option<String>,
+        is_error: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let language_registry = self.project.read(cx).languages().clone();
+
+        let Some((ix, tool_call)) =
+            self.entries
+                .iter_mut()
+                .enumerate()
+                .find_map(|(index, entry)| {
+                    if let AgentThreadEntry::ToolCall(tool_call) = entry
+                        && let Some(subagent_session_info) = &tool_call.subagent_session_info
+                        && &subagent_session_info.session_id == subagent_session_id
+                    {
+                        return Some((index, tool_call));
+                    }
+                    None
+                })
+        else {
+            return;
+        };
+
+        tool_call.status = if is_error {
+            ToolCallStatus::Failed
+        } else {
+            ToolCallStatus::Completed
+        };
+
+        if let Some(output) = output {
+            let raw_output = serde_json::Value::String(output);
+            tool_call.raw_output = Some(raw_output.clone());
+            tool_call.content.clear();
+            if let Some(markdown) = markdown_for_raw_output(&raw_output, &language_registry, cx) {
+                tool_call
+                    .content
+                    .push(ToolCallContent::ContentBlock(ContentBlock::Markdown { markdown }));
+            }
+        }
+
         cx.emit(AcpThreadEvent::EntryUpdated(ix));
     }
 
@@ -4328,6 +4407,164 @@ mod tests {
                     ..
                 })
             ));
+        });
+    }
+
+    /// Regression test for retry-after-completion: when a subagent's first turn
+    /// has already completed and the user retries it, the parent's tool_call is
+    /// set back to InProgress by `restart_subagent_tool_call`. Once the retry
+    /// finishes, `complete_subagent_tool_call` must transition it to Completed
+    /// and replace the content with the new output. Without this, the parent's
+    /// tool_call stays InProgress forever — the loading spinner never clears
+    /// and the stop button cannot fix it (cancel returns early when there is no
+    /// running_turn on the parent).
+    #[gpui::test]
+    async fn test_complete_subagent_tool_call(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let subagent_session_id = acp::SessionId::new("subagent-1");
+        let tool_call_id = acp::ToolCallId::new("spawn_agent_1");
+
+        // Set up a meta with subagent_session_info so the tool_call is
+        // recognized as belonging to a subagent.
+        let subagent_info = SubagentSessionInfo {
+            session_id: subagent_session_id.clone(),
+            message_start_index: 0,
+            message_end_index: None,
+        };
+        let meta = Some(acp::Meta::from_iter([(
+            SUBAGENT_SESSION_INFO_META_KEY.into(),
+            serde_json::to_value(&subagent_info).unwrap(),
+        )]));
+
+        let connection = Rc::new(FakeAgentConnection::new().on_user_message({
+            let id = tool_call_id.clone();
+            let meta = meta.clone();
+            move |_, thread, mut cx| {
+                let id = id.clone();
+                let meta = meta.clone();
+                async move {
+                    thread
+                        .update(&mut cx, |thread, cx| {
+                            thread.handle_session_update(
+                                acp::SessionUpdate::ToolCall(
+                                    acp::ToolCall::new(id.clone(), "Subagent")
+                                        .kind(acp::ToolKind::Other)
+                                        .status(acp::ToolCallStatus::Completed)
+                                        .meta(meta.clone())
+                                        .raw_output(
+                                            serde_json::Value::String(
+                                                "first output".into(),
+                                            ),
+                                        ),
+                                ),
+                                cx,
+                            )
+                        })
+                        .unwrap()
+                        .unwrap();
+                    Ok(acp::PromptResponse::new(acp::StopReason::EndTurn))
+                }
+                .boxed_local()
+            }
+        }));
+
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        let request = thread.update(cx, |thread, cx| {
+            thread.send_raw("Run subagent", cx)
+        });
+
+        run_until_first_tool_call(&thread, cx).await;
+
+        // Wait for the turn to complete — tool_call should be Completed with
+        // the first output.
+        request.await.unwrap();
+
+        thread.read_with(cx, |thread, _| {
+            let tool_call = thread.tool_call_for_subagent(&subagent_session_id);
+            assert!(tool_call.is_some(), "tool_call should exist for subagent");
+            let tool_call = tool_call.unwrap();
+            assert!(
+                matches!(tool_call.status, ToolCallStatus::Completed),
+                "tool_call should be Completed initially"
+            );
+            assert_eq!(
+                tool_call.raw_output.as_ref().unwrap(),
+                &serde_json::Value::String("first output".into())
+            );
+        });
+
+        // Simulate a retry: restart_subagent_tool_call sets it back to InProgress.
+        thread.update(cx, |thread, cx| {
+            thread.restart_subagent_tool_call(&subagent_session_id, cx);
+        });
+
+        thread.read_with(cx, |thread, _| {
+            let tool_call = thread.tool_call_for_subagent(&subagent_session_id);
+            assert!(
+                matches!(
+                    tool_call.unwrap().status,
+                    ToolCallStatus::InProgress
+                ),
+                "tool_call should be InProgress after restart"
+            );
+        });
+
+        // Simulate the retry completing with a new output.
+        thread.update(cx, |thread, cx| {
+            thread.complete_subagent_tool_call(
+                &subagent_session_id,
+                Some("second output".to_string()),
+                false,
+                cx,
+            );
+        });
+
+        thread.read_with(cx, |thread, cx| {
+            let tool_call = thread.tool_call_for_subagent(&subagent_session_id);
+            let tool_call = tool_call.expect("tool_call should still exist");
+            assert!(
+                matches!(tool_call.status, ToolCallStatus::Completed),
+                "tool_call should be Completed after complete_subagent_tool_call"
+            );
+            assert_eq!(
+                tool_call.raw_output.as_ref().unwrap(),
+                &serde_json::Value::String("second output".into()),
+                "raw_output should be updated to the new output"
+            );
+            // Verify the rendered content also reflects the new output.
+            let content_md = tool_call.to_markdown(cx);
+            assert!(
+                content_md.contains("second output"),
+                "rendered content should contain the new output, got: {content_md}"
+            );
+            assert!(
+                !content_md.contains("first output"),
+                "rendered content should NOT contain the old output, got: {content_md}"
+            );
+        });
+
+        // Verify the error case transitions to Failed.
+        thread.update(cx, |thread, cx| {
+            thread.restart_subagent_tool_call(&subagent_session_id, cx);
+        });
+        thread.update(cx, |thread, cx| {
+            thread.complete_subagent_tool_call(&subagent_session_id, None, true, cx);
+        });
+        thread.read_with(cx, |thread, _| {
+            let tool_call = thread.tool_call_for_subagent(&subagent_session_id);
+            assert!(
+                matches!(tool_call.unwrap().status, ToolCallStatus::Failed),
+                "tool_call should be Failed when is_error=true"
+            );
         });
     }
 
