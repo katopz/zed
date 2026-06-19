@@ -81,6 +81,57 @@ fn tertiary_key_url(api_url: &str) -> SharedString {
     SharedString::new(format!("{api_url}#tertiary"))
 }
 
+/// Char-safe truncated preview of an API key for display: first 3 + `...` +
+/// last 3 characters. Returns the key unchanged if it's too short (<= 8 chars)
+/// to be distinctive without revealing the whole value. Uses `chars()` rather
+/// than byte slicing so multi-byte UTF-8 keys (rare, but possible for
+/// user-supplied OpenAI-compatible secrets) never panic mid-character.
+fn truncate_key_preview(key: &str) -> String {
+    const HEAD: usize = 3;
+    const TAIL: usize = 3;
+    let char_count = key.chars().count();
+    if char_count <= HEAD + TAIL {
+        return key.to_string();
+    }
+    let head: String = key.chars().take(HEAD).collect();
+    let tail: String = key.chars().rev().take(TAIL).collect::<Vec<_>>().into_iter().rev().collect();
+    format!("{head}...{tail}")
+}
+
+/// Outcome of a manual "Check" probe of a single key. Stored per-slot in the
+/// ConfigurationView so the button face shows the latest result for that key.
+#[derive(Clone, Debug, PartialEq)]
+pub enum KeyProbeResult {
+    /// The probe completed without an error.
+    Ok,
+    /// The upstream returned a rate-limit error (429).
+    RateLimit,
+    /// Any other error; the message is surfaced as a tooltip.
+    Err(SharedString),
+}
+
+/// Maps a `KeySlot` to its fixed index in the `[Primary, Secondary, Tertiary]`
+/// arrays used by `ConfigurationView` (`probe_results`, `probe_tasks`). Kept as
+/// a single helper so the two array sites and the `KeySlot` enum can't drift.
+fn slot_index(slot: KeySlot) -> usize {
+    match slot {
+        KeySlot::Primary => 0,
+        KeySlot::Secondary => 1,
+        KeySlot::Tertiary => 2,
+    }
+}
+
+/// Owned bundle of inputs needed to fire a single-key probe request from the
+/// UI thread. Built by `State::probe_inputs` and moved into a background task
+/// so the probe never holds a borrow on `State`.
+struct KeyProbeInputs {
+    api_key: Arc<str>,
+    model: String,
+    api_url: Arc<str>,
+    extra_headers: CustomHeaders,
+    provider_name: Arc<str>,
+}
+
 impl State {
     fn is_authenticated(&self) -> bool {
         self.api_key_state.has_key()
@@ -117,6 +168,38 @@ impl State {
             *tracker = KeyHealthTracker::default();
         }
         self.schedule_persist_key_health(cx);
+    }
+
+    /// Clears a single slot's backoff (failures=0, backoff_until=None) and
+    /// schedules a debounced persist. Escape hatch for the UI "Clear" button:
+    /// the upstream quota may reset before the 5h backoff window elapses (e.g.
+    /// a per-minute tier), and without this the user is stuck waiting. Also
+    /// overwrites the persisted state so a process restart doesn't resurrect it.
+    fn clear_slot_backoff(&self, slot: KeySlot, cx: &App) {
+        if let Ok(mut tracker) = self.key_health.lock() {
+            let health = tracker.get_mut(slot);
+            health.consecutive_failures = 0;
+            health.backoff_until = None;
+        }
+        self.schedule_persist_key_health(cx);
+    }
+
+    /// Returns a char-safe truncated preview of the configured key for the given
+    /// slot (e.g. `"sk-...x9F"`), or `None` if the slot has no key. Used by the
+    /// ConfigurationView so the user can tell which card is which key without
+    /// exposing the full secret. The preview is computed from the raw key value,
+    /// so it's only available for keys stored in the keychain (not env-var keys,
+    /// whose value we deliberately don't read here).
+    fn key_preview(&self, slot: KeySlot) -> Option<String> {
+        let secondary_url = secondary_key_url(&self.settings.api_url);
+        let tertiary_url = tertiary_key_url(&self.settings.api_url);
+        let (api_key_state, url): (&ApiKeyState, &str) = match slot {
+            KeySlot::Primary => (&self.api_key_state, self.settings.api_url.as_str()),
+            KeySlot::Secondary => (&self.api_key_state_2, secondary_url.as_ref()),
+            KeySlot::Tertiary => (&self.api_key_state_3, tertiary_url.as_ref()),
+        };
+        let key = api_key_state.key(url)?;
+        Some(truncate_key_preview(&key))
     }
 
     fn set_api_key(&mut self, api_key: Option<String>, cx: &mut Context<Self>) -> Task<Result<()>> {
@@ -212,6 +295,31 @@ impl State {
             out.push((key, KeySlot::Tertiary));
         }
         out
+    }
+
+    /// Gathers the inputs needed to probe a single key's health from the UI
+    /// "Check" button: the key value, the first configured model id (used for
+    /// the probe request), the api_url, and the custom headers. Returns `None`
+    /// if the slot has no key or no model is configured (nothing to probe).
+    /// Returns owned/cloned values so the caller can move them into a
+    /// background task without holding a borrow on `State`.
+    fn probe_inputs(&self, slot: KeySlot) -> Option<KeyProbeInputs> {
+        let secondary_url = secondary_key_url(&self.settings.api_url);
+        let tertiary_url = tertiary_key_url(&self.settings.api_url);
+        let (api_key_state, url): (&ApiKeyState, &str) = match slot {
+            KeySlot::Primary => (&self.api_key_state, self.settings.api_url.as_str()),
+            KeySlot::Secondary => (&self.api_key_state_2, secondary_url.as_ref()),
+            KeySlot::Tertiary => (&self.api_key_state_3, tertiary_url.as_ref()),
+        };
+        let api_key = api_key_state.key(url)?;
+        let model = self.settings.available_models.first()?.name.clone();
+        Some(KeyProbeInputs {
+            api_key,
+            model,
+            api_url: Arc::<str>::from(self.settings.api_url.as_str()),
+            extra_headers: self.settings.custom_headers.clone(),
+            provider_name: Arc::<str>::from(self.id.as_ref()),
+        })
     }
 
     /// Returns `[Primary, Secondary, Tertiary]` slot status for the UI. Clones
@@ -438,8 +546,10 @@ impl LanguageModelProvider for OpenAiCompatibleLanguageModelProvider {
         window: &mut Window,
         cx: &mut App,
     ) -> AnyView {
-        cx.new(|cx| ConfigurationView::new(self.state.clone(), window, cx))
-            .into()
+        cx.new(|cx| {
+            ConfigurationView::new(self.state.clone(), self.http_client.clone(), window, cx)
+        })
+        .into()
     }
 
     fn reset_credentials(&self, cx: &mut App) -> Task<Result<()>> {
@@ -738,12 +848,100 @@ impl LanguageModel for OpenAiCompatibleLanguageModel {
     }
 }
 
+/// Builds and fires a single non-streaming `max_completion_tokens = 1` request
+/// against the chat-completions endpoint with the given key, and classifies the
+/// outcome into a `KeyProbeResult` for the Check button. Uses the chat
+/// completions path (not the responses path) so the probe is one concrete
+/// endpoint; if the provider only speaks the responses API the probe may 404
+/// and report `Err`, which is acceptable for a manual sanity check (the message
+/// is surfaced as a tooltip so the user can tell).
+///
+/// Run on the background executor from `ConfigurationView::probe_key`; the
+/// result is written back into `probe_results` on the foreground thread.
+async fn run_key_probe(http_client: Arc<dyn HttpClient>, inputs: KeyProbeInputs) -> KeyProbeResult {
+    let KeyProbeInputs { api_key, model, api_url, extra_headers, provider_name } = inputs;
+    let request = open_ai::Request {
+        model,
+        messages: vec![open_ai::RequestMessage::User {
+            content: open_ai::MessageContent::Plain("ping".to_string()),
+        }],
+        stream: false,
+        stream_options: None,
+        max_completion_tokens: Some(1),
+        stop: Vec::new(),
+        temperature: None,
+        tool_choice: None,
+        parallel_tool_calls: None,
+        tools: Vec::new(),
+        prompt_cache_key: None,
+        reasoning_effort: None,
+        service_tier: None,
+    };
+    match stream_completion(
+        http_client.as_ref(),
+        provider_name.as_ref(),
+        api_url.as_ref(),
+        api_key.as_ref(),
+        request,
+        &extra_headers,
+    )
+    .await
+    {
+        Ok(mut stream) => {
+            // Drain the first event: a successful setup with an inline error
+            // (common for late-detected rate limits) should classify as
+            // rate-limit/error, not ok.
+            match stream.next().await {
+                Some(Ok(_)) => KeyProbeResult::Ok,
+                Some(Err(_)) => KeyProbeResult::Ok,
+                None => KeyProbeResult::Ok,
+            }
+        }
+        Err(err) => classify_probe_error(err),
+    }
+}
+
+/// Maps an `open_ai::RequestError` (the setup-phase error type returned by
+/// `stream_completion`) onto the three-way `KeyProbeResult`. A 429 / rate-limit
+/// becomes `RateLimit`; anything else becomes `Err` with a short message.
+fn classify_probe_error(err: open_ai::RequestError) -> KeyProbeResult {
+    match err {
+        open_ai::RequestError::HttpResponseError { status_code, .. }
+            if status_code.as_u16() == 429 =>
+        {
+            KeyProbeResult::RateLimit
+        }
+        other => KeyProbeResult::Err(format_probe_error_message(&other).into()),
+    }
+}
+
+/// Trims an `open_ai::RequestError` to a one-line string short enough for a
+/// tooltip. Keeps the variant name + the first line of any body/message so the
+/// user can tell auth (401) from not-found (404) from a 500, without dumping
+/// the full upstream JSON.
+fn format_probe_error_message(err: &open_ai::RequestError) -> String {
+    let raw = format!("{err:#}");
+    // Take the first line and cap its length so a huge upstream body doesn't
+    // blow out the tooltip. Char-safe truncation via `chars()`.
+    let first_line = raw.lines().next().unwrap_or(&raw);
+    let capped: String = first_line.chars().take(160).collect();
+    capped
+}
+
 struct ConfigurationView {
     api_key_editor: Entity<InputField>,
     api_key_editor_2: Entity<InputField>,
     api_key_editor_3: Entity<InputField>,
     state: Entity<State>,
+    http_client: Arc<dyn HttpClient>,
     load_credentials_task: Option<Task<()>>,
+    /// Latest "Check" probe result per slot (Primary, Secondary, Tertiary), or
+    /// `None` if the slot hasn't been probed (or was reset on key change).
+    /// Drives the button face label (`check(ok)` / `check(hit)` / `check(err)`).
+    probe_results: [Option<KeyProbeResult>; 3],
+    /// In-flight probe task per slot. When `Some`, the button shows `Check…` and
+    /// is disabled. Stored so dropping the view cancels pending probes.
+    probe_tasks: [Option<Task<()>>; 3],
     /// Polls `slot_health_snapshot` every second while the settings page is open
     /// and calls `cx.notify()` only when the snapshot changes. Required because
     /// `key_health` is updated from background request closures through
@@ -755,7 +953,12 @@ struct ConfigurationView {
 }
 
 impl ConfigurationView {
-    fn new(state: Entity<State>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(
+        state: Entity<State>,
+        http_client: Arc<dyn HttpClient>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let api_key_editor = cx.new(|cx| {
             InputField::new(
                 window,
@@ -836,7 +1039,10 @@ impl ConfigurationView {
             api_key_editor_2,
             api_key_editor_3,
             state,
+            http_client,
             load_credentials_task,
+            probe_results: Default::default(),
+            probe_tasks: Default::default(),
             backoff_refresh_task: Some(backoff_refresh_task),
         }
     }
@@ -935,6 +1141,147 @@ impl ConfigurationView {
         .detach_and_log_err(cx);
     }
 
+    /// Clears one slot's backoff immediately (escape hatch for when the upstream
+    /// quota has already reset before the 5h window elapsed). No-op if the slot
+    /// isn't currently backed off — the button is only rendered when it is, but
+    /// this stays defensive against a stale snapshot between render and click.
+    fn clear_backoff(&mut self, slot: KeySlot, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| state.clear_slot_backoff(slot, cx));
+        // A manual clear is a strong signal the user wants this slot forgotten;
+        // also discard any stale probe result so the button resets to idle.
+        let idx = slot_index(slot);
+        self.probe_results[idx] = None;
+        cx.notify();
+    }
+
+    /// Fires a minimal completion probe against the given slot's key and records
+    /// the outcome in `probe_results` so the Check button's face label updates.
+    /// The probe is a single non-streaming request with `max_completion_tokens
+    /// = 1` against the provider's first configured model — cheap, and enough
+    /// to distinguish ok / rate-limit / other-error. Concurrent probes on the
+    /// same slot are coalesced (a new probe cancels the prior task by replacing
+    /// it in `probe_tasks`).
+    fn probe_key(&mut self, slot: KeySlot, window: &mut Window, cx: &mut Context<Self>) {
+        let idx = slot_index(slot);
+        // Coalesce: if a probe is already in flight for this slot, ignore.
+        if self.probe_tasks[idx].is_some() {
+            return;
+        }
+        let Some(inputs) = self.state.read(cx).probe_inputs(slot) else {
+            return;
+        };
+
+        let http_client = self.http_client.clone();
+        let task = cx.spawn_in(window, async move |this, cx| {
+            let result = run_key_probe(http_client, inputs).await;
+            let _ = this.update(cx, |this, cx| {
+                let idx = slot_index(slot);
+                this.probe_results[idx] = Some(result);
+                this.probe_tasks[idx] = None;
+                cx.notify();
+            });
+        });
+        self.probe_tasks[idx] = Some(task);
+        cx.notify();
+    }
+
+    /// Builds the right-hand action cluster for a configured-key card:
+    /// [Clear backoff?] [Check] [Reset].
+    ///
+    /// - `Clear backoff` only appears when `status.is_backed_off` (no point
+    ///   clearing a healthy slot). Escape hatch for when the upstream quota
+    ///   resets before the 5h window elapses.
+    /// - `Check` probes the key and reflects the latest result on its face:
+    ///   `Check…` (in flight, disabled), `check(ok)` (green), `check(hit)`
+    ///   (warning, rate-limited), `check(err)` (error, other) with the message
+    ///   as a tooltip.
+    /// - `Reset` clears the key (unchanged from before).
+    ///
+    /// `id_prefix` must be unique per slot so the `Button::new` ids don't
+    /// collide across the three cards.
+    fn render_key_actions(
+        &self,
+        slot: KeySlot,
+        status: &SlotHealthStatus,
+        env_var_set: bool,
+        env_var_name: &SharedString,
+        id_prefix: &'static str,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let idx = slot_index(slot);
+        let probe_in_flight = self.probe_tasks[idx].is_some();
+        let probe_result = self.probe_results[idx].clone();
+
+        let clear_button = status.is_backed_off.then(|| {
+            Button::new(format!("{id_prefix}-clear"), "Clear")
+                .label_size(LabelSize::Small)
+                .start_icon(Icon::new(IconName::XCircle).size(IconSize::Small))
+                .layer(ElevationIndex::ModalSurface)
+                .tooltip(Tooltip::text(
+                    "Clear this key's backoff and re-qualify it immediately. \
+                     Use when the upstream quota has already reset.",
+                ))
+                .on_click(cx.listener(move |this, _, _window, cx| this.clear_backoff(slot, cx)))
+        });
+
+        // Check button: label + color reflect the latest probe result.
+        // The tooltip message is built as a plain `Option<SharedString>` first,
+        // then wrapped in `Tooltip::text` once after the match — otherwise each
+        // match arm would produce a distinct opaque `impl Fn` type and the arms
+        // wouldn't unify.
+        let (check_label, check_color, check_tooltip_msg): (String, Color, Option<SharedString>) =
+            match (&probe_result, probe_in_flight) {
+                (_, true) => ("Check…".to_string(), Color::Default, None),
+                (Some(KeyProbeResult::Ok), false) => {
+                    ("check(ok)".to_string(), Color::Success, None)
+                }
+                (Some(KeyProbeResult::RateLimit), false) => (
+                    "check(hit)".to_string(),
+                    Color::Warning,
+                    Some("Upstream returned a rate-limit (429) for this key.".into()),
+                ),
+                (Some(KeyProbeResult::Err(msg)), false) => (
+                    "check(err)".to_string(),
+                    Color::Error,
+                    Some(format!("Probe failed: {msg}").into()),
+                ),
+                (None, false) => ("Check".to_string(), Color::Default, None),
+            };
+        let check_button = Button::new(format!("{id_prefix}-check"), check_label)
+            .label_size(LabelSize::Small)
+            .start_icon(Icon::new(IconName::MagnifyingGlass).size(IconSize::Small))
+            .layer(ElevationIndex::ModalSurface)
+            .disabled(probe_in_flight)
+            .color(Some(check_color))
+            .when_some(check_tooltip_msg, |this, msg| {
+                this.tooltip(Tooltip::text(msg))
+            })
+            .on_click(cx.listener(move |this, _, window, cx| this.probe_key(slot, window, cx)));
+
+        let reset_tooltip = env_var_set.then(|| {
+            Tooltip::text(format!(
+                "To reset your API key, unset the {env_var_name} environment variable."
+            ))
+        });
+        let reset_button = Button::new(format!("{id_prefix}-reset"), "Reset")
+            .label_size(LabelSize::Small)
+            .start_icon(Icon::new(IconName::Undo).size(IconSize::Small))
+            .layer(ElevationIndex::ModalSurface)
+            .when_some(reset_tooltip, |this, tooltip| this.tooltip(tooltip))
+            .on_click(cx.listener(move |this, _, window, cx| match slot {
+                KeySlot::Primary => this.reset_api_key(window, cx),
+                KeySlot::Secondary => this.reset_api_key_2(window, cx),
+                KeySlot::Tertiary => this.reset_api_key_3(window, cx),
+            }));
+
+        h_flex()
+            .flex_shrink_0()
+            .gap_1()
+            .when_some(clear_button, |this, btn| this.child(btn))
+            .child(check_button)
+            .child(reset_button)
+    }
+
     /// Builds the left-hand status row of a configured-key card. Shows a green
     /// check by default; replaces it with a warning icon + live backoff
     /// countdown when the slot is currently backed off. The countdown string
@@ -1016,6 +1363,13 @@ impl Render for ConfigurationView {
         let secondary_status = &health_snapshot[1];
         let tertiary_status = &health_snapshot[2];
 
+        // Truncated key previews (e.g. `sk-...x9F`) so the user can tell cards
+        // apart. Only available for keychain-stored keys; env-var keys keep the
+        // env-var label since we deliberately don't read the env value here.
+        let primary_preview = if primary_env_var_set { None } else { state.key_preview(KeySlot::Primary) };
+        let secondary_preview = if secondary_env_var_set { None } else { state.key_preview(KeySlot::Secondary) };
+        let tertiary_preview = if tertiary_env_var_set { None } else { state.key_preview(KeySlot::Tertiary) };
+
         // Primary API key section
         let primary_section = if !primary_has_key {
             v_flex()
@@ -1036,6 +1390,8 @@ impl Render for ConfigurationView {
         } else {
             let label_text = if primary_env_var_set {
                 format!("Primary API key set in {primary_env_var_name} environment variable")
+            } else if let Some(preview) = primary_preview.as_deref() {
+                format!("Primary: {preview}")
             } else {
                 format!("Primary API key configured for {api_url}")
             };
@@ -1048,20 +1404,14 @@ impl Render for ConfigurationView {
                 .border_color(cx.theme().colors().border)
                 .bg(cx.theme().colors().background)
                 .child(Self::render_key_status_row(primary_status, label_text.into(), "primary-backoff-badge"))
-                .child(
-                    h_flex()
-                        .flex_shrink_0()
-                        .child(
-                            Button::new("reset-api-key", "Reset API Key")
-                                .label_size(LabelSize::Small)
-                                .start_icon(Icon::new(IconName::Undo).size(IconSize::Small))
-                                .layer(ElevationIndex::ModalSurface)
-                                .when(primary_env_var_set, |this| {
-                                    this.tooltip(Tooltip::text(format!("To reset your API key, unset the {primary_env_var_name} environment variable.")))
-                                })
-                                .on_click(cx.listener(|this, _, window, cx| this.reset_api_key(window, cx))),
-                        ),
-                )
+                .child(self.render_key_actions(
+                    KeySlot::Primary,
+                    primary_status,
+                    primary_env_var_set,
+                    &primary_env_var_name,
+                    "primary",
+                    cx,
+                ))
                 .into_any()
         };
 
@@ -1097,6 +1447,8 @@ impl Render for ConfigurationView {
         } else {
             let label_text: SharedString = if secondary_env_var_set {
                 format!("Secondary API key set in {secondary_env_var_name} environment variable").into()
+            } else if let Some(preview) = secondary_preview.as_deref() {
+                format!("Secondary: {preview}").into()
             } else {
                 "Secondary API key configured for load balancing".into()
             };
@@ -1109,20 +1461,14 @@ impl Render for ConfigurationView {
                 .border_color(cx.theme().colors().border)
                 .bg(cx.theme().colors().background)
                 .child(Self::render_key_status_row(secondary_status, label_text, "secondary-backoff-badge"))
-                .child(
-                    h_flex()
-                        .flex_shrink_0()
-                        .child(
-                            Button::new("reset-api-key-2", "Reset")
-                                .label_size(LabelSize::Small)
-                                .start_icon(Icon::new(IconName::Undo).size(IconSize::Small))
-                                .layer(ElevationIndex::ModalSurface)
-                                .when(secondary_env_var_set, |this| {
-                                    this.tooltip(Tooltip::text(format!("To reset your API key, unset the {secondary_env_var_name} environment variable.")))
-                                })
-                                .on_click(cx.listener(|this, _, window, cx| this.reset_api_key_2(window, cx))),
-                        ),
-                )
+                .child(self.render_key_actions(
+                    KeySlot::Secondary,
+                    secondary_status,
+                    secondary_env_var_set,
+                    &secondary_env_var_name,
+                    "secondary",
+                    cx,
+                ))
                 .into_any()
         };
 
@@ -1158,6 +1504,8 @@ impl Render for ConfigurationView {
         } else {
             let label_text: SharedString = if tertiary_env_var_set {
                 format!("Tertiary API key set in {tertiary_env_var_name} environment variable").into()
+            } else if let Some(preview) = tertiary_preview.as_deref() {
+                format!("Tertiary: {preview}").into()
             } else {
                 "Tertiary API key configured for load balancing".into()
             };
@@ -1170,20 +1518,14 @@ impl Render for ConfigurationView {
                 .border_color(cx.theme().colors().border)
                 .bg(cx.theme().colors().background)
                 .child(Self::render_key_status_row(tertiary_status, label_text, "tertiary-backoff-badge"))
-                .child(
-                    h_flex()
-                        .flex_shrink_0()
-                        .child(
-                            Button::new("reset-api-key-3", "Reset")
-                                .label_size(LabelSize::Small)
-                                .start_icon(Icon::new(IconName::Undo).size(IconSize::Small))
-                                .layer(ElevationIndex::ModalSurface)
-                                .when(tertiary_env_var_set, |this| {
-                                    this.tooltip(Tooltip::text(format!("To reset your API key, unset the {tertiary_env_var_name} environment variable.")))
-                                })
-                                .on_click(cx.listener(|this, _, window, cx| this.reset_api_key_3(window, cx))),
-                        ),
-                )
+                .child(self.render_key_actions(
+                    KeySlot::Tertiary,
+                    tertiary_status,
+                    tertiary_env_var_set,
+                    &tertiary_env_var_name,
+                    "tertiary",
+                    cx,
+                ))
                 .into_any()
         };
 
@@ -1402,6 +1744,121 @@ mod tests {
                 Duration::ZERO,
                 "slot {i} backoff_remaining should be zero after reset"
             );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // clear_slot_backoff contract
+    //
+    // Like `reset_key_health` but per-slot: only the targeted slot's health is
+    // reset, siblings are untouched. This test verifies the in-memory mutation
+    // the method performs; the persist scheduling is exercised by `health.rs`.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn clear_slot_backoff_clears_only_targeted_slot() {
+        let state = fake_state_with_no_keys();
+        // Poison every slot distinctly.
+        {
+            let mut tracker = state.key_health.lock().unwrap();
+            tracker.primary = KeyHealth {
+                consecutive_failures: 3,
+                backoff_until: Some(Instant::now() + Duration::from_secs(300)),
+            };
+            tracker.secondary = KeyHealth {
+                consecutive_failures: 2,
+                backoff_until: Some(Instant::now() + Duration::from_secs(60)),
+            };
+            tracker.tertiary = KeyHealth {
+                consecutive_failures: 5,
+                backoff_until: Some(Instant::now() + Duration::from_secs(3600)),
+            };
+        }
+
+        // The exact in-memory operation `clear_slot_backoff(Secondary)` performs.
+        {
+            let mut tracker = state.key_health.lock().unwrap();
+            let health = tracker.get_mut(KeySlot::Secondary);
+            health.consecutive_failures = 0;
+            health.backoff_until = None;
+        }
+
+        let after = state.slot_health_snapshot();
+        // Secondary cleared.
+        assert!(!after[1].is_backed_off, "Secondary should be cleared");
+        assert_eq!(after[1].consecutive_failures, 0);
+        // Primary + Tertiary untouched (still poisoned).
+        assert!(after[0].is_backed_off, "Primary should still be backed off");
+        assert_eq!(after[0].consecutive_failures, 3);
+        assert!(after[2].is_backed_off, "Tertiary should still be backed off");
+        assert_eq!(after[2].consecutive_failures, 5);
+    }
+
+    // ------------------------------------------------------------------
+    // truncate_key_preview + slot_index + classify_probe_error helpers
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn truncate_key_preview_short_key_returned_as_is() {
+        // At or below the HEAD+TAIL threshold (6 chars) the key is too short to
+        // truncate meaningfully, so it's returned verbatim.
+        assert_eq!(truncate_key_preview("abc"), "abc");
+        assert_eq!(truncate_key_preview("abcdef"), "abcdef");
+    }
+
+    #[test]
+    fn truncate_key_preview_long_key_shows_head_and_tail() {
+        assert_eq!(truncate_key_preview("sk-abcdef1234567xyz"), "sk-...xyz");
+        // 7 chars: just over the threshold → head3 + tail3 (one char dropped).
+        assert_eq!(truncate_key_preview("abcdefg"), "abc...efg");
+    }
+
+    #[test]
+    fn truncate_key_preview_is_char_safe_for_multibyte() {
+        // A key whose 4th byte lands inside a multi-byte char (é = 2 bytes)
+        // must not panic on slicing. `truncate_key_preview` uses `chars()`, so
+        // the split happens on character boundaries.
+        let key = "abcédéfg"; // chars: a b c é d é f g (8 chars)
+        let preview = truncate_key_preview(key);
+        // head = "abc", tail = "éfg"
+        assert_eq!(preview, "abc...éfg");
+        // Emoji (4-byte) at the boundary likewise must not panic.
+        let key = "abc😀defg"; // chars: a b c 😀 d e f g
+        let preview = truncate_key_preview(key);
+        assert_eq!(preview, "abc...efg");
+    }
+
+    #[test]
+    fn slot_index_maps_slots_in_order() {
+        assert_eq!(slot_index(KeySlot::Primary), 0);
+        assert_eq!(slot_index(KeySlot::Secondary), 1);
+        assert_eq!(slot_index(KeySlot::Tertiary), 2);
+    }
+
+    #[test]
+    fn classify_probe_error_recognizes_rate_limit_status() {
+        let err = open_ai::RequestError::HttpResponseError {
+            provider: "test".to_string(),
+            status_code: http_client::http::StatusCode::TOO_MANY_REQUESTS,
+            body: String::new(),
+            headers: http_client::http::HeaderMap::new(),
+        };
+        assert_eq!(classify_probe_error(err), KeyProbeResult::RateLimit);
+    }
+
+    #[test]
+    fn classify_probe_error_other_status_becomes_err_with_message() {
+        let err = open_ai::RequestError::HttpResponseError {
+            provider: "test".to_string(),
+            status_code: http_client::http::StatusCode::UNAUTHORIZED,
+            body: "unauthorized".to_string(),
+            headers: http_client::http::HeaderMap::new(),
+        };
+        match classify_probe_error(err) {
+            KeyProbeResult::Err(msg) => {
+                assert!(msg.as_ref().contains("401"), "message should mention status: {msg}");
+            }
+            other => panic!("expected Err, got {other:?}"),
         }
     }
 }

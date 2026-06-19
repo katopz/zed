@@ -397,6 +397,20 @@ pub fn format_backoff_remaining(remaining: Duration) -> String {
     }
 }
 
+/// True for `RateLimitExceeded` specifically. Used by `retry_stream` to decide
+/// whether to stop rotating after the first failure: rate limits are
+/// frequently account/org-wide (multiple keys under one quota), so a 429 on
+/// key A is a strong predictor of a 429 on key B. Rotating in that case just
+/// poisons the whole pool in one request and leaves no healthy key for the
+/// *next* request. The slot that hit the limit is still backed off (so the
+/// next request skips it), we just don't burn its siblings.
+pub fn is_rate_limit(err: &LanguageModelCompletionError) -> bool {
+    matches!(
+        err,
+        LanguageModelCompletionError::RateLimitExceeded { .. }
+    )
+}
+
 /// Returns true for errors that suggest the *key* or *upstream* is the problem
 /// (and so rotating to a different key may help), false for errors that will
 /// recur on every key (so poisoning the slot would just shrink the pool
@@ -513,8 +527,12 @@ pub fn snapshot_health(key_health: &Arc<std::sync::Mutex<KeyHealthTracker>>) -> 
 /// each selected at the moment of the attempt (so a slot that just got backed
 /// off is skipped on the next pick). On the first success the resulting stream
 /// is returned and the slot's health is cleared. On a backoff-worthy failure
-/// the slot is poisoned and the next candidate is tried. On any other error
-/// the loop exits immediately — the error would recur on every key.
+/// the slot is poisoned and the next candidate is tried — *except* for
+/// `RateLimitExceeded`, which exits the loop immediately after poisoning the
+/// slot (see `is_rate_limit`: rate limits are commonly account-wide, so
+/// rotating would burn healthy siblings for no benefit). On any other
+/// (non-backoff-worthy) error the loop exits immediately — the error would
+/// recur on every key.
 ///
 /// `do_attempt` receives the chosen key and must return a `'static` future;
 /// callers are expected to clone the request template inside the closure
@@ -522,9 +540,10 @@ pub fn snapshot_health(key_health: &Arc<std::sync::Mutex<KeyHealthTracker>>) -> 
 /// `Clone` for this purpose) and to map the provider-specific error into
 /// `LanguageModelCompletionError`.
 ///
-/// Bounds the worst-case latency to one full key rotation per user request,
-/// which is acceptable because the alternative (returning the error
-/// immediately) is strictly worse for the user's stated reliability goal.
+/// Bounds the worst-case latency to one full key rotation per user request
+/// (fewer on rate-limit or non-backoff-worthy errors), which is acceptable
+/// because the alternative (returning the error immediately) is strictly
+/// worse for the user's stated reliability goal.
 pub async fn retry_stream<S>(
     candidates: &[(Arc<str>, KeySlot)],
     key_health: &Arc<std::sync::Mutex<KeyHealthTracker>>,
@@ -556,6 +575,16 @@ pub async fn retry_stream<S>(
                 record_key_failure(key_health, slot, &err);
                 if !worthy {
                     // Would fail on every key; don't waste the user's time.
+                    return Err(err);
+                }
+                if is_rate_limit(&err) {
+                    // Rate limits are commonly account/org-wide: multiple keys
+                    // under one quota all 429 together. Rotating here would
+                    // burn the remaining healthy keys in a single request and
+                    // leave no key available for the *next* request. The slot
+                    // is already poisoned above; just return so the caller sees
+                    // the rate-limit error and the next request picks a
+                    // different (still-healthy) key.
                     return Err(err);
                 }
                 // Don't try this slot again within this request.
@@ -840,6 +869,14 @@ mod tests {
         }
     }
 
+    fn server_overloaded_err() -> LanguageModelCompletionError {
+        // Backoff-worthy but NOT a rate limit: rotation should proceed.
+        LanguageModelCompletionError::ServerOverloaded {
+            provider: provider_name(),
+            retry_after: None,
+        }
+    }
+
     fn bad_request_err() -> LanguageModelCompletionError {
         // Non-backoff-worthy: should abort retry loop immediately.
         LanguageModelCompletionError::BadRequestFormat {
@@ -875,9 +912,12 @@ mod tests {
 
     #[test]
     fn retry_stream_rotates_on_backoff_worthy_failure() {
-        // First-selected key always fails with rate limit; second always succeeds.
-        // Selection among healthy candidates is random, so the test tracks which
-        // key was tried first rather than hard-coding Primary/Secondary order.
+        // First-selected key always fails with a backoff-worthy, NON-rate-limit
+        // error (server overloaded); second always succeeds. Selection among
+        // healthy candidates is random, so the test tracks which key was tried
+        // first rather than hard-coding Primary/Secondary order. Uses
+        // `server_overloaded_err` rather than `rate_limit_err` because a rate
+        // limit now stops rotation (see `retry_stream_stops_on_rate_limit_*`).
         let candidates: Vec<(Arc<str>, KeySlot)> = vec![
             (Arc::<str>::from("key-a"), KeySlot::Primary),
             (Arc::<str>::from("key-b"), KeySlot::Secondary),
@@ -903,7 +943,7 @@ mod tests {
                 };
                 Box::pin(async move {
                     if is_first {
-                        Err(rate_limit_err())
+                        Err(server_overloaded_err())
                     } else {
                         Ok(7_i32)
                     }
@@ -932,6 +972,57 @@ mod tests {
             health.get(second_slot).consecutive_failures, 0,
             "succeeded slot should have cleared health"
         );
+    }
+
+    #[test]
+    fn retry_stream_stops_on_rate_limit_does_not_burn_siblings() {
+        // A rate-limit error must NOT rotate: rate limits are commonly
+        // account-wide, so burning key2/key3 in the same request would poison
+        // the whole pool. Only the slot that hit the limit should be backed
+        // off; the next request picks a healthy sibling.
+        let candidates: Vec<(Arc<str>, KeySlot)> = vec![
+            (Arc::<str>::from("key-a"), KeySlot::Primary),
+            (Arc::<str>::from("key-b"), KeySlot::Secondary),
+            (Arc::<str>::from("key-c"), KeySlot::Tertiary),
+        ];
+        let key_health = Arc::new(std::sync::Mutex::new(KeyHealthTracker::default()));
+        let attempts = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+
+        let attempts_for_closure = attempts.clone();
+        let result: Result<i32, _> = smol::block_on(retry_stream(
+            &candidates,
+            &key_health,
+            provider_name(),
+            move |api_key| {
+                let key = (*api_key).to_string();
+                attempts_for_closure.lock().push(key);
+                Box::pin(async move { Err(rate_limit_err()) })
+            },
+        ));
+
+        assert!(
+            matches!(result, Err(LanguageModelCompletionError::RateLimitExceeded { .. })),
+            "should return the rate-limit error"
+        );
+        let attempts = attempts.lock();
+        assert_eq!(
+            attempts.len(),
+            1,
+            "rate-limit error must not rotate to siblings: {attempts:?}"
+        );
+
+        // Exactly one slot poisoned (the one that was tried); the other two
+        // remain healthy so the next request can use them.
+        let health = key_health.lock().unwrap();
+        let poisoned = [
+            health.get(KeySlot::Primary).consecutive_failures,
+            health.get(KeySlot::Secondary).consecutive_failures,
+            health.get(KeySlot::Tertiary).consecutive_failures,
+        ]
+        .iter()
+        .filter(|c| **c > 0)
+        .count();
+        assert_eq!(poisoned, 1, "only the tried slot should be poisoned");
     }
 
     #[test]
@@ -967,8 +1058,10 @@ mod tests {
 
     #[test]
     fn retry_stream_returns_last_error_when_all_candidates_fail() {
-        // Every key fails backoff-worthily; loop should exhaust and return the
-        // final error, not retry any slot twice.
+        // Every key fails backoff-worthily with a NON-rate-limit error (server
+        // overloaded); loop should exhaust and return the final error, not retry
+        // any slot twice. Uses `server_overloaded_err` because a rate-limit
+        // error now stops rotation after the first failure.
         let candidates: Vec<(Arc<str>, KeySlot)> = vec![
             (Arc::<str>::from("key-a"), KeySlot::Primary),
             (Arc::<str>::from("key-b"), KeySlot::Secondary),
@@ -985,11 +1078,11 @@ mod tests {
             move |api_key| {
                 let key = (*api_key).to_string();
                 attempts_for_closure.lock().push(key);
-                Box::pin(async move { Err(rate_limit_err()) })
+                Box::pin(async move { Err(server_overloaded_err()) })
             },
         ));
 
-        assert!(matches!(result, Err(LanguageModelCompletionError::RateLimitExceeded { .. })));
+        assert!(matches!(result, Err(LanguageModelCompletionError::ServerOverloaded { .. })));
         // Exactly one attempt per candidate — no slot tried twice.
         let attempts = attempts.lock();
         assert_eq!(attempts.len(), 3, "each candidate tried exactly once: {attempts:?}");
