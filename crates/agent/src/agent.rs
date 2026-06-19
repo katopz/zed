@@ -1582,6 +1582,11 @@ impl NativeAgent {
         let thread = self.open_thread(id.clone(), project, None, cx);
         cx.spawn(async move |this, cx| {
             let acp_thread = thread.await?;
+            // `thread.summary()` returns `None` when no summarization model is
+            // available or streaming fails. In that case we fall back to an
+            // empty summary rather than propagating an error: the caller
+            // (thread mention) keeps the `@thread` link in the editor as a
+            // reference even without expanded summary text.
             let result = this
                 .update(cx, |this, cx| {
                     this.sessions
@@ -1591,7 +1596,13 @@ impl NativeAgent {
                         .update(cx, |thread, cx| thread.summary(cx))
                 })?
                 .await
-                .context("Failed to generate summary")?;
+                .unwrap_or_else(|| {
+                    log::warn!(
+                        "thread.summary returned None for session {id}; \
+                         falling back to empty summary"
+                    );
+                    SharedString::default()
+                });
 
             this.update(cx, |this, cx| this.close_session(&id, cx))?
                 .await?;
@@ -5858,6 +5869,79 @@ mod internal_tests {
                 "closing the active session after thread_summary should unload it"
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_thread_summary_falls_back_when_summary_unavailable(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/",
+            json!({
+                "a": {
+                    "file.txt": "hello"
+                }
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/a").as_ref()], cx).await;
+        let thread_store = cx.new(|cx| ThreadStore::new(cx));
+        let agent = cx
+            .update(|cx| NativeAgent::new(thread_store.clone(), Templates::new(), fs.clone(), cx));
+        let connection = Rc::new(NativeAgentConnection(agent.clone()));
+
+        let acp_thread = cx
+            .update(|cx| {
+                connection
+                    .clone()
+                    .new_session(project.clone(), PathList::new(&[Path::new("")]), cx)
+            })
+            .await
+            .unwrap();
+        let session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let thread = agent.read_with(cx, |agent, _| {
+            agent.sessions.get(&session_id).unwrap().thread.clone()
+        });
+
+        let model = Arc::new(FakeLanguageModel::default());
+        // Force no summarization model: register_session sets one from the
+        // global registry (see init_test -> LanguageModelRegistry::test), so
+        // we override it to None afterwards. thread.summary() should then
+        // return None, and thread_summary should fall back to an empty
+        // SharedString instead of erroring.
+        thread.update(cx, |thread, cx| {
+            thread.set_model(model.clone(), cx);
+            thread.set_summarization_model(None, cx);
+        });
+
+        let send = acp_thread.update(cx, |thread, cx| thread.send(vec!["hello".into()], cx));
+        let send = cx.foreground_executor().spawn(send);
+        cx.run_until_parked();
+
+        model.send_last_completion_stream_text_chunk("world");
+        model.end_last_completion_stream();
+        send.await.unwrap();
+        cx.run_until_parked();
+
+        let summary = agent.update(cx, |agent, cx| {
+            agent.thread_summary(session_id.clone(), project.clone(), cx)
+        });
+        cx.run_until_parked();
+
+        // No "Failed to generate summary" error: caller keeps the @thread link.
+        let summary = summary.await.expect("thread_summary should not error");
+        assert_eq!(
+            summary.as_ref(),
+            "",
+            "thread_summary should fall back to empty summary when thread.summary() returns None"
+        );
+
+        cx.update(|cx| connection.clone().close_session(&session_id, cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
     }
 
     #[gpui::test]
