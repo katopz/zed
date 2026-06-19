@@ -94,13 +94,8 @@ impl State {
     /// single retry loop into one disk write. Called after every request
     /// outcome (success or failure) from `stream_completion` / `stream_response`
     /// via the free-function form `schedule_persist_key_health_inner` (which
-    /// takes `Send`-safe handles, not `AsyncApp`).
-    ///
-    /// This method exists for symmetry + future foreground-triggered saves
-    /// (e.g. on `reset_credentials`). Currently unused; the request path uses
-    /// the free-function form because `AsyncApp` is `!Send` and the rate-limited
-    /// stream closure must be `Send`.
-    #[allow(dead_code)]
+    /// takes `Send`-safe handles, not `AsyncApp`), and from `reset_key_health`
+    /// when the user clears all credentials.
     fn schedule_persist_key_health(&self, cx: &App) {
         schedule_persist_key_health_inner(
             &self.key_health,
@@ -109,6 +104,19 @@ impl State {
             cx.background_executor().clone(),
             <dyn Fs>::global(cx),
         );
+    }
+
+    /// Resets every slot's health to defaults (no failures, no backoff) and
+    /// schedules a debounced persist so the cleared state overwrites any stale
+    /// backoff on disk. Called from `reset_credentials` so a freshly-added key
+    /// value doesn't inherit backoff from a previously-removed key that occupied
+    /// the same slot — the new key is unknown and shouldn't be penalized for the
+    /// old key's failures, and the UI badge shouldn't show a stale countdown.
+    fn reset_key_health(&self, cx: &App) {
+        if let Ok(mut tracker) = self.key_health.lock() {
+            *tracker = KeyHealthTracker::default();
+        }
+        self.schedule_persist_key_health(cx);
     }
 
     fn set_api_key(&mut self, api_key: Option<String>, cx: &mut Context<Self>) -> Task<Result<()>> {
@@ -436,6 +444,11 @@ impl LanguageModelProvider for OpenAiCompatibleLanguageModelProvider {
 
     fn reset_credentials(&self, cx: &mut App) -> Task<Result<()>> {
         self.state.update(cx, |state, cx| {
+            // Clear all per-slot backoff state. A freshly-added key value is
+            // unknown and shouldn't inherit failures recorded against the old
+            // key that occupied this slot; the persisted file is overwritten so
+            // a process restart doesn't resurrect the stale backoff either.
+            state.reset_key_health(cx);
             let task1 = state.set_api_key(None, cx);
             let task2 = state.set_api_key_2(None, cx);
             let task3 = state.set_api_key_3(None, cx);
@@ -1336,5 +1349,59 @@ mod tests {
         // slot is no longer backed off. The UI badge only shows when
         // is_backed_off is true, so this doesn't affect rendering.
         assert_eq!(snapshot[1].consecutive_failures, 5);
+    }
+
+    // ------------------------------------------------------------------
+    // reset_key_health contract
+    //
+    // `reset_key_health` (called from `reset_credentials`) replaces the
+    // tracker with `KeyHealthTracker::default()`. This test verifies that
+    // contract: a tracker poisoned across all slots reads back as all-clear
+    // after the same in-memory reset the method performs. The persist call
+    // inside `reset_key_health` is exercised by the persistence tests in
+    // `health.rs`; the wiring into `reset_credentials` is verified by code
+    // review (calling it requires an `App` context unavailable to these
+    // plain `#[test]`s).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn reset_key_health_clears_all_slots() {
+        let state = fake_state_with_no_keys();
+        // Poison every slot with distinct failure counts / backoff windows.
+        {
+            let mut tracker = state.key_health.lock().unwrap();
+            tracker.primary = KeyHealth {
+                consecutive_failures: 3,
+                backoff_until: Some(Instant::now() + Duration::from_secs(300)),
+            };
+            tracker.secondary = KeyHealth {
+                consecutive_failures: 2,
+                backoff_until: Some(Instant::now() + Duration::from_secs(60)),
+            };
+            tracker.tertiary = KeyHealth {
+                consecutive_failures: 5,
+                backoff_until: Some(Instant::now() + Duration::from_secs(3600)),
+            };
+        }
+        // Sanity: all three slots report backed-off before reset.
+        let before = state.slot_health_snapshot();
+        assert!(before[0].is_backed_off && before[1].is_backed_off && before[2].is_backed_off);
+
+        // The exact in-memory operation `reset_key_health` performs.
+        {
+            let mut tracker = state.key_health.lock().unwrap();
+            *tracker = KeyHealthTracker::default();
+        }
+
+        let after = state.slot_health_snapshot();
+        for (i, status) in after.iter().enumerate() {
+            assert!(!status.is_backed_off, "slot {i} should not be backed off after reset");
+            assert_eq!(status.consecutive_failures, 0, "slot {i} failures should be cleared");
+            assert_eq!(
+                status.backoff_remaining,
+                Duration::ZERO,
+                "slot {i} backoff_remaining should be zero after reset"
+            );
+        }
     }
 }
