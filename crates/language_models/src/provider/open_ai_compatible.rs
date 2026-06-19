@@ -626,7 +626,7 @@ impl OpenAiCompatibleLanguageModel {
                     let provider_name = provider_name.clone();
                     let attempt_request = request.clone();
                     Box::pin(async move {
-                        stream_completion(
+                        let stream = stream_completion(
                             http_client.as_ref(),
                             provider_name.as_str(),
                             api_url.as_ref(),
@@ -634,8 +634,8 @@ impl OpenAiCompatibleLanguageModel {
                             attempt_request,
                             &extra_headers,
                         )
-                        .await
-                        .map_err(Into::into)
+                        .await?;
+                        probe_first_event(stream).await
                     })
                 },
             )
@@ -680,7 +680,7 @@ impl OpenAiCompatibleLanguageModel {
                     let provider_name = provider_name.clone();
                     let attempt_request = request.clone();
                     Box::pin(async move {
-                        stream_response(
+                        let stream = stream_response(
                             http_client.as_ref(),
                             provider_name.as_str(),
                             api_url.as_ref(),
@@ -688,8 +688,8 @@ impl OpenAiCompatibleLanguageModel {
                             attempt_request,
                             &extra_headers,
                         )
-                        .await
-                        .map_err(Into::into)
+                        .await?;
+                        probe_first_event(stream).await
                     })
                 },
             )
@@ -803,6 +803,38 @@ fn snapshot_health(key_health: &Arc<std::sync::Mutex<KeyHealthTracker>>) -> KeyH
     match key_health.lock() {
         Ok(guard) => guard.clone(),
         Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
+/// Pulls exactly one event from a candidate stream before handing it back to
+/// `retry_stream`. This catches errors that surface as the *first* SSE event
+/// after a successful HTTP 200 — a common shape for late-detected rate limits
+/// and upstream provider errors. Without this probe, those errors would
+/// propagate straight to the consumer and terminate the request, even though
+/// a different key would have worked.
+///
+/// - `Some(Ok(first))` — the event is re-prepended via `stream::once` chained
+///   onto the remaining stream, so the consumer sees the full sequence with
+///   nothing lost.
+/// - `Some(Err(e))` — converted to `LanguageModelCompletionError` and returned
+///   as `Err`, so `retry_stream` records a failure and rotates to the next
+///   key (if the error is backoff-worthy).
+/// - `None` — empty stream, returned as `Ok` because producing no events is
+///   the provider's decision, not a transport failure.
+async fn probe_first_event<T, E>(
+    mut stream: futures::stream::BoxStream<'static, Result<T, E>>,
+) -> Result<futures::stream::BoxStream<'static, Result<T, E>>, LanguageModelCompletionError>
+where
+    T: Send + 'static,
+    E: Into<LanguageModelCompletionError> + Send + 'static,
+{
+    use futures::StreamExt;
+    match stream.next().await {
+        Some(Ok(first)) => Ok(futures::stream::once(async move { Ok::<_, E>(first) })
+            .chain(stream)
+            .boxed()),
+        Some(Err(err)) => Err(err.into()),
+        None => Ok(stream),
     }
 }
 
@@ -1731,25 +1763,34 @@ mod tests {
 
     #[test]
     fn retry_stream_rotates_on_backoff_worthy_failure() {
-        // Primary key always fails with rate limit; Secondary always succeeds.
-        // The loop must rotate to Secondary and return Ok.
+        // First-selected key always fails with rate limit; second always succeeds.
+        // Selection among healthy candidates is random, so the test tracks which
+        // key was tried first rather than hard-coding Primary/Secondary order.
         let candidates: Vec<(Arc<str>, KeySlot)> = vec![
             (Arc::<str>::from("key-a"), KeySlot::Primary),
             (Arc::<str>::from("key-b"), KeySlot::Secondary),
         ];
         let key_health = Arc::new(std::sync::Mutex::new(KeyHealthTracker::default()));
         let attempts = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let seen_first = Arc::new(std::sync::Mutex::new(false));
 
         let attempts_for_closure = attempts.clone();
+        let seen_first_for_closure = seen_first;
         let result: Result<i32, _> = smol::block_on(retry_stream(
             &candidates,
             &key_health,
             provider_name(),
             move |api_key| {
                 let key = (*api_key).to_string();
-                attempts_for_closure.lock().push(key.clone());
+                attempts_for_closure.lock().push(key);
+                let is_first = {
+                    let mut seen = seen_first_for_closure.lock().unwrap();
+                    let first = !*seen;
+                    *seen = true;
+                    first
+                };
                 Box::pin(async move {
-                    if key == "key-a" {
+                    if is_first {
                         Err(rate_limit_err())
                     } else {
                         Ok(7_i32)
@@ -1759,16 +1800,24 @@ mod tests {
         ));
 
         assert_eq!(result.unwrap(), 7);
-        assert_eq!(*attempts.lock(), vec!["key-a".to_string(), "key-b".to_string()]);
+        let attempts_guard = attempts.lock();
+        assert_eq!(attempts_guard.len(), 2, "should rotate exactly once");
 
-        // Primary should now be in backoff, Secondary healthy (the success cleared it).
+        let slot_for_key = |key: &str| match key {
+            "key-a" => KeySlot::Primary,
+            "key-b" => KeySlot::Secondary,
+            _ => panic!("unknown key {key:?}"),
+        };
+        let first_slot = slot_for_key(&attempts_guard[0]);
+        let second_slot = slot_for_key(&attempts_guard[1]);
+
         let health = key_health.lock().unwrap();
         assert!(
-            health.get(KeySlot::Primary).consecutive_failures >= 1,
+            health.get(first_slot).consecutive_failures >= 1,
             "failed slot should be poisoned"
         );
         assert_eq!(
-            health.get(KeySlot::Secondary).consecutive_failures, 0,
+            health.get(second_slot).consecutive_failures, 0,
             "succeeded slot should have cleared health"
         );
     }
@@ -1849,6 +1898,90 @@ mod tests {
         ));
 
         assert!(matches!(result, Err(LanguageModelCompletionError::NoApiKey { .. })));
+    }
+
+    // ------------------------------------------------------------------
+    // probe_first_event tests
+    //
+    // The helper pulls one event from a candidate stream so that a first-event
+    // error (e.g., late rate limit delivered inside the SSE stream) can trigger
+    // key rotation via the surrounding `retry_stream` closure. These tests
+    // exercise the helper in isolation: first-event Ok (preserved + chained),
+    // first-event Err (propagated), and empty stream (None).
+    // ------------------------------------------------------------------
+
+    fn boxed_stream<T, E>(items: Vec<Result<T, E>>) -> futures::stream::BoxStream<'static, Result<T, E>>
+    where
+        T: Send + 'static,
+        E: Send + 'static,
+    {
+        futures::stream::iter(items).boxed()
+    }
+
+    #[test]
+    fn probe_first_event_ok_preserves_first_and_subsequent_events() {
+        let stream = boxed_stream(vec![
+            Ok::<i32, anyhow::Error>(1),
+            Ok(2),
+            Ok(3),
+        ]);
+        let mut result = smol::block_on(probe_first_event(stream)).unwrap();
+
+        use futures::StreamExt;
+        let collected: Vec<i32> = smol::block_on(async {
+            let mut v = Vec::new();
+            while let Some(Ok(n)) = result.next().await {
+                v.push(n);
+            }
+            v
+        });
+        assert_eq!(collected, vec![1, 2, 3], "first event must not be dropped");
+    }
+
+    #[test]
+    fn probe_first_event_err_propagates_as_language_model_error() {
+        // First event is an `anyhow::Error` (the real stream item error type).
+        // The helper must convert it to `LanguageModelCompletionError::Other`
+        // so the surrounding `retry_stream` can classify and record it.
+        let stream: futures::stream::BoxStream<'static, Result<i32, anyhow::Error>> =
+            boxed_stream(vec![Err(anyhow::anyhow!("late rate limit")), Ok(2)]);
+        let result = smol::block_on(probe_first_event(stream));
+
+        match result {
+            Err(LanguageModelCompletionError::Other(err)) => {
+                assert!(
+                    err.to_string().contains("late rate limit"),
+                    "error message should survive conversion"
+                );
+            }
+            Err(err) => panic!("expected Other(anyhow), got {err:?}"),
+            Ok(_) => panic!("expected Err, got Ok"),
+        }
+    }
+
+    #[test]
+    fn probe_first_event_empty_stream_returns_ok_empty() {
+        let stream: futures::stream::BoxStream<'static, Result<i32, anyhow::Error>> =
+            boxed_stream(vec![]);
+        let mut result = smol::block_on(probe_first_event(stream)).unwrap();
+
+        use futures::StreamExt;
+        let count = smol::block_on(async { result.next().await });
+        assert!(count.is_none(), "empty stream should remain empty");
+    }
+
+    #[test]
+    fn probe_first_event_single_ok_event_preserved() {
+        // Stream with exactly one event — the re-prepend path must handle the
+        // case where `chain` is attached to an already-exhausted stream.
+        let stream = boxed_stream(vec![Ok::<i32, anyhow::Error>(42)]);
+        let mut result = smol::block_on(probe_first_event(stream)).unwrap();
+
+        use futures::StreamExt;
+        let first = smol::block_on(result.next()).unwrap().unwrap();
+        assert_eq!(first, 42);
+        let second = smol::block_on(result.next());
+        assert!(second.is_none(), "stream should be exhausted after the one event");
     }
 
     // ------------------------------------------------------------------
