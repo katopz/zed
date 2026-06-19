@@ -1161,6 +1161,12 @@ impl ConfigurationView {
     /// to distinguish ok / rate-limit / other-error. Concurrent probes on the
     /// same slot are coalesced (a new probe cancels the prior task by replacing
     /// it in `probe_tasks`).
+    ///
+    /// On `Ok` the slot's backoff is also cleared: a successful probe is direct
+    /// evidence the key works right now, so any stale backoff (e.g. the upstream
+    /// quota reset) shouldn't keep the key rotated out until the 5h window
+    /// elapses. This mirrors the per-key success path in `retry_stream`, which
+    /// clears health on the first successful request.
     fn probe_key(&mut self, slot: KeySlot, window: &mut Window, cx: &mut Context<Self>) {
         let idx = slot_index(slot);
         // Coalesce: if a probe is already in flight for this slot, ignore.
@@ -1176,6 +1182,15 @@ impl ConfigurationView {
             let result = run_key_probe(http_client, inputs).await;
             let _ = this.update(cx, |this, cx| {
                 let idx = slot_index(slot);
+                // A successful probe means the key is healthy right now — clear
+                // any backoff so the slot re-enters rotation immediately instead
+                // of waiting out the 5h window. Non-ok results leave backoff
+                // untouched (a rate-limit probe confirms the backoff is still
+                // warranted; an error probe is ambiguous and shouldn't quietly
+                // clear a backoff earned by real request failures).
+                if result == KeyProbeResult::Ok {
+                    this.state.update(cx, |state, cx| state.clear_slot_backoff(slot, cx));
+                }
                 this.probe_results[idx] = Some(result);
                 this.probe_tasks[idx] = None;
                 cx.notify();

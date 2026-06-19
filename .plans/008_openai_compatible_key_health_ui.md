@@ -94,6 +94,14 @@ fixing the account-wide-quota footgun the user hit.
   - last result ok → `"check(ok)"` (success color)
   - last result rate-limit → `"check(hit)"` (warning color)
   - last result other err → `"check(err)"` (error color) + tooltip with message
+- **On `Ok`, the slot's backoff is also cleared**: a successful probe is direct
+  evidence the key works right now, so any stale backoff (e.g. the upstream
+  quota reset) shouldn't keep it rotated out until the 5h window elapses. This
+  mirrors `retry_stream`'s per-key success path (which clears health on the
+  first successful request). Non-ok results leave backoff untouched: a
+  rate-limit probe confirms the backoff is still warranted, and an error probe
+  is ambiguous so it shouldn't quietly clear a backoff earned by real request
+  failures.
 - Reuses the open_ai completion path (not the responses path) so the probe is a
   single concrete endpoint; if the provider only supports the responses API the
   probe may 404 and report `err` — acceptable for a manual sanity check, and the
