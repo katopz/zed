@@ -2,7 +2,7 @@ use anyhow::Result;
 use convert_case::{Case, Casing};
 use credentials_provider::CredentialsProvider;
 use futures::{FutureExt, StreamExt, future::BoxFuture};
-use gpui::{AnyView, App, AsyncApp, Context, Entity, SharedString, Task, TaskExt, Window};
+use gpui::{AnyView, App, AsyncApp, Context, ElementId, Entity, SharedString, Task, TaskExt, Window};
 use http_client::{CustomHeaders, HttpClient};
 use language_model::{
     ApiKeyState, AuthenticateError, EnvVar, IconOrSvg, LanguageModel, LanguageModelCompletionError,
@@ -85,6 +85,18 @@ struct KeyHealth {
     backoff_until: Option<Instant>,
 }
 
+/// UI-facing projection of one slot's health + configuration state. Returned
+/// in a fixed `[Primary, Secondary, Tertiary]` order by `State::slot_health_snapshot`
+/// so the ConfigurationView can render a backoff badge without reaching into
+/// `KeyHealthTracker` directly (which is private and lives behind a mutex).
+#[derive(Clone, Debug, PartialEq)]
+struct SlotHealthStatus {
+    has_key: bool,
+    is_backed_off: bool,
+    backoff_remaining: Duration,
+    consecutive_failures: u32,
+}
+
 impl KeyHealth {
     fn is_backed_off(&self, now: Instant) -> bool {
         matches!(self.backoff_until, Some(until) if now < until)
@@ -163,6 +175,25 @@ fn compute_backoff(failures: u32) -> Duration {
         .min(BACKOFF_MAX);
     let jitter = rand::rng().random_range(0.5..1.5);
     candidate.mul_f64(jitter).min(BACKOFF_MAX)
+}
+
+/// Formats a remaining backoff duration for the ConfigurationView badge.
+/// Hour precision drops the seconds (the user doesn't need them at that scale);
+/// sub-minute durations still show seconds so short backoffs feel responsive.
+/// Returns `"0s"` for `Duration::ZERO` (e.g. slot just exited backoff between
+/// snapshot and render).
+fn format_backoff_remaining(remaining: Duration) -> String {
+    let total_secs = remaining.as_secs();
+    let hours = total_secs / 3600;
+    let minutes = (total_secs % 3600) / 60;
+    let seconds = total_secs % 60;
+    if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds}s")
+    } else {
+        format!("{seconds}s")
+    }
 }
 
 /// Returns true for errors that suggest the *key* or *upstream* is the problem
@@ -295,6 +326,50 @@ impl State {
             out.push((key, KeySlot::Tertiary));
         }
         out
+    }
+
+    /// Returns `[Primary, Secondary, Tertiary]` slot status for the UI. Clones
+    /// the tracker under the mutex (same pattern as `snapshot_health`) so the
+    /// lock is not held across the per-slot computation. Used by
+    /// `ConfigurationView::render` to draw a backoff badge with a live
+    /// countdown. The ConfigurationView polls this on a 1s timer while the
+    /// settings page is open; see `backoff_refresh_task`.
+    fn slot_health_snapshot(&self) -> [SlotHealthStatus; 3] {
+        let now = Instant::now();
+        let tracker = match self.key_health.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        [
+            self.slot_status(KeySlot::Primary, &tracker, now),
+            self.slot_status(KeySlot::Secondary, &tracker, now),
+            self.slot_status(KeySlot::Tertiary, &tracker, now),
+        ]
+    }
+
+    fn slot_status(
+        &self,
+        slot: KeySlot,
+        tracker: &KeyHealthTracker,
+        now: Instant,
+    ) -> SlotHealthStatus {
+        let health = tracker.get(slot);
+        let has_key = match slot {
+            KeySlot::Primary => self.api_key_state.has_key(),
+            KeySlot::Secondary => self.api_key_state_2.has_key(),
+            KeySlot::Tertiary => self.api_key_state_3.has_key(),
+        };
+        let backoff_remaining = match health.backoff_until {
+            Some(until) => until.saturating_duration_since(now),
+            None => Duration::ZERO,
+        };
+        let is_backed_off = health.is_backed_off(now);
+        SlotHealthStatus {
+            has_key,
+            is_backed_off,
+            backoff_remaining,
+            consecutive_failures: health.consecutive_failures,
+        }
     }
 }
 
@@ -851,6 +926,14 @@ struct ConfigurationView {
     api_key_editor_3: Entity<InputField>,
     state: Entity<State>,
     load_credentials_task: Option<Task<()>>,
+    /// Polls `slot_health_snapshot` every second while the settings page is open
+    /// and calls `cx.notify()` only when the snapshot changes. Required because
+    /// `key_health` is updated from background request closures through
+    /// `Arc<Mutex<KeyHealthTracker>>`, bypassing `cx.notify()` on `State` —
+    /// so the view wouldn't otherwise learn about backoff state transitions or
+    /// the countdown ticking down. The task is dropped (cancelled) with the view.
+    #[allow(dead_code)]
+    backoff_refresh_task: Option<Task<()>>,
 }
 
 impl ConfigurationView {
@@ -897,12 +980,46 @@ impl ConfigurationView {
             }
         }));
 
+        // Background refresh of backoff badges. `key_health` is updated by
+        // request closures on the background executor via `Arc<Mutex>`, which
+        // bypasses `Entity::notify`, so `cx.observe(&state, ...)` alone can't
+        // catch slot backoff transitions. This task polls the snapshot every
+        // second and only notifies when something changed (countdown tick,
+        // slot entered/exited backoff). It self-terminates if the view is dropped
+        // (the `this.update` call returns `Err`).
+        let backoff_refresh_task = cx.spawn_in(window, {
+            let state = state.clone();
+            async move |this, cx| {
+                let mut last_snapshot: [SlotHealthStatus; 3] =
+                    state.read_with(cx, |state, _| state.slot_health_snapshot());
+                loop {
+                    cx.background_executor()
+                        .timer(Duration::from_secs(1))
+                        .await;
+                    let update_result = this.update(cx, |_, cx| {
+                        let current = state.read(cx).slot_health_snapshot();
+                        let changed = current != last_snapshot;
+                        last_snapshot = current;
+                        changed
+                    });
+                    match update_result {
+                        Ok(true) => {
+                            let _ = this.update(cx, |_, cx| cx.notify());
+                        }
+                        Ok(false) => {}
+                        Err(_) => break, // view dropped; exit the loop
+                    }
+                }
+            }
+        });
+
         Self {
             api_key_editor,
             api_key_editor_2,
             api_key_editor_3,
             state,
             load_credentials_task,
+            backoff_refresh_task: Some(backoff_refresh_task),
         }
     }
 
@@ -999,6 +1116,60 @@ impl ConfigurationView {
         })
         .detach_and_log_err(cx);
     }
+
+    /// Builds the left-hand status row of a configured-key card. Shows a green
+    /// check by default; replaces it with a warning icon + live backoff
+    /// countdown when the slot is currently backed off. The countdown string
+    /// stays in sync with `backoff_refresh_task`, which polls every second and
+    /// re-renders when the snapshot changes.
+    ///
+    /// `badge_id` must be unique per slot so the stateful tooltip div doesn't
+    /// collide across the three rendered cards.
+    fn render_key_status_row(
+        status: &SlotHealthStatus,
+        label_text: SharedString,
+        badge_id: impl Into<ElementId>,
+    ) -> impl IntoElement {
+        let label_node = div()
+            .w_full()
+            .overflow_x_hidden()
+            .text_ellipsis()
+            .child(Label::new(label_text));
+
+        if status.is_backed_off {
+            let countdown = format_backoff_remaining(status.backoff_remaining);
+            let failures = status.consecutive_failures;
+            let tooltip_msg = format!(
+                "Key temporarily rotated out after {failures} consecutive \
+                 failure(s). Auto-recovers when backoff expires (max 5h)."
+            );
+            h_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_1()
+                .child(Icon::new(IconName::Warning).color(Color::Warning))
+                .child(label_node)
+                .child(
+                    // `tooltip` is on `StatefulInteractiveElement`, so the div
+                    // needs an id to become stateful.
+                    div()
+                        .id(badge_id)
+                        .tooltip(Tooltip::text(tooltip_msg))
+                        .child(
+                            Label::new(format!("In backoff: {countdown}"))
+                                .size(LabelSize::Small)
+                                .color(Color::Warning),
+                        ),
+                )
+        } else {
+            h_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_1()
+                .child(Icon::new(IconName::Check).color(Color::Success))
+                .child(label_node)
+        }
+    }
 }
 
 impl Render for ConfigurationView {
@@ -1019,6 +1190,14 @@ impl Render for ConfigurationView {
 
         let api_url = state.settings.api_url.clone();
 
+        // Per-slot health snapshot powers the backoff badge + countdown. Read
+        // once per render; the `backoff_refresh_task` polls every second and
+        // calls `cx.notify()` when this snapshot changes.
+        let health_snapshot = state.slot_health_snapshot();
+        let primary_status = &health_snapshot[0];
+        let secondary_status = &health_snapshot[1];
+        let tertiary_status = &health_snapshot[2];
+
         // Primary API key section
         let primary_section = if !primary_has_key {
             v_flex()
@@ -1037,6 +1216,11 @@ impl Render for ConfigurationView {
                 )
                 .into_any()
         } else {
+            let label_text = if primary_env_var_set {
+                format!("Primary API key set in {primary_env_var_name} environment variable")
+            } else {
+                format!("Primary API key configured for {api_url}")
+            };
             h_flex()
                 .mt_1()
                 .p_1()
@@ -1045,26 +1229,7 @@ impl Render for ConfigurationView {
                 .border_1()
                 .border_color(cx.theme().colors().border)
                 .bg(cx.theme().colors().background)
-                .child(
-                    h_flex()
-                        .flex_1()
-                        .min_w_0()
-                        .gap_1()
-                        .child(Icon::new(IconName::Check).color(Color::Success))
-                        .child(
-                            div()
-                                .w_full()
-                                .overflow_x_hidden()
-                                .text_ellipsis()
-                                .child(Label::new(
-                                    if primary_env_var_set {
-                                        format!("Primary API key set in {primary_env_var_name} environment variable")
-                                    } else {
-                                        format!("Primary API key configured for {api_url}")
-                                    }
-                                ))
-                        ),
-                )
+                .child(Self::render_key_status_row(primary_status, label_text.into(), "primary-backoff-badge"))
                 .child(
                     h_flex()
                         .flex_shrink_0()
@@ -1112,6 +1277,11 @@ impl Render for ConfigurationView {
                 )
                 .into_any()
         } else {
+            let label_text: SharedString = if secondary_env_var_set {
+                format!("Secondary API key set in {secondary_env_var_name} environment variable").into()
+            } else {
+                "Secondary API key configured for load balancing".into()
+            };
             h_flex()
                 .mt_1()
                 .p_1()
@@ -1120,26 +1290,7 @@ impl Render for ConfigurationView {
                 .border_1()
                 .border_color(cx.theme().colors().border)
                 .bg(cx.theme().colors().background)
-                .child(
-                    h_flex()
-                        .flex_1()
-                        .min_w_0()
-                        .gap_1()
-                        .child(Icon::new(IconName::Check).color(Color::Success))
-                        .child(
-                            div()
-                                .w_full()
-                                .overflow_x_hidden()
-                                .text_ellipsis()
-                                .child(Label::new(
-                                    if secondary_env_var_set {
-                                        format!("Secondary API key set in {secondary_env_var_name} environment variable")
-                                    } else {
-                                        "Secondary API key configured for load balancing".to_string()
-                                    }
-                                ))
-                        ),
-                )
+                .child(Self::render_key_status_row(secondary_status, label_text, "secondary-backoff-badge"))
                 .child(
                     h_flex()
                         .flex_shrink_0()
@@ -1187,6 +1338,11 @@ impl Render for ConfigurationView {
                 )
                 .into_any()
         } else {
+            let label_text: SharedString = if tertiary_env_var_set {
+                format!("Tertiary API key set in {tertiary_env_var_name} environment variable").into()
+            } else {
+                "Tertiary API key configured for load balancing".into()
+            };
             h_flex()
                 .mt_1()
                 .p_1()
@@ -1195,26 +1351,7 @@ impl Render for ConfigurationView {
                 .border_1()
                 .border_color(cx.theme().colors().border)
                 .bg(cx.theme().colors().background)
-                .child(
-                    h_flex()
-                        .flex_1()
-                        .min_w_0()
-                        .gap_1()
-                        .child(Icon::new(IconName::Check).color(Color::Success))
-                        .child(
-                            div()
-                                .w_full()
-                                .overflow_x_hidden()
-                                .text_ellipsis()
-                                .child(Label::new(
-                                    if tertiary_env_var_set {
-                                        format!("Tertiary API key set in {tertiary_env_var_name} environment variable")
-                                    } else {
-                                        "Tertiary API key configured for load balancing".to_string()
-                                    }
-                                ))
-                        ),
-                )
+                .child(Self::render_key_status_row(tertiary_status, label_text, "tertiary-backoff-badge"))
                 .child(
                     h_flex()
                         .flex_shrink_0()
@@ -1712,5 +1849,120 @@ mod tests {
         ));
 
         assert!(matches!(result, Err(LanguageModelCompletionError::NoApiKey { .. })));
+    }
+
+    // ------------------------------------------------------------------
+    // format_backoff_remaining tests
+    //
+    // The badge's countdown string format. Hour precision drops seconds;
+    // sub-minute durations still show seconds so short backoffs feel
+    // responsive.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn format_backoff_zero_is_zero_seconds() {
+        assert_eq!(format_backoff_remaining(Duration::ZERO), "0s");
+    }
+
+    #[test]
+    fn format_backoff_sub_minute_shows_seconds() {
+        assert_eq!(format_backoff_remaining(Duration::from_secs(1)), "1s");
+        assert_eq!(format_backoff_remaining(Duration::from_secs(45)), "45s");
+        assert_eq!(format_backoff_remaining(Duration::from_secs(59)), "59s");
+    }
+
+    #[test]
+    fn format_backoff_sub_hour_shows_minutes_and_seconds() {
+        assert_eq!(format_backoff_remaining(Duration::from_secs(60)), "1m 0s");
+        assert_eq!(format_backoff_remaining(Duration::from_secs(119)), "1m 59s");
+        assert_eq!(format_backoff_remaining(Duration::from_secs(272)), "4m 32s");
+    }
+
+    #[test]
+    fn format_backoff_hour_or_more_drops_seconds() {
+        // 1h 5m = 3900s
+        assert_eq!(format_backoff_remaining(Duration::from_secs(3900)), "1h 5m");
+        // Exactly one hour
+        assert_eq!(format_backoff_remaining(Duration::from_secs(3600)), "1h 0m");
+        // The 5h cap
+        assert_eq!(format_backoff_remaining(BACKOFF_MAX), "5h 0m");
+    }
+
+    // ------------------------------------------------------------------
+    // slot_health_snapshot tests
+    //
+    // These exercise the UI-facing projection of per-key health. They build a
+    // fresh `State`, push failures directly into `key_health` (bypassing the
+    // request closure), and verify the snapshot returns the expected mix of
+    // healthy / backed-off / unconfigured slots.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn slot_health_snapshot_fresh_state_is_all_clear() {
+        // No keys configured, no failures — every slot should report
+        // `has_key: false`, `is_backed_off: false`, zero failures.
+        let state = fake_state_with_no_keys();
+        let snapshot = state.slot_health_snapshot();
+        for status in &snapshot {
+            assert!(!status.has_key, "no keys should be configured");
+            assert!(!status.is_backed_off, "fresh slot should not be backed off");
+            assert_eq!(status.consecutive_failures, 0);
+            assert_eq!(status.backoff_remaining, Duration::ZERO);
+        }
+    }
+
+    #[test]
+    fn slot_health_snapshot_reports_backed_off_slot() {
+        let state = fake_state_with_no_keys();
+        // Poison Primary directly via the shared mutex, with a backoff window
+        // well into the future so it can't accidentally expire mid-test.
+        {
+            let mut tracker = state.key_health.lock().unwrap();
+            tracker.primary = KeyHealth {
+                consecutive_failures: 2,
+                backoff_until: Some(Instant::now() + Duration::from_secs(300)),
+            };
+        }
+        let snapshot = state.slot_health_snapshot();
+        // [Primary, Secondary, Tertiary]
+        assert!(snapshot[0].is_backed_off, "Primary should be backed off");
+        assert_eq!(snapshot[0].consecutive_failures, 2);
+        // 300s backoff, so remaining should be just under 300s. We don't assert
+        // the exact value (depends on how long the lock + read took), only that
+        // it's in the expected band.
+        assert!(
+            snapshot[0].backoff_remaining > Duration::from_secs(290)
+                && snapshot[0].backoff_remaining <= Duration::from_secs(300),
+            "Primary backoff_remaining should be ~300s, got {:?}",
+            snapshot[0].backoff_remaining
+        );
+        // Other slots untouched.
+        assert!(!snapshot[1].is_backed_off);
+        assert!(!snapshot[2].is_backed_off);
+    }
+
+    #[test]
+    fn slot_health_snapshot_handles_expired_backoff_gracefully() {
+        // If `backoff_until` is in the past, the slot should read as NOT backed
+        // off (auto-recovered) and `backoff_remaining` should be ZERO (not
+        // negative — `saturating_duration_since` clamps).
+        let state = fake_state_with_no_keys();
+        {
+            let mut tracker = state.key_health.lock().unwrap();
+            tracker.secondary = KeyHealth {
+                consecutive_failures: 5,
+                backoff_until: Some(Instant::now() - Duration::from_secs(60)),
+            };
+        }
+        let snapshot = state.slot_health_snapshot();
+        assert!(!snapshot[1].is_backed_off, "expired backoff should auto-clear");
+        assert_eq!(
+            snapshot[1].backoff_remaining, Duration::ZERO,
+            "expired backoff remaining should clamp to zero"
+        );
+        // consecutive_failures is still recorded (historical), even though the
+        // slot is no longer backed off. The UI badge only shows when
+        // is_backed_off is true, so this doesn't affect rendering.
+        assert_eq!(snapshot[1].consecutive_failures, 5);
     }
 }
