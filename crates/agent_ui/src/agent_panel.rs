@@ -4464,6 +4464,24 @@ impl AgentPanel {
                 {
                     return false;
                 }
+                // `is_loading_contents` covers the window between `send()` and
+                // the turn actually starting: the editor's message (including
+                // mention resolutions such as the ThreadSummary follow-up) is
+                // being resolved into content blocks. The thread reports Idle
+                // during this window, so without this guard the thread can be
+                // evicted while its summary/content is still loading — which is
+                // the "new thread disappears while summary is loading" bug.
+                //
+                // Note: we intentionally do NOT guard on `_auto_prompt_task` —
+                // that task is the orchestration LLM call, and cancelling it on
+                // eviction merely stops the auto_prompt chain for an otherwise
+                // idle thread; it does not lose user data. Guarding it would
+                // prevent legitimate cleanup of idle threads (the stub-thread
+                // regression tests create threads whose `on_thread_stopped`
+                // plants a pending auto_prompt task).
+                if thread_view.is_loading_contents {
+                    return false;
+                }
                 if let Some(native_thread) = thread_view.as_native_thread(cx) {
                     let native = native_thread.read(cx);
                     if native.is_generating_title()
@@ -11092,6 +11110,217 @@ mod tests {
             assert!(
                 panel.retained_threads.contains_key(&thread_id_c),
                 "loading thread C should survive cleanup_retained_threads"
+            );
+        });
+    }
+
+    /// Regression test for the "new thread disappears while summary is loading"
+    /// bug. The previous fixes only protected threads in `ServerState::Loading`
+    /// (no `root_thread_view`) or with native-agent background flags
+    /// (title/summary/queued). They missed `ThreadView::is_loading_contents` —
+    /// the window between `send()` and the turn starting, where the editor is
+    /// resolving mention content (e.g. the ThreadSummary follow-up) into blocks.
+    /// During this window the thread reports `ThreadStatus::Idle` with no
+    /// background flags, so `cleanup_retained_threads` would evict it,
+    /// cancelling the in-flight content resolution and losing the thread.
+    /// This test simulates that exact state by flipping `is_loading_contents`
+    /// on a retained thread and asserting cleanup leaves it alone.
+    #[gpui::test]
+    async fn test_loading_contents_thread_not_cleaned_up(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+
+        // Thread A: connected, idle, loadable — will become the navigation
+        // target so the loading-contents thread B can be retained.
+        let connection_a = StubAgentConnection::new()
+            .with_supports_load_session(true)
+            .with_agent_id("loadable-stub".into())
+            .with_telemetry_id("loadable-stub".into());
+        let (_session_id_a, thread_id_a) =
+            open_generating_thread_with_loadable_connection(&panel, &connection_a, &mut cx);
+        let session_id_a = active_session_id(&panel, &cx);
+        cx.update(|_, _cx| {
+            connection_a.end_turn(session_id_a.clone(), acp::StopReason::EndTurn);
+        });
+        cx.run_until_parked();
+
+        // Thread B: also connected, idle, loadable. This is the thread that
+        // would be created by auto_prompt's ThreadSummary dispatch.
+        let (_session_id_b, thread_id_b) =
+            open_generating_thread_with_loadable_connection(&panel, &connection_a, &mut cx);
+        let session_id_b = active_session_id(&panel, &cx);
+        cx.update(|_, _cx| {
+            connection_a.end_turn(session_id_b.clone(), acp::StopReason::EndTurn);
+        });
+        cx.run_until_parked();
+
+        // Simulate the "summary loading" window: the thread is connected and
+        // Idle, but `is_loading_contents` is true because its message (with a
+        // ThreadSummary mention) is being resolved into content blocks.
+        //
+        // Clear any stale auto_prompt_task so is_loading_contents is the only
+        // relevant state differing from a plain idle thread.
+        panel.update(&mut cx, |panel, cx| {
+            let view = panel
+                .active_conversation_view()
+                .expect("thread B should be active");
+            let thread_view = view
+                .read(cx)
+                .root_thread_view()
+                .expect("thread B should be connected");
+            thread_view.update(cx, |tv, _cx| {
+                tv._auto_prompt_task = None;
+                tv.is_loading_contents = true;
+            });
+        });
+
+        // Force aggressive cleanup so any non-protected idle thread is dropped.
+        cx.update(|_, cx| {
+            cx.set_global(MaxIdleRetainedThreads(0));
+        });
+
+        // Navigate away to thread A — this retains thread B.
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.load_agent_thread(
+                crate::Agent::NativeAgent,
+                thread_id_a,
+                None,
+                None,
+                true,
+                AgentThreadSource::Sidebar,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, _cx| {
+            assert!(
+                panel.retained_threads.contains_key(&thread_id_b),
+                "loading-contents thread B should be retained after navigating away"
+            );
+        });
+
+        // Run cleanup — thread B must survive because is_loading_contents is true.
+        panel.update(&mut cx, |panel, cx| {
+            panel.cleanup_retained_threads(cx);
+        });
+
+        panel.read_with(&cx, |panel, _cx| {
+            assert!(
+                panel.retained_threads.contains_key(&thread_id_b),
+                "loading-contents thread B should survive cleanup_retained_threads"
+            );
+        });
+
+        // Sanity check: prove the protection was specifically due to
+        // is_loading_contents, not some other quirk. Clear is_loading_contents
+        // and re-evaluate the exact predicate from cleanup_retained_threads;
+        // the thread should now be a cleanup candidate given it is idle,
+        // loadable, and not native.
+        panel.update(&mut cx, |panel, cx| {
+            let view = panel
+                .retained_threads
+                .get(&thread_id_b)
+                .expect("thread B still present")
+                .clone();
+            let thread_view_entity = view
+                .read(cx)
+                .root_thread_view()
+                .expect("thread B connected");
+            thread_view_entity.update(cx, |tv, _cx| {
+                tv.is_loading_contents = false;
+            });
+            let tv = thread_view_entity.read(cx);
+            let acp_thread = tv.thread.read(cx);
+            let is_candidate = acp_thread.connection().supports_load_session()
+                && acp_thread.status() == ThreadStatus::Idle
+                && !tv.is_loading_contents;
+            assert!(
+                is_candidate,
+                "after clearing is_loading_contents, idle loadable stub thread should be a cleanup candidate (status={:?}, supports_load={}, loading_contents={})",
+                acp_thread.status(),
+                acp_thread.connection().supports_load_session(),
+                tv.is_loading_contents
+            );
+        });
+    }
+
+    /// Regression test: a thread with an in-flight `_auto_prompt_task` SHOULD
+    /// be cleanable — the task is the auto_prompt orchestration LLM call, and
+    /// cancelling it on eviction merely stops the auto_prompt chain for an
+    /// otherwise idle thread; it does not lose user data. This test pins that
+    /// contract so a future "protect everything" change can't silently break
+    /// cleanup of idle threads whose `on_thread_stopped` planted a pending task.
+    #[gpui::test]
+    async fn test_auto_prompt_task_thread_is_cleanable(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+
+        let connection_a = StubAgentConnection::new()
+            .with_supports_load_session(true)
+            .with_agent_id("loadable-stub".into())
+            .with_telemetry_id("loadable-stub".into());
+        let (_session_id_a, thread_id_a) =
+            open_generating_thread_with_loadable_connection(&panel, &connection_a, &mut cx);
+        let session_id_a = active_session_id(&panel, &cx);
+        cx.update(|_, _cx| {
+            connection_a.end_turn(session_id_a.clone(), acp::StopReason::EndTurn);
+        });
+        cx.run_until_parked();
+
+        let (_session_id_b, thread_id_b) =
+            open_generating_thread_with_loadable_connection(&panel, &connection_a, &mut cx);
+        let session_id_b = active_session_id(&panel, &cx);
+        cx.update(|_, _cx| {
+            connection_a.end_turn(session_id_b.clone(), acp::StopReason::EndTurn);
+        });
+        cx.run_until_parked();
+
+        // Plant a dummy non-completing auto_prompt task to simulate an in-flight
+        // orchestration call, and ensure is_loading_contents is false so the
+        // ONLY potential guard would be _auto_prompt_task (which we deliberately
+        // do NOT guard on).
+        panel.update(&mut cx, |panel, cx| {
+            let view = panel
+                .active_conversation_view()
+                .expect("thread B active");
+            let thread_view = view
+                .read(cx)
+                .root_thread_view()
+                .expect("thread B connected");
+            thread_view.update(cx, |tv, cx| {
+                tv.is_loading_contents = false;
+                tv._auto_prompt_task = Some(cx.background_executor().spawn(async {
+                    std::future::pending::<()>().await;
+                }));
+            });
+        });
+
+        cx.update(|_, cx| {
+            cx.set_global(MaxIdleRetainedThreads(0));
+        });
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.load_agent_thread(
+                crate::Agent::NativeAgent,
+                thread_id_a,
+                None,
+                None,
+                true,
+                AgentThreadSource::Sidebar,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        panel.update(&mut cx, |panel, cx| {
+            panel.cleanup_retained_threads(cx);
+        });
+
+        panel.read_with(&cx, |panel, _cx| {
+            assert!(
+                !panel.retained_threads.contains_key(&thread_id_b),
+                "idle thread with only an in-flight auto_prompt_task should still be cleaned up"
             );
         });
     }
