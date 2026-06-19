@@ -8,7 +8,7 @@ use serde_json::Value;
 
 use crate::{ReasoningEffort, RequestError, Role, ServiceTier, ToolChoice};
 
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Debug, Clone)]
 pub struct Request {
     pub model: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -48,7 +48,7 @@ pub enum ResponseIncludable {
     ReasoningEncryptedContent,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseInputItem {
     Message(ResponseMessageItem),
@@ -57,7 +57,7 @@ pub enum ResponseInputItem {
     Reasoning(ResponseReasoningInputItem),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponseMessageItem {
     pub role: Role,
     pub content: Vec<ResponseInputContent>,
@@ -65,14 +65,14 @@ pub struct ResponseMessageItem {
     pub phase: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponseFunctionCallItem {
     pub call_id: String,
     pub name: String,
     pub arguments: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponseFunctionCallOutputItem {
     pub call_id: String,
     pub output: ResponseFunctionCallOutputContent,
@@ -98,7 +98,7 @@ pub enum ResponseReasoningSummaryPart {
     SummaryText { text: String },
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ResponseFunctionCallOutputContent {
     List(Vec<ResponseInputContent>),
@@ -122,7 +122,7 @@ pub enum ResponseInputContent {
     Refusal { refusal: String },
 }
 
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Debug, Clone)]
 pub struct ReasoningConfig {
     pub effort: ReasoningEffort,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -137,7 +137,7 @@ pub enum ReasoningSummaryMode {
     Detailed,
 }
 
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Debug, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToolDefinition {
     Function {

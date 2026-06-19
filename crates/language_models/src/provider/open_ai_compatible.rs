@@ -275,64 +275,62 @@ impl State {
         })
     }
 
-    /// Picks an available API key, skipping any currently in backoff.
-    ///
-    /// Returns the key plus the slot it came from so the caller can later
-    /// report success/failure via `record_key_success` / `record_key_failure`.
-    ///
-    /// If *every* present key is in backoff, returns the one with the earliest
-    /// `backoff_until` rather than `None` — failing open here lets the caller
-    /// at least try the soonest-available key instead of erroring as `NoApiKey`.
-    /// Returns `None` only when no key is configured at all.
-    fn select_key(&self, health: &KeyHealthTracker, now: Instant) -> Option<(Arc<str>, KeySlot)> {
+    /// Collects every configured key with its slot. Used by the intra-request
+    /// retry loop in `stream_completion` / `stream_response`, which needs the
+    /// candidate list up-front so it can try keys one at a time without
+    /// re-entering `Entity::read_with` from a `!Send` background context.
+    fn gather_candidates(&self) -> Vec<(Arc<str>, KeySlot)> {
         let primary_url = self.settings.api_url.as_str();
         let secondary_url = secondary_key_url(primary_url);
         let tertiary_url = tertiary_key_url(primary_url);
 
-        let candidates: [(Option<Arc<str>>, KeySlot); 3] = [
-            (
-                self.api_key_state.key(primary_url),
-                KeySlot::Primary,
-            ),
-            (
-                self.api_key_state_2.key(&secondary_url),
-                KeySlot::Secondary,
-            ),
-            (
-                self.api_key_state_3.key(&tertiary_url),
-                KeySlot::Tertiary,
-            ),
-        ];
-
-        // Healthy candidates: present and not in backoff.
-        let healthy: Vec<(Arc<str>, KeySlot)> = candidates
-            .iter()
-            .filter_map(|(key, slot)| {
-                let key = key.clone()?;
-                if health.get(*slot).is_backed_off(now) {
-                    return None;
-                }
-                Some((key, *slot))
-            })
-            .collect();
-
-        if let Some(pick) = healthy.choose(&mut rand::rng()).cloned() {
-            return Some(pick);
+        let mut out = Vec::with_capacity(3);
+        if let Some(key) = self.api_key_state.key(primary_url) {
+            out.push((key, KeySlot::Primary));
         }
-
-        // Everything present is backed off — fall back to the earliest-expiring
-        // backed-off key. Better than NoApiKey when at least one key exists.
-        candidates
-            .iter()
-            .filter_map(|(key, slot)| {
-                let key = key.clone()?;
-                let slot_health = health.get(*slot);
-                let until = slot_health.backoff_until?;
-                Some((key, *slot, until))
-            })
-            .min_by_key(|&(_, _, until)| until)
-            .map(|(key, slot, _)| (key, slot))
+        if let Some(key) = self.api_key_state_2.key(&secondary_url) {
+            out.push((key, KeySlot::Secondary));
+        }
+        if let Some(key) = self.api_key_state_3.key(&tertiary_url) {
+            out.push((key, KeySlot::Tertiary));
+        }
+        out
     }
+}
+
+/// Pure-function form of key selection. Used by the intra-request retry loop
+/// in `stream_completion` / `stream_response`, which has already snapshot the
+/// candidate list and cannot go back through `&self`.
+///
+/// Picks a random healthy candidate. If every candidate is currently backed
+/// off, returns the one whose `backoff_until` is soonest — failing open is
+/// strictly better than `NoApiKey` when at least one key exists.
+fn select_from_candidates(
+    candidates: &[(Arc<str>, KeySlot)],
+    health: &KeyHealthTracker,
+    now: Instant,
+) -> Option<(Arc<str>, KeySlot)> {
+    // Healthy candidates: present and not in backoff.
+    let healthy: Vec<(Arc<str>, KeySlot)> = candidates
+        .iter()
+        .filter(|(_, slot)| !health.get(*slot).is_backed_off(now))
+        .cloned()
+        .collect();
+
+    if let Some(pick) = healthy.choose(&mut rand::rng()).cloned() {
+        return Some(pick);
+    }
+
+    // Everything present is backed off — fall back to the earliest-expiring
+    // backed-off key. Better than NoApiKey when at least one key exists.
+    candidates
+        .iter()
+        .filter_map(|(key, slot)| {
+            let until = health.get(*slot).backoff_until?;
+            Some(((key.clone(), *slot), until))
+        })
+        .min_by_key(|(_, until)| *until)
+        .map(|((key, slot), _)| (key, slot))
 }
 
 impl OpenAiCompatibleLanguageModelProvider {
@@ -526,37 +524,47 @@ impl OpenAiCompatibleLanguageModel {
     > {
         let http_client = self.http_client.clone();
 
-        let (key_health, selected, api_url, extra_headers) =
+        let (key_health, candidates, api_url, extra_headers) =
             self.state.read_with(cx, |state, _cx| {
-                let health = state.key_health.lock().expect("key_health mutex poisoned");
                 (
                     state.key_health.clone(),
-                    state.select_key(&health, Instant::now()),
-                    state.settings.api_url.clone(),
+                    state.gather_candidates(),
+                    Arc::<str>::from(state.settings.api_url.as_str()),
                     state.settings.custom_headers.clone(),
                 )
             });
 
         let provider = self.provider_name.clone();
+        let provider_name = provider.0.clone();
         let future = self.request_limiter.stream(async move {
-            let Some((api_key, slot)) = selected else {
+            if candidates.is_empty() {
                 return Err(LanguageModelCompletionError::NoApiKey { provider });
-            };
-            let result: Result<
-                futures::stream::BoxStream<'static, Result<ResponseStreamEvent>>,
-                LanguageModelCompletionError,
-            > = stream_completion(
-                http_client.as_ref(),
-                provider.0.as_str(),
-                &api_url,
-                &api_key,
-                request,
-                &extra_headers,
+            }
+            retry_stream(
+                &candidates,
+                &key_health,
+                provider,
+                move |api_key| {
+                    let http_client = http_client.clone();
+                    let api_url = api_url.clone();
+                    let extra_headers = extra_headers.clone();
+                    let provider_name = provider_name.clone();
+                    let attempt_request = request.clone();
+                    Box::pin(async move {
+                        stream_completion(
+                            http_client.as_ref(),
+                            provider_name.as_str(),
+                            api_url.as_ref(),
+                            api_key.as_ref(),
+                            attempt_request,
+                            &extra_headers,
+                        )
+                        .await
+                        .map_err(Into::into)
+                    })
+                },
             )
             .await
-            .map_err(Into::into);
-            record_outcome(&key_health, slot, &result);
-            result
         });
 
         async move { Ok(future.await?.boxed()) }.boxed()
@@ -570,66 +578,156 @@ impl OpenAiCompatibleLanguageModel {
     {
         let http_client = self.http_client.clone();
 
-        let (key_health, selected, api_url, extra_headers) =
+        let (key_health, candidates, api_url, extra_headers) =
             self.state.read_with(cx, |state, _cx| {
-                let health = state.key_health.lock().expect("key_health mutex poisoned");
                 (
                     state.key_health.clone(),
-                    state.select_key(&health, Instant::now()),
-                    state.settings.api_url.clone(),
+                    state.gather_candidates(),
+                    Arc::<str>::from(state.settings.api_url.as_str()),
                     state.settings.custom_headers.clone(),
                 )
             });
 
         let provider = self.provider_name.clone();
+        let provider_name = provider.0.clone();
         let future = self.request_limiter.stream(async move {
-            let Some((api_key, slot)) = selected else {
+            if candidates.is_empty() {
                 return Err(LanguageModelCompletionError::NoApiKey { provider });
-            };
-            let result: Result<
-                futures::stream::BoxStream<'static, Result<ResponsesStreamEvent>>,
-                LanguageModelCompletionError,
-            > = stream_response(
-                http_client.as_ref(),
-                provider.0.as_str(),
-                &api_url,
-                &api_key,
-                request,
-                &extra_headers,
+            }
+            retry_stream(
+                &candidates,
+                &key_health,
+                provider,
+                move |api_key| {
+                    let http_client = http_client.clone();
+                    let api_url = api_url.clone();
+                    let extra_headers = extra_headers.clone();
+                    let provider_name = provider_name.clone();
+                    let attempt_request = request.clone();
+                    Box::pin(async move {
+                        stream_response(
+                            http_client.as_ref(),
+                            provider_name.as_str(),
+                            api_url.as_ref(),
+                            api_key.as_ref(),
+                            attempt_request,
+                            &extra_headers,
+                        )
+                        .await
+                        .map_err(Into::into)
+                    })
+                },
             )
             .await
-            .map_err(Into::into);
-            record_outcome(&key_health, slot, &result);
-            result
         });
 
         async move { Ok(future.await?.boxed()) }.boxed()
     }
 }
 
-/// Updates per-key health after a request completes. Called from inside the
-/// rate-limited stream closure so health reflects real request outcomes.
+/// Updates per-key health after a successful request. Called from inside
+/// the rate-limited stream closure so health reflects real request outcomes.
 ///
-/// - Success: clears the slot's failure counter and backoff.
-/// - Backoff-worthy error: bumps the counter and schedules exponential backoff.
-/// - Other error: leaves health untouched (it would fail on every key anyway).
+/// A single success clears the slot's failure counter and backoff — a
+/// previously-failing key re-qualifies immediately.
 ///
 /// Uses the shared `Arc<Mutex<KeyHealthTracker>>` rather than `Entity::update`
 /// because the request closure runs on a background executor where `AsyncApp`
 /// (`!Send`) cannot travel.
-fn record_outcome<T>(
-    key_health: &Arc<std::sync::Mutex<KeyHealthTracker>>,
-    slot: KeySlot,
-    result: &Result<T, LanguageModelCompletionError>,
-) {
+fn record_key_success(key_health: &Arc<std::sync::Mutex<KeyHealthTracker>>, slot: KeySlot) {
     let mut health = match key_health.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
-    match result {
-        Ok(_) => health.record_success(slot),
-        Err(err) if is_backoff_worthy(err) => health.record_failure(slot, Instant::now()),
-        Err(_) => {}
+    health.record_success(slot);
+}
+
+/// Updates per-key health after a failed request. Only backoff-worthy errors
+/// (see `is_backoff_worthy`) bump the failure counter and reschedule backoff;
+/// other errors are no-ops because they would recur on every key.
+fn record_key_failure(
+    key_health: &Arc<std::sync::Mutex<KeyHealthTracker>>,
+    slot: KeySlot,
+    err: &LanguageModelCompletionError,
+) {
+    if !is_backoff_worthy(err) {
+        return;
+    }
+    let mut health = match key_health.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    health.record_failure(slot, Instant::now());
+}
+
+/// Drives intra-request key rotation. Tries up to `candidates.len()` keys,
+/// each selected at the moment of the attempt (so a slot that just got backed
+/// off is skipped on the next pick). On the first success the resulting stream
+/// is returned and the slot's health is cleared. On a backoff-worthy failure
+/// the slot is poisoned and the next candidate is tried. On any other error
+/// the loop exits immediately — the error would recur on every key.
+///
+/// `do_attempt` receives the chosen key and must return a `'static` future;
+/// callers are expected to clone the request template inside the closure
+/// (the underlying `open_ai::Request` / `responses::Request` types derive
+/// `Clone` for this purpose) and to map the provider-specific error into
+/// `LanguageModelCompletionError`.
+///
+/// Bounds the worst-case latency to one full key rotation per user request,
+/// which is acceptable because the alternative (returning the error
+/// immediately) is strictly worse for the user's stated reliability goal.
+async fn retry_stream<S>(
+    candidates: &[(Arc<str>, KeySlot)],
+    key_health: &Arc<std::sync::Mutex<KeyHealthTracker>>,
+    provider: LanguageModelProviderName,
+    mut do_attempt: impl FnMut(Arc<str>) -> BoxFuture<'static, Result<S, LanguageModelCompletionError>>,
+) -> Result<S, LanguageModelCompletionError> {
+    let mut remaining: Vec<(Arc<str>, KeySlot)> = candidates.to_vec();
+    let mut last_error: Option<LanguageModelCompletionError> = None;
+
+    // Upper bound: try each configured key at most once. After that, even if
+    // every failure was backoff-worthy, we've exhausted the pool.
+    let max_attempts = remaining.len();
+    for _ in 0..max_attempts {
+        let Some((api_key, slot)) =
+            select_from_candidates(&remaining, &snapshot_health(key_health), Instant::now())
+        else {
+            break;
+        };
+
+        match do_attempt(api_key).await {
+            Ok(stream) => {
+                record_key_success(key_health, slot);
+                return Ok(stream);
+            }
+            Err(err) => {
+                let worthy = is_backoff_worthy(&err);
+                // Always record so health reflects reality; record_key_failure
+                // is a no-op for non-backoff-worthy errors.
+                record_key_failure(key_health, slot, &err);
+                if !worthy {
+                    // Would fail on every key; don't waste the user's time.
+                    return Err(err);
+                }
+                // Don't try this slot again within this request.
+                remaining.retain(|(_, s)| *s != slot);
+                last_error = Some(err);
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or(LanguageModelCompletionError::NoApiKey { provider }))
+}
+
+/// Helper: snapshots the health tracker under the mutex so the (borrowing)
+/// `select_from_candidates` can read it without holding the lock across the
+/// attempt future. Holding the lock across `.await` would serialize all
+/// in-flight requests on the same provider and risk deadlock if a downstream
+/// path ever tried to re-acquire.
+fn snapshot_health(key_health: &Arc<std::sync::Mutex<KeyHealthTracker>>) -> KeyHealthTracker {
+    match key_health.lock() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
     }
 }
 
@@ -1381,9 +1479,238 @@ mod tests {
     }
 
     #[test]
-    fn select_key_returns_none_when_no_keys_configured() {
-        let state = fake_state_with_no_keys();
+    fn select_from_candidates_returns_none_when_no_keys_configured() {
+        let candidates: Vec<(Arc<str>, KeySlot)> = Vec::new();
         let health = KeyHealthTracker::default();
-        assert!(state.select_key(&health, Instant::now()).is_none());
+        assert!(select_from_candidates(&candidates, &health, Instant::now()).is_none());
+    }
+
+    #[test]
+    fn gather_candidates_returns_nothing_for_fake_state_with_no_keys() {
+        // Sanity: the test fixture really has no keys configured, otherwise
+        // the test above would be misleading.
+        let state = fake_state_with_no_keys();
+        assert!(state.gather_candidates().is_empty());
+    }
+
+    #[test]
+    fn select_from_candidates_skips_backed_off_slots() {
+        let candidates: Vec<(Arc<str>, KeySlot)> = vec![
+            (Arc::<str>::from("key-a"), KeySlot::Primary),
+            (Arc::<str>::from("key-b"), KeySlot::Secondary),
+            (Arc::<str>::from("key-c"), KeySlot::Tertiary),
+        ];
+        let mut health = KeyHealthTracker::default();
+        // Back off everything except Secondary.
+        health.record_failure(KeySlot::Primary, Instant::now());
+        health.record_failure(KeySlot::Tertiary, Instant::now());
+
+        let now = Instant::now();
+        // Secondary is the only healthy candidate, so it must be picked.
+        for _ in 0..20 {
+            let (key, slot) = select_from_candidates(&candidates, &health, now).unwrap();
+            assert_eq!(slot, KeySlot::Secondary);
+            assert_eq!(&*key, "key-b");
+        }
+    }
+
+    #[test]
+    fn select_from_candidates_falls_open_when_all_backed_off() {
+        // If every slot is in backoff, the function still returns a key
+        // (the soonest-expiring one) rather than `None`.
+        let candidates: Vec<(Arc<str>, KeySlot)> = vec![
+            (Arc::<str>::from("key-a"), KeySlot::Primary),
+            (Arc::<str>::from("key-b"), KeySlot::Secondary),
+        ];
+        // Set up deterministic backoff end times by writing directly into the
+        // tracker, rather than going through `record_failure` (which adds
+        // randomized jitter).
+        let now = Instant::now();
+        let mut health = KeyHealthTracker::default();
+        health.primary = KeyHealth {
+            consecutive_failures: 3,
+            backoff_until: Some(now + Duration::from_secs(120)),
+        };
+        health.secondary = KeyHealth {
+            consecutive_failures: 1,
+            backoff_until: Some(now + Duration::from_secs(30)),
+        };
+
+        let pick = select_from_candidates(&candidates, &health, now);
+        assert!(pick.is_some(), "fail-open should return a key even when all backed off");
+        // Secondary expires sooner, so it must be picked.
+        let (_, slot) = pick.unwrap();
+        assert_eq!(slot, KeySlot::Secondary);
+    }
+
+    // ------------------------------------------------------------------
+    // retry_stream tests
+    //
+    // These exercise the intra-request retry loop in isolation. The
+    // `do_attempt` closure records which key it was called with and returns
+    // a canned result, so we can assert on rotation order and exit conditions
+    // without a real HTTP client.
+    // ------------------------------------------------------------------
+
+    fn rate_limit_err() -> LanguageModelCompletionError {
+        LanguageModelCompletionError::RateLimitExceeded {
+            provider: provider_name(),
+            retry_after: None,
+        }
+    }
+
+    fn bad_request_err() -> LanguageModelCompletionError {
+        // Non-backoff-worthy: should abort retry loop immediately.
+        LanguageModelCompletionError::BadRequestFormat {
+            provider: provider_name(),
+            message: "bad".into(),
+        }
+    }
+
+    #[test]
+    fn retry_stream_succeeds_on_first_attempt() {
+        let candidates: Vec<(Arc<str>, KeySlot)> = vec![
+            (Arc::<str>::from("key-a"), KeySlot::Primary),
+            (Arc::<str>::from("key-b"), KeySlot::Secondary),
+        ];
+        let key_health = Arc::new(std::sync::Mutex::new(KeyHealthTracker::default()));
+        let attempts = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+
+        let attempts_for_closure = attempts.clone();
+        let result: Result<i32, _> = smol::block_on(retry_stream(
+            &candidates,
+            &key_health,
+            provider_name(),
+            move |api_key| {
+                let key = (*api_key).to_string();
+                attempts_for_closure.lock().push(key);
+                Box::pin(async move { Ok(42_i32) })
+            },
+        ));
+
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(attempts.lock().len(), 1, "should not retry after success");
+    }
+
+    #[test]
+    fn retry_stream_rotates_on_backoff_worthy_failure() {
+        // Primary key always fails with rate limit; Secondary always succeeds.
+        // The loop must rotate to Secondary and return Ok.
+        let candidates: Vec<(Arc<str>, KeySlot)> = vec![
+            (Arc::<str>::from("key-a"), KeySlot::Primary),
+            (Arc::<str>::from("key-b"), KeySlot::Secondary),
+        ];
+        let key_health = Arc::new(std::sync::Mutex::new(KeyHealthTracker::default()));
+        let attempts = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+
+        let attempts_for_closure = attempts.clone();
+        let result: Result<i32, _> = smol::block_on(retry_stream(
+            &candidates,
+            &key_health,
+            provider_name(),
+            move |api_key| {
+                let key = (*api_key).to_string();
+                attempts_for_closure.lock().push(key.clone());
+                Box::pin(async move {
+                    if key == "key-a" {
+                        Err(rate_limit_err())
+                    } else {
+                        Ok(7_i32)
+                    }
+                })
+            },
+        ));
+
+        assert_eq!(result.unwrap(), 7);
+        assert_eq!(*attempts.lock(), vec!["key-a".to_string(), "key-b".to_string()]);
+
+        // Primary should now be in backoff, Secondary healthy (the success cleared it).
+        let health = key_health.lock().unwrap();
+        assert!(
+            health.get(KeySlot::Primary).consecutive_failures >= 1,
+            "failed slot should be poisoned"
+        );
+        assert_eq!(
+            health.get(KeySlot::Secondary).consecutive_failures, 0,
+            "succeeded slot should have cleared health"
+        );
+    }
+
+    #[test]
+    fn retry_stream_aborts_on_non_backoff_worthy_error() {
+        // Non-backoff-worthy error must terminate the loop without trying
+        // other keys — they would fail identically.
+        let candidates: Vec<(Arc<str>, KeySlot)> = vec![
+            (Arc::<str>::from("key-a"), KeySlot::Primary),
+            (Arc::<str>::from("key-b"), KeySlot::Secondary),
+        ];
+        let key_health = Arc::new(std::sync::Mutex::new(KeyHealthTracker::default()));
+        let attempts = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+
+        let attempts_for_closure = attempts.clone();
+        let result: Result<i32, _> = smol::block_on(retry_stream(
+            &candidates,
+            &key_health,
+            provider_name(),
+            move |api_key| {
+                let key = (*api_key).to_string();
+                attempts_for_closure.lock().push(key);
+                Box::pin(async move { Err(bad_request_err()) })
+            },
+        ));
+
+        assert!(matches!(result, Err(LanguageModelCompletionError::BadRequestFormat { .. })));
+        // Only one attempt — non-backoff-worthy errors don't rotate.
+        assert_eq!(attempts.lock().len(), 1);
+        // No slot should have been poisoned (the error wasn't backoff-worthy).
+        let health = key_health.lock().unwrap();
+        assert_eq!(health.get(KeySlot::Primary).consecutive_failures, 0);
+    }
+
+    #[test]
+    fn retry_stream_returns_last_error_when_all_candidates_fail() {
+        // Every key fails backoff-worthily; loop should exhaust and return the
+        // final error, not retry any slot twice.
+        let candidates: Vec<(Arc<str>, KeySlot)> = vec![
+            (Arc::<str>::from("key-a"), KeySlot::Primary),
+            (Arc::<str>::from("key-b"), KeySlot::Secondary),
+            (Arc::<str>::from("key-c"), KeySlot::Tertiary),
+        ];
+        let key_health = Arc::new(std::sync::Mutex::new(KeyHealthTracker::default()));
+        let attempts = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+
+        let attempts_for_closure = attempts.clone();
+        let result: Result<i32, _> = smol::block_on(retry_stream(
+            &candidates,
+            &key_health,
+            provider_name(),
+            move |api_key| {
+                let key = (*api_key).to_string();
+                attempts_for_closure.lock().push(key);
+                Box::pin(async move { Err(rate_limit_err()) })
+            },
+        ));
+
+        assert!(matches!(result, Err(LanguageModelCompletionError::RateLimitExceeded { .. })));
+        // Exactly one attempt per candidate — no slot tried twice.
+        let attempts = attempts.lock();
+        assert_eq!(attempts.len(), 3, "each candidate tried exactly once: {attempts:?}");
+        let unique: std::collections::HashSet<&String> = attempts.iter().collect();
+        assert_eq!(unique.len(), 3, "no candidate retried: {attempts:?}");
+    }
+
+    #[test]
+    fn retry_stream_returns_no_key_error_for_empty_candidates() {
+        let candidates: Vec<(Arc<str>, KeySlot)> = Vec::new();
+        let key_health = Arc::new(std::sync::Mutex::new(KeyHealthTracker::default()));
+
+        let result: Result<i32, _> = smol::block_on(retry_stream(
+            &candidates,
+            &key_health,
+            provider_name(),
+            move |_api_key| Box::pin(async move { Ok(1_i32) }),
+        ));
+
+        assert!(matches!(result, Err(LanguageModelCompletionError::NoApiKey { .. })));
     }
 }

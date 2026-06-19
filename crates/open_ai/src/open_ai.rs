@@ -444,7 +444,7 @@ mod tests {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamOptions {
     pub include_usage: bool,
 }
@@ -457,7 +457,7 @@ impl Default for StreamOptions {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Request {
     pub model: String,
     pub messages: Vec<RequestMessage>,
@@ -500,7 +500,7 @@ pub enum ServiceTier {
     Priority,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ToolChoice {
     Auto,
