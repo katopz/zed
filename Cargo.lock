@@ -9787,6 +9787,7 @@ dependencies = [
  "open_router",
  "opencode",
  "parking_lot",
+ "paths",
  "pretty_assertions",
  "rand 0.9.4",
  "release_channel",

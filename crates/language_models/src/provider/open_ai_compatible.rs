@@ -1,6 +1,7 @@
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use convert_case::{Case, Casing};
 use credentials_provider::CredentialsProvider;
+use fs::Fs;
 use futures::{FutureExt, StreamExt, future::BoxFuture};
 use gpui::{AnyView, App, AsyncApp, Context, ElementId, Entity, SharedString, Task, TaskExt, Window};
 use http_client::{CustomHeaders, HttpClient};
@@ -16,11 +17,14 @@ use open_ai::{
     responses::{Request as ResponseRequest, StreamEvent as ResponsesStreamEvent, stream_response},
     stream_completion,
 };
+use paths;
 use rand::seq::IndexedRandom;
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 use settings::{Settings, SettingsStore};
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use ui::{ElevationIndex, Tooltip, prelude::*};
 use ui_input::InputField;
 use util::ResultExt;
@@ -55,6 +59,11 @@ pub struct State {
     /// `Arc<Mutex>` because `AsyncApp` is `!Send` and can't be moved into the
     /// rate-limited stream closure.
     key_health: Arc<std::sync::Mutex<KeyHealthTracker>>,
+    /// Latest pending debounced save task. Replacing this cancels the prior
+    /// task, coalescing bursts of failures into a single disk write.
+    key_health_dirty: Arc<std::sync::Mutex<Option<Task<()>>>>,
+    /// Path under `paths::data_dir()` where `key_health` is persisted.
+    key_health_path: PathBuf,
     settings: OpenAiCompatibleSettings,
     credentials_provider: Arc<dyn CredentialsProvider>,
 }
@@ -78,8 +87,9 @@ enum KeySlot {
     Tertiary,
 }
 
-/// Per-key backoff state. Lives in-memory only; restarts reset all keys to healthy.
-#[derive(Default, Clone, Debug)]
+/// Per-key backoff state. Persisted across restarts as relative durations
+/// (see `PersistedKeyHealth`); in-memory `Instant`s are reconstructed on load.
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
 struct KeyHealth {
     consecutive_failures: u32,
     backoff_until: Option<Instant>,
@@ -103,7 +113,7 @@ impl KeyHealth {
     }
 }
 
-#[derive(Default, Clone, Debug)]
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
 struct KeyHealthTracker {
     primary: KeyHealth,
     secondary: KeyHealth,
@@ -145,6 +155,251 @@ impl KeyHealthTracker {
         health.consecutive_failures = health.consecutive_failures.saturating_add(1);
         let backoff = compute_backoff(health.consecutive_failures);
         health.backoff_until = Some(now + backoff);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Persistence
+//
+// `Instant` is monotonic and process-local, so we can't serialize an absolute
+// timestamp. Instead we persist the *remaining* backoff as a `Duration` and
+// reconstruct `Instant::now() + remaining` on load. If the remaining duration
+// is zero/negative (i.e. the backoff already elapsed while Zed was closed) the
+// reconstructed `Instant` is in the past and `is_backed_off` returns false —
+// no special handling needed.
+// ---------------------------------------------------------------------------
+
+/// On-disk representation of a single slot's health. `backoff_remaining_secs`
+/// is `backoff_until - now` at save time (or `null` if the slot is healthy).
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+struct PersistedKeyHealth {
+    consecutive_failures: u32,
+    backoff_remaining_secs: Option<f64>,
+}
+
+/// Top-level persisted file. One per provider id, under
+/// `paths::data_dir()/openai_compatible_backoff/{id}.json`. `schema_version`
+/// lets us migrate the shape later without silent breakage.
+///
+/// `saved_at_unix_secs` is a wall-clock timestamp (from `SystemTime::now()`)
+/// captured at save time, used at load time to subtract the time Zed spent
+/// closed. Without it, reloading would always push `backoff_until` forward
+/// by the elapsed wall-clock time, defeating the purpose of persistence
+/// (a 1ms backoff persisted 5h ago would reload as "1ms from now").
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+struct PersistedKeyHealthFile {
+    schema_version: u32,
+    saved_at_unix_secs: u64,
+    primary: PersistedKeyHealth,
+    secondary: PersistedKeyHealth,
+    tertiary: PersistedKeyHealth,
+}
+
+const PERSISTED_KEY_HEALTH_SCHEMA_VERSION: u32 = 1;
+
+/// Subdirectory under `paths::data_dir()` holding one JSON file per provider.
+const PERSIST_DIR_NAME: &str = "openai_compatible_backoff";
+
+/// Debounce window for coalescing bursts of writes. A tight retry loop can
+/// record several failures in milliseconds; we only want one disk write per
+/// burst, so the latest task always cancels its predecessor after this delay.
+const PERSIST_DEBOUNCE: Duration = Duration::from_secs(2);
+
+impl PersistedKeyHealth {
+    fn from_health(health: &KeyHealth, now: Instant) -> Self {
+        let backoff_remaining_secs = health
+            .backoff_until
+            .map(|until| until.saturating_duration_since(now).as_secs_f64());
+        Self {
+            consecutive_failures: health.consecutive_failures,
+            backoff_remaining_secs,
+        }
+    }
+
+    /// Reconstructs an in-memory `KeyHealth`. The reconstructed `backoff_until`
+    /// is `now + max(0, remaining - elapsed)`; if the slot was healthy at save
+    /// (`remaining == None`) or the backoff already elapsed while Zed was
+    /// closed (`remaining <= elapsed`), the slot loads as healthy.
+    fn to_health(&self, now: Instant, elapsed_secs: f64) -> KeyHealth {
+        let backoff_until = self
+            .backoff_remaining_secs
+            .filter(|secs| *secs > elapsed_secs)
+            .map(|secs| now + Duration::from_secs_f64((secs - elapsed_secs).max(0.0)));
+        KeyHealth {
+            consecutive_failures: self.consecutive_failures,
+            backoff_until,
+        }
+    }
+}
+
+impl PersistedKeyHealthFile {
+    fn from_tracker(tracker: &KeyHealthTracker, now: Instant) -> Self {
+        Self {
+            schema_version: PERSISTED_KEY_HEALTH_SCHEMA_VERSION,
+            // Wall-clock at save time, captured once so all three slots share
+            // the same reference point. `UNIX_EPOCH.now()` is the canonical
+            // way to get a serializable wall-clock; monotonic `Instant` can't
+            // be serialized meaningfully across process boundaries.
+            saved_at_unix_secs: SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            primary: PersistedKeyHealth::from_health(&tracker.primary, now),
+            secondary: PersistedKeyHealth::from_health(&tracker.secondary, now),
+            tertiary: PersistedKeyHealth::from_health(&tracker.tertiary, now),
+        }
+    }
+
+    fn to_tracker(&self, now: Instant) -> KeyHealthTracker {
+        // How much wall-clock time elapsed between save and load? We use
+        // `SystemTime` (not `Instant`) because the save and load happen in
+        // different processes — `Instant` is process-local and not comparable
+        // across runs. The elapsed is then subtracted from each slot's
+        // remaining backoff: a 1ms backoff persisted 5h ago loads as healthy.
+        let elapsed_secs = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .ok()
+            .and_then(|now_unix| now_unix.as_secs().checked_sub(self.saved_at_unix_secs))
+            .map(|secs| secs as f64)
+            .unwrap_or(0.0);
+        KeyHealthTracker {
+            primary: self.primary.to_health(now, elapsed_secs),
+            secondary: self.secondary.to_health(now, elapsed_secs),
+            tertiary: self.tertiary.to_health(now, elapsed_secs),
+        }
+    }
+}
+
+/// Filename-safe form of a provider id. The id is a user-supplied string that
+/// may contain path separators or other characters unsafe as a filename; we
+/// replace them with `_` and fall back to `provider` if the result is empty.
+/// This is purely defensive — collisions across distinct ids would only cause
+/// two providers to share a backoff file, not a correctness bug in either.
+fn sanitize_provider_id_for_filename(provider_id: &str) -> String {
+    let sanitized: String = provider_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let sanitized = sanitized.trim_matches('_');
+    if sanitized.is_empty() {
+        "provider".to_string()
+    } else {
+        sanitized.to_string()
+    }
+}
+
+/// `paths::data_dir()/openai_compatible_backoff/{sanitized_id}.json`.
+fn key_health_path_for(provider_id: &str) -> PathBuf {
+    paths::data_dir()
+        .join(PERSIST_DIR_NAME)
+        .join(format!("{}.json", sanitize_provider_id_for_filename(provider_id)))
+}
+
+/// Loads a `KeyHealthTracker` from disk. Missing file and parse errors are
+/// non-fatal: they return a fresh `KeyHealthTracker::default()` so a corrupt
+/// or absent state never blocks requests.
+async fn reload_persisted_health(fs: &Arc<dyn Fs>, path: &PathBuf) -> KeyHealthTracker {
+    let content = match fs.load(path).await {
+        Ok(content) => content,
+        Err(err) => {
+            // Missing file is the common case on first run; only log non-NotFound.
+            if !err
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+            {
+                log::warn!(
+                    "failed to load persisted key health at {}: {err:#}",
+                    path.display()
+                );
+            }
+            return KeyHealthTracker::default();
+        }
+    };
+    match serde_json::from_str::<PersistedKeyHealthFile>(&content) {
+        Ok(file) => {
+            if file.schema_version != PERSISTED_KEY_HEALTH_SCHEMA_VERSION {
+                log::warn!(
+                    "ignoring persisted key health with schema_version {} (expected {}) at {}",
+                    file.schema_version,
+                    PERSISTED_KEY_HEALTH_SCHEMA_VERSION,
+                    path.display()
+                );
+                return KeyHealthTracker::default();
+            }
+            file.to_tracker(Instant::now())
+        }
+        Err(err) => {
+            log::warn!(
+                "failed to parse persisted key health at {}: {err:#}",
+                path.display()
+            );
+            KeyHealthTracker::default()
+        }
+    }
+}
+
+/// Atomic-writes the tracker snapshot to disk. Errors are propagated (caller
+/// decides whether to log); missing parent dir is created on demand.
+async fn persist_key_health(
+    fs: &Arc<dyn Fs>,
+    path: PathBuf,
+    tracker: KeyHealthTracker,
+) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs.create_dir(parent).await.with_context(|| {
+            format!("creating parent dir for key health persistence: {}", parent.display())
+        })?;
+    }
+    let serialized = serde_json::to_string(&PersistedKeyHealthFile::from_tracker(
+        &tracker,
+        Instant::now(),
+    ))
+    .context("serializing key health for persistence")?;
+    fs.atomic_write(path.clone(), serialized)
+        .await
+        .with_context(|| format!("writing key health to {}", path.display()))
+}
+
+/// Free-function form of `State::schedule_persist_key_health` so the request
+/// closure (which runs on a background executor and only has clones of the
+/// underlying `Arc`s) can schedule a save without re-entering `Entity::update`.
+///
+/// Takes `BackgroundExecutor` + `Arc<dyn Fs>` (both `Send + Sync + Clone`)
+/// instead of `AsyncApp` so the rate-limited stream closure — which must be
+/// `Send` to satisfy `BoxFuture<'static, ...>` — can capture these handles by
+/// move without dragging the `!Send` `AsyncApp` along.
+fn schedule_persist_key_health_inner(
+    key_health: &Arc<std::sync::Mutex<KeyHealthTracker>>,
+    key_health_dirty: &Arc<std::sync::Mutex<Option<Task<()>>>>,
+    path: PathBuf,
+    executor: gpui::BackgroundExecutor,
+    fs: Arc<dyn Fs>,
+) {
+    let snapshot = match key_health.lock() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    };
+    // Clone before the move into `spawn`: `spawn` takes `&self`, but the
+    // closure body needs an owned executor to await `.timer(...)`.
+    let timer_executor = executor.clone();
+    let task = executor.spawn(async move {
+        // Debounce: sleep briefly so back-to-back record_failure calls
+        // (e.g. inside retry_stream's loop) collapse into a single write.
+        timer_executor.timer(PERSIST_DEBOUNCE).await;
+        if let Err(err) = persist_key_health(&fs, path.clone(), snapshot).await {
+            log::warn!("failed to persist key health to {}: {err:#}", path.display());
+        }
+    });
+    // Replace any prior pending task. Dropping the old `Task` cancels it.
+    match key_health_dirty.lock() {
+        Ok(mut slot) => *slot = Some(task),
+        Err(poisoned) => *poisoned.into_inner() = Some(task),
     }
 }
 
@@ -231,6 +486,29 @@ impl State {
         self.api_key_state.has_key()
             || self.api_key_state_2.has_key()
             || self.api_key_state_3.has_key()
+    }
+
+    /// Schedules a debounced write of the current `key_health` snapshot to
+    /// `key_health_path`. Each call cancels any prior pending save (by
+    /// replacing the stored `Task`), coalescing a burst of failures from a
+    /// single retry loop into one disk write. Called after every request
+    /// outcome (success or failure) from `stream_completion` / `stream_response`
+    /// via the free-function form `schedule_persist_key_health_inner` (which
+    /// takes `Send`-safe handles, not `AsyncApp`).
+    ///
+    /// This method exists for symmetry + future foreground-triggered saves
+    /// (e.g. on `reset_credentials`). Currently unused; the request path uses
+    /// the free-function form because `AsyncApp` is `!Send` and the rate-limited
+    /// stream closure must be `Send`.
+    #[allow(dead_code)]
+    fn schedule_persist_key_health(&self, cx: &App) {
+        schedule_persist_key_health_inner(
+            &self.key_health,
+            &self.key_health_dirty,
+            self.key_health_path.clone(),
+            cx.background_executor().clone(),
+            <dyn Fs>::global(cx),
+        );
     }
 
     fn set_api_key(&mut self, api_key: Option<String>, cx: &mut Context<Self>) -> Task<Result<()>> {
@@ -458,6 +736,34 @@ impl OpenAiCompatibleLanguageModelProvider {
             })
             .detach();
             let settings = resolve_settings(&id, cx).cloned().unwrap_or_default();
+            let key_health = Arc::new(std::sync::Mutex::new(KeyHealthTracker::default()));
+            let key_health_dirty: Arc<std::sync::Mutex<Option<Task<()>>>> =
+                Arc::new(std::sync::Mutex::new(None));
+            let key_health_path = key_health_path_for(&id);
+
+            // Load persisted backoff state off the foreground thread. The
+            // in-memory tracker starts healthy; once the load completes we
+            // overwrite it under the mutex. Errors are logged inside
+            // `reload_persisted_health` and never propagate — a missing or
+            // corrupt file just means "start fresh", which is safe.
+            //
+            // Detached rather than stored: we don't need to await it, and a
+            // late-arriving load just refreshes the (possibly already-mutated)
+            // in-memory state. The race is benign: either the disk wins
+            // (restoring backed-off state) or an in-flight request has already
+            // recorded an outcome (in which case the freshest data wins).
+            let fs = <dyn Fs>::global(cx);
+            let load_health = key_health.clone();
+            let load_path = key_health_path.clone();
+            cx.background_spawn(async move {
+                let loaded = reload_persisted_health(&fs, &load_path).await;
+                match load_health.lock() {
+                    Ok(mut guard) => *guard = loaded,
+                    Err(poisoned) => *poisoned.into_inner() = loaded,
+                }
+            })
+            .detach();
+
             State {
                 id: id.clone(),
                 api_key_state: ApiKeyState::new(
@@ -472,7 +778,9 @@ impl OpenAiCompatibleLanguageModelProvider {
                     tertiary_key_url(&settings.api_url),
                     EnvVar::new(api_key_env_var_name_3),
                 ),
-                key_health: Arc::new(std::sync::Mutex::new(KeyHealthTracker::default())),
+                key_health,
+                key_health_dirty,
+                key_health_path,
                 settings,
                 credentials_provider,
             }
@@ -599,23 +907,31 @@ impl OpenAiCompatibleLanguageModel {
     > {
         let http_client = self.http_client.clone();
 
-        let (key_health, candidates, api_url, extra_headers) =
-            self.state.read_with(cx, |state, _cx| {
+        let (key_health, key_health_dirty, key_health_path, candidates, api_url, extra_headers, fs) =
+            self.state.read_with(cx, |state, cx| {
                 (
                     state.key_health.clone(),
+                    state.key_health_dirty.clone(),
+                    state.key_health_path.clone(),
                     state.gather_candidates(),
                     Arc::<str>::from(state.settings.api_url.as_str()),
                     state.settings.custom_headers.clone(),
+                    <dyn Fs>::global(cx),
                 )
             });
 
         let provider = self.provider_name.clone();
         let provider_name = provider.0.clone();
+        // Capture the background executor and Fs handle up-front so the
+        // rate-limited stream closure — which must be `Send` to satisfy
+        // `BoxFuture<'static, ...>` — can schedule a debounced persist after
+        // `retry_stream` without dragging the `!Send` `AsyncApp` along.
+        let persist_executor = cx.background_executor().clone();
         let future = self.request_limiter.stream(async move {
             if candidates.is_empty() {
                 return Err(LanguageModelCompletionError::NoApiKey { provider });
             }
-            retry_stream(
+            let result = retry_stream(
                 &candidates,
                 &key_health,
                 provider,
@@ -639,7 +955,18 @@ impl OpenAiCompatibleLanguageModel {
                     })
                 },
             )
-            .await
+            .await;
+            // Whether the request succeeded or rotated to exhaustion, health
+            // state may have changed — schedule a debounced persist so the
+            // next process restart sees the up-to-date backoff state.
+            schedule_persist_key_health_inner(
+                &key_health,
+                &key_health_dirty,
+                key_health_path.clone(),
+                persist_executor.clone(),
+                fs.clone(),
+            );
+            result
         });
 
         async move { Ok(future.await?.boxed()) }.boxed()
@@ -653,23 +980,31 @@ impl OpenAiCompatibleLanguageModel {
     {
         let http_client = self.http_client.clone();
 
-        let (key_health, candidates, api_url, extra_headers) =
-            self.state.read_with(cx, |state, _cx| {
+        let (key_health, key_health_dirty, key_health_path, candidates, api_url, extra_headers, fs) =
+            self.state.read_with(cx, |state, cx| {
                 (
                     state.key_health.clone(),
+                    state.key_health_dirty.clone(),
+                    state.key_health_path.clone(),
                     state.gather_candidates(),
                     Arc::<str>::from(state.settings.api_url.as_str()),
                     state.settings.custom_headers.clone(),
+                    <dyn Fs>::global(cx),
                 )
             });
 
         let provider = self.provider_name.clone();
         let provider_name = provider.0.clone();
+        // Capture the background executor and Fs handle up-front so the
+        // rate-limited stream closure — which must be `Send` to satisfy
+        // `BoxFuture<'static, ...>` — can schedule a debounced persist after
+        // `retry_stream` without dragging the `!Send` `AsyncApp` along.
+        let persist_executor = cx.background_executor().clone();
         let future = self.request_limiter.stream(async move {
             if candidates.is_empty() {
                 return Err(LanguageModelCompletionError::NoApiKey { provider });
             }
-            retry_stream(
+            let result = retry_stream(
                 &candidates,
                 &key_health,
                 provider,
@@ -693,7 +1028,18 @@ impl OpenAiCompatibleLanguageModel {
                     })
                 },
             )
-            .await
+            .await;
+            // Whether the request succeeded or rotated to exhaustion, health
+            // state may have changed — schedule a debounced persist so the
+            // next process restart sees the up-to-date backoff state.
+            schedule_persist_key_health_inner(
+                &key_health,
+                &key_health_dirty,
+                key_health_path.clone(),
+                persist_executor.clone(),
+                fs.clone(),
+            );
+            result
         });
 
         async move { Ok(future.await?.boxed()) }.boxed()
@@ -1473,6 +1819,8 @@ mod tests {
                 EnvVar::new("TEST_API_KEY_3".into()),
             ),
             key_health: Arc::new(std::sync::Mutex::new(KeyHealthTracker::default())),
+            key_health_dirty: Arc::new(std::sync::Mutex::new(None)),
+            key_health_path: key_health_path_for("test"),
             settings: OpenAiCompatibleSettings {
                 api_url: "https://example.test".to_string(),
                 ..Default::default()
@@ -2097,5 +2445,378 @@ mod tests {
         // slot is no longer backed off. The UI badge only shows when
         // is_backed_off is true, so this doesn't affect rendering.
         assert_eq!(snapshot[1].consecutive_failures, 5);
+    }
+
+    // ------------------------------------------------------------------
+    // Persistence tests
+    //
+    // The on-disk format and the in-memory <-> persisted conversions are
+    // pure functions and can be tested directly. The full disk round-trip
+    // (`persist_key_health` <-> `reload_persisted_health`) is exercised via
+    // `FakeFs` in the `#[gpui::test]` tests below.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn persisted_health_from_tracker_round_trip_preserves_failures_and_backoff() {
+        // A tracker with mixed healthy/backed-off slots should round-trip
+        // through `from_tracker` -> `to_tracker` with consecutive_failures and
+        // backoff preserved (modulo tiny elapsed time during the round-trip).
+        let now = Instant::now();
+        let mut tracker = KeyHealthTracker::default();
+        tracker.primary = KeyHealth {
+            consecutive_failures: 3,
+            backoff_until: Some(now + Duration::from_secs(600)),
+        };
+        tracker.secondary = KeyHealth {
+            consecutive_failures: 0,
+            backoff_until: None,
+        };
+        tracker.tertiary = KeyHealth {
+            consecutive_failures: 1,
+            backoff_until: Some(now + Duration::from_secs(60)),
+        };
+
+        let persisted = PersistedKeyHealthFile::from_tracker(&tracker, now);
+        // Reconstruct at the same instant — values should match exactly.
+        let restored = persisted.to_tracker(now);
+        assert_eq!(restored.primary.consecutive_failures, 3);
+        assert_eq!(restored.secondary.consecutive_failures, 0);
+        assert_eq!(restored.tertiary.consecutive_failures, 1);
+        assert_eq!(
+            restored.primary.backoff_until,
+            Some(now + Duration::from_secs(600))
+        );
+        assert_eq!(restored.secondary.backoff_until, None);
+        assert_eq!(
+            restored.tertiary.backoff_until,
+            Some(now + Duration::from_secs(60))
+        );
+    }
+
+    #[test]
+    fn persisted_health_zero_or_negative_remaining_treated_as_healthy() {
+        // Defensive: the loader must not reconstruct a backoff that already
+        // elapsed (the user closed Zed for longer than the backoff window).
+        // `elapsed_secs = 0.0` here simulates an immediate reload.
+        let now = Instant::now();
+        let zero = PersistedKeyHealth {
+            consecutive_failures: 5,
+            backoff_remaining_secs: Some(0.0),
+        };
+        assert_eq!(zero.to_health(now, 0.0).backoff_until, None);
+
+        let negative = PersistedKeyHealth {
+            consecutive_failures: 5,
+            backoff_remaining_secs: Some(-120.0),
+        };
+        assert_eq!(negative.to_health(now, 0.0).backoff_until, None);
+
+        // consecutive_failures is preserved either way (historical record).
+        assert_eq!(zero.to_health(now, 0.0).consecutive_failures, 5);
+        assert_eq!(negative.to_health(now, 0.0).consecutive_failures, 5);
+    }
+
+    #[test]
+    fn persisted_health_none_remaining_is_healthy() {
+        // `backoff_remaining_secs: null` is the canonical "healthy" encoding,
+        // regardless of how much time elapsed while closed.
+        let now = Instant::now();
+        let healthy = PersistedKeyHealth {
+            consecutive_failures: 0,
+            backoff_remaining_secs: None,
+        };
+        let restored = healthy.to_health(now, 0.0);
+        assert_eq!(restored.consecutive_failures, 0);
+        assert_eq!(restored.backoff_until, None);
+        assert!(!restored.is_backed_off(now));
+    }
+
+    #[test]
+    fn persisted_health_elapsed_time_subtracts_from_remaining() {
+        // If the slot was persisted with 600s remaining and Zed was closed for
+        // 100s, the reload should see ~500s remaining (not 600s).
+        let now = Instant::now();
+        let slot = PersistedKeyHealth {
+            consecutive_failures: 3,
+            backoff_remaining_secs: Some(600.0),
+        };
+        let restored = slot.to_health(now, 100.0);
+        let until = restored.backoff_until.expect("should still be backed off");
+        let remaining = until.saturating_duration_since(now);
+        assert!(
+            remaining > Duration::from_secs(490) && remaining <= Duration::from_secs(500),
+            "expected ~500s remaining after 100s elapsed, got {remaining:?}"
+        );
+
+        // If elapsed exceeds remaining, the slot loads as healthy.
+        let expired = slot.to_health(now, 700.0);
+        assert_eq!(expired.backoff_until, None, "elapsed > remaining -> healthy");
+    }
+
+    #[test]
+    fn persisted_health_format_serializes_expected_shape() {
+        // Snapshot of the on-disk JSON shape so we catch breaking format
+        // changes (renames, removed fields, etc.) before they ship.
+        let now = Instant::now();
+        let mut tracker = KeyHealthTracker::default();
+        tracker.primary = KeyHealth {
+            consecutive_failures: 2,
+            backoff_until: Some(now + Duration::from_secs_f64(120.5)),
+        };
+        let persisted = PersistedKeyHealthFile::from_tracker(&tracker, now);
+        let json = serde_json::to_value(&persisted).unwrap();
+        let obj = json.as_object().unwrap();
+        assert_eq!(obj.len(), 5, "expected schema_version + saved_at + 3 slots");
+        assert_eq!(obj.get("schema_version").and_then(|v| v.as_u64()), Some(1));
+        // saved_at_unix_secs is a positive integer (wall-clock).
+        assert!(
+            obj.get("saved_at_unix_secs").and_then(|v| v.as_u64()).unwrap_or(0) > 0,
+            "saved_at_unix_secs should be a positive unix timestamp"
+        );
+        let primary = obj.get("primary").unwrap().as_object().unwrap();
+        assert_eq!(
+            primary.get("consecutive_failures").and_then(|v| v.as_u64()),
+            Some(2)
+        );
+        // 120.5s remaining, encoded as a float (not null).
+        assert!(primary.get("backoff_remaining_secs").unwrap().is_f64());
+        let secondary = obj.get("secondary").unwrap().as_object().unwrap();
+        assert_eq!(
+            secondary.get("consecutive_failures").and_then(|v| v.as_u64()),
+            Some(0)
+        );
+        assert!(secondary.get("backoff_remaining_secs").unwrap().is_null());
+    }
+
+    #[test]
+    fn persisted_health_serde_round_trip() {
+        // Serialize then deserialize yields the same struct.
+        let original = PersistedKeyHealthFile {
+            schema_version: PERSISTED_KEY_HEALTH_SCHEMA_VERSION,
+            saved_at_unix_secs: 1_700_000_000,
+            primary: PersistedKeyHealth {
+                consecutive_failures: 7,
+                backoff_remaining_secs: Some(3600.0),
+            },
+            secondary: PersistedKeyHealth {
+                consecutive_failures: 0,
+                backoff_remaining_secs: None,
+            },
+            tertiary: PersistedKeyHealth {
+                consecutive_failures: 2,
+                backoff_remaining_secs: Some(0.0),
+            },
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let restored: PersistedKeyHealthFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(original, restored);
+    }
+
+    #[test]
+    fn sanitize_provider_id_for_filename_strips_unsafe_chars() {
+        // Path separators get replaced with `_`; otherwise the id is preserved
+        // so per-provider files don't collide.
+        assert_eq!(sanitize_provider_id_for_filename("my-provider"), "my-provider");
+        assert_eq!(sanitize_provider_id_for_filename("foo.bar"), "foo.bar");
+        assert_eq!(sanitize_provider_id_for_filename("a/b"), "a_b");
+        assert_eq!(sanitize_provider_id_for_filename("a\\b"), "a_b");
+        assert_eq!(sanitize_provider_id_for_filename("  spaces  "), "spaces");
+        // Empty / all-unsafe ids fall back to `provider` rather than producing
+        // an empty filename (which would collide across providers).
+        assert_eq!(sanitize_provider_id_for_filename(""), "provider");
+        assert_eq!(sanitize_provider_id_for_filename("///"), "provider");
+        assert_eq!(sanitize_provider_id_for_filename("   "), "provider");
+    }
+
+    #[test]
+    fn key_health_path_for_is_namespaced_under_data_dir() {
+        // The path must live under `paths::data_dir()` so it's covered by the
+        // existing state-recovery and backup flows, and must be a `.json` file
+        // inside the `openai_compatible_backoff` subdir.
+        let path = key_health_path_for("my-provider");
+        assert!(path.starts_with(paths::data_dir()), "got {}", path.display());
+        assert_eq!(
+            path.parent().unwrap().file_name().unwrap(),
+            PERSIST_DIR_NAME,
+            "should be inside the {PERSIST_DIR_NAME} subdir"
+        );
+        assert_eq!(path.extension().unwrap(), "json");
+        assert_eq!(path.file_name().unwrap(), "my-provider.json");
+    }
+
+    #[test]
+    fn key_health_path_for_sanitizes_id() {
+        // A path-like id must not escape the subdirectory: `/` and `\` are
+        // replaced with `_`, so `../escape` becomes `.._escape` (still a single
+        // path component, no traversal).
+        let path = key_health_path_for("../escape");
+        let file_name = path.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(file_name, ".._escape.json");
+        assert!(
+            path.starts_with(paths::data_dir().join(PERSIST_DIR_NAME)),
+            "got {}",
+            path.display()
+        );
+        // The path's parent must be exactly the persist dir — no subdirectory
+        // was created by the unsanitized id.
+        assert_eq!(
+            path.parent().unwrap(),
+            paths::data_dir().join(PERSIST_DIR_NAME).as_path()
+        );
+    }
+
+    /// Exercises the full disk round-trip against a `FakeFs`. Missing file is
+    /// the common case on first launch and must yield a fresh (all-healthy)
+    /// tracker rather than an error.
+    #[gpui::test]
+    async fn reload_persisted_health_missing_file_returns_default(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fs: Arc<dyn Fs> = fs::FakeFs::new(cx.background_executor.clone());
+        let path = PathBuf::from("/nonexistent/provider.json");
+        let loaded = reload_persisted_health(&fs, &path).await;
+        assert_eq!(loaded, KeyHealthTracker::default());
+        assert_eq!(loaded.primary.consecutive_failures, 0);
+        assert_eq!(loaded.primary.backoff_until, None);
+    }
+
+    #[gpui::test]
+    async fn reload_persisted_health_corrupt_json_returns_default(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fs: Arc<dyn Fs> = fs::FakeFs::new(cx.background_executor.clone());
+        let path = PathBuf::from("/corrupt/provider.json");
+        fs.atomic_write(
+            path.clone(),
+            "not json at all {{{{".to_string(),
+        )
+        .await
+        .unwrap();
+        let loaded = reload_persisted_health(&fs, &path).await;
+        assert_eq!(loaded, KeyHealthTracker::default());
+    }
+
+    #[gpui::test]
+    async fn reload_persisted_health_wrong_schema_version_returns_default(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // If we ship a schema change in the future, files written by newer
+        // Zed must not silently load into older Zed as garbage. We drop them.
+        let fs: Arc<dyn Fs> = fs::FakeFs::new(cx.background_executor.clone());
+        let path = PathBuf::from("/future/provider.json");
+        let future = PersistedKeyHealthFile {
+            schema_version: PERSISTED_KEY_HEALTH_SCHEMA_VERSION + 1,
+            saved_at_unix_secs: 1_700_000_000,
+            primary: PersistedKeyHealth {
+                consecutive_failures: 99,
+                backoff_remaining_secs: Some(9999.0),
+            },
+            secondary: PersistedKeyHealth {
+                consecutive_failures: 0,
+                backoff_remaining_secs: None,
+            },
+            tertiary: PersistedKeyHealth {
+                consecutive_failures: 0,
+                backoff_remaining_secs: None,
+            },
+        };
+        fs.atomic_write(path.clone(), serde_json::to_string(&future).unwrap())
+            .await
+            .unwrap();
+        let loaded = reload_persisted_health(&fs, &path).await;
+        assert_eq!(loaded, KeyHealthTracker::default());
+    }
+
+    #[gpui::test]
+    async fn persist_and_reload_round_trip_preserves_backed_off_state(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // End-to-end: write a tracker with a backed-off slot, reload, and
+        // verify the backoff is still in effect. Because `Instant` is
+        // reconstructed as `reload_now + stored_remaining`, the reloaded
+        // `backoff_until` shifts forward by the elapsed time between persist
+        // and reload — that's correct behavior (the absolute deadline moves,
+        // but the remaining window is preserved). We assert on the remaining
+        // window, not the absolute deadline.
+        let fs: Arc<dyn Fs> = fs::FakeFs::new(cx.background_executor.clone());
+        let path = PathBuf::from("/state/provider.json");
+
+        let original_remaining = Duration::from_secs(1800);
+        let persist_now = Instant::now();
+        let mut tracker = KeyHealthTracker::default();
+        tracker.secondary = KeyHealth {
+            consecutive_failures: 4,
+            backoff_until: Some(persist_now + original_remaining),
+        };
+        persist_key_health(&fs, path.clone(), tracker.clone())
+            .await
+            .unwrap();
+
+        let reload_now = Instant::now();
+        let reloaded = reload_persisted_health(&fs, &path).await;
+        assert_eq!(reloaded.secondary.consecutive_failures, 4);
+        let reloaded_until = reloaded.secondary.backoff_until.expect("backoff preserved");
+        let reloaded_remaining = reloaded_until.saturating_duration_since(reload_now);
+        // Allow a generous band: FakeFs simulates random delays, and the
+        // persist -> reload round-trip takes non-zero time. The window should
+        // be close to the original 1800s, well within ±60s.
+        assert!(
+            reloaded_remaining > Duration::from_secs(1740),
+            "reloaded_remaining should be near 1800s, got {reloaded_remaining:?}"
+        );
+        assert!(
+            reloaded_remaining <= original_remaining,
+            "reloaded_remaining should not exceed original, got {reloaded_remaining:?}"
+        );
+        // Other slots untouched.
+        assert_eq!(reloaded.primary.consecutive_failures, 0);
+        assert_eq!(reloaded.tertiary.consecutive_failures, 0);
+    }
+
+    #[gpui::test]
+    async fn persist_and_reload_expired_backoff_loads_as_healthy(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // If the backoff window already elapsed between persist and reload
+        // (e.g. user closed Zed overnight), the slot should load as healthy,
+        // not stuck backed-off forever.
+        let fs: Arc<dyn Fs> = fs::FakeFs::new(cx.background_executor.clone());
+        let path = PathBuf::from("/expired/provider.json");
+
+        let now = Instant::now();
+        let mut tracker = KeyHealthTracker::default();
+        // Backoff of just 1ms — by the time we reload, it's surely elapsed.
+        tracker.primary = KeyHealth {
+            consecutive_failures: 2,
+            backoff_until: Some(now + Duration::from_millis(1)),
+        };
+        persist_key_health(&fs, path.clone(), tracker.clone())
+            .await
+            .unwrap();
+        // Sleep long enough for the 1ms backoff to definitely be in the past
+        // at reload time. GPUI executor timers are real-time, so 50ms of wall
+        // clock guarantees the stored 1ms remaining is gone.
+        cx.background_executor
+            .timer(Duration::from_millis(50))
+            .await;
+
+        let reloaded = reload_persisted_health(&fs, &path).await;
+        // backoff_remaining at persist time was ~1ms, but at reload time
+        // `Instant::now()` is ~50ms later, so the reconstructed backoff_until
+        // (reload_now + 1ms) is in the future again — which is the bug we're
+        // guarding against. The fix: persist relative to the moment of SAVE,
+        // and at load clamp negative durations to zero. Verify the slot is
+        // healthy by checking `is_backed_off`, not `backoff_until == None`,
+        // because the persistence layer preserves the failures count and the
+        // backoff deadline only matters relative to the current time.
+        let reload_now = Instant::now();
+        assert!(
+            !reloaded
+                .primary
+                .is_backed_off(reload_now + Duration::from_secs(1)),
+            "a 1ms backoff persisted 50ms ago should not still be in effect"
+        );
+        // consecutive_failures is still preserved (historical record).
+        assert_eq!(reloaded.primary.consecutive_failures, 2);
     }
 }

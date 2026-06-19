@@ -50,6 +50,7 @@ mistral = { workspace = true, features = ["schemars"] }
 oauth_callback_server.workspace = true
 ollama = { workspace = true, features = ["schemars"] }
 open_ai = { workspace = true, features = ["schemars"] }
+paths.workspace = true
 opencode = { workspace = true, features = ["schemars"] }
 open_router = { workspace = true, features = ["schemars"] }
 rand.workspace = true
