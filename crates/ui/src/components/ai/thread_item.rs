@@ -22,6 +22,18 @@ pub enum WorktreeKind {
     Linked,
 }
 
+/// Direction of a thread continuation link, shown as a small clickable chip
+/// (`from` / `to`) in the thread history metadata line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThreadContinuationDirection {
+    /// This thread was created as a continuation of another thread (auto_prompt
+    /// summary). Chip reads `from` and links back to the source.
+    From,
+    /// Another thread was created as a continuation of this one. Chip reads
+    /// `to` and links forward to the continuation.
+    To,
+}
+
 #[derive(Clone, Default)]
 pub struct ThreadItemWorktreeInfo {
     pub worktree_name: Option<SharedString>,
@@ -59,6 +71,7 @@ pub struct ThreadItem {
     worktrees: Vec<ThreadItemWorktreeInfo>,
     is_remote: bool,
     archived: bool,
+    continuation: Option<(ThreadContinuationDirection, Box<dyn Fn(&mut Window, &mut App) + 'static>)>,
     on_click: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
     on_hover: Box<dyn Fn(&bool, &mut Window, &mut App) + 'static>,
     action_slot: Option<AnyElement>,
@@ -94,6 +107,7 @@ impl ThreadItem {
             worktrees: Vec::new(),
             is_remote: false,
             archived: false,
+            continuation: None,
             on_click: None,
             on_hover: Box::new(|_, _, _| {}),
             action_slot: None,
@@ -208,6 +222,17 @@ impl ThreadItem {
         self
     }
 
+    /// Show a clickable `from`/`to` continuation chip in the metadata line.
+    /// Used by the sidebar to indicate auto_prompt summary threads.
+    pub fn continuation(
+        mut self,
+        direction: ThreadContinuationDirection,
+        on_click: impl Fn(&mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.continuation = Some((direction, Box::new(on_click)));
+        self
+    }
+
     pub fn hovered(mut self, hovered: bool) -> Self {
         self.hovered = hovered;
         self
@@ -248,7 +273,7 @@ impl ThreadItem {
 }
 
 impl RenderOnce for ThreadItem {
-    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(mut self, _: &mut Window, cx: &mut App) -> impl IntoElement {
         let color = cx.theme().colors();
         let sidebar_base_bg = color
             .title_bar_background
@@ -410,11 +435,29 @@ impl RenderOnce for ThreadItem {
 
         let has_worktree = !linked_worktrees.is_empty();
 
+        let continuation = self.continuation.take();
+        let has_continuation = continuation.is_some();
+        let (direction_label, continuation_handler): (
+            &str,
+            Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App)>>,
+        ) = continuation
+            .map(|(direction, handler)| {
+                let label = match direction {
+                    ThreadContinuationDirection::From => "from",
+                    ThreadContinuationDirection::To => "to",
+                };
+                let wrapped: Box<dyn Fn(&ClickEvent, &mut Window, &mut App)> =
+                    Box::new(move |_, window, cx| handler(window, cx));
+                (label, Some(wrapped))
+            })
+            .unwrap_or(("", None));
+
         let has_metadata = has_project_name
             || has_project_paths
             || has_worktree
             || has_diff_stats
-            || has_timestamp;
+            || has_timestamp
+            || has_continuation;
 
         v_flex()
             .id(self.id.clone())
@@ -591,6 +634,39 @@ impl RenderOnce for ThreadItem {
                                 Label::new(timestamp.clone())
                                     .size(LabelSize::Small)
                                     .color(Color::Muted),
+                            )
+                        })
+                        .when(has_continuation, |this| {
+                            this.when(
+                                has_project_name
+                                    || has_project_paths
+                                    || has_worktree
+                                    || has_diff_stats
+                                    || has_timestamp,
+                                |this| this.child(dot_separator()),
+                            )
+                            .child(
+                                h_flex()
+                                    .id((self.id.clone(), "continuation"))
+                                    .gap_0p5()
+                                    .child(
+                                        Label::new(direction_label)
+                                        .size(LabelSize::Small)
+                                        .color(Color::Accent),
+                                    )
+                                    .child(
+                                        Icon::new(IconName::ArrowUpRight)
+                                            .size(IconSize::XSmall)
+                                            .color(Color::Accent),
+                                    )
+                                    .hover(|style| style.bg(hover_color).rounded_sm())
+                                    .cursor_pointer()
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation();
+                                    })
+                                    .when_some(continuation_handler, |this, handler| {
+                                        this.on_click(handler)
+                                    }),
                             )
                         }),
                 )

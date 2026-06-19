@@ -142,6 +142,7 @@ fn migrate_thread_metadata(cx: &mut App) -> Task<anyhow::Result<()>> {
                         worktree_paths: WorktreePaths::from_folder_paths(&entry.folder_paths),
                         remote_connection: None,
                         archived: true,
+                        continued_from_session_id: None,
                     })
                 })
                 .collect::<Vec<_>>()
@@ -323,6 +324,11 @@ pub struct ThreadMetadata {
     pub worktree_paths: WorktreePaths,
     pub remote_connection: Option<RemoteConnectionOptions>,
     pub archived: bool,
+    /// When this thread was created from an auto_prompt summary continuation,
+    /// this holds the source thread's session id. Used to render a clickable
+    /// `from` chip in the thread history and to derive the reverse `to`
+    /// indicator on the source thread.
+    pub continued_from_session_id: Option<acp::SessionId>,
 }
 
 impl ThreadMetadata {
@@ -736,6 +742,60 @@ impl ThreadMetadataStore {
             ..existing.clone()
         };
         self.save(metadata, cx);
+    }
+
+    /// Record that `thread_id` was created as a continuation (via auto_prompt
+    /// summary) of `from_session_id`. Persists to DB and updates the cache so
+    /// both the `from` chip (on this thread) and the `to` chip (on the source)
+    /// can be derived at render time.
+    pub fn set_continued_from(
+        &mut self,
+        thread_id: ThreadId,
+        from_session_id: acp::SessionId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(existing) = self.entry(thread_id) else {
+            return;
+        };
+        if existing.continued_from_session_id.as_ref() == Some(&from_session_id) {
+            return;
+        }
+        let metadata = ThreadMetadata {
+            continued_from_session_id: Some(from_session_id),
+            ..existing.clone()
+        };
+        self.save(metadata, cx);
+    }
+
+    /// Reverse lookup: find the thread that continues from `session_id`
+    /// (i.e. was created as a summary continuation of it). Returns the
+    /// continuation thread's id + title if one exists.
+    pub fn find_continuation_of(
+        &self,
+        session_id: &acp::SessionId,
+    ) -> Option<(ThreadId, Option<SharedString>)> {
+        self.threads.values().find_map(|m| {
+            if m.continued_from_session_id.as_ref() == Some(session_id) {
+                Some((m.thread_id, m.title()))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Forward lookup: get the source thread metadata that `thread_id` was
+    /// continued from.
+    pub fn continued_from(
+        &self,
+        thread_id: ThreadId,
+    ) -> Option<(acp::SessionId, SharedString)> {
+        let m = self.threads.get(&thread_id)?;
+        let from_session_id = m.continued_from_session_id.clone()?;
+        let title = self
+            .entry_by_session(&from_session_id)
+            .and_then(|m| m.title())
+            .unwrap_or_else(|| crate::DEFAULT_THREAD_TITLE.into());
+        Some((from_session_id, title))
     }
 
     fn save_internal(&mut self, metadata: ThreadMetadata) {
@@ -1350,6 +1410,7 @@ impl ThreadMetadataStore {
             worktree_paths,
             remote_connection,
             archived,
+            continued_from_session_id: existing_thread.and_then(|t| t.continued_from_session_id.clone()),
         };
 
         self.save(metadata, cx);
@@ -1462,6 +1523,9 @@ impl Domain for ThreadMetadataDb {
         sql!(
             ALTER TABLE sidebar_threads ADD COLUMN title_override TEXT;
         ),
+        sql!(
+            ALTER TABLE sidebar_threads ADD COLUMN continued_from_session_id TEXT;
+        ),
     ];
 }
 
@@ -1478,7 +1542,7 @@ impl ThreadMetadataDb {
 
     const LIST_QUERY: &str = "SELECT thread_id, session_id, agent_id, title, updated_at, \
         created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, \
-        main_worktree_paths_order, remote_connection, title_override \
+        main_worktree_paths_order, remote_connection, title_override, continued_from_session_id \
         FROM sidebar_threads \
         ORDER BY updated_at DESC";
 
@@ -1531,10 +1595,14 @@ impl ThreadMetadataDb {
         let title_override = row.title_override.as_ref().map(|t| t.to_string());
         let thread_id = row.thread_id;
         let archived = row.archived;
+        let continued_from_session_id = row
+            .continued_from_session_id
+            .as_ref()
+            .map(|s| s.0.clone());
 
         self.write(move |conn| {
-            let sql = "INSERT INTO sidebar_threads(thread_id, session_id, agent_id, title, updated_at, created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, main_worktree_paths_order, remote_connection, title_override) \
-                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
+            let sql = "INSERT INTO sidebar_threads(thread_id, session_id, agent_id, title, updated_at, created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, main_worktree_paths_order, remote_connection, title_override, continued_from_session_id) \
+                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) \
                        ON CONFLICT(thread_id) DO UPDATE SET \
                            session_id = excluded.session_id, \
                            agent_id = excluded.agent_id, \
@@ -1548,7 +1616,8 @@ impl ThreadMetadataDb {
                            main_worktree_paths = excluded.main_worktree_paths, \
                            main_worktree_paths_order = excluded.main_worktree_paths_order, \
                            remote_connection = excluded.remote_connection, \
-                           title_override = excluded.title_override";
+                           title_override = excluded.title_override, \
+                           continued_from_session_id = excluded.continued_from_session_id";
             let mut stmt = Statement::prepare(conn, sql)?;
             let mut i = stmt.bind(&thread_id, 1)?;
             i = stmt.bind(&session_id, i)?;
@@ -1563,7 +1632,8 @@ impl ThreadMetadataDb {
             i = stmt.bind(&main_worktree_paths, i)?;
             i = stmt.bind(&main_worktree_paths_order, i)?;
             i = stmt.bind(&remote_connection, i)?;
-            stmt.bind(&title_override, i)?;
+            i = stmt.bind(&title_override, i)?;
+            stmt.bind(&continued_from_session_id, i)?;
             stmt.exec()
         })
         .await
@@ -1721,6 +1791,8 @@ impl Column for ThreadMetadata {
         let (remote_connection_json, next): (Option<String>, i32) =
             Column::column(statement, next)?;
         let (title_override, next): (Option<String>, i32) = Column::column(statement, next)?;
+        let (continued_from_session_id, next): (Option<Arc<str>>, i32) =
+            Column::column(statement, next)?;
 
         let agent_id = agent_id
             .map(|id| AgentId::new(id))
@@ -1787,6 +1859,7 @@ impl Column for ThreadMetadata {
                 worktree_paths,
                 remote_connection,
                 archived,
+                continued_from_session_id: continued_from_session_id.map(acp::SessionId::new),
             },
             next,
         ))
@@ -1864,6 +1937,7 @@ mod tests {
         ThreadMetadata {
             thread_id: ThreadId::new(),
             archived: false,
+            continued_from_session_id: None,
             session_id: Some(acp::SessionId::new(session_id)),
             agent_id: agent::ZED_AGENT_ID.clone(),
             title: if title.is_empty() {
@@ -1974,6 +2048,35 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_database_round_trips_continued_from_session_id(_cx: &mut TestAppContext) {
+        let now = Utc::now();
+        let mut metadata = make_metadata(
+            "continuation-session",
+            "Continued Thread",
+            now,
+            PathList::new(&[Path::new("/project-a")]),
+        );
+        metadata.continued_from_session_id = Some(acp::SessionId::new("source-session"));
+
+        let thread = std::thread::current();
+        let test_name = thread.name().unwrap_or("unknown_test");
+        let db_name = format!("THREAD_METADATA_DB_{}", test_name);
+        let db = ThreadMetadataDb(gpui::block_on(db::open_test_db::<ThreadMetadataDb>(
+            &db_name,
+        )));
+
+        db.save(metadata).await.unwrap();
+
+        let rows = db.list().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].continued_from_session_id.as_ref(),
+            Some(&acp::SessionId::new("source-session")),
+            "continued_from_session_id should survive a DB round-trip"
+        );
+    }
+
+    #[gpui::test]
     async fn test_store_set_title_override_updates_cached_metadata(cx: &mut TestAppContext) {
         init_test(cx);
 
@@ -2035,6 +2138,65 @@ mod tests {
             assert_eq!(metadata.title.as_deref(), Some("New Generated Title"));
             assert_eq!(metadata.title_override, None);
             assert_eq!(metadata.display_title().as_ref(), "New Generated Title");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_continuation_link_sets_and_finds(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let source = make_metadata(
+            "source-session",
+            "Original Thread",
+            Utc::now(),
+            PathList::default(),
+        );
+        let mut continuation = make_metadata(
+            "continuation-session",
+            "Continued Thread",
+            Utc::now(),
+            PathList::default(),
+        );
+        let source_session_id = source.session_id.clone().unwrap();
+        continuation.continued_from_session_id = Some(source_session_id.clone());
+        let continuation_thread_id = continuation.thread_id;
+        let source_thread_id = source.thread_id;
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.save(source, cx);
+                store.save(continuation, cx);
+            });
+        });
+
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            let store = store.read(cx);
+
+            // Forward lookup: the continuation thread records its source.
+            let (from_session, from_title) = store
+                .continued_from(continuation_thread_id)
+                .expect("continuation should record its source");
+            assert_eq!(from_session, source_session_id);
+            assert_eq!(from_title.as_ref(), "Original Thread");
+
+            // Reverse lookup: the source thread can find what continues from it.
+            let (found_thread_id, found_title) = store
+                .find_continuation_of(&source_session_id)
+                .expect("source should find its continuation");
+            assert_eq!(found_thread_id, continuation_thread_id);
+            assert_eq!(found_title.as_deref(), Some("Continued Thread"));
+
+            // No false positive: a random session id finds nothing.
+            assert!(store
+                .find_continuation_of(&acp::SessionId::new("nonexistent"))
+                .is_none());
+
+            // The source thread itself has no continued_from.
+            assert!(store.continued_from(source_thread_id).is_none());
         });
     }
 
@@ -2171,6 +2333,7 @@ mod tests {
             worktree_paths: WorktreePaths::from_folder_paths(&second_paths),
             remote_connection: None,
             archived: false,
+            continued_from_session_id: None,
         };
 
         cx.update(|cx| {
@@ -2256,6 +2419,7 @@ mod tests {
             worktree_paths: WorktreePaths::from_folder_paths(&project_a_paths),
             remote_connection: None,
             archived: false,
+            continued_from_session_id: None,
         };
 
         cx.update(|cx| {
@@ -2382,6 +2546,7 @@ mod tests {
             worktree_paths: WorktreePaths::from_folder_paths(&project_paths),
             remote_connection: None,
             archived: false,
+            continued_from_session_id: None,
         };
 
         cx.update(|cx| {
@@ -3117,6 +3282,7 @@ mod tests {
         let local_linked_thread = ThreadMetadata {
             thread_id: ThreadId::new(),
             archived: false,
+            continued_from_session_id: None,
             session_id: Some(acp::SessionId::new("local-linked")),
             agent_id: agent::ZED_AGENT_ID.clone(),
             title: Some("Local Linked".into()),
@@ -3131,6 +3297,7 @@ mod tests {
         let remote_linked_thread = ThreadMetadata {
             thread_id: ThreadId::new(),
             archived: false,
+            continued_from_session_id: None,
             session_id: Some(acp::SessionId::new("remote-linked")),
             agent_id: agent::ZED_AGENT_ID.clone(),
             title: Some("Remote Linked".into()),

@@ -55,8 +55,8 @@ use theme::ActiveTheme;
 use ui::{
     AgentThreadStatus, CommonAnimationExt, ContextMenu, ContextMenuEntry, Divider, GradientFade,
     HighlightedLabel, KeyBinding, PopoverMenu, PopoverMenuHandle, ProjectEmptyState, ScrollAxes,
-    Scrollbars, Tab, ThreadItem, ThreadItemWorktreeInfo, TintColor, Tooltip, WithScrollbar,
-    prelude::*, render_modifiers, right_click_menu,
+    Scrollbars, Tab, ThreadContinuationDirection, ThreadItem, ThreadItemWorktreeInfo, TintColor,
+    Tooltip, WithScrollbar, prelude::*, render_modifiers, right_click_menu,
 };
 use unicode_segmentation::UnicodeSegmentation as _;
 use util::ResultExt as _;
@@ -3803,6 +3803,44 @@ impl Sidebar {
         self.activate_thread_in_other_window(metadata, workspace, target_window, cx);
     }
 
+    /// Activate a thread by its [`ThreadId`], used by the continuation chip
+    /// (`from`/`to`) click handler. Looks up the entry in the current contents
+    /// and routes through the normal activation path.
+    fn activate_thread_by_id(
+        &mut self,
+        thread_id: ThreadId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let entry = self.contents.entries.iter().find_map(|entry| {
+            match entry {
+                ListEntry::Thread(t) if t.metadata.thread_id == thread_id => Some(t.clone()),
+                _ => None,
+            }
+        });
+        let Some(thread) = entry else {
+            return;
+        };
+        let metadata = thread.metadata.clone();
+        match &thread.workspace {
+            ThreadEntryWorkspace::Open(workspace) => {
+                self.activate_thread(metadata, workspace, false, window, cx);
+            }
+            ThreadEntryWorkspace::Closed {
+                folder_paths,
+                project_group_key,
+            } => {
+                self.open_workspace_and_activate_thread(
+                    metadata,
+                    folder_paths.clone(),
+                    project_group_key,
+                    window,
+                    cx,
+                );
+            }
+        }
+    }
+
     fn open_workspace_and_activate_thread(
         &mut self,
         metadata: ThreadMetadata,
@@ -6149,6 +6187,29 @@ impl Sidebar {
                 .regenerating_titles
                 .contains(&thread.metadata.thread_id);
 
+        // Continuation indicator: `from` if this thread was continued from
+        // another, `to` if another thread continues from this one.
+        let continuation = ThreadMetadataStore::try_global(cx).and_then(|store| {
+            let store = store.read(cx);
+            if let Some(from_session_id) = &thread.metadata.continued_from_session_id {
+                // Forward: this thread was continued from `from_session_id`.
+                let target_thread_id = store
+                    .entry_by_session(from_session_id)
+                    .map(|m| m.thread_id)?;
+                Some((
+                    ThreadContinuationDirection::From,
+                    target_thread_id,
+                ))
+            } else if let Some(session_id) = &thread.metadata.session_id {
+                // Reverse: find the thread that continues from us.
+                store
+                    .find_continuation_of(session_id)
+                    .map(|(target_thread_id, _)| (ThreadContinuationDirection::To, target_thread_id))
+            } else {
+                None
+            }
+        });
+
         let thread_item = ThreadItem::new(id, title.clone())
             .base_bg(sidebar_bg)
             .icon(icon)
@@ -6174,6 +6235,16 @@ impl Sidebar {
             .selected(is_selected)
             .focused(is_focused)
             .hovered(is_hovered)
+            .when_some(continuation, |this, (direction, target_thread_id)| {
+                let weak = cx.weak_entity();
+                this.continuation(direction, move |window, cx| {
+                    if let Some(sidebar) = weak.upgrade() {
+                        sidebar.update(cx, |sidebar, cx| {
+                            sidebar.activate_thread_by_id(target_thread_id, window, cx);
+                        });
+                    }
+                })
+            })
             .on_hover(cx.listener(move |this, is_hovered: &bool, _window, cx| {
                 if *is_hovered {
                     this.hovered_thread_index = Some(ix);

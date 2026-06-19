@@ -8,6 +8,8 @@ use std::path::PathBuf;
 use ui::prelude::*;
 use workspace::PathList;
 
+use crate::thread_metadata_store::ThreadMetadataStore;
+
 /// Strip the context wrapper produced by `with_first_prompt_context`.
 /// For same-thread continuation (ACP agents) the AI already has full
 /// context — the wrapper wastes tokens, so we extract just the instruction.
@@ -436,7 +438,13 @@ pub(crate) fn dispatch_action(
             };
 
             panel.update(cx, |panel, cx| {
-                panel.external_thread(
+                let continued_from = match &initial_content {
+                    crate::AgentInitialContent::ThreadSummary { session_id, .. } => {
+                        Some(session_id.clone())
+                    }
+                    _ => None,
+                };
+                let new_thread_id = panel.external_thread(
                     None,
                     None,
                     work_dirs,
@@ -447,6 +455,13 @@ pub(crate) fn dispatch_action(
                     window,
                     cx,
                 );
+                if let (Some(thread_id), Some(from_session_id)) = (new_thread_id, continued_from) {
+                    if let Some(store) = ThreadMetadataStore::try_global(cx) {
+                        store.update(cx, |store, cx| {
+                            store.set_continued_from(thread_id, from_session_id, cx);
+                        });
+                    }
+                }
             });
         });
     });

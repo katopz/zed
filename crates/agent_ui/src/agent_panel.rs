@@ -549,7 +549,13 @@ pub fn init(cx: &mut App) {
                             };
 
                         panel.update(cx, |panel, cx| {
-                            panel.external_thread(
+                            let continued_from = match &initial_content {
+                                AgentInitialContent::ThreadSummary { session_id, .. } => {
+                                    Some(session_id.clone())
+                                }
+                                _ => None,
+                            };
+                            let new_thread_id = panel.external_thread(
                                 None,
                                 None,
                                 work_dirs,
@@ -560,6 +566,19 @@ pub fn init(cx: &mut App) {
                                 window,
                                 cx,
                             );
+                            if let (Some(thread_id), Some(from_session_id)) =
+                                (new_thread_id, continued_from)
+                            {
+                                if let Some(store) = ThreadMetadataStore::try_global(cx) {
+                                    store.update(cx, |store, cx| {
+                                        store.set_continued_from(
+                                            thread_id,
+                                            from_session_id,
+                                            cx,
+                                        );
+                                    });
+                                }
+                            }
                         });
                     } else {
                         log::warn!(
@@ -3547,7 +3566,7 @@ impl AgentPanel {
 
         cx.spawn_in(window, async move |this, cx| {
             this.update_in(cx, |this, window, cx| {
-                this.external_thread(
+                let new_thread_id = this.external_thread(
                     Some(Agent::NativeAgent),
                     None,
                     None,
@@ -3558,6 +3577,13 @@ impl AgentPanel {
                     window,
                     cx,
                 );
+                if let Some(thread_id) = new_thread_id {
+                    if let Some(store) = ThreadMetadataStore::try_global(cx) {
+                        store.update(cx, |store, cx| {
+                            store.set_continued_from(thread_id, session_id.clone(), cx);
+                        });
+                    }
+                }
                 anyhow::Ok(())
             })
         })
@@ -3620,9 +3646,9 @@ impl AgentPanel {
         source: AgentThreadSource,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Option<ThreadId> {
         if resume_thread_id.is_none() && !self.has_open_project(cx) {
-            return;
+            return None;
         }
 
         let agent = agent_choice.unwrap_or_else(|| self.selected_agent(cx));
@@ -3638,7 +3664,9 @@ impl AgentPanel {
             window,
             cx,
         );
+        let thread_id = thread.conversation_view.read(cx).thread_id;
         self.set_base_view(thread.into(), focus, window, cx);
+        Some(thread_id)
     }
 
     fn deploy_rules_library(
@@ -7972,6 +8000,7 @@ mod tests {
                         worktree_paths: WorktreePaths::from_folder_paths(&PathList::default()),
                         remote_connection: None,
                         archived: false,
+                        continued_from_session_id: None,
                     },
                     cx,
                 );
