@@ -11,8 +11,6 @@ use std::time::{Duration, Instant};
 pub struct EditLock {
     /// Which agent session holds the lock.
     pub session_id: acp::SessionId,
-    /// When the lock was acquired.
-    pub locked_at: Instant,
     /// Most recent edit activity timestamp.
     pub last_heartbeat: Instant,
 }
@@ -41,6 +39,10 @@ impl EditConflictRegistry {
 
     /// Enable or disable conflict detection globally.
     /// When disabled, register/release/check become no-ops.
+    ///
+    /// Only used by tests to isolate parallel instances from the global
+    /// registry; production code never toggles this.
+    #[cfg(test)]
     pub fn set_enabled(&self, enabled: bool) {
         self.enabled
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
@@ -62,7 +64,6 @@ impl EditConflictRegistry {
             path,
             EditLock {
                 session_id,
-                locked_at: now,
                 last_heartbeat: now,
             },
         );
@@ -151,18 +152,5 @@ impl EditConflictRegistry {
         } else {
             None
         }
-    }
-
-    /// Remove all stale locks (no heartbeat for longer than `max_age`).
-    pub fn cleanup_stale(&self, max_age: Duration) {
-        let mut locks = self.locks.lock();
-        let now = Instant::now();
-        locks.retain(|_, lock| now.duration_since(lock.last_heartbeat) <= max_age);
-    }
-
-    /// Clear all locks. For use in test teardown.
-    #[cfg(test)]
-    pub fn clear(&self) {
-        self.locks.lock().clear();
     }
 }
