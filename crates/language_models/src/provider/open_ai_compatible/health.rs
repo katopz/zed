@@ -16,6 +16,7 @@ use fs::Fs;
 use futures::{StreamExt, future::BoxFuture};
 use gpui::{BackgroundExecutor, Task};
 use language_model::{LanguageModelCompletionError, LanguageModelProviderName};
+use parking_lot::Mutex as ParkingMutex;
 use paths;
 use rand::Rng;
 use rand::seq::IndexedRandom;
@@ -321,16 +322,13 @@ pub async fn persist_key_health(
 /// `Send` to satisfy `BoxFuture<'static, ...>` — can capture these handles by
 /// move without dragging the `!Send` `AsyncApp` along.
 pub fn schedule_persist_key_health_inner(
-    key_health: &Arc<std::sync::Mutex<KeyHealthTracker>>,
-    key_health_dirty: &Arc<std::sync::Mutex<Option<Task<()>>>>,
+    key_health: &Arc<ParkingMutex<KeyHealthTracker>>,
+    key_health_dirty: &Arc<ParkingMutex<Option<Task<()>>>>,
     path: PathBuf,
     executor: BackgroundExecutor,
     fs: Arc<dyn Fs>,
 ) {
-    let snapshot = match key_health.lock() {
-        Ok(guard) => guard.clone(),
-        Err(poisoned) => poisoned.into_inner().clone(),
-    };
+    let snapshot = key_health.lock().clone();
     // Clone before the move into `spawn`: `spawn` takes `&self`, but the
     // closure body needs an owned executor to await `.timer(...)`.
     let timer_executor = executor.clone();
@@ -343,10 +341,7 @@ pub fn schedule_persist_key_health_inner(
         }
     });
     // Replace any prior pending task. Dropping the old `Task` cancels it.
-    match key_health_dirty.lock() {
-        Ok(mut slot) => *slot = Some(task),
-        Err(poisoned) => *poisoned.into_inner() = Some(task),
-    }
+    *key_health_dirty.lock() = Some(task);
 }
 
 /// Soft cap on backoff. After this duration since the last failure the key is
@@ -485,11 +480,8 @@ pub fn select_from_candidates(
 /// Uses the shared `Arc<Mutex<KeyHealthTracker>>` rather than `Entity::update`
 /// because the request closure runs on a background executor where `AsyncApp`
 /// (`!Send`) cannot travel.
-pub fn record_key_success(key_health: &Arc<std::sync::Mutex<KeyHealthTracker>>, slot: KeySlot) {
-    let mut health = match key_health.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
+pub fn record_key_success(key_health: &Arc<ParkingMutex<KeyHealthTracker>>, slot: KeySlot) {
+    let mut health = key_health.lock();
     health.record_success(slot);
 }
 
@@ -497,17 +489,14 @@ pub fn record_key_success(key_health: &Arc<std::sync::Mutex<KeyHealthTracker>>, 
 /// (see `is_backoff_worthy`) bump the failure counter and reschedule backoff;
 /// other errors are no-ops because they would recur on every key.
 pub fn record_key_failure(
-    key_health: &Arc<std::sync::Mutex<KeyHealthTracker>>,
+    key_health: &Arc<ParkingMutex<KeyHealthTracker>>,
     slot: KeySlot,
     err: &LanguageModelCompletionError,
 ) {
     if !is_backoff_worthy(err) {
         return;
     }
-    let mut health = match key_health.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
+    let mut health = key_health.lock();
     health.record_failure(slot, Instant::now());
 }
 
@@ -516,11 +505,8 @@ pub fn record_key_failure(
 /// attempt future. Holding the lock across `.await` would serialize all
 /// in-flight requests on the same provider and risk deadlock if a downstream
 /// path ever tried to re-acquire.
-pub fn snapshot_health(key_health: &Arc<std::sync::Mutex<KeyHealthTracker>>) -> KeyHealthTracker {
-    match key_health.lock() {
-        Ok(guard) => guard.clone(),
-        Err(poisoned) => poisoned.into_inner().clone(),
-    }
+pub fn snapshot_health(key_health: &Arc<ParkingMutex<KeyHealthTracker>>) -> KeyHealthTracker {
+    key_health.lock().clone()
 }
 
 /// Drives intra-request key rotation. Tries up to `candidates.len()` keys,
@@ -546,7 +532,7 @@ pub fn snapshot_health(key_health: &Arc<std::sync::Mutex<KeyHealthTracker>>) -> 
 /// worse for the user's stated reliability goal.
 pub async fn retry_stream<S>(
     candidates: &[(Arc<str>, KeySlot)],
-    key_health: &Arc<std::sync::Mutex<KeyHealthTracker>>,
+    key_health: &Arc<ParkingMutex<KeyHealthTracker>>,
     provider: LanguageModelProviderName,
     mut do_attempt: impl FnMut(Arc<str>) -> BoxFuture<'static, Result<S, LanguageModelCompletionError>>,
 ) -> Result<S, LanguageModelCompletionError> {
@@ -891,7 +877,7 @@ mod tests {
             (Arc::<str>::from("key-a"), KeySlot::Primary),
             (Arc::<str>::from("key-b"), KeySlot::Secondary),
         ];
-        let key_health = Arc::new(std::sync::Mutex::new(KeyHealthTracker::default()));
+        let key_health = Arc::new(ParkingMutex::new(KeyHealthTracker::default()));
         let attempts = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
 
         let attempts_for_closure = attempts.clone();
@@ -922,9 +908,9 @@ mod tests {
             (Arc::<str>::from("key-a"), KeySlot::Primary),
             (Arc::<str>::from("key-b"), KeySlot::Secondary),
         ];
-        let key_health = Arc::new(std::sync::Mutex::new(KeyHealthTracker::default()));
+        let key_health = Arc::new(ParkingMutex::new(KeyHealthTracker::default()));
         let attempts = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
-        let seen_first = Arc::new(std::sync::Mutex::new(false));
+        let seen_first = Arc::new(ParkingMutex::new(false));
 
         let attempts_for_closure = attempts.clone();
         let seen_first_for_closure = seen_first;
@@ -936,7 +922,7 @@ mod tests {
                 let key = (*api_key).to_string();
                 attempts_for_closure.lock().push(key);
                 let is_first = {
-                    let mut seen = seen_first_for_closure.lock().unwrap();
+                    let mut seen = seen_first_for_closure.lock();
                     let first = !*seen;
                     *seen = true;
                     first
@@ -963,7 +949,7 @@ mod tests {
         let first_slot = slot_for_key(&attempts_guard[0]);
         let second_slot = slot_for_key(&attempts_guard[1]);
 
-        let health = key_health.lock().unwrap();
+        let health = key_health.lock();
         assert!(
             health.get(first_slot).consecutive_failures >= 1,
             "failed slot should be poisoned"
@@ -985,7 +971,7 @@ mod tests {
             (Arc::<str>::from("key-b"), KeySlot::Secondary),
             (Arc::<str>::from("key-c"), KeySlot::Tertiary),
         ];
-        let key_health = Arc::new(std::sync::Mutex::new(KeyHealthTracker::default()));
+        let key_health = Arc::new(ParkingMutex::new(KeyHealthTracker::default()));
         let attempts = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
 
         let attempts_for_closure = attempts.clone();
@@ -1013,7 +999,7 @@ mod tests {
 
         // Exactly one slot poisoned (the one that was tried); the other two
         // remain healthy so the next request can use them.
-        let health = key_health.lock().unwrap();
+        let health = key_health.lock();
         let poisoned = [
             health.get(KeySlot::Primary).consecutive_failures,
             health.get(KeySlot::Secondary).consecutive_failures,
@@ -1033,7 +1019,7 @@ mod tests {
             (Arc::<str>::from("key-a"), KeySlot::Primary),
             (Arc::<str>::from("key-b"), KeySlot::Secondary),
         ];
-        let key_health = Arc::new(std::sync::Mutex::new(KeyHealthTracker::default()));
+        let key_health = Arc::new(ParkingMutex::new(KeyHealthTracker::default()));
         let attempts = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
 
         let attempts_for_closure = attempts.clone();
@@ -1052,7 +1038,7 @@ mod tests {
         // Only one attempt — non-backoff-worthy errors don't rotate.
         assert_eq!(attempts.lock().len(), 1);
         // No slot should have been poisoned (the error wasn't backoff-worthy).
-        let health = key_health.lock().unwrap();
+        let health = key_health.lock();
         assert_eq!(health.get(KeySlot::Primary).consecutive_failures, 0);
     }
 
@@ -1067,7 +1053,7 @@ mod tests {
             (Arc::<str>::from("key-b"), KeySlot::Secondary),
             (Arc::<str>::from("key-c"), KeySlot::Tertiary),
         ];
-        let key_health = Arc::new(std::sync::Mutex::new(KeyHealthTracker::default()));
+        let key_health = Arc::new(ParkingMutex::new(KeyHealthTracker::default()));
         let attempts = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
 
         let attempts_for_closure = attempts.clone();
@@ -1093,7 +1079,7 @@ mod tests {
     #[test]
     fn retry_stream_returns_no_key_error_for_empty_candidates() {
         let candidates: Vec<(Arc<str>, KeySlot)> = Vec::new();
-        let key_health = Arc::new(std::sync::Mutex::new(KeyHealthTracker::default()));
+        let key_health = Arc::new(ParkingMutex::new(KeyHealthTracker::default()));
 
         let result: Result<i32, _> = smol::block_on(retry_stream(
             &candidates,

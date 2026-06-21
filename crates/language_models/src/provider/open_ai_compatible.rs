@@ -5,6 +5,7 @@ use fs::Fs;
 use futures::{FutureExt, StreamExt, future::BoxFuture};
 use gpui::{AnyView, App, AsyncApp, Context, ElementId, Entity, SharedString, Task, TaskExt, Window};
 use http_client::{CustomHeaders, HttpClient};
+use parking_lot::Mutex as ParkingMutex;
 use language_model::{
     ApiKeyState, AuthenticateError, EnvVar, IconOrSvg, LanguageModel, LanguageModelCompletionError,
     LanguageModelCompletionEvent, LanguageModelId, LanguageModelName, LanguageModelProvider,
@@ -35,7 +36,7 @@ mod health;
 use health::{
     KeyHealthTracker, KeySlot, SlotHealthStatus, format_backoff_remaining,
     key_health_path_for, probe_first_event, reload_persisted_health, retry_stream,
-    schedule_persist_key_health_inner,
+    schedule_persist_key_health_inner, snapshot_health,
 };
 
 #[derive(Default, Clone, Debug, PartialEq)]
@@ -59,12 +60,14 @@ pub struct State {
     api_key_state_3: ApiKeyState,
     /// Shared across threads so the request closure (background executor) can
     /// record outcomes without going through GPUI's `Entity::update`.
-    /// `Arc<Mutex>` because `AsyncApp` is `!Send` and can't be moved into the
-    /// rate-limited stream closure.
-    key_health: Arc<std::sync::Mutex<KeyHealthTracker>>,
+    /// `parking_lot::Mutex` (not `std::sync::Mutex`) because the background
+    /// executor's thread pool contends here on every inference request, and
+    /// `parking_lot` spins before parking the OS thread — measurably better
+    /// under subagent fan-out.
+    key_health: Arc<ParkingMutex<KeyHealthTracker>>,
     /// Latest pending debounced save task. Replacing this cancels the prior
     /// task, coalescing bursts of failures into a single disk write.
-    key_health_dirty: Arc<std::sync::Mutex<Option<Task<()>>>>,
+    key_health_dirty: Arc<ParkingMutex<Option<Task<()>>>>,
     /// Path under `paths::data_dir()` where `key_health` is persisted.
     key_health_path: PathBuf,
     settings: OpenAiCompatibleSettings,
@@ -164,9 +167,7 @@ impl State {
     /// the same slot — the new key is unknown and shouldn't be penalized for the
     /// old key's failures, and the UI badge shouldn't show a stale countdown.
     fn reset_key_health(&self, cx: &App) {
-        if let Ok(mut tracker) = self.key_health.lock() {
-            *tracker = KeyHealthTracker::default();
-        }
+        *self.key_health.lock() = KeyHealthTracker::default();
         self.schedule_persist_key_health(cx);
     }
 
@@ -176,11 +177,11 @@ impl State {
     /// a per-minute tier), and without this the user is stuck waiting. Also
     /// overwrites the persisted state so a process restart doesn't resurrect it.
     fn clear_slot_backoff(&self, slot: KeySlot, cx: &App) {
-        if let Ok(mut tracker) = self.key_health.lock() {
-            let health = tracker.get_mut(slot);
-            health.consecutive_failures = 0;
-            health.backoff_until = None;
-        }
+        let mut tracker = self.key_health.lock();
+        let health = tracker.get_mut(slot);
+        health.consecutive_failures = 0;
+        health.backoff_until = None;
+        drop(tracker);
         self.schedule_persist_key_health(cx);
     }
 
@@ -330,10 +331,7 @@ impl State {
     /// settings page is open; see `backoff_refresh_task`.
     fn slot_health_snapshot(&self) -> [SlotHealthStatus; 3] {
         let now = Instant::now();
-        let tracker = match self.key_health.lock() {
-            Ok(guard) => guard.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
-        };
+        let tracker = self.key_health.lock().clone();
         [
             self.slot_status(KeySlot::Primary, &tracker, now),
             self.slot_status(KeySlot::Secondary, &tracker, now),
@@ -417,9 +415,9 @@ impl OpenAiCompatibleLanguageModelProvider {
             })
             .detach();
             let settings = resolve_settings(&id, cx).cloned().unwrap_or_default();
-            let key_health = Arc::new(std::sync::Mutex::new(KeyHealthTracker::default()));
-            let key_health_dirty: Arc<std::sync::Mutex<Option<Task<()>>>> =
-                Arc::new(std::sync::Mutex::new(None));
+            let key_health = Arc::new(ParkingMutex::new(KeyHealthTracker::default()));
+            let key_health_dirty: Arc<ParkingMutex<Option<Task<()>>>> =
+                Arc::new(ParkingMutex::new(None));
             let key_health_path = key_health_path_for(&id);
 
             // Load persisted backoff state off the foreground thread. The
@@ -438,10 +436,7 @@ impl OpenAiCompatibleLanguageModelProvider {
             let load_path = key_health_path.clone();
             cx.background_spawn(async move {
                 let loaded = reload_persisted_health(&fs, &load_path).await;
-                match load_health.lock() {
-                    Ok(mut guard) => *guard = loaded,
-                    Err(poisoned) => *poisoned.into_inner() = loaded,
-                }
+                *load_health.lock() = loaded;
             })
             .detach();
 
@@ -619,6 +614,14 @@ impl OpenAiCompatibleLanguageModel {
             if candidates.is_empty() {
                 return Err(LanguageModelCompletionError::NoApiKey { provider });
             }
+            // Snapshot health before the retry loop so we can detect whether
+            // retry_stream actually mutated it (a failure bumped a slot's
+            // backoff, or a success cleared one). A clean first-try success on
+            // a fresh tracker leaves health unchanged — in that case we skip
+            // the persist entirely, avoiding a snapshot clone + task spawn +
+            // dirty-lock churn on every request. Under subagent fan-out this
+            // is the difference between N concurrent persists and zero.
+            let health_before = snapshot_health(&key_health);
             let result = retry_stream(
                 &candidates,
                 &key_health,
@@ -644,16 +647,18 @@ impl OpenAiCompatibleLanguageModel {
                 },
             )
             .await;
-            // Whether the request succeeded or rotated to exhaustion, health
-            // state may have changed — schedule a debounced persist so the
-            // next process restart sees the up-to-date backoff state.
-            schedule_persist_key_health_inner(
-                &key_health,
-                &key_health_dirty,
-                key_health_path.clone(),
-                persist_executor.clone(),
-                fs.clone(),
-            );
+            // Only schedule a persist if retry_stream actually mutated health.
+            // KeyHealthTracker derives PartialEq; the clone here is tiny (3
+            // slots) and dwarfed by the lock + spawn + disk-write it avoids.
+            if snapshot_health(&key_health) != health_before {
+                schedule_persist_key_health_inner(
+                    &key_health,
+                    &key_health_dirty,
+                    key_health_path.clone(),
+                    persist_executor.clone(),
+                    fs.clone(),
+                );
+            }
             result
         });
 
@@ -692,6 +697,8 @@ impl OpenAiCompatibleLanguageModel {
             if candidates.is_empty() {
                 return Err(LanguageModelCompletionError::NoApiKey { provider });
             }
+            // See stream_completion: skip persist when health is unchanged.
+            let health_before = snapshot_health(&key_health);
             let result = retry_stream(
                 &candidates,
                 &key_health,
@@ -717,16 +724,15 @@ impl OpenAiCompatibleLanguageModel {
                 },
             )
             .await;
-            // Whether the request succeeded or rotated to exhaustion, health
-            // state may have changed — schedule a debounced persist so the
-            // next process restart sees the up-to-date backoff state.
-            schedule_persist_key_health_inner(
-                &key_health,
-                &key_health_dirty,
-                key_health_path.clone(),
-                persist_executor.clone(),
-                fs.clone(),
-            );
+            if snapshot_health(&key_health) != health_before {
+                schedule_persist_key_health_inner(
+                    &key_health,
+                    &key_health_dirty,
+                    key_health_path.clone(),
+                    persist_executor.clone(),
+                    fs.clone(),
+                );
+            }
             result
         });
 
@@ -1609,8 +1615,8 @@ mod tests {
                 tertiary_key_url("https://example.test"),
                 EnvVar::new("TEST_API_KEY_3".into()),
             ),
-            key_health: Arc::new(std::sync::Mutex::new(KeyHealthTracker::default())),
-            key_health_dirty: Arc::new(std::sync::Mutex::new(None)),
+            key_health: Arc::new(ParkingMutex::new(KeyHealthTracker::default())),
+            key_health_dirty: Arc::new(ParkingMutex::new(None)),
             key_health_path: key_health_path_for("test"),
             settings: OpenAiCompatibleSettings {
                 api_url: "https://example.test".to_string(),
@@ -1659,7 +1665,7 @@ mod tests {
         // Poison Primary directly via the shared mutex, with a backoff window
         // well into the future so it can't accidentally expire mid-test.
         {
-            let mut tracker = state.key_health.lock().unwrap();
+            let mut tracker = state.key_health.lock();
             tracker.primary = KeyHealth {
                 consecutive_failures: 2,
                 backoff_until: Some(Instant::now() + Duration::from_secs(300)),
@@ -1690,7 +1696,7 @@ mod tests {
         // negative — `saturating_duration_since` clamps).
         let state = fake_state_with_no_keys();
         {
-            let mut tracker = state.key_health.lock().unwrap();
+            let mut tracker = state.key_health.lock();
             tracker.secondary = KeyHealth {
                 consecutive_failures: 5,
                 backoff_until: Some(Instant::now() - Duration::from_secs(60)),
@@ -1726,7 +1732,7 @@ mod tests {
         let state = fake_state_with_no_keys();
         // Poison every slot with distinct failure counts / backoff windows.
         {
-            let mut tracker = state.key_health.lock().unwrap();
+            let mut tracker = state.key_health.lock();
             tracker.primary = KeyHealth {
                 consecutive_failures: 3,
                 backoff_until: Some(Instant::now() + Duration::from_secs(300)),
@@ -1746,7 +1752,7 @@ mod tests {
 
         // The exact in-memory operation `reset_key_health` performs.
         {
-            let mut tracker = state.key_health.lock().unwrap();
+            let mut tracker = state.key_health.lock();
             *tracker = KeyHealthTracker::default();
         }
 
@@ -1775,7 +1781,7 @@ mod tests {
         let state = fake_state_with_no_keys();
         // Poison every slot distinctly.
         {
-            let mut tracker = state.key_health.lock().unwrap();
+            let mut tracker = state.key_health.lock();
             tracker.primary = KeyHealth {
                 consecutive_failures: 3,
                 backoff_until: Some(Instant::now() + Duration::from_secs(300)),
@@ -1792,7 +1798,7 @@ mod tests {
 
         // The exact in-memory operation `clear_slot_backoff(Secondary)` performs.
         {
-            let mut tracker = state.key_health.lock().unwrap();
+            let mut tracker = state.key_health.lock();
             let health = tracker.get_mut(KeySlot::Secondary);
             health.consecutive_failures = 0;
             health.backoff_until = None;
