@@ -40,6 +40,7 @@ and already fully loaded in memory.
 - [x] **Sidebar rendering**: In `render_thread`, compute continuation info (both directions) and pass to ThreadItem
 - [x] **Click navigation**: Clicking the indicator activates the referenced thread (reuse existing `activate_thread` path)
 - [x] **Tests**: Verify the continuation is set, persisted, and rendered
+- [x] **Bugfix: timing gap in `set_continued_from`**: The original implementation silently bailed when `set_continued_from` was called before the target thread had a store entry. This was the actual production path: `auto_prompt::dispatch_action` calls `set_continued_from` synchronously right after `external_thread` returns, but `handle_conversation_event` (which saves the thread) fires asynchronously later. Fix: stage the continuation in a `pending_continuations` map and drain it in `save_internal` on the thread's first save. Test: `test_continuation_link_sets_before_thread_is_cached`.
 
 ## Files to Modify
 

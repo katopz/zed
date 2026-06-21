@@ -513,6 +513,13 @@ pub struct ThreadMetadataStore {
     conversation_subscriptions: HashMap<gpui::EntityId, Subscription>,
     pending_thread_ops_tx: async_channel::Sender<DbOperation>,
     in_flight_archives: HashMap<ThreadId, (Task<()>, async_channel::Sender<()>)>,
+    /// Continuations registered via `set_continued_from` before the target
+    /// thread had a store entry. Drained by `save_internal` once the thread
+    /// is first cached. This bridges the auto_prompt timing gap where
+    /// `dispatch_action` calls `set_continued_from` synchronously right
+    /// after creating the thread, before `handle_conversation_event` has
+    /// saved its metadata.
+    pending_continuations: HashMap<ThreadId, acp::SessionId>,
     _db_operations_task: Task<()>,
 }
 
@@ -755,6 +762,13 @@ impl ThreadMetadataStore {
         cx: &mut Context<Self>,
     ) {
         let Some(existing) = self.entry(thread_id) else {
+            // The thread hasn't been cached yet. This happens when
+            // auto_prompt's dispatch_action calls set_continued_from
+            // synchronously right after external_thread returns, before
+            // handle_conversation_event has fired. Stash the continuation;
+            // save_internal applies it when the thread is first saved.
+            self.pending_continuations
+                .insert(thread_id, from_session_id);
             return;
         };
         if existing.continued_from_session_id.as_ref() == Some(&from_session_id) {
@@ -798,7 +812,14 @@ impl ThreadMetadataStore {
         Some((from_session_id, title))
     }
 
-    fn save_internal(&mut self, metadata: ThreadMetadata) {
+    fn save_internal(&mut self, mut metadata: ThreadMetadata) {
+        // Apply a continuation that was registered before this thread had an
+        // entry (see set_continued_from). Drained here so the value persists
+        // to the DB and so the sidebar renders the `from`/`to` chips once
+        // handle_conversation_event saves the thread.
+        if let Some(from_session_id) = self.pending_continuations.remove(&metadata.thread_id) {
+            metadata.continued_from_session_id = Some(from_session_id);
+        }
         if let Some(thread) = self.threads.get(&metadata.thread_id) {
             if thread.folder_paths() != metadata.folder_paths() {
                 if let Some(thread_ids) = self.threads_by_paths.get_mut(thread.folder_paths()) {
@@ -1198,6 +1219,7 @@ impl ThreadMetadataStore {
     }
 
     pub fn delete(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {
+        self.pending_continuations.remove(&thread_id);
         if let Some(thread) = self.threads.get(&thread_id) {
             if let Some(sid) = &thread.session_id {
                 self.threads_by_session.remove(sid);
@@ -1305,6 +1327,7 @@ impl ThreadMetadataStore {
             conversation_subscriptions: HashMap::default(),
             pending_thread_ops_tx: tx,
             in_flight_archives: HashMap::default(),
+            pending_continuations: HashMap::default(),
             _db_operations_task,
         };
         let _ = this.reload(cx);
@@ -2197,6 +2220,76 @@ mod tests {
 
             // The source thread itself has no continued_from.
             assert!(store.continued_from(source_thread_id).is_none());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_continuation_link_sets_before_thread_is_cached(cx: &mut TestAppContext) {
+        // Reproduces the auto_prompt timing gap: dispatch_action calls
+        // set_continued_from synchronously right after external_thread
+        // returns, before handle_conversation_event has saved the thread's
+        // metadata. The continuation must be stashed and applied when the
+        // thread is first saved, otherwise the `from`/`to` chips never render.
+        init_test(cx);
+
+        let source = make_metadata(
+            "source-session",
+            "Original Thread",
+            Utc::now(),
+            PathList::default(),
+        );
+        let source_session_id = source.session_id.clone().unwrap();
+
+        // Build the continuation metadata but DON'T save it yet — it has
+        // no continued_from_session_id, mirroring what
+        // handle_conversation_event will construct.
+        let mut continuation = make_metadata(
+            "continuation-session",
+            "Continued Thread",
+            Utc::now(),
+            PathList::default(),
+        );
+        continuation.continued_from_session_id = None;
+        let continuation_thread_id = continuation.thread_id;
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            store.update(cx, |store, cx| {
+                // Source exists in the store; continuation does not.
+                store.save(source, cx);
+                // This is the call that used to silently bail.
+                store.set_continued_from(continuation_thread_id, source_session_id.clone(), cx);
+            });
+        });
+
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            store.update(cx, |store, cx| {
+                // Now the async path catches up: handle_conversation_event
+                // saves the thread for the first time, with no continued_from.
+                store.save(continuation, cx);
+            });
+        });
+
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            let store = store.read(cx);
+
+            // The stashed continuation should have been applied on save.
+            let (from_session, _) = store
+                .continued_from(continuation_thread_id)
+                .expect("pending continuation should be applied on first save");
+            assert_eq!(from_session, source_session_id);
+
+            // And the reverse lookup on the source should find it.
+            assert_eq!(
+                store.find_continuation_of(&source_session_id).map(|(id, _)| id),
+                Some(continuation_thread_id)
+            );
         });
     }
 
