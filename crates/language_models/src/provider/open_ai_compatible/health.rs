@@ -13,13 +13,12 @@
 
 use anyhow::{Context as _, Result};
 use fs::Fs;
-use futures::{StreamExt, future::BoxFuture};
+use futures::future::BoxFuture;
 use gpui::{BackgroundExecutor, Task};
 use language_model::{LanguageModelCompletionError, LanguageModelProviderName};
 use parking_lot::Mutex as ParkingMutex;
 use paths;
 use rand::Rng;
-use rand::seq::IndexedRandom;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -440,9 +439,16 @@ pub fn is_backoff_worthy(err: &LanguageModelCompletionError) -> bool {
 /// in `stream_completion` / `stream_response`, which has already snapshot the
 /// candidate list and cannot go back through `&self`.
 ///
-/// Picks a random healthy candidate. If every candidate is currently backed
-/// off, returns the one whose `backoff_until` is soonest — failing open is
-/// strictly better than `NoApiKey` when at least one key exists.
+/// Picks a healthy candidate by **deterministic hourly rotation**, not random.
+/// The index is `floor(now_unix_secs / 3600) % healthy.len()` — so the same key
+/// is selected for the entire wall-clock hour. This is cache-friendly: most
+/// upstream providers key their prompt cache on the API key, and random
+/// per-request rotation would thrash the cache. Rotating once per hour keeps
+/// the cache warm while still distributing load across keys over time.
+///
+/// If every candidate is currently backed off, returns the one whose
+/// `backoff_until` is soonest — failing open is strictly better than
+/// `NoApiKey` when at least one key exists.
 pub fn select_from_candidates(
     candidates: &[(Arc<str>, KeySlot)],
     health: &KeyHealthTracker,
@@ -455,7 +461,7 @@ pub fn select_from_candidates(
         .cloned()
         .collect();
 
-    if let Some(pick) = healthy.choose(&mut rand::rng()).cloned() {
+    if let Some(pick) = deterministic_hourly_pick(&healthy) {
         return Some(pick);
     }
 
@@ -469,6 +475,26 @@ pub fn select_from_candidates(
         })
         .min_by_key(|(_, until)| *until)
         .map(|((key, slot), _)| (key, slot))
+}
+
+/// Picks a candidate by the current wall-clock hour so the same key is used
+/// for the whole hour (cache-friendly). Returns `None` for an empty list.
+fn deterministic_hourly_pick(
+    healthy: &[(Arc<str>, KeySlot)],
+) -> Option<(Arc<str>, KeySlot)> {
+    if healthy.is_empty() {
+        return None;
+    }
+    // Wall-clock hour since UNIX_EPOCH. `SystemTime` (not `Instant`) because
+    // the rotation must align across process boundaries and restarts — a
+    // process-local monotonic clock would desync the schedule.
+    let unix_secs = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let hour = (unix_secs / 3600) as usize;
+    let idx = hour % healthy.len();
+    Some(healthy[idx].clone())
 }
 
 /// Updates per-key health after a successful request. Called from inside
@@ -581,37 +607,6 @@ pub async fn retry_stream<S>(
     }
 
     Err(last_error.unwrap_or(LanguageModelCompletionError::NoApiKey { provider }))
-}
-
-/// Pulls exactly one event from a candidate stream before handing it back to
-/// `retry_stream`. This catches errors that surface as the *first* SSE event
-/// after a successful HTTP 200 — a common shape for late-detected rate limits
-/// and upstream provider errors. Without this probe, those errors would
-/// propagate straight to the consumer and terminate the request, even though
-/// a different key would have worked.
-///
-/// - `Some(Ok(first))` — the event is re-prepended via `stream::once` chained
-///   onto the remaining stream, so the consumer sees the full sequence with
-///   nothing lost.
-/// - `Some(Err(e))` — converted to `LanguageModelCompletionError` and returned
-///   as `Err`, so `retry_stream` records a failure and rotates to the next
-///   key (if the error is backoff-worthy).
-/// - `None` — empty stream, returned as `Ok` because producing no events is
-///   the provider's decision, not a transport failure.
-pub async fn probe_first_event<T, E>(
-    mut stream: futures::stream::BoxStream<'static, Result<T, E>>,
-) -> Result<futures::stream::BoxStream<'static, Result<T, E>>, LanguageModelCompletionError>
-where
-    T: Send + 'static,
-    E: Into<LanguageModelCompletionError> + Send + 'static,
-{
-    match stream.next().await {
-        Some(Ok(first)) => Ok(futures::stream::once(async move { Ok::<_, E>(first) })
-            .chain(stream)
-            .boxed()),
-        Some(Err(err)) => Err(err.into()),
-        None => Ok(stream),
-    }
 }
 
 #[cfg(test)]
@@ -1089,87 +1084,6 @@ mod tests {
         ));
 
         assert!(matches!(result, Err(LanguageModelCompletionError::NoApiKey { .. })));
-    }
-
-    // ------------------------------------------------------------------
-    // probe_first_event tests
-    //
-    // The helper pulls one event from a candidate stream so that a first-event
-    // error (e.g., late rate limit delivered inside the SSE stream) can trigger
-    // key rotation via the surrounding `retry_stream` closure. These tests
-    // exercise the helper in isolation: first-event Ok (preserved + chained),
-    // first-event Err (propagated), and empty stream (None).
-    // ------------------------------------------------------------------
-
-    fn boxed_stream<T, E>(items: Vec<Result<T, E>>) -> futures::stream::BoxStream<'static, Result<T, E>>
-    where
-        T: Send + 'static,
-        E: Send + 'static,
-    {
-        futures::stream::iter(items).boxed()
-    }
-
-    #[test]
-    fn probe_first_event_ok_preserves_first_and_subsequent_events() {
-        let stream = boxed_stream(vec![
-            Ok::<i32, anyhow::Error>(1),
-            Ok(2),
-            Ok(3),
-        ]);
-        let mut result = smol::block_on(probe_first_event(stream)).unwrap();
-
-        let collected: Vec<i32> = smol::block_on(async {
-            let mut v = Vec::new();
-            while let Some(Ok(n)) = result.next().await {
-                v.push(n);
-            }
-            v
-        });
-        assert_eq!(collected, vec![1, 2, 3], "first event must not be dropped");
-    }
-
-    #[test]
-    fn probe_first_event_err_propagates_as_language_model_error() {
-        // First event is an `anyhow::Error` (the real stream item error type).
-        // The helper must convert it to `LanguageModelCompletionError::Other`
-        // so the surrounding `retry_stream` can classify and record it.
-        let stream: futures::stream::BoxStream<'static, Result<i32, anyhow::Error>> =
-            boxed_stream(vec![Err(anyhow::anyhow!("late rate limit")), Ok(2)]);
-        let result = smol::block_on(probe_first_event(stream));
-
-        match result {
-            Err(LanguageModelCompletionError::Other(err)) => {
-                assert!(
-                    err.to_string().contains("late rate limit"),
-                    "error message should survive conversion"
-                );
-            }
-            Err(err) => panic!("expected Other(anyhow), got {err:?}"),
-            Ok(_) => panic!("expected Err, got Ok"),
-        }
-    }
-
-    #[test]
-    fn probe_first_event_empty_stream_returns_ok_empty() {
-        let stream: futures::stream::BoxStream<'static, Result<i32, anyhow::Error>> =
-            boxed_stream(vec![]);
-        let mut result = smol::block_on(probe_first_event(stream)).unwrap();
-
-        let count = smol::block_on(async { result.next().await });
-        assert!(count.is_none(), "empty stream should remain empty");
-    }
-
-    #[test]
-    fn probe_first_event_single_ok_event_preserved() {
-        // Stream with exactly one event — the re-prepend path must handle the
-        // case where `chain` is attached to an already-exhausted stream.
-        let stream = boxed_stream(vec![Ok::<i32, anyhow::Error>(42)]);
-        let mut result = smol::block_on(probe_first_event(stream)).unwrap();
-
-        let first = smol::block_on(result.next()).unwrap().unwrap();
-        assert_eq!(first, 42);
-        let second = smol::block_on(result.next());
-        assert!(second.is_none(), "stream should be exhausted after the one event");
     }
 
     // ------------------------------------------------------------------

@@ -35,7 +35,7 @@ pub use settings::OpenAiCompatibleModelCapabilities as ModelCapabilities;
 mod health;
 use health::{
     KeyHealthTracker, KeySlot, SlotHealthStatus, format_backoff_remaining,
-    key_health_path_for, probe_first_event, reload_persisted_health, retry_stream,
+    key_health_path_for, reload_persisted_health, retry_stream,
     schedule_persist_key_health_inner, snapshot_health,
 };
 
@@ -614,13 +614,6 @@ impl OpenAiCompatibleLanguageModel {
             if candidates.is_empty() {
                 return Err(LanguageModelCompletionError::NoApiKey { provider });
             }
-            // Snapshot health before the retry loop so we can detect whether
-            // retry_stream actually mutated it (a failure bumped a slot's
-            // backoff, or a success cleared one). A clean first-try success on
-            // a fresh tracker leaves health unchanged — in that case we skip
-            // the persist entirely, avoiding a snapshot clone + task spawn +
-            // dirty-lock churn on every request. Under subagent fan-out this
-            // is the difference between N concurrent persists and zero.
             let health_before = snapshot_health(&key_health);
             let result = retry_stream(
                 &candidates,
@@ -633,7 +626,15 @@ impl OpenAiCompatibleLanguageModel {
                     let provider_name = provider_name.clone();
                     let attempt_request = request.clone();
                     Box::pin(async move {
-                        let stream = stream_completion(
+                        // Return the stream directly after HTTP setup (no
+                        // `probe_first_event`). Probing the first SSE event added
+                        // time-to-first-token latency to the critical path of
+                        // every request and held the rate-limiter permit during
+                        // that wait, which serialized subagent fan-out. Setup-phase
+                        // errors (auth, 429, 5xx) still surface here and drive
+                        // key rotation; first-event-in-stream errors are rare and
+                        // handled by the consumer like any stream error.
+                        Ok(stream_completion(
                             http_client.as_ref(),
                             provider_name.as_str(),
                             api_url.as_ref(),
@@ -641,15 +642,11 @@ impl OpenAiCompatibleLanguageModel {
                             attempt_request,
                             &extra_headers,
                         )
-                        .await?;
-                        probe_first_event(stream).await
+                        .await?)
                     })
                 },
             )
             .await;
-            // Only schedule a persist if retry_stream actually mutated health.
-            // KeyHealthTracker derives PartialEq; the clone here is tiny (3
-            // slots) and dwarfed by the lock + spawn + disk-write it avoids.
             if snapshot_health(&key_health) != health_before {
                 schedule_persist_key_health_inner(
                     &key_health,
@@ -697,7 +694,6 @@ impl OpenAiCompatibleLanguageModel {
             if candidates.is_empty() {
                 return Err(LanguageModelCompletionError::NoApiKey { provider });
             }
-            // See stream_completion: skip persist when health is unchanged.
             let health_before = snapshot_health(&key_health);
             let result = retry_stream(
                 &candidates,
@@ -710,7 +706,8 @@ impl OpenAiCompatibleLanguageModel {
                     let provider_name = provider_name.clone();
                     let attempt_request = request.clone();
                     Box::pin(async move {
-                        let stream = stream_response(
+                        // See stream_completion: no probe_first_event.
+                        Ok(stream_response(
                             http_client.as_ref(),
                             provider_name.as_str(),
                             api_url.as_ref(),
@@ -718,8 +715,7 @@ impl OpenAiCompatibleLanguageModel {
                             attempt_request,
                             &extra_headers,
                         )
-                        .await?;
-                        probe_first_event(stream).await
+                        .await?)
                     })
                 },
             )
