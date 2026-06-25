@@ -5974,6 +5974,21 @@ impl ThreadView {
 
         let comments_editor = self.thread_feedback.comments_editor.clone();
 
+        // For assistant messages that close a turn, append the separator + branch
+        // affordance so each completed response is visually delimited.
+        let primary = if matches!(entry, AgentThreadEntry::AssistantMessage(_)) {
+            match self.render_turn_end_separator(entry_ix, total_entries, cx) {
+                Some(separator) => v_flex()
+                    .w_full()
+                    .child(primary)
+                    .child(separator)
+                    .into_any_element(),
+                None => primary,
+            }
+        } else {
+            primary
+        };
+
         let primary = if entry_ix + 1 == total_entries {
             v_flex()
                 .w_full()
@@ -6288,6 +6303,154 @@ impl ThreadView {
     pub fn scroll_to_end(&mut self, cx: &mut Context<Self>) {
         self.list_state.scroll_to_end();
         cx.notify();
+    }
+
+    /// Scrolls the nth user prompt (0-based, in entry order) to the top of the
+    /// viewport. Used by the always-visible prompt-jump strip under the title.
+    pub(crate) fn scroll_to_user_prompt(&mut self, prompt_ix: usize, cx: &mut Context<Self>) {
+        let entries = self.thread.read(cx).entries();
+        if entries.is_empty() {
+            return;
+        }
+        let target = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| matches!(entry, AgentThreadEntry::UserMessage(_)))
+            .nth(prompt_ix)
+            .map(|(ix, _)| ix);
+        if let Some(ix) = target {
+            self.list_state.scroll_to(ListOffset {
+                item_ix: ix,
+                offset_in_item: px(0.0),
+            });
+            cx.notify();
+        }
+    }
+
+    /// Creates a new thread that carries over the current thread's context as a
+    /// summary mention, then waits for the user to type and send a message.
+    /// This is the "branch from this point" affordance shown after each turn.
+    fn branch_to_new_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let thread = self.thread.read(cx);
+        let session_id = thread.session_id().clone();
+        let title = thread.title();
+        let work_dirs = thread.work_dirs().cloned();
+
+        window.defer(cx, move |window, cx| {
+            let Some(panel) = workspace.read(cx).panel::<crate::AgentPanel>(cx) else {
+                return;
+            };
+            panel.update(cx, |panel, cx| {
+                panel.external_thread(
+                    None,
+                    None,
+                    work_dirs,
+                    title,
+                    Some(crate::AgentInitialContent::ThreadSummary {
+                        session_id,
+                        title: None,
+                        follow_up: None,
+                        auto_submit: false,
+                    }),
+                    true,
+                    crate::AgentThreadSource::AgentPanel,
+                    window,
+                    cx,
+                );
+            });
+        });
+    }
+
+    /// Renders the separator + "Branch New Thread" affordance shown at the end
+    /// of each completed assistant turn (an assistant message followed by a
+    /// user message starting the next turn, or the final entry while idle).
+    fn render_turn_end_separator(
+        &self,
+        entry_ix: usize,
+        total_entries: usize,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        let entries = self.thread.read(cx).entries();
+        let is_last = entry_ix + 1 == total_entries;
+        let closes_turn = is_last
+            || matches!(
+                entries.get(entry_ix + 1),
+                Some(AgentThreadEntry::UserMessage(_))
+            );
+        if !closes_turn {
+            return None;
+        }
+        if matches!(self.thread.read(cx).status(), ThreadStatus::Generating) {
+            return None;
+        }
+
+        Some(
+            h_flex()
+                .w_full()
+                .px_5()
+                .py_1()
+                .gap_2()
+                .items_center()
+                .child(Divider::horizontal().flex_1())
+                .child(
+                    Button::new(("branch-thread", entry_ix), "Branch New Thread")
+                        .style(ButtonStyle::Subtle)
+                        .label_size(LabelSize::XSmall)
+                        .color(Color::Muted)
+                        .start_icon(
+                            Icon::new(IconName::GitBranch)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .tooltip(Tooltip::text(
+                            "Start a new thread that carries this conversation as context.",
+                        ))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.branch_to_new_thread(window, cx);
+                        })),
+                )
+                .child(Divider::horizontal().flex_1())
+                .into_any_element(),
+        )
+    }
+
+    /// Always-visible strip of numbered buttons (one per user prompt) shown at
+    /// the top of the conversation. Clicking a number scrolls that user prompt
+    /// to the top of the viewport.
+    fn render_user_prompt_jumps(&self, cx: &Context<Self>) -> Option<Div> {
+        let entries = self.thread.read(cx).entries();
+        let user_prompt_count = entries
+            .iter()
+            .filter(|e| matches!(e, AgentThreadEntry::UserMessage(_)))
+            .count();
+        if user_prompt_count <= 1 {
+            return None;
+        }
+
+        let mut buttons = h_flex().w_full().px_5().py_1().gap_1().items_center();
+        for index in 0..user_prompt_count {
+            buttons = buttons.child(
+                div()
+                    .id(("prompt-jump", index))
+                    .px_1()
+                    .rounded_sm()
+                    .hover(|s| s.bg(cx.theme().colors().element_hover))
+                    .tooltip(Tooltip::text(format!("Jump to prompt {}", index + 1)))
+                    .child(
+                        Label::new(format!("{}", index + 1))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.scroll_to_user_prompt(index, cx);
+                    })),
+            );
+        }
+
+        Some(buttons)
     }
 
     fn handle_feedback_click(
@@ -10779,6 +10942,7 @@ impl Render for ThreadView {
             }))
             .size_full()
             .children(self.render_subagent_titlebar(cx))
+            .children(self.render_user_prompt_jumps(cx))
             .child(conversation)
             .children(self.render_multi_root_callout(cx))
             .children(self.render_skill_loading_errors(cx))
