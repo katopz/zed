@@ -6187,28 +6187,33 @@ impl Sidebar {
                 .regenerating_titles
                 .contains(&thread.metadata.thread_id);
 
-        // Continuation indicator: `from` if this thread was continued from
-        // another, `to` if another thread continues from this one.
-        let continuation = ThreadMetadataStore::try_global(cx).and_then(|store| {
-            let store = store.read(cx);
-            if let Some(from_session_id) = &thread.metadata.continued_from_session_id {
+        // Continuation indicators. A thread can show up to two chips:
+        // `from` (it was continued from another thread) and `to` (another
+        // thread continues from it). These are independent — a thread in the
+        // middle of a continuation chain shows both.
+        let (continuation_from, continuation_to) = ThreadMetadataStore::try_global(cx)
+            .map(|store| {
+                let store = store.read(cx);
+
                 // Forward: this thread was continued from `from_session_id`.
-                let target_thread_id = store
-                    .entry_by_session(from_session_id)
-                    .map(|m| m.thread_id)?;
-                Some((
-                    ThreadContinuationDirection::From,
-                    target_thread_id,
-                ))
-            } else if let Some(session_id) = &thread.metadata.session_id {
+                let from = thread
+                    .metadata
+                    .continued_from_session_id
+                    .as_ref()
+                    .and_then(|from_session_id| {
+                        store.entry_by_session(from_session_id).map(|m| m.thread_id)
+                    });
+
                 // Reverse: find the thread that continues from us.
-                store
-                    .find_continuation_of(session_id)
-                    .map(|(target_thread_id, _)| (ThreadContinuationDirection::To, target_thread_id))
-            } else {
-                None
-            }
-        });
+                let to = thread
+                    .metadata
+                    .session_id
+                    .as_ref()
+                    .and_then(|session_id| store.find_continuation_of(session_id).map(|(id, _)| id));
+
+                (from, to)
+            })
+            .unwrap_or_default();
 
         let thread_item = ThreadItem::new(id, title.clone())
             .base_bg(sidebar_bg)
@@ -6235,9 +6240,19 @@ impl Sidebar {
             .selected(is_selected)
             .focused(is_focused)
             .hovered(is_hovered)
-            .when_some(continuation, |this, (direction, target_thread_id)| {
+            .when_some(continuation_from, |this, target_thread_id| {
                 let weak = cx.weak_entity();
-                this.continuation(direction, move |window, cx| {
+                this.continuation(ThreadContinuationDirection::From, move |window, cx| {
+                    if let Some(sidebar) = weak.upgrade() {
+                        sidebar.update(cx, |sidebar, cx| {
+                            sidebar.activate_thread_by_id(target_thread_id, window, cx);
+                        });
+                    }
+                })
+            })
+            .when_some(continuation_to, |this, target_thread_id| {
+                let weak = cx.weak_entity();
+                this.continuation(ThreadContinuationDirection::To, move |window, cx| {
                     if let Some(sidebar) = weak.upgrade() {
                         sidebar.update(cx, |sidebar, cx| {
                             sidebar.activate_thread_by_id(target_thread_id, window, cx);

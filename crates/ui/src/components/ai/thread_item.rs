@@ -71,7 +71,10 @@ pub struct ThreadItem {
     worktrees: Vec<ThreadItemWorktreeInfo>,
     is_remote: bool,
     archived: bool,
-    continuation: Option<(ThreadContinuationDirection, Box<dyn Fn(&mut Window, &mut App) + 'static>)>,
+    continuations: Vec<(
+        ThreadContinuationDirection,
+        Box<dyn Fn(&mut Window, &mut App) + 'static>,
+    )>,
     on_click: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
     on_hover: Box<dyn Fn(&bool, &mut Window, &mut App) + 'static>,
     action_slot: Option<AnyElement>,
@@ -107,7 +110,7 @@ impl ThreadItem {
             worktrees: Vec::new(),
             is_remote: false,
             archived: false,
-            continuation: None,
+            continuations: Vec::new(),
             on_click: None,
             on_hover: Box::new(|_, _, _| {}),
             action_slot: None,
@@ -223,13 +226,15 @@ impl ThreadItem {
     }
 
     /// Show a clickable `from`/`to` continuation chip in the metadata line.
-    /// Used by the sidebar to indicate auto_prompt summary threads.
+    /// Used by the sidebar to indicate auto_prompt summary threads. A thread
+    /// may show up to two chips: one `from` (it was continued from another
+    /// thread) and one `to` (another thread continues from it).
     pub fn continuation(
         mut self,
         direction: ThreadContinuationDirection,
         on_click: impl Fn(&mut Window, &mut App) + 'static,
     ) -> Self {
-        self.continuation = Some((direction, Box::new(on_click)));
+        self.continuations.push((direction, Box::new(on_click)));
         self
     }
 
@@ -435,12 +440,13 @@ impl RenderOnce for ThreadItem {
 
         let has_worktree = !linked_worktrees.is_empty();
 
-        let continuation = self.continuation.take();
-        let has_continuation = continuation.is_some();
-        let (direction_label, continuation_handler): (
+        let continuations = self.continuations.drain(..).collect::<Vec<_>>();
+        let has_continuation = !continuations.is_empty();
+        let continuation_chips: Vec<(
             &str,
             Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App)>>,
-        ) = continuation
+        )> = continuations
+            .into_iter()
             .map(|(direction, handler)| {
                 let label = match direction {
                     ThreadContinuationDirection::From => "from",
@@ -450,7 +456,7 @@ impl RenderOnce for ThreadItem {
                     Box::new(move |_, window, cx| handler(window, cx));
                 (label, Some(wrapped))
             })
-            .unwrap_or(("", None));
+            .collect();
 
         let has_metadata = has_project_name
             || has_project_paths
@@ -645,27 +651,33 @@ impl RenderOnce for ThreadItem {
                                     || has_timestamp,
                                 |this| this.child(dot_separator()),
                             )
-                            .child(
-                                h_flex()
-                                    .id((self.id.clone(), "continuation"))
-                                    .gap_0p5()
-                                    .child(
-                                        Label::new(direction_label)
-                                        .size(LabelSize::Small)
-                                        .color(Color::Accent),
-                                    )
-                                    .child(
-                                        Icon::new(IconName::ArrowUpRight)
-                                            .size(IconSize::XSmall)
-                                            .color(Color::Accent),
-                                    )
-                                    .hover(|style| style.bg(hover_color).rounded_sm())
-                                    .cursor_pointer()
-                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                        cx.stop_propagation();
-                                    })
-                                    .when_some(continuation_handler, |this, handler| {
-                                        this.on_click(handler)
+                            .children(
+                                continuation_chips
+                                    .into_iter()
+                                    .enumerate()
+                                    .map(|(ix, (label, handler))| {
+                                        h_flex()
+                                            .id((self.id.clone(), format!("continuation-{ix}-{label}")))
+                                            .gap_0p5()
+                                            .when(ix > 0, |this| this.child(dot_separator()))
+                                            .child(
+                                                Label::new(label)
+                                                    .size(LabelSize::Small)
+                                                    .color(Color::Accent),
+                                            )
+                                            .child(
+                                                Icon::new(IconName::ArrowUpRight)
+                                                    .size(IconSize::XSmall)
+                                                    .color(Color::Accent),
+                                            )
+                                            .hover(|style| style.bg(hover_color).rounded_sm())
+                                            .cursor_pointer()
+                                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                                cx.stop_propagation();
+                                            })
+                                            .when_some(handler, |this, handler| {
+                                                this.on_click(handler)
+                                            })
                                     }),
                             )
                         }),
