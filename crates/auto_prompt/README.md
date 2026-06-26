@@ -529,7 +529,7 @@ When `AutoPromptNewThread` is dispatched, `AgentPanel::auto_prompt_new_thread()`
 | Function | Location | Purpose |
 |----------|----------|---------|
 | `auto_prompt_new_thread()` | `agent_ui/agent_panel.rs` | Builds 3-section ContentBlock, creates external thread with auto_submit |
-| `build_continuation_prompt()` | `auto_prompt/auto_prompt.rs` | Checks `detect_remaining_work()` for actionable items, falls back to static prompt |
+| `build_continuation_prompt()` | `agent_ui/src/auto_prompt/mod.rs` | Formats same-thread continuation: emits the decision as-is, falls back to minimal `"Continue from where we left off."` only when the decision is empty/generic |
 | `detect_remaining_work()` | `auto_prompt/auto_prompt.rs` | Scans last_assistant_message for "remaining work", "todo:", unchecked `- [ ]` |
 | `truncate_to_paragraph_budget()` | `auto_prompt/context.rs` | Truncates text to N chars, splitting at paragraph boundaries |
 | `extract_decision_prompt()` | `auto_prompt/auto_prompt.rs` | Extracts `## 3. Decision` section from `with_first_prompt_context` formatted text |
@@ -542,10 +542,20 @@ When `AutoPromptNewThread` is dispatched, `AgentPanel::auto_prompt_new_thread()`
 
 When the token count is below the `same_thread_token_threshold` (default 60K), continuations are sent to the **same thread** instead of creating a new one:
 
-- **Native Zed agent**: `"Continue from where we left off. Summarize prior context internally and proceed."` + decision only
+- **Native Zed agent**: the orchestration LLM's decision is emitted **as-is** (no static preamble prepended)
 - **ACP agents (Claude, etc.)**: `/compact` + decision only
 
-The last assistant message is **not** repeated — it's already visible in the thread history. Only the orchestration LLM's decision is appended, keeping the continuation concise.
+The last assistant message is **not** repeated — it's already visible in the thread history. Only the orchestration LLM's decision is sent, keeping the continuation concise and avoiding the two-voice failure mode where a generic "Continue from where we left off…" preamble would be bolted onto a substantive task instruction.
+
+**`build_continuation_prompt(decision)` behavior** (`agent_ui/src/auto_prompt/mod.rs`):
+
+| Decision content | Emitted message |
+|------------------|-----------------|
+| Substantive task (e.g. "Scaffold the issue file at…", "Implement X. Production grade only.") | The decision, unchanged |
+| Bare generic "Continue from where we left off." (manual auto-prompt, overflow fallback) | `"Continue from where we left off."` (minimal fallback) |
+| Empty | `"Continue from where we left off."` (minimal fallback) |
+
+The fallback is intentionally minimal. Behavioral meta-instructions ("commit when done", "review remaining work") belong in the agent's system prompt or the user's `AGENTS.md`, not bolted onto every same-thread continuation — otherwise a reply like "Yes, I love you" to "Do you love me?" would get prefixed with "Continue from where we left off. Summarize prior context internally…", producing an absurd two-paragraph message.
 
 **Routing rules** (hard invariant — enforced in `dispatch_action`):
 

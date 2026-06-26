@@ -224,30 +224,29 @@ pub struct AutoPromptNewThread {
 /// plan state to decide whether to continue, pre-stop, or stop. This function
 /// only formats the instruction; it does not second-guess that decision.
 ///
-/// For same-thread continuations the last assistant message is already visible in the
-/// thread history, so we only include the decision prompt — not a verbatim repeat.
+/// For same-thread continuations the last assistant message is already visible
+/// in the thread history, so the decision is emitted as-is. A static preamble
+/// is only used as a fallback when the decision is empty or a bare generic
+/// "Continue from where we left off." (e.g. from manual_auto_prompt). Bolting a
+/// generic preamble onto a substantive decision produced absurd two-paragraph
+/// messages (e.g. preamble + "Yes, I love you" in reply to "Do you love me?").
 fn build_continuation_prompt(
     _last_assistant_message: Option<&str>,
     decision: &str,
 ) -> String {
-    let preamble = "Continue from where we left off. Summarize prior context internally and proceed.\n\
-         Review your progress and continue any remaining work in the current repo or context first.\n\
-         If everything is complete, commit all changes with conventional commit messages.";
-    let mut parts = vec![preamble.to_string()];
-
     let trimmed = decision.trim();
-    // Skip appending the decision when it is just a generic restatement of the preamble
-    // (e.g. "Continue from where we left off." from manual_auto_prompt).
+
+    // Bare generic continuation (manual_auto_prompt, overflow fallbacks) — no
+    // substantive task to emit, so use a minimal continuation instruction.
     let is_generic_continuation = trimmed
         .strip_prefix("Continue from where we left off")
         .map_or(false, |rest| rest.trim().trim_end_matches('.').is_empty());
 
     if !trimmed.is_empty() && !is_generic_continuation {
-        parts.push(String::new());
-        parts.push(trimmed.to_string());
+        return trimmed.to_string();
     }
 
-    parts.join("\n")
+    "Continue from where we left off.".to_string()
 }
 
 pub(crate) fn dispatch_action(
