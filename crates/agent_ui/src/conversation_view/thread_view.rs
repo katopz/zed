@@ -6349,6 +6349,10 @@ impl ThreadView {
     /// For external ACP agents (history lives server-side and can't be forked)
     /// this falls back to copying a verbatim transcript into the new thread's
     /// composer.
+    ///
+    /// The boundary computation itself is delegated to
+    /// [`slice_messages_for_branch`] / [`transcript_entry_count`] so it can be
+    /// unit-tested without rendering a view.
     fn branch_to_new_thread(
         &mut self,
         up_to_user_message: Option<UserMessageId>,
@@ -6367,45 +6371,28 @@ impl ThreadView {
         // local message log we can fork; external ACP agents hold history
         // server-side with no protocol-level fork, so they fall through to the
         // transcript path below.
+        //
+        // A `None` slice means the requested branch point couldn't be found in
+        // native history, so we fall through to the transcript path (which
+        // itself degrades to the whole thread). `up_to_user_message = None`
+        // (turn-end-separator button) forks the whole conversation.
         let native_branch = self.as_native_thread(cx).and_then(|native_thread| {
             let connection = self.as_native_connection(cx)?;
             let messages = native_thread.read(cx).messages().to_vec();
-            let sliced = match &up_to_user_message {
-                Some(target_id) => {
-                    // Inclusive boundary: carry everything up to and including
-                    // the selected user message.
-                    let end = messages.iter().position(|message| {
-                        matches!(&**message, agent::Message::User(user) if &user.id == target_id)
-                    })?;
-                    messages.into_iter().take(end + 1).collect::<Vec<_>>()
-                }
-                None => messages,
-            };
-            Some((connection, sliced))
+            slice_messages_for_branch(&messages, up_to_user_message.as_ref())
+                .map(|sliced| (connection, sliced))
         });
 
         // Fallback transcript for external ACP agents: a flattened copy of the
         // rendered entries up to the branch point. Computed eagerly so the new
         // thread can be created with it as initial composer content.
         let transcript_fallback = if native_branch.is_none() {
+            let entries = thread.entries();
+            let take = transcript_entry_count(entries, up_to_user_message.as_ref());
             Some(
-                thread
-                    .entries()
+                entries
                     .iter()
-                    .take(
-                        up_to_user_message
-                            .as_ref()
-                            .and_then(|id| {
-                                thread
-                                    .entries()
-                                    .iter()
-                                    .position(|entry| {
-                                        matches!(entry, acp_thread::AgentThreadEntry::UserMessage(m) if m.id.as_ref() == Some(id))
-                                    })
-                            })
-                            .map(|ix| ix + 1)
-                            .unwrap_or_else(|| thread.entries().len()),
-                    )
+                    .take(take)
                     .map(|entry| entry.to_markdown(cx))
                     .collect::<String>(),
             )
@@ -11292,4 +11279,210 @@ pub(crate) fn reset_fast_mode_warnings(cx: &mut App) {
             .log_err();
     })
     .detach();
+}
+
+/// Computes the inclusive slice of native `messages` to fork into a branched
+/// thread.
+///
+/// - `up_to = None` → the whole conversation is forked (`Some(all)`).
+/// - `up_to = Some(id)` → everything up to and *including* the matching user
+///   message (`Some(slice)`). Returns `None` when no such message exists,
+///   which makes `branch_to_new_thread` fall through to the transcript path.
+///
+/// Extracted from `branch_to_new_thread` so the inclusive-boundary logic can
+/// be unit-tested without rendering a view.
+fn slice_messages_for_branch(
+    messages: &[Arc<agent::Message>],
+    up_to: Option<&UserMessageId>,
+) -> Option<Vec<Arc<agent::Message>>> {
+    let Some(target_id) = up_to else {
+        return Some(messages.to_vec());
+    };
+    let end = messages.iter().position(|message| {
+        matches!(&**message, agent::Message::User(user) if &user.id == target_id)
+    })?;
+    Some(messages.iter().take(end + 1).cloned().collect())
+}
+
+/// Computes how many leading rendered `entries` to include in a verbatim
+/// transcript when branching an external (non-native) thread.
+///
+/// - `up_to = None` → the whole thread (`entries.len()`).
+/// - `up_to = Some(id)` → inclusive of the entry whose user-message id matches.
+///   When the id isn't found, falls back to the whole thread: the branch is a
+///   no-op against the boundary, so the full transcript is the only sensible
+///   copy. This mirrors `slice_messages_for_branch`'s not-found semantics
+///   (the native path returns `None` there and also lands on the full-thread
+///   transcript here).
+///
+/// Extracted from `branch_to_new_thread` so the boundary logic can be
+/// unit-tested without rendering a view.
+fn transcript_entry_count(entries: &[AgentThreadEntry], up_to: Option<&UserMessageId>) -> usize {
+    match up_to {
+        Some(id) => entries
+            .iter()
+            .position(|entry| {
+                matches!(entry, AgentThreadEntry::UserMessage(m) if m.id.as_ref() == Some(id))
+            })
+            .map(|ix| ix + 1)
+            .unwrap_or_else(|| entries.len()),
+        None => entries.len(),
+    }
+}
+
+#[cfg(test)]
+mod branch_boundary_tests {
+    use super::*;
+    use acp_thread::UserMessageId;
+    use agent::{
+        AgentMessage, Message as AgentMessageKind, UserMessage as NativeUserMessage,
+        UserMessageContent,
+    };
+
+    // --- slice_messages_for_branch (native message slice) ---
+
+    fn native_user(id: &UserMessageId, text: &str) -> Arc<AgentMessageKind> {
+        Arc::new(AgentMessageKind::User(NativeUserMessage {
+            id: id.clone(),
+            content: vec![UserMessageContent::Text(text.to_string())].into(),
+        }))
+    }
+
+    fn native_agent(text: &str) -> Arc<AgentMessageKind> {
+        // `AgentMessage`'s content fields are `pub(crate)`, so we can't build a
+        // populated one from outside the `agent` crate. That's fine: the slice
+        // logic only matches on user-message ids, so an empty default agent
+        // message suffices to prove inter-user messages are carried through.
+        let _ = text;
+        Arc::new(AgentMessageKind::Agent(AgentMessage::default()))
+    }
+
+    #[test]
+    fn slice_none_up_to_forks_whole_conversation() {
+        let id_a = UserMessageId::new();
+        let messages = vec![native_user(&id_a, "u1"), native_agent("a1")];
+        let sliced =
+            slice_messages_for_branch(&messages, None).expect("None up_to forks everything");
+        assert_eq!(sliced.len(), 2);
+        assert_eq!(sliced[0], messages[0]);
+        assert_eq!(sliced[1], messages[1]);
+    }
+
+    #[test]
+    fn slice_some_up_to_is_inclusive_of_matching_user_message() {
+        let id_a = UserMessageId::new();
+        let id_b = UserMessageId::new();
+        let messages = vec![
+            native_user(&id_a, "u1"),
+            native_agent("a1"),
+            native_user(&id_b, "u2"),
+            native_agent("a2"),
+        ];
+        // Branch at id_b: inclusive → keeps u1, a1, u2 (drops the trailing a2).
+        let sliced = slice_messages_for_branch(&messages, Some(&id_b))
+            .expect("matching id should produce a slice");
+        assert_eq!(sliced.len(), 3);
+        assert_eq!(sliced[0], messages[0]);
+        assert_eq!(sliced[2], messages[2]);
+    }
+
+    #[test]
+    fn slice_some_up_to_first_message_keeps_only_first() {
+        let id_a = UserMessageId::new();
+        let id_b = UserMessageId::new();
+        let messages = vec![
+            native_user(&id_a, "u1"),
+            native_agent("a1"),
+            native_user(&id_b, "u2"),
+        ];
+        let sliced = slice_messages_for_branch(&messages, Some(&id_a))
+            .expect("first-message branch should produce a slice");
+        assert_eq!(sliced.len(), 1);
+        assert_eq!(sliced[0], messages[0]);
+    }
+
+    #[test]
+    fn slice_unknown_up_to_returns_none_so_transcript_path_is_used() {
+        let id_a = UserMessageId::new();
+        let missing = UserMessageId::new();
+        let messages = vec![native_user(&id_a, "u1"), native_agent("a1")];
+        assert!(
+            slice_messages_for_branch(&messages, Some(&missing)).is_none(),
+            "an unknown branch id must fall through to the transcript path"
+        );
+    }
+
+    #[test]
+    fn slice_up_to_pointing_at_an_assistant_message_is_not_a_match() {
+        // Branch ids are user-message ids; an assistant message never matches,
+        // so pointing `up_to` at an id that isn't any user message returns None.
+        let id_a = UserMessageId::new();
+        let messages = vec![native_user(&id_a, "u1"), native_agent("a1")];
+        let not_in_thread = UserMessageId::new();
+        assert!(slice_messages_for_branch(&messages, Some(&not_in_thread)).is_none());
+    }
+
+    // --- transcript_entry_count (external ACP transcript fallback) ---
+
+    fn entry_user(id: Option<UserMessageId>, _text: &str) -> AgentThreadEntry {
+        AgentThreadEntry::UserMessage(acp_thread::UserMessage {
+            id,
+            // `content`/`chunks` are irrelevant to the count logic under test;
+            // `Empty` avoids needing a Markdown entity + cx to construct.
+            content: ContentBlock::Empty,
+            chunks: vec![],
+            checkpoint: None,
+            indented: false,
+        })
+    }
+
+    fn entry_assistant() -> AgentThreadEntry {
+        AgentThreadEntry::AssistantMessage(acp_thread::AssistantMessage {
+            chunks: vec![],
+            indented: false,
+            is_subagent_output: false,
+        })
+    }
+
+    #[test]
+    fn transcript_none_up_to_takes_whole_thread() {
+        let entries = vec![entry_user(None, "u1"), entry_assistant(), entry_user(None, "u2")];
+        assert_eq!(transcript_entry_count(&entries, None), 3);
+    }
+
+    #[test]
+    fn transcript_some_up_to_is_inclusive_of_matching_entry() {
+        let id_b = UserMessageId::new();
+        let entries = vec![
+            entry_user(None, "u1"),
+            entry_assistant(),
+            entry_user(Some(id_b.clone()), "u2"),
+            entry_assistant(),
+        ];
+        // Inclusive: keeps through the id_b entry (3), drops the trailing assistant.
+        assert_eq!(transcript_entry_count(&entries, Some(&id_b)), 3);
+    }
+
+    #[test]
+    fn transcript_unknown_up_to_degrades_to_whole_thread() {
+        // The external path has no native history to fall back to, so an
+        // unmatched branch id copies the entire thread rather than nothing.
+        let entries = vec![entry_user(None, "u1"), entry_assistant()];
+        let missing = UserMessageId::new();
+        assert_eq!(transcript_entry_count(&entries, Some(&missing)), 2);
+    }
+
+    #[test]
+    fn transcript_first_matching_user_entry_when_ids_repeat_takes_first() {
+        // `position` returns the first match. This documents the (reasonable)
+        // behavior: branch-at-id forks up to the first occurrence of that id.
+        let id = UserMessageId::new();
+        let entries = vec![
+            entry_user(Some(id.clone()), "u1"),
+            entry_assistant(),
+            entry_user(Some(id.clone()), "u2"),
+            entry_assistant(),
+        ];
+        assert_eq!(transcript_entry_count(&entries, Some(&id)), 1);
+    }
 }

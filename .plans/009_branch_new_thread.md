@@ -105,7 +105,11 @@ genuine ceiling for non-native agents.
 - [x] `cargo test -p agent_ui --lib` (rewind, continuation)
 - [x] `./script/clippy -p agent -p agent_ui` (mandatory stronger linter)
 - [x] Automated test `test_seed_history_forks_real_turns` (covers native fork of real history)
-- [ ] Manual GUI smoke test — only viewport-coupled items remain (see below)
+- [x] Extract `slice_messages_for_branch` helper from `branch_to_new_thread` (native inclusive-boundary logic)
+- [x] Extract `transcript_entry_count` helper from `branch_to_new_thread` (external transcript slicing logic)
+- [x] Unit tests for `slice_messages_for_branch` + `transcript_entry_count` (9 tests in `branch_boundary_tests`)
+- [x] `./script/clippy -p agent_ui` (after extraction + tests)
+- [ ] Manual GUI smoke test — only pure-rendering items remain (scroll viewport, button presence in element tree)
 
 ## Validation
 
@@ -116,7 +120,9 @@ genuine ceiling for non-native agents.
 | `cargo test -p agent_ui --lib` (rewind, continuation) | Pass |
 | `./script/clippy -p agent` (after adding the test) | Clean (`--deny warnings`, plus `cargo-machete` + `typos`) |
 | `test_seed_history_forks_real_turns` (8 iterations) | Pass — native fork renders identically to source |
-| Manual GUI smoke | Partially covered — see smoke-item breakdown below |
+| `branch_boundary_tests` (9 tests) | Pass — inclusive boundary, whole-thread fork, not-found fallback, first-match semantics |
+| `./script/clippy -p agent_ui` (after extraction + tests) | Clean (`--deny warnings`, plus `cargo-machete` + `typos`) |
+| Manual GUI smoke | Only pure-rendering items remain (see smoke-item breakdown below) |
 
 ## Key Files
 
@@ -124,7 +130,7 @@ genuine ceiling for non-native agents.
 |------|--------|
 | `crates/agent/src/thread.rs` | `messages()` + `set_messages()` accessors |
 | `crates/agent/src/agent.rs` | `NativeAgentConnection::seed_history()` + `test_seed_history_forks_real_turns` |
-| `crates/agent_ui/src/conversation_view/thread_view.rs` | `branch_to_new_thread` rewrite, `[TOP]`/`[BOTTOM]`, checkpoint-row Branch button, turn-end call site |
+| `crates/agent_ui/src/conversation_view/thread_view.rs` | `branch_to_new_thread` rewrite, `[TOP]`/`[BOTTOM]`, checkpoint-row Branch button, turn-end call site, `slice_messages_for_branch`/`transcript_entry_count` helpers + `branch_boundary_tests` |
 
 ## Manual smoke-test item breakdown
 
@@ -132,12 +138,12 @@ The four original manual smoke items, re-assessed for automated coverage:
 
 | # | Item | Status | How covered |
 |---|------|--------|-------------|
-| 1 | `[TOP]`/`[BOTTOM]` scroll correctly | Manual only | Viewport-coupled: `scroll_to_top`/`scroll_to_end` mutate a `ListState` against laid-out content. No unit-testable seam; both target methods are pre-existing and well-exercised. |
-| 2 | Checkpoint row shows both buttons | Manual only | Requires a full `ThreadView` render harness (workspace + panel + checkpoint-bearing user message) that the agent_ui test suite doesn't provide. Code inspection confirms Restore and Branch are siblings in the same `h_flex`. |
+| 1 | `[TOP]`/`[BOTTOM]` scroll correctly | Manual only | Viewport-coupled: `scroll_to_top`/`scroll_to_end` mutate a `ListState` whose item count is only synced during the `list()` element's layout pass (no agent_ui test renders/draws). Without rendering, `scroll_to_end` resolves to `item_ix == 0`. The target methods themselves are pre-existing and well-exercised, so only the wiring (TOP→`scroll_to_top`, BOTTOM→`scroll_to_end`) is at risk — verified by code inspection. |
+| 2 | Checkpoint row shows both buttons | Logic automated, render manual | Requires a full `ThreadView` render harness (workspace + panel + checkpoint-bearing user message) that the agent_ui test suite doesn't provide (no `cx.draw` usage anywhere in the crate). The **branch-boundary logic** the checkpoint-row Branch button depends on is extracted into `slice_messages_for_branch` and covered by 5 unit tests. Code inspection confirms Restore and Branch are siblings in the same `h_flex`. |
 | 3 | Native Branch forks real history | **Automated** | `test_seed_history_forks_real_turns` forks session A's messages into session B via `seed_history` and asserts B's `acp_thread.to_markdown()` == A's, plus matching entry/message counts. Text-only turns chosen deliberately; tool-card replay is transitively covered by `test_replay_tool_call_replays_image_content` since both share `Thread::replay()`. |
-| 4 | External agent transcript fallback | Manual only | Slicing + `to_markdown` + `ContentBlock` path is inline in `branch_to_new_thread`, tightly coupled to UI. Not cleanly extractable without a refactor; code inspection confirms the `AgentInitialContent::ContentBlock` construction. |
+| 4 | External agent transcript fallback | Logic automated, render manual | The `to_markdown`/composer wiring is inline and needs rendering. The **transcript slicing logic** is extracted into `transcript_entry_count` and covered by 4 unit tests (inclusive boundary, whole-thread fallback for `None`, whole-thread degradation for unknown id, first-match semantics). |
 
-Only item #3 was cleanly automatable; the rest depend on a rendered viewport or an inline UI coupling that the test harness can't reach.
+The pure-rendering aspects (buttons actually appearing in the element tree, scroll actually moving the viewport) genuinely require a render/draw harness that no agent_ui test uses; building one would pioneer brittle infrastructure outside this codebase's conventions. The **logic** behind items 2–4 is now fully extracted and unit-tested, including a regression the extraction caught (`None` up-to must fork the whole conversation, not fall through to transcript).
 
 ## TL;DR
 
