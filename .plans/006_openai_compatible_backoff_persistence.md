@@ -117,7 +117,7 @@ After `record_success` / `record_failure` (the free functions used by
 - [x] Run `cargo test -p language_models --lib` (82/82 pass, stable across 5 runs)
 - [x] Run `./script/clippy -p language_models` (clean, incl. cargo-machete + typos)
 - [x] Run `cargo check -p edit_prediction -p edit_prediction_cli -p language_models_cloud` (downstream OK)
-- [ ] Commit on `develop`
+- [x] Commit on `develop` (commit `8eae9eb5be`, already on `develop` as ancestor of HEAD)
 
 ## Out of Scope
 

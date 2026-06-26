@@ -1,6 +1,7 @@
 use acp_thread::MentionUri;
 use agent::ZED_AGENT_ID;
 use agent_client_protocol::schema as acp;
+use agent_servers::CLAUDE_AGENT_ID;
 use gpui::Window;
 use notifications::status_toast::StatusToast;
 use prompt_store::{BuiltInPrompt, PromptId, PromptStore};
@@ -510,7 +511,22 @@ pub fn on_thread_stopped(
         );
     }
 
-    let decision = auto_prompt::decide(thread, used_tools, stop_reason, cx);
+    // Route to the isolated Claude path for ACP Claude agents. Claude Code
+    // manages its own context/compaction — it must never hit the native
+    // ContextOverflow / summarize / new-thread flow (see claude_agent.rs).
+    let is_claude_agent = thread
+        .read(cx)
+        .connection()
+        .agent_id()
+        .as_ref()
+        == CLAUDE_AGENT_ID;
+
+    let decision = if is_claude_agent {
+        log::info!("[auto_prompt] Claude agent detected — using claude_agent::decide_claude");
+        auto_prompt::claude_agent::decide_claude(thread, used_tools, stop_reason, cx)
+    } else {
+        auto_prompt::decide(thread, used_tools, stop_reason, cx)
+    };
     log::info!("[auto_prompt] decision result: {:?}", decision);
 
     let mut profile_id = conversation_view

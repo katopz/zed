@@ -6,6 +6,7 @@
 //! handles the actual GPUI action dispatch.
 
 mod config;
+pub mod claude_agent;
 pub mod context;
 pub mod lightweight_context;
 pub mod plan_registry;
@@ -2308,7 +2309,7 @@ pub fn reset_llm_failure_count() {
     AUTO_PROMPT_LLM_FAILURE_COUNT.store(0, Ordering::Relaxed);
 }
 
-fn get_iteration() -> u32 {
+pub(crate) fn get_iteration() -> u32 {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
