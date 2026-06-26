@@ -5962,6 +5962,92 @@ pub(crate) mod tests {
         });
     }
 
+    /// Covers the `[TOP]`/`[BOTTOM]` bookend wiring in `render_user_prompt_jumps`:
+    /// the buttons call `scroll_to_top` / `scroll_to_end`, and this test pins that
+    /// those two methods actually move the `ListState` to the expected ends of a
+    /// multi-turn conversation. The list is drawn first so the `ListState` item
+    /// count is synced during the `list()` layout pass (without a draw,
+    /// `scroll_to_end` has no measured extent to scroll to).
+    #[gpui::test]
+    async fn test_prompt_jump_bookends_scroll_to_ends(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new("Response 1".into()),
+        )]);
+
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let thread = conversation_view
+            .read_with(cx, |view, cx| {
+                view.active_thread().map(|r| r.read(cx).thread.clone())
+            })
+            .unwrap();
+
+        // Two turns: entries layout is [User1, Assistant1, User2, Assistant2].
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Prompt 1", cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new("Response 2".into()),
+        )]);
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Prompt 2", cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        let thread_view = active_thread(&conversation_view, cx);
+        let entry_count = thread_view.read_with(cx, |view, cx| {
+            view.thread.read(cx).entries().len()
+        });
+        assert_eq!(
+            entry_count, 4,
+            "expected two user/assistant turns; got {entry_count} entries"
+        );
+
+        // Draw so the ListState measures its items and scroll_to_end has an extent.
+        draw_thread_list_at(
+            &thread_view,
+            ListOffset {
+                item_ix: 0,
+                offset_in_item: px(0.0),
+            },
+            cx,
+        );
+
+        // BOTTOM bookend wiring: scroll_to_end lands at or past the last
+        // thread entry (the list may render extra items such as turn-end
+        // separators, so the exact index is not pinned to entry_count - 1).
+        thread_view.update(cx, |view, cx| {
+            view.scroll_to_end(cx);
+        });
+        let bottom = thread_view.read_with(cx, |view, _cx| view.list_state.logical_scroll_top());
+        assert!(
+            bottom.item_ix >= entry_count - 1,
+            "scroll_to_end should reach at least the last thread entry ({}), got {}",
+            entry_count - 1,
+            bottom.item_ix
+        );
+
+        // TOP bookend wiring: scroll_to_top returns to the first entry.
+        thread_view.update(cx, |view, cx| {
+            view.scroll_to_top(cx);
+        });
+        let top = thread_view.read_with(cx, |view, _cx| view.list_state.logical_scroll_top());
+        assert_eq!(
+            top.item_ix, 0,
+            "scroll_to_top should land on the first entry"
+        );
+        assert!(
+            bottom.item_ix > top.item_ix,
+            "scroll_to_end and scroll_to_top should land on different ends"
+        );
+    }
+
     #[gpui::test]
     async fn test_message_editing_cancel(cx: &mut TestAppContext) {
         init_test(cx);

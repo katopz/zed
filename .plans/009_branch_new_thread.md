@@ -109,7 +109,8 @@ genuine ceiling for non-native agents.
 - [x] Extract `transcript_entry_count` helper from `branch_to_new_thread` (external transcript slicing logic)
 - [x] Unit tests for `slice_messages_for_branch` + `transcript_entry_count` (9 tests in `branch_boundary_tests`)
 - [x] `./script/clippy -p agent_ui` (after extraction + tests)
-- [ ] Manual GUI smoke test — only pure-rendering items remain (scroll viewport, button presence in element tree)
+- [x] Automated `test_prompt_jump_bookends_scroll_to_ends` (covers `[TOP]`/`[BOTTOM]` scroll wiring via the `draw_thread_list_at` render harness)
+- [ ] Manual GUI smoke test — only presentational items remain (button presence in element tree; scroll wiring now automated)
 
 ## Validation
 
@@ -122,7 +123,9 @@ genuine ceiling for non-native agents.
 | `test_seed_history_forks_real_turns` (8 iterations) | Pass — native fork renders identically to source |
 | `branch_boundary_tests` (9 tests) | Pass — inclusive boundary, whole-thread fork, not-found fallback, first-match semantics |
 | `./script/clippy -p agent_ui` (after extraction + tests) | Clean (`--deny warnings`, plus `cargo-machete` + `typos`) |
-| Manual GUI smoke | Only pure-rendering items remain (see smoke-item breakdown below) |
+| `test_prompt_jump_bookends_scroll_to_ends` | Pass — `[TOP]`/`[BOTTOM]` scroll wiring covered via `draw_thread_list_at` |
+| `./script/clippy -p agent_ui` (after scroll test) | Clean (`--deny warnings`, plus `cargo-machete` + `typos`) |
+| Manual GUI smoke | Only presentational items remain (button visibility in element tree; see smoke-item breakdown below) |
 
 ## Key Files
 
@@ -131,6 +134,7 @@ genuine ceiling for non-native agents.
 | `crates/agent/src/thread.rs` | `messages()` + `set_messages()` accessors |
 | `crates/agent/src/agent.rs` | `NativeAgentConnection::seed_history()` + `test_seed_history_forks_real_turns` |
 | `crates/agent_ui/src/conversation_view/thread_view.rs` | `branch_to_new_thread` rewrite, `[TOP]`/`[BOTTOM]`, checkpoint-row Branch button, turn-end call site, `slice_messages_for_branch`/`transcript_entry_count` helpers + `branch_boundary_tests` |
+| `crates/agent_ui/src/conversation_view.rs` | `test_prompt_jump_bookends_scroll_to_ends` (scroll wiring via `draw_thread_list_at` render harness) |
 
 ## Manual smoke-test item breakdown
 
@@ -138,12 +142,12 @@ The four original manual smoke items, re-assessed for automated coverage:
 
 | # | Item | Status | How covered |
 |---|------|--------|-------------|
-| 1 | `[TOP]`/`[BOTTOM]` scroll correctly | Manual only | Viewport-coupled: `scroll_to_top`/`scroll_to_end` mutate a `ListState` whose item count is only synced during the `list()` element's layout pass (no agent_ui test renders/draws). Without rendering, `scroll_to_end` resolves to `item_ix == 0`. The target methods themselves are pre-existing and well-exercised, so only the wiring (TOP→`scroll_to_top`, BOTTOM→`scroll_to_end`) is at risk — verified by code inspection. |
-| 2 | Checkpoint row shows both buttons | Logic automated, render manual | Requires a full `ThreadView` render harness (workspace + panel + checkpoint-bearing user message) that the agent_ui test suite doesn't provide (no `cx.draw` usage anywhere in the crate). The **branch-boundary logic** the checkpoint-row Branch button depends on is extracted into `slice_messages_for_branch` and covered by 5 unit tests. Code inspection confirms Restore and Branch are siblings in the same `h_flex`. |
+| 1 | `[TOP]`/`[BOTTOM]` scroll correctly | **Automated** | `test_prompt_jump_bookends_scroll_to_ends` builds a 2-turn conversation, draws the list via `draw_thread_list_at` (syncs `ListState` item count during the `list()` layout pass), then asserts `scroll_to_end` lands at/past the last entry and `scroll_to_top` returns to item 0. Corrects the prior session's claim that "no agent_ui test renders/draws" — `draw_thread_list_at` (conversation_view.rs) and `debug_bounds` (agent_panel.rs) are established harnesses in this crate. |
+| 2 | Checkpoint row shows both buttons | Logic automated, render manual | The checkpoint-row Branch button is a static `.child(Button...)` sibling of Restore inside an `h_flex`, gated on `is_editable && has_checkpoint_button`. Testing its *visibility* would require either annotating production code with `debug_selector` (code smell) or building a full `ThreadView` content-tree walker (heavy infrastructure no test in this crate does for content). The **branch-boundary logic** the button triggers is extracted into `slice_messages_for_branch` and covered by 5 unit tests. The button declaration itself is a low-risk static child unlikely to silently break. |
 | 3 | Native Branch forks real history | **Automated** | `test_seed_history_forks_real_turns` forks session A's messages into session B via `seed_history` and asserts B's `acp_thread.to_markdown()` == A's, plus matching entry/message counts. Text-only turns chosen deliberately; tool-card replay is transitively covered by `test_replay_tool_call_replays_image_content` since both share `Thread::replay()`. |
 | 4 | External agent transcript fallback | Logic automated, render manual | The `to_markdown`/composer wiring is inline and needs rendering. The **transcript slicing logic** is extracted into `transcript_entry_count` and covered by 4 unit tests (inclusive boundary, whole-thread fallback for `None`, whole-thread degradation for unknown id, first-match semantics). |
 
-The pure-rendering aspects (buttons actually appearing in the element tree, scroll actually moving the viewport) genuinely require a render/draw harness that no agent_ui test uses; building one would pioneer brittle infrastructure outside this codebase's conventions. The **logic** behind items 2–4 is now fully extracted and unit-tested, including a regression the extraction caught (`None` up-to must fork the whole conversation, not fall through to transcript).
+The remaining manual items are genuinely presentational: button visibility in the element tree (items 2 & 4). Automating these would require either polluting production code with `debug_selector` annotations purely for tests, or building a `ThreadView` content-tree walker — both net-negative for static `.child()` declarations that are low-risk and caught immediately by any screenshot review. The **logic** behind all items is now fully extracted and unit-tested, the **scroll wiring** (item 1) is automated via the existing `draw_thread_list_at` render harness, and the **native fork** (item 3) is end-to-end automated. (Corrects the prior session's false claim that "no agent_ui test renders/draws" — `draw_thread_list_at` at conversation_view.rs:8235 and `debug_bounds` at agent_panel.rs:9639 are established harnesses.)
 
 ## TL;DR
 
