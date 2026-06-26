@@ -104,7 +104,8 @@ genuine ceiling for non-native agents.
 - [x] `cargo test -p agent --lib thread::`
 - [x] `cargo test -p agent_ui --lib` (rewind, continuation)
 - [x] `./script/clippy -p agent -p agent_ui` (mandatory stronger linter)
-- [ ] Manual GUI smoke test (cannot run the GUI from this context)
+- [x] Automated test `test_seed_history_forks_real_turns` (covers native fork of real history)
+- [ ] Manual GUI smoke test — only viewport-coupled items remain (see below)
 
 ## Validation
 
@@ -113,16 +114,30 @@ genuine ceiling for non-native agents.
 | `cargo check -p agent -p agent_ui` | Clean |
 | `cargo test -p agent --lib thread::` | 24/24 pass |
 | `cargo test -p agent_ui --lib` (rewind, continuation) | Pass |
-| `./script/clippy -p agent -p agent_ui` | Clean (`--deny warnings`, plus `cargo-machete` + `typos`) |
-| Manual GUI smoke | Deferred — cannot run GUI from this context |
+| `./script/clippy -p agent` (after adding the test) | Clean (`--deny warnings`, plus `cargo-machete` + `typos`) |
+| `test_seed_history_forks_real_turns` (8 iterations) | Pass — native fork renders identically to source |
+| Manual GUI smoke | Partially covered — see smoke-item breakdown below |
 
 ## Key Files
 
 | File | Change |
 |------|--------|
 | `crates/agent/src/thread.rs` | `messages()` + `set_messages()` accessors |
-| `crates/agent/src/agent.rs` | `NativeAgentConnection::seed_history()` |
+| `crates/agent/src/agent.rs` | `NativeAgentConnection::seed_history()` + `test_seed_history_forks_real_turns` |
 | `crates/agent_ui/src/conversation_view/thread_view.rs` | `branch_to_new_thread` rewrite, `[TOP]`/`[BOTTOM]`, checkpoint-row Branch button, turn-end call site |
+
+## Manual smoke-test item breakdown
+
+The four original manual smoke items, re-assessed for automated coverage:
+
+| # | Item | Status | How covered |
+|---|------|--------|-------------|
+| 1 | `[TOP]`/`[BOTTOM]` scroll correctly | Manual only | Viewport-coupled: `scroll_to_top`/`scroll_to_end` mutate a `ListState` against laid-out content. No unit-testable seam; both target methods are pre-existing and well-exercised. |
+| 2 | Checkpoint row shows both buttons | Manual only | Requires a full `ThreadView` render harness (workspace + panel + checkpoint-bearing user message) that the agent_ui test suite doesn't provide. Code inspection confirms Restore and Branch are siblings in the same `h_flex`. |
+| 3 | Native Branch forks real history | **Automated** | `test_seed_history_forks_real_turns` forks session A's messages into session B via `seed_history` and asserts B's `acp_thread.to_markdown()` == A's, plus matching entry/message counts. Text-only turns chosen deliberately; tool-card replay is transitively covered by `test_replay_tool_call_replays_image_content` since both share `Thread::replay()`. |
+| 4 | External agent transcript fallback | Manual only | Slicing + `to_markdown` + `ContentBlock` path is inline in `branch_to_new_thread`, tightly coupled to UI. Not cleanly extractable without a refactor; code inspection confirms the `AgentInitialContent::ContentBlock` construction. |
+
+Only item #3 was cleanly automatable; the rest depend on a rendered viewport or an inline UI coupling that the test harness can't reach.
 
 ## TL;DR
 

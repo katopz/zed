@@ -5743,6 +5743,110 @@ mod internal_tests {
         });
     }
 
+    /// Verifies the native-agent branch path: `seed_history` forks another
+    /// thread's message history into a fresh session as *real rendered turns*
+    /// (separate user/assistant entries), not a flattened transcript. This is
+    /// the automated stand-in for the manual smoke item "native Branch forks
+    /// real history with working tool cards" from `.plans/009`.
+    ///
+    /// `iterations` because the path is scheduler-sensitive (async session
+    /// creation + replay event draining); verified stable across seeds.
+    #[gpui::test(iterations = 8)]
+    async fn test_seed_history_forks_real_turns(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/", json!({})).await;
+        let project = Project::test(fs.clone(), [path!("/").as_ref()], cx).await;
+        let thread_store = cx.new(|cx| ThreadStore::new(cx));
+        let agent = cx
+            .update(|cx| NativeAgent::new(thread_store.clone(), Templates::new(), fs.clone(), cx));
+        let connection = Rc::new(NativeAgentConnection(agent.clone()));
+
+        // Session A: drive one real user -> assistant exchange so A carries
+        // genuine rendered history (not just pushed messages).
+        let acp_thread_a = cx
+            .update(|cx| {
+                connection
+                    .clone()
+                    .new_session(project.clone(), PathList::new(&[Path::new("")]), cx)
+            })
+            .await
+            .unwrap();
+        let session_a_id =
+            acp_thread_a.read_with(cx, |thread, _| thread.session_id().clone());
+        let thread_a = agent.read_with(cx, |agent, _| {
+            agent.sessions.get(&session_a_id).unwrap().thread.clone()
+        });
+
+        let model = Arc::new(FakeLanguageModel::default());
+        thread_a.update(cx, |thread, cx| thread.set_model(model.clone(), cx));
+
+        let send_a = acp_thread_a.update(cx, |thread, cx| {
+            thread.send(vec!["Hello from A".into()], cx)
+        });
+        let send_a = cx.foreground_executor().spawn(send_a);
+        cx.run_until_parked();
+        model.send_last_completion_stream_text_chunk("Hi back from A.");
+        model.end_last_completion_stream();
+        cx.run_until_parked();
+        send_a.await.unwrap();
+
+        // Snapshot A's source-of-truth messages and its rendered markdown.
+        let source_messages = thread_a.read_with(cx, |thread, _| thread.messages().to_vec());
+        let markdown_a = acp_thread_a.read_with(cx, |thread, cx| thread.to_markdown(cx));
+        assert!(
+            markdown_a.contains("Hello from A") && markdown_a.contains("Hi back from A."),
+            "session A should have the exchange, got: {markdown_a}"
+        );
+
+        // Session B: freshly created, empty.
+        let acp_thread_b = cx
+            .update(|cx| {
+                connection
+                    .clone()
+                    .new_session(project.clone(), PathList::new(&[Path::new("")]), cx)
+            })
+            .await
+            .unwrap();
+        let session_b_id =
+            acp_thread_b.read_with(cx, |thread, _| thread.session_id().clone());
+        assert_eq!(
+            acp_thread_b.read_with(cx, |thread, _| thread.entries().len()),
+            0,
+            "session B should start empty"
+        );
+
+        // Fork A's history into B, then let the replayed events drain.
+        let seed = cx.update(|cx| {
+            connection.seed_history(&session_b_id, source_messages, cx)
+        });
+        seed.await.unwrap();
+        cx.run_until_parked();
+
+        // B now renders the SAME turns as A — proof the fork preserved
+        // user/assistant boundaries rather than flattening to a transcript.
+        let markdown_b = acp_thread_b.read_with(cx, |thread, cx| thread.to_markdown(cx));
+        assert_eq!(
+            markdown_b, markdown_a,
+            "forked session B should render identically to source A"
+        );
+        assert_eq!(
+            acp_thread_b.read_with(cx, |thread, _| thread.entries().len()),
+            acp_thread_a.read_with(cx, |thread, _| thread.entries().len()),
+            "forked session B should have the same entry count as A"
+        );
+
+        // And B's underlying thread carries the messages verbatim.
+        let thread_b = agent.read_with(cx, |agent, _| {
+            agent.sessions.get(&session_b_id).unwrap().thread.clone()
+        });
+        assert_eq!(
+            thread_b.read_with(cx, |thread, _| thread.messages().len()),
+            thread_a.read_with(cx, |thread, _| thread.messages().len()),
+            "session B's native thread should hold the same message count as A"
+        );
+    }
+
     #[gpui::test]
     async fn test_close_session_saves_thread(cx: &mut TestAppContext) {
         init_test(cx);
