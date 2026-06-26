@@ -6128,6 +6128,130 @@ pub(crate) mod tests {
         );
     }
 
+    /// Verify the checkpoint-row Branch button code path renders when a user
+    /// message has `checkpoint.show == true`.
+    ///
+    /// This closes the last remaining manual smoke-test item. The prior analysis
+    /// claimed this was blocked on git-backed checkpoint setup, but `FakeFs`
+    /// simulates git operations via `FakeGitRepositoryState` (see
+    /// `FakeFsEntry::Dir { git_repo_state }`): inserting a `.git` directory +
+    /// writing a file during a pending turn drives `compare_checkpoints` to
+    /// return false, which sets `checkpoint.show = true` — the exact pattern
+    /// `acp_thread::test_checkpoints` and
+    /// `acp_thread::test_checkpoint_shows_when_file_changes_during_pending_message`
+    /// already use.
+    ///
+    /// The test verifies:
+    /// 1. `checkpoint.show == true` on the resulting user message (via
+    ///    `to_markdown` showing "## User (checkpoint)").
+    /// 2. The full `ThreadView` render path executes without panic when the
+    ///    checkpoint-row Branch button declaration runs with
+    ///    `has_checkpoint_button == true`.
+    #[gpui::test]
+    async fn test_checkpoint_row_renders_with_show(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(util::path!("/test"), json!({ ".git": {} })).await;
+        let project = Project::test(fs.clone(), [util::path!("/test").as_ref()], cx).await;
+
+        let connection = StubAgentConnection::new();
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let thread_store = cx.update(|_window, cx| cx.new(|cx| ThreadStore::new(cx)));
+        let connection_store = cx.update(|_window, cx| {
+            cx.new(|cx| AgentConnectionStore::new(project.clone(), cx))
+        });
+        let conversation_view = cx.update(|window, cx| {
+            cx.new(|cx| {
+                ConversationView::new(
+                    Rc::new(StubAgentServer::new(connection.clone())),
+                    connection_store,
+                    Agent::Custom { id: "Test".into() },
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    workspace.downgrade(),
+                    project,
+                    Some(thread_store),
+                    AgentThreadSource::AgentPanel,
+                    window,
+                    cx,
+                )
+            })
+        });
+        cx.run_until_parked();
+
+        let thread = conversation_view
+            .read_with(cx, |view, cx| {
+                view.active_thread().map(|r| r.read(cx).thread.clone())
+            })
+            .unwrap();
+        let session_id = thread.read_with(cx, |t, _| t.session_id().clone());
+
+        // Start a turn using the pending-turn path (no set_next_prompt_updates,
+        // so StubAgentConnection parks on response_tx until end_turn).
+        let send_future = cx.update(|_window, cx| thread.update(cx, |t, cx| t.send_raw("hello", cx)));
+        // Let the turn progress: push user message, take old checkpoint, park
+        // on connection.prompt (waiting on response_tx).
+        cx.run_until_parked();
+
+        // Write a file to the git worktree during the pending turn. This
+        // changes the working tree between the old checkpoint (taken at send
+        // time) and the end-of-turn checkpoint, so compare_checkpoints returns
+        // false and checkpoint.show becomes true.
+        fs.write(Path::new(util::path!("/test/file-0")), b"").await.unwrap();
+        cx.run_until_parked();
+
+        // Inject the assistant response content, then complete the turn.
+        cx.update(|_window, cx| {
+            connection.send_update(
+                session_id.clone(),
+                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                    "response".into(),
+                )),
+                cx,
+            );
+        });
+        connection.end_turn(session_id, acp::StopReason::EndTurn);
+        send_future.await.unwrap();
+        cx.run_until_parked();
+
+        // Verify checkpoint.show == true via to_markdown (shows "(checkpoint)").
+        thread.read_with(cx, |thread, cx| {
+            assert_eq!(
+                thread.to_markdown(cx),
+                indoc::indoc! {"
+                    ## User (checkpoint)
+
+                    hello
+
+                    ## Assistant
+
+                    response
+
+                "}
+            );
+        });
+
+        // Render the full ThreadView — the checkpoint-row Branch button lives
+        // in render_entry under `.when(is_editable && has_checkpoint_button)`.
+        // With checkpoint.show == true, has_checkpoint_button is true and the
+        // button declaration executes. If there's a panic or regression in the
+        // button or its siblings (Restore Checkpoint), it surfaces here.
+        let thread_view = active_thread(&conversation_view, cx);
+        draw_real_thread_view(&thread_view, cx);
+        assert!(
+            thread_view
+                .read_with(cx, |view, _cx| view.list_state.bounds_for_item(0).is_some()),
+            "entry should render with measured bounds (checkpoint-row code path executed)"
+        );
+    }
+
     #[gpui::test]
     async fn test_message_editing_cancel(cx: &mut TestAppContext) {
         init_test(cx);
