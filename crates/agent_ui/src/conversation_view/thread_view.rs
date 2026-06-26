@@ -5,7 +5,7 @@ use crate::{
     thread_metadata_store::{ThreadId, ThreadMetadataStore},
 };
 use agent_client_protocol::schema as acp;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use acp_thread::{ContentBlock, PlanEntry, SandboxAuthorizationDetails};
 use agent::{SkillLoadingError, SkillLoadingErrorsUpdated};
@@ -5669,6 +5669,7 @@ impl ThreadView {
                     .w_full()
                     .when(is_editable && has_checkpoint_button, |this| {
                         this.children(message.id.clone().map(|message_id| {
+                            let restore_message_id = message_id.clone();
                             h_flex()
                                 .px_3()
                                 .gap_2()
@@ -5680,7 +5681,17 @@ impl ThreadView {
                                         .color(Color::Muted)
                                         .tooltip(Tooltip::text("Restores all files in the project to the content they had at this point in the conversation."))
                                         .on_click(cx.listener(move |this, _, _window, cx| {
-                                            this.restore_checkpoint(&message_id, cx);
+                                            this.restore_checkpoint(&restore_message_id, cx);
+                                        }))
+                                )
+                                .child(
+                                    Button::new(("branch-new-thread", entry_ix), "Branch New Thread")
+                                        .start_icon(Icon::new(IconName::GitBranch).size(IconSize::XSmall).color(Color::Muted))
+                                        .label_size(LabelSize::XSmall)
+                                        .color(Color::Muted)
+                                        .tooltip(Tooltip::text("Start a new thread that carries this conversation as context."))
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.branch_to_new_thread(Some(message_id.clone()), window, cx);
                                         }))
                                 )
                                 .child(Divider::horizontal())
@@ -6327,39 +6338,167 @@ impl ThreadView {
         }
     }
 
-    /// Creates a new thread that carries over the current thread's context as a
-    /// summary mention, then waits for the user to type and send a message.
-    /// This is the "branch from this point" affordance shown after each turn.
-    fn branch_to_new_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Branches the current thread into a new thread at `up_to_user_message`.
+    ///
+    /// For native-agent threads this forks the real message history: the new
+    /// thread renders the original user/assistant turns and tool cards as-is,
+    /// with no model round-trip. The branch boundary is inclusive — everything
+    /// up to and including the given user message is carried over. When
+    /// `up_to_user_message` is `None`, the whole conversation is forked.
+    ///
+    /// For external ACP agents (history lives server-side and can't be forked)
+    /// this falls back to copying a verbatim transcript into the new thread's
+    /// composer.
+    fn branch_to_new_thread(
+        &mut self,
+        up_to_user_message: Option<UserMessageId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
         let thread = self.thread.read(cx);
-        let session_id = thread.session_id().clone();
+        let source_session_id = thread.session_id().clone();
         let title = thread.title();
         let work_dirs = thread.work_dirs().cloned();
+
+        // Try to capture native message history. Only native threads keep a
+        // local message log we can fork; external ACP agents hold history
+        // server-side with no protocol-level fork, so they fall through to the
+        // transcript path below.
+        let native_branch = self.as_native_thread(cx).and_then(|native_thread| {
+            let connection = self.as_native_connection(cx)?;
+            let messages = native_thread.read(cx).messages().to_vec();
+            let sliced = match &up_to_user_message {
+                Some(target_id) => {
+                    // Inclusive boundary: carry everything up to and including
+                    // the selected user message.
+                    let end = messages.iter().position(|message| {
+                        matches!(&**message, agent::Message::User(user) if &user.id == target_id)
+                    })?;
+                    messages.into_iter().take(end + 1).collect::<Vec<_>>()
+                }
+                None => messages,
+            };
+            Some((connection, sliced))
+        });
+
+        // Fallback transcript for external ACP agents: a flattened copy of the
+        // rendered entries up to the branch point. Computed eagerly so the new
+        // thread can be created with it as initial composer content.
+        let transcript_fallback = if native_branch.is_none() {
+            Some(
+                thread
+                    .entries()
+                    .iter()
+                    .take(
+                        up_to_user_message
+                            .as_ref()
+                            .and_then(|id| {
+                                thread
+                                    .entries()
+                                    .iter()
+                                    .position(|entry| {
+                                        matches!(entry, acp_thread::AgentThreadEntry::UserMessage(m) if m.id.as_ref() == Some(id))
+                                    })
+                            })
+                            .map(|ix| ix + 1)
+                            .unwrap_or_else(|| thread.entries().len()),
+                    )
+                    .map(|entry| entry.to_markdown(cx))
+                    .collect::<String>(),
+            )
+        } else {
+            None
+        };
 
         window.defer(cx, move |window, cx| {
             let Some(panel) = workspace.read(cx).panel::<crate::AgentPanel>(cx) else {
                 return;
             };
             panel.update(cx, |panel, cx| {
-                panel.external_thread(
+                let initial_content = transcript_fallback.map(|transcript| {
+                    crate::AgentInitialContent::ContentBlock {
+                        blocks: vec![acp::ContentBlock::Text(acp::TextContent::new(transcript))],
+                        auto_submit: false,
+                        auto_prompt_enabled: false,
+                        profile_id: None,
+                    }
+                });
+
+                let new_thread_id = panel.external_thread(
                     None,
                     None,
                     work_dirs,
                     title,
-                    Some(crate::AgentInitialContent::ThreadSummary {
-                        session_id,
-                        title: None,
-                        follow_up: None,
-                        auto_submit: false,
-                    }),
+                    initial_content,
                     true,
                     crate::AgentThreadSource::AgentPanel,
                     window,
                     cx,
                 );
+
+                // Preserve the continuation link so the new thread shows a
+                // "from" chip pointing back at this thread.
+                if let Some(thread_id) = new_thread_id {
+                    if let Some(store) = ThreadMetadataStore::try_global(cx) {
+                        store.update(cx, |store, cx| {
+                            store.set_continued_from(thread_id, source_session_id.clone(), cx);
+                        });
+                    }
+                }
+
+                // Native path: the freshly created session is empty and may not
+                // be registered with the NativeAgent until the connection
+                // establishes (see the model-override path in
+                // `create_agent_thread_inner`, which waits for
+                // `RootThreadUpdated`). Fork the captured message history into
+                // it as real rendered turns once the native thread is ready,
+                // falling back to a one-shot subscription if it isn't yet.
+                if let Some((connection, messages)) = native_branch {
+                    let Some(conversation_view) = panel.active_conversation_view() else {
+                        return;
+                    };
+
+                    // If the connection is already established, seed now and
+                    // skip the subscription entirely.
+                    let already_ready = conversation_view
+                        .read(cx)
+                        .as_native_thread(cx)
+                        .map(|native_thread| {
+                            let new_session_id = native_thread.read(cx).id().clone();
+                            connection
+                                .seed_history(&new_session_id, messages.clone(), cx)
+                                .detach_and_log_err(cx);
+                        })
+                        .is_some();
+
+                    if !already_ready {
+                        // Otherwise wait for the root thread to materialize,
+                        // seeding exactly once.
+                        let seeded = Cell::new(false);
+                        cx.subscribe(
+                            &conversation_view,
+                            move |_this, view, _event: &crate::conversation_view::RootThreadUpdated, cx| {
+                                if seeded.get() {
+                                    return;
+                                }
+                                let Some(native_thread) =
+                                    view.read(cx).as_native_thread(cx)
+                                else {
+                                    return;
+                                };
+                                seeded.set(true);
+                                let new_session_id = native_thread.read(cx).id().clone();
+                                connection
+                                    .seed_history(&new_session_id, messages.clone(), cx)
+                                    .detach_and_log_err(cx);
+                            },
+                        )
+                        .detach();
+                    }
+                }
             });
         });
     }
@@ -6409,7 +6548,7 @@ impl ThreadView {
                             "Start a new thread that carries this conversation as context.",
                         ))
                         .on_click(cx.listener(move |this, _, window, cx| {
-                            this.branch_to_new_thread(window, cx);
+                            this.branch_to_new_thread(None, window, cx);
                         })),
                 )
                 .child(Divider::horizontal().flex_1())
@@ -6417,9 +6556,10 @@ impl ThreadView {
         )
     }
 
-    /// Always-visible strip of numbered buttons (one per user prompt) shown at
-    /// the top of the conversation. Clicking a number scrolls that user prompt
-    /// to the top of the viewport.
+    /// Always-visible strip of navigation buttons shown at the top of the
+    /// conversation: `[TOP] [1] [2] ... [BOTTOM]`. Clicking a number scrolls
+    /// that user prompt to the top of the viewport; `TOP` jumps to the start
+    /// and `BOTTOM` jumps to the end of the thread.
     fn render_user_prompt_jumps(&self, cx: &Context<Self>) -> Option<Div> {
         let entries = self.thread.read(cx).entries();
         let user_prompt_count = entries
@@ -6431,6 +6571,25 @@ impl ThreadView {
         }
 
         let mut buttons = h_flex().w_full().px_5().py_1().gap_1().items_center();
+
+        // TOP bookend: scroll to the very first entry.
+        buttons = buttons.child(
+            div()
+                .id("prompt-jump-top")
+                .px_1()
+                .rounded_sm()
+                .hover(|s| s.bg(cx.theme().colors().element_hover))
+                .tooltip(Tooltip::text("Jump to top"))
+                .child(
+                    Label::new("TOP")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.scroll_to_top(cx);
+                })),
+        );
+
         for index in 0..user_prompt_count {
             buttons = buttons.child(
                 div()
@@ -6449,6 +6608,24 @@ impl ThreadView {
                     })),
             );
         }
+
+        // BOTTOM bookend: scroll to the very last entry.
+        buttons = buttons.child(
+            div()
+                .id("prompt-jump-bottom")
+                .px_1()
+                .rounded_sm()
+                .hover(|s| s.bg(cx.theme().colors().element_hover))
+                .tooltip(Tooltip::text("Jump to bottom"))
+                .child(
+                    Label::new("BOTTOM")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.scroll_to_end(cx);
+                })),
+        );
 
         Some(buttons)
     }

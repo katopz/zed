@@ -1838,6 +1838,24 @@ impl Thread {
         self.messages.last().map(std::ops::Deref::deref)
     }
 
+    /// Read-only access to the full message history.
+    ///
+    /// Used by thread branching to fork a conversation into a new session
+    /// carrying real rendered history (separate user/assistant turns and tool
+    /// cards), as opposed to flattening the thread into a transcript.
+    pub fn messages(&self) -> &[Arc<Message>] {
+        &self.messages
+    }
+
+    /// Replace the message history, then replay must be driven separately by
+    /// the caller (see [`Thread::replay`]). Used by thread branching to seed a
+    /// freshly created session with a slice of another thread's messages.
+    pub fn set_messages(&mut self, messages: Vec<Arc<Message>>, cx: &mut Context<Self>) {
+        self.messages = messages;
+        self.clear_summary();
+        cx.notify();
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub fn last_received_or_pending_message(&self) -> Option<Arc<Message>> {
         if let Some(message) = self.pending_message.clone() {

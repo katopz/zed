@@ -1953,6 +1953,41 @@ impl NativeAgentConnection {
             .update(cx, |this, cx| this.load_thread(id, project, cx))
     }
 
+    /// Seeds an already-created native session with `messages`, replaying that
+    /// history into the session's [`AcpThread`] as real rendered turns and tool
+    /// cards.
+    ///
+    /// This is the native-agent branch path for "Branch New Thread": the caller
+    /// creates a fresh, empty session through the normal panel wiring, then
+    /// calls this to fork another thread's message history into it. Unlike
+    /// flattening the conversation into a single composer message, the new
+    /// thread carries the original user/assistant message boundaries so tool
+    /// cards, thinking blocks, and per-message structure survive the fork.
+    ///
+    /// The returned task resolves once the replayed events have been drained
+    /// into the AcpThread.
+    pub fn seed_history(
+        &self,
+        session_id: &acp::SessionId,
+        messages: Vec<Arc<Message>>,
+        cx: &mut App,
+    ) -> Task<Result<acp::PromptResponse>> {
+        let Some((thread, acp_thread)) = self.0.update(cx, |agent, _cx| {
+            agent
+                .sessions
+                .get(session_id)
+                .map(|s| (s.thread.clone(), s.acp_thread.clone()))
+        }) else {
+            return Task::ready(Err(anyhow!("session not found for seed_history")));
+        };
+
+        let events = thread.update(cx, |thread, cx| {
+            thread.set_messages(messages, cx);
+            thread.replay(cx)
+        });
+        Self::handle_thread_events(events, acp_thread.downgrade(), cx)
+    }
+
     fn run_turn(
         &self,
         session_id: acp::SessionId,
