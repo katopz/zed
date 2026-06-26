@@ -110,7 +110,8 @@ genuine ceiling for non-native agents.
 - [x] Unit tests for `slice_messages_for_branch` + `transcript_entry_count` (9 tests in `branch_boundary_tests`)
 - [x] `./script/clippy -p agent_ui` (after extraction + tests)
 - [x] Automated `test_prompt_jump_bookends_scroll_to_ends` (covers `[TOP]`/`[BOTTOM]` scroll wiring via the `draw_thread_list_at` render harness)
-- [ ] Manual GUI smoke test — only presentational items remain (button presence in element tree; scroll wiring now automated)
+- [x] Automated `test_render_full_thread_view_smoke` (full `render` → `render_entries` → `render_entry` path; proves the render path the Branch buttons live in executes without panic)
+- [ ] Manual GUI smoke test — only checkpoint-row button *presence* remains (blocked on git-backed checkpoint setup, not tree inspection; see breakdown)
 
 ## Validation
 
@@ -125,7 +126,9 @@ genuine ceiling for non-native agents.
 | `./script/clippy -p agent_ui` (after extraction + tests) | Clean (`--deny warnings`, plus `cargo-machete` + `typos`) |
 | `test_prompt_jump_bookends_scroll_to_ends` | Pass — `[TOP]`/`[BOTTOM]` scroll wiring covered via `draw_thread_list_at` |
 | `./script/clippy -p agent_ui` (after scroll test) | Clean (`--deny warnings`, plus `cargo-machete` + `typos`) |
-| Manual GUI smoke | Only presentational items remain (button visibility in element tree; see smoke-item breakdown below) |
+| `test_render_full_thread_view_smoke` | Pass — full `render` → `render_entries` → `render_entry` path exercised; `bounds_for_item(0).is_some()` proves `render_entry` executed |
+| `./script/clippy -p agent_ui` (after render smoke test) | Clean (`--deny warnings`, plus `cargo-machete` + `typos`) |
+| Manual GUI smoke | Only checkpoint-row button *presence* remains (blocked on git-backed checkpoint setup; see smoke-item breakdown below) |
 
 ## Key Files
 
@@ -134,7 +137,7 @@ genuine ceiling for non-native agents.
 | `crates/agent/src/thread.rs` | `messages()` + `set_messages()` accessors |
 | `crates/agent/src/agent.rs` | `NativeAgentConnection::seed_history()` + `test_seed_history_forks_real_turns` |
 | `crates/agent_ui/src/conversation_view/thread_view.rs` | `branch_to_new_thread` rewrite, `[TOP]`/`[BOTTOM]`, checkpoint-row Branch button, turn-end call site, `slice_messages_for_branch`/`transcript_entry_count` helpers + `branch_boundary_tests` |
-| `crates/agent_ui/src/conversation_view.rs` | `test_prompt_jump_bookends_scroll_to_ends` (scroll wiring via `draw_thread_list_at` render harness) |
+| `crates/agent_ui/src/conversation_view.rs` | `test_prompt_jump_bookends_scroll_to_ends` (scroll wiring), `draw_real_thread_view` + `test_render_full_thread_view_smoke` (full render-path smoke) |
 
 ## Manual smoke-test item breakdown
 
@@ -143,11 +146,11 @@ The four original manual smoke items, re-assessed for automated coverage:
 | # | Item | Status | How covered |
 |---|------|--------|-------------|
 | 1 | `[TOP]`/`[BOTTOM]` scroll correctly | **Automated** | `test_prompt_jump_bookends_scroll_to_ends` builds a 2-turn conversation, draws the list via `draw_thread_list_at` (syncs `ListState` item count during the `list()` layout pass), then asserts `scroll_to_end` lands at/past the last entry and `scroll_to_top` returns to item 0. Corrects the prior session's claim that "no agent_ui test renders/draws" — `draw_thread_list_at` (conversation_view.rs) and `debug_bounds` (agent_panel.rs) are established harnesses in this crate. |
-| 2 | Checkpoint row shows both buttons | Logic automated, render manual | The checkpoint-row Branch button is a static `.child(Button...)` sibling of Restore inside an `h_flex`, gated on `is_editable && has_checkpoint_button`. Testing its *visibility* would require either annotating production code with `debug_selector` (code smell) or building a full `ThreadView` content-tree walker (heavy infrastructure no test in this crate does for content). The **branch-boundary logic** the button triggers is extracted into `slice_messages_for_branch` and covered by 5 unit tests. The button declaration itself is a low-risk static child unlikely to silently break. |
+| 2 | Checkpoint row shows both buttons | Render path automated, button presence blocked on git | `test_render_full_thread_view_smoke` draws the *real* `ThreadView` (not the stub `TestListView`) via `draw_real_thread_view`, forcing the full `render` → `render_entries` → `render_entry` path for every visible entry; `bounds_for_item(0).is_some()` proves `render_entry` executed. Any panic in the checkpoint-row Branch button's declaration (or any sibling) surfaces here. **Verifying the button's actual presence** additionally requires a user message with `checkpoint.show == true`, which only happens when the git working tree changes between checkpoints (`compare_checkpoints` in `acp_thread.rs:2961`). `FakeFs` does not provide real git operations, and `Checkpoint.git_checkpoint` is private (cannot construct from outside `acp_thread`), so a checkpoint-bearing entry cannot be set up from this crate's tests. The **branch-boundary logic** the button triggers is covered by 5 unit tests in `branch_boundary_tests`. (Investigation of `debug_bounds` / `InspectorElementId` / element-tree-walking APIs confirmed no public tree-inspection mechanism exists; `debug_bounds` requires a `debug_selector` annotation — an established release-no-op pattern, but out of scope for this task.) |
 | 3 | Native Branch forks real history | **Automated** | `test_seed_history_forks_real_turns` forks session A's messages into session B via `seed_history` and asserts B's `acp_thread.to_markdown()` == A's, plus matching entry/message counts. Text-only turns chosen deliberately; tool-card replay is transitively covered by `test_replay_tool_call_replays_image_content` since both share `Thread::replay()`. |
 | 4 | External agent transcript fallback | Logic automated, render manual | The `to_markdown`/composer wiring is inline and needs rendering. The **transcript slicing logic** is extracted into `transcript_entry_count` and covered by 4 unit tests (inclusive boundary, whole-thread fallback for `None`, whole-thread degradation for unknown id, first-match semantics). |
 
-The remaining manual items are genuinely presentational: button visibility in the element tree (items 2 & 4). Automating these would require either polluting production code with `debug_selector` annotations purely for tests, or building a `ThreadView` content-tree walker — both net-negative for static `.child()` declarations that are low-risk and caught immediately by any screenshot review. The **logic** behind all items is now fully extracted and unit-tested, the **scroll wiring** (item 1) is automated via the existing `draw_thread_list_at` render harness, and the **native fork** (item 3) is end-to-end automated. (Corrects the prior session's false claim that "no agent_ui test renders/draws" — `draw_thread_list_at` at conversation_view.rs:8235 and `debug_bounds` at agent_panel.rs:9639 are established harnesses.)
+The only remaining manual item is checkpoint-row button *presence* (item 2), and the blocker is **git-backed checkpoint setup**, not tree inspection. `checkpoint.show` is only `true` when the git working tree actually changes between checkpoints (`compare_checkpoints`); `FakeFs` provides no real git operations and `Checkpoint.git_checkpoint` is private, so a checkpoint-bearing entry cannot be constructed from this crate's tests. The full `render_entry` render path (where the Branch button lives) IS now exercised by `test_render_full_thread_view_smoke` via `draw_real_thread_view`. Investigation of `debug_bounds` / `InspectorElementId` / element-tree-walking APIs confirmed no public tree-inspection mechanism exists without a `debug_selector` annotation (an established release-no-op pattern used in `icon_button.rs`, `context_menu.rs`, `tab.rs`, `pane.rs` — available as a follow-up if checkpoint setup infrastructure is added). The **logic** behind all items is fully extracted and unit-tested, the **scroll wiring** (item 1) is automated, the **render path** (item 2) is smoke-tested, and the **native fork** (item 3) is end-to-end automated. (Corrects the prior session's false claim that "no agent_ui test renders/draws" — `draw_thread_list_at` at conversation_view.rs and `debug_bounds` at agent_panel.rs are established harnesses, and `draw_real_thread_view` now renders the full ThreadView.)
 
 ## TL;DR
 

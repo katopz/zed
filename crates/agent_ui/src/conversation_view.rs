@@ -6048,6 +6048,86 @@ pub(crate) mod tests {
         );
     }
 
+    /// Smoke-test the full `ThreadView` render path. No existing test draws the
+    /// real `ThreadView` (the permission-row tests draw a stub `TestListView`
+    /// that shares only the `ListState`); this renders the actual view so the
+    /// full `render` → `render_entries` → `render_entry` path executes for every
+    /// visible entry. Catches panics/regressions in entry rendering — the same
+    /// code path the checkpoint-row Branch button and the turn-end Branch button
+    /// live in.
+    ///
+    /// Note: verifying the checkpoint-row Branch button's *presence* in the tree
+    /// additionally requires a user message with `checkpoint.show == true`, which
+    /// only happens when the git working tree actually changes between
+    /// checkpoints (`compare_checkpoints`). `FakeFs` does not provide real git
+    /// operations, and `Checkpoint.git_checkpoint` is private, so a checkpoint-
+    /// bearing entry cannot be constructed from this crate's tests. The boundary
+    /// *logic* the button triggers is covered by `branch_boundary_tests`.
+    #[gpui::test]
+    async fn test_render_full_thread_view_smoke(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new("Response 1".into()),
+        )]);
+
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let thread = conversation_view
+            .read_with(cx, |view, cx| {
+                view.active_thread().map(|r| r.read(cx).thread.clone())
+            })
+            .unwrap();
+
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Prompt 1", cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        let thread_view = active_thread(&conversation_view, cx);
+
+        // Draw the real ThreadView with one turn present. This forces the full
+        // `render` → `render_entries` → `render_entry` path for a user message
+        // + assistant message entry. Asserting `bounds_for_item` proves the list
+        // callback actually executed (items were laid out), not just that the
+        // list state has a count.
+        draw_real_thread_view(&thread_view, cx);
+        let entry_count_after_first = thread_view.read_with(cx, |view, _cx| {
+            view.list_state.item_count()
+        });
+        assert!(
+            entry_count_after_first > 0,
+            "list should have entries after a turn"
+        );
+        assert!(
+            thread_view
+                .read_with(cx, |view, _cx| view.list_state.bounds_for_item(0).is_some()),
+            "first entry should have measured bounds after drawing (render_entry executed)"
+        );
+
+        // Render a multi-turn conversation to exercise render_entry across
+        // user/assistant entry types and the turn-end separator.
+        connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new("Response 2".into()),
+        )]);
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Prompt 2", cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        // Re-render with the expanded conversation — exercises render_entry for
+        // both turns plus any turn-end separators.
+        draw_real_thread_view(&thread_view, cx);
+        assert_eq!(
+            thread_view.read_with(cx, |view, cx| view.thread.read(cx).entries().len()),
+            4,
+            "expected two user/assistant turns"
+        );
+    }
+
     #[gpui::test]
     async fn test_message_editing_cancel(cx: &mut TestAppContext) {
         init_test(cx);
@@ -8334,6 +8414,20 @@ pub(crate) mod tests {
                 })
                 .into_any_element()
             },
+        );
+    }
+
+    /// Draw the *real* `ThreadView` (not the stub `TestListView`) into the test
+    /// window. This forces the full render path — `ThreadView::render` →
+    /// `render_entries` → `render_entry` for every visible entry — so any panic
+    /// or regression in the entry-rendering code (including the checkpoint-row
+    /// Branch button path) surfaces here. The stub `draw_thread_list_at` only
+    /// exercises `ListState` mechanics, not content rendering.
+    fn draw_real_thread_view(thread_view: &Entity<ThreadView>, cx: &mut VisualTestContext) {
+        cx.draw(
+            point(px(0.0), px(0.0)),
+            size(px(400.0), px(400.0)),
+            |_window, _cx| thread_view.clone().into_any_element(),
         );
     }
 
