@@ -9,6 +9,7 @@ mod config;
 pub mod claude_agent;
 pub mod context;
 pub mod lightweight_context;
+mod pending_question;
 pub mod plan_registry;
 
 pub use config::AutoPromptConfig;
@@ -113,6 +114,12 @@ fn get_commit_hash() -> &'static str {
         Some(hash) => hash.to_string(),
         None => format!("{}-{}", env!("CARGO_PKG_VERSION"), "dev"),
     })
+}
+
+/// Crate-internal accessor for the commit hash, used by sibling modules'
+/// debug logs (e.g. `pending_question::write_answer_log`).
+pub(crate) fn commit_hash() -> &'static str {
+    get_commit_hash()
 }
 
 use std::sync::RwLock;
@@ -493,7 +500,7 @@ impl std::fmt::Debug for LlmCallData {
 }
 
 impl LlmCallData {
-    fn make_continue_action(&self, next_prompt: String) -> AutoPromptAction {
+    pub(crate) fn make_continue_action(&self, next_prompt: String) -> AutoPromptAction {
         AutoPromptAction {
             from_session_id: self.session_id.clone(),
             from_title: self.title.clone(),
@@ -1073,6 +1080,25 @@ pub async fn decide_with_llm(
     );
 
     let session_id_str = data.session_id.to_string();
+
+    // ── Pending-question fast path ───────────────────────────────────────
+    //
+    // If the worker stopped to ASK THE USER a question ("Which do you want?
+    // Option A or Option B?", "Want me to do that?"), answer it directly via
+    // a targeted LLM call on the last 2-3 paragraphs and dispatch that answer.
+    // This runs before the overflow / lightweight / verification paths because
+    // answering a short question is cheap and avoids the expensive summary
+    // dance that would otherwise drain tokens and throw away the question.
+    //
+    // On any failure (no question, LLM unreachable, low confidence) the helper
+    // returns Ok(None) and we fall through to the normal decision flow — the
+    // user explicitly required that uncertain cases still reach stop/summary.
+    if let Some(outcome) = pending_question::try_answer_pending_question(&data, cx).await? {
+        log::warn!(
+            "[auto_prompt::decide_with_llm] Pending-question fast path fired — dispatching answer (session={session_id_str})"
+        );
+        return Ok(outcome);
+    }
 
     let result = if data.context_exceeds_limit {
         let summary_state = summary_state_for(&session_id_str);
@@ -3480,7 +3506,7 @@ fn detect_remaining_work(last_assistant_message: Option<&str>) -> Option<String>
 /// The worker responds with a structured summary that naturally has "What Remains"
 /// sections with unchecked items. Both `detect_remaining_work` and
 /// `llm_acknowledged_all_tasks_blocked` must skip these to avoid false positives.
-fn is_auto_prompt_summary_response(text: &str) -> bool {
+pub(crate) fn is_auto_prompt_summary_response(text: &str) -> bool {
     let lower = text.to_lowercase();
     // Phase 1 prompt asks for exactly these 4 sections
     let has_original_task = lower.contains("original task");

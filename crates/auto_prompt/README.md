@@ -27,6 +27,13 @@ ConversationView::handle_thread_event()
   │       └─ Otherwise → NeedsLlmCall(data)
   │
   └─ decide_with_llm() — async LLM call
+      ├─ detect_pending_question(last_assistant_message)? Yes → fast path:
+      │   ├─ Build targeted prompt with last 2-3 paragraphs
+      │   ├─ call_language_model with answerer system prompt
+      │   ├─ Err → log, fall through to normal flow
+      │   ├─ confidence < 0.6 or no answer → fall through to normal flow
+      │   └─ confidence >= 0.6 + answer → Continue(answer)
+      │
       ├─ context_exceeds_limit? Yes → ContextOverflow two-phase path:
       │   ├─ SUMMARY_REQUESTED==0 (Phase 1): send summary prompt to current thread
       │   ├─ SUMMARY_REQUESTED==1 (Phase 2): create new thread with summary + continuation
@@ -294,14 +301,47 @@ Add `.logs/` to `.gitignore` — these are for local debugging only.
 
 The orchestration LLM follows a simple priority order:
 
-1. **Pre-stop verification** (`stop_phase=pre_stop`) → verify plans/diagnostics/git, continue if any fail
-2. **Plan steps remain** → continue next unchecked `[ ]` step
-3. **New plan without checkboxes** → refine plan to add checkboxes
-4. **AI asked a question** → auto-answer (pick option 1 or AI recommendation)
-5. **All steps `[x]`** → fix diagnostics/tests, then create docs, then done
-6. **No plan but work incomplete** → "continue"
-7. **Confidence < 0.5** → stop
-8. **iteration_count > 15** → consider stopping
+1. **Pending question fast path** (`detect_pending_question`) — see dedicated section below
+2. **Pre-stop verification** (`stop_phase=pre_stop`) → verify plans/diagnostics/git, continue if any fail
+3. **Plan steps remain** → continue next unchecked `[ ]` step
+4. **New plan without checkboxes** → refine plan to add checkboxes
+5. **AI asked a question** (normal-path fallback) → auto-answer (pick option 1 or AI recommendation)
+6. **All steps `[x]`** → fix diagnostics/tests, then create docs, then done
+7. **No plan but work incomplete** → "continue"
+8. **Confidence < 0.5** → stop
+9. **iteration_count > 15** → consider stopping
+
+### Pending question fast path
+
+When the worker agent ends its turn by asking the user a direct question
+("Which do you want? Option A or Option B?", "Want me to do that?"), the
+normal orchestration flow wastes a cycle: it cannot "continue work" because
+there is none — there is a question — so it returns `should_continue=false`
+and drifts into pre-stop verification or the ContextOverflow summary dance.
+That summary drains tokens and throws away the agent's actual question.
+
+The fast path in `pending_question.rs` runs **before** the overflow /
+lightweight / verification paths in `decide_with_llm`. It:
+
+1. **Detects** the question via `detect_pending_question` — scans the last 3
+   paragraphs for option-request patterns ("option a/b", "which do you want",
+   "a or b"), permission-request patterns ("want me to", "should i",
+   "would you like"), or a paragraph ending in `?` that addresses the user in
+   the second person.
+2. **Skips** auto_prompt's own summary responses (same guard as
+   `detect_remaining_work`) to avoid re-looping the overflow dance.
+3. **Calls the LLM** with a dedicated answerer system prompt and only the
+   last 2-3 paragraphs as context — cheap regardless of overall context size.
+4. **Dispatches** the answer as `Continue` (wrapped via
+   `with_first_prompt_context`) when the answerer's confidence >= 0.6.
+5. **Falls through** to the normal flow on any failure: no question detected,
+   LLM call error, unparseable response, or confidence < 0.6. This is the
+   user's explicit requirement: uncertain cases still reach stop/summary.
+
+The fast path is **purely additive** — every branch either returns a
+`Continue` with a real answer or falls through. No existing behavior is
+removed. Decisions are logged to `.logs/{timestamp}_{iteration}_pending_question.json`
+for debuggability.
 
 ### Decision provenance (DecisionSource)
 
@@ -474,6 +514,7 @@ Messages like "5 remaining tasks require GPU hardware" or "Remaining Work (block
 | `src/config.rs` | `AutoPromptConfig` from `~/.config/zed/auto_prompt.json` or env vars |
 | `src/context.rs` | `AutoPromptContext`, `AutoPromptResponse`, `StopPhase`, plan/message serialization |
 | `src/lightweight_context.rs` | `build_lightweight_orchestration_context()` — compact context (last message + plan summaries) to reduce token usage from ~80K to ~500 |
+| `src/pending_question.rs` | `detect_pending_question()`, `try_answer_pending_question()` — fast path that answers the worker agent's direct questions to the user (option choices, permission requests) instead of stopping. Falls through to the normal flow on low confidence or failure |
 | `src/plan_registry.rs` | Plan claim tracking for multi-agent coordination — `try_claim()`, `release()`, `heartbeat()`, `auto_claim_from_prompt()` |
 
 ### Bridge in agent_ui
