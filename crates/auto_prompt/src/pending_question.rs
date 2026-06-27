@@ -203,8 +203,13 @@ fn looks_like_option_context(paragraph: &str) -> bool {
     {
         return true;
     }
-    // Numbered list of choices.
+    // Numbered/bulleted list of choices — either opens with a list item...
     if trimmed.starts_with("1.") || trimmed.starts_with("- ") || trimmed.starts_with("* ") {
+        return true;
+    }
+    // ...or is a prose-introduced list ("Plan 335 Phase 2 is the remaining GOAT work:\n- T2.1...").
+    // Detect by counting list-item line starts anywhere in the paragraph.
+    if paragraph.lines().filter(|line| is_list_item_line(line)).count() >= 2 {
         return true;
     }
     // Short label-style line ending with ':' ("My recommendation:", "Option A:").
@@ -213,6 +218,23 @@ fn looks_like_option_context(paragraph: &str) -> bool {
     }
 
     false
+}
+
+/// Returns true for a line that opens a markdown list item: `- `, `* `, or `N.`.
+/// Used by `looks_like_option_context` to spot prose-introduced task lists
+/// (e.g. a paragraph starting with "Plan ...:" then listing `- T2.1 ...`).
+fn is_list_item_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
+        return true;
+    }
+    // `N.` where N is digits — split on the first '.' and check the prefix.
+    if let Some(dot) = trimmed.find('.') {
+        let prefix = &trimmed[..dot];
+        !prefix.is_empty() && prefix.chars().all(|c| c.is_ascii_digit())
+    } else {
+        false
+    }
 }
 
 /// System prompt for the targeted answerer call. Instructs the model to reason
@@ -546,6 +568,43 @@ Which do you want? I'd lean Option A.";
     }
 
     #[test]
+    fn detects_real_world_katgpt_phase2_question() {
+        // Verbatim trailing paragraphs from a real auto_prompt chain where the
+        // worker asked a continue/pivot question at the end of a long summary.
+        // This is the exact case the fast path was built to unblock — the old
+        // flow stopped+summarized instead of answering.
+        let msg = "\
+### Commit
+
+`866a21f0` on `develop` (not pushed; branch is 2 commits ahead of origin/develop). Used a message file for the amend to avoid shell backtick mangling.
+
+### Next steps (Phase 2)
+
+Plan 335 Phase 2 is the remaining GOAT work (G2 perf bench + G4 gain fixture):
+- **T2.1** — `benches/paired_loss_bench.rs` (L=8192, target < 1us)
+- **T2.2** — G2 zero-alloc confirmation (already true via iterator folds; may not need `FilterScratch`)
+- **T2.3** — Build the G4 micro-GPT A/B fixture (ac_prefix on/off per Plan 313)
+- **T2.4** — G4 gain gate (TOP-K intersect NO-COPY amplifies gap >= 1.5x vs ALL_TOKENS)
+- **T2.5** — Document in `.benchmarks/335_paired_loss_goat.md`
+
+Want me to continue with Phase 2 (G2 perf bench first, then the G4 A/B fixture), or pick up a different task?";
+        let pending = detect_pending_question(Some(msg)).expect("should detect the trailing permission question");
+        assert!(
+            pending.question_text.contains("Want me to continue with Phase 2"),
+            "question_text was: {}",
+            pending.question_text
+        );
+        // Context window must include the Phase 2 task list so the answerer can
+        // pick 'G2 perf bench first' with full context, not guess blindly.
+        assert!(
+            pending.context_window.contains("T2.1"),
+            "context window should include the preceding task list, got: {}",
+            pending.context_window
+        );
+        assert!(pending.context_window.contains("T2.5"));
+    }
+
+    #[test]
     fn detects_direct_question_with_you() {
         let msg = "Done with the refactor. Are you sure you want the ArrayVec port too?";
         let pending = detect_pending_question(Some(msg)).expect("should detect");
@@ -648,6 +707,37 @@ All done now, committed on develop.";
             "This is a long prose paragraph that rambles on about the design \
              without being a header or a list or anything like that at all."
         ));
+    }
+
+    #[test]
+    fn prose_introduced_task_list_is_option_context() {
+        // The Phase 2 pattern from a real chain: prose intro + bullet list of
+        // tasks the worker is offering to do next. Must count as context so the
+        // answerer sees what it's choosing between.
+        let para = "Plan 335 Phase 2 is the remaining GOAT work:\n\
+            - **T2.1** — benches/paired_loss_bench.rs (L=8192, target < 1us)\n\
+            - **T2.2** — G2 zero-alloc confirmation\n\
+            - **T2.3** — Build the G4 micro-GPT A/B fixture";
+        assert!(looks_like_option_context(para));
+    }
+
+    #[test]
+    fn single_bullet_is_not_enough_to_be_option_context() {
+        // A single stray bullet in a prose paragraph shouldn't trigger — avoids
+        // pulling in unrelated context. Requires >= 2 list items.
+        let para = "Here is a thought about the design that happens to mention - one bullet mid-sentence and then rambles on without any more list items at all whatsoever.";
+        assert!(!looks_like_option_context(para));
+    }
+
+    #[test]
+    fn numbered_list_lines_detected() {
+        assert!(is_list_item_line("- T2.1 do the thing"));
+        assert!(is_list_item_line("  * alt bullet"));
+        assert!(is_list_item_line("1. first"));
+        assert!(is_list_item_line("42. deep"));
+        assert!(!is_list_item_line("regular prose line"));
+        assert!(!is_list_item_line("-no space after dash"));
+        assert!(!is_list_item_line("v1.2 version string"));
     }
 
     // ── extract_json_local / parse_answer ─────────────────────────────────
