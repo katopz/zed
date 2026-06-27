@@ -126,6 +126,7 @@ async fn load_auto_prompt_system_prompt(
                         log::warn!(
                             "[auto_prompt] Global AUTO_PROMPT.md is outdated (file=v{file_version}, default=v{default_version}), using default"
                         );
+                        persist_upgraded_prompt(&global_auto_prompt_path, &default_content);
                         return Some((default_content, true));
                     }
                     log::info!("[auto_prompt] Using global AUTO_PROMPT.md (v{file_version})");
@@ -155,9 +156,34 @@ async fn load_auto_prompt_system_prompt(
         log::warn!(
             "[auto_prompt] Stored system prompt is outdated (stored=v{stored_version}, default=v{default_version}), using default and resetting stored prompt"
         );
+        persist_upgraded_prompt(&global_auto_prompt_path, &default_content);
         Some((default_content, true))
     } else {
         Some((stored_prompt, false))
+    }
+}
+
+/// Write the upgraded default prompt back to the global AUTO_PROMPT.md so the
+/// "outdated" detection does not recur on every thread stop. The toast still
+/// fires once (signaling the upgrade to the user), but subsequent runs see the
+/// up-to-date version and skip both the write and the toast.
+fn persist_upgraded_prompt(path: &std::path::Path, content: &str) {
+    if let Some(parent) = path.parent() {
+        if let Err(err) = std::fs::create_dir_all(parent) {
+            log::warn!(
+                "[auto_prompt] Failed to create parent dir for {path:?}: {err}"
+            );
+            return;
+        }
+    }
+    if let Err(err) = std::fs::write(path, content) {
+        log::warn!(
+            "[auto_prompt] Failed to persist upgraded AUTO_PROMPT.md to {path:?}: {err}"
+        );
+    } else {
+        log::info!(
+            "[auto_prompt] Persisted upgraded AUTO_PROMPT.md to {path:?}"
+        );
     }
 }
 
