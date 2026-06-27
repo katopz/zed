@@ -132,7 +132,20 @@ sequenceDiagram
             decide-->>CV: NeedsLlmCall(data)
             CV->>CV: State = Processing
             CV->>decide_llm: decide_with_llm(data)
-            
+
+            Note over CV,decide_llm: Pending-question fast path (runs FIRST)
+            decide_llm->>decide_llm: detect_pending_question(last_assistant_message)
+            alt Question detected (option/permission/direct-you-question)
+                decide_llm->>LLM: Answerer call (last 2-3 paragraphs only)
+                alt Err or confidence < 0.6 or no answer
+                    Note over decide_llm: Fall through to normal flow below
+                else confidence >= 0.6 with answer
+                    decide_llm->>decide_llm: write_answer_log (.logs/*_pending_question.json)
+                    decide_llm-->>CV: Continue(answer wrapped via with_first_prompt_context)
+                    CV->>Workspace: dispatch_action(AutoPromptNewThread)
+                end
+            end
+
             Note over CV,decide_llm: Context overflow check
             alt context_exceeds_limit=true
                 alt SUMMARY_REQUESTED==0 (Phase 1)
