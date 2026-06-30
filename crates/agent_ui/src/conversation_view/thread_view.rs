@@ -6513,6 +6513,23 @@ impl ThreadView {
             return None;
         }
 
+        // If the next entry is an editable user message with a visible
+        // checkpoint, that entry's checkpoint row will render both
+        // "Restore Checkpoint" and "Branch New Thread". Skip the turn-end
+        // separator here to avoid stacking two "Branch New Thread" buttons.
+        if let Some(AgentThreadEntry::UserMessage(message)) = entries.get(entry_ix + 1) {
+            let next_renders_checkpoint_row = message
+                .checkpoint
+                .as_ref()
+                .is_some_and(|checkpoint| checkpoint.show)
+                && message.id.is_some()
+                && !self.is_subagent()
+                && self.thread.read(cx).supports_truncate(cx);
+            if next_renders_checkpoint_row {
+                return None;
+            }
+        }
+
         Some(
             h_flex()
                 .w_full()
