@@ -35,9 +35,6 @@ use std::time::Duration;
 /// Seconds of inactivity before an auto-prompt chain is considered stale.
 const CHAIN_TIMEOUT_SECS: u64 = 300;
 
-/// Fallback log directory when no project root is available.
-const FALLBACK_LOG_DIR: &str = "/tmp/zed_auto_prompt_logs";
-
 /// Iteration counter for the current auto-prompt chain.
 static AUTO_PROMPT_ITERATION: AtomicU32 = AtomicU32::new(0);
 
@@ -102,24 +99,6 @@ fn clear_summary_for_session(session_id: &str) {
     with_summary_registry(|map| {
         map.remove(session_id);
     })
-}
-
-/// Short git commit hash for log provenance.
-/// Set by build.rs via `AUTO_PROMPT_COMMIT_SHA` at compile time.
-/// Falls back to package version when built outside a git repo.
-static COMMIT_HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-
-fn get_commit_hash() -> &'static str {
-    COMMIT_HASH.get_or_init(|| match option_env!("AUTO_PROMPT_COMMIT_SHA") {
-        Some(hash) => hash.to_string(),
-        None => format!("{}-{}", env!("CARGO_PKG_VERSION"), "dev"),
-    })
-}
-
-/// Crate-internal accessor for the commit hash, used by sibling modules'
-/// debug logs (e.g. `pending_question::write_answer_log`).
-pub(crate) fn commit_hash() -> &'static str {
-    get_commit_hash()
 }
 
 use std::sync::RwLock;
@@ -726,12 +705,6 @@ pub fn decide(
         .and_then(|pl| pl.paths().first().cloned());
     let iteration_count = get_iteration();
 
-    write_stop_log(
-        project_root.as_ref(),
-        iteration_count,
-        &format!("evaluation started (stop_reason={stop_reason:?}, used_tools={used_tools})"),
-    );
-
     let config = match load_config_cached() {
         Ok(c) => {
             log::info!("[auto_prompt::decide] Config loaded");
@@ -739,11 +712,6 @@ pub fn decide(
         }
         Err(err) => {
             log::warn!("[auto_prompt::decide] config load failed: {err}");
-            write_stop_log(
-                project_root.as_ref(),
-                iteration_count,
-                &format!("config load failed: {err}"),
-            );
             return AutoPromptDecision::NoAction;
         }
     };
@@ -770,11 +738,6 @@ pub fn decide(
 
     if matches!(stop_reason, acp::StopReason::Cancelled) {
         log::info!("[auto_prompt::decide] Thread was cancelled, skipping auto-prompt");
-        write_stop_log(
-            project_root.as_ref(),
-            iteration_count,
-            "thread cancelled by user or system",
-        );
         let session_id_str = thread.read(cx).session_id().to_string();
         reset_iteration_with_session(&session_id_str);
         return AutoPromptDecision::NoAction;
@@ -786,11 +749,6 @@ pub fn decide(
     // (browser login, device auth, etc.), the user is mid-flow — don't chain.
     if is_interactive_tool_pending(thread, cx) {
         log::info!("[auto_prompt::decide] Interactive auth tool pending, stopping");
-        write_stop_log(
-            project_root.as_ref(),
-            iteration_count,
-            "interactive auth tool pending — user must complete login",
-        );
         return AutoPromptDecision::NoAction;
     }
 
@@ -804,11 +762,6 @@ pub fn decide(
             "[auto_prompt::decide] Max iterations ({}) reached, stopping chain",
             config.max_iterations
         );
-        write_stop_log(
-            project_root.as_ref(),
-            iteration_count,
-            &format!("max iterations ({}) reached", config.max_iterations),
-        );
         let session_id_str = thread.read(cx).session_id().to_string();
         clear_summary_for_session(&session_id_str);
         reset_iteration_with_session(&session_id_str);
@@ -818,11 +771,6 @@ pub fn decide(
     let registry = language_model::LanguageModelRegistry::read_global(cx);
     let Some(configured_model) = registry.default_model() else {
         log::warn!("[auto_prompt::decide] No language model configured in Zed");
-        write_stop_log(
-            project_root.as_ref(),
-            iteration_count,
-            "no language model configured in Zed",
-        );
         return AutoPromptDecision::NoAction;
     };
     let model = configured_model.model;
@@ -1006,11 +954,6 @@ pub fn decide(
         }
         Err(err) => {
             log::warn!("[auto_prompt::decide] failed to serialize context: {err}");
-            write_stop_log(
-                project_root.as_ref(),
-                iteration_count,
-                &format!("context serialization failed: {err}"),
-            );
             return AutoPromptDecision::NoAction;
         }
     };
@@ -1117,15 +1060,6 @@ pub async fn decide_with_llm(
             log::info!(
                 "[auto_prompt::decide_with_llm] Returning ContextOverflow — requesting summary from AI (session={session_id_str})"
             );
-            write_overflow_log(
-                data.project_root.as_ref(),
-                data.iteration_count,
-                1,
-                summary_state,
-                OverflowContinuationSource::Phase1RequestSummary,
-                &next_prompt,
-                data.last_assistant_message.as_deref(),
-            );
             return Ok(AutoPromptOutcome::ContextOverflow(AutoPromptAction {
                 from_session_id: data.session_id,
                 from_title: data.title,
@@ -1167,16 +1101,13 @@ pub async fn decide_with_llm(
             // skips auto_prompt summary responses (see its guard) to avoid
             // re-summarization loops in the safety-net path. Phase 2 wants the
             // summary's guidance, so we use `extract_summary_next_steps` instead.
-            let (continuation, continuation_source) = if llm_acknowledged_all_tasks_blocked(
+            let continuation = if llm_acknowledged_all_tasks_blocked(
                 data.last_assistant_message.as_deref(),
             ) {
                 log::info!(
                     "auto_prompt: ContextOverflow — LLM acknowledged blocked tasks, using generic continuation"
                 );
-                (
-                    "Continue from where we left off.".to_string(),
-                    OverflowContinuationSource::AllBlockedGeneric,
-                )
+                "Continue from where we left off.".to_string()
             } else if let Some(steps) = data
                 .last_assistant_message
                 .as_deref()
@@ -1185,7 +1116,7 @@ pub async fn decide_with_llm(
                 log::warn!(
                     "auto_prompt: ContextOverflow Phase 2 — using summary's Recommended Next Steps as continuation"
                 );
-                (steps, OverflowContinuationSource::SummaryNextSteps)
+                steps
             } else if let Some(plan_prompt) = detect_remaining_plan_tasks(
                 &data.context_json,
                 PlanRepoFilter::CurrentRepo,
@@ -1194,7 +1125,7 @@ pub async fn decide_with_llm(
                 log::warn!(
                     "auto_prompt: ContextOverflow Phase 2 — no summary next steps, falling back to current-repo plan tasks"
                 );
-                (plan_prompt, OverflowContinuationSource::PlanTasksCurrentRepo)
+                plan_prompt
             } else if let Some(plan_prompt) = detect_remaining_plan_tasks(
                 &data.context_json,
                 PlanRepoFilter::OtherRepos,
@@ -1203,50 +1134,34 @@ pub async fn decide_with_llm(
                 log::warn!(
                     "auto_prompt: ContextOverflow Phase 2 — no current-repo tasks, falling back to other-repo plan tasks"
                 );
-                (plan_prompt, OverflowContinuationSource::PlanTasksOtherRepos)
+                plan_prompt
             } else {
                 log::info!(
                     "auto_prompt: ContextOverflow Phase 2 — no detectors matched, generic continuation"
                 );
-                (
-                    "Continue from where we left off.".to_string(),
-                    OverflowContinuationSource::GenericFallback,
-                )
+                "Continue from where we left off.".to_string()
             };
 
             // Preserve slash commands (e.g. /optimize) through context overflow
             // so the new thread re-activates the skill and continues the loop.
-            let (continuation, continuation_source) = match data.original_user_message.as_deref() {
+            let continuation = match data.original_user_message.as_deref() {
                 Some(msg) if msg.trim().starts_with('/') => {
                     let cmd = msg.trim();
                     log::info!(
                         "auto_prompt: ContextOverflow — original message is slash command '{cmd}', preserving it"
                     );
-                    (
-                        format!(
-                            "{cmd}\n\nContext overflowed mid-task. Pick up where the summary left off. \
-                             Do NOT summarize again — continue working immediately."
-                        ),
-                        OverflowContinuationSource::SlashCommandPreserved,
+                    format!(
+                        "{cmd}\n\nContext overflowed mid-task. Pick up where the summary left off. \
+                         Do NOT summarize again — continue working immediately."
                     )
                 }
-                _ => (continuation, continuation_source),
+                _ => continuation,
             };
 
             let next_prompt = with_first_prompt_context(
                 continuation,
                 prompt_summary.as_deref(),
                 data.title.as_deref(),
-                data.last_assistant_message.as_deref(),
-            );
-
-            write_overflow_log(
-                data.project_root.as_ref(),
-                data.iteration_count,
-                2,
-                summary_state,
-                continuation_source,
-                &next_prompt,
                 data.last_assistant_message.as_deref(),
             );
 
@@ -1271,20 +1186,6 @@ pub async fn decide_with_llm(
             // Unexpected state — reset and stop
             clear_summary_for_session(&session_id_str);
             let stop_reason = "context overflow: unexpected summary state".to_string();
-            write_overflow_log(
-                data.project_root.as_ref(),
-                data.iteration_count,
-                0,
-                summary_state,
-                OverflowContinuationSource::UnexpectedState,
-                &stop_reason,
-                data.last_assistant_message.as_deref(),
-            );
-            write_stop_log(
-                data.project_root.as_ref(),
-                data.iteration_count,
-                &stop_reason,
-            );
             reset_iteration_with_session(&data.session_id.to_string());
             return Ok(AutoPromptOutcome::Stopped {
                 reason: stop_reason,
@@ -1313,7 +1214,7 @@ pub async fn decide_with_llm(
     );
 
     match result {
-        Ok((raw_response, mut response)) => {
+        Ok((_raw_response, mut response)) => {
             let has_prompt = response
                 .next_prompt
                 .as_ref()
@@ -1324,24 +1225,6 @@ pub async fn decide_with_llm(
                     let lower = r.to_ascii_lowercase();
                     lower.starts_with("model returned") || lower.starts_with("model stream")
                 });
-
-            let response_origin = if is_synthetic_failure {
-                "synthetic"
-            } else {
-                "llm"
-            };
-
-            write_decision_log(
-                data.project_root.as_ref(),
-                data.iteration_count,
-                &format!("{:?}", data.model.id()),
-                &data.system_prompt,
-                &data.context_json,
-                &raw_response,
-                &response,
-                data.actual_input_tokens,
-                response_origin,
-            );
 
             log::info!(
                 "[auto_prompt::decide_with_llm] Response received: confidence={:?}, has_next_prompt={:?}",
@@ -1507,11 +1390,6 @@ pub async fn decide_with_llm(
                                     response.reason.as_deref().unwrap_or("no reason given")
                                 );
                                 log::info!("[auto_prompt::decide_with_llm] {stop_reason}");
-                                write_stop_log(
-                                    data.project_root.as_ref(),
-                                    data.iteration_count,
-                                    &stop_reason,
-                                );
                                 reset_iteration_with_session(&data.session_id.to_string());
                                 Ok(AutoPromptOutcome::Stopped {
                                     reason: stop_reason,
@@ -1523,11 +1401,6 @@ pub async fn decide_with_llm(
                                 "second opinion LLM call failed: {err:#} — defaulting to stop"
                             );
                             log::warn!("[auto_prompt::decide_with_llm] {stop_reason}");
-                            write_stop_log(
-                                data.project_root.as_ref(),
-                                data.iteration_count,
-                                &stop_reason,
-                            );
                             reset_iteration_with_session(&data.session_id.to_string());
                             Ok(AutoPromptOutcome::Stopped {
                                 reason: stop_reason,
@@ -1706,11 +1579,6 @@ pub async fn decide_with_llm(
                                     log::info!(
                                         "auto_prompt: all safety nets exhausted — no remaining work patterns and no unchecked plan tasks, accepting retry stop"
                                     );
-                                    write_stop_log(
-                                        data.project_root.as_ref(),
-                                        data.iteration_count,
-                                        &format!("lightweight retry: {stop_reason}"),
-                                    );
                                     reset_iteration_with_session(&data.session_id.to_string());
                                     Ok(AutoPromptOutcome::Stopped {
                                         reason: stop_reason,
@@ -1768,13 +1636,6 @@ pub async fn decide_with_llm(
                                     log::warn!(
                                         "auto_prompt: all safety nets exhausted — no remaining work patterns and no unchecked plan tasks, giving up"
                                     );
-                                    write_stop_log(
-                                        data.project_root.as_ref(),
-                                        data.iteration_count,
-                                        &format!(
-                                            "lightweight retry failed after 3 attempts, no remaining work or plan tasks detected: {reason}"
-                                        ),
-                                    );
                                     reset_iteration_with_session(&data.session_id.to_string());
                                     Ok(AutoPromptOutcome::Stopped {
                                         reason: format!("lightweight retry failed: {reason}"),
@@ -1786,11 +1647,6 @@ pub async fn decide_with_llm(
                         log::info!(
                             "auto_prompt: decisive stop (confidence={:?}), skipping verification",
                             input.confidence
-                        );
-                        write_stop_log(
-                            data.project_root.as_ref(),
-                            data.iteration_count,
-                            &format!("decisive stop: {reason}"),
                         );
                         reset_iteration_with_session(&data.session_id.to_string());
                         return Ok(AutoPromptOutcome::Stopped { reason });
@@ -1836,11 +1692,6 @@ pub async fn decide_with_llm(
                             let stop_reason =
                                 format!("max verification attempts ({max_verifications}) exceeded");
                             log::warn!("auto_prompt: {stop_reason}");
-                            write_stop_log(
-                                data.project_root.as_ref(),
-                                data.iteration_count,
-                                &stop_reason,
-                            );
                             reset_iteration_with_session(&data.session_id.to_string());
                             Ok(AutoPromptOutcome::Stopped {
                                 reason: stop_reason,
@@ -1876,11 +1727,6 @@ pub async fn decide_with_llm(
                                     log::info!(
                                         "auto_prompt: no verification needed (no plan files found), stopping"
                                     );
-                                    write_stop_log(
-                                        data.project_root.as_ref(),
-                                        data.iteration_count,
-                                        &stop_reason,
-                                    );
                                     reset_iteration_with_session(&data.session_id.to_string());
                                     Ok(AutoPromptOutcome::Stopped {
                                         reason: stop_reason,
@@ -1893,319 +1739,8 @@ pub async fn decide_with_llm(
             }
         }
         Err(err) => {
-            write_error_log(
-                data.project_root.as_ref(),
-                data.iteration_count,
-                &format!("{:?}", data.model.id()),
-                &err,
-            );
             log::warn!("auto_prompt: language model call failed: {err}");
             Err(err)
-        }
-    }
-}
-
-fn write_decision_log(
-    project_root: Option<&PathBuf>,
-    iteration: u32,
-    model: &str,
-    system_prompt: &str,
-    context_json: &str,
-    raw_response: &str,
-    parsed: &AutoPromptResponse,
-    actual_input_tokens: Option<u64>,
-    response_origin: &str,
-) {
-    let logs_dir = match project_root {
-        Some(root) => root.join(".logs"),
-        None => {
-            log::info!(
-                "[auto_prompt] decision log: using fallback {FALLBACK_LOG_DIR} (no project root)"
-            );
-            PathBuf::from(FALLBACK_LOG_DIR)
-        }
-    };
-    if let Err(err) = std::fs::create_dir_all(&logs_dir) {
-        log::warn!("auto_prompt: failed to create .logs dir: {err}");
-        return;
-    }
-
-    let timestamp = chrono::Local::now().format("%Y-%m-%dT%H-%M-%S%.3f");
-    let filename = format!("{timestamp}_{iteration}.json");
-    let path = logs_dir.join(&filename);
-
-    let log_entry = serde_json::json!({
-        "timestamp": chrono::Local::now().to_rfc3339(),
-        "commit": get_commit_hash(),
-        "iteration": iteration,
-        "model": model,
-        "response_origin": response_origin,
-        "request": {
-            "system_prompt": system_prompt,
-            "context_json": context_json,
-        },
-        "raw_response": raw_response,
-        "actual_input_tokens": actual_input_tokens,
-        "parsed_response": {
-            "next_prompt": parsed.next_prompt,
-            "reason": parsed.reason,
-            "confidence": parsed.confidence,
-        },
-    });
-
-    match serde_json::to_string_pretty(&log_entry) {
-        Ok(json) => {
-            if let Err(err) = std::fs::write(&path, json) {
-                log::warn!("auto_prompt: failed to write log {}: {err}", path.display());
-            } else {
-                log::info!("auto_prompt: wrote decision log to {}", path.display());
-            }
-        }
-        Err(err) => {
-            log::warn!("auto_prompt: failed to serialize log entry: {err}");
-        }
-    }
-}
-
-/// What source produced the continuation prompt in a ContextOverflow phase.
-///
-/// Recorded in overflow logs so the reason a particular continuation was
-/// chosen is auditable without re-running the chain.
-#[derive(Clone, Copy, Debug)]
-enum OverflowContinuationSource {
-    /// Worker AI declared all tasks blocked — generic "continue" sent.
-    AllBlockedGeneric,
-    /// `extract_summary_next_steps` found a Recommended Next Steps section.
-    SummaryNextSteps,
-    /// `detect_remaining_plan_tasks(CurrentRepo)` found unclaimed same-repo tasks.
-    PlanTasksCurrentRepo,
-    /// `detect_remaining_plan_tasks(OtherRepos)` found unclaimed cross-repo tasks.
-    PlanTasksOtherRepos,
-    /// No detector matched — sent the generic "continue from where we left off".
-    GenericFallback,
-    /// Phase 1 — asking the worker to produce a summary. No continuation yet.
-    Phase1RequestSummary,
-    /// Phase 2 — slash command preserved (e.g. /optimize) regardless of detectors.
-    SlashCommandPreserved,
-    /// Unexpected summary state — chain stopped.
-    UnexpectedState,
-}
-
-impl OverflowContinuationSource {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::AllBlockedGeneric => "all_blocked_generic",
-            Self::SummaryNextSteps => "summary_next_steps",
-            Self::PlanTasksCurrentRepo => "plan_tasks_current_repo",
-            Self::PlanTasksOtherRepos => "plan_tasks_other_repos",
-            Self::GenericFallback => "generic_fallback",
-            Self::Phase1RequestSummary => "phase1_request_summary",
-            Self::SlashCommandPreserved => "slash_command_preserved",
-            Self::UnexpectedState => "unexpected_state",
-        }
-    }
-}
-
-/// Truncate `s` to at most `max_bytes`, never splitting a multi-byte UTF-8
-/// character. If byte index `max_bytes` lands inside a character, the slice is
-/// rolled back to the preceding char boundary. Returns the truncated string
-/// with a `...[truncated]` marker when truncation actually occurs.
-///
-/// This exists because `&s[..n]` panics if `n` is not on a char boundary, and
-/// log previews of AI output (which frequently contains em-dashes, smart
-/// quotes, CJK, emoji) would otherwise crash the process.
-fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> String {
-    if s.len() <= max_bytes {
-        return s.to_string();
-    }
-    let mut end = max_bytes;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}...[truncated]", &s[..end])
-}
-
-/// Log a ContextOverflow phase decision. Mirrors `write_decision_log` shape
-/// but adds overflow-specific fields (phase, summary_state, continuation source).
-///
-/// Without this, the entire overflow path was invisible: all three branches
-/// (Phase 1, Phase 2, unexpected) `return` early before `write_decision_log`
-/// at the bottom of `decide_with_llm`, so only the pre-call `write_stop_log`
-/// ("evaluation started") marker survived — no record of *why* the chosen
-/// continuation was produced.
-fn write_overflow_log(
-    project_root: Option<&PathBuf>,
-    iteration: u32,
-    phase: u8,
-    summary_state: u32,
-    continuation_source: OverflowContinuationSource,
-    next_prompt: &str,
-    last_assistant_message: Option<&str>,
-) {
-    let logs_dir = match project_root {
-        Some(root) => root.join(".logs"),
-        None => {
-            log::info!(
-                "[auto_prompt] overflow log: using fallback {FALLBACK_LOG_DIR} (no project root)"
-            );
-            PathBuf::from(FALLBACK_LOG_DIR)
-        }
-    };
-    if let Err(err) = std::fs::create_dir_all(&logs_dir) {
-        log::warn!("auto_prompt: failed to create .logs dir: {err}");
-        return;
-    }
-
-    let timestamp = chrono::Local::now().format("%Y-%m-%dT%H-%M-%S%.3f");
-    let filename = format!("{timestamp}_{iteration}_overflow.json");
-    let path = logs_dir.join(&filename);
-
-    // Truncate the last assistant message so log files stay manageable —
-    // we only need enough to identify which summary produced this decision.
-    // Use char-boundary-safe truncation: slicing a &str at a byte index that
-    // lands inside a multi-byte UTF-8 sequence panics, and AI assistant
-    // messages routinely contain non-ASCII (em-dashes, smart quotes, CJK),
-    // so a naive &s[..2000] would crash the process.
-    let last_msg_preview = last_assistant_message
-        .map(|m| truncate_at_char_boundary(m.trim(), 2000))
-        .unwrap_or_default();
-
-    let next_prompt_preview = truncate_at_char_boundary(next_prompt.trim(), 4000);
-
-    let log_entry = serde_json::json!({
-        "timestamp": chrono::Local::now().to_rfc3339(),
-        "commit": get_commit_hash(),
-        "iteration": iteration,
-        "response_origin": "context_overflow",
-        "phase": phase,
-        "summary_state": summary_state,
-        "continuation_source": continuation_source.as_str(),
-        "next_prompt": next_prompt_preview,
-        "last_assistant_message_preview": last_msg_preview,
-    });
-
-    match serde_json::to_string_pretty(&log_entry) {
-        Ok(json) => {
-            if let Err(err) = std::fs::write(&path, json) {
-                log::warn!("auto_prompt: failed to write overflow log {}: {err}", path.display());
-            } else {
-                log::info!("auto_prompt: wrote overflow log to {}", path.display());
-            }
-        }
-        Err(err) => {
-            log::warn!("auto_prompt: failed to serialize overflow log entry: {err}");
-        }
-    }
-}
-
-fn write_error_log(
-    project_root: Option<&PathBuf>,
-    iteration: u32,
-    model: &str,
-    error: &anyhow::Error,
-) {
-    let timestamp = chrono::Local::now().format("%Y-%m-%dT%H-%M-%S%.3f");
-    let filename = format!("{timestamp}_{iteration}_error.json");
-    let log_entry = serde_json::json!({
-        "timestamp": chrono::Local::now().to_rfc3339(),
-        "commit": get_commit_hash(),
-        "iteration": iteration,
-        "model": model,
-        "error": format!("{error:#}"),
-    });
-
-    let json = match serde_json::to_string_pretty(&log_entry) {
-        Ok(json) => json,
-        Err(err) => {
-            log::warn!("auto_prompt: failed to serialize error log entry: {err}");
-            return;
-        }
-    };
-
-    let primary_dir = match project_root {
-        Some(root) => root.join(".logs"),
-        None => {
-            log::info!(
-                "[auto_prompt] error log: using fallback {FALLBACK_LOG_DIR} (no project root)"
-            );
-            PathBuf::from(FALLBACK_LOG_DIR)
-        }
-    };
-
-    let fallback_dir = PathBuf::from(FALLBACK_LOG_DIR);
-
-    for (label, dir) in [("primary", &primary_dir), ("fallback", &fallback_dir)] {
-        if let Err(err) = std::fs::create_dir_all(dir) {
-            log::warn!(
-                "auto_prompt: failed to create {label} log dir {}: {err}",
-                dir.display()
-            );
-            continue;
-        }
-        let path = dir.join(&filename);
-        match std::fs::write(&path, &json) {
-            Ok(()) => {
-                log::info!("auto_prompt: wrote error log to {}", path.display());
-            }
-            Err(err) => {
-                log::warn!(
-                    "auto_prompt: failed to write error log {}: {err}",
-                    path.display()
-                );
-            }
-        }
-    }
-}
-
-fn write_stop_log(project_root: Option<&PathBuf>, iteration: u32, reason: &str) {
-    let timestamp = chrono::Local::now().format("%Y-%m-%dT%H-%M-%S%.3f");
-    let filename = format!("{timestamp}_{iteration}_stop.json");
-    let log_entry = serde_json::json!({
-        "timestamp": chrono::Local::now().to_rfc3339(),
-        "commit": get_commit_hash(),
-        "iteration": iteration,
-        "reason": reason,
-    });
-
-    let json = match serde_json::to_string_pretty(&log_entry) {
-        Ok(json) => json,
-        Err(err) => {
-            log::warn!("auto_prompt: failed to serialize stop log: {err}");
-            return;
-        }
-    };
-
-    let primary_dir = match project_root {
-        Some(root) => root.join(".logs"),
-        None => {
-            log::info!(
-                "[auto_prompt] stop: {reason} (no project root, using fallback {FALLBACK_LOG_DIR})"
-            );
-            PathBuf::from(FALLBACK_LOG_DIR)
-        }
-    };
-
-    let fallback_dir = PathBuf::from(FALLBACK_LOG_DIR);
-
-    for (label, dir) in [("primary", &primary_dir), ("fallback", &fallback_dir)] {
-        if let Err(err) = std::fs::create_dir_all(dir) {
-            log::warn!(
-                "auto_prompt: failed to create {label} log dir {}: {err}",
-                dir.display()
-            );
-            continue;
-        }
-        let path = dir.join(&filename);
-        match std::fs::write(&path, &json) {
-            Ok(()) => {
-                log::info!("auto_prompt: wrote stop log to {}", path.display());
-            }
-            Err(err) => {
-                log::warn!(
-                    "auto_prompt: failed to write stop log {}: {err}",
-                    path.display()
-                );
-            }
         }
     }
 }
@@ -5616,72 +5151,6 @@ mod tests {
             result.contains("Pick up from here"),
             "continuation framing should be present"
         );
-    }
-
-    #[test]
-    fn test_truncate_at_char_boundary_ascii_short() {
-        // Short string is returned unchanged (no truncation marker).
-        let out = truncate_at_char_boundary("hello", 100);
-        assert_eq!(out, "hello");
-    }
-
-    #[test]
-    fn test_truncate_at_char_boundary_ascii_exact() {
-        // Exactly at the limit: no truncation marker.
-        let out = truncate_at_char_boundary("abcdefghij", 10);
-        assert_eq!(out, "abcdefghij");
-    }
-
-    #[test]
-    fn test_truncate_at_char_boundary_ascii_long() {
-        let out = truncate_at_char_boundary("abcdefghij", 5);
-        assert_eq!(out, "abcde...[truncated]");
-    }
-
-    #[test]
-    fn test_truncate_at_char_boundary_multibyte_no_panic() {
-        // Regression test for the crash on 2026-06-17: `&s[..2000]` panicked
-        // because byte index 2000 landed inside a multi-byte UTF-8 sequence.
-        // Fill with em-dashes (3 bytes each) so any byte boundary is almost
-        // certainly mid-character.
-        let em_dash = "\u{2014}"; // '—', 3 bytes
-        let big: String = em_dash.repeat(10_000);
-        // Must not panic and must be marked truncated.
-        let out = truncate_at_char_boundary(&big, 2000);
-        assert!(
-            out.ends_with("...[truncated]"),
-            "should be marked truncated, got trailing bytes: {:?}",
-            &out[out.len().min(40)..]
-        );
-        // Truncated output must be valid UTF-8 and end on a char boundary.
-        assert!(out.is_char_boundary(out.len() - "...[truncated]".len()));
-    }
-
-    #[test]
-    fn test_truncate_at_char_boundary_multibyte_rolls_back_to_boundary() {
-        // Force the requested byte index to land INSIDE a multi-byte character.
-        // Layout of "aXX": byte 0 = 'a', bytes 1,2,3 = first '—', bytes 4,5,6
-        // = second '—'. Asking for byte index 5 lands mid-character inside the
-        // second em-dash, so the slice must roll back to byte 4 (the start of
-        // that em-dash) and STOP there — the truncated body is bytes 0..4,
-        // i.e. "a—" (one em-dash). This is the regression that crashed Zed:
-        // a naive &s[..5] would panic.
-        let s = "a\u{2014}\u{2014}";
-        let out = truncate_at_char_boundary(s, 5);
-        assert_eq!(out, "a—...[truncated]");
-    }
-
-    #[test]
-    fn test_truncate_at_char_boundary_empty() {
-        assert_eq!(truncate_at_char_boundary("", 100), "");
-        assert_eq!(truncate_at_char_boundary("", 0), "");
-    }
-
-    #[test]
-    fn test_truncate_at_char_boundary_zero_max_bytes() {
-        // max_bytes=0 with non-empty input: rolls back to 0, no slice body.
-        let out = truncate_at_char_boundary("abc", 0);
-        assert_eq!(out, "...[truncated]");
     }
 
     #[test]

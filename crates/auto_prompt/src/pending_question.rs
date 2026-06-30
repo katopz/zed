@@ -28,7 +28,7 @@ use serde::Deserialize;
 
 use crate::{
     AutoPromptOutcome, AutoPromptResponse, LlmCallData, with_first_prompt_context,
-    commit_hash, is_auto_prompt_summary_response,
+    is_auto_prompt_summary_response,
 };
 
 // `AutoPromptAction` is constructed via `LlmCallData::make_continue_action` so
@@ -365,8 +365,6 @@ pub(crate) async fn try_answer_pending_question(
         data.last_assistant_message.as_deref(),
     );
 
-    write_answer_log(data, &raw_response, &next_prompt, confidence);
-
     let mut action = data.make_continue_action(next_prompt);
     // Answering a question re-enters the SAME thread context — no need to
     // force a new thread. Keep token counts so the dispatch logic can still
@@ -499,42 +497,6 @@ fn extract_json_local(text: &str) -> &str {
         }
     }
     text.trim()
-}
-
-/// Write a decision log for the answerer path so it's debuggable alongside the
-/// normal `.logs/` entries.
-fn write_answer_log(data: &LlmCallData, raw_response: &str, next_prompt: &str, confidence: f64) {
-    let Some(root) = data.project_root.as_ref() else {
-        return;
-    };
-    let logs_dir = root.join(".logs");
-    let _ = std::fs::create_dir_all(&logs_dir);
-    let timestamp = chrono::Local::now().format("%Y-%m-%dT%H-%M-%S%.3f");
-    let filename = format!("{timestamp}_{}_pending_question.json", data.iteration_count);
-    let entry = serde_json::json!({
-        "timestamp": chrono::Local::now().to_rfc3339(),
-        "commit": commit_hash(),
-        "iteration": data.iteration_count,
-        "kind": "pending_question_answer",
-        "model": format!("{:?}", data.model.id()),
-        "raw_response": raw_response,
-        "confidence": confidence,
-        "dispatched_prompt": next_prompt,
-        "last_assistant_message_preview": data
-            .last_assistant_message
-            .as_deref()
-            .map(|s| s.chars().take(500).collect::<String>()),
-    });
-    let json = match serde_json::to_string_pretty(&entry) {
-        Ok(j) => j,
-        Err(err) => {
-            log::warn!("[auto_prompt::pending_question] failed to serialize answer log: {err}");
-            return;
-        }
-    };
-    if let Err(err) = std::fs::write(logs_dir.join(filename), json) {
-        log::warn!("[auto_prompt::pending_question] failed to write answer log: {err}");
-    }
 }
 
 #[cfg(test)]
