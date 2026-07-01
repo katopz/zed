@@ -5669,7 +5669,6 @@ impl ThreadView {
                     .w_full()
                     .when(is_editable && has_checkpoint_button, |this| {
                         this.children(message.id.clone().map(|message_id| {
-                            let restore_message_id = message_id.clone();
                             h_flex()
                                 .px_3()
                                 .gap_2()
@@ -5681,17 +5680,7 @@ impl ThreadView {
                                         .color(Color::Muted)
                                         .tooltip(Tooltip::text("Restores all files in the project to the content they had at this point in the conversation."))
                                         .on_click(cx.listener(move |this, _, _window, cx| {
-                                            this.restore_checkpoint(&restore_message_id, cx);
-                                        }))
-                                )
-                                .child(
-                                    Button::new(("branch-new-thread", entry_ix), "Branch New Thread")
-                                        .start_icon(Icon::new(IconName::GitBranch).size(IconSize::XSmall).color(Color::Muted))
-                                        .label_size(LabelSize::XSmall)
-                                        .color(Color::Muted)
-                                        .tooltip(Tooltip::text("Start a new thread that carries this conversation as context."))
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.branch_to_new_thread(Some(message_id.clone()), window, cx);
+                                            this.restore_checkpoint(&message_id, cx);
                                         }))
                                 )
                                 .child(Divider::horizontal())
@@ -6511,23 +6500,6 @@ impl ThreadView {
         }
         if matches!(self.thread.read(cx).status(), ThreadStatus::Generating) {
             return None;
-        }
-
-        // If the next entry is an editable user message with a visible
-        // checkpoint, that entry's checkpoint row will render both
-        // "Restore Checkpoint" and "Branch New Thread". Skip the turn-end
-        // separator here to avoid stacking two "Branch New Thread" buttons.
-        if let Some(AgentThreadEntry::UserMessage(message)) = entries.get(entry_ix + 1) {
-            let next_renders_checkpoint_row = message
-                .checkpoint
-                .as_ref()
-                .is_some_and(|checkpoint| checkpoint.show)
-                && message.id.is_some()
-                && !self.is_subagent()
-                && self.thread.read(cx).supports_truncate(cx);
-            if next_renders_checkpoint_row {
-                return None;
-            }
         }
 
         Some(
