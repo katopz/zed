@@ -5962,12 +5962,13 @@ pub(crate) mod tests {
         });
     }
 
-    /// Covers the `[TOP]`/`[BOTTOM]` bookend wiring in `render_user_prompt_jumps`:
-    /// the buttons call `scroll_to_top` / `scroll_to_end`, and this test pins that
-    /// those two methods actually move the `ListState` to the expected ends of a
-    /// multi-turn conversation. The list is drawn first so the `ListState` item
-    /// count is synced during the `list()` layout pass (without a draw,
-    /// `scroll_to_end` has no measured extent to scroll to).
+    /// Covers the `[<-]`/`[up]`/`[down]`/`[->]` bookend wiring in
+    /// `render_user_prompt_jumps`: the buttons call `scroll_to_top` /
+    /// `scroll_to_end` / `scroll_to_prev_user_prompt` / `scroll_to_next_user_prompt`,
+    /// and this test pins that those methods actually move the `ListState` to the
+    /// expected ends of a multi-turn conversation. The list is drawn first so the
+    /// `ListState` item count is synced during the `list()` layout pass (without a
+    /// draw, `scroll_to_end` has no measured extent to scroll to).
     #[gpui::test]
     async fn test_prompt_jump_bookends_scroll_to_ends(cx: &mut TestAppContext) {
         init_test(cx);
@@ -6045,6 +6046,29 @@ pub(crate) mod tests {
         assert!(
             bottom.item_ix > top.item_ix,
             "scroll_to_end and scroll_to_top should land on different ends"
+        );
+
+        // PREV/NEXT bookend wiring: stepping next jumps to the 2nd user prompt
+        // (entry index 2 in [U0, A1, U2, A3]), and stepping prev returns to the
+        // 1st user prompt (entry index 0).
+        thread_view.update(cx, |view, cx| {
+            view.scroll_to_next_user_prompt(cx);
+        });
+        let after_next =
+            thread_view.read_with(cx, |view, _cx| view.list_state.logical_scroll_top());
+        assert_eq!(
+            after_next.item_ix, 2,
+            "scroll_to_next_user_prompt should land on the second user prompt (entry 2)"
+        );
+
+        thread_view.update(cx, |view, cx| {
+            view.scroll_to_prev_user_prompt(cx);
+        });
+        let after_prev =
+            thread_view.read_with(cx, |view, _cx| view.list_state.logical_scroll_top());
+        assert_eq!(
+            after_prev.item_ix, 0,
+            "scroll_to_prev_user_prompt should return to the first user prompt (entry 0)"
         );
     }
 

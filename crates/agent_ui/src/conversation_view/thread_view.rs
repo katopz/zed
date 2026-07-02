@@ -6327,6 +6327,58 @@ impl ThreadView {
         }
     }
 
+    /// Scrolls to the previous user prompt before the current viewport top.
+    /// No-op when already at or before the first user prompt. Used by the
+    /// `[<-]` bookend in the prompt-jump strip and by the
+    /// `ScrollOutputToPreviousMessage` action.
+    pub(crate) fn scroll_to_prev_user_prompt(&mut self, cx: &mut Context<Self>) {
+        let entries = self.thread.read(cx).entries();
+        let current_ix = self.list_state.logical_scroll_top().item_ix;
+        if let Some(target_ix) = (0..current_ix)
+            .rev()
+            .find(|&i| matches!(entries.get(i), Some(AgentThreadEntry::UserMessage(_))))
+        {
+            self.list_state.scroll_to(ListOffset {
+                item_ix: target_ix,
+                offset_in_item: px(0.),
+            });
+            cx.notify();
+        }
+    }
+
+    /// Scrolls to the next user prompt after the current viewport top.
+    /// No-op when already at or past the last user prompt. Used by the
+    /// `[->]` bookend in the prompt-jump strip and by the
+    /// `ScrollOutputToNextMessage` action.
+    pub(crate) fn scroll_to_next_user_prompt(&mut self, cx: &mut Context<Self>) {
+        let entries = self.thread.read(cx).entries();
+        let current_ix = self.list_state.logical_scroll_top().item_ix;
+        if let Some(target_ix) = (current_ix + 1..entries.len())
+            .find(|&i| matches!(entries.get(i), Some(AgentThreadEntry::UserMessage(_))))
+        {
+            self.list_state.scroll_to(ListOffset {
+                item_ix: target_ix,
+                offset_in_item: px(0.),
+            });
+            cx.notify();
+        }
+    }
+
+    /// Returns the 0-based index (in user-prompt order) of the user prompt at
+    /// or before the current viewport top. Used to compute whether the
+    /// `[<-]`/`[->]` bookends in the prompt-jump strip should be disabled.
+    pub(crate) fn current_user_prompt_index(&self, cx: &App) -> Option<usize> {
+        let entries = self.thread.read(cx).entries();
+        let current_ix = self.list_state.logical_scroll_top().item_ix;
+        entries
+            .iter()
+            .enumerate()
+            .take(current_ix.saturating_add(1))
+            .filter(|(_, entry)| matches!(entry, AgentThreadEntry::UserMessage(_)))
+            .count()
+            .checked_sub(1)
+    }
+
     /// Branches the current thread into a new thread at `up_to_user_message`.
     ///
     /// For native-agent threads this forks the real message history: the new
@@ -6533,15 +6585,17 @@ impl ThreadView {
     }
 
     /// Always-visible strip of navigation buttons shown at the top of the
-    /// conversation: `[TOP] [1] [2] ... [BOTTOM]`. Clicking a number scrolls
-    /// that user prompt to the top of the viewport; `TOP` jumps to the start
-    /// and `BOTTOM` jumps to the end of the thread.
+    /// conversation: `[<-] [up] [1] [2] ... [down] [->]`.
     ///
-    /// `TOP`/`BOTTOM` are shown whenever there is at least one user prompt,
+    /// - `[<-]` / `[->]` step to the previous / next user prompt relative to
+    ///   the current viewport (disabled at the respective ends).
+    /// - `[up]` / `[down]` jump to the very top / bottom of the thread.
+    /// - `[1] [2] ...` jump to a specific user prompt. Only rendered when there
+    ///   are multiple prompts, since a lone `[1]` is redundant with `[up]`.
+    ///
+    /// The whole strip is rendered whenever there is at least one user prompt,
     /// so a single-prompt thread (which may still contain a long assistant
-    /// response) still gets end-to-end navigation. The numbered buttons are
-    /// only rendered when there are multiple prompts, since a lone `[1]` is
-    /// redundant with `TOP`.
+    /// response) still gets end-to-end navigation.
     fn render_user_prompt_jumps(&self, cx: &Context<Self>) -> Option<Div> {
         let entries = self.thread.read(cx).entries();
         let user_prompt_count = entries
@@ -6552,28 +6606,41 @@ impl ThreadView {
             return None;
         }
 
+        // Current user-prompt index relative to the viewport top, used to
+        // disable the prev/next bookends at the conversation ends.
+        let current_prompt_ix = self.current_user_prompt_index(cx);
+        let can_prev = current_prompt_ix.map_or(false, |ix| ix > 0);
+        let can_next = current_prompt_ix.map_or(false, |ix| ix + 1 < user_prompt_count);
+
         let mut buttons = h_flex().w_full().px_5().py_1().gap_1().items_center();
 
-        // TOP bookend: scroll to the very first entry.
+        // PREV bookend: step to the previous user prompt.
         buttons = buttons.child(
-            div()
-                .id("prompt-jump-top")
-                .px_1()
-                .rounded_sm()
-                .hover(|s| s.bg(cx.theme().colors().element_hover))
+            IconButton::new("prompt-jump-prev", IconName::ArrowLeft)
+                .shape(ui::IconButtonShape::Square)
+                .icon_size(IconSize::Small)
+                .icon_color(Color::Muted)
+                .disabled(!can_prev)
+                .tooltip(Tooltip::text("Previous prompt"))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.scroll_to_prev_user_prompt(cx);
+                })),
+        );
+
+        // TOP bookend: jump to the very first entry.
+        buttons = buttons.child(
+            IconButton::new("prompt-jump-top", IconName::ArrowUp)
+                .shape(ui::IconButtonShape::Square)
+                .icon_size(IconSize::Small)
+                .icon_color(Color::Muted)
                 .tooltip(Tooltip::text("Jump to top"))
-                .child(
-                    Label::new("TOP")
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                )
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.scroll_to_top(cx);
                 })),
         );
 
         // Numbered prompt buttons: only render when there are multiple prompts,
-        // since a lone `[1]` is redundant with `TOP`.
+        // since a lone `[1]` is redundant with the TOP bookend.
         if user_prompt_count > 1 {
             for index in 0..user_prompt_count {
                 buttons = buttons.child(
@@ -6595,22 +6662,28 @@ impl ThreadView {
             }
         }
 
-        // BOTTOM bookend: scroll to the very last entry. Always rendered so a
-        // single-prompt thread still gets end-to-end navigation.
+        // BOTTOM bookend: jump to the very last entry.
         buttons = buttons.child(
-            div()
-                .id("prompt-jump-bottom")
-                .px_1()
-                .rounded_sm()
-                .hover(|s| s.bg(cx.theme().colors().element_hover))
+            IconButton::new("prompt-jump-bottom", IconName::ArrowDown)
+                .shape(ui::IconButtonShape::Square)
+                .icon_size(IconSize::Small)
+                .icon_color(Color::Muted)
                 .tooltip(Tooltip::text("Jump to bottom"))
-                .child(
-                    Label::new("BOTTOM")
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                )
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.scroll_to_end(cx);
+                })),
+        );
+
+        // NEXT bookend: step to the next user prompt.
+        buttons = buttons.child(
+            IconButton::new("prompt-jump-next", IconName::ArrowRight)
+                .shape(ui::IconButtonShape::Square)
+                .icon_size(IconSize::Small)
+                .icon_color(Color::Muted)
+                .disabled(!can_next)
+                .tooltip(Tooltip::text("Next prompt"))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.scroll_to_next_user_prompt(cx);
                 })),
         );
 
@@ -6705,18 +6778,7 @@ impl ThreadView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let entries = self.thread.read(cx).entries();
-        let current_ix = self.list_state.logical_scroll_top().item_ix;
-        if let Some(target_ix) = (0..current_ix)
-            .rev()
-            .find(|&i| matches!(entries.get(i), Some(AgentThreadEntry::UserMessage(_))))
-        {
-            self.list_state.scroll_to(ListOffset {
-                item_ix: target_ix,
-                offset_in_item: px(0.),
-            });
-            cx.notify();
-        }
+        self.scroll_to_prev_user_prompt(cx);
     }
 
     fn scroll_output_to_next_message(
@@ -6725,17 +6787,7 @@ impl ThreadView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let entries = self.thread.read(cx).entries();
-        let current_ix = self.list_state.logical_scroll_top().item_ix;
-        if let Some(target_ix) = (current_ix + 1..entries.len())
-            .find(|&i| matches!(entries.get(i), Some(AgentThreadEntry::UserMessage(_))))
-        {
-            self.list_state.scroll_to(ListOffset {
-                item_ix: target_ix,
-                offset_in_item: px(0.),
-            });
-            cx.notify();
-        }
+        self.scroll_to_next_user_prompt(cx);
     }
 
     pub fn open_thread_as_markdown(
