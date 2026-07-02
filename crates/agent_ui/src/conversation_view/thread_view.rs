@@ -6536,13 +6536,19 @@ impl ThreadView {
     /// conversation: `[TOP] [1] [2] ... [BOTTOM]`. Clicking a number scrolls
     /// that user prompt to the top of the viewport; `TOP` jumps to the start
     /// and `BOTTOM` jumps to the end of the thread.
+    ///
+    /// `TOP`/`BOTTOM` are shown whenever there is at least one user prompt,
+    /// so a single-prompt thread (which may still contain a long assistant
+    /// response) still gets end-to-end navigation. The numbered buttons are
+    /// only rendered when there are multiple prompts, since a lone `[1]` is
+    /// redundant with `TOP`.
     fn render_user_prompt_jumps(&self, cx: &Context<Self>) -> Option<Div> {
         let entries = self.thread.read(cx).entries();
         let user_prompt_count = entries
             .iter()
             .filter(|e| matches!(e, AgentThreadEntry::UserMessage(_)))
             .count();
-        if user_prompt_count <= 1 {
+        if user_prompt_count == 0 {
             return None;
         }
 
@@ -6566,26 +6572,31 @@ impl ThreadView {
                 })),
         );
 
-        for index in 0..user_prompt_count {
-            buttons = buttons.child(
-                div()
-                    .id(("prompt-jump", index))
-                    .px_1()
-                    .rounded_sm()
-                    .hover(|s| s.bg(cx.theme().colors().element_hover))
-                    .tooltip(Tooltip::text(format!("Jump to prompt {}", index + 1)))
-                    .child(
-                        Label::new(format!("{}", index + 1))
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.scroll_to_user_prompt(index, cx);
-                    })),
-            );
+        // Numbered prompt buttons: only render when there are multiple prompts,
+        // since a lone `[1]` is redundant with `TOP`.
+        if user_prompt_count > 1 {
+            for index in 0..user_prompt_count {
+                buttons = buttons.child(
+                    div()
+                        .id(("prompt-jump", index))
+                        .px_1()
+                        .rounded_sm()
+                        .hover(|s| s.bg(cx.theme().colors().element_hover))
+                        .tooltip(Tooltip::text(format!("Jump to prompt {}", index + 1)))
+                        .child(
+                            Label::new(format!("{}", index + 1))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.scroll_to_user_prompt(index, cx);
+                        })),
+                );
+            }
         }
 
-        // BOTTOM bookend: scroll to the very last entry.
+        // BOTTOM bookend: scroll to the very last entry. Always rendered so a
+        // single-prompt thread still gets end-to-end navigation.
         buttons = buttons.child(
             div()
                 .id("prompt-jump-bottom")

@@ -6048,6 +6048,74 @@ pub(crate) mod tests {
         );
     }
 
+    /// Regression test for a bug where `render_user_prompt_jumps` returned
+    /// `None` whenever a thread had exactly one user prompt, hiding the entire
+    /// `[TOP] ... [BOTTOM]` strip — so a single-prompt thread (which may still
+    /// contain a long assistant response) had no end-to-end navigation at all.
+    ///
+    /// This test sets up a one-prompt thread, draws the real `ThreadView` (so
+    /// the full render path including `render_user_prompt_jumps` runs without
+    /// panicking), and pins that the TOP/BOTTOM scroll targets still function.
+    #[gpui::test]
+    async fn test_prompt_jump_strip_visible_with_single_prompt(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new("A single long response".into()),
+        )]);
+
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let thread = conversation_view
+            .read_with(cx, |view, cx| {
+                view.active_thread().map(|r| r.read(cx).thread.clone())
+            })
+            .unwrap();
+
+        // Exactly one user/assistant turn.
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Only prompt", cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        let thread_view = active_thread(&conversation_view, cx);
+        let entry_count = thread_view.read_with(cx, |view, cx| {
+            view.thread.read(cx).entries().len()
+        });
+        assert_eq!(
+            entry_count, 2,
+            "expected one user/assistant turn; got {entry_count} entries"
+        );
+
+        // Draw the real ThreadView so the render path (including
+        // render_user_prompt_jumps) executes; this would panic if the
+        // single-prompt branch were broken.
+        draw_real_thread_view(&thread_view, cx);
+
+        // The strip must be functional: TOP and BOTTOM must move the list.
+        thread_view.update(cx, |view, cx| {
+            view.scroll_to_end(cx);
+        });
+        let bottom = thread_view.read_with(cx, |view, _cx| view.list_state.logical_scroll_top());
+
+        thread_view.update(cx, |view, cx| {
+            view.scroll_to_top(cx);
+        });
+        let top = thread_view.read_with(cx, |view, _cx| view.list_state.logical_scroll_top());
+
+        assert_eq!(
+            top.item_ix, 0,
+            "scroll_to_top should land on the first entry even with a single prompt"
+        );
+        assert!(
+            bottom.item_ix >= entry_count - 1,
+            "scroll_to_end should reach the last entry even with a single prompt, got {}",
+            bottom.item_ix
+        );
+    }
+
     /// Smoke-test the full `ThreadView` render path. No existing test draws the
     /// real `ThreadView` (the permission-row tests draw a stub `TestListView`
     /// that shares only the `ListState`); this renders the actual view so the
