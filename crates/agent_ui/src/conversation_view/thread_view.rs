@@ -6364,21 +6364,6 @@ impl ThreadView {
         }
     }
 
-    /// Returns the 0-based index (in user-prompt order) of the user prompt at
-    /// or before the current viewport top. Used to compute whether the
-    /// `[<-]`/`[->]` bookends in the prompt-jump strip should be disabled.
-    pub(crate) fn current_user_prompt_index(&self, cx: &App) -> Option<usize> {
-        let entries = self.thread.read(cx).entries();
-        let current_ix = self.list_state.logical_scroll_top().item_ix;
-        entries
-            .iter()
-            .enumerate()
-            .take(current_ix.saturating_add(1))
-            .filter(|(_, entry)| matches!(entry, AgentThreadEntry::UserMessage(_)))
-            .count()
-            .checked_sub(1)
-    }
-
     /// Branches the current thread into a new thread at `up_to_user_message`.
     ///
     /// For native-agent threads this forks the real message history: the new
@@ -6508,13 +6493,14 @@ impl ThreadView {
                         let seeded = Cell::new(false);
                         cx.subscribe(
                             &conversation_view,
-                            move |_this, view, _event: &crate::conversation_view::RootThreadUpdated, cx| {
+                            move |_this,
+                                  view,
+                                  _event: &crate::conversation_view::RootThreadUpdated,
+                                  cx| {
                                 if seeded.get() {
                                     return;
                                 }
-                                let Some(native_thread) =
-                                    view.read(cx).as_native_thread(cx)
-                                else {
+                                let Some(native_thread) = view.read(cx).as_native_thread(cx) else {
                                     return;
                                 };
                                 seeded.set(true);
@@ -6585,10 +6571,13 @@ impl ThreadView {
     }
 
     /// Always-visible strip of navigation buttons shown at the top of the
-    /// conversation: `[<-] [up] [1] [2] ... [down] [->]`.
+    /// conversation: `[from] [up] [1] [2] ... [down] [to]`.
     ///
-    /// - `[<-]` / `[->]` step to the previous / next user prompt relative to
-    ///   the current viewport (disabled at the respective ends).
+    /// - `[from]` / `[to]` navigate across threads: `[from]` jumps to the
+    ///   source thread this one was summarized from (auto_prompt
+    ///   continuation), `[to]` jumps to the thread that continues from this
+    ///   one. Both are only rendered when the corresponding continuation
+    ///   link exists, mirroring the `from`/`to` chips in the sidebar.
     /// - `[up]` / `[down]` jump to the very top / bottom of the thread.
     /// - `[1] [2] ...` jump to a specific user prompt. Only rendered when there
     ///   are multiple prompts, since a lone `[1]` is redundant with `[up]`.
@@ -6606,26 +6595,52 @@ impl ThreadView {
             return None;
         }
 
-        // Current user-prompt index relative to the viewport top, used to
-        // disable the prev/next bookends at the conversation ends.
-        let current_prompt_ix = self.current_user_prompt_index(cx);
-        let can_prev = current_prompt_ix.map_or(false, |ix| ix > 0);
-        let can_next = current_prompt_ix.map_or(false, |ix| ix + 1 < user_prompt_count);
+        // Cross-thread continuation links. `from` = the source thread this one
+        // was summarized from; `to` = the thread that continues from this one.
+        // Both are derived from ThreadMetadataStore exactly like the sidebar
+        // `from`/`to` chips, so the prompt-jump strip and the sidebar stay in
+        // sync.
+        let my_session_id = self.session_id.clone();
+        let (continuation_from, continuation_to) = ThreadMetadataStore::try_global(cx)
+            .map(|store| {
+                let store = store.read(cx);
+                let from = store.continued_from(self.root_thread_id);
+                let to = store
+                    .find_continuation_of(&my_session_id)
+                    .and_then(|(thread_id, _)| {
+                        store.entry(thread_id).and_then(|m| {
+                            m.session_id.clone().map(|session_id| {
+                                (
+                                    session_id,
+                                    m.title()
+                                        .unwrap_or_else(|| crate::DEFAULT_THREAD_TITLE.into()),
+                                )
+                            })
+                        })
+                    });
+                (from, to)
+            })
+            .unwrap_or((None, None));
 
         let mut buttons = h_flex().w_full().px_5().py_1().gap_1().items_center();
 
-        // PREV bookend: step to the previous user prompt.
-        buttons = buttons.child(
-            IconButton::new("prompt-jump-prev", IconName::ArrowLeft)
-                .shape(ui::IconButtonShape::Square)
-                .icon_size(IconSize::Small)
-                .icon_color(Color::Muted)
-                .disabled(!can_prev)
-                .tooltip(Tooltip::text("Previous prompt"))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.scroll_to_prev_user_prompt(cx);
-                })),
-        );
+        // FROM bookend: jump to the source thread this one was continued from.
+        // Only rendered when the continuation link exists.
+        if let Some((from_session_id, from_title)) = continuation_from {
+            let server_view = self.server_view.clone();
+            buttons = buttons.child(
+                IconButton::new("prompt-jump-from", IconName::ArrowLeft)
+                    .shape(ui::IconButtonShape::Square)
+                    .icon_size(IconSize::Small)
+                    .icon_color(Color::Accent)
+                    .tooltip(Tooltip::text(format!("from: {}", from_title)))
+                    .on_click(move |_, window, cx| {
+                        let _ = server_view.update(cx, |server_view, cx| {
+                            server_view.navigate_to_thread(from_session_id.clone(), window, cx);
+                        });
+                    }),
+            );
+        }
 
         // TOP bookend: jump to the very first entry.
         buttons = buttons.child(
@@ -6674,18 +6689,23 @@ impl ThreadView {
                 })),
         );
 
-        // NEXT bookend: step to the next user prompt.
-        buttons = buttons.child(
-            IconButton::new("prompt-jump-next", IconName::ArrowRight)
-                .shape(ui::IconButtonShape::Square)
-                .icon_size(IconSize::Small)
-                .icon_color(Color::Muted)
-                .disabled(!can_next)
-                .tooltip(Tooltip::text("Next prompt"))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.scroll_to_next_user_prompt(cx);
-                })),
-        );
+        // TO bookend: jump to the thread that continues from this one.
+        // Only rendered when the continuation link exists.
+        if let Some((to_session_id, to_title)) = continuation_to {
+            let server_view = self.server_view.clone();
+            buttons = buttons.child(
+                IconButton::new("prompt-jump-to", IconName::ArrowRight)
+                    .shape(ui::IconButtonShape::Square)
+                    .icon_size(IconSize::Small)
+                    .icon_color(Color::Accent)
+                    .tooltip(Tooltip::text(format!("to: {}", to_title)))
+                    .on_click(move |_, window, cx| {
+                        let _ = server_view.update(cx, |server_view, cx| {
+                            server_view.navigate_to_thread(to_session_id.clone(), window, cx);
+                        });
+                    }),
+            );
+        }
 
         Some(buttons)
     }
@@ -6945,7 +6965,7 @@ impl ThreadView {
         }
     }
 
-    fn render_generating(&self, confirmation: bool, cx: &App) -> impl IntoElement {
+    fn render_generating(&self, confirmation: bool, cx: &Context<Self>) -> AnyElement {
         let show_stats = AgentSettings::get_global(cx).show_turn_stats;
         let elapsed_label = show_stats
             .then(|| {
@@ -6975,6 +6995,16 @@ impl ThreadView {
         } else {
             IconName::ArrowDown
         };
+
+        // Retry availability + elapsed-since-turn-start for the inline retry
+        // control. Unlike `elapsed_label` (gated by `show_stats` and
+        // STOPWATCH_THRESHOLD), this always shows when a retry is possible so
+        // the user can see how long the turn has been stuck.
+        let can_retry = self.thread.read(cx).can_retry(cx);
+        let retry_elapsed = self
+            .turn_fields
+            .turn_started_at
+            .map(|started_at| started_at.elapsed());
 
         h_flex()
             .id("generating-spinner")
@@ -7028,6 +7058,39 @@ impl ThreadView {
                                 .size(LabelSize::Small)
                                 .color(Color::Muted),
                         ),
+                )
+            })
+            // Push the retry control to the far right of the generating row so
+            // it sits "behind" (to the right of) the loading spinner, matching
+            // the subagent panel's stop/retry layout.
+            .child(div().flex_1())
+            .when(can_retry, |this| {
+                this.child(
+                    ButtonLike::new("generating-retry")
+                        .style(ButtonStyle::Tinted(TintColor::Warning))
+                        .children(retry_elapsed.map(|elapsed| {
+                            Label::new(format_retries_elapsed(elapsed))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted)
+                        }))
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .child(
+                                    Icon::new(IconName::RotateCw)
+                                        .size(IconSize::XSmall)
+                                        .color(Color::Warning),
+                                )
+                                .child(
+                                    Label::new("RETRY")
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Warning),
+                                ),
+                        )
+                        .tooltip(Tooltip::text("Retry generation"))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.retry_generation(cx);
+                        })),
                 )
             })
             .into_any_element()
@@ -7492,11 +7555,10 @@ impl ThreadView {
             .unwrap_or(&command_source)
             .to_string();
 
-        let mut style = self
-            .markdown_style_for_thread(
-                MarkdownStyle::themed(MarkdownFont::Agent, window, cx).with_buffer_font(cx),
-                cx,
-            );
+        let mut style = self.markdown_style_for_thread(
+            MarkdownStyle::themed(MarkdownFont::Agent, window, cx).with_buffer_font(cx),
+            cx,
+        );
         style.container_style.text.font_size = Some(rems_from_px(12.).into());
         style.container_style.text.line_height = Some(rems_from_px(17.).into());
         style.height_is_multiple_of_line_height = true;
@@ -7957,16 +8019,13 @@ impl ThreadView {
                 .buffer_font(cx)
         };
 
-        let tool_output_display = if is_open {
-            match &tool_call.status {
-                ToolCallStatus::WaitingForConfirmation { options, .. } => v_flex()
-                    .w_full()
-                    .children(
-                        tool_call
-                            .content
-                            .iter()
-                            .enumerate()
-                            .map(|(content_ix, content)| {
+        let tool_output_display =
+            if is_open {
+                match &tool_call.status {
+                    ToolCallStatus::WaitingForConfirmation { options, .. } => v_flex()
+                        .w_full()
+                        .children(tool_call.content.iter().enumerate().map(
+                            |(content_ix, content)| {
                                 div()
                                     .child(self.render_tool_call_content(
                                         active_session_id,
@@ -7981,70 +8040,124 @@ impl ThreadView {
                                         cx,
                                     ))
                                     .into_any_element()
-                            }),
-                    )
-                    .when_some(
-                        tool_call.sandbox_authorization_details.as_ref(),
-                        |this, details| {
-                            this.child(self.render_sandbox_authorization_details(
-                                entry_ix,
-                                &tool_call.id,
-                                details,
-                                cx,
-                            ))
-                        },
-                    )
-                    .when(should_show_raw_input, |this| {
-                        let is_raw_input_expanded =
-                            self.expanded_tool_call_raw_inputs.contains(&tool_call.id);
+                            },
+                        ))
+                        .when_some(
+                            tool_call.sandbox_authorization_details.as_ref(),
+                            |this, details| {
+                                this.child(self.render_sandbox_authorization_details(
+                                    entry_ix,
+                                    &tool_call.id,
+                                    details,
+                                    cx,
+                                ))
+                            },
+                        )
+                        .when(should_show_raw_input, |this| {
+                            let is_raw_input_expanded =
+                                self.expanded_tool_call_raw_inputs.contains(&tool_call.id);
 
-                        let input_header = if is_raw_input_expanded {
-                            "Raw Input:"
-                        } else {
-                            "View Raw Input"
-                        };
+                            let input_header = if is_raw_input_expanded {
+                                "Raw Input:"
+                            } else {
+                                "View Raw Input"
+                            };
 
-                        this.child(
-                            v_flex()
-                                .p_2()
-                                .gap_1()
-                                .border_t_1()
-                                .border_color(self.tool_card_border_color(cx))
-                                .child(
-                                    h_flex()
-                                        .id("disclosure_container")
-                                        .pl_0p5()
-                                        .gap_1()
-                                        .justify_between()
-                                        .rounded_xs()
-                                        .hover(|s| s.bg(cx.theme().colors().element_hover))
-                                        .child(input_output_header(input_header.into()))
-                                        .child(
-                                            Disclosure::new(
-                                                ("raw-input-disclosure", entry_ix),
-                                                is_raw_input_expanded,
+                            this.child(
+                                v_flex()
+                                    .p_2()
+                                    .gap_1()
+                                    .border_t_1()
+                                    .border_color(self.tool_card_border_color(cx))
+                                    .child(
+                                        h_flex()
+                                            .id("disclosure_container")
+                                            .pl_0p5()
+                                            .gap_1()
+                                            .justify_between()
+                                            .rounded_xs()
+                                            .hover(|s| s.bg(cx.theme().colors().element_hover))
+                                            .child(input_output_header(input_header.into()))
+                                            .child(
+                                                Disclosure::new(
+                                                    ("raw-input-disclosure", entry_ix),
+                                                    is_raw_input_expanded,
+                                                )
+                                                .opened_icon(IconName::ChevronUp)
+                                                .closed_icon(IconName::ChevronDown),
                                             )
-                                            .opened_icon(IconName::ChevronUp)
-                                            .closed_icon(IconName::ChevronDown),
-                                        )
-                                        .on_click(cx.listener({
-                                            let id = tool_call.id.clone();
+                                            .on_click(cx.listener({
+                                                let id = tool_call.id.clone();
 
-                                            move |this: &mut Self, _, _, cx| {
-                                                if this.expanded_tool_call_raw_inputs.contains(&id)
-                                                {
-                                                    this.expanded_tool_call_raw_inputs.remove(&id);
-                                                } else {
-                                                    this.expanded_tool_call_raw_inputs
-                                                        .insert(id.clone());
+                                                move |this: &mut Self, _, _, cx| {
+                                                    if this
+                                                        .expanded_tool_call_raw_inputs
+                                                        .contains(&id)
+                                                    {
+                                                        this.expanded_tool_call_raw_inputs
+                                                            .remove(&id);
+                                                    } else {
+                                                        this.expanded_tool_call_raw_inputs
+                                                            .insert(id.clone());
+                                                    }
+                                                    cx.notify();
                                                 }
-                                                cx.notify();
-                                            }
-                                        })),
-                                )
-                                .when(is_raw_input_expanded, |this| {
-                                    this.children(tool_call.raw_input_markdown.clone().map(
-                                        |input| {
+                                            })),
+                                    )
+                                    .when(is_raw_input_expanded, |this| {
+                                        this.children(tool_call.raw_input_markdown.clone().map(
+                                            |input| {
+                                                self.render_markdown(
+                                                    input,
+                                                    self.markdown_style_for_thread(
+                                                        MarkdownStyle::themed(
+                                                            MarkdownFont::Agent,
+                                                            window,
+                                                            cx,
+                                                        ),
+                                                        cx,
+                                                    ),
+                                                    cx,
+                                                )
+                                            },
+                                        ))
+                                    }),
+                            )
+                        })
+                        .child(self.render_permission_buttons(
+                            self.thread.read(cx).session_id().clone(),
+                            self.is_first_tool_call(active_session_id, &tool_call.id, cx),
+                            options,
+                            entry_ix,
+                            tool_call.id.clone(),
+                            focus_handle,
+                            cx,
+                        ))
+                        .into_any(),
+                    ToolCallStatus::Pending | ToolCallStatus::InProgress
+                        if is_edit
+                            && tool_call.content.is_empty()
+                            && self.as_native_connection(cx).is_some() =>
+                    {
+                        self.render_diff_loading(cx)
+                    }
+                    ToolCallStatus::Pending
+                    | ToolCallStatus::InProgress
+                    | ToolCallStatus::Completed
+                    | ToolCallStatus::Failed
+                    | ToolCallStatus::Canceled => v_flex()
+                        .when(should_show_raw_input, |this| {
+                            this.mt_1p5().w_full().child(
+                                v_flex()
+                                    .ml(rems(0.4))
+                                    .px_3p5()
+                                    .pb_1()
+                                    .gap_1()
+                                    .border_l_1()
+                                    .border_color(self.tool_card_border_color(cx))
+                                    .child(input_output_header("Raw Input:".into()))
+                                    .children(tool_call.raw_input_markdown.clone().map(|input| {
+                                        div().id(("tool-call-raw-input-markdown", entry_ix)).child(
                                             self.render_markdown(
                                                 input,
                                                 self.markdown_style_for_thread(
@@ -8056,65 +8169,14 @@ impl ThreadView {
                                                     cx,
                                                 ),
                                                 cx,
-                                            )
-                                        },
-                                    ))
-                                }),
-                        )
-                    })
-                    .child(self.render_permission_buttons(
-                        self.thread.read(cx).session_id().clone(),
-                        self.is_first_tool_call(active_session_id, &tool_call.id, cx),
-                        options,
-                        entry_ix,
-                        tool_call.id.clone(),
-                        focus_handle,
-                        cx,
-                    ))
-                    .into_any(),
-                ToolCallStatus::Pending | ToolCallStatus::InProgress
-                    if is_edit
-                        && tool_call.content.is_empty()
-                        && self.as_native_connection(cx).is_some() =>
-                {
-                    self.render_diff_loading(cx)
-                }
-                ToolCallStatus::Pending
-                | ToolCallStatus::InProgress
-                | ToolCallStatus::Completed
-                | ToolCallStatus::Failed
-                | ToolCallStatus::Canceled => v_flex()
-                    .when(should_show_raw_input, |this| {
-                        this.mt_1p5().w_full().child(
-                            v_flex()
-                                .ml(rems(0.4))
-                                .px_3p5()
-                                .pb_1()
-                                .gap_1()
-                                .border_l_1()
-                                .border_color(self.tool_card_border_color(cx))
-                                .child(input_output_header("Raw Input:".into()))
-                                .children(tool_call.raw_input_markdown.clone().map(|input| {
-                                    div().id(("tool-call-raw-input-markdown", entry_ix)).child(
-                                        self.render_markdown(
-                                            input,
-                                            self.markdown_style_for_thread(
-                                                MarkdownStyle::themed(MarkdownFont::Agent, window, cx),
-                                                cx,
                                             ),
-                                            cx,
-                                        ),
-                                    )
-                                }))
-                                .child(input_output_header("Output:".into())),
-                        )
-                    })
-                    .children(
-                        tool_call
-                            .content
-                            .iter()
-                            .enumerate()
-                            .map(|(content_ix, content)| {
+                                        )
+                                    }))
+                                    .child(input_output_header("Output:".into())),
+                            )
+                        })
+                        .children(tool_call.content.iter().enumerate().map(
+                            |(content_ix, content)| {
                                 div().id(("tool-call-output", entry_ix)).child(
                                     self.render_tool_call_content(
                                         active_session_id,
@@ -8129,14 +8191,16 @@ impl ThreadView {
                                         cx,
                                     ),
                                 )
-                            }),
-                    )
-                    .when(!use_card_layout, |this| {
-                        let button_id =
-                            SharedString::from(format!("tool_output-collapse-{:?}", tool_call.id));
-                        let tool_call_id = tool_call.id.clone();
+                            },
+                        ))
+                        .when(!use_card_layout, |this| {
+                            let button_id = SharedString::from(format!(
+                                "tool_output-collapse-{:?}",
+                                tool_call.id
+                            ));
+                            let tool_call_id = tool_call.id.clone();
 
-                        this.child(
+                            this.child(
                             div()
                                 .ml(rems(0.4))
                                 .px_3p5()
@@ -8156,14 +8220,14 @@ impl ThreadView {
                                         })),
                                 ),
                         )
-                    })
-                    .into_any(),
-                ToolCallStatus::Rejected => Empty.into_any(),
-            }
-            .into()
-        } else {
-            None
-        };
+                        })
+                        .into_any(),
+                    ToolCallStatus::Rejected => Empty.into_any(),
+                }
+                .into()
+            } else {
+                None
+            };
 
         v_flex()
             .map(|this| {
@@ -9227,14 +9291,17 @@ impl ThreadView {
             } else {
                 h_flex()
                     .w_full()
-                    .child(self.render_markdown(
-                        tool_call.label.clone(),
-                        self.markdown_style_for_thread(
-                            MarkdownStyle::themed(MarkdownFont::Agent, window, cx).with_muted_text(cx),
+                    .child(
+                        self.render_markdown(
+                            tool_call.label.clone(),
+                            self.markdown_style_for_thread(
+                                MarkdownStyle::themed(MarkdownFont::Agent, window, cx)
+                                    .with_muted_text(cx),
+                                cx,
+                            ),
                             cx,
                         ),
-                        cx,
-                    ))
+                    )
                     .into_any()
             })
             .when(!is_edit, |this| this.child(gradient_overlay))
@@ -9481,10 +9548,8 @@ impl ThreadView {
         window: &Window,
         cx: &Context<Self>,
     ) -> AnyElement {
-        let markdown_style = self.markdown_style_for_thread(
-            MarkdownStyle::themed(MarkdownFont::Agent, window, cx),
-            cx,
-        );
+        let markdown_style = self
+            .markdown_style_for_thread(MarkdownStyle::themed(MarkdownFont::Agent, window, cx), cx);
         let output = self
             .render_numbered_read_file_output(
                 markdown.clone(),
@@ -10505,11 +10570,7 @@ impl ThreadView {
     /// (e.g. GLM 5.2 thinking streams up to 1M tokens), which is the main GPU
     /// choke during subagent spawns. Sibling buttons (stop / retry / permission)
     /// are rendered outside the markdown subtree, so they remain clickable.
-    fn markdown_style_for_thread(
-        &self,
-        mut style: MarkdownStyle,
-        cx: &App,
-    ) -> MarkdownStyle {
+    fn markdown_style_for_thread(&self, mut style: MarkdownStyle, cx: &App) -> MarkdownStyle {
         if self.thread.read(cx).status() == ThreadStatus::Generating {
             style.prevent_mouse_interaction = true;
         }
@@ -11333,6 +11394,21 @@ pub(crate) fn reset_fast_mode_warnings(cx: &mut App) {
     .detach();
 }
 
+/// Compact elapsed-time label for the inline retry control in the generating
+/// indicator. Shows one decimal place under a minute (e.g. `1.1s`) so the user
+/// can spot a stuck turn early, then switches to `Xm Ys` for longer waits.
+fn format_retries_elapsed(elapsed: Duration) -> String {
+    let total_secs = elapsed.as_secs();
+    if total_secs >= 60 {
+        let minutes = total_secs / 60;
+        let seconds = total_secs % 60;
+        format!("{}m {}s", minutes, seconds)
+    } else {
+        let tenths = elapsed.subsec_millis() / 100;
+        format!("{}.{}s", total_secs, tenths)
+    }
+}
+
 /// Computes the inclusive slice of native `messages` to fork into a branched
 /// thread.
 ///
@@ -11350,9 +11426,9 @@ fn slice_messages_for_branch(
     let Some(target_id) = up_to else {
         return Some(messages.to_vec());
     };
-    let end = messages.iter().position(|message| {
-        matches!(&**message, agent::Message::User(user) if &user.id == target_id)
-    })?;
+    let end = messages.iter().position(
+        |message| matches!(&**message, agent::Message::User(user) if &user.id == target_id),
+    )?;
     Some(messages.iter().take(end + 1).cloned().collect())
 }
 
@@ -11498,7 +11574,11 @@ mod branch_boundary_tests {
 
     #[test]
     fn transcript_none_up_to_takes_whole_thread() {
-        let entries = vec![entry_user(None, "u1"), entry_assistant(), entry_user(None, "u2")];
+        let entries = vec![
+            entry_user(None, "u1"),
+            entry_assistant(),
+            entry_user(None, "u2"),
+        ];
         assert_eq!(transcript_entry_count(&entries, None), 3);
     }
 

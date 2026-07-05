@@ -427,7 +427,7 @@ async fn run_terminal_tool(
     // this bound the `wait_for_exit.await` after kill would hang indefinitely
     // — the exact "agent waits forever for a simple command" bug.
     const KILL_GRACE_PERIOD: Duration = Duration::from_secs(5);
-    let kill_grace = cx.background_executor().timer(KILL_GRACE_PERIOD);
+    let kill_grace = cx.background_executor().timer(KILL_GRACE_PERIOD).shared();
 
     match timeout {
         Some(timeout) => {

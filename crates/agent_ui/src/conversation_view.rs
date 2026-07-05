@@ -5962,13 +5962,15 @@ pub(crate) mod tests {
         });
     }
 
-    /// Covers the `[<-]`/`[up]`/`[down]`/`[->]` bookend wiring in
-    /// `render_user_prompt_jumps`: the buttons call `scroll_to_top` /
-    /// `scroll_to_end` / `scroll_to_prev_user_prompt` / `scroll_to_next_user_prompt`,
-    /// and this test pins that those methods actually move the `ListState` to the
-    /// expected ends of a multi-turn conversation. The list is drawn first so the
-    /// `ListState` item count is synced during the `list()` layout pass (without a
-    /// draw, `scroll_to_end` has no measured extent to scroll to).
+    /// Covers the `[up]`/`[down]` bookend wiring in `render_user_prompt_jumps`
+    /// and the `scroll_to_prev_user_prompt` / `scroll_to_next_user_prompt`
+    /// helpers (still used by the ScrollOutputToPrevious/NextMessage actions
+    /// even though the prompt-jump strip's prev/next bookends were replaced by
+    /// cross-thread `from`/`to` navigation). The test pins that those methods
+    /// actually move the `ListState` to the expected ends of a multi-turn
+    /// conversation. The list is drawn first so the `ListState` item count is
+    /// synced during the `list()` layout pass (without a draw, `scroll_to_end`
+    /// has no measured extent to scroll to).
     #[gpui::test]
     async fn test_prompt_jump_bookends_scroll_to_ends(cx: &mut TestAppContext) {
         init_test(cx);
@@ -6002,9 +6004,8 @@ pub(crate) mod tests {
         cx.run_until_parked();
 
         let thread_view = active_thread(&conversation_view, cx);
-        let entry_count = thread_view.read_with(cx, |view, cx| {
-            view.thread.read(cx).entries().len()
-        });
+        let entry_count =
+            thread_view.read_with(cx, |view, cx| view.thread.read(cx).entries().len());
         assert_eq!(
             entry_count, 4,
             "expected two user/assistant turns; got {entry_count} entries"
@@ -6048,9 +6049,10 @@ pub(crate) mod tests {
             "scroll_to_end and scroll_to_top should land on different ends"
         );
 
-        // PREV/NEXT bookend wiring: stepping next jumps to the 2nd user prompt
-        // (entry index 2 in [U0, A1, U2, A3]), and stepping prev returns to the
-        // 1st user prompt (entry index 0).
+        // scroll_to_prev/next_user_prompt wiring (used by the
+        // ScrollOutputToPrevious/NextMessage actions): stepping next jumps to
+        // the 2nd user prompt (entry index 2 in [U0, A1, U2, A3]), and stepping
+        // prev returns to the 1st user prompt (entry index 0).
         thread_view.update(cx, |view, cx| {
             view.scroll_to_next_user_prompt(cx);
         });
@@ -6105,9 +6107,8 @@ pub(crate) mod tests {
         cx.run_until_parked();
 
         let thread_view = active_thread(&conversation_view, cx);
-        let entry_count = thread_view.read_with(cx, |view, cx| {
-            view.thread.read(cx).entries().len()
-        });
+        let entry_count =
+            thread_view.read_with(cx, |view, cx| view.thread.read(cx).entries().len());
         assert_eq!(
             entry_count, 2,
             "expected one user/assistant turn; got {entry_count} entries"
@@ -6186,16 +6187,14 @@ pub(crate) mod tests {
         // callback actually executed (items were laid out), not just that the
         // list state has a count.
         draw_real_thread_view(&thread_view, cx);
-        let entry_count_after_first = thread_view.read_with(cx, |view, _cx| {
-            view.list_state.item_count()
-        });
+        let entry_count_after_first =
+            thread_view.read_with(cx, |view, _cx| view.list_state.item_count());
         assert!(
             entry_count_after_first > 0,
             "list should have entries after a turn"
         );
         assert!(
-            thread_view
-                .read_with(cx, |view, _cx| view.list_state.bounds_for_item(0).is_some()),
+            thread_view.read_with(cx, |view, _cx| view.list_state.bounds_for_item(0).is_some()),
             "first entry should have measured bounds after drawing (render_entry executed)"
         );
 
@@ -6244,18 +6243,17 @@ pub(crate) mod tests {
         init_test(cx);
 
         let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(util::path!("/test"), json!({ ".git": {} })).await;
+        fs.insert_tree(util::path!("/test"), json!({ ".git": {} }))
+            .await;
         let project = Project::test(fs.clone(), [util::path!("/test").as_ref()], cx).await;
 
         let connection = StubAgentConnection::new();
-        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
-            MultiWorkspace::test_new(project.clone(), window, cx)
-        });
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
         let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
         let thread_store = cx.update(|_window, cx| cx.new(|cx| ThreadStore::new(cx)));
-        let connection_store = cx.update(|_window, cx| {
-            cx.new(|cx| AgentConnectionStore::new(project.clone(), cx))
-        });
+        let connection_store =
+            cx.update(|_window, cx| cx.new(|cx| AgentConnectionStore::new(project.clone(), cx)));
         let conversation_view = cx.update(|window, cx| {
             cx.new(|cx| {
                 ConversationView::new(
@@ -6287,7 +6285,8 @@ pub(crate) mod tests {
 
         // Start a turn using the pending-turn path (no set_next_prompt_updates,
         // so StubAgentConnection parks on response_tx until end_turn).
-        let send_future = cx.update(|_window, cx| thread.update(cx, |t, cx| t.send_raw("hello", cx)));
+        let send_future =
+            cx.update(|_window, cx| thread.update(cx, |t, cx| t.send_raw("hello", cx)));
         // Let the turn progress: push user message, take old checkpoint, park
         // on connection.prompt (waiting on response_tx).
         cx.run_until_parked();
@@ -6296,16 +6295,16 @@ pub(crate) mod tests {
         // changes the working tree between the old checkpoint (taken at send
         // time) and the end-of-turn checkpoint, so compare_checkpoints returns
         // false and checkpoint.show becomes true.
-        fs.write(Path::new(util::path!("/test/file-0")), b"").await.unwrap();
+        fs.write(Path::new(util::path!("/test/file-0")), b"")
+            .await
+            .unwrap();
         cx.run_until_parked();
 
         // Inject the assistant response content, then complete the turn.
         cx.update(|_window, cx| {
             connection.send_update(
                 session_id.clone(),
-                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
-                    "response".into(),
-                )),
+                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new("response".into())),
                 cx,
             );
         });
@@ -6338,8 +6337,7 @@ pub(crate) mod tests {
         let thread_view = active_thread(&conversation_view, cx);
         draw_real_thread_view(&thread_view, cx);
         assert!(
-            thread_view
-                .read_with(cx, |view, _cx| view.list_state.bounds_for_item(0).is_some()),
+            thread_view.read_with(cx, |view, _cx| view.list_state.bounds_for_item(0).is_some()),
             "entry should render with measured bounds (checkpoint-row code path executed)"
         );
     }
