@@ -420,6 +420,15 @@ async fn run_terminal_tool(
     let mut user_stopped_via_signal = false;
     let wait_for_exit = terminal.wait_for_exit(cx).map_err(|e| e.to_string())?;
 
+    // The grace period given to `wait_for_exit` *after* the process has been
+    // killed. Killing is best-effort: on Windows `sysinfo`'s `Process::kill`
+    // can fail silently (permission denied, PID already reaped), and even on
+    // Unix the pty reader may not observe the child exit immediately. Without
+    // this bound the `wait_for_exit.await` after kill would hang indefinitely
+    // — the exact "agent waits forever for a simple command" bug.
+    const KILL_GRACE_PERIOD: Duration = Duration::from_secs(5);
+    let kill_grace = cx.background_executor().timer(KILL_GRACE_PERIOD);
+
     match timeout {
         Some(timeout) => {
             let timeout_task = cx.background_executor().timer(timeout);
@@ -428,13 +437,25 @@ async fn run_terminal_tool(
                 _ = wait_for_exit.clone().fuse() => {},
                 _ = timeout_task.fuse() => {
                     timed_out = true;
-                    terminal.kill(cx).map_err(|e| e.to_string())?;
-                    wait_for_exit.await;
+                    let _ = terminal.kill(cx);
+                    // Bounded wait: if kill didn't take, proceed with whatever
+                    // output we already have instead of hanging forever.
+                    futures::select! {
+                        _ = wait_for_exit.clone().fuse() => {},
+                        _ = kill_grace.clone().fuse() => {
+                            log::warn!("terminal process did not exit within {KILL_GRACE_PERIOD:?} after kill (timeout path)");
+                        },
+                    }
                 }
                 _ = event_stream.cancelled_by_user().fuse() => {
                     user_stopped_via_signal = true;
-                    terminal.kill(cx).map_err(|e| e.to_string())?;
-                    wait_for_exit.await;
+                    let _ = terminal.kill(cx);
+                    futures::select! {
+                        _ = wait_for_exit.clone().fuse() => {},
+                        _ = kill_grace.clone().fuse() => {
+                            log::warn!("terminal process did not exit within {KILL_GRACE_PERIOD:?} after kill (user-cancel path)");
+                        },
+                    }
                 }
             }
         }
@@ -443,8 +464,13 @@ async fn run_terminal_tool(
                 _ = wait_for_exit.clone().fuse() => {},
                 _ = event_stream.cancelled_by_user().fuse() => {
                     user_stopped_via_signal = true;
-                    terminal.kill(cx).map_err(|e| e.to_string())?;
-                    wait_for_exit.await;
+                    let _ = terminal.kill(cx);
+                    futures::select! {
+                        _ = wait_for_exit.clone().fuse() => {},
+                        _ = kill_grace.clone().fuse() => {
+                            log::warn!("terminal process did not exit within {KILL_GRACE_PERIOD:?} after kill (no-timeout user-cancel path)");
+                        },
+                    }
                 }
             }
         }
