@@ -509,6 +509,11 @@ pub struct ThreadMetadataStore {
     threads_by_paths: HashMap<PathList, HashSet<ThreadId>>,
     threads_by_main_paths: HashMap<PathList, HashSet<ThreadId>>,
     threads_by_session: HashMap<acp::SessionId, ThreadId>,
+    /// Reverse index for `find_continuation_of`: maps a source session id to
+    /// the thread that continues from it. Mirrors `continued_from_session_id`
+    /// so the render-path `to` lookups (prompt-jump strip + sidebar) stay O(1)
+    /// instead of scanning every thread each frame.
+    threads_by_continued_from_session: HashMap<acp::SessionId, ThreadId>,
     reload_task: Option<Shared<Task<()>>>,
     conversation_subscriptions: HashMap<gpui::EntityId, Subscription>,
     pending_thread_ops_tx: async_channel::Sender<DbOperation>,
@@ -685,6 +690,7 @@ impl ThreadMetadataStore {
                     this.threads_by_paths.clear();
                     this.threads_by_main_paths.clear();
                     this.threads_by_session.clear();
+                    this.threads_by_continued_from_session.clear();
 
                     for row in rows {
                         this.cache_thread_metadata(row);
@@ -784,25 +790,21 @@ impl ThreadMetadataStore {
     /// Reverse lookup: find the thread that continues from `session_id`
     /// (i.e. was created as a summary continuation of it). Returns the
     /// continuation thread's id + title if one exists.
+    ///
+    /// O(1) via `threads_by_continued_from_session`. This is on the hot render
+    /// path (prompt-jump strip + sidebar), so it must not scan all threads.
     pub fn find_continuation_of(
         &self,
         session_id: &acp::SessionId,
     ) -> Option<(ThreadId, Option<SharedString>)> {
-        self.threads.values().find_map(|m| {
-            if m.continued_from_session_id.as_ref() == Some(session_id) {
-                Some((m.thread_id, m.title()))
-            } else {
-                None
-            }
-        })
+        let thread_id = self.threads_by_continued_from_session.get(session_id)?;
+        let metadata = self.threads.get(thread_id)?;
+        Some((metadata.thread_id, metadata.title()))
     }
 
     /// Forward lookup: get the source thread metadata that `thread_id` was
     /// continued from.
-    pub fn continued_from(
-        &self,
-        thread_id: ThreadId,
-    ) -> Option<(acp::SessionId, SharedString)> {
+    pub fn continued_from(&self, thread_id: ThreadId) -> Option<(acp::SessionId, SharedString)> {
         let m = self.threads.get(&thread_id)?;
         let from_session_id = m.continued_from_session_id.clone()?;
         let title = self
@@ -845,11 +847,36 @@ impl ThreadMetadataStore {
     }
 
     fn cache_thread_metadata(&mut self, metadata: ThreadMetadata) {
+        // If this thread is already cached, drop its old reverse-continuation
+        // mapping before reinserting below, so a changed (or cleared)
+        // `continued_from_session_id` doesn't leave a stale entry pointing at
+        // this thread.
+        if let Some(old) = self.threads.get(&metadata.thread_id) {
+            if let Some(old_from) = old.continued_from_session_id.as_ref() {
+                if self
+                    .threads_by_continued_from_session
+                    .get(old_from)
+                    .map(|id| *id == metadata.thread_id)
+                    .unwrap_or(false)
+                {
+                    self.threads_by_continued_from_session.remove(old_from);
+                }
+            }
+        }
+
         // Drafts may not have a session_id yet; only index by session
         // when one is present.
         if let Some(session_id) = metadata.session_id.as_ref() {
             self.threads_by_session
                 .insert(session_id.clone(), metadata.thread_id);
+        }
+
+        // Maintain the reverse continuation index. Each source session is
+        // assumed to have at most one continuation (auto_prompt creates exactly
+        // one), matching the previous `find_map`-based single-result semantics.
+        if let Some(from_session_id) = metadata.continued_from_session_id.as_ref() {
+            self.threads_by_continued_from_session
+                .insert(from_session_id.clone(), metadata.thread_id);
         }
 
         self.threads.insert(metadata.thread_id, metadata.clone());
@@ -1224,6 +1251,16 @@ impl ThreadMetadataStore {
             if let Some(sid) = &thread.session_id {
                 self.threads_by_session.remove(sid);
             }
+            if let Some(from_sid) = thread.continued_from_session_id.as_ref() {
+                if self
+                    .threads_by_continued_from_session
+                    .get(from_sid)
+                    .map(|id| *id == thread_id)
+                    .unwrap_or(false)
+                {
+                    self.threads_by_continued_from_session.remove(from_sid);
+                }
+            }
             if let Some(thread_ids) = self.threads_by_paths.get_mut(thread.folder_paths()) {
                 thread_ids.remove(&thread_id);
             }
@@ -1323,6 +1360,7 @@ impl ThreadMetadataStore {
             threads_by_paths: HashMap::default(),
             threads_by_main_paths: HashMap::default(),
             threads_by_session: HashMap::default(),
+            threads_by_continued_from_session: HashMap::default(),
             reload_task: None,
             conversation_subscriptions: HashMap::default(),
             pending_thread_ops_tx: tx,
@@ -1433,7 +1471,8 @@ impl ThreadMetadataStore {
             worktree_paths,
             remote_connection,
             archived,
-            continued_from_session_id: existing_thread.and_then(|t| t.continued_from_session_id.clone()),
+            continued_from_session_id: existing_thread
+                .and_then(|t| t.continued_from_session_id.clone()),
         };
 
         self.save(metadata, cx);
@@ -1618,10 +1657,7 @@ impl ThreadMetadataDb {
         let title_override = row.title_override.as_ref().map(|t| t.to_string());
         let thread_id = row.thread_id;
         let archived = row.archived;
-        let continued_from_session_id = row
-            .continued_from_session_id
-            .as_ref()
-            .map(|s| s.0.clone());
+        let continued_from_session_id = row.continued_from_session_id.as_ref().map(|s| s.0.clone());
 
         self.write(move |conn| {
             let sql = "INSERT INTO sidebar_threads(thread_id, session_id, agent_id, title, updated_at, created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, main_worktree_paths_order, remote_connection, title_override, continued_from_session_id) \
@@ -2214,9 +2250,11 @@ mod tests {
             assert_eq!(found_title.as_deref(), Some("Continued Thread"));
 
             // No false positive: a random session id finds nothing.
-            assert!(store
-                .find_continuation_of(&acp::SessionId::new("nonexistent"))
-                .is_none());
+            assert!(
+                store
+                    .find_continuation_of(&acp::SessionId::new("nonexistent"))
+                    .is_none()
+            );
 
             // The source thread itself has no continued_from.
             assert!(store.continued_from(source_thread_id).is_none());
@@ -2287,8 +2325,101 @@ mod tests {
 
             // And the reverse lookup on the source should find it.
             assert_eq!(
-                store.find_continuation_of(&source_session_id).map(|(id, _)| id),
+                store
+                    .find_continuation_of(&source_session_id)
+                    .map(|(id, _)| id),
                 Some(continuation_thread_id)
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_find_continuation_of_reflects_updates_and_deletes(cx: &mut TestAppContext) {
+        // Exercises the reverse index (`threads_by_continued_from_session`)
+        // maintenance: after a thread's `continued_from_session_id` changes,
+        // or after a continuation thread is deleted, `find_continuation_of`
+        // must not return a stale result.
+        init_test(cx);
+
+        let source_a = make_metadata("source-a", "Source A", Utc::now(), PathList::default());
+        let source_b = make_metadata("source-b", "Source B", Utc::now(), PathList::default());
+        let source_a_session = source_a.session_id.clone().unwrap();
+        let source_b_session = source_b.session_id.clone().unwrap();
+
+        let mut continuation =
+            make_metadata("continuation", "Continued", Utc::now(), PathList::default());
+        continuation.continued_from_session_id = Some(source_a_session.clone());
+        let continuation_thread_id = continuation.thread_id;
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.save(source_a, cx);
+                store.save(source_b, cx);
+                store.save(continuation, cx);
+            });
+        });
+
+        cx.run_until_parked();
+
+        // Initially: continuation points back to source A.
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            let store = store.read(cx);
+            assert_eq!(
+                store
+                    .find_continuation_of(&source_a_session)
+                    .map(|(id, _)| id),
+                Some(continuation_thread_id)
+            );
+            assert!(store.find_continuation_of(&source_b_session).is_none());
+        });
+
+        // Re-save the continuation pointing at source B instead.
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            store.update(cx, |store, cx| {
+                let mut updated = store.entry(continuation_thread_id).unwrap().clone();
+                updated.continued_from_session_id = Some(source_b_session.clone());
+                store.save(updated, cx);
+            });
+        });
+
+        cx.run_until_parked();
+
+        // The old reverse mapping (A -> continuation) must be gone, the new
+        // one (B -> continuation) must be present.
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            let store = store.read(cx);
+            assert!(
+                store.find_continuation_of(&source_a_session).is_none(),
+                "stale reverse mapping for source A should be removed"
+            );
+            assert_eq!(
+                store
+                    .find_continuation_of(&source_b_session)
+                    .map(|(id, _)| id),
+                Some(continuation_thread_id)
+            );
+        });
+
+        // Delete the continuation thread; the reverse mapping for B must go.
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.delete(continuation_thread_id, cx);
+            });
+        });
+
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            let store = store.read(cx);
+            assert!(
+                store.find_continuation_of(&source_b_session).is_none(),
+                "reverse mapping should be removed after deletion"
             );
         });
     }
