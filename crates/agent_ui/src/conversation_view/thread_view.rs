@@ -6585,6 +6585,14 @@ impl ThreadView {
     /// The whole strip is rendered whenever there is at least one user prompt,
     /// so a single-prompt thread (which may still contain a long assistant
     /// response) still gets end-to-end navigation.
+    ///
+    /// Performance: the numbered prompt buttons are O(n) in the prompt count
+    /// and this runs on every render frame. To stay cheap while a long thread
+    /// is streaming we (a) skip the numbered buttons entirely while the thread
+    /// is `Generating` (same gating pattern as `markdown_style_for_thread`),
+    /// since mid-stream prompt jumping is not useful, and (b) cap the visible
+    /// buttons to the first/last `PROMPT_BUTTON_EDGE_WINDOW` with an ellipsis
+    /// in between, so a 200-prompt thread renders ~20 buttons, not 200.
     fn render_user_prompt_jumps(&self, cx: &Context<Self>) -> Option<Div> {
         let entries = self.thread.read(cx).entries();
         let user_prompt_count = entries
@@ -6594,6 +6602,11 @@ impl ThreadView {
         if user_prompt_count == 0 {
             return None;
         }
+
+        // The numbered buttons are the only O(n)-in-prompt-count part of this
+        // strip, and the thread re-renders on every streamed token. Skip them
+        // while generating (from/to + top/bottom remain, all O(1)).
+        let is_generating = self.thread.read(cx).status() == ThreadStatus::Generating;
 
         // Cross-thread continuation links. `from` = the source thread this one
         // was summarized from; `to` = the thread that continues from this one.
@@ -6654,27 +6667,12 @@ impl ThreadView {
                 })),
         );
 
-        // Numbered prompt buttons: only render when there are multiple prompts,
-        // since a lone `[1]` is redundant with the TOP bookend.
-        if user_prompt_count > 1 {
-            for index in 0..user_prompt_count {
-                buttons = buttons.child(
-                    div()
-                        .id(("prompt-jump", index))
-                        .px_1()
-                        .rounded_sm()
-                        .hover(|s| s.bg(cx.theme().colors().element_hover))
-                        .tooltip(Tooltip::text(format!("Jump to prompt {}", index + 1)))
-                        .child(
-                            Label::new(format!("{}", index + 1))
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
-                        )
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.scroll_to_user_prompt(index, cx);
-                        })),
-                );
-            }
+        // Numbered prompt buttons: only render when there are multiple prompts
+        // AND the thread is idle. While generating, mid-stream prompt jumping
+        // is not useful and the buttons are O(n) in the prompt count, so we
+        // skip them to keep the per-token re-render cheap.
+        if user_prompt_count > 1 && !is_generating {
+            buttons = buttons.children(self.render_numbered_prompt_buttons(user_prompt_count, cx));
         }
 
         // BOTTOM bookend: jump to the very last entry.
@@ -6708,6 +6706,79 @@ impl ThreadView {
         }
 
         Some(buttons)
+    }
+
+    /// Renders the numbered `[1] [2] ... [N]` prompt-jump buttons, capped at
+    /// `2 * PROMPT_BUTTON_EDGE_WINDOW` entries with an ellipsis in the middle
+    /// when the thread has more prompts than `PROMPT_BUTTON_CAP`. Each button
+    /// scrolls its prompt to the top of the viewport on click.
+    ///
+    /// Returns a `Vec` so the caller can splice it into the strip with a single
+    /// `.children(...)` call.
+    fn render_numbered_prompt_buttons(
+        &self,
+        user_prompt_count: usize,
+        cx: &Context<Self>,
+    ) -> Vec<AnyElement> {
+        /// How many buttons to render at each edge (head + tail) once the cap
+        /// is exceeded. Tuned so a 200-prompt thread renders ~20 buttons.
+        const PROMPT_BUTTON_EDGE_WINDOW: usize = 10;
+        /// Threshold above which we collapse the middle of the range. Must be
+        /// at least `2 * PROMPT_BUTTON_EDGE_WINDOW` so the capped form never
+        /// drops buttons that the full form would have shown.
+        const PROMPT_BUTTON_CAP: usize = 2 * PROMPT_BUTTON_EDGE_WINDOW;
+
+        // Indices (0-based, in prompt order) of the buttons to render.
+        let rendered_indices: Vec<usize> = if user_prompt_count <= PROMPT_BUTTON_CAP {
+            (0..user_prompt_count).collect()
+        } else {
+            let tail_start = user_prompt_count - PROMPT_BUTTON_EDGE_WINDOW;
+            let mut indices = (0..PROMPT_BUTTON_EDGE_WINDOW).collect::<Vec<_>>();
+            indices.extend(tail_start..user_prompt_count);
+            indices
+        };
+        let needs_ellipsis = user_prompt_count > PROMPT_BUTTON_CAP;
+
+        let mut out = Vec::with_capacity(rendered_indices.len() + usize::from(needs_ellipsis));
+        let mut last_rendered = None;
+        for prompt_index in rendered_indices {
+            // When we see a gap between consecutive rendered indices, insert a
+            // non-interactive ellipsis marker once.
+            if needs_ellipsis && last_rendered.is_some_and(|prev| prompt_index > prev + 1) {
+                out.push(
+                    div()
+                        .child(
+                            Label::new("\u{2026}")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Disabled),
+                        )
+                        .into_any_element(),
+                );
+            }
+            last_rendered = Some(prompt_index);
+
+            out.push(
+                div()
+                    .id(("prompt-jump", prompt_index))
+                    .px_1()
+                    .rounded_sm()
+                    .hover(|s| s.bg(cx.theme().colors().element_hover))
+                    .tooltip(Tooltip::text(format!(
+                        "Jump to prompt {}",
+                        prompt_index + 1
+                    )))
+                    .child(
+                        Label::new(format!("{}", prompt_index + 1))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.scroll_to_user_prompt(prompt_index, cx);
+                    }))
+                    .into_any_element(),
+            );
+        }
+        out
     }
 
     fn handle_feedback_click(
