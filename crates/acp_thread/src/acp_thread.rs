@@ -1838,8 +1838,15 @@ impl AcpThread {
         // streaming instead of appending all at once which may feel more choppy.
         if let acp::ContentBlock::Text(text_content) = &chunk {
             if let Some(markdown) = self.streaming_markdown_target(is_thought, indented) {
-                let entries_len = self.entries.len();
-                cx.emit(AcpThreadEvent::EntryUpdated(entries_len - 1));
+                // Note: no EntryUpdated emit here — the text is only buffered,
+                // not yet in the Markdown source. The reveal task's
+                // `markdown.append()` will trigger `cx.notify()` +
+                // `cx.refresh_windows()` when the text actually lands, which
+                // drives both the MarkdownElement re-render and the list item
+                // height remeasure. Emitting EntryUpdated here would cause a
+                // `list_state.remeasure_items()` per token chunk (100+/sec
+                // during fast streaming), each rebuilding the sum tree — a
+                // major source of foreground-thread choke.
                 self.buffer_streaming_text(&markdown, text_content.text.clone(), cx);
                 return;
             }
