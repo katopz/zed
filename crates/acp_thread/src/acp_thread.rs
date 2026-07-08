@@ -1258,11 +1258,18 @@ struct StreamingTextBuffer {
 }
 
 impl StreamingTextBuffer {
-    /// The number of milliseconds between each timer tick, controlling how quickly
-    /// text is revealed.
-    const TASK_UPDATE_MS: u64 = 16;
-    /// The time in milliseconds to reveal the entire pending text.
-    const REVEAL_TARGET: f32 = 200.0;
+    /// The number of milliseconds between each timer tick. Each tick drains
+    /// pending text into the Markdown source, which triggers a background parse
+    /// and `cx.refresh_windows()` — forcing every window to re-render.
+    ///
+    /// At 16ms (60fps) the repaint churn from a single streaming response can
+    /// freeze the UI on long outputs. 300ms (~3fps) keeps the foreground
+    /// thread responsive so it can still pump the incoming HTTP stream.
+    const TASK_UPDATE_MS: u64 = 300;
+    /// The time in milliseconds to reveal the entire pending text. Set equal to
+    /// `TASK_UPDATE_MS` so buffered text drains in a single tick — text arrives
+    /// from the model in bursts and is flushed every `TASK_UPDATE_MS`.
+    const REVEAL_TARGET: f32 = 300.0;
 }
 
 impl From<&AcpThread> for ActionLogTelemetry {

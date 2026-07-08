@@ -622,6 +622,12 @@ pub struct ThreadView {
     pub show_codex_windows_warning: bool,
     pub multi_root_callout_dismissed: bool,
     pub generating_indicator_in_list: bool,
+    /// Whether the mouse is currently hovering over the conversation message
+    /// list. While generating, markdown bodies are non-interactive unless this
+    /// is true — saving the per-frame hit-testing / hover / selection cost on
+    /// large streamed bodies, while still allowing the user to select/copy text
+    /// by moving the mouse into the panel.
+    pub conversation_hovered: bool,
     pub skill_loading_errors: Vec<SkillLoadingError>,
     /// Errors the user has explicitly dismissed. Each entry is matched against
     /// emitted errors by full equality; when an error no longer appears in the
@@ -1011,6 +1017,7 @@ impl ThreadView {
             show_codex_windows_warning,
             multi_root_callout_dismissed: false,
             generating_indicator_in_list: false,
+            conversation_hovered: false,
             skill_loading_errors: Vec::new(),
             dismissed_skill_loading_errors: HashSet::default(),
         };
@@ -10699,15 +10706,18 @@ impl ThreadView {
 
     /// Applies the thread-generation gate to a markdown style.
     ///
-    /// While the thread (or any of its running subagents) is generating, all
-    /// rendered text/code/markdown bodies are forced into static, non-interactive
-    /// mode (`prevent_mouse_interaction = true`). This kills the per-frame
-    /// hit-testing / hover / selection machinery on large streamed bodies
-    /// (e.g. GLM 5.2 thinking streams up to 1M tokens), which is the main GPU
-    /// choke during subagent spawns. Sibling buttons (stop / retry / permission)
-    /// are rendered outside the markdown subtree, so they remain clickable.
+    /// While the thread is generating, markdown bodies are forced into static,
+    /// non-interactive mode (`prevent_mouse_interaction = true`) — UNLESS the
+    /// mouse is hovering over the conversation panel. This kills the per-frame
+    /// hit-testing / hover / selection machinery on large streamed bodies (the
+    /// main GPU choke during long outputs), while still letting the user
+    /// select/copy text by moving the mouse into the panel. Sibling buttons
+    /// (stop / retry / permission) render outside the markdown subtree, so they
+    /// remain clickable regardless.
     fn markdown_style_for_thread(&self, mut style: MarkdownStyle, cx: &App) -> MarkdownStyle {
-        if self.thread.read(cx).status() == ThreadStatus::Generating {
+        if self.thread.read(cx).status() == ThreadStatus::Generating
+            && !self.conversation_hovered
+        {
             style.prevent_mouse_interaction = true;
         }
         style
@@ -11140,9 +11150,20 @@ impl Render for ThreadView {
         let list_state = self.list_state.clone();
 
         let conversation = v_flex()
+            .id("conversation-panel")
             .when(self.resumed_without_history, |this| {
                 this.child(Self::render_resume_notice(cx))
             })
+            // Track whether the mouse is over the conversation panel so that
+            // `markdown_style_for_thread` can keep markdown bodies
+            // non-interactive (cheap prepaint) while generating, and only
+            // enable hit-testing/selection when the user is actually hovering.
+            .on_hover(cx.listener(|this, hovered, _window, cx| {
+                if this.conversation_hovered != *hovered {
+                    this.conversation_hovered = *hovered;
+                    cx.notify();
+                }
+            }))
             .map(|this| {
                 if has_messages {
                     this.flex_1()
