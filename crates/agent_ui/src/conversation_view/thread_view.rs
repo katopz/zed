@@ -628,6 +628,15 @@ pub struct ThreadView {
     /// large streamed bodies, while still allowing the user to select/copy text
     /// by moving the mouse into the panel.
     pub conversation_hovered: bool,
+    /// Whether the conversation list is currently being scrolled (via scroll
+    /// wheel or drag). While scrolling, markdown bodies are forced
+    /// non-interactive even if the mouse is over the panel — the user is
+    /// navigating, not selecting text, and skipping hit-testing during scroll
+    /// frames keeps them smooth.
+    pub is_scrolling: bool,
+    /// Debounce task that clears `is_scrolling` after a short period of no
+    /// scroll-wheel activity.
+    pub _scroll_clear_task: Option<Task<()>>,
     pub skill_loading_errors: Vec<SkillLoadingError>,
     /// Errors the user has explicitly dismissed. Each entry is matched against
     /// emitted errors by full equality; when an error no longer appears in the
@@ -1018,6 +1027,8 @@ impl ThreadView {
             multi_root_callout_dismissed: false,
             generating_indicator_in_list: false,
             conversation_hovered: false,
+            is_scrolling: false,
+            _scroll_clear_task: None,
             skill_loading_errors: Vec::new(),
             dismissed_skill_loading_errors: HashSet::default(),
         };
@@ -10708,15 +10719,16 @@ impl ThreadView {
     ///
     /// While the thread is generating, markdown bodies are forced into static,
     /// non-interactive mode (`prevent_mouse_interaction = true`) — UNLESS the
-    /// mouse is hovering over the conversation panel. This kills the per-frame
-    /// hit-testing / hover / selection machinery on large streamed bodies (the
-    /// main GPU choke during long outputs), while still letting the user
-    /// select/copy text by moving the mouse into the panel. Sibling buttons
-    /// (stop / retry / permission) render outside the markdown subtree, so they
-    /// remain clickable regardless.
+    /// mouse is hovering over the conversation panel AND the user is not
+    /// scrolling. This kills the per-frame hit-testing / hover / selection
+    /// machinery on large streamed bodies (the main GPU choke during long
+    /// outputs), while still letting the user select/copy text by moving the
+    /// mouse into the panel and stopping. Sibling buttons (stop / retry /
+    /// permission) render outside the markdown subtree, so they remain
+    /// clickable regardless.
     fn markdown_style_for_thread(&self, mut style: MarkdownStyle, cx: &App) -> MarkdownStyle {
         if self.thread.read(cx).status() == ThreadStatus::Generating
-            && !self.conversation_hovered
+            && (!self.conversation_hovered || self.is_scrolling)
         {
             style.prevent_mouse_interaction = true;
         }
@@ -11161,6 +11173,25 @@ impl Render for ThreadView {
             .on_hover(cx.listener(|this, hovered, _window, cx| {
                 if this.conversation_hovered != *hovered {
                     this.conversation_hovered = *hovered;
+                    cx.notify();
+                }
+            }))
+            // While the user is scrolling the conversation list, keep markdown
+            // bodies non-interactive so scroll frames stay smooth. The flag is
+            // cleared by a debounce task 200ms after the last scroll-wheel event.
+            .on_scroll_wheel(cx.listener(|this, _event, _window, cx| {
+                let was_scrolling = this.is_scrolling;
+                this.is_scrolling = true;
+                this._scroll_clear_task = Some(cx.spawn(async move |this, cx| {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(200))
+                        .await;
+                    let _ = this.update(cx, |this, cx| {
+                        this.is_scrolling = false;
+                        cx.notify();
+                    });
+                }));
+                if !was_scrolling {
                     cx.notify();
                 }
             }))
