@@ -1317,12 +1317,44 @@ impl ThreadView {
         self.turn_fields._turn_timer_task = Some(cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
-                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                // Skip the notify while text is actively streaming: the Markdown
+                // background parser already calls `cx.refresh_windows()` on each
+                // parse completion (many times per second), which drives the
+                // elapsed/retry display repaints. This timer's `cx.notify()` is
+                // only useful when the turn is *blocked* (tool call running,
+                // awaiting confirmation) and no streaming repaints are happening.
+                let should_continue = this
+                    .update(cx, |this, cx| {
+                        let is_streaming = this.is_actively_streaming(cx);
+                        if !is_streaming {
+                            cx.notify();
+                        }
+                    })
+                    .is_ok();
+                if !should_continue {
                     break;
                 }
             }
         }));
         generation
+    }
+
+    /// Returns true when the model is actively streaming text into a markdown
+    /// body. While this is the case, the Markdown background parser fires
+    /// `cx.refresh_windows()` on each parse completion (many times per second),
+    /// which already drives the elapsed/retry display repaints. The
+    /// `_turn_timer_task` can safely skip its own `cx.notify()` during these
+    /// periods to avoid piling an extra full-ThreadView repaint onto an
+    /// already-busy frame budget.
+    fn is_actively_streaming(&self, cx: &App) -> bool {
+        let thread = self.thread.read(cx);
+        if thread.status() != ThreadStatus::Generating {
+            return false;
+        }
+        // No streaming repaints happen while a tool call is running or the
+        // thread is blocked on confirmation — the timer is the only thing
+        // keeping the elapsed display alive in those states.
+        !thread.has_in_progress_tool_calls()
     }
 
     pub fn stop_turn(&mut self, generation: usize, _cx: &mut Context<Self>) {
@@ -2747,7 +2779,6 @@ impl ThreadView {
         let thread = self.thread.read(cx);
         let action_log = thread.action_log();
         let telemetry = ActionLogTelemetry::from(thread);
-        let changed_buffers = action_log.read(cx).changed_buffers(cx).collect::<Vec<_>>();
         let plan = thread.plan();
         let queue_is_empty = !self.has_queued_messages();
 
@@ -2755,6 +2786,29 @@ impl ThreadView {
             .render_main_agent_awaiting_permission(window, cx)
             .or_else(|| self.render_subagents_awaiting_permission(cx));
         let has_awaiting_permission = awaiting_permission.is_some();
+
+        // Defer the `changed_buffers` collect until after the cheap early-exit
+        // checks. `changed_buffers` calls `has_edits` on every tracked buffer,
+        // which builds a diff snapshot — moderately expensive per buffer, and
+        // this runs on every repaint during streaming.
+        //
+        // Fast path: when none of the other sections (plan, queue, permission)
+        // would render either, probe only the first changed buffer to decide
+        // the early return — avoid allocating a Vec just to check `is_empty()`.
+        let changed_buffers = if plan.is_empty() && queue_is_empty && !has_awaiting_permission {
+            let mut iter = action_log.read(cx).changed_buffers(cx);
+            match iter.next() {
+                None => Vec::new(),
+                Some(first) => {
+                    let mut buffers = Vec::with_capacity(1);
+                    buffers.push(first);
+                    buffers.extend(iter);
+                    buffers
+                }
+            }
+        } else {
+            action_log.read(cx).changed_buffers(cx).collect::<Vec<_>>()
+        };
 
         if changed_buffers.is_empty()
             && plan.is_empty()
@@ -6594,19 +6648,30 @@ impl ThreadView {
     /// buttons to the first/last `PROMPT_BUTTON_EDGE_WINDOW` with an ellipsis
     /// in between, so a 200-prompt thread renders ~20 buttons, not 200.
     fn render_user_prompt_jumps(&self, cx: &Context<Self>) -> Option<Div> {
-        let entries = self.thread.read(cx).entries();
-        let user_prompt_count = entries
+        let thread = self.thread.read(cx);
+        let is_generating = thread.status() == ThreadStatus::Generating;
+        let entries = thread.entries();
+
+        // While generating, the numbered buttons are skipped entirely (see
+        // below), so we only need to know whether *any* user prompt exists —
+        // `any()` short-circuits instead of scanning the full entry list.
+        let has_user_prompt = entries
             .iter()
-            .filter(|e| matches!(e, AgentThreadEntry::UserMessage(_)))
-            .count();
-        if user_prompt_count == 0 {
+            .any(|e| matches!(e, AgentThreadEntry::UserMessage(_)));
+        if !has_user_prompt {
             return None;
         }
-
-        // The numbered buttons are the only O(n)-in-prompt-count part of this
-        // strip, and the thread re-renders on every streamed token. Skip them
-        // while generating (from/to + top/bottom remain, all O(1)).
-        let is_generating = self.thread.read(cx).status() == ThreadStatus::Generating;
+        // Exact count is only needed when we render the numbered buttons (idle
+        // threads with multiple prompts). During generation the strip only shows
+        // from/to + top/bottom, all O(1).
+        let user_prompt_count = if is_generating {
+            0
+        } else {
+            entries
+                .iter()
+                .filter(|e| matches!(e, AgentThreadEntry::UserMessage(_)))
+                .count()
+        };
 
         // Cross-thread continuation links. `from` = the source thread this one
         // was summarized from; `to` = the thread that continues from this one.
