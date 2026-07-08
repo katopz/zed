@@ -11583,8 +11583,10 @@ pub(crate) fn reset_fast_mode_warnings(cx: &mut App) {
 }
 
 /// Compact elapsed-time label for the inline retry control in the generating
-/// indicator. Shows one decimal place under a minute (e.g. `1.1s`) so the user
-/// can spot a stuck turn early, then switches to `Xm Ys` for longer waits.
+/// indicator. Uses whole seconds only — the thread re-renders on every streamed
+/// token and every spinner animation frame, so sub-second precision (tenths)
+/// would produce a different string on every repaint, forcing the text layout
+/// system to re-shape the label 60+ times/second.
 fn format_retries_elapsed(elapsed: Duration) -> String {
     let total_secs = elapsed.as_secs();
     if total_secs >= 60 {
@@ -11592,8 +11594,7 @@ fn format_retries_elapsed(elapsed: Duration) -> String {
         let seconds = total_secs % 60;
         format!("{}m {}s", minutes, seconds)
     } else {
-        let tenths = elapsed.subsec_millis() / 100;
-        format!("{}.{}s", total_secs, tenths)
+        format!("{}s", total_secs)
     }
 }
 
