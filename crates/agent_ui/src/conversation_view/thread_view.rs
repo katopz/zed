@@ -6721,9 +6721,13 @@ impl ThreadView {
         let mut buttons = h_flex().w_full().px_5().py_1().gap_1().items_center();
 
         // FROM bookend: jump to the source thread this one was continued from.
-        // Only rendered when the continuation link exists.
+        // Only rendered when the continuation link exists. The continuation is
+        // a separate top-level thread, so route through the AgentPanel (which
+        // resolves the session id to a thread id and loads it) instead of the
+        // ConversationView, which can only switch between already-loaded
+        // sub-threads in this view.
         if let Some((from_session_id, from_title)) = continuation_from {
-            let server_view = self.server_view.clone();
+            let workspace = self.workspace.clone();
             buttons = buttons.child(
                 IconButton::new("prompt-jump-from", IconName::ArrowLeft)
                     .shape(ui::IconButtonShape::Square)
@@ -6731,8 +6735,20 @@ impl ThreadView {
                     .icon_color(Color::Accent)
                     .tooltip(Tooltip::text(format!("from: {}", from_title)))
                     .on_click(move |_, window, cx| {
-                        let _ = server_view.update(cx, |server_view, cx| {
-                            server_view.navigate_to_thread(from_session_id.clone(), window, cx);
+                        let Some(workspace) = workspace.upgrade() else {
+                            return;
+                        };
+                        let Some(panel) = workspace.read(cx).panel::<crate::AgentPanel>(cx) else {
+                            return;
+                        };
+                        panel.update(cx, |panel, cx| {
+                            panel.open_thread(
+                                from_session_id.clone(),
+                                None,
+                                None,
+                                window,
+                                cx,
+                            );
                         });
                     }),
             );
@@ -6771,9 +6787,10 @@ impl ThreadView {
         );
 
         // TO bookend: jump to the thread that continues from this one.
-        // Only rendered when the continuation link exists.
+        // Only rendered when the continuation link exists. Routed through the
+        // AgentPanel for the same reason as the FROM bookend above.
         if let Some((to_session_id, to_title)) = continuation_to {
-            let server_view = self.server_view.clone();
+            let workspace = self.workspace.clone();
             buttons = buttons.child(
                 IconButton::new("prompt-jump-to", IconName::ArrowRight)
                     .shape(ui::IconButtonShape::Square)
@@ -6781,8 +6798,20 @@ impl ThreadView {
                     .icon_color(Color::Accent)
                     .tooltip(Tooltip::text(format!("to: {}", to_title)))
                     .on_click(move |_, window, cx| {
-                        let _ = server_view.update(cx, |server_view, cx| {
-                            server_view.navigate_to_thread(to_session_id.clone(), window, cx);
+                        let Some(workspace) = workspace.upgrade() else {
+                            return;
+                        };
+                        let Some(panel) = workspace.read(cx).panel::<crate::AgentPanel>(cx) else {
+                            return;
+                        };
+                        panel.update(cx, |panel, cx| {
+                            panel.open_thread(
+                                to_session_id.clone(),
+                                None,
+                                None,
+                                window,
+                                cx,
+                            );
                         });
                     }),
             );
