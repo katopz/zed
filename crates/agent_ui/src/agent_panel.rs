@@ -1419,6 +1419,13 @@ pub struct AgentPanel {
     last_context_source: Option<AgentContextSource>,
 
     is_active: bool,
+    /// Whether the mouse is currently hovering over the agent panel's surface
+    /// (thread view, chat input, toolbar). Used to suppress automated focus
+    /// steals (e.g. auto_prompt creating a new background thread) while the
+    /// user is actively reading or interacting inside the panel. Explicit
+    /// user actions (clicking a thread in the history) are unaffected because
+    /// they drive focus directly rather than via the automated path.
+    panel_hovered: bool,
 }
 
 impl AgentPanel {
@@ -1826,6 +1833,7 @@ impl AgentPanel {
             _thread_metadata_store_subscription,
             last_context_source: None,
             is_active: false,
+            panel_hovered: false,
         };
 
         panel.ensure_native_agent_connection(cx);
@@ -2149,6 +2157,13 @@ impl AgentPanel {
 
     pub fn set_auto_prompt_enabled(&mut self, enabled: bool) {
         self.auto_prompt_enabled = enabled;
+    }
+
+    /// Whether the mouse is currently over the panel's surface. The auto_prompt
+    /// new-thread path consults this to decide whether stealing keyboard focus
+    /// would disrupt the user (who is reading or typing inside the panel).
+    pub fn panel_hovered(&self) -> bool {
+        self.panel_hovered
     }
 
     pub fn new_external_agent_thread(
@@ -6938,10 +6953,20 @@ impl Render for AgentPanel {
         // - Files can be dropped into the panel
         let content = v_flex()
             .key_context(self.key_context())
+            .id("agent-panel")
             .relative()
             .size_full()
             .justify_between()
             .bg(cx.theme().colors().panel_background)
+            // Track whether the mouse is over the panel so the auto_prompt
+            // new-thread path can suppress focus stealing while the user is
+            // actively reading or interacting inside the panel.
+            .on_hover(cx.listener(|this, hovered, _window, cx| {
+                if this.panel_hovered != *hovered {
+                    this.panel_hovered = *hovered;
+                    cx.notify();
+                }
+            }))
             .on_action(cx.listener(|this, action: &NewThread, window, cx| {
                 this.new_thread(action, window, cx);
             }))

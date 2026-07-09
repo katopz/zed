@@ -402,12 +402,21 @@ pub(crate) fn dispatch_action(
 
     window.defer(cx, move |window, cx| {
         let _ = workspace.update(cx, |workspace, cx| {
-            workspace.focus_panel::<crate::AgentPanel>(window, cx);
-
             let Some(panel) = workspace.panel::<crate::AgentPanel>(cx) else {
                 log::warn!("[auto_prompt] dispatch_action: AgentPanel not found in workspace");
                 return;
             };
+
+            // If the user is actively hovering over the panel (reading a
+            // thread, sitting in the chat input, etc.), don't steal focus:
+            // skip raising the panel to keyboard focus and tell
+            // `external_thread` not to focus the new thread's input. The new
+            // thread is still created and becomes the panel's base view, but
+            // keyboard focus stays where the user left it.
+            let suppress_focus = panel.read(cx).panel_hovered();
+            if !suppress_focus {
+                workspace.focus_panel::<crate::AgentPanel>(window, cx);
+            }
 
             let work_dirs = action.work_dirs.clone().map(|dirs| PathList::new(&dirs));
 
@@ -476,7 +485,7 @@ pub(crate) fn dispatch_action(
                     work_dirs,
                     action.from_title.clone().map(Into::into),
                     Some(initial_content),
-                    true,
+                    !suppress_focus,
                     crate::AgentThreadSource::AgentPanel,
                     window,
                     cx,
