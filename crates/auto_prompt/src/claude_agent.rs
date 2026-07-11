@@ -9,7 +9,8 @@
 //! Rules (do not change without explicit owner sign-off):
 //!   1. Never return `ContextOverflow` — no token-limit triggers.
 //!   2. Never set `force_new_thread = true` — always continue in the same thread.
-//!   3. No fancy conditions: cancelled or max-iterations ⇒ stop, otherwise continue.
+//!   3. Stop on: cancel, max-iterations, or EndTurn without tool use (task done).
+//!      Otherwise continue.
 //!   4. The continuation prompt asks Claude to reason about its last paragraph
 //!      in the context of the current project state and continue answering.
 
@@ -34,7 +35,8 @@ const REFUSAL_RETRY_PROMPT: &str =
 /// Decide the next auto-prompt action for a Claude (ACP) agent thread.
 ///
 /// Returns one of:
-/// - `NoAction` — chain should stop (cancelled or max iterations reached).
+/// - `NoAction` — chain should stop (cancelled, max iterations, or EndTurn
+///   without tool use — agent is done or waiting for user input).
 /// - `DispatchNow(action)` — send `action.next_prompt` to the SAME thread immediately.
 /// - `DispatchAfterDelay { action, delay_ms }` — same, after an error backoff.
 ///
@@ -42,7 +44,7 @@ const REFUSAL_RETRY_PROMPT: &str =
 /// in the orchestration-LLM / ContextOverflow flow that the native path uses.
 pub fn decide_claude(
     thread: &gpui::Entity<acp_thread::AcpThread>,
-    _used_tools: bool,
+    used_tools: bool,
     stop_reason: &acp::StopReason,
     cx: &App,
 ) -> AutoPromptDecision {
@@ -73,13 +75,27 @@ pub fn decide_claude(
         config.max_iterations
     );
 
-    // Safety stop: max iterations reached. This is the ONLY stopping condition
-    // besides user cancel — there is no pre-stop verification or context-overflow
-    // path for Claude.
+    // Safety stop: max iterations reached. There is no pre-stop verification
+    // or context-overflow path for Claude.
     if iteration_count > config.max_iterations {
         log::info!(
             "[auto_prompt::claude] Max iterations ({}) reached — stopping",
             config.max_iterations
+        );
+        let session_id_str = thread.read(cx).session_id().to_string();
+        crate::reset_iteration_with_session(&session_id_str);
+        return AutoPromptDecision::NoAction;
+    }
+
+    // Agent finished its turn normally but didn't use any tools since the last
+    // user message. The agent chose to stop on its own — either the task is
+    // complete or it's waiting for user input. Continuing here creates an
+    // infinite loop where the agent repeatedly says "I'm done" and gets the
+    // same nudge back.
+    if matches!(stop_reason, acp::StopReason::EndTurn) && !used_tools {
+        log::info!(
+            "[auto_prompt::claude] EndTurn without tool use — stopping chain \
+             (agent appears done or is waiting for user input)"
         );
         let session_id_str = thread.read(cx).session_id().to_string();
         crate::reset_iteration_with_session(&session_id_str);
@@ -97,8 +113,8 @@ pub fn decide_claude(
             );
             (REFUSAL_RETRY_PROMPT.to_string(), Some(delay))
         }
-        // Everything else (EndTurn, MaxTokens, tool use, etc.): keep going
-        // immediately. MaxTokens is left to Claude's own context management.
+        // EndTurn with tool use, MaxTokens, MaxTurnRequests, etc.: keep going.
+        // EndTurn without tools is already handled above.
         _ => (CONTINUATION_PROMPT.to_string(), None),
     };
 
