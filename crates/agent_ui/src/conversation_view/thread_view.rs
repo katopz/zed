@@ -7045,7 +7045,10 @@ impl ThreadView {
                 if content.is_empty() {
                     None
                 } else {
-                    Some(auto_prompt::truncate_to_paragraph_budget(&content, 2_500))
+                    Some(auto_prompt::truncate_to_paragraph_budget(
+                        &content,
+                        auto_prompt::AutoPromptContext::LAST_MESSAGE_PARAGRAPH_BUDGET,
+                    ))
                 }
             } else {
                 None

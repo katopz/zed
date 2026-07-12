@@ -3,7 +3,7 @@ use chrono::Local;
 use gpui::App;
 use serde::{Deserialize, Serialize};
 
-const MAX_ASSISTANT_CHUNK_BYTES: usize = 10000;
+const MAX_ASSISTANT_CHUNK_BYTES: usize = 20000;
 const MAX_TOOL_CONTENT_BYTES: usize = 5000;
 
 /// Phase of the auto-prompt stop lifecycle.
@@ -343,10 +343,14 @@ impl AutoPromptContext {
         })
     }
 
-    /// Maximum character budget for `last_assistant_message`. Paragraphs accumulate
+    /// Maximum byte budget for `last_assistant_message`. Paragraphs accumulate
     /// from the start; the paragraph that crosses this threshold is included so we
     /// always return complete paragraphs (no mid-sentence cut-off).
-    const LAST_MESSAGE_PARAGRAPH_BUDGET: usize = 5_000;
+    ///
+    /// Doubled from 5_000 → 10_000 after observing real-world assistant messages
+    /// (especially those including thinking blocks) getting cut off mid-way through
+    /// the response, losing critical context like benchmark gaps and next-steps.
+    pub const LAST_MESSAGE_PARAGRAPH_BUDGET: usize = 10_000;
 
     pub fn compute_last_assistant_message(&self) -> Option<String> {
         let mut chunks: Vec<&str> = self

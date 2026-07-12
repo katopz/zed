@@ -623,7 +623,7 @@ fn test_paragraph_budget_single_short_paragraph() {
 #[test]
 fn test_paragraph_budget_takes_paragraphs_until_over_budget() {
     let p1: String = "a".repeat(1_000);
-    let p2: String = "b".repeat(5_000);
+    let p2: String = "b".repeat(10_000);
     let p3 = "c third paragraph";
     let full = format!("{p1}\n\n{p2}\n\n{p3}");
 
@@ -635,7 +635,7 @@ fn test_paragraph_budget_takes_paragraphs_until_over_budget() {
         ..default_context()
     };
     let result = context.compute_last_assistant_message().unwrap();
-    // p1(1000) + p2(5000) = 6000 > 5000 → take both p1 + p2
+    // p1(1000) + p2(10000) = 11000 > 10000 → take both p1 + p2
     assert!(result.contains(&p1), "should contain p1");
     assert!(result.contains(&p2), "should contain p2");
     assert!(!result.contains(p3), "should not contain p3");
@@ -643,7 +643,7 @@ fn test_paragraph_budget_takes_paragraphs_until_over_budget() {
 
 #[test]
 fn test_paragraph_budget_single_huge_paragraph_included() {
-    let big = "x".repeat(10_000);
+    let big = "x".repeat(20_000);
     let context = AutoPromptContext {
         messages: vec![auto_prompt::context::ContextMessage {
             role: auto_prompt::context::ContextMessageRole::Assistant,
@@ -653,7 +653,7 @@ fn test_paragraph_budget_single_huge_paragraph_included() {
     };
     let result = context.compute_last_assistant_message().unwrap();
     // Single paragraph always included even if > budget
-    assert_eq!(result.len(), 10_000);
+    assert_eq!(result.len(), 20_000);
 }
 
 #[test]
