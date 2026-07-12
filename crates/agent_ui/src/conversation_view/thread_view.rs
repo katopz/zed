@@ -6660,36 +6660,26 @@ impl ThreadView {
     ///
     /// Performance: the numbered prompt buttons are O(n) in the prompt count
     /// and this runs on every render frame. To stay cheap while a long thread
-    /// is streaming we (a) skip the numbered buttons entirely while the thread
-    /// is `Generating` (same gating pattern as `markdown_style_for_thread`),
-    /// since mid-stream prompt jumping is not useful, and (b) cap the visible
-    /// buttons to the first/last `PROMPT_BUTTON_EDGE_WINDOW` with an ellipsis
-    /// in between, so a 200-prompt thread renders ~20 buttons, not 200.
+    /// is streaming we cap the visible buttons to the first/last
+    /// `PROMPT_BUTTON_EDGE_WINDOW` with an ellipsis in between, so a 200-prompt
+    /// thread renders ~20 buttons, not 200. The numbered buttons remain visible
+    /// during generation so the user can see re-indexed prompt numbers after
+    /// editing and resending an earlier message.
     fn render_user_prompt_jumps(&self, cx: &Context<Self>) -> Option<Div> {
         let thread = self.thread.read(cx);
-        let is_generating = thread.status() == ThreadStatus::Generating;
         let entries = thread.entries();
 
-        // While generating, the numbered buttons are skipped entirely (see
-        // below), so we only need to know whether *any* user prompt exists —
-        // `any()` short-circuits instead of scanning the full entry list.
-        let has_user_prompt = entries
+        // Count user prompts. This is a linear scan but very cheap (just a
+        // match check) and the button rendering is capped at
+        // 2 * PROMPT_BUTTON_EDGE_WINDOW entries, so it's safe to run on every
+        // render even during streaming.
+        let user_prompt_count = entries
             .iter()
-            .any(|e| matches!(e, AgentThreadEntry::UserMessage(_)));
-        if !has_user_prompt {
+            .filter(|e| matches!(e, AgentThreadEntry::UserMessage(_)))
+            .count();
+        if user_prompt_count == 0 {
             return None;
         }
-        // Exact count is only needed when we render the numbered buttons (idle
-        // threads with multiple prompts). During generation the strip only shows
-        // from/to + top/bottom, all O(1).
-        let user_prompt_count = if is_generating {
-            0
-        } else {
-            entries
-                .iter()
-                .filter(|e| matches!(e, AgentThreadEntry::UserMessage(_)))
-                .count()
-        };
 
         // Cross-thread continuation links. `from` = the source thread this one
         // was summarized from; `to` = the thread that continues from this one.
@@ -6766,11 +6756,10 @@ impl ThreadView {
                 })),
         );
 
-        // Numbered prompt buttons: only render when there are multiple prompts
-        // AND the thread is idle. While generating, mid-stream prompt jumping
-        // is not useful and the buttons are O(n) in the prompt count, so we
-        // skip them to keep the per-token re-render cheap.
-        if user_prompt_count > 1 && !is_generating {
+        // Numbered prompt buttons: render when there are multiple prompts.
+        // Kept visible during generation so the user can see the re-indexed
+        // prompt numbers after editing and resending an earlier message.
+        if user_prompt_count > 1 {
             buttons = buttons.children(self.render_numbered_prompt_buttons(user_prompt_count, cx));
         }
 

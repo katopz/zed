@@ -2,7 +2,7 @@ use acp_thread::MentionUri;
 use agent::ZED_AGENT_ID;
 use agent_client_protocol::schema as acp;
 use agent_servers::CLAUDE_AGENT_ID;
-use gpui::Window;
+use gpui::{Focusable, Window};
 use notifications::status_toast::StatusToast;
 use prompt_store::{BuiltInPrompt, PromptId, PromptStore};
 use std::path::PathBuf;
@@ -407,13 +407,35 @@ pub(crate) fn dispatch_action(
                 return;
             };
 
-            // If the user is actively hovering over the panel (reading a
-            // thread, sitting in the chat input, etc.), don't steal focus:
-            // skip raising the panel to keyboard focus and tell
-            // `external_thread` not to focus the new thread's input. The new
-            // thread is still created and becomes the panel's base view, but
-            // keyboard focus stays where the user left it.
-            let suppress_focus = panel.read(cx).panel_hovered();
+            // Suppress focus stealing when the user is actively engaged
+            // elsewhere — don't yank keyboard focus to the new thread.
+            //
+            // Conditions that suppress focus:
+            // 1. Panel is hovered (user is reading or sitting in the chat input)
+            // 2. Panel does not contain keyboard focus (user is focused on
+            //    an editor, terminal, or another panel)
+            // 3. The active thread's message editor has non-empty text (user
+            //    has started typing a follow-up and would lose their draft)
+            //
+            // The new thread is still created and becomes the panel's base
+            // view, but keyboard focus stays where the user left it.
+            let panel_has_focus = panel
+                .read(cx)
+                .focus_handle(cx)
+                .contains_focused(window, cx);
+            let editor_has_text = panel
+                .read(cx)
+                .active_thread_view(cx)
+                .is_some_and(|tv| {
+                    !tv.read(cx)
+                        .message_editor
+                        .read(cx)
+                        .text(cx)
+                        .trim()
+                        .is_empty()
+                });
+            let suppress_focus =
+                panel.read(cx).panel_hovered() || !panel_has_focus || editor_has_text;
             if !suppress_focus {
                 workspace.focus_panel::<crate::AgentPanel>(window, cx);
             }
