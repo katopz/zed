@@ -6600,11 +6600,14 @@ impl ThreadView {
     ) -> Option<AnyElement> {
         let entries = self.thread.read(cx).entries();
         let is_last = entry_ix + 1 == total_entries;
-        let closes_turn = is_last
-            || matches!(
-                entries.get(entry_ix + 1),
-                Some(AgentThreadEntry::UserMessage(_))
-            );
+        // An assistant message closes a turn when it is the last assistant
+        // message before the next user message (or end of thread). Trailing
+        // non-user entries (canceled ToolCall, CompletedPlan, ContextCompaction)
+        // are part of the same turn's tail and must not block the separator —
+        // otherwise "Branch New Thread" disappears exactly when the turn ended
+        // mid-tool-call, which is also when files changed and "Restore
+        // Checkpoint" is visible, producing the either/or symptom.
+        let closes_turn = is_last || assistant_message_closes_turn(entries, entry_ix);
         if !closes_turn {
             return None;
         }
@@ -11668,6 +11671,36 @@ fn transcript_entry_count(entries: &[AgentThreadEntry], up_to: Option<&UserMessa
     }
 }
 
+/// Whether the assistant message at `entry_ix` is the LAST assistant
+/// message in its turn — i.e. the turn's tail (the entries after it, up to
+/// the next user message or end of thread) contains no further assistant
+/// message.
+///
+/// This drives whether `render_turn_end_separator` shows the "Branch New
+/// Thread" affordance after that assistant message. Trailing non-user,
+/// non-assistant entries (a canceled `ToolCall`, a `CompletedPlan` snapshot,
+/// a `ContextCompaction` marker) are part of the same turn's tail and must
+/// NOT block the separator — otherwise the branch button disappears
+/// whenever a turn ends on something other than a clean assistant message
+/// (e.g. the user hit Stop mid-tool-call), which is also exactly when files
+/// have changed and "Restore Checkpoint" is shown, producing an either/or
+/// symptom where one button hides the other.
+///
+/// Extracted from `render_turn_end_separator` so the boundary logic can be
+/// unit-tested without rendering a view.
+fn assistant_message_closes_turn(
+    entries: &[AgentThreadEntry],
+    entry_ix: usize,
+) -> bool {
+    let Some(rest) = entries.get(entry_ix + 1..) else {
+        // entry_ix is the last entry — vacuously closes the turn.
+        return true;
+    };
+    rest.iter()
+        .take_while(|e| !matches!(e, AgentThreadEntry::UserMessage(_)))
+        .all(|e| !matches!(e, AgentThreadEntry::AssistantMessage(_)))
+}
+
 #[cfg(test)]
 mod branch_boundary_tests {
     use super::*;
@@ -11826,5 +11859,83 @@ mod branch_boundary_tests {
             entry_assistant(),
         ];
         assert_eq!(transcript_entry_count(&entries, Some(&id)), 1);
+    }
+
+    // --- assistant_message_closes_turn (render_turn_end_separator guard) ---
+
+    // Stand-in for any non-user, non-assistant entry that can trail an
+    // assistant message at the end of a turn (canceled ToolCall, CompletedPlan
+    // snapshot, ContextCompaction marker). The closes-turn logic only
+    // discriminates on variant, not fields, so a ContextCompaction with no
+    // summary is the cheapest to construct without a cx.
+    use acp_thread::ContextCompactionId;
+    fn entry_other() -> AgentThreadEntry {
+        AgentThreadEntry::ContextCompaction(acp_thread::ContextCompaction {
+            id: ContextCompactionId(std::sync::Arc::from("")),
+            summary: None,
+        })
+    }
+
+    #[test]
+    fn closes_turn_last_entry_is_vacuously_true() {
+        // Assistant is the last entry — always closes the turn.
+        let entries = vec![entry_user(None, "u1"), entry_assistant()];
+        assert!(assistant_message_closes_turn(&entries, 1));
+    }
+
+    #[test]
+    fn closes_turn_next_is_user_message() {
+        // Classic turn boundary: assistant immediately followed by next user.
+        let entries = vec![
+            entry_user(None, "u1"),
+            entry_assistant(),
+            entry_user(None, "u2"),
+        ];
+        assert!(assistant_message_closes_turn(&entries, 1));
+    }
+
+    #[test]
+    fn closes_turn_next_is_another_assistant_in_same_turn() {
+        // Multi-step turn: assistant → tool → assistant. The first assistant
+        // does NOT close the turn (there's a later assistant before the next
+        // user message).
+        let entries = vec![
+            entry_user(None, "u1"),
+            entry_assistant(),
+            entry_other(),
+            entry_assistant(),
+        ];
+        assert!(!assistant_message_closes_turn(&entries, 1));
+        assert!(assistant_message_closes_turn(&entries, 3));
+    }
+
+    #[test]
+    fn closes_turn_trailing_other_entries_do_not_block() {
+        // Regression for the either/or bug: turn ends on a trailing non-user,
+        // non-assistant entry (e.g. a canceled ToolCall after Stop). The
+        // preceding assistant message MUST still close the turn so "Branch
+        // New Thread" shows alongside "Restore Checkpoint".
+        let entries = vec![
+            entry_user(None, "u1"),
+            entry_assistant(),
+            entry_other(),
+        ];
+        assert!(
+            assistant_message_closes_turn(&entries, 1),
+            "trailing non-assistant entry must not suppress the turn separator"
+        );
+    }
+
+    #[test]
+    fn closes_turn_other_then_user_message() {
+        // Compaction marker logged right before the next user message — the
+        // assistant before it still closes the turn.
+        let entries = vec![
+            entry_user(None, "u1"),
+            entry_assistant(),
+            entry_other(),
+            entry_user(None, "u2"),
+        ];
+        assert!(assistant_message_closes_turn(&entries, 1));
     }
 }
