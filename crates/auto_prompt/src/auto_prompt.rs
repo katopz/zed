@@ -8,6 +8,7 @@
 mod config;
 pub mod claude_agent;
 pub mod context;
+pub(crate) mod debug_log;
 pub mod lightweight_context;
 mod pending_question;
 pub mod plan_registry;
@@ -705,6 +706,15 @@ pub fn decide(
         .and_then(|pl| pl.paths().first().cloned());
     let iteration_count = get_iteration();
 
+    debug_log::write_log(
+        "decide_entry",
+        serde_json::json!({
+            "stop_reason": format!("{stop_reason:?}"),
+            "used_tools": used_tools,
+            "iteration": iteration_count,
+        }),
+    );
+
     let config = match load_config_cached() {
         Ok(c) => {
             log::info!("[auto_prompt::decide] Config loaded");
@@ -712,6 +722,10 @@ pub fn decide(
         }
         Err(err) => {
             log::warn!("[auto_prompt::decide] config load failed: {err}");
+            debug_log::write_log(
+                "no_action",
+                serde_json::json!({"reason": "config_load_failed", "error": format!("{err}")}),
+            );
             return AutoPromptDecision::NoAction;
         }
     };
@@ -740,6 +754,10 @@ pub fn decide(
         log::info!("[auto_prompt::decide] Thread was cancelled, skipping auto-prompt");
         let session_id_str = thread.read(cx).session_id().to_string();
         reset_iteration_with_session(&session_id_str);
+        debug_log::write_log(
+            "no_action",
+            serde_json::json!({"reason": "cancelled"}),
+        );
         return AutoPromptDecision::NoAction;
     }
 
@@ -749,6 +767,10 @@ pub fn decide(
     // (browser login, device auth, etc.), the user is mid-flow — don't chain.
     if is_interactive_tool_pending(thread, cx) {
         log::info!("[auto_prompt::decide] Interactive auth tool pending, stopping");
+        debug_log::write_log(
+            "no_action",
+            serde_json::json!({"reason": "interactive_tool_pending"}),
+        );
         return AutoPromptDecision::NoAction;
     }
 
@@ -765,12 +787,24 @@ pub fn decide(
         let session_id_str = thread.read(cx).session_id().to_string();
         clear_summary_for_session(&session_id_str);
         reset_iteration_with_session(&session_id_str);
+        debug_log::write_log(
+            "no_action",
+            serde_json::json!({
+                "reason": "max_iterations",
+                "iteration": iteration_count,
+                "max_iterations": config.max_iterations,
+            }),
+        );
         return AutoPromptDecision::NoAction;
     }
 
     let registry = language_model::LanguageModelRegistry::read_global(cx);
     let Some(configured_model) = registry.default_model() else {
         log::warn!("[auto_prompt::decide] No language model configured in Zed");
+        debug_log::write_log(
+            "no_action",
+            serde_json::json!({"reason": "no_model_configured"}),
+        );
         return AutoPromptDecision::NoAction;
     };
     let model = configured_model.model;
@@ -954,6 +988,10 @@ pub fn decide(
         }
         Err(err) => {
             log::warn!("[auto_prompt::decide] failed to serialize context: {err}");
+            debug_log::write_log(
+                "no_action",
+                serde_json::json!({"reason": "context_serialize_failed", "error": format!("{err}")}),
+            );
             return AutoPromptDecision::NoAction;
         }
     };
@@ -980,6 +1018,20 @@ pub fn decide(
     }
 
     log::info!("[auto_prompt::decide] Returning NeedsLlmCall decision");
+    debug_log::write_log(
+        "needs_llm_call",
+        serde_json::json!({
+            "iteration": iteration_count,
+            "stop_phase": format!("{:?}", stop_phase),
+            "context_exceeds_limit": context_exceeds_limit,
+            "had_error": auto_prompt_ctx.had_error,
+            "model": format!("{:?}", model.id()),
+            "last_assistant_message": debug_log::truncate(
+                last_assistant_message.as_deref().unwrap_or(""),
+                2000,
+            ),
+        }),
+    );
     AutoPromptDecision::NeedsLlmCall(LlmCallData {
         model,
         system_prompt,
@@ -1273,6 +1325,22 @@ pub async fn decide_with_llm(
             );
 
             let evaluation = evaluate_response(&input);
+
+            debug_log::write_log(
+                "evaluate_response",
+                serde_json::json!({
+                    "confidence": input.confidence,
+                    "has_prompt": input.next_prompt.as_ref().is_some_and(|p| !p.trim().is_empty()),
+                    "is_synthetic_failure": input.is_synthetic_failure,
+                    "stop_phase": format!("{:?}", input.stop_phase),
+                    "source": format!("{:?}", evaluation.source()),
+                    "result": format!("{:?}", evaluation),
+                    "last_assistant_message": debug_log::truncate(
+                        input.last_assistant_message.as_deref().unwrap_or(""),
+                        2000,
+                    ),
+                }),
+            );
 
             log::info!(
                 "[auto_prompt::decide_with_llm] evaluate_response: source={:?}, result={:?}",

@@ -294,12 +294,32 @@ pub(crate) async fn try_answer_pending_question(
 ) -> anyhow::Result<Option<AutoPromptOutcome>> {
     let pending = match detect_pending_question(data.last_assistant_message.as_deref()) {
         Some(p) => p,
-        None => return Ok(None),
+        None => {
+            crate::debug_log::write_log(
+                "pending_question",
+                serde_json::json!({
+                    "detected": false,
+                    "last_assistant_message": crate::debug_log::truncate(
+                        data.last_assistant_message.as_deref().unwrap_or(""),
+                        2000,
+                    ),
+                }),
+            );
+            return Ok(None);
+        }
     };
 
     log::warn!(
         "[auto_prompt::pending_question] Fast path triggered — answering pending question ({} chars of context)",
         pending.context_window.len()
+    );
+
+    crate::debug_log::write_log(
+        "pending_question",
+        serde_json::json!({
+            "detected": true,
+            "question_text": crate::debug_log::truncate(&pending.question_text, 1000),
+        }),
     );
 
     let raw_response = match call_answerer(&data.model, &pending.context_window, cx).await {
@@ -311,6 +331,14 @@ pub(crate) async fn try_answer_pending_question(
             log::warn!(
                 "[auto_prompt::pending_question] Answerer LLM call failed: {err:#} — falling through to normal flow"
             );
+            crate::debug_log::write_log(
+                "pending_question",
+                serde_json::json!({
+                    "detected": true,
+                    "outcome": "answerer_error",
+                    "error": format!("{err:#}"),
+                }),
+            );
             return Ok(None);
         }
     };
@@ -321,6 +349,14 @@ pub(crate) async fn try_answer_pending_question(
             log::warn!(
                 "[auto_prompt::pending_question] Answerer response unparseable: {err:#} — falling through. Raw: {}",
                 raw_response.chars().take(300).collect::<String>()
+            );
+            crate::debug_log::write_log(
+                "pending_question",
+                serde_json::json!({
+                    "detected": true,
+                    "outcome": "answerer_unparseable",
+                    "raw_response": crate::debug_log::truncate(&raw_response, 1000),
+                }),
             );
             return Ok(None);
         }
@@ -339,6 +375,14 @@ pub(crate) async fn try_answer_pending_question(
             log::info!(
                 "[auto_prompt::pending_question] Answerer returned no `next_prompt` — falling through"
             );
+            crate::debug_log::write_log(
+                "pending_question",
+                serde_json::json!({
+                    "detected": true,
+                    "outcome": "no_next_prompt",
+                    "confidence": confidence,
+                }),
+            );
             return Ok(None);
         }
     };
@@ -347,12 +391,32 @@ pub(crate) async fn try_answer_pending_question(
         log::info!(
             "[auto_prompt::pending_question] Answerer confidence {confidence:.2} < {ANSWER_CONFIDENCE_THRESHOLD} — falling through (user: not confident → allow summary)"
         );
+        crate::debug_log::write_log(
+            "pending_question",
+            serde_json::json!({
+                "detected": true,
+                "outcome": "low_confidence",
+                "confidence": confidence,
+                "threshold": ANSWER_CONFIDENCE_THRESHOLD,
+                "answer": crate::debug_log::truncate(&answer, 1000),
+            }),
+        );
         return Ok(None);
     }
 
     log::warn!(
         "[auto_prompt::pending_question] Dispatching answer (confidence {confidence:.2}): {}",
         answer.chars().take(200).collect::<String>()
+    );
+
+    crate::debug_log::write_log(
+        "pending_question",
+        serde_json::json!({
+            "detected": true,
+            "outcome": "dispatched",
+            "confidence": confidence,
+            "answer": crate::debug_log::truncate(&answer, 1000),
+        }),
     );
 
     // Wrap with the chain's summary/title context — same pattern as every
