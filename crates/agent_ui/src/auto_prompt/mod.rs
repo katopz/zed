@@ -414,28 +414,23 @@ pub(crate) fn dispatch_action(
             // 1. Panel is hovered (user is reading or sitting in the chat input)
             // 2. Panel does not contain keyboard focus (user is focused on
             //    an editor, terminal, or another panel)
-            // 3. The active thread's message editor has non-empty text (user
-            //    has started typing a follow-up and would lose their draft)
+            // 3. Any chat input surface in the panel has non-empty text —
+            //    the active thread's main editor, any retained thread's
+            //    editor, the draft editor, or any queued-message editor.
+            //    A user mid-composition anywhere in the panel should not
+            //    have their focus stolen.
             //
             // The new thread is still created and becomes the panel's base
             // view, but keyboard focus stays where the user left it.
-            let panel_has_focus = panel
-                .read(cx)
-                .focus_handle(cx)
-                .contains_focused(window, cx);
-            let editor_has_text = panel
-                .read(cx)
-                .active_thread_view(cx)
-                .is_some_and(|tv| {
-                    !tv.read(cx)
-                        .message_editor
-                        .read(cx)
-                        .text(cx)
-                        .trim()
-                        .is_empty()
-                });
-            let suppress_focus =
-                panel.read(cx).panel_hovered() || !panel_has_focus || editor_has_text;
+            let suppress_focus = {
+                let panel_ref = panel.read(cx);
+                let panel_has_focus = panel_ref
+                    .focus_handle(cx)
+                    .contains_focused(window, cx);
+                panel_ref.panel_hovered()
+                    || !panel_has_focus
+                    || panel_ref.any_chat_input_has_text(cx)
+            };
             if !suppress_focus {
                 workspace.focus_panel::<crate::AgentPanel>(window, cx);
             }

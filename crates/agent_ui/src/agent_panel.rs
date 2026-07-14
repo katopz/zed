@@ -2166,6 +2166,61 @@ impl AgentPanel {
         self.panel_hovered
     }
 
+    /// Whether any chat input surface in the panel currently has non-empty
+    /// text, indicating the user is mid-composition.
+    ///
+    /// Scans every place a user can be typing a message:
+    /// - The active conversation view's root thread main editor
+    /// - Every retained (parked) thread's main editor
+    /// - The ephemeral draft thread's main editor
+    /// - Every thread's queued-message editors (fast-mode queue)
+    ///
+    /// Used by auto_prompt to suppress focus stealing. False positives (a
+    /// stale draft with leftover text) only cost us skipping one focus
+    /// jump; false negatives rip focus away from a typing user. So we err
+    /// on the side of reporting "typing" whenever any editor has text.
+    pub fn any_chat_input_has_text(&self, cx: &App) -> bool {
+        let thread_view_has_text = |thread_view: Entity<ThreadView>| {
+            let thread_view = thread_view.read(cx);
+            if !thread_view
+                .message_editor
+                .read(cx)
+                .text(cx)
+                .trim()
+                .is_empty()
+            {
+                return true;
+            }
+            thread_view
+                .queued_message_editors
+                .iter()
+                .any(|editor| !editor.read(cx).text(cx).trim().is_empty())
+        };
+
+        let conversation_view_has_text = |cv: &Entity<crate::ConversationView>| {
+            cv.read(cx)
+                .root_thread_view()
+                .is_some_and(thread_view_has_text)
+        };
+
+        if self
+            .active_conversation_view()
+            .is_some_and(conversation_view_has_text)
+        {
+            return true;
+        }
+        if self
+            .draft_thread
+            .as_ref()
+            .is_some_and(conversation_view_has_text)
+        {
+            return true;
+        }
+        self.retained_threads
+            .values()
+            .any(conversation_view_has_text)
+    }
+
     pub fn new_external_agent_thread(
         &mut self,
         action: &NewExternalAgentThread,
