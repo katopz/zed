@@ -341,6 +341,20 @@ pub(crate) fn dispatch_action(
     // → summarize → new thread when tokens exceed the limit.
     if !use_new_thread {
         if let Some(active_tv) = conversation_view.active_thread() {
+            // Check if the user is mid-composition in the active thread's editor.
+            // The same-thread path overwrites the editor via set_message, which
+            // would destroy the user's draft. We log the state for diagnosis.
+            let editor_has_text = active_tv.read(cx)
+                .message_editor
+                .read(cx)
+                .text(cx)
+                .trim()
+                .is_empty();
+            log::info!(
+                "[auto_prompt] SAME-THREAD continuation: editor_was_empty={}, sending to same thread (tokens={:?})",
+                editor_has_text,
+                action.actual_input_tokens
+            );
             let decision = strip_first_prompt_wrapper(&action.next_prompt);
             let prompt = build_continuation_prompt(
                 action.last_assistant_message.as_deref(),
@@ -427,12 +441,22 @@ pub(crate) fn dispatch_action(
                 let panel_has_focus = panel_ref
                     .focus_handle(cx)
                     .contains_focused(window, cx);
-                panel_ref.panel_hovered()
-                    || !panel_has_focus
-                    || panel_ref.any_chat_input_has_text(cx)
+                let panel_hovered = panel_ref.panel_hovered();
+                let any_input_has_text = panel_ref.any_chat_input_has_text(cx);
+                log::info!(
+                    "[auto_prompt] suppress_focus decision: panel_hovered={}, panel_has_focus={}, any_input_has_text={} => suppress={}",
+                    panel_hovered,
+                    panel_has_focus,
+                    any_input_has_text,
+                    panel_hovered || !panel_has_focus || any_input_has_text
+                );
+                panel_hovered || !panel_has_focus || any_input_has_text
             };
             if !suppress_focus {
+                log::warn!("[auto_prompt] FOCUS NOT SUPPRESSED — calling workspace.focus_panel");
                 workspace.focus_panel::<crate::AgentPanel>(window, cx);
+            } else {
+                log::info!("[auto_prompt] focus suppressed — new thread created without stealing focus");
             }
 
             let work_dirs = action.work_dirs.clone().map(|dirs| PathList::new(&dirs));

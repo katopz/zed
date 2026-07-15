@@ -2170,9 +2170,10 @@ impl AgentPanel {
     /// text, indicating the user is mid-composition.
     ///
     /// Scans every place a user can be typing a message:
-    /// - The active conversation view's root thread main editor
-    /// - Every retained (parked) thread's main editor
-    /// - The ephemeral draft thread's main editor
+    /// - Every thread view in every conversation (root, active, and any
+    ///   navigated sub-thread) — the user may have navigated to a child
+    ///   thread via a continuation link and be typing there, which is NOT
+    ///   the root thread view.
     /// - Every thread's queued-message editors (fast-mode queue)
     ///
     /// Used by auto_prompt to suppress focus stealing. False positives (a
@@ -2180,45 +2181,79 @@ impl AgentPanel {
     /// jump; false negatives rip focus away from a typing user. So we err
     /// on the side of reporting "typing" whenever any editor has text.
     pub fn any_chat_input_has_text(&self, cx: &App) -> bool {
-        let thread_view_has_text = |thread_view: Entity<ThreadView>| {
+        let thread_view_has_text = |thread_view: &Entity<ThreadView>| {
             let thread_view = thread_view.read(cx);
-            if !thread_view
+            let main_text = thread_view
                 .message_editor
                 .read(cx)
-                .text(cx)
-                .trim()
-                .is_empty()
-            {
-                return true;
-            }
-            thread_view
+                .text(cx);
+            let main_has_text = !main_text.trim().is_empty();
+            let queued_has_text = thread_view
                 .queued_message_editors
                 .iter()
-                .any(|editor| !editor.read(cx).text(cx).trim().is_empty())
+                .any(|editor| !editor.read(cx).text(cx).trim().is_empty());
+            if main_has_text || queued_has_text {
+                log::info!(
+                    "[auto_prompt] thread_view_has_text: main_editor_chars={}, queued_editors={}, main_has_text={}, queued_has_text={}",
+                    main_text.chars().count(),
+                    thread_view.queued_message_editors.len(),
+                    main_has_text,
+                    queued_has_text,
+                );
+            }
+            main_has_text || queued_has_text
         };
 
         let conversation_view_has_text = |cv: &Entity<crate::ConversationView>| {
-            cv.read(cx)
-                .root_thread_view()
-                .is_some_and(thread_view_has_text)
+            let cv_ref = cv.read(cx);
+            // Check every thread view in the conversation, not just the root —
+            // the user may have navigated to a child thread (via a continuation
+            // link or branch) and be typing in that thread's editor.
+            if let Some(connected) = cv_ref.as_connected() {
+                let thread_count = connected.threads.len();
+                let has_text = connected
+                    .threads
+                    .values()
+                    .any(thread_view_has_text);
+                if !has_text {
+                    log::info!(
+                        "[auto_prompt] conversation_view_has_text: scanned {} thread(s), none had text",
+                        thread_count,
+                    );
+                }
+                has_text
+            } else {
+                // Fallback: if not connected yet, check the root thread view.
+                cv_ref
+                    .root_thread_view()
+                    .as_ref()
+                    .is_some_and(thread_view_has_text)
+            }
         };
 
-        if self
+        let active_has_text = self
             .active_conversation_view()
-            .is_some_and(conversation_view_has_text)
-        {
+            .is_some_and(conversation_view_has_text);
+        if active_has_text {
+            log::info!("[auto_prompt] any_chat_input_has_text: ACTIVE conversation has text");
             return true;
         }
-        if self
+        let draft_has_text = self
             .draft_thread
             .as_ref()
-            .is_some_and(conversation_view_has_text)
-        {
+            .is_some_and(conversation_view_has_text);
+        if draft_has_text {
+            log::info!("[auto_prompt] any_chat_input_has_text: DRAFT thread has text");
             return true;
         }
-        self.retained_threads
+        let retained_has_text = self
+            .retained_threads
             .values()
-            .any(conversation_view_has_text)
+            .any(conversation_view_has_text);
+        if retained_has_text {
+            log::info!("[auto_prompt] any_chat_input_has_text: RETAINED thread has text");
+        }
+        retained_has_text
     }
 
     pub fn new_external_agent_thread(
