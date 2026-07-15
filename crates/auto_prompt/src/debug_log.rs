@@ -1,9 +1,9 @@
 //! Structured decision logging for debugging auto-prompt.
 //!
-//! Opt-in: set `ZED_AUTO_PROMPT_LOG=1` (or set `ZED_AUTO_PROMPT_LOG_DIR`).
-//! Writes one JSON file per decision event to `/tmp/zed_auto_prompt/` by
-//! default, named `{ms}_{seq}_{label}.json` so a full trace of a single
-//! stop/resume cycle is reconstructable by file order.
+//! On by default. Disable explicitly with `ZED_AUTO_PROMPT_LOG=0`; redirect the
+//! destination with `ZED_AUTO_PROMPT_LOG_DIR`. Writes one JSON file per decision
+//! event to `/tmp/zed_auto_prompt/` by default, named `{ms}_{seq}_{label}.json`
+//! so a full trace of a single stop/resume cycle is reconstructable by file order.
 //!
 //! All IO is best-effort: failures are surfaced via `log::warn!` and never
 //! propagated, so logging can never break the decision pipeline.
@@ -15,10 +15,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Monotonic sequence to keep filenames unique within a millisecond.
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-/// Whether the user has opted into decision logging.
+/// Whether decision logging is active. On by default; disable explicitly
+/// with `ZED_AUTO_PROMPT_LOG=0` (or `false`).
 fn enabled() -> bool {
-    matches!(std::env::var("ZED_AUTO_PROMPT_LOG").as_deref(), Ok("1"))
-        || std::env::var("ZED_AUTO_PROMPT_LOG_DIR").is_ok()
+    !matches!(
+        std::env::var("ZED_AUTO_PROMPT_LOG").as_deref(),
+        Ok("0") | Ok("false")
+    )
 }
 
 /// Directory to write logs to. Defaults to `/tmp/zed_auto_prompt`.
