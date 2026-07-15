@@ -1661,16 +1661,14 @@ impl ConversationView {
                                 window,
                                 cx,
                             ) {
-                                // Arm a fresh watchdog for the next generation
-                                // cycle before storing the task. start_watchdog
-                                // needs the ConversationView context, so it must run
-                                // outside the active.update() closure.
-                                let watchdog_task =
-                                    crate::auto_prompt::start_watchdog(self, window, cx);
+                                // The watchdog is armed inside send_content when
+                                // the next generation actually starts, not here —
+                                // arming at this point would start the timer during
+                                // the orchestration LLM call (before the worker
+                                // begins generating).
                                 if let Some(active) = self.active_thread() {
                                     active.update(cx, |active, cx| {
                                         active._auto_prompt_task = Some(task);
-                                        active._watchdog_task = watchdog_task;
                                         cx.notify();
                                     });
                                 }
@@ -1778,12 +1776,11 @@ impl ConversationView {
                                 window,
                                 cx,
                             ) {
-                                let watchdog_task =
-                                    crate::auto_prompt::start_watchdog(self, window, cx);
+                                // The watchdog is armed inside send_content when
+                                // the next generation actually starts.
                                 if let Some(active) = self.active_thread() {
                                     active.update(cx, |active, cx| {
                                         active._auto_prompt_task = Some(task);
-                                        active._watchdog_task = watchdog_task;
                                         cx.notify();
                                     });
                                 }

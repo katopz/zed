@@ -4,6 +4,9 @@
 - [x] Root cause identified
 - [x] Watchdog implemented
 - [x] Tested (unit tests pass, compiles clean)
+- [x] Coverage gap fixed: watchdog now armed at generation start (send_content),
+      not just after `on_thread_stopped`. Covers initial user send + within-turn
+      hangs (the original bug1.md scenario).
 
 ## Symptom
 
@@ -116,3 +119,22 @@ Thread enters Generating
   recovery mechanism, not a cure for the stream bug.
 - Non-auto-prompt threads (user-driven, no auto-prompt enabled). The watchdog
   only runs when `auto_prompt_enabled == true`.
+
+### Follow-up fix (gap closure)
+
+The initial watchdog implementation only armed the watchdog in
+`conversation_view.rs` after `on_thread_stopped` dispatched a continuation.
+This missed the **original bug1.md scenario**: a worker that hangs *mid-turn*
+(after a tool call, before emitting `Stopped`) never triggers `on_thread_stopped`,
+so no watchdog was armed.
+
+**Fix**: The watchdog is now armed in `ThreadView::send_content` (the single
+funnel point for all send paths: initial user send, auto_prompt continuations,
+queued messages, interrupt-and-send). The arming happens right after
+`thread.send()` when the thread enters `Generating`. The redundant arming in
+`conversation_view.rs` Stopped/Error handlers was removed (send_content covers it).
+
+This means the watchdog now protects EVERY generation, including the first one.
+`retry_generation` is the only send path that doesn't go through `send_content`
+(it calls `thread.retry()` directly) — retries are user-initiated and less likely
+to be in auto_prompt mode, so this is a minor known gap.

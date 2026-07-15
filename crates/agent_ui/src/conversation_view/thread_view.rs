@@ -1668,10 +1668,39 @@ impl ThreadView {
                 thread.send(contents, cx)
             })?;
 
-            let _ = this.update(cx, |this, cx| {
+            let _ = this.update_in(cx, |this, _window, cx| {
                 this.sync_generating_indicator(cx);
                 cx.notify();
             });
+
+            // Arm the stuck-thread watchdog for this generation. This covers
+            // ALL send paths (initial user send, auto_prompt continuations,
+            // retries) — the original implementation only armed it after
+            // `on_thread_stopped`, which missed the case where the worker
+            // hangs mid-turn before ever emitting Stopped (the original
+            // bug1.md scenario).
+            //
+            // Done outside the `this.update_in` above because `start_watchdog`
+            // reads the active ThreadView via ConversationView::active_thread(),
+            // which would re-enter the update we just did.
+            let should_arm_watchdog = this
+                .read_with(cx, |this, _cx| {
+                    this.auto_prompt_enabled && this._watchdog_task.is_none()
+                })
+                .unwrap_or(false);
+            if should_arm_watchdog {
+                if let Some(server) = this.read_with(cx, |this, _cx| this.server_view.upgrade()).ok().flatten() {
+                    let _ = server.update_in(cx, |server, window, cx| {
+                        if let Some(task) = crate::auto_prompt::start_watchdog(server, window, cx) {
+                            // Store the watchdog task back on the ThreadView.
+                            this.update(cx, |this, cx| {
+                                this._watchdog_task = Some(task);
+                                cx.notify();
+                            }).ok();
+                        }
+                    });
+                }
+            }
 
             let res = send.await;
             let turn_time_ms = turn_start_time.elapsed().as_millis();
