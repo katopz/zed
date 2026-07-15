@@ -570,6 +570,9 @@ pub struct ThreadView {
     pub auto_prompt_state: crate::auto_prompt::AutoPromptState,
     pub _auto_prompt_task: Option<gpui::Task<()>>,
     pub _auto_prompt_retry_data: Option<auto_prompt::LlmCallData>,
+    /// Stuck-thread watchdog task. Started when the thread enters Generating,
+    /// cancelled (dropped) when the thread stops. See `auto_prompt::start_watchdog`.
+    pub _watchdog_task: Option<gpui::Task<()>>,
     pub list_state: ListState,
     pub session_capabilities: SharedSessionCapabilities,
     /// Tracks which tool calls have their content/output expanded.
@@ -985,6 +988,7 @@ impl ThreadView {
             auto_prompt_state: Default::default(),
             _auto_prompt_task: None,
             _auto_prompt_retry_data: None,
+            _watchdog_task: None,
             expanded_tool_calls: HashSet::default(),
             expanded_tool_call_raw_inputs: HashSet::default(),
             collapsed_sandbox_authorization_details: HashSet::default(),
@@ -1874,6 +1878,18 @@ impl ThreadView {
         self._cancel_task = Some(self.thread.update(cx, |thread, cx| thread.cancel(cx)));
         self.sync_generating_indicator(cx);
         cx.notify();
+    }
+
+    /// Drop the stuck-thread watchdog task, if any.
+    ///
+    /// Called by `auto_prompt::cancel_watchdog_for_thread` when the thread
+    /// stops normally — the watchdog is no longer needed and its timer should
+    /// not fire on a thread that has already recovered.
+    pub fn cancel_watchdog(&mut self) {
+        if self._watchdog_task.is_some() {
+            log::info!("[auto_prompt::watchdog] Cancelling watchdog: thread stopped normally");
+            self._watchdog_task = None;
+        }
     }
 
     pub fn retry_generation(&mut self, cx: &mut Context<Self>) {

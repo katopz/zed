@@ -270,6 +270,27 @@ sequenceDiagram
 
 If more than 300 seconds (`CHAIN_TIMEOUT_SECS`) pass between iterations, the chain is considered stale and the iteration counter resets on the next call. This prevents stale chains from accumulating.
 
+### Stuck-thread watchdog
+
+**Problem**: All other timeouts in auto_prompt run *after* `on_thread_stopped` fires. If the worker LLM stream hangs (provider stall, rate-limit with empty body, ACP protocol dead-end), the thread stays in `Generating` forever and `on_thread_stopped` never fires. None of the existing timeouts can recover from this.
+
+**Solution**: A watchdog task (`auto_prompt/src/watchdog.rs`) is armed when auto_prompt dispatches a continuation. It sleeps for `watchdog_timeout_secs` (default 600 = 10 minutes), then:
+
+1. Checks if the thread is still `Generating`. If not, the thread recovered — exit.
+2. Gathers context: last tool call (input + output), last assistant message, cumulative elapsed time, timeout number.
+3. Calls a headless reasoning LLM with a dedicated system prompt that classifies the stuck state.
+4. The LLM returns `{ "action": "continue" | "halt", "reason": "..." }`.
+5. **`continue`**: Reschedule the watchdog for another window. The reasoning LLM sees the incremented timeout number next time (1st → 2nd → 3rd...).
+6. **`halt`**: Cancel the worker thread (`thread.cancel()`), wait for cancel completion, then dispatch a timeout-recovery prompt to the same thread: "Your last tool call completed N minutes ago but you produced no follow-up. Decide: retry, try another approach, or stop." The worker restarts generation with this context.
+
+**Key safety properties**:
+- On any reasoning LLM failure (unreachable, unparseable, timeout), defaults to `Continue` — never kills a possibly-fine worker on a flaky reasoning call.
+- The reasoning LLM can distinguish "`git log` returned 3 lines 10 min ago" (halt) from "`cargo test` still running" (continue).
+- Config: `watchdog_timeout_secs` (env: `ZED_AUTO_PROMPT_WATCHDOG_TIMEOUT_SECS`), `watchdog_enabled` (env: `ZED_AUTO_PROMPT_WATCHDOG_ENABLED`). Disable with `watchdog_enabled: false`.
+- Decisions logged to `/tmp/zed_auto_prompt/{ms}_{seq}_watchdog_decision.json`.
+
+**Lifecycle**: The watchdog task is stored in `ThreadView._watchdog_task`. It is cancelled (dropped) whenever the thread stops normally (`Stopped` / `Error` events). A new watchdog is armed each time auto_prompt dispatches a continuation.
+
 ### Thread summary context grounding
 
 Every auto-prompt dispatch prepends a comprehensive thread summary via `with_first_prompt_context()`. The orchestration LLM generates this summary with the active plan bolded, keeping long auto-prompt chains grounded in the full conversation context. The `build_prompt_summary()` function selects the best source in priority order:
@@ -666,7 +687,9 @@ Config file: `~/.config/zed/auto_prompt.json`
   "backoff_base_ms": 2000,
   "max_verification_attempts": 2,
   "max_llm_retries": 3,
-  "same_thread_token_threshold": 60000
+  "same_thread_token_threshold": 60000,
+  "watchdog_timeout_secs": 600,
+  "watchdog_enabled": true
 }
 ```
 
@@ -679,10 +702,12 @@ Config file: `~/.config/zed/auto_prompt.json`
 | `max_llm_retries` | `3` | Max automatic retry attempts for LLM calls before showing "Retry" button |
 | `max_verification_attempts` | `2` | Max verification prompts in PreStop phase before accepting stop |
 | `same_thread_token_threshold` | `60000` | Token count below which auto-prompt continues in the same thread instead of creating a new thread |
+| `watchdog_timeout_secs` | `600` | Seconds the worker may stay in `Generating` before a reasoning LLM decides continue/halt |
+| `watchdog_enabled` | `true` | Whether the stuck-thread watchdog is active |
 
 Note: Enable/disable is controlled by the UI toggle (sparkle button) per thread, not by the config file.
 
-Environment variable overrides: `ZED_AUTO_PROMPT_MAX_ITERATIONS`, `ZED_AUTO_PROMPT_MAX_CONTEXT_TOKENS`, `ZED_AUTO_PROMPT_BACKOFF_BASE_MS`, `ZED_AUTO_PROMPT_SYSTEM_PROMPT`, `ZED_AUTO_PROMPT_MAX_LLM_RETRIES`, `ZED_AUTO_PROMPT_MAX_VERIFICATION_ATTEMPTS`, `ZED_AUTO_PROMPT_SAME_THREAD_TOKEN_THRESHOLD`.
+Environment variable overrides: `ZED_AUTO_PROMPT_MAX_ITERATIONS`, `ZED_AUTO_PROMPT_MAX_CONTEXT_TOKENS`, `ZED_AUTO_PROMPT_BACKOFF_BASE_MS`, `ZED_AUTO_PROMPT_SYSTEM_PROMPT`, `ZED_AUTO_PROMPT_MAX_LLM_RETRIES`, `ZED_AUTO_PROMPT_MAX_VERIFICATION_ATTEMPTS`, `ZED_AUTO_PROMPT_SAME_THREAD_TOKEN_THRESHOLD`, `ZED_AUTO_PROMPT_WATCHDOG_TIMEOUT_SECS`, `ZED_AUTO_PROMPT_WATCHDOG_ENABLED`.
 
 ## E2E Testing
 

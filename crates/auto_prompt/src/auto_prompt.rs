@@ -12,6 +12,7 @@ pub(crate) mod debug_log;
 pub mod lightweight_context;
 mod pending_question;
 pub mod plan_registry;
+pub mod watchdog;
 
 pub use config::AutoPromptConfig;
 pub use context::{

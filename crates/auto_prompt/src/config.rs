@@ -51,6 +51,25 @@ pub struct AutoPromptConfig {
     /// tokens, capped at 100_000. Any positive value overrides this with a fixed threshold.
     #[serde(default = "default_same_thread_token_threshold")]
     pub same_thread_token_threshold: usize,
+
+    /// Watchdog: seconds the worker thread may stay in `Generating` without
+    /// stopping before a reasoning LLM is asked whether to keep waiting or
+    /// halt. The watchdog is the only mechanism that recovers from a worker
+    /// LLM stream hang — `on_thread_stopped` never fires in that case, so all
+    /// other auto-prompt timeouts are unreachable.
+    ///
+    /// On each expiry a headless LLM sees the last tool call (input + output),
+    /// the last assistant message, the cumulative elapsed time, and which
+    /// timeout number this is. `continue` reschedules for another window;
+    /// `halt` cancels the worker and injects a timeout notice into the same
+    /// thread so the worker can recover (retry / change approach / stop).
+    #[serde(default = "default_watchdog_timeout_secs")]
+    pub watchdog_timeout_secs: u64,
+
+    /// Whether the stuck-thread watchdog is active. Disable to revert to the
+    /// pre-watchdog behaviour (a hung worker stream stalls forever).
+    #[serde(default = "default_watchdog_enabled")]
+    pub watchdog_enabled: bool,
 }
 
 fn default_max_iterations() -> u32 {
@@ -78,6 +97,14 @@ fn default_same_thread_token_threshold() -> usize {
     0
 }
 
+fn default_watchdog_timeout_secs() -> u64 {
+    600
+}
+
+fn default_watchdog_enabled() -> bool {
+    true
+}
+
 impl Default for AutoPromptConfig {
     fn default() -> Self {
         Self {
@@ -88,6 +115,8 @@ impl Default for AutoPromptConfig {
             max_verification_attempts: default_max_verification_attempts(),
             max_llm_retries: default_max_llm_retries(),
             same_thread_token_threshold: default_same_thread_token_threshold(),
+            watchdog_timeout_secs: default_watchdog_timeout_secs(),
+            watchdog_enabled: default_watchdog_enabled(),
         }
     }
 }
@@ -162,6 +191,16 @@ impl AutoPromptConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or_else(default_same_thread_token_threshold);
 
+        let watchdog_timeout_secs = std::env::var("ZED_AUTO_PROMPT_WATCHDOG_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(default_watchdog_timeout_secs);
+
+        let watchdog_enabled = std::env::var("ZED_AUTO_PROMPT_WATCHDOG_ENABLED")
+            .ok()
+            .map(|v| !matches!(v.as_str(), "0" | "false"))
+            .unwrap_or_else(default_watchdog_enabled);
+
         Self {
             system_prompt,
             max_iterations,
@@ -170,6 +209,8 @@ impl AutoPromptConfig {
             max_verification_attempts,
             max_llm_retries,
             same_thread_token_threshold,
+            watchdog_timeout_secs,
+            watchdog_enabled,
         }
     }
 

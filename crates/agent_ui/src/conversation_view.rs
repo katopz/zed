@@ -1647,6 +1647,10 @@ impl ConversationView {
                         .active_thread()
                         .is_some_and(|tv| tv.read(cx).auto_prompt_enabled);
                     if auto_prompt_enabled {
+                        // The thread just stopped — cancel any running watchdog
+                        // from the previous generation cycle.
+                        crate::auto_prompt::cancel_watchdog_for_thread(self, cx);
+
                         let has_in_progress = thread.read(cx).has_in_progress_tool_calls();
                         if !has_in_progress {
                             if let Some(task) = crate::auto_prompt::on_thread_stopped(
@@ -1657,9 +1661,16 @@ impl ConversationView {
                                 window,
                                 cx,
                             ) {
+                                // Arm a fresh watchdog for the next generation
+                                // cycle before storing the task. start_watchdog
+                                // needs the ConversationView context, so it must run
+                                // outside the active.update() closure.
+                                let watchdog_task =
+                                    crate::auto_prompt::start_watchdog(self, window, cx);
                                 if let Some(active) = self.active_thread() {
                                     active.update(cx, |active, cx| {
                                         active._auto_prompt_task = Some(task);
+                                        active._watchdog_task = watchdog_task;
                                         cx.notify();
                                     });
                                 }
@@ -1746,6 +1757,10 @@ impl ConversationView {
                             );
                         }
                         if auto_prompt_enabled && !has_in_progress {
+                            // The thread errored — cancel any running watchdog
+                            // from the previous generation cycle.
+                            crate::auto_prompt::cancel_watchdog_for_thread(self, cx);
+
                             // Don't override a task already set by the Stopped handler.
                             // Error events can fire alongside Stopped (e.g. MaxTokens emits both).
                             let already_has_task = self
@@ -1763,9 +1778,12 @@ impl ConversationView {
                                 window,
                                 cx,
                             ) {
+                                let watchdog_task =
+                                    crate::auto_prompt::start_watchdog(self, window, cx);
                                 if let Some(active) = self.active_thread() {
                                     active.update(cx, |active, cx| {
                                         active._auto_prompt_task = Some(task);
+                                        active._watchdog_task = watchdog_task;
                                         cx.notify();
                                     });
                                 }

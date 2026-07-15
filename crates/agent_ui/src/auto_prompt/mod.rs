@@ -1,11 +1,13 @@
-use acp_thread::MentionUri;
+use acp_thread::{AgentThreadEntry, MentionUri, ThreadStatus, ToolCallStatus};
 use agent::ZED_AGENT_ID;
 use agent_client_protocol::schema as acp;
 use agent_servers::CLAUDE_AGENT_ID;
 use gpui::{Focusable, Window};
+use language_model::LanguageModelRegistry;
 use notifications::status_toast::StatusToast;
 use prompt_store::{BuiltInPrompt, PromptId, PromptStore};
 use std::path::PathBuf;
+use std::time::Instant;
 use ui::prelude::*;
 use workspace::PathList;
 
@@ -994,5 +996,289 @@ pub fn on_thread_stopped(
 
             Some(task)
         }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Stuck-thread watchdog
+// ──────────────────────────────────────────────────────────────────────
+//
+// See `auto_prompt::watchdog` and `.issues/002_auto_prompt_stuck_after_tool_call_watchdog.md`
+// for the full design rationale. Short version: if the worker LLM stream
+// hangs after a tool call, `on_thread_stopped` never fires and every other
+// auto_prompt timeout is unreachable. The watchdog is the only recovery path.
+//
+// The watchdog task is stored in `ThreadView._watchdog_task` and dropped
+// (cancelled) when the thread stops normally. If it fires, it calls a
+// headless reasoning LLM that decides `continue` (reschedule) or `halt`
+// (cancel worker + inject timeout notice).
+
+/// Build the `WatchdogContext` by scanning the thread's entries in reverse
+/// for the last tool call (input + output) and the last assistant message.
+///
+/// Returns `None` when the thread is no longer `Generating` — the caller
+/// should treat that as "nothing to do, the thread recovered on its own."
+fn gather_watchdog_context(
+    thread: &acp_thread::AcpThread,
+    cx: &gpui::App,
+    cumulative_elapsed_secs: u64,
+    timeout_number: u32,
+) -> Option<auto_prompt::watchdog::WatchdogContext> {
+    if thread.status() != ThreadStatus::Generating {
+        return None;
+    }
+
+    let entries = thread.entries();
+
+    // Walk backwards to find the most-recent tool call. We stop at the first
+    // user message (anything before that is a previous turn).
+    let mut last_tool_input: Option<String> = None;
+    let mut last_tool_output: Option<String> = None;
+
+    for entry in entries.iter().rev() {
+        match entry {
+            AgentThreadEntry::UserMessage(_) => break,
+            AgentThreadEntry::ToolCall(tool_call)
+                if last_tool_input.is_none()
+                    && matches!(
+                        tool_call.status,
+                        ToolCallStatus::Completed
+                            | ToolCallStatus::Failed
+                            | ToolCallStatus::InProgress
+                            | ToolCallStatus::Pending
+                    ) =>
+            {
+                // raw_input / raw_output are serde_json::Value — serialise to a
+                // compact string for the reasoning prompt.
+                last_tool_input = tool_call.raw_input.as_ref().map(|v| v.to_string());
+                last_tool_output = tool_call.raw_output.as_ref().map(|v| v.to_string());
+            }
+            AgentThreadEntry::ToolCall(_)
+            | AgentThreadEntry::AssistantMessage(_)
+            | AgentThreadEntry::CompletedPlan(_)
+            | AgentThreadEntry::ContextCompaction(_) => {}
+        }
+    }
+
+    // Reuse the thread's own helper — it handles Markdown entity reads correctly.
+    let last_assistant = thread.last_assistant_message_text(cx);
+
+    Some(auto_prompt::watchdog::WatchdogContext {
+        last_tool_call_input: last_tool_input,
+        last_tool_call_output: last_tool_output,
+        last_assistant_message: last_assistant,
+        cumulative_elapsed_secs,
+        timeout_number,
+    })
+}
+
+/// Start the stuck-thread watchdog for the active thread.
+///
+/// Call this when the thread enters `Generating` and auto-prompt is enabled.
+/// The returned `Task` should be stored in `ThreadView._watchdog_task` so it
+/// is cancelled when the thread stops normally (just drop the task).
+///
+/// Returns `None` when the watchdog is disabled in config or no model is
+/// configured.
+pub fn start_watchdog(
+    conversation_view: &crate::ConversationView,
+    window: &mut Window,
+    cx: &mut gpui::Context<crate::ConversationView>,
+) -> Option<gpui::Task<()>> {
+    let config = auto_prompt::load_config_cached().ok()?;
+    if !config.watchdog_enabled || config.watchdog_timeout_secs == 0 {
+        return None;
+    }
+
+    let registry = LanguageModelRegistry::read_global(cx);
+    let configured_model = registry.default_model()?;
+    let model = configured_model.model.clone();
+
+    let timeout_secs = config.watchdog_timeout_secs;
+
+    let active_thread = conversation_view.active_thread()?;
+    let thread = active_thread.read(cx).thread.clone();
+    let thread_weak = thread.downgrade();
+    let started_at = Instant::now();
+
+    log::info!(
+        "[auto_prompt::watchdog] Starting watchdog: timeout={}s, model={:?}",
+        timeout_secs,
+        model.id()
+    );
+
+    let task = cx.spawn_in(window, async move |_view, cx| {
+        let mut timeout_number: u32 = 0;
+
+        loop {
+            // Sleep for the configured window.
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(timeout_secs))
+                .await;
+
+            let elapsed = started_at.elapsed().as_secs();
+            timeout_number += 1;
+
+            log::warn!(
+                "[auto_prompt::watchdog] Timeout #{} fired — thread has been generating \
+                 for {}s (cumulative). Reasoning about whether to halt.",
+                timeout_number,
+                elapsed
+            );
+
+            // Gather context from the thread. If the thread is no longer
+            // generating, it recovered on its own — exit quietly.
+            let context = match thread_weak.read_with(cx, |thread, cx| {
+                gather_watchdog_context(thread, cx, elapsed, timeout_number)
+            }) {
+                Ok(Some(ctx)) => ctx,
+                Ok(None) => {
+                    log::info!(
+                        "[auto_prompt::watchdog] Thread is no longer Generating — exiting watchdog"
+                    );
+                    return;
+                }
+                Err(err) => {
+                    log::warn!(
+                        "[auto_prompt::watchdog] Thread entity dropped, exiting: {err}"
+                    );
+                    return;
+                }
+            };
+
+            // Ask the reasoning LLM whether to continue or halt.
+            let decision =
+                auto_prompt::watchdog::reason_about_stuck_thread(&model, &context, cx)
+                    .await
+                    .unwrap_or(auto_prompt::watchdog::WatchdogDecision::Continue {
+                        reason: "reasoning call errored".to_string(),
+                    });
+
+            match decision {
+                auto_prompt::watchdog::WatchdogDecision::Continue { reason } => {
+                    log::info!(
+                        "[auto_prompt::watchdog] Decision: CONTINUE (timeout #{}, reason: {})",
+                        timeout_number,
+                        reason
+                    );
+                    // Loop again — sleep another window.
+                    continue;
+                }
+                auto_prompt::watchdog::WatchdogDecision::Halt { reason } => {
+                    log::warn!(
+                        "[auto_prompt::watchdog] Decision: HALT (timeout #{}, reason: {}) \
+                         — cancelling worker and injecting timeout notice",
+                        timeout_number,
+                        reason
+                    );
+
+                    // Cancel the worker thread. This triggers Stopped(Cancelled),
+                    // which on_thread_stopped treats as NoAction (resets iteration).
+                    // We then dispatch a timeout prompt to the SAME thread so the
+                    // worker can recover with full context.
+                    let cancel_task = match thread_weak.update(cx, |thread, cx| {
+                        thread.cancel(cx)
+                    }) {
+                        Ok(task) => task,
+                        Err(err) => {
+                            log::warn!(
+                                "[auto_prompt::watchdog] Cannot cancel thread (dropped?): {err}"
+                            );
+                            return;
+                        }
+                    };
+
+                    // Wait for the cancel to fully complete before injecting the
+                    // timeout message — otherwise the new prompt may race with
+                    // the in-flight cancellation.
+                    cancel_task.await;
+
+                    // Build and dispatch the timeout-recovery prompt.
+                    let timeout_prompt = format!(
+                        "⚠️ Watchdog timeout: your last tool call completed \
+                         approximately {} minutes ago but you produced no follow-up \
+                         response (the LLM stream appeared to hang). You have been \
+                         automatically cancelled. Please decide how to proceed: \
+                         retry the task from where you left off, try a different \
+                         approach, or explicitly state that you are done. \
+                         Reason for halt: {}",
+                        elapsed / 60,
+                        reason
+                    );
+
+                    let action = match thread_weak.read_with(cx, |thread, _cx| {
+                        auto_prompt::AutoPromptAction {
+                            from_session_id: thread.session_id().clone(),
+                            from_title: thread.title().map(|t| t.to_string()),
+                            next_prompt: timeout_prompt,
+                            work_dirs: thread
+                                .work_dirs()
+                                .map(|pl| pl.paths().to_vec()),
+                            original_user_message: None,
+                            profile_id: None,
+                            actual_input_tokens: None,
+                            approximate_token_count: 0,
+                            last_assistant_message: None,
+                            force_new_thread: false,
+                        }
+                    }) {
+                        Ok(action) => action,
+                        Err(err) => {
+                            log::warn!(
+                                "[auto_prompt::watchdog] Cannot build timeout action \
+                                 (thread dropped?): {err}"
+                            );
+                            return;
+                        }
+                    };
+
+                    match _view.update_in(cx, |view, window, cx| {
+                        // Clear the watchdog task before dispatching so it doesn't
+                        // interfere with the new generation's lifecycle.
+                        if let Some(active) = view.active_thread() {
+                            active.update(cx, |active, cx| {
+                                active._watchdog_task = None;
+                                cx.notify();
+                            });
+                        }
+                        dispatch_action(action, view, window, cx);
+                    }) {
+                        Ok(()) => {
+                            log::info!(
+                                "[auto_prompt::watchdog] Timeout notice dispatched to thread"
+                            );
+                        }
+                        Err(err) => {
+                            log::warn!(
+                                "[auto_prompt::watchdog] Failed to dispatch timeout notice \
+                                 (view dropped?): {err}"
+                            );
+                        }
+                    }
+
+                    // The dispatch above starts a new generation. A NEW watchdog
+                    // will be started by conversation_view when that generation
+                    // begins — so we exit this loop here.
+                    return;
+                }
+            }
+        }
+    });
+
+    Some(task)
+}
+
+/// Cancel any running watchdog task for the active thread.
+///
+/// Call this when the thread stops normally (Stopped / Error / Refusal) — the
+/// watchdog is no longer needed. Simply dropping the `Task` cancels it.
+pub fn cancel_watchdog_for_thread(
+    conversation_view: &crate::ConversationView,
+    cx: &mut gpui::App,
+) {
+    if let Some(active) = conversation_view.active_thread() {
+        active.update(cx, |active, _cx| {
+            active.cancel_watchdog();
+        });
     }
 }
