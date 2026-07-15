@@ -1072,7 +1072,7 @@ fn gather_watchdog_context(
     })
 }
 
-/// Start the stuck-thread watchdog for the active thread.
+/// Start the stuck-thread watchdog for a thread.
 ///
 /// Call this when the thread enters `Generating` and auto-prompt is enabled.
 /// The returned `Task` should be stored in `ThreadView._watchdog_task` so it
@@ -1080,10 +1080,16 @@ fn gather_watchdog_context(
 ///
 /// Returns `None` when the watchdog is disabled in config or no model is
 /// configured.
+///
+/// `thread` is the worker thread to watch. `conversation_view` is used only
+/// for the timeout-notice dispatch (clearing the watchdog task and sending
+/// the recovery prompt). Both are passed as weak handles to avoid requiring
+/// an active entity lease at the call site — this function only reads `cx`.
 pub fn start_watchdog(
-    conversation_view: &crate::ConversationView,
-    window: &mut Window,
-    cx: &mut gpui::Context<crate::ConversationView>,
+    thread: gpui::WeakEntity<acp_thread::AcpThread>,
+    conversation_view: gpui::WeakEntity<crate::ConversationView>,
+    window: &Window,
+    cx: &gpui::App,
 ) -> Option<gpui::Task<()>> {
     let config = auto_prompt::load_config_cached().ok()?;
     if !config.watchdog_enabled || config.watchdog_timeout_secs == 0 {
@@ -1095,10 +1101,7 @@ pub fn start_watchdog(
     let model = configured_model.model.clone();
 
     let timeout_secs = config.watchdog_timeout_secs;
-
-    let active_thread = conversation_view.active_thread()?;
-    let thread = active_thread.read(cx).thread.clone();
-    let thread_weak = thread.downgrade();
+    let thread_weak = thread;
     let started_at = Instant::now();
 
     log::info!(
@@ -1107,7 +1110,7 @@ pub fn start_watchdog(
         model.id()
     );
 
-    let task = cx.spawn_in(window, async move |_view, cx| {
+    let task = window.spawn(cx, async move |cx| {
         let mut timeout_number: u32 = 0;
 
         loop {
@@ -1232,7 +1235,7 @@ pub fn start_watchdog(
                         }
                     };
 
-                    match _view.update_in(cx, |view, window, cx| {
+                    match conversation_view.update_in(cx, |view, window, cx| {
                         // Clear the watchdog task before dispatching so it doesn't
                         // interfere with the new generation's lifecycle.
                         if let Some(active) = view.active_thread() {
@@ -1256,9 +1259,10 @@ pub fn start_watchdog(
                         }
                     }
 
-                    // The dispatch above starts a new generation. A NEW watchdog
-                    // will be started by conversation_view when that generation
-                    // begins — so we exit this loop here.
+                    // The dispatch above starts a new generation (via
+                    // dispatch_action -> tv.send -> send_content). A NEW watchdog
+                    // is armed inside `send_content` when that generation begins
+                    // — so we exit this loop here.
                     return;
                 }
             }

@@ -7,6 +7,8 @@
 - [x] Coverage gap fixed: watchdog now armed at generation start (send_content),
       not just after `on_thread_stopped`. Covers initial user send + within-turn
       hangs (the original bug1.md scenario).
+- [x] Retry path gap closed: `retry_generation` now takes `window` and arms the
+      watchdog explicitly (was the last send path bypassing `send_content`).
 
 ## Symptom
 
@@ -135,6 +137,10 @@ queued messages, interrupt-and-send). The arming happens right after
 `conversation_view.rs` Stopped/Error handlers was removed (send_content covers it).
 
 This means the watchdog now protects EVERY generation, including the first one.
-`retry_generation` is the only send path that doesn't go through `send_content`
-(it calls `thread.retry()` directly) — retries are user-initiated and less likely
-to be in auto_prompt mode, so this is a minor known gap.
+
+The last remaining send path — `retry_generation` — was also closed: it now
+accepts `window: &mut Window` and calls `arm_watchdog` after `thread.retry()`.
+All call sites updated. The `start_watchdog` API was refactored to take
+`(WeakEntity<AcpThread>, WeakEntity<ConversationView>, &Window, &App)` instead
+of `(&ConversationView, &mut Window, &mut Context<ConversationView>)`, avoiding
+a double-lease panic when called from within a ThreadView update.

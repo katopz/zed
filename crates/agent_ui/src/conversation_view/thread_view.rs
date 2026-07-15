@@ -1675,32 +1675,13 @@ impl ThreadView {
 
             // Arm the stuck-thread watchdog for this generation. This covers
             // ALL send paths (initial user send, auto_prompt continuations,
-            // retries) — the original implementation only armed it after
-            // `on_thread_stopped`, which missed the case where the worker
-            // hangs mid-turn before ever emitting Stopped (the original
-            // bug1.md scenario).
-            //
-            // Done outside the `this.update_in` above because `start_watchdog`
-            // reads the active ThreadView via ConversationView::active_thread(),
-            // which would re-enter the update we just did.
-            let should_arm_watchdog = this
-                .read_with(cx, |this, _cx| {
-                    this.auto_prompt_enabled && this._watchdog_task.is_none()
-                })
-                .unwrap_or(false);
-            if should_arm_watchdog {
-                if let Some(server) = this.read_with(cx, |this, _cx| this.server_view.upgrade()).ok().flatten() {
-                    let _ = server.update_in(cx, |server, window, cx| {
-                        if let Some(task) = crate::auto_prompt::start_watchdog(server, window, cx) {
-                            // Store the watchdog task back on the ThreadView.
-                            this.update(cx, |this, cx| {
-                                this._watchdog_task = Some(task);
-                                cx.notify();
-                            }).ok();
-                        }
-                    });
-                }
-            }
+            // queued messages, interrupt-and-send) — the original implementation
+            // only armed it after `on_thread_stopped`, which missed the case
+            // where the worker hangs mid-turn before ever emitting Stopped
+            // (the original bug1.md scenario).
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.arm_watchdog(window, cx);
+            });
 
             let res = send.await;
             let turn_time_ms = turn_start_time.elapsed().as_millis();
@@ -1921,7 +1902,33 @@ impl ThreadView {
         }
     }
 
-    pub fn retry_generation(&mut self, cx: &mut Context<Self>) {
+    /// Arm the stuck-thread watchdog for the current generation.
+    ///
+    /// Must be called AFTER the thread enters `Generating` (i.e. after
+    /// `thread.send()` or `thread.retry()`). No-op if auto_prompt is disabled
+    /// or a watchdog is already running.
+    ///
+    /// Safe to call from within a ThreadView update — `start_watchdog` receives
+    /// the thread handle directly and does not read the ThreadView entity, so
+    /// there is no double-lease risk.
+    pub fn arm_watchdog(&mut self, window: &Window, cx: &App) {
+        if !self.auto_prompt_enabled || self._watchdog_task.is_some() {
+            return;
+        }
+        let Some(server) = self.server_view.upgrade() else {
+            return;
+        };
+        if let Some(task) = crate::auto_prompt::start_watchdog(
+            self.thread.downgrade(),
+            server.downgrade(),
+            window,
+            cx,
+        ) {
+            self._watchdog_task = Some(task);
+        }
+    }
+
+    pub fn retry_generation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.thread_error.take();
 
         let thread = &self.thread;
@@ -1948,6 +1955,10 @@ impl ThreadView {
         cx.emit(AcpThreadViewEvent::Interacted);
         self.sync_generating_indicator(cx);
         cx.notify();
+
+        // Arm the watchdog for this retry generation. Retries bypass
+        // `send_content` (the normal arming point), so we arm explicitly here.
+        self.arm_watchdog(window, cx);
 
         // Capture handles needed to update the parent's tool_call after the
         // retry completes. For retry-after-completion, the original send()
@@ -4057,8 +4068,8 @@ impl ThreadView {
                                             .icon_size(IconSize::Small)
                                             .icon_color(Color::Warning)
                                             .tooltip(Tooltip::text("Retry Subagent"))
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.retry_generation(cx);
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.retry_generation(window, cx);
                                             })),
                                     )
                                 })
@@ -4068,8 +4079,8 @@ impl ThreadView {
                                             .icon_size(IconSize::Small)
                                             .icon_color(Color::Warning)
                                             .tooltip(Tooltip::text("Continue Subagent"))
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.retry_generation(cx);
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.retry_generation(window, cx);
                                             })),
                                     )
                                 })
@@ -7311,8 +7322,8 @@ impl ThreadView {
                                 ),
                         )
                         .tooltip(Tooltip::text("Retry generation"))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.retry_generation(cx);
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.retry_generation(window, cx);
                         })),
                 )
             })
@@ -10204,10 +10215,10 @@ impl ThreadView {
                                     .icon_color(Color::Warning)
                                     .tooltip(Tooltip::text("Continue Subagent"))
                                     .on_click(
-                                        move |_, _, cx| {
+                                        move |_, window, cx| {
                                             telemetry::event!("Subagent Retried");
-                                            subagent_view.update(cx, |view, cx| {
-                                                view.retry_generation(cx);
+                                            let _ = subagent_view.update(cx, |view, cx| {
+                                                view.retry_generation(window, cx);
                                             });
                                         },
                                     ),
@@ -10649,8 +10660,8 @@ impl ThreadView {
         Button::new("retry", "Retry")
             .label_size(LabelSize::Small)
             .style(ButtonStyle::Filled)
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.retry_generation(cx);
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.retry_generation(window, cx);
             }))
     }
 
@@ -10759,8 +10770,8 @@ impl ThreadView {
                             IconButton::new("retry", IconName::RotateCw)
                                 .icon_size(IconSize::Small)
                                 .tooltip(Tooltip::text("Retry Generation"))
-                                .on_click(cx.listener(|this, _, _window, cx| {
-                                    this.retry_generation(cx);
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.retry_generation(window, cx);
                                 })),
                         )
                     })
