@@ -1545,6 +1545,10 @@ impl ConversationView {
                         active.watchdog_activity_gen.set(next_gen);
                     });
                 }
+                // If this is a subagent entry, the parent thread is also
+                // active (it's waiting on the subagent). Bump its watchdog
+                // activity counter so it doesn't false-positive.
+                self.bump_parent_watchdog(&session_id, cx);
             }
             AcpThreadEvent::EntryUpdated(index) => {
                 if let Some(active) = self.thread_view(&session_id) {
@@ -1562,6 +1566,8 @@ impl ConversationView {
                         active.watchdog_activity_gen.set(next_gen);
                     });
                 }
+                // Subagent streaming = parent is also active.
+                self.bump_parent_watchdog(&session_id, cx);
             }
             AcpThreadEvent::EntriesRemoved(range) => {
                 if let Some(active) = self.thread_view(&session_id) {
@@ -1575,6 +1581,14 @@ impl ConversationView {
                 }
             }
             AcpThreadEvent::SubagentSpawned(subagent_session_id) => {
+                // A subagent just started — the parent is actively working.
+                // Bump the parent's watchdog activity counter.
+                if let Some(tv) = self.thread_view(&session_id) {
+                    tv.update(cx, |tv, _cx| {
+                        let next_gen = tv.watchdog_activity_gen.get().wrapping_add(1);
+                        tv.watchdog_activity_gen.set(next_gen);
+                    });
+                }
                 self.load_subagent_session(subagent_session_id.clone(), session_id, window, cx)
             }
             AcpThreadEvent::ToolAuthorizationRequested(_) => {
@@ -1909,6 +1923,37 @@ impl ConversationView {
             }
         }
         cx.notify();
+    }
+
+    /// Bump the parent thread's watchdog activity counter when a subagent
+    /// produces output. Without this, a long-running subagent call would
+    /// leave the parent thread with no `NewEntry`/`EntryUpdated` events,
+    /// causing the parent's watchdog to false-positive.
+    fn bump_parent_watchdog(&self, subagent_session_id: &acp::SessionId, cx: &mut App) {
+        let Some(connected) = self.as_connected() else {
+            return;
+        };
+        // Find the subagent's parent session id, then bump that parent's
+        // watchdog activity counter.
+        let parent_session_id = connected
+            .threads
+            .get(subagent_session_id)
+            .and_then(|tv| {
+                tv.read(cx)
+                    .thread
+                    .read(cx)
+                    .parent_session_id()
+                    .cloned()
+            });
+        let Some(parent_session_id) = parent_session_id else {
+            return;
+        };
+        if let Some(parent_tv) = self.thread_view(&parent_session_id) {
+            parent_tv.update(cx, |tv, _cx| {
+                let next_gen = tv.watchdog_activity_gen.get().wrapping_add(1);
+                tv.watchdog_activity_gen.set(next_gen);
+            });
+        }
     }
 
     fn schedule_draft_prompt_persist(&mut self, cx: &mut Context<Self>) {
