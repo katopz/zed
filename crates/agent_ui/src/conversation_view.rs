@@ -4188,6 +4188,7 @@ pub(crate) mod tests {
                         remote_connection: None,
                         archived: false,
                         continued_from_session_id: None,
+                        pinned: false,
                     },
                     cx,
                 );

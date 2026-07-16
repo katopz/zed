@@ -611,6 +611,7 @@ fn collect_importable_threads(
                 remote_connection: remote_connection.clone(),
                 archived: true,
                 continued_from_session_id: None,
+                pinned: false,
             });
         }
     }

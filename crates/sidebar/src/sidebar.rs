@@ -19,7 +19,7 @@ use agent_ui::threads_archive_view::{
 use agent_ui::{
     AcpThreadImportOnboarding, Agent, AgentPanel, AgentPanelEvent, AgentThreadSource,
     ArchiveSelectedThread, CrossChannelImportOnboarding, DEFAULT_THREAD_TITLE, NewTerminalThread,
-    NewThread, RenameSelectedThread, TerminalId, ThreadId, ThreadImportModal,
+    NewThread, PinSelectedThread, RenameSelectedThread, TerminalId, ThreadId, ThreadImportModal,
     ThreadTitleRegenerationResult, channels_with_threads, import_threads_from_other_channels,
 };
 use chrono::{DateTime, Utc};
@@ -1772,7 +1772,12 @@ impl Sidebar {
                 threads.sort_by(|a, b| {
                     let a_time = Self::thread_display_time(&a.metadata);
                     let b_time = Self::thread_display_time(&b.metadata);
-                    b_time.cmp(&a_time)
+                    // Pinned threads float to the top of their group; within
+                    // each tier, sort by recency descending.
+                    b.metadata
+                        .pinned
+                        .cmp(&a.metadata.pinned)
+                        .then_with(|| b_time.cmp(&a_time))
                 });
             } else {
                 for info in live_infos {
@@ -5712,6 +5717,37 @@ impl Sidebar {
         self.start_renaming_thread(ix, thread_id, title, window, cx);
     }
 
+    fn pin_thread(&mut self, thread_id: ThreadId, pinned: bool, cx: &mut Context<Self>) {
+        ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+            store.set_pinned(thread_id, pinned, cx);
+        });
+        self.update_entries(cx);
+    }
+
+    fn toggle_pin_thread(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {
+        let pinned = ThreadMetadataStore::global(cx)
+            .read(cx)
+            .entry(thread_id)
+            .is_some_and(|metadata| metadata.pinned);
+        self.pin_thread(thread_id, !pinned, cx);
+    }
+
+    fn pin_selected_thread(
+        &mut self,
+        _: &PinSelectedThread,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ix) = self.selection else {
+            return;
+        };
+        let Some(ListEntry::Thread(thread)) = self.contents.entries.get(ix) else {
+            return;
+        };
+        let thread_id = thread.metadata.thread_id;
+        self.toggle_pin_thread(thread_id, cx);
+    }
+
     fn record_thread_access(&mut self, id: &ThreadId) {
         self.thread_last_accessed.insert(*id, Utc::now());
     }
@@ -5749,11 +5785,25 @@ impl Sidebar {
             }
         }
 
+        // Terminals are never pinned, so they sort as the unpinned tier.
+        let pinned = |entry: &ListEntry| -> bool {
+            match entry {
+                ListEntry::Thread(thread) => thread.metadata.pinned,
+                _ => false,
+            }
+        };
+
         let row_entries = terminals
             .into_iter()
             .map(ListEntry::Terminal)
             .chain(threads.into_iter().map(ListEntry::Thread))
-            .sorted_by_key(|right| std::cmp::Reverse(display_time(right)));
+            .sorted_by(|left, right| {
+                // Pinned first, then recency descending (matches the in-group
+                // sort in `rebuild_contents`).
+                pinned(right)
+                    .cmp(&pinned(left))
+                    .then_with(|| display_time(right).cmp(&display_time(left)))
+            });
 
         for entry in row_entries {
             if let ListEntry::Thread(thread) = &entry {
@@ -6291,6 +6341,29 @@ impl Sidebar {
                 )
             })
             .when(is_hovered && !is_renaming, |this| {
+                let is_pinned = thread.metadata.pinned;
+                let pin_button = IconButton::new(("pin-thread", ix), if is_pinned {
+                    IconName::Unpin
+                } else {
+                    IconName::Pin
+                })
+                .icon_size(IconSize::Small)
+                .icon_color(if is_pinned { Color::Accent } else { Color::Muted })
+                .tooltip({
+                    let focus_handle = focus_handle.clone();
+                    move |_window, cx| {
+                        Tooltip::for_action_in(
+                            if is_pinned { "Unpin Thread" } else { "Pin Thread" },
+                            &PinSelectedThread,
+                            &focus_handle,
+                            cx,
+                        )
+                    }
+                })
+                .on_click(cx.listener(move |this, _, _window, cx| {
+                    this.toggle_pin_thread(thread_id_for_actions, cx);
+                }));
+
                 let rename_button = IconButton::new(("rename-thread", ix), IconName::Pencil)
                     .icon_size(IconSize::Small)
                     .icon_color(Color::Muted)
@@ -6382,8 +6455,20 @@ impl Sidebar {
                 this.action_slot(
                     h_flex()
                         .gap_0p5()
+                        .child(pin_button)
                         .child(rename_button)
                         .when_some(contextual_action, |this, action| this.child(action)),
+                )
+            })
+            .when(!is_hovered && thread.metadata.pinned && !is_renaming, |this| {
+                // Persistent pin indicator: when the row isn't hovered, show an
+                // accent pin icon so the pinned state is visible at a glance.
+                this.action_slot(
+                    div().child(
+                        Icon::new(IconName::Pin)
+                            .size(IconSize::Small)
+                            .color(Color::Accent),
+                    ),
                 )
             })
             .on_click({
@@ -6445,7 +6530,26 @@ impl Sidebar {
                     let markdown_title = markdown_title.clone();
                     let rename_title = rename_title.clone();
                     let folder_paths = folder_paths.clone();
+                    let is_pinned = ThreadMetadataStore::global(cx)
+                        .read(cx)
+                        .entry(thread_id)
+                        .is_some_and(|metadata| metadata.pinned);
                     ContextMenu::build(_window, cx, move |mut menu, _window, _cx| {
+                        menu = menu.entry(
+                            if is_pinned { "Unpin Thread" } else { "Pin Thread" },
+                            None,
+                            {
+                                let sidebar = sidebar.clone();
+                                move |_window, cx| {
+                                    sidebar
+                                        .update(cx, |sidebar, cx| {
+                                            sidebar.toggle_pin_thread(thread_id, cx);
+                                        })
+                                        .ok();
+                                }
+                            },
+                        );
+
                         menu = menu.entry("Rename Title", None, {
                             let sidebar = sidebar.clone();
                             let rename_title = rename_title.clone();
@@ -7952,6 +8056,7 @@ impl Render for Sidebar {
             .on_action(cx.listener(Self::cancel))
             .on_action(cx.listener(Self::archive_selected_thread))
             .on_action(cx.listener(Self::rename_selected_thread))
+            .on_action(cx.listener(Self::pin_selected_thread))
             .on_action(cx.listener(Self::new_thread_in_group))
             .on_action(cx.listener(Self::new_terminal_thread))
             .on_action(cx.listener(Self::toggle_archive))

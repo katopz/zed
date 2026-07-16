@@ -1775,7 +1775,9 @@ impl AgentPanel {
         let _thread_metadata_store_subscription = cx.subscribe(
             &ThreadMetadataStore::global(cx),
             |this, _store, event, cx| {
-                let ThreadMetadataStoreEvent::ThreadArchived(thread_id) = event;
+                let ThreadMetadataStoreEvent::ThreadArchived(thread_id) = event else {
+                    return;
+                };
                 if this.retained_threads.remove(thread_id).is_some() {
                     cx.notify();
                 }
@@ -8020,6 +8022,7 @@ mod tests {
                         remote_connection: None,
                         archived: false,
                         continued_from_session_id: None,
+                        pinned: false,
                     },
                     cx,
                 );
