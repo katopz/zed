@@ -3671,6 +3671,49 @@ impl AgentPanel {
         Some(thread_id)
     }
 
+    /// Like [`external_thread`](Self::external_thread) but parks the new thread
+    /// in `retained_threads` instead of making it the active base_view.
+    ///
+    /// Used by auto_prompt continuation threads so they generate in the
+    /// background without replacing the view the user is currently looking
+    /// at. The thread stays live and appears in the sidebar; the user can
+    /// click into it when ready. Passing `true` for `focus` here has no
+    /// effect — background threads never steal focus.
+    pub(crate) fn external_thread_background(
+        &mut self,
+        agent_choice: Option<crate::Agent>,
+        resume_thread_id: Option<ThreadId>,
+        work_dirs: Option<PathList>,
+        title: Option<SharedString>,
+        initial_content: Option<AgentInitialContent>,
+        source: AgentThreadSource,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<ThreadId> {
+        if resume_thread_id.is_none() && !self.has_open_project(cx) {
+            return None;
+        }
+        let agent = agent_choice.unwrap_or_else(|| self.selected_agent(cx));
+        let thread = self.create_agent_thread_with_server(
+            agent,
+            None,
+            resume_thread_id,
+            work_dirs,
+            title,
+            initial_content,
+            None,
+            source,
+            window,
+            cx,
+        );
+        let thread_id = thread.conversation_view.read(cx).thread_id;
+        self.retained_threads
+            .insert(thread_id, thread.conversation_view);
+        cx.emit(AgentPanelEvent::ActiveViewChanged);
+        cx.notify();
+        Some(thread_id)
+    }
+
     fn deploy_rules_library(
         &mut self,
         _action: &OpenRulesLibrary,

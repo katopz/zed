@@ -497,17 +497,36 @@ pub(crate) fn dispatch_action(
                     }
                     _ => None,
                 };
-                let new_thread_id = panel.external_thread(
-                    None,
-                    None,
-                    work_dirs,
-                    action.from_title.clone().map(Into::into),
-                    Some(initial_content),
-                    focus,
-                    crate::AgentThreadSource::AgentPanel,
-                    window,
-                    cx,
-                );
+                // When the user has not opted into auto-focus, create the
+                // continuation thread in the background (retained_threads)
+                // instead of replacing the active base_view. This avoids
+                // visual focus stealing: the new thread generates silently
+                // and shows up in the sidebar without disturbing whatever
+                // the user is currently looking at.
+                let new_thread_id = if focus {
+                    panel.external_thread(
+                        None,
+                        None,
+                        work_dirs,
+                        action.from_title.clone().map(Into::into),
+                        Some(initial_content),
+                        focus,
+                        crate::AgentThreadSource::AgentPanel,
+                        window,
+                        cx,
+                    )
+                } else {
+                    panel.external_thread_background(
+                        None,
+                        None,
+                        work_dirs,
+                        action.from_title.clone().map(Into::into),
+                        Some(initial_content),
+                        crate::AgentThreadSource::AgentPanel,
+                        window,
+                        cx,
+                    )
+                };
                 if let (Some(thread_id), Some(from_session_id)) = (new_thread_id, continued_from) {
                     if let Some(store) = ThreadMetadataStore::try_global(cx) {
                         store.update(cx, |store, cx| {
