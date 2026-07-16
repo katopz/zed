@@ -6,6 +6,7 @@ use crate::{
 };
 use agent_client_protocol::schema as acp;
 use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 
 use acp_thread::{ContentBlock, PlanEntry, SandboxAuthorizationDetails};
 use agent::{SkillLoadingError, SkillLoadingErrorsUpdated};
@@ -573,6 +574,12 @@ pub struct ThreadView {
     /// Stuck-thread watchdog task. Started when the thread enters Generating,
     /// cancelled (dropped) when the thread stops. See `auto_prompt::start_watchdog`.
     pub _watchdog_task: Option<gpui::Task<()>>,
+    /// Shared watchdog activity generation counter. Incremented on every
+    /// send and every received entry update. The watchdog task captures the
+    /// value at sleep start and re-sleeps if it changed when it wakes —
+    /// meaning active streaming resets the stuck-thread clock without
+    /// depending on wall-clock time (which breaks under the mock test clock).
+    pub watchdog_activity_gen: Rc<Cell<u64>>,
     pub list_state: ListState,
     pub session_capabilities: SharedSessionCapabilities,
     /// Tracks which tool calls have their content/output expanded.
@@ -989,6 +996,7 @@ impl ThreadView {
             _auto_prompt_task: None,
             _auto_prompt_retry_data: None,
             _watchdog_task: None,
+            watchdog_activity_gen: Rc::new(Cell::new(0)),
             expanded_tool_calls: HashSet::default(),
             expanded_tool_call_raw_inputs: HashSet::default(),
             collapsed_sandbox_authorization_details: HashSet::default(),
@@ -1565,6 +1573,12 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Bump the watchdog activity counter immediately on send — the
+        // async task below may take time to resolve contents, and we don't
+        // want a stale watchdog to fire during that gap.
+        let next_gen = self.watchdog_activity_gen.get().wrapping_add(1);
+        self.watchdog_activity_gen.set(next_gen);
+
         // Cancel any running auto_prompt task — user input takes priority.
         if self._auto_prompt_task.is_some() {
             log::info!("[auto_prompt] Cancelling auto_prompt: user message takes priority");
@@ -1907,30 +1921,27 @@ impl ThreadView {
     /// Must be called AFTER the thread enters `Generating` (i.e. after
     /// `thread.send()` or `thread.retry()`). No-op if auto_prompt is disabled.
     ///
-    /// A new generation invalidates any previous watchdog — its `started_at`
-    /// is no longer meaningful. We drop the stale task (which cancels it)
-    /// before creating a fresh one, so each generation gets a timer counting
-    /// from its own start. Without this, a stale watchdog from a prior
-    /// generation (left behind when `cancel_watchdog_for_thread` missed it)
-    /// would accumulate elapsed time across boundaries (see issue 004).
-    ///
-    /// Safe to call from within a ThreadView update — `start_watchdog` receives
-    /// the thread handle directly and does not read the ThreadView entity, so
-    /// there is no double-lease risk.
+    /// A new generation always drops any stale watchdog task (even when
+    /// auto_prompt is off) so its timer can't survive into the next
+    /// generation. The watchdog reads elapsed time from `watchdog_reset_at`,
+    /// which is reset on every send and every received entry update.
     pub fn arm_watchdog(&mut self, window: &Window, cx: &App) {
+        // Always drop a stale watchdog task — even when auto_prompt is disabled,
+        // because a prior generation may have left one behind (e.g. the user
+        // toggled auto_prompt off mid-generation). Without this, the stale task
+        // survives with its old timer and fires false timeouts.
+        self._watchdog_task = None;
+
         if !self.auto_prompt_enabled {
             return;
         }
-        // Drop any stale watchdog from a prior generation before re-arming.
-        // Dropping the Task cancels it. A new generation must always get a
-        // fresh `started_at = Instant::now()`.
-        self._watchdog_task = None;
         let Some(server) = self.server_view.upgrade() else {
             return;
         };
         if let Some(task) = crate::auto_prompt::start_watchdog(
             self.thread.downgrade(),
             server.downgrade(),
+            self.watchdog_activity_gen.clone(),
             window,
             cx,
         ) {

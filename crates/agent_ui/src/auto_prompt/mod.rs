@@ -8,7 +8,6 @@ use notifications::status_toast::StatusToast;
 use prompt_store::{BuiltInPrompt, PromptId, PromptStore};
 use settings::Settings;
 use std::path::PathBuf;
-use std::time::Instant;
 use ui::prelude::*;
 use workspace::PathList;
 
@@ -1064,6 +1063,7 @@ fn gather_watchdog_context(
 pub fn start_watchdog(
     thread: gpui::WeakEntity<acp_thread::AcpThread>,
     conversation_view: gpui::WeakEntity<crate::ConversationView>,
+    activity_gen: std::rc::Rc<std::cell::Cell<u64>>,
     window: &Window,
     cx: &gpui::App,
 ) -> Option<gpui::Task<()>> {
@@ -1078,7 +1078,6 @@ pub fn start_watchdog(
 
     let timeout_secs = config.watchdog_timeout_secs;
     let thread_weak = thread;
-    let started_at = Instant::now();
 
     log::info!(
         "[auto_prompt::watchdog] Starting watchdog: timeout={}s, model={:?}",
@@ -1090,25 +1089,34 @@ pub fn start_watchdog(
         let mut timeout_number: u32 = 0;
 
         loop {
-            // Sleep for the configured window.
+            // Capture the activity generation before sleeping. If it changes
+            // during the sleep (send, NewEntry, EntryUpdated), the thread is
+            // actively working — re-sleep instead of firing.
+            let gen_at_sleep = activity_gen.get();
+
             cx.background_executor()
                 .timer(std::time::Duration::from_secs(timeout_secs))
                 .await;
 
-            let elapsed = started_at.elapsed().as_secs();
+            if activity_gen.get() != gen_at_sleep {
+                // Activity happened during the sleep window. The thread is not
+                // stuck — reset and sleep again.
+                continue;
+            }
+
             timeout_number += 1;
 
             log::warn!(
-                "[auto_prompt::watchdog] Timeout #{} fired — thread has been generating \
-                 for {}s (cumulative). Reasoning about whether to halt.",
+                "[auto_prompt::watchdog] Timeout #{} fired — no activity for {}s. \
+                 Reasoning about whether to halt.",
                 timeout_number,
-                elapsed
+                timeout_secs
             );
 
             // Gather context from the thread. If the thread is no longer
             // generating, it recovered on its own — exit quietly.
             let context = match thread_weak.read_with(cx, |thread, cx| {
-                gather_watchdog_context(thread, cx, elapsed, timeout_number)
+                gather_watchdog_context(thread, cx, timeout_secs, timeout_number)
             }) {
                 Ok(Some(ctx)) => ctx,
                 Ok(None) => {
@@ -1181,7 +1189,7 @@ pub fn start_watchdog(
                          retry the task from where you left off, try a different \
                          approach, or explicitly state that you are done. \
                          Reason for halt: {}",
-                        elapsed / 60,
+                        timeout_secs / 60,
                         reason
                     );
 

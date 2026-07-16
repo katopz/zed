@@ -1538,6 +1538,11 @@ impl ConversationView {
                     });
                     active.update(cx, |active, cx| {
                         active.sync_editor_mode_for_empty_state(cx);
+                        // New entry = the worker produced output. Bump the
+                        // watchdog activity counter so active streaming never
+                        // triggers a false stuck-thread timeout.
+                        let next_gen = active.watchdog_activity_gen.get().wrapping_add(1);
+                        active.watchdog_activity_gen.set(next_gen);
                     });
                 }
             }
@@ -1551,6 +1556,10 @@ impl ConversationView {
                     list_state.remeasure_items(*index..*index + 1);
                     active.update(cx, |active, cx| {
                         active.auto_expand_streaming_thought(cx);
+                        // Streaming update = the worker is active. Bump the
+                        // watchdog activity counter.
+                        let next_gen = active.watchdog_activity_gen.get().wrapping_add(1);
+                        active.watchdog_activity_gen.set(next_gen);
                     });
                 }
             }
@@ -9735,6 +9744,108 @@ pub(crate) mod tests {
         assert!(
             watchdog_armed,
             "a fresh watchdog should be armed for generation 2 (fix for Bug B)"
+        );
+    }
+
+    /// The watchdog must NOT fire while the worker is actively streaming output.
+    ///
+    /// Before this fix, the watchdog measured elapsed time from a single
+    /// `started_at = Instant::now()` captured when the generation began. A
+    /// long-running generation that was actively producing content (tool calls,
+    /// streaming text) would still trip the watchdog after `timeout_secs`,
+    /// producing false "stuck thread" cancellations.
+    ///
+    /// After the fix, every `NewEntry` / `EntryUpdated` event bumps an activity
+    /// generation counter. The watchdog captures the counter before sleeping;
+    /// if it changed when the timer expires, the thread is active and the
+    /// watchdog re-sleeps instead of firing.
+    #[gpui::test]
+    async fn test_watchdog_does_not_fire_during_active_stream(cx: &mut TestAppContext) {
+        // 2s watchdog window — short enough for the test, long enough that we
+        // can advance the clock in steps and inject streaming chunks between.
+        set_watchdog_env("2", "1");
+        let _guard = WatchdogEnvGuard;
+
+        init_test(cx);
+
+        let fake_model = cx.read(|cx| {
+            LanguageModelRegistry::read_global(cx)
+                .default_model()
+                .expect("no default model")
+                .model
+                .clone()
+        });
+
+        // Use a stub connection that we control: we'll feed it streaming
+        // updates manually so the thread stays Generating with periodic output.
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+
+        active_thread(&conversation_view, cx).update(cx, |view, cx| {
+            view.auto_prompt_enabled = true;
+            cx.notify();
+        });
+
+        // Send a message. The worker enters Generating.
+        let message_editor = message_editor(&conversation_view, cx);
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("do something slowly", window, cx);
+        });
+        active_thread(&conversation_view, cx)
+            .update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+
+        let session_id = active_thread(&conversation_view, cx)
+            .read_with(cx, |view, cx| view.thread.read(cx).session_id().clone());
+
+        // Sanity: thread is generating, watchdog armed.
+        let (status, watchdog_armed) =
+            active_thread(&conversation_view, cx).read_with(cx, |view, cx| {
+                (view.thread.read(cx).status(), view._watchdog_task.is_some())
+            });
+        assert_eq!(status, acp_thread::ThreadStatus::Generating);
+        assert!(watchdog_armed);
+
+        // Advance the clock 1s (halfway to the 2s timeout), then inject a
+        // streaming chunk via send_update (set_next_prompt_updates only
+        // applies to the NEXT prompt call, but this session is already
+        // hanging). This bumps the activity counter.
+        cx.executor().advance_clock(std::time::Duration::from_secs(1));
+        cx.update(|_, cx| {
+            connection.send_update(
+                session_id.clone(),
+                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                    "working...".into(),
+                )),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        // Advance past the original 2s window (total 3s). Without the activity
+        // reset, the watchdog would have fired by now.
+        cx.executor().advance_clock(std::time::Duration::from_secs(2));
+        cx.run_until_parked();
+
+        // The watchdog should NOT have called the reasoning LLM — the stream
+        // was active.
+        assert_eq!(
+            fake_model.as_fake().completion_count(),
+            0,
+            "watchdog should not fire while the worker is actively streaming"
+        );
+
+        // Now stop feeding updates and advance past the timeout again.
+        // With no activity for a full window, the watchdog should fire.
+        cx.executor().advance_clock(std::time::Duration::from_secs(3));
+        cx.run_until_parked();
+
+        assert_eq!(
+            fake_model.as_fake().completion_count(),
+            1,
+            "watchdog should fire after a full timeout window with no activity"
         );
     }
 }
