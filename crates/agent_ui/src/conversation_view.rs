@@ -1648,8 +1648,10 @@ impl ConversationView {
                         .is_some_and(|tv| tv.read(cx).auto_prompt_enabled);
                     if auto_prompt_enabled {
                         // The thread just stopped — cancel any running watchdog
-                        // from the previous generation cycle.
-                        crate::auto_prompt::cancel_watchdog_for_thread(self, cx);
+                        // for THIS thread from the previous generation cycle.
+                        // Pass session_id so we cancel the event's thread, not
+                        // whatever thread is currently active (issue 004).
+                        crate::auto_prompt::cancel_watchdog_for_thread(self, &session_id, cx);
 
                         let has_in_progress = thread.read(cx).has_in_progress_tool_calls();
                         if !has_in_progress {
@@ -1756,8 +1758,10 @@ impl ConversationView {
                         }
                         if auto_prompt_enabled && !has_in_progress {
                             // The thread errored — cancel any running watchdog
-                            // from the previous generation cycle.
-                            crate::auto_prompt::cancel_watchdog_for_thread(self, cx);
+                            // for THIS thread from the previous generation
+                            // cycle. Pass session_id so we cancel the event's
+                            // thread, not the currently-active one (issue 004).
+                            crate::auto_prompt::cancel_watchdog_for_thread(self, &session_id, cx);
 
                             // Don't override a task already set by the Stopped handler.
                             // Error events can fire alongside Stopped (e.g. MaxTokens emits both).

@@ -1248,17 +1248,24 @@ pub fn start_watchdog(
     Some(task)
 }
 
-/// Cancel any running watchdog task for the active thread.
+/// Cancel any running watchdog task for a specific thread.
 ///
 /// Call this when the thread stops normally (Stopped / Error / Refusal) — the
 /// watchdog is no longer needed. Simply dropping the `Task` cancels it.
+///
+/// Targets the thread identified by `session_id`, NOT the currently-active
+/// view. The previous implementation used `active_thread()`, which cancels
+/// the wrong thread when the user has switched away from the thread that
+/// emitted the stop event — leaving a stale watchdog behind that accumulates
+/// elapsed time across generations (see issue 004).
 pub fn cancel_watchdog_for_thread(
     conversation_view: &crate::ConversationView,
+    session_id: &acp::SessionId,
     cx: &mut gpui::App,
 ) {
-    if let Some(active) = conversation_view.active_thread() {
-        active.update(cx, |active, _cx| {
-            active.cancel_watchdog();
+    if let Some(view) = conversation_view.thread_view(session_id) {
+        view.update(cx, |view, _cx| {
+            view.cancel_watchdog();
         });
     }
 }

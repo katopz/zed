@@ -1905,16 +1905,26 @@ impl ThreadView {
     /// Arm the stuck-thread watchdog for the current generation.
     ///
     /// Must be called AFTER the thread enters `Generating` (i.e. after
-    /// `thread.send()` or `thread.retry()`). No-op if auto_prompt is disabled
-    /// or a watchdog is already running.
+    /// `thread.send()` or `thread.retry()`). No-op if auto_prompt is disabled.
+    ///
+    /// A new generation invalidates any previous watchdog — its `started_at`
+    /// is no longer meaningful. We drop the stale task (which cancels it)
+    /// before creating a fresh one, so each generation gets a timer counting
+    /// from its own start. Without this, a stale watchdog from a prior
+    /// generation (left behind when `cancel_watchdog_for_thread` missed it)
+    /// would accumulate elapsed time across boundaries (see issue 004).
     ///
     /// Safe to call from within a ThreadView update — `start_watchdog` receives
     /// the thread handle directly and does not read the ThreadView entity, so
     /// there is no double-lease risk.
     pub fn arm_watchdog(&mut self, window: &Window, cx: &App) {
-        if !self.auto_prompt_enabled || self._watchdog_task.is_some() {
+        if !self.auto_prompt_enabled {
             return;
         }
+        // Drop any stale watchdog from a prior generation before re-arming.
+        // Dropping the Task cancels it. A new generation must always get a
+        // fresh `started_at = Instant::now()`.
+        self._watchdog_task = None;
         let Some(server) = self.server_view.upgrade() else {
             return;
         };
