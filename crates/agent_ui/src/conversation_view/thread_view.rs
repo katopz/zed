@@ -1899,6 +1899,9 @@ impl ThreadView {
         self.thread_retry_status.take();
         self.thread_error.take();
         self.user_interrupted_generation = true;
+        // Cancel the watchdog immediately — don't wait for the Stopped event,
+        // which may not fire promptly or may skip the cancel path.
+        self.cancel_watchdog();
         self._cancel_task = Some(self.thread.update(cx, |thread, cx| thread.cancel(cx)));
         self.sync_generating_indicator(cx);
         cx.notify();

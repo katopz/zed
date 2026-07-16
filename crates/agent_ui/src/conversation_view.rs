@@ -1612,6 +1612,12 @@ impl ConversationView {
                     return;
                 }
 
+                // The thread stopped for ANY reason (user cancel, error, end
+                // turn, retry wall) — always cancel the watchdog. Don't gate
+                // this on auto_prompt_enabled or should_send_queued: a stale
+                // watchdog from this generation must not survive.
+                crate::auto_prompt::cancel_watchdog_for_thread(self, &session_id, cx);
+
                 let should_send_queued = if let Some(active) = self.root_thread_view() {
                     active.update(cx, |active, cx| {
                         if active.skip_queue_processing_count > 0 {
@@ -1656,12 +1662,6 @@ impl ConversationView {
                         .active_thread()
                         .is_some_and(|tv| tv.read(cx).auto_prompt_enabled);
                     if auto_prompt_enabled {
-                        // The thread just stopped — cancel any running watchdog
-                        // for THIS thread from the previous generation cycle.
-                        // Pass session_id so we cancel the event's thread, not
-                        // whatever thread is currently active (issue 004).
-                        crate::auto_prompt::cancel_watchdog_for_thread(self, &session_id, cx);
-
                         let has_in_progress = thread.read(cx).has_in_progress_tool_calls();
                         if !has_in_progress {
                             if let Some(task) = crate::auto_prompt::on_thread_stopped(
@@ -1691,6 +1691,9 @@ impl ConversationView {
                 }
             }
             AcpThreadEvent::Refusal => {
+                // Refusal = thread stopped. Cancel the watchdog.
+                crate::auto_prompt::cancel_watchdog_for_thread(self, &session_id, cx);
+
                 let error = ThreadError::Refusal;
                 if let Some(active) = self.thread_view(&session_id) {
                     active.update(cx, |active, cx| {
@@ -1720,6 +1723,9 @@ impl ConversationView {
                     });
                 }
                 if !is_subagent {
+                    // Error = thread stopped. Always cancel the watchdog.
+                    crate::auto_prompt::cancel_watchdog_for_thread(self, &session_id, cx);
+
                     self.notify_with_sound(
                         "Agent stopped due to an error",
                         IconName::Warning,
@@ -1766,12 +1772,6 @@ impl ConversationView {
                             );
                         }
                         if auto_prompt_enabled && !has_in_progress {
-                            // The thread errored — cancel any running watchdog
-                            // for THIS thread from the previous generation
-                            // cycle. Pass session_id so we cancel the event's
-                            // thread, not the currently-active one (issue 004).
-                            crate::auto_prompt::cancel_watchdog_for_thread(self, &session_id, cx);
-
                             // Don't override a task already set by the Stopped handler.
                             // Error events can fire alongside Stopped (e.g. MaxTokens emits both).
                             let already_has_task = self
