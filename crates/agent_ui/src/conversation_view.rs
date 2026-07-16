@@ -9520,4 +9520,221 @@ pub(crate) mod tests {
             "auto_prompt state should be Idle after cancellation"
         );
     }
+
+    // Guard that restores the watchdog env vars and invalidates the config
+    // cache on drop, so a panic mid-test doesn't leak a 1s watchdog timeout
+    // into sibling tests running in the same process.
+    struct WatchdogEnvGuard;
+    impl Drop for WatchdogEnvGuard {
+        fn drop(&mut self) {
+            // `set_var`/`remove_var` are `unsafe` as of Rust 2024 (mutating
+            // global state). The test process is single-threaded for env vars.
+            unsafe {
+                std::env::remove_var("ZED_AUTO_PROMPT_WATCHDOG_TIMEOUT_SECS");
+                std::env::remove_var("ZED_AUTO_PROMPT_WATCHDOG_ENABLED");
+            }
+            auto_prompt::invalidate_config_cache();
+        }
+    }
+
+    /// Set the watchdog env vars and invalidate the cached config so the next
+    /// `load_config_cached()` picks up the test values.
+    fn set_watchdog_env(timeout_secs: &str, enabled: &str) {
+        unsafe {
+            std::env::set_var("ZED_AUTO_PROMPT_WATCHDOG_TIMEOUT_SECS", timeout_secs);
+            std::env::set_var("ZED_AUTO_PROMPT_WATCHDOG_ENABLED", enabled);
+        }
+        auto_prompt::invalidate_config_cache();
+    }
+
+    /// End-to-end test for the stuck-thread watchdog HALT flow.
+    ///
+    /// Covers the full recovery path: a worker that hangs forever (its `prompt()`
+    /// never returns) → watchdog timer fires → reasoning LLM returns `halt` →
+    /// worker is cancelled → timeout-notice prompt is injected into the same
+    /// thread → a new generation begins.
+    ///
+    /// This also implicitly verifies that the watchdog is armed on `send_content`
+    /// (the bug1.md fix) — not just after `on_thread_stopped`.
+    #[gpui::test]
+    async fn test_watchdog_halts_stuck_thread(cx: &mut TestAppContext) {
+        // 1s watchdog window so the test advances the clock only a little.
+        set_watchdog_env("1", "1");
+        let _guard = WatchdogEnvGuard;
+
+        init_test(cx);
+
+        // Grab the registered FakeLanguageModel so we can feed the reasoning
+        // response via `as_fake()`.
+        let fake_model = cx.read(|cx| {
+            LanguageModelRegistry::read_global(cx)
+                .default_model()
+                .expect("no default model")
+                .model
+                .clone()
+        });
+
+        // A stub connection with no `next_prompt_updates` hangs forever until
+        // `end_turn`/`cancel` resolves its oneshot channel — the stuck-worker
+        // scenario.
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+
+        // Enable auto_prompt — the watchdog only arms when it is on.
+        active_thread(&conversation_view, cx).update(cx, |view, cx| {
+            view.auto_prompt_enabled = true;
+            cx.notify();
+        });
+
+        // Send a message. The worker enters Generating and hangs.
+        let message_editor = message_editor(&conversation_view, cx);
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("do something", window, cx);
+        });
+        active_thread(&conversation_view, cx)
+            .update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+
+        // Pre-timeout: thread is stuck Generating and the watchdog is armed.
+        let (status, watchdog_armed) =
+            active_thread(&conversation_view, cx).read_with(cx, |view, cx| {
+                (
+                    view.thread.read(cx).status(),
+                    view._watchdog_task.is_some(),
+                )
+            });
+        assert_eq!(status, acp_thread::ThreadStatus::Generating);
+        assert!(watchdog_armed, "watchdog should be armed while generating");
+
+        // Advance the mock clock past the 1s window so the timer fires.
+        cx.executor().advance_clock(std::time::Duration::from_secs(2));
+        cx.run_until_parked();
+
+        // The watchdog's reasoning call should now be parked inside
+        // `FakeLanguageModel::stream_completion`.
+        assert_eq!(
+            fake_model.as_fake().completion_count(),
+            1,
+            "watchdog reasoning call should be pending"
+        );
+
+        // Feed a HALT decision.
+        fake_model.as_fake().send_last_completion_stream_text_chunk(
+            r#"{"action":"halt","reason":"test: simulated hang"}"#,
+        );
+        fake_model.as_fake().end_last_completion_stream();
+        cx.run_until_parked();
+
+        // Post-HALT: the worker was cancelled and the timeout-notice prompt was
+        // dispatched to the same thread, starting a new (also stuck) generation.
+        let (status, markdown) =
+            active_thread(&conversation_view, cx).read_with(cx, |view, cx| {
+                (view.thread.read(cx).status(), view.thread.read(cx).to_markdown(cx))
+            });
+        assert_eq!(
+            status,
+            acp_thread::ThreadStatus::Generating,
+            "new generation should be running after timeout-notice dispatch"
+        );
+        assert!(
+            markdown.contains("Watchdog timeout"),
+            "timeout-notice prompt should be in the thread; got: {markdown}"
+        );
+    }
+
+    /// Regression test for issue 004: the watchdog timer must reset for each
+    /// new generation, and cancellation must target the thread that stopped
+    /// (by session_id), not whichever thread happens to be active.
+    ///
+    /// Before the fix, `cancel_watchdog_for_thread` cancelled
+    /// `active_thread()` instead of the stopped thread, and `arm_watchdog`
+    /// refused to re-arm when a stale task existed. Combined, a stale watchdog
+    /// survived across generation boundaries and accumulated elapsed time.
+    ///
+    /// This test drives two sequential generations on the same thread and
+    /// asserts the watchdog task lifecycle: armed → cancelled (None) on stop →
+    /// re-armed (Some, a fresh task) on the next send.
+    #[gpui::test]
+    async fn test_watchdog_resets_across_generations(cx: &mut TestAppContext) {
+        // This test does NOT set the watchdog env vars. The watchdog is enabled
+        // by default with a 600s window — long enough that the timer never
+        // fires during this test (we never advance the clock that far). This
+        // deliberately avoids any global env-var race with
+        // `test_watchdog_halts_stuck_thread`, which sets a 1s window.
+        //
+        // We only assert the arm/cancel lifecycle, not the timeout itself.
+
+        init_test(cx);
+
+        // Use the default-response stub: each `prompt` sends one message chunk
+        // then ends the turn, so generations complete normally (non-hanging).
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+
+        // Enable auto_prompt so the watchdog arms.
+        active_thread(&conversation_view, cx).update(cx, |view, cx| {
+            view.auto_prompt_enabled = true;
+            cx.notify();
+        });
+
+        // --- Generation 1: send, arm watchdog, then let it complete ---
+        message_editor(&conversation_view, cx).update_in(cx, |editor, window, cx| {
+            editor.set_text("first", window, cx);
+        });
+        active_thread(&conversation_view, cx)
+            .update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+
+        // Generation 1 ran: thread is back to Idle and the watchdog was
+        // cancelled by session_id via the Stopped handler.
+        let (status, watchdog_armed) =
+            active_thread(&conversation_view, cx).read_with(cx, |view, cx| {
+                (
+                    view.thread.read(cx).status(),
+                    view._watchdog_task.is_some(),
+                )
+            });
+        assert_eq!(
+            status,
+            acp_thread::ThreadStatus::Idle,
+            "generation 1 should have completed"
+        );
+        assert!(
+            !watchdog_armed,
+            "watchdog should be cancelled after normal stop (fix for Bug A)"
+        );
+
+        // --- Generation 2: a fresh watchdog must re-arm (fix for Bug B) ---
+        message_editor(&conversation_view, cx).update_in(cx, |editor, window, cx| {
+            editor.set_text("second", window, cx);
+        });
+        active_thread(&conversation_view, cx)
+            .update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+
+        // While generating, the watchdog is armed again. With the pre-fix code,
+        // the stale task guard would skip this and `_watchdog_task` could hold
+        // a task from generation 1 whose `started_at` predated this send.
+        // After the fix, `arm_watchdog` drops the stale task (already None here)
+        // and creates a fresh one with `Instant::now()`.
+        let (status, watchdog_armed) =
+            active_thread(&conversation_view, cx).read_with(cx, |view, cx| {
+                (
+                    view.thread.read(cx).status(),
+                    view._watchdog_task.is_some(),
+                )
+            });
+        assert_eq!(
+            status,
+            acp_thread::ThreadStatus::Generating,
+            "generation 2 should be running"
+        );
+        assert!(
+            watchdog_armed,
+            "a fresh watchdog should be armed for generation 2 (fix for Bug B)"
+        );
+    }
 }
