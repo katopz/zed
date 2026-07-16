@@ -1419,13 +1419,6 @@ pub struct AgentPanel {
     last_context_source: Option<AgentContextSource>,
 
     is_active: bool,
-    /// Whether the mouse is currently hovering over the agent panel's surface
-    /// (thread view, chat input, toolbar). Used to suppress automated focus
-    /// steals (e.g. auto_prompt creating a new background thread) while the
-    /// user is actively reading or interacting inside the panel. Explicit
-    /// user actions (clicking a thread in the history) are unaffected because
-    /// they drive focus directly rather than via the automated path.
-    panel_hovered: bool,
 }
 
 impl AgentPanel {
@@ -1833,7 +1826,6 @@ impl AgentPanel {
             _thread_metadata_store_subscription,
             last_context_source: None,
             is_active: false,
-            panel_hovered: false,
         };
 
         panel.ensure_native_agent_connection(cx);
@@ -2157,103 +2149,6 @@ impl AgentPanel {
 
     pub fn set_auto_prompt_enabled(&mut self, enabled: bool) {
         self.auto_prompt_enabled = enabled;
-    }
-
-    /// Whether the mouse is currently over the panel's surface. The auto_prompt
-    /// new-thread path consults this to decide whether stealing keyboard focus
-    /// would disrupt the user (who is reading or typing inside the panel).
-    pub fn panel_hovered(&self) -> bool {
-        self.panel_hovered
-    }
-
-    /// Whether any chat input surface in the panel currently has non-empty
-    /// text, indicating the user is mid-composition.
-    ///
-    /// Scans every place a user can be typing a message:
-    /// - Every thread view in every conversation (root, active, and any
-    ///   navigated sub-thread) — the user may have navigated to a child
-    ///   thread via a continuation link and be typing there, which is NOT
-    ///   the root thread view.
-    /// - Every thread's queued-message editors (fast-mode queue)
-    ///
-    /// Used by auto_prompt to suppress focus stealing. False positives (a
-    /// stale draft with leftover text) only cost us skipping one focus
-    /// jump; false negatives rip focus away from a typing user. So we err
-    /// on the side of reporting "typing" whenever any editor has text.
-    pub fn any_chat_input_has_text(&self, cx: &App) -> bool {
-        let thread_view_has_text = |thread_view: &Entity<ThreadView>| {
-            let thread_view = thread_view.read(cx);
-            let main_text = thread_view
-                .message_editor
-                .read(cx)
-                .text(cx);
-            let main_has_text = !main_text.trim().is_empty();
-            let queued_has_text = thread_view
-                .queued_message_editors
-                .iter()
-                .any(|editor| !editor.read(cx).text(cx).trim().is_empty());
-            if main_has_text || queued_has_text {
-                log::info!(
-                    "[auto_prompt] thread_view_has_text: main_editor_chars={}, queued_editors={}, main_has_text={}, queued_has_text={}",
-                    main_text.chars().count(),
-                    thread_view.queued_message_editors.len(),
-                    main_has_text,
-                    queued_has_text,
-                );
-            }
-            main_has_text || queued_has_text
-        };
-
-        let conversation_view_has_text = |cv: &Entity<crate::ConversationView>| {
-            let cv_ref = cv.read(cx);
-            // Check every thread view in the conversation, not just the root —
-            // the user may have navigated to a child thread (via a continuation
-            // link or branch) and be typing in that thread's editor.
-            if let Some(connected) = cv_ref.as_connected() {
-                let thread_count = connected.threads.len();
-                let has_text = connected
-                    .threads
-                    .values()
-                    .any(thread_view_has_text);
-                if !has_text {
-                    log::info!(
-                        "[auto_prompt] conversation_view_has_text: scanned {} thread(s), none had text",
-                        thread_count,
-                    );
-                }
-                has_text
-            } else {
-                // Fallback: if not connected yet, check the root thread view.
-                cv_ref
-                    .root_thread_view()
-                    .as_ref()
-                    .is_some_and(thread_view_has_text)
-            }
-        };
-
-        let active_has_text = self
-            .active_conversation_view()
-            .is_some_and(conversation_view_has_text);
-        if active_has_text {
-            log::info!("[auto_prompt] any_chat_input_has_text: ACTIVE conversation has text");
-            return true;
-        }
-        let draft_has_text = self
-            .draft_thread
-            .as_ref()
-            .is_some_and(conversation_view_has_text);
-        if draft_has_text {
-            log::info!("[auto_prompt] any_chat_input_has_text: DRAFT thread has text");
-            return true;
-        }
-        let retained_has_text = self
-            .retained_threads
-            .values()
-            .any(conversation_view_has_text);
-        if retained_has_text {
-            log::info!("[auto_prompt] any_chat_input_has_text: RETAINED thread has text");
-        }
-        retained_has_text
     }
 
     pub fn new_external_agent_thread(
@@ -7048,15 +6943,6 @@ impl Render for AgentPanel {
             .size_full()
             .justify_between()
             .bg(cx.theme().colors().panel_background)
-            // Track whether the mouse is over the panel so the auto_prompt
-            // new-thread path can suppress focus stealing while the user is
-            // actively reading or interacting inside the panel.
-            .on_hover(cx.listener(|this, hovered, _window, cx| {
-                if this.panel_hovered != *hovered {
-                    this.panel_hovered = *hovered;
-                    cx.notify();
-                }
-            }))
             .on_action(cx.listener(|this, action: &NewThread, window, cx| {
                 this.new_thread(action, window, cx);
             }))

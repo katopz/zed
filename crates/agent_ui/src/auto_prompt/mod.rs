@@ -2,10 +2,11 @@ use acp_thread::{AgentThreadEntry, MentionUri, ThreadStatus, ToolCallStatus};
 use agent::ZED_AGENT_ID;
 use agent_client_protocol::schema as acp;
 use agent_servers::CLAUDE_AGENT_ID;
-use gpui::{Focusable, Window};
+use gpui::Window;
 use language_model::LanguageModelRegistry;
 use notifications::status_toast::StatusToast;
 use prompt_store::{BuiltInPrompt, PromptId, PromptStore};
+use settings::Settings;
 use std::path::PathBuf;
 use std::time::Instant;
 use ui::prelude::*;
@@ -423,42 +424,17 @@ pub(crate) fn dispatch_action(
                 return;
             };
 
-            // Suppress focus stealing when the user is actively engaged
-            // elsewhere — don't yank keyboard focus to the new thread.
-            //
-            // Conditions that suppress focus:
-            // 1. Panel is hovered (user is reading or sitting in the chat input)
-            // 2. Panel does not contain keyboard focus (user is focused on
-            //    an editor, terminal, or another panel)
-            // 3. Any chat input surface in the panel has non-empty text —
-            //    the active thread's main editor, any retained thread's
-            //    editor, the draft editor, or any queued-message editor.
-            //    A user mid-composition anywhere in the panel should not
-            //    have their focus stolen.
-            //
-            // The new thread is still created and becomes the panel's base
-            // view, but keyboard focus stays where the user left it.
-            let suppress_focus = {
-                let panel_ref = panel.read(cx);
-                let panel_has_focus = panel_ref
-                    .focus_handle(cx)
-                    .contains_focused(window, cx);
-                let panel_hovered = panel_ref.panel_hovered();
-                let any_input_has_text = panel_ref.any_chat_input_has_text(cx);
-                log::info!(
-                    "[auto_prompt] suppress_focus decision: panel_hovered={}, panel_has_focus={}, any_input_has_text={} => suppress={}",
-                    panel_hovered,
-                    panel_has_focus,
-                    any_input_has_text,
-                    panel_hovered || !panel_has_focus || any_input_has_text
-                );
-                panel_hovered || !panel_has_focus || any_input_has_text
-            };
-            if !suppress_focus {
-                log::warn!("[auto_prompt] FOCUS NOT SUPPRESSED — calling workspace.focus_panel");
+            // Whether to steal keyboard focus for the new thread is governed
+            // entirely by the `auto_focus_new_thread` setting (default:
+            // false). The previous detection-based approach (panel hovered,
+            // panel has focus, any chat input has text) had too many edge
+            // cases and still stole focus in practice. Defaulting to
+            // never-focus keeps the new thread from interrupting the user;
+            // users who want the old auto-focus behavior can opt in via
+            // `"agent.auto_focus_new_thread": true`.
+            let focus = agent_settings::AgentSettings::get_global(cx).auto_focus_new_thread;
+            if focus {
                 workspace.focus_panel::<crate::AgentPanel>(window, cx);
-            } else {
-                log::info!("[auto_prompt] focus suppressed — new thread created without stealing focus");
             }
 
             let work_dirs = action.work_dirs.clone().map(|dirs| PathList::new(&dirs));
@@ -528,7 +504,7 @@ pub(crate) fn dispatch_action(
                     work_dirs,
                     action.from_title.clone().map(Into::into),
                     Some(initial_content),
-                    !suppress_focus,
+                    focus,
                     crate::AgentThreadSource::AgentPanel,
                     window,
                     cx,

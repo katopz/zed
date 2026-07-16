@@ -203,6 +203,17 @@ pub struct AgentSettingsContent {
     ///
     /// Default: true
     pub show_merge_conflict_indicator: Option<bool>,
+    /// Whether auto_prompt should steal keyboard focus when it creates a
+    /// new background continuation thread.
+    ///
+    /// When false (the default) the new thread is still created and becomes
+    /// the panel's base view, but keyboard focus stays wherever the user
+    /// left it — typing in another thread, an editor, or a terminal is not
+    /// interrupted. Set to true to have the new thread's composer focused
+    /// automatically.
+    ///
+    /// Default: false
+    pub auto_focus_new_thread: Option<bool>,
     /// Per-tool permission rules for granular control over which tool actions
     /// require confirmation.
     ///
