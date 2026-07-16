@@ -600,6 +600,7 @@ mod tests {
             sandbox_permissions: Default::default(),
             show_turn_stats: false,
             show_merge_conflict_indicator: true,
+            auto_focus_new_thread: false,
             sidebar_side: Default::default(),
             thinking_display: Default::default(),
         }

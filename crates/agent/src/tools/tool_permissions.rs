@@ -285,18 +285,23 @@ pub async fn resolve_creatable_global_skill_descendant_path(
 }
 
 /// Returns the kind of sensitive settings or agent skills location this path targets, if any:
-/// either inside a `.zed/` local-settings directory, inside `.agents/skills/`, or inside
-/// the global config dir.
+/// either inside a `.zed/` local-settings directory, inside the global agent skills directory
+/// (`~/.agents/skills/`), or inside the global config dir.
+///
+/// Project-local `.agents/skills/` directories (i.e. those inside a trusted worktree) are
+/// intentionally NOT classified as sensitive: they are part of the project codebase and follow
+/// the same permission flow as any other project file. Only the global skills directory is
+/// sensitive.
 ///
 /// `canonical_worktree_roots` should be the result of
 /// [`canonicalize_worktree_roots`]; it's used to re-check the local
-/// `.zed/` and `.agents/skills/` protections against the canonical form
-/// of `path`, which catches two classes of bypass that the raw-component
-/// scan misses:
+/// `.zed/` protection against the canonical form of `path`, which catches
+/// two classes of bypass that the raw-component scan misses:
 ///
-///   1. `..` traversal, e.g. `.agents/foo/../skills/SKILL.md`. The raw
-///      components are `[.agents, foo, .., skills, SKILL.md]`, so the
-///      consecutive-pair match in [`is_agents_skills_path`] fails.
+///   1. `..` traversal, e.g. `.zed/foo/../settings.json`. The raw
+///      components are `[.zed, foo, .., settings.json]`, but after
+///      canonicalization the `.zed` is still present in the path relative
+///      to the worktree root.
 ///   2. Intra-project symlinks, e.g. a symlink `safe -> .zed` followed
 ///      by `safe/settings.json`. `resolve_project_path` correctly classes
 ///      this as *not* a symlink escape (it stays inside the project), so
@@ -306,8 +311,8 @@ pub async fn resolve_creatable_global_skill_descendant_path(
 /// After canonicalizing we strip the matching worktree root before
 /// re-scanning components, so that a worktree literally rooted at a path
 /// like `~/projects/.zed/foo` doesn't classify every file inside it as
-/// `.zed/` local-settings — only files that have `.zed` (or
-/// `.agents/skills`) inside the worktree are flagged.
+/// `.zed/` local-settings — only files that have `.zed` inside the
+/// worktree are flagged.
 pub async fn sensitive_settings_kind(
     path: &Path,
     canonical_worktree_roots: &[PathBuf],
@@ -317,14 +322,22 @@ pub async fn sensitive_settings_kind(
 
     // Fast path: scan the raw path components before any I/O. Covers the
     // common case where the agent passes a path that literally contains
-    // `.zed/` or `.agents/skills/`.
+    // `.zed/` or `.agents/skills/`. For `.agents/skills/`, we skip the
+    // fast path if the path is lexically inside a worktree root (those are
+    // project-local skills and follow normal permission flow); the
+    // canonical path check below handles any `..`/symlink cases that the
+    // lexical check misses.
     if path.components().any(|component| {
         component_matches_ignore_ascii_case(component.as_os_str(), local_settings_folder)
     }) {
         return Some(SensitiveSettingsKind::Local);
     }
 
-    if is_agents_skills_path(path) {
+    if is_agents_skills_path(path)
+        && !canonical_worktree_roots
+            .iter()
+            .any(|root| path.starts_with(root))
+    {
         return Some(SensitiveSettingsKind::AgentSkills);
     }
 
@@ -342,8 +355,12 @@ pub async fn sensitive_settings_kind(
             }) {
                 return Some(SensitiveSettingsKind::Local);
             }
+
+            // Project-local `.agents/skills` (inside a worktree) is part of
+            // the codebase, not sensitive. Return None early to skip the
+            // global skills dir canonicalization below.
             if is_agents_skills_path(relative) {
-                return Some(SensitiveSettingsKind::AgentSkills);
+                return None;
             }
 
             // The canonical path can only live inside one worktree, so
@@ -644,11 +661,15 @@ pub fn authorize_file_edit(
     let thread = thread.clone();
     let event_stream = event_stream.clone();
 
-    // The raw-path sensitivity checks are synchronous (pure path inspection).
-    // We still have to spawn anyway to resolve symlink escapes against the
-    // worktree, but we can short-circuit straight to the appropriate
-    // SensitiveSettingsKind on these fast paths and skip the async
-    // `sensitive_settings_kind` canonicalization step below.
+    // The raw-path sensitivity checks are synchronous (pure path
+    // inspection). We still have to spawn anyway to resolve symlink
+    // escapes against the worktree, but we can short-circuit straight
+    // to the appropriate SensitiveSettingsKind on these fast paths and
+    // skip the async `sensitive_settings_kind` canonicalization step
+    // below. For `.agents/skills/` paths, we additionally check whether
+    // the path resolves inside the project: project-local skills are
+    // part of the codebase and should follow the normal permission flow,
+    // not be unconditionally flagged as sensitive.
     let local_settings_folder = paths::local_settings_folder_name();
     let is_local_settings = path.components().any(|component| {
         component_matches_ignore_ascii_case(component.as_os_str(), local_settings_folder)
@@ -687,41 +708,66 @@ pub fn authorize_file_edit(
 
         // Create-mode paths may not resolve yet, so also inspect the parent path
         // for symlink escapes before applying settings-based allow decisions.
+        // We also track whether the parent resolves safely inside the project,
+        // which lets us classify create-mode `.agents/skills` paths as
+        // project-local (not sensitive).
+        let mut parent_is_safe = false;
         if resolved.is_err() {
             if let Some(parent_path) = path_owned.parent() {
                 let parent_resolved = project_entity.read_with(cx, |project, cx| {
                     resolve_project_path(project, parent_path, &canonical_roots, cx)
                 });
 
-                if let Ok(ResolvedProjectPath::SymlinkEscape {
-                    canonical_target, ..
-                }) = &parent_resolved
-                {
-                    let authorize = cx.update(|cx| {
-                        authorize_symlink_access(
-                            &tool_name,
-                            &path_owned.to_string_lossy(),
-                            canonical_target,
-                            &event_stream,
-                            cx,
-                        )
-                    });
-                    return authorize.await;
+                match &parent_resolved {
+                    Ok(ResolvedProjectPath::SymlinkEscape {
+                        canonical_target, ..
+                    }) => {
+                        let authorize = cx.update(|cx| {
+                            authorize_symlink_access(
+                                &tool_name,
+                                &path_owned.to_string_lossy(),
+                                canonical_target,
+                                &event_stream,
+                                cx,
+                            )
+                        });
+                        return authorize.await;
+                    }
+                    Ok(ResolvedProjectPath::Safe(_)) => parent_is_safe = true,
+                    Err(_) => {}
                 }
             }
         }
 
         let explicitly_allowed = matches!(decision, ToolPermissionDecision::Allow);
 
-        // Check sensitive settings asynchronously. Short-circuit on the
-        // raw-path fast paths to skip the canonicalization in
-        // `sensitive_settings_kind`; the slow path still runs for paths
-        // that don't trivially look sensitive, so `..` traversal and
-        // intra-project-symlink bypasses are still caught there.
+        // A `.agents/skills` path is only sensitive when it lives outside
+        // the project (i.e. a global skill under `~/.agents/skills/`).
+        // Project-local skills inside a trusted worktree are part of the
+        // codebase and follow the normal permission flow. This check is
+        // purely synchronous (using `resolved` and the parent resolution
+        // above), so `.agents/skills` paths never enter the async
+        // `sensitive_settings_kind` canonicalization path.
+        let is_inside_project =
+            matches!(&resolved, Ok(ResolvedProjectPath::Safe(_))) || parent_is_safe;
+
+        // Check sensitive settings. Short-circuit on the raw-path fast
+        // paths (`.zed` and `.agents/skills`) to skip the async
+        // canonicalization in `sensitive_settings_kind`. For
+        // `.agents/skills`, the project-local vs global distinction is
+        // handled here via `is_inside_project`.
         let settings_kind = if is_local_settings {
             Some(SensitiveSettingsKind::Local)
         } else if is_agents_skills {
-            Some(SensitiveSettingsKind::AgentSkills)
+            // `.agents/skills` paths are handled entirely here via the
+            // fast path — we never enter the async `sensitive_settings_kind`
+            // for them, because that path's canonicalization of the
+            // global skills dir can cause excessive yields in tests.
+            if is_inside_project {
+                None // project-local skill → not sensitive
+            } else {
+                Some(SensitiveSettingsKind::AgentSkills)
+            }
         } else {
             sensitive_settings_kind(&path_owned, &canonical_roots, fs.as_ref()).await
         };

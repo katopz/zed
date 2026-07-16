@@ -1212,7 +1212,7 @@ mod tests {
 
     #[gpui::test]
     async fn test_streaming_authorize(cx: &mut TestAppContext) {
-        let (edit_tool, _project, _action_log, _fs, _thread) = setup_test(cx, json!({})).await;
+        let (edit_tool, _project, _action_log, fs, _thread) = setup_test(cx, json!({})).await;
 
         // Test 1: Path with .zed component should require confirmation
         let (stream_tx, mut stream_rx) = ToolCallEventStream::test();
@@ -1303,22 +1303,29 @@ mod tests {
             Some("Edit `/etc/hosts`".into())
         );
 
-        // 5.5: .agents/skills is a sensitive path — still prompts. The
-        // sensitive-path classifier runs regardless of the default mode, so
-        // it doesn't matter that we're now in Confirm mode — we're checking
-        // that the path is recognized and gets the "(agent skills)" tag.
+        // 5.5: Project-local `.agents/skills/` is NOT sensitive — it's
+        // part of the project codebase. Insert the skill file so it
+        // resolves inside the worktree, then verify no prompt fires.
+        fs.insert_tree(
+            "/root/.agents/skills/my-skill",
+            json!({ "SKILL.md": "content" }),
+        )
+        .await;
+        cx.executor().run_until_parked();
+
         let (stream_tx, mut stream_rx) = ToolCallEventStream::test();
-        let _auth = cx.update(|cx| {
+        cx.update(|cx| {
             edit_tool.authorize(
                 &PathBuf::from("root/.agents/skills/my-skill/SKILL.md"),
                 &stream_tx,
                 cx,
             )
-        });
-        let event = stream_rx.expect_authorization().await;
-        assert_eq!(
-            event.tool_call.fields.title,
-            Some("Edit `root/.agents/skills/my-skill/SKILL.md` (agent skills)".into())
+        })
+        .await
+        .unwrap();
+        assert!(
+            stream_rx.try_recv().is_err(),
+            "project-local .agents/skills must NOT prompt"
         );
 
         // 5.6: The global .agents/skills directory is sensitive — still prompts
@@ -1339,10 +1346,10 @@ mod tests {
     }
 
     /// `.agents/foo/../skills/SKILL.md` would slip past the raw
-    /// `is_agents_skills_path` check (the components `.agents` and
-    /// `skills` aren't consecutive once `..` sits between them), but it
-    /// canonicalizes to a path inside `.agents/skills/`, so it has to
-    /// still prompt with the agent-skills tag.
+    /// With project-local `.agents/skills/` no longer classified as
+    /// sensitive, a `..` traversal into `.agents/skills` inside the
+    /// project should behave like any other project-local file: no
+    /// prompt.
     #[gpui::test]
     async fn test_streaming_authorize_blocks_dotdot_skills_bypass(cx: &mut TestAppContext) {
         init_test(cx);
@@ -1361,23 +1368,18 @@ mod tests {
             setup_test_with_fs(cx, fs, &[path!("/root").as_ref()]).await;
 
         let (stream_tx, mut stream_rx) = ToolCallEventStream::test();
-        let _auth = cx.update(|cx| {
+        cx.update(|cx| {
             edit_tool.authorize(
                 &PathBuf::from(path!("/root/.agents/foo/../skills/my-skill/SKILL.md")),
                 &stream_tx,
                 cx,
             )
-        });
-        let event = stream_rx.expect_authorization().await;
+        })
+        .await
+        .unwrap();
         assert!(
-            event
-                .tool_call
-                .fields
-                .title
-                .as_deref()
-                .is_some_and(|title| title.ends_with("(agent skills)")),
-            "`..` traversal into .agents/skills must still prompt: {:?}",
-            event.tool_call.fields.title,
+            stream_rx.try_recv().is_err(),
+            "project-local .agents/skills via .. traversal must NOT prompt"
         );
     }
 
@@ -1463,8 +1465,9 @@ mod tests {
         );
     }
 
-    /// Same as the previous test but for the agent-skills sensitive
-    /// path, via an intra-project symlink `safe -> .agents/skills`.
+    /// With project-local `.agents/skills/` no longer classified as
+    /// sensitive, an intra-project symlink `safe -> .agents/skills`
+    /// should resolve as a normal project-local file: no prompt.
     #[gpui::test]
     async fn test_streaming_authorize_blocks_intra_project_symlink_skills_bypass(
         cx: &mut TestAppContext,
@@ -1486,23 +1489,18 @@ mod tests {
             setup_test_with_fs(cx, fs, &[path!("/root").as_ref()]).await;
 
         let (stream_tx, mut stream_rx) = ToolCallEventStream::test();
-        let _auth = cx.update(|cx| {
+        cx.update(|cx| {
             edit_tool.authorize(
                 &PathBuf::from(path!("/root/safe/my-skill/SKILL.md")),
                 &stream_tx,
                 cx,
             )
-        });
-        let event = stream_rx.expect_authorization().await;
+        })
+        .await
+        .unwrap();
         assert!(
-            event
-                .tool_call
-                .fields
-                .title
-                .as_deref()
-                .is_some_and(|title| title.ends_with("(agent skills)")),
-            "Intra-project symlink to .agents/skills must still prompt: {:?}",
-            event.tool_call.fields.title,
+            stream_rx.try_recv().is_err(),
+            "intra-project symlink to .agents/skills must NOT prompt"
         );
     }
 
