@@ -80,11 +80,15 @@ impl ActionStatistics {
     }
 
     pub fn save_action_timing(&mut self) {
+        // `running` may be `None` when another thread dispatched an action
+        // concurrently and consumed this entry first. `ACTION_STATISTICS` is a
+        // process-global, so the update→listener→save sequence is not atomic
+        // across threads; losing one sample to such a race is acceptable noise
+        // for a statistical profiler.
+        let Some((action, started)) = self.running.take() else {
+            return;
+        };
         let now = Instant::now();
-        let (action, started) = self
-            .running
-            .take()
-            .expect("only called after `update_running_action`");
 
         let runtime = now.duration_since(started);
         if runtime >= self.runtime_to_beat {
