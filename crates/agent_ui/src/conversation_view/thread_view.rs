@@ -1976,6 +1976,9 @@ impl ThreadView {
         }
 
         let task = thread.update(cx, |thread, cx| thread.retry(cx));
+        // Reset the turn stopwatch so the Retry button shows elapsed time
+        // from THIS retry, not from the original turn that was retried.
+        self.start_turn(cx);
         cx.emit(AcpThreadViewEvent::Interacted);
         self.sync_generating_indicator(cx);
         cx.notify();
