@@ -33,18 +33,18 @@ use rpc::{
     AnyProtoClient, TypedEnvelope,
     proto::{self, REMOTE_SERVER_PEER_ID, REMOTE_SERVER_PROJECT_ID},
 };
-use smol::process::Child;
-
 use settings::initial_server_settings_content;
 use std::{
     num::NonZeroU64,
     path::{Path, PathBuf},
+    process::Stdio,
     sync::{
         Arc,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::Instant,
 };
+use util::process::Child;
 use sysinfo::{ProcessRefreshKind, RefreshKind, System, UpdateKind};
 use util::{ResultExt, paths::PathStyle, rel_path::RelPath};
 use worktree::Worktree;
@@ -966,7 +966,7 @@ impl HeadlessProject {
 
         // Spawn kernel
         let spawn_kernel = |binary: &str, args: &[String]| {
-            let mut command = smol::process::Command::new(binary);
+            let mut command = std::process::Command::new(binary);
 
             if !args.is_empty() {
                 for arg in args {
@@ -1003,7 +1003,12 @@ impl HeadlessProject {
             if let Some(wd) = &working_directory {
                 command.current_dir(wd);
             }
-            command.spawn()
+            util::process::Child::spawn(
+                command,
+                Stdio::inherit(),
+                Stdio::inherit(),
+                Stdio::inherit(),
+            )
         };
 
         // We need to manage the child process lifecycle

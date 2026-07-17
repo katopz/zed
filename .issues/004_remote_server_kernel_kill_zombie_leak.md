@@ -1,9 +1,29 @@
 # Issue 004: remote_server `handle_kill_kernel` leaks zombie via raw `smol::process::Child`
 
 ## Status
-- [ ] Fix
-- [ ] Proof (no zombie after kill on remote host)
+- [x] Fix (commit pending — `headless_project.rs` migrated to `util::process::Child`)
+- [ ] Proof (no zombie after kill on remote host — requires remote SSH session to validate)
 - [ ] Close-out note in related doc
+
+## Resolution
+Applied **Option A** from the fix sketch: swapped `use smol::process::Child;` →
+`use util::process::Child;` in `crates/remote_server/src/headless_project.rs`, and
+changed the `spawn_kernel` closure to use `util::process::Child::spawn(command,
+Stdio::inherit(), Stdio::inherit(), Stdio::inherit())` with a `std::process::Command`.
+
+Behavior changes (both improvements, no regression):
+1. Killed kernels are now reaped by `util::process::Child::Drop` — no zombie.
+2. Kernels now run in their own session (`set_pre_exec_to_start_new_session`), so
+   `kill()` reaches the whole process group including kernel-spawned subprocesses.
+
+`handle_kill_kernel` is unchanged — `child.kill().log_err()` still works; the reap
+happens when `child` drops at the end of the if-block via the wrapper's `Drop` impl.
+
+Validation:
+- `cargo clippy -p remote_server --no-deps -- --deny warnings` ✅
+- `cargo build -p remote_server --tests` ✅
+- Runtime proof (no zombie on remote host) requires a live SSH session and is left
+  to the user to verify on next remote kernel restart.
 
 ## Symptom
 When a user kills a Jupyter (or other) kernel on a remote Zed session, the
