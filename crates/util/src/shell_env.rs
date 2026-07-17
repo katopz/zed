@@ -192,16 +192,29 @@ async fn spawn_and_read_fd(
         child_fd,
     }])?;
 
-    let process = smol::process::Command::from(command)
+    let spawn_result = smol::process::Command::from(command)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()?;
+        .spawn();
+
+    let process = spawn_result?;
 
     let mut buffer = Vec::new();
-    reader.read_to_end(&mut buffer)?;
+    // Read the env payload and collect the child's exit status independently.
+    // A failed read (EINTR, broken pipe from a crashed shell) must NOT skip the
+    // reap on `process`, otherwise the dead shell becomes a permanent zombie
+    // parented by the Zed editor process. We always run `output()` to reap,
+    // then surface whichever error happened first.
+    //
+    // `reader` sees EOF on the inherited `writer` FD once the child exits and
+    // the kernel closes its end — `writer` itself was already moved into the
+    // `fd_mappings` call above, so there is nothing extra to drop here.
+    let read_result = reader.read_to_end(&mut buffer);
+    let output_result = process.output().await;
 
-    Ok((buffer, process.output().await?))
+    read_result?;
+    Ok((buffer, output_result?))
 }
 
 #[cfg(windows)]
