@@ -742,6 +742,7 @@ mod test_support {
         next_prompt_updates: Arc<Mutex<Vec<acp::SessionUpdate>>>,
         supports_load_session: bool,
         supports_session_additional_directories: bool,
+        supports_retry: bool,
         agent_id: AgentId,
         telemetry_id: SharedString,
     }
@@ -765,6 +766,7 @@ mod test_support {
                 sessions: Arc::default(),
                 supports_load_session: false,
                 supports_session_additional_directories: false,
+                supports_retry: false,
                 agent_id: AgentId::new("stub"),
                 telemetry_id: "stub".into(),
             }
@@ -792,6 +794,11 @@ mod test_support {
             supports_session_additional_directories: bool,
         ) -> Self {
             self.supports_session_additional_directories = supports_session_additional_directories;
+            self
+        }
+
+        pub fn with_supports_retry(mut self, supports_retry: bool) -> Self {
+            self.supports_retry = supports_retry;
             self
         }
 
@@ -1028,6 +1035,26 @@ mod test_support {
             Some(Rc::new(StubAgentSessionEditor))
         }
 
+        fn retry(
+            &self,
+            session_id: &acp::SessionId,
+            _cx: &App,
+        ) -> Option<Rc<dyn AgentSessionRetry>> {
+            if !self.supports_retry {
+                return None;
+            }
+            // The retry uses the same response channel as a normal prompt:
+            // `run_turn` cancels the current turn, then this `run()` blocks on
+            // a fresh `response_tx` that `end_turn` resolves. This lets retry
+            // tests reuse the existing send_update / end_turn plumbing.
+            let sessions = self.sessions.clone();
+            let session_id = session_id.clone();
+            Some(Rc::new(StubAgentSessionRetry {
+                sessions,
+                session_id,
+            }))
+        }
+
         fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
             self
         }
@@ -1046,6 +1073,26 @@ mod test_support {
     impl AgentSessionTruncate for StubAgentSessionEditor {
         fn run(&self, _: UserMessageId, _: &mut App) -> Task<Result<()>> {
             Task::ready(Ok(()))
+        }
+    }
+
+    struct StubAgentSessionRetry {
+        sessions: Arc<Mutex<HashMap<acp::SessionId, Session>>>,
+        session_id: acp::SessionId,
+    }
+
+    impl AgentSessionRetry for StubAgentSessionRetry {
+        fn run(&self, cx: &mut App) -> Task<Result<acp::PromptResponse>> {
+            let (tx, rx) = oneshot::channel();
+            {
+                let mut sessions = self.sessions.lock();
+                let session = sessions.get_mut(&self.session_id).unwrap();
+                session.response_tx = Some(tx);
+            }
+            cx.spawn(async move |_| {
+                let stop_reason = rx.await?;
+                Ok(acp::PromptResponse::new(stop_reason))
+            })
         }
     }
 

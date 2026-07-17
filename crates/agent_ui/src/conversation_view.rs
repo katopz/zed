@@ -9893,4 +9893,75 @@ pub(crate) mod tests {
             "watchdog should fire after a full timeout window with no activity"
         );
     }
+
+    /// `retry_generation` must reset the turn stopwatch (`turn_started_at`) so
+    /// the elapsed-time counter beside the inline RETRY button restarts from
+    /// zero for the retried turn, rather than continuing to count from the
+    /// original turn's start. Regression test for the "count time beside RETRY
+    /// button still bug" report.
+    ///
+    /// Flow: send a message (turn 1 starts, stopwatch = T0), end the turn, then
+    /// call retry_generation. After retry, `turn_started_at` must be > T0
+    /// (reset to a fresh Instant::now()).
+    #[gpui::test]
+    async fn test_retry_generation_resets_turn_stopwatch(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        // StubAgentConnection must advertise retry support, otherwise
+        // `can_retry` returns false and `retry_generation` early-returns
+        // before reaching `start_turn`.
+        let connection = StubAgentConnection::new().with_supports_retry(true);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+
+        // --- Turn 1: send a message, capture turn_started_at, end the turn ---
+        message_editor(&conversation_view, cx).update_in(cx, |editor, window, cx| {
+            editor.set_text("first", window, cx);
+        });
+        active_thread(&conversation_view, cx)
+            .update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+
+        let session_id = conversation_view.read_with(cx, |view, cx| {
+            view.active_thread()
+                .unwrap()
+                .read(cx)
+                .thread
+                .read(cx)
+                .session_id()
+                .clone()
+        });
+
+        // End turn 1 so the thread returns to Idle and `turn_started_at` is
+        // cleared by `stop_turn` (via send_content's defer).
+        connection.end_turn(session_id, acp::StopReason::EndTurn);
+        cx.run_until_parked();
+
+        // Sanity: thread is Idle after turn 1.
+        let status = active_thread(&conversation_view, cx)
+            .read_with(cx, |view, cx| view.thread.read(cx).status());
+        assert_eq!(status, acp_thread::ThreadStatus::Idle);
+
+        // --- Turn 2: retry. start_turn must reset turn_started_at. ---
+        let t_before_retry = std::time::Instant::now();
+        active_thread(&conversation_view, cx).update_in(cx, |view, window, cx| {
+            view.retry_generation(window, cx);
+        });
+        cx.run_until_parked();
+
+        let turn_started_at = active_thread(&conversation_view, cx)
+            .read_with(cx, |view, _cx| view.turn_fields.turn_started_at);
+        let turn_started_at = turn_started_at
+            .expect("turn_started_at must be Some after retry_generation (start_turn reset)");
+
+        // turn_started_at was just set by start_turn inside retry_generation,
+        // so it must be at or after the Instant we captured just before the
+        // retry call. Before the fix, retry bypassed start_turn and this would
+        // be None (or a stale value from turn 1).
+        assert!(
+            turn_started_at >= t_before_retry,
+            "retry_generation must reset turn_started_at to a fresh Instant::now()"
+        );
+    }
 }
