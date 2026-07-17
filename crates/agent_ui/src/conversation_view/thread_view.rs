@@ -1978,7 +1978,7 @@ impl ThreadView {
         let task = thread.update(cx, |thread, cx| thread.retry(cx));
         // Reset the turn stopwatch so the Retry button shows elapsed time
         // from THIS retry, not from the original turn that was retried.
-        self.start_turn(cx);
+        let turn_generation = self.start_turn(cx);
         cx.emit(AcpThreadViewEvent::Interacted);
         self.sync_generating_indicator(cx);
         cx.notify();
@@ -2003,6 +2003,11 @@ impl ThreadView {
             let result = task.await;
 
             this.update(cx, |this, cx| {
+                // Stop the turn timer task set up by `start_turn` above.
+                // Without this, `_turn_timer_task` keeps notifying every
+                // second indefinitely after the retry completes.
+                this.stop_turn(turn_generation, cx);
+
                 if let Some(parent_session_id) = &parent_session_id {
                     let (output, is_error) = match &result {
                         Ok(Some(response)) => {
