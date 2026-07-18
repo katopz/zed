@@ -688,6 +688,64 @@ pub fn is_decisive_stop(input: &EvaluationInput) -> bool {
     confidence <= DECISIVE_STOP_THRESHOLD && !has_prompt
 }
 
+/// Returns true when the worker AI's last message explicitly defers a decision
+/// to the user — i.e. it is asking the user to pick between options or to
+/// provide input that the worker itself cannot supply.
+///
+/// This is distinct from permission-seeking questions ("Want me to implement X?")
+/// which rule 3 of the orchestration prompt auto-answers. Here the worker is
+/// asking for a *strategic* or *external* decision and explicitly declines to
+/// make the choice itself (e.g. "I won't pick for you", "you decide",
+/// "I need a decision from you"). Continuing the chain is pointless — another
+/// nudge will produce the same question — so we stop cleanly and surface the
+/// message to the user.
+///
+/// Must be scoped to the worker's own output: auto_prompt's own summary /
+/// verification prompts are not the worker deferring to the user, so we exclude
+/// those explicitly via `is_auto_prompt_summary_response`.
+pub fn is_waiting_for_user_decision(last_assistant_message: Option<&str>) -> bool {
+    let msg = match last_assistant_message {
+        Some(m) if !m.trim().is_empty() => m.trim(),
+        _ => return false,
+    };
+
+    // auto_prompt's own Phase 1 summary responses naturally contain phrases like
+    // "what remains" and "recommended next steps" — those are not the worker
+    // deferring a decision to the user.
+    if is_auto_prompt_summary_response(msg) {
+        return false;
+    }
+
+    let lower = msg.to_lowercase();
+
+    // Worker explicitly defers the decision to the user. These phrases are
+    // deliberately specific — they require the worker to *say* it is deferring,
+    // not merely to mention the word "you" near options.
+    let explicit_deferral = lower.contains("i won't pick for you")
+        || lower.contains("i won't choose for you")
+        || lower.contains("i can't pick for you")
+        || lower.contains("i can't decide for you")
+        || lower.contains("i won't decide for you")
+        || lower.contains("you need to decide")
+        || lower.contains("you should decide")
+        || lower.contains("you decide")
+        || lower.contains("i need a decision from you")
+        || lower.contains("i need your decision")
+        || lower.contains("i need your input")
+        || lower.contains("need your decision")
+        || lower.contains("need your input")
+        || lower.contains("need your choice")
+        || lower.contains("awaiting your decision")
+        || lower.contains("waiting for your decision")
+        || lower.contains("waiting on you")
+        || lower.contains("waiting for you to")
+        || lower.contains("let me know which")
+        || lower.contains("let me know what you prefer")
+        || lower.contains("let me know how you'd like");
+
+    explicit_deferral
+}
+
 /// Synchronous pre-check and decision.
 ///
 /// Returns `NoAction` if auto-prompt should not fire (disabled, no tools,
@@ -1510,8 +1568,11 @@ pub async fn decide_with_llm(
                             1. LAST MESSAGE IS KING — reason about it first, before looking at plans\n\
                             2. If it asks \"would you like to continue?\" or \"want me to ...?\" → confidence >= 0.8, \n\
                                next_prompt=\"continue as you prefer\"\n\
-                            3. If it presents options to pick from → confidence >= 0.8, \n\
+                            3. If it presents options to pick from AND is willing to pick → confidence >= 0.8, \n\
                                next_prompt=\"select best for performance, security, SOLID, DRY principles\"\n\
+                            3a. If it presents options BUT explicitly defers to the user (e.g. \"I won't pick\", \n\
+                               \"you decide\", \"need your input\", \"let me know which\") → confidence <= 0.2, \n\
+                               next_prompt = null — another nudge produces the same question\n\
                             4. If it reports plan done but mentions remaining phases/next steps → confidence >= 0.7, \n\
                                next_prompt=\"continue with the next phase/step\"\n\
                             5. If it describes specific remaining work → confidence >= 0.7, \n\
@@ -1716,6 +1777,20 @@ pub async fn decide_with_llm(
                         log::info!(
                             "auto_prompt: decisive stop (confidence={:?}), skipping verification",
                             input.confidence
+                        );
+                        reset_iteration_with_session(&data.session_id.to_string());
+                        return Ok(AutoPromptOutcome::Stopped { reason });
+                    } else if is_waiting_for_user_decision(data.last_assistant_message.as_deref()) {
+                        // Worker explicitly deferred a decision to the user (e.g.
+                        // "I won't pick for you", "you decide", "need your input").
+                        // Any further nudge will produce the same question, so stop
+                        // cleanly and surface the worker's message to the user.
+                        // Skipping pre-stop verification here is the whole point —
+                        // otherwise we inject PRE-STOP VERIFICATION noise that
+                        // ends in a `stopping` declaration anyway (see plan/bug
+                        // on Plan 456 close-out where this fired needlessly).
+                        log::info!(
+                            "auto_prompt: worker is waiting for user decision — stopping without verification"
                         );
                         reset_iteration_with_session(&data.session_id.to_string());
                         return Ok(AutoPromptOutcome::Stopped { reason });
@@ -5549,6 +5624,125 @@ mod tests {
         assert!(
             is_decisive_stop(&input),
             "None confidence defaults to 0.0, should be decisive"
+        );
+    }
+
+    // --- Waiting-for-user-decision tests ---
+    // Reproduces the Plan 456 close-out bug: worker presented A/B/C/D options
+    // and explicitly said "I won't pick for you". The chain fired pre-stop
+    // verification anyway, ending in a needless `stopping` declaration.
+    // These tests guard `is_waiting_for_user_decision` against regressions.
+
+    #[test]
+    fn test_waiting_for_user_decision_explicit_wont_pick() {
+        let msg = "Before I do anything else, I need a decision from you. \
+                   | Option A | Option B | Option C |\n\
+                   Which one? I won't pick for you — A and B both commit to a new plan.";
+        assert!(
+            is_waiting_for_user_decision(Some(msg)),
+            "explicit 'I won't pick for you' with options table should trigger"
+        );
+    }
+
+    #[test]
+    fn test_waiting_for_user_decision_you_decide() {
+        let msg = "Both approaches are valid. You decide which one fits your priorities.";
+        assert!(
+            is_waiting_for_user_decision(Some(msg)),
+            "'you decide' phrase should trigger"
+        );
+    }
+
+    #[test]
+    fn test_waiting_for_user_decision_need_your_input() {
+        let msg = "I've laid out the tradeoffs. Need your input before proceeding.";
+        assert!(
+            is_waiting_for_user_decision(Some(msg)),
+            "'need your input' phrase should trigger"
+        );
+    }
+
+    #[test]
+    fn test_waiting_for_user_decision_let_me_know_which() {
+        let msg = "Pick one of the three. Let me know which you prefer.";
+        assert!(
+            is_waiting_for_user_decision(Some(msg)),
+            "'let me know which' phrase should trigger"
+        );
+    }
+
+    #[test]
+    fn test_waiting_for_user_decision_awaiting() {
+        let msg = "Drafted the proposal. Awaiting your decision on the deployment target.";
+        assert!(
+            is_waiting_for_user_decision(Some(msg)),
+            "'awaiting your decision' phrase should trigger"
+        );
+    }
+
+    #[test]
+    fn test_waiting_for_user_decision_permission_seeking_does_not_trigger() {
+        // Permission-seeking questions are auto-answered by rule 3 — they must
+        // NOT trigger the waiting-for-user path (or the chain would stop
+        // unnecessarily on every "want me to proceed?").
+        let msg = "Want me to implement this? Should I proceed with the refactor?";
+        assert!(
+            !is_waiting_for_user_decision(Some(msg)),
+            "permission-seeking questions must not be treated as user-decision-required"
+        );
+    }
+
+    #[test]
+    fn test_waiting_for_user_decision_which_approach_alone_does_not_trigger() {
+        // "Which approach?" without an explicit deferral is rule 3 territory —
+        // orchestration LLM should auto-pick. Only an explicit deferral
+        // ("I won't pick", "you decide", etc.) bypasses that.
+        let msg = "I see two approaches. Which approach do you recommend?";
+        assert!(
+            !is_waiting_for_user_decision(Some(msg)),
+            "bare 'which approach' without an explicit deferral should not trigger"
+        );
+    }
+
+    #[test]
+    fn test_waiting_for_user_decision_summary_response_skipped() {
+        // auto_prompt's own Phase 1 summary responses mention 'what remains' and
+        // 'recommended next steps' — they are NOT the worker deferring to user.
+        let summary = "### 1. Original Task\nImplement Plan 264.\n\n\
+                       ### 2. What Was Accomplished\nPhases 1-4 done.\n\n\
+                       ### 3. What Remains\nPhase 5 blocked.\n\n\
+                       ### 4. Active Plan State\nPlan 264 closed.\n\
+                       You decide on next steps.";
+        assert!(
+            !is_waiting_for_user_decision(Some(summary)),
+            "Phase 1 summary responses must not be mistaken for worker deferral"
+        );
+    }
+
+    #[test]
+    fn test_waiting_for_user_decision_none_message() {
+        assert!(
+            !is_waiting_for_user_decision(None),
+            "None message should not trigger"
+        );
+    }
+
+    #[test]
+    fn test_waiting_for_user_decision_empty_message() {
+        assert!(
+            !is_waiting_for_user_decision(Some("   \n  \t")),
+            "whitespace-only message should not trigger"
+        );
+    }
+
+    #[test]
+    fn test_waiting_for_user_decision_normal_completion_does_not_trigger() {
+        // A normal completion message without an explicit deferral should NOT
+        // trigger — that path is handled by the LLM confidence / decisive stop.
+        let msg = "All tasks complete. Tests pass. Commits landed on develop.";
+        assert!(
+            !is_waiting_for_user_decision(Some(msg)),
+            "normal completion message without explicit deferral should not trigger"
         );
     }
 

@@ -455,6 +455,8 @@ If no plan files exist, verification is skipped and the chain stops immediately.
 
 **Not triggered for synthetic failures** — pre-stop verification only runs when the LLM produced a real decision. Synthetic failures go through the lightweight retry + safety net path instead.
 
+**Not triggered when worker is waiting for user decision** — if `is_waiting_for_user_decision(last_assistant_message)` detects an explicit deferral to the user (e.g. "I won't pick for you", "you decide", "need your input", "let me know which", "awaiting your decision"), the chain stops immediately without verification. Another nudge would just reproduce the same question. This is distinct from rule 3 permission-seeking ("Want me to proceed?") which is auto-answered — the worker explicitly declines to make the choice itself. Triggers are deliberately specific phrases; a bare "which approach?" without an explicit deferral does NOT trigger this path (rule 3 handles it).
+
 ### Context overflow
 
 When token count exceeds `max_context_tokens` (default 80K), the system uses a two-phase mechanism tracked by the per-session summary registry:

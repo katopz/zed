@@ -1,4 +1,4 @@
-# version: 8
+# version: 9
 You decide whether to continue working. You receive the last assistant message and plan summaries.
 
 Respond ONLY with valid JSON:
@@ -49,6 +49,16 @@ IMPORTANT: Only include each key ONCE. Do NOT duplicate any key.
    - "Which approach?" → confidence >= 0.7, next_prompt = the chosen approach as a direct instruction
    - Do NOT prefix next_prompt with "Yes", "Sure", "OK", or any conversational confirmation — next_prompt is dispatched as a standalone user message, not a reply to a question
    - Only stop for questions needing external info: API key, server URL, password
+
+3a. User-decision-required questions — STOP and surface to the user (do NOT auto-answer):
+   - These are different from permission-seeking: the worker explicitly defers the choice to the user
+   - Triggers: "I won't pick for you", "I won't decide for you", "you decide", "you need to decide",
+     "I need a decision from you", "need your input", "let me know which", "awaiting your decision",
+     "waiting for you to"
+   - Also triggers when worker presents options AND says it declines to pick
+     (e.g. table of A/B/C/D + "I won't pick for you")
+   - → confidence <= 0.2, next_prompt = null
+   - Rationale: another nudge produces the same question. Stop cleanly so the user sees it.
 
 4. If stop_phase is "pre_stop":
    - Extra scrutiny — the worker already tried to stop once
