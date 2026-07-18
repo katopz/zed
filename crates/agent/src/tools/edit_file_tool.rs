@@ -1345,6 +1345,89 @@ mod tests {
         );
     }
 
+    /// Project-local `.agents/skills/` paths must not prompt even when
+    /// (a) the agent omits the worktree-root prefix, and
+    /// (b) the target file (and its parent skill directory) do not yet
+    ///     exist in the worktree snapshot — i.e. the agent is creating a
+    ///     new skill directory + SKILL.md.
+    ///
+    /// This reproduces a real-world report where the agent, working in a
+    /// single-worktree project whose root name matched the repo
+    /// (e.g. `katgpt-rs`), tried to write
+    /// `katgpt-rs/.agents/skills/<new-skill>/SKILL.md` and was prompted
+    /// every time despite the path being project-local.
+    #[gpui::test]
+    async fn test_streaming_authorize_project_local_skill_new_dir_no_prefix(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = project::FakeFs::new(cx.executor());
+        // Worktree root contains `.agents/skills/` with one existing skill
+        // (`existing-skill`), but the target skill dir (`new-skill`) does
+        // NOT exist yet — mirroring the create-mode case.
+        fs.insert_tree(
+            path!("/katgpt-rs"),
+            json!({
+                ".agents": {
+                    "skills": {
+                        "existing-skill": { "SKILL.md": "content" }
+                    }
+                },
+            }),
+        )
+        .await;
+        let (edit_tool, _project, _action_log, _fs, _thread) =
+            setup_test_with_fs(cx, fs, &[path!("/katgpt-rs").as_ref()]).await;
+        cx.run_until_parked();
+
+        // Case A: WITH worktree-root prefix, brand-new skill dir + file.
+        //
+        // This path resolves inside the worktree (find_project_path's
+        // second pass strips the `katgpt-rs` prefix), so authorize must
+        // complete without prompting.
+        let (stream_tx, mut stream_rx) = ToolCallEventStream::test();
+        cx.update(|cx| {
+            edit_tool.authorize(
+                &PathBuf::from("katgpt-rs/.agents/skills/new-skill/SKILL.md"),
+                &stream_tx,
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+        assert!(
+            stream_rx.try_recv().is_err(),
+            "project-local .agents/skills with root prefix and new dir must NOT prompt"
+        );
+
+        // Case B: WITHOUT worktree-root prefix, brand-new skill dir + file.
+        //
+        // This is the case `find_project_path`'s second pass doesn't cover:
+        // it only strips the worktree-root prefix for non-existent paths.
+        // A bare `.agents/skills/...` path with no prefix and no existing
+        // entry resolves to None, so authorize currently treats the path as
+        // a global (sensitive) skill and prompts.
+        //
+        // We spawn the authorize call (instead of awaiting it inline) so
+        // that, if it does try to prompt, we can observe the prompt event
+        // on the stream rather than deadlock the test.
+        let (stream_tx, mut stream_rx) = ToolCallEventStream::test();
+        let authorize_task = cx.update(|cx| {
+            edit_tool.authorize(
+                &PathBuf::from(".agents/skills/new-skill/SKILL.md"),
+                &stream_tx,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let prompted = stream_rx.try_recv().is_ok();
+        drop(authorize_task);
+        assert!(
+            !prompted,
+            "project-local .agents/skills without root prefix and new dir must NOT prompt"
+        );
+    }
+
     /// `.agents/foo/../skills/SKILL.md` would slip past the raw
     /// With project-local `.agents/skills/` no longer classified as
     /// sensitive, a `..` traversal into `.agents/skills` inside the

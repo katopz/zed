@@ -5068,6 +5068,51 @@ impl Project {
                     });
                 }
             }
+
+            // Third pass: in a single-worktree project, a relative path
+            // that does not start with the worktree root name and does not
+            // yet exist is still unambiguous *if* some ancestor of the
+            // path already exists in the worktree snapshot — that proves
+            // the path is meant to live inside this worktree.
+            //
+            // Without this fallback, agent tools writing to a brand-new
+            // `.agents/skills/<new-skill>/SKILL.md` in a single-worktree
+            // project fail to resolve the path, get misclassified as a
+            // global (sensitive) skill, and prompt every time despite
+            // the path being project-local. The ancestor-existence guard
+            // prevents the fallback from absorbing genuinely foreign
+            // paths (e.g. `~/.agents/skills/...`, `/etc/hosts`).
+            //
+            // We deliberately skip paths that contain `..` components:
+            // `RelPath::new` normalizes them away, which would let
+            // `project/../other` (an escape attempt) match a root-level
+            // entry via this fallback. Such paths must go through the
+            // stricter resolution above.
+            let contains_dotdot = path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir));
+            let mut visible = worktree_store.visible_worktrees(cx);
+            if !contains_dotdot
+                && let (Some(worktree), None) = (visible.next(), visible.next())
+            {
+                let worktree = worktree.read(cx);
+                if let Ok(rel_path) = RelPath::new(path, path_style)
+                    && rel_path
+                        .ancestors()
+                        // skip self and the empty/root ancestor: the
+                        // root entry always exists, so allowing it to
+                        // satisfy the guard would absorb any path (e.g.
+                        // `~/.agents/skills/...`) into the worktree.
+                        .skip(1)
+                        .filter(|ancestor| !ancestor.is_empty())
+                        .any(|ancestor| worktree.entry_for_path(ancestor).is_some())
+                {
+                    return Some(ProjectPath {
+                        worktree_id: worktree.id(),
+                        path: rel_path.into_arc(),
+                    });
+                }
+            }
         }
 
         None
