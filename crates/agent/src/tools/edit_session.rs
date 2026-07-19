@@ -188,7 +188,25 @@ impl EditSessionContext {
         }
     }
 
-    async fn ensure_buffer_saved(&self, buffer: &Entity<Buffer>, cx: &mut AsyncApp) {
+    /// Persists the buffer to disk via `project.save_buffer`, and runs
+    /// `format_on_save` first if it is enabled for the buffer's language.
+    ///
+    /// **Error handling contract:**
+    /// - `format_on_save` failures are logged and ignored. Formatting is
+    ///   best-effort; a formatter crash or LSP timeout must not prevent
+    ///   the edit from being saved.
+    /// - `save_buffer` failures are **propagated**. Returning `Err` here
+    ///   lets `run_session` surface the failure to the user as a tool
+    ///   error instead of silently reporting success with no file on
+    ///   disk. This matters under resource exhaustion (EMFILE / ENOSPC
+    ///   / EACCES / network failures on remote projects) — without
+    ///   propagation, the agent believes its write succeeded and moves
+    ///   on, leaving the user with a phantom edit.
+    async fn ensure_buffer_saved(
+        &self,
+        buffer: &Entity<Buffer>,
+        cx: &mut AsyncApp,
+    ) -> Result<()> {
         let format_on_save_enabled = buffer.read_with(cx, |buffer, cx| {
             let settings = language_settings::LanguageSettings::for_buffer(buffer, cx);
             settings.format_on_save != FormatOnSave::Off
@@ -211,12 +229,13 @@ impl EditSessionContext {
 
         self.project
             .update(cx, |project, cx| project.save_buffer(buffer.clone(), cx))
-            .await
-            .log_err();
+            .await?;
 
         self.action_log.update(cx, |log, cx| {
             log.buffer_edited(buffer.clone(), cx);
         });
+
+        Ok(())
     }
 
     pub(crate) fn initial_title_from_path(
@@ -284,10 +303,35 @@ pub(crate) async fn run_session(
 ) -> Result<EditSessionOutput, EditSessionOutput> {
     match result {
         EditSessionResult::Completed(session) => {
-            session
+            // If the final save fails (EMFILE, ENOSPC, EACCES, remote
+            // project network error, etc.) we MUST surface it as a tool
+            // error. Previously this was `.await` with the result
+            // dropped, so `save_buffer` failures were silently logged
+            // and the tool reported `Success` even though no file was
+            // written to disk — leaving the agent to build on top of a
+            // phantom edit.
+            if let Err(save_error) = session
                 .context
                 .ensure_buffer_saved(&session.buffer, cx)
-                .await;
+                .await
+            {
+                let (_new_text, diff) = session.compute_new_text_and_diff(cx).await;
+                let error = format!(
+                    "Failed to save buffer after edit: {save_error}"
+                );
+                if !diff.is_empty() {
+                    event_stream.update_fields(
+                        acp::ToolCallUpdateFields::new().content(vec![
+                            acp::ToolCallContent::Content(acp::Content::new(error.clone())),
+                        ]),
+                    );
+                }
+                return Err(EditSessionOutput::Error {
+                    error,
+                    input_path: Some(session.input_path),
+                    diff,
+                });
+            }
             let (new_text, diff) = session.compute_new_text_and_diff(cx).await;
             Ok(EditSessionOutput::Success {
                 old_text: session.old_text.clone(),
@@ -300,10 +344,16 @@ pub(crate) async fn run_session(
             error,
             session: Some(session),
         } => {
+            // Best-effort save on the failure path — the session was
+            // partially applied, and we want to preserve whatever
+            // reached the buffer. Swallow errors here because the
+            // primary error (the one that failed the session) is more
+            // important to surface than a secondary save failure.
             session
                 .context
                 .ensure_buffer_saved(&session.buffer, cx)
-                .await;
+                .await
+                .ok();
             let (_new_text, diff) = session.compute_new_text_and_diff(cx).await;
             if diff.is_empty() {
                 event_stream.update_fields(acp::ToolCallUpdateFields::new().content(vec![
