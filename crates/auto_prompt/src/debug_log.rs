@@ -1,9 +1,11 @@
 //! Structured decision logging for debugging auto-prompt.
 //!
-//! On by default. Disable explicitly with `ZED_AUTO_PROMPT_LOG=0`; redirect the
-//! destination with `ZED_AUTO_PROMPT_LOG_DIR`. Writes one JSON file per decision
-//! event to `/tmp/zed_auto_prompt/` by default, named `{ms}_{seq}_{label}.json`
-//! so a full trace of a single stop/resume cycle is reconstructable by file order.
+//! Off by default (each decision performs a synchronous filesystem write on
+//! the foreground thread, which is unjustifiable as a default — see issue 006).
+//! Enable explicitly with `ZED_AUTO_PROMPT_LOG=1`; redirect the destination
+//! with `ZED_AUTO_PROMPT_LOG_DIR`. Writes one JSON file per decision event
+//! to `/tmp/zed_auto_prompt/` by default, named `{ms}_{seq}_{label}.json` so a
+//! full trace of a single stop/resume cycle is reconstructable by file order.
 //!
 //! All IO is best-effort: failures are surfaced via `log::warn!` and never
 //! propagated, so logging can never break the decision pipeline.
@@ -15,12 +17,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Monotonic sequence to keep filenames unique within a millisecond.
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-/// Whether decision logging is active. On by default; disable explicitly
-/// with `ZED_AUTO_PROMPT_LOG=0` (or `false`).
+/// Whether decision logging is active. Off by default to avoid a synchronous
+/// filesystem write per decision on the foreground thread (issue 006); enable
+/// explicitly with `ZED_AUTO_PROMPT_LOG=1` (or `true`).
 fn enabled() -> bool {
-    !matches!(
+    matches!(
         std::env::var("ZED_AUTO_PROMPT_LOG").as_deref(),
-        Ok("0") | Ok("false")
+        Ok("1") | Ok("true")
     )
 }
 

@@ -3114,46 +3114,77 @@ fn detect_remaining_work(last_assistant_message: Option<&str>) -> Option<String>
 
     let section = extract_remaining_section(msg);
 
-    let lower = msg.to_lowercase();
-    let patterns: &[&str] = &[
-        "remaining work",
-        "remaining:",
-        "still need",
-        "still needs",
-        "next step",
-        "next steps",
+    // Tightened pattern set (issue 006): only phrases that are authoritative
+    // task-list markers. Generic phrases like "remaining work", "remaining:",
+    // "still need", "next step(s)" were dropped because they matched inside
+    // ordinary prose — e.g. "No remaining work" — and forced an extra LLM
+    // second-opinion call every time a worker summarized a clean stop.
+    //
+    // We also require the phrase to appear in a *list/heading context*: the
+    // line must start with a markdown list/heading marker. This prevents
+    // free-form mentions like "consider the action items above" from firing.
+    const PATTERNS: &[&str] = &[
         "todo:",
         "action items",
         "left to do",
     ];
 
-    for pattern in patterns {
-        if lower.contains(pattern) {
-            log::warn!(
-                "[auto_prompt::detect_remaining_work] Pattern found: {pattern} in last_assistant_message — overriding stop"
-            );
-            let section_text = section.as_deref().unwrap_or(msg);
-            let section_lower = section_text.to_lowercase();
-            let is_actionable = section_text.contains("- ")
-                || section_text.contains("* ")
-                || section_text.contains("1.")
-                || section_lower.contains("todo")
-                || section_lower.contains("must")
-                || section_lower.contains("need to");
+    // Negation cues: if any appear within ~40 chars before the matched phrase
+    // on the same line, treat the mention as referring to work that does NOT
+    // exist and skip the override. Covers "no remaining work", "nothing left
+    // to do", "no action items", etc.
+    const NEGATIONS: &[&str] = &[
+        "no ",
+        "none ",
+        "nothing ",
+        "no further ",
+        "nothing left ",
+        "already done",
+        "all done",
+        "complete",
+        "finished",
+        "shipped",
+        "landed",
+        "resolved",
+    ];
 
-            if is_actionable {
-                return Some(format!(
-                    "Previous assistant mentioned remaining work. Extracted section:\n\n\
-                     {section_text}\n\n\
-                     If this describes specific actionable remaining work, continue with it. \
-                     If the work is already done or this is a false positive, stop."
-                ));
-            }
-            log::info!(
-                "[auto_prompt::detect_remaining_work] Pattern '{pattern}' found but no actionable items — skipping override"
-            );
-            return None;
+    for (line_idx, line) in msg.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if !is_list_or_heading_line(trimmed) {
+            continue;
         }
+        let lower = trimmed.to_lowercase();
+        let mut matched_pattern: Option<&str> = None;
+        for pattern in PATTERNS {
+            if let Some(pos) = lower.find(pattern) {
+                // Negation guard: scan up to 40 chars before the match for a
+                // negation cue on the same line.
+                let window_start = pos.saturating_sub(40);
+                let prefix = &lower[window_start..pos];
+                if NEGATIONS.iter().any(|neg| prefix.contains(neg)) {
+                    log::info!(
+                        "[auto_prompt::detect_remaining_work] Pattern '{pattern}' found on line {line_idx} but negated by preceding text — skipping override"
+                    );
+                    continue;
+                }
+                matched_pattern = Some(pattern);
+                break;
+            }
+        }
+        let Some(pattern) = matched_pattern else { continue };
+        log::warn!(
+            "[auto_prompt::detect_remaining_work] Pattern found: {pattern} in a list/heading line of last_assistant_message — overriding stop"
+        );
+        let section_text = section.as_deref().unwrap_or(msg);
+        // We already know the matched line is a list/heading line, so the
+        // section is actionable by construction; surface it to the second
+        // opinion and let the LLM decide whether to continue.
+        return Some(format!(
+            "Previous assistant mentioned remaining work. Extracted section:\n\n\
+             {section_text}\n\n\
+             If this describes specific actionable remaining work, continue with it. \
+             If the work is already done or this is a false positive, stop."
+        ));
     }
 
     for line in msg.lines() {
@@ -3173,6 +3204,35 @@ fn detect_remaining_work(last_assistant_message: Option<&str>) -> Option<String>
     }
 
     None
+}
+
+/// Whether a line starts with a markdown list or heading marker. Used by
+/// [`detect_remaining_work`] to require task-list context for the substring
+/// patterns (issue 006): a phrase like "action items" buried mid-paragraph in
+/// prose does not count, but `## Action items` or `- Action items:` does.
+fn is_list_or_heading_line(trimmed: &str) -> bool {
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.starts_with('-')
+        || trimmed.starts_with('*')
+        || trimmed.starts_with('+')
+        || trimmed.starts_with('#')
+    {
+        return true;
+    }
+    // Ordered list: digit(s) followed by `.` or `)`.
+    let bytes = trimmed.as_bytes();
+    let mut idx = 0;
+    while idx < bytes.len() && bytes[idx].is_ascii_digit() {
+        idx += 1;
+    }
+    if idx > 0 && idx + 1 < bytes.len() {
+        let sep = bytes[idx];
+        let next = bytes[idx + 1];
+        return (sep == b'.' || sep == b')') && (next == b' ' || next == b'\t');
+    }
+    false
 }
 
 /// Detect auto_prompt's own ContextOverflow Phase 1 summary responses.
@@ -4001,15 +4061,17 @@ mod tests {
 
     #[test]
     fn test_eval_remaining_work_remaining_work_pattern() {
+        // Issue 006 tightened the patterns: "remaining work" alone no longer
+        // fires. Use an authoritative task-list marker in a heading line.
         let input = EvaluationInput {
             confidence: Some(0.1),
-            last_assistant_message: Some("## Remaining Work\n- fix tests".to_string()),
+            last_assistant_message: Some("## Action items\n- fix tests".to_string()),
             ..make_input()
         };
         let result = evaluate_response(&input);
         assert!(
             matches!(result, EvaluationResult::NeedsSecondOpinion { .. }),
-            "expected NeedsSecondOpinion for remaining work pattern, got {result:?}"
+            "expected NeedsSecondOpinion for action-items heading with list, got {result:?}"
         );
     }
 
@@ -4029,15 +4091,17 @@ mod tests {
 
     #[test]
     fn test_eval_remaining_work_todo_pattern() {
+        // Issue 006: the phrase must appear in a list/heading line, not
+        // free-form prose.
         let input = EvaluationInput {
             confidence: Some(0.1),
-            last_assistant_message: Some("TODO: fix this".to_string()),
+            last_assistant_message: Some("- TODO: fix this".to_string()),
             ..make_input()
         };
         let result = evaluate_response(&input);
         assert!(
             matches!(result, EvaluationResult::NeedsSecondOpinion { .. }),
-            "expected NeedsSecondOpinion for TODO pattern, got {result:?}"
+            "expected NeedsSecondOpinion for TODO list item, got {result:?}"
         );
     }
 
@@ -4071,10 +4135,12 @@ mod tests {
 
     #[test]
     fn test_eval_remaining_work_trigger_with_bullets_overrides_stop() {
+        // Issue 006: "remaining work" prose removed; require an authoritative
+        // task-list heading.
         let input = EvaluationInput {
             confidence: Some(0.1),
             last_assistant_message: Some(
-                "Done with part 1.\n\n### Remaining work:\n\n- Fix the bug\n- Add tests"
+                "Done with part 1.\n\n### Action items\n\n- Fix the bug\n- Add tests"
                     .to_string(),
             ),
             ..make_input()
@@ -4241,15 +4307,17 @@ mod tests {
 
     #[test]
     fn test_eval_low_confidence_remaining_work_needs_second_opinion() {
+        // Issue 006: "Remaining work:" prose removed; require an authoritative
+        // task-list marker.
         let input = EvaluationInput {
             confidence: Some(0.1),
-            last_assistant_message: Some("Remaining work:\n- fix test".to_string()),
+            last_assistant_message: Some("## Action items\n- fix test".to_string()),
             ..make_input()
         };
         let result = evaluate_response(&input);
         assert!(
             matches!(result, EvaluationResult::NeedsSecondOpinion { .. }),
-            "expected NeedsSecondOpinion for low confidence with remaining work pattern, got {result:?}"
+            "expected NeedsSecondOpinion for low confidence with action-items heading, got {result:?}"
         );
     }
 
@@ -5001,6 +5069,76 @@ mod tests {
             result.is_none(),
             "struck-through checkbox should not trigger remaining work override, got: {result:?}"
         );
+    }
+
+    #[test]
+    fn test_detect_remaining_work_ignores_no_remaining_work_prose() {
+        // Regression for issue 006: worker says "No remaining work" and the
+        // old naive substring match on "remaining work" forced a second-opinion
+        // LLM call. Tightened patterns + list-context requirement must skip it.
+        let msg = "All 7 commits landed and pushed successfully.\n\nNo remaining work.";
+        let result = detect_remaining_work(Some(msg));
+        assert!(
+            result.is_none(),
+            "'No remaining work' in prose must NOT trigger override, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_detect_remaining_work_ignores_pattern_in_prose_without_list_context() {
+        // "action items" buried mid-paragraph must not fire.
+        let msg = "I reviewed the action items above and they are all complete. Stopping now.";
+        let result = detect_remaining_work(Some(msg));
+        assert!(
+            result.is_none(),
+            "pattern in prose without list/heading context must NOT trigger, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_detect_remaining_work_fires_on_action_items_heading_with_list() {
+        let msg = "Done with phase 1.\n\n## Action items\n\n- Fix bug A\n- Add tests for B";
+        let result = detect_remaining_work(Some(msg));
+        assert!(
+            result.is_some(),
+            "'## Action items' heading followed by list items SHOULD trigger"
+        );
+    }
+
+    #[test]
+    fn test_detect_remaining_work_fires_on_todo_list_item() {
+        let msg = "Phase 1 complete.\n\n- TODO: wire up the new config flag";
+        let result = detect_remaining_work(Some(msg));
+        assert!(
+            result.is_some(),
+            "'- TODO:' list item SHOULD trigger, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_detect_remaining_work_negation_guard_skips_override() {
+        // Even in a list/heading line, a negation cue before the pattern must
+        // suppress the override.
+        let msg = "Summary.\n\n- No action items left to do — all complete";
+        let result = detect_remaining_work(Some(msg));
+        assert!(
+            result.is_none(),
+            "negated 'No action items left to do' must NOT trigger, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_is_list_or_heading_line_markers() {
+        assert!(is_list_or_heading_line("- item"));
+        assert!(is_list_or_heading_line("* item"));
+        assert!(is_list_or_heading_line("+ item"));
+        assert!(is_list_or_heading_line("# Heading"));
+        assert!(is_list_or_heading_line("## Subheading"));
+        assert!(is_list_or_heading_line("1. first"));
+        assert!(is_list_or_heading_line("12) twelfth"));
+        assert!(!is_list_or_heading_line("Plain prose."));
+        assert!(!is_list_or_heading_line("1.NoSpace"));
+        assert!(!is_list_or_heading_line(""));
     }
 
     #[test]

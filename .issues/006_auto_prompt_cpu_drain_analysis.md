@@ -3,9 +3,11 @@
 ## Status
 - [x] Symptom reproduced (live process sampled, log scanned, subprocess tree inspected)
 - [x] Root cause identified (multiple compounding causes — see below)
-- [ ] Fix proposed (see "Recommended fixes" — pick subset per priority)
-- [ ] Tested
-- [ ] GOAT verified
+- [x] Fix proposed (see "Recommended fixes" — pick subset per priority)
+- [x] P0 fixes landed (see `.docs/006_auto_prompt_cpu_drain_p0_fixes.md`)
+- [ ] P1 fixes (subprocess reaping, MCP dedup, scoped action_log observe)
+- [ ] P2 fixes (concurrent-stream cap, SSE idle timeout, background decision log)
+- [ ] GOAT verified (live CPU measurement after P0 lands)
 
 ## Symptom
 
@@ -192,22 +194,24 @@ HTTP stream") recurs.
 
 ## Recommended fixes (priority order)
 
-### P0 — Quick wins, low risk
+### P0 — Quick wins, low risk  ✅ LANDED (see `.docs/006_auto_prompt_cpu_drain_p0_fixes.md`)
 
-- [ ] **Default-disable decision logging.** Flip default in
+- [x] **Default-disable decision logging.** Flip default in
       `crates/auto_prompt/src/debug_log.rs:20` from on → off. The logging is
       structured debug data, not user-facing. Users who need it set
       `ZED_AUTO_PROMPT_LOG=1`. Saves 1 sync fs write per decision.
-- [ ] **Tighten `detect_remaining_work` patterns.** Require the phrase to
+- [x] **Tighten `detect_remaining_work` patterns.** Require the phrase to
       appear in a *heading* or *list item context* (line starts with `-`, `*`,
       `#`, or a digit), not free-form prose. Drop "remaining:" and
       "remaining work" from the patterns (too generic) — keep "left to do",
       "todo:", "action items". This kills the false-positive → second-opinion
       LLM call cycle.
-- [ ] **Bound `retained_threads`.** Hard cap at, say, 8 threads. When
-      inserting past the cap, evict the oldest non-generating thread and drop
-      it from memory (let `ThreadMetadataStore` keep metadata for reopen).
-      Prevents unbounded growth under auto_prompt loops.
+- [x] **Bound `retained_threads`.** Hard cap at 8 threads via new
+      `insert_retained_thread` helper that all insertion paths now route
+      through. Existing `cleanup_retained_threads` (cap 5 idle) is invoked
+      from the helper so auto_prompt's continuation path no longer bypasses
+      it. When the cap is exceeded with all threads busy, the oldest is
+      evicted; metadata stays in `ThreadMetadataStore` for reopen.
 
 ### P1 — Higher-impact, more code
 

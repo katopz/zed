@@ -70,7 +70,7 @@ use audio::{Audio, Sound};
 use chrono::{DateTime, Utc};
 use client::{UserStore, zed_urls};
 use cloud_api_types::Plan;
-use collections::HashMap;
+use collections::{HashMap, IndexMap};
 use editor::{Editor, MultiBuffer};
 use extension_host::ExtensionStore;
 use feature_flags::{CreateThreadToolFeatureFlag, FeatureFlagAppExt as _};
@@ -1397,7 +1397,7 @@ pub struct AgentPanel {
     last_created_entry_kind: AgentPanelEntryKind,
     overlay_view: Option<OverlayView>,
     draft_thread: Option<Entity<ConversationView>>,
-    retained_threads: HashMap<ThreadId, Entity<ConversationView>>,
+    retained_threads: IndexMap<ThreadId, Entity<ConversationView>>,
     terminals: HashMap<TerminalId, AgentTerminal>,
     pending_terminal_spawn: Option<TerminalId>,
     new_thread_menu_handle: PopoverMenuHandle<ContextMenu>,
@@ -1420,6 +1420,14 @@ pub struct AgentPanel {
 
     is_active: bool,
 }
+
+/// Upper bound on the number of parked continuation threads we keep live in
+/// memory at once (issue 006). Each retained `ConversationView` subscribes to
+/// the global `action_log`, so unbounded growth produces an N×M repaint
+/// cascade on every file edit. Past this cap the oldest non-generating thread
+/// is dropped from memory; its metadata stays in `ThreadMetadataStore` so the
+/// user can reopen it from the sidebar.
+const MAX_RETAINED_THREADS: usize = 8;
 
 impl AgentPanel {
     fn serialize(&mut self, cx: &mut App) {
@@ -1778,7 +1786,7 @@ impl AgentPanel {
                 let ThreadMetadataStoreEvent::ThreadArchived(thread_id) = event else {
                     return;
                 };
-                if this.retained_threads.remove(thread_id).is_some() {
+                if this.retained_threads.shift_remove(thread_id).is_some() {
                     cx.notify();
                 }
             },
@@ -1805,7 +1813,7 @@ impl AgentPanel {
             focus_handle: cx.focus_handle(),
             context_server_registry,
             draft_thread: None,
-            retained_threads: HashMap::default(),
+            retained_threads: IndexMap::default(),
             terminals: HashMap::default(),
             pending_terminal_spawn: None,
             new_thread_menu_handle: PopoverMenuHandle::default(),
@@ -2046,7 +2054,7 @@ impl AgentPanel {
                 let draft_id = draft.read(cx).thread_id;
                 self.draft_thread = None;
                 self._draft_editor_observation = None;
-                self.retained_threads.insert(draft_id, draft);
+                self.insert_retained_thread(draft_id, draft, cx);
             } else if *draft.read(cx).agent_key() != self.selected_agent {
                 let old_draft_id = draft.read(cx).thread_id;
                 ThreadMetadataStore::global(cx).update(cx, |store, cx| {
@@ -3288,7 +3296,7 @@ impl AgentPanel {
             return false;
         }
 
-        self.retained_threads.remove(&thread_id);
+        self.retained_threads.shift_remove(&thread_id);
         self.set_ephemeral_draft(conversation_view, cx);
         true
     }
@@ -3366,8 +3374,7 @@ impl AgentPanel {
             }
         }
         let thread_id = thread.conversation_view.read(cx).thread_id;
-        self.retained_threads
-            .insert(thread_id, thread.conversation_view);
+        self.insert_retained_thread(thread_id, thread.conversation_view, cx);
         thread_id
     }
 
@@ -3378,7 +3385,7 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let conversation_view = if let Some(view) = self.retained_threads.remove(&id) {
+        let conversation_view = if let Some(view) = self.retained_threads.shift_remove(&id) {
             self.try_make_empty_draft_ephemeral(view.clone(), cx);
             view
         } else if let Some(draft) = &self.draft_thread {
@@ -3430,7 +3437,7 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.retained_threads.remove(&id);
+        self.retained_threads.shift_remove(&id);
         ThreadMetadataStore::global(cx).update(cx, |store, cx| {
             store.delete(id, cx);
         });
@@ -3707,11 +3714,54 @@ impl AgentPanel {
             cx,
         );
         let thread_id = thread.conversation_view.read(cx).thread_id;
-        self.retained_threads
-            .insert(thread_id, thread.conversation_view);
+        self.insert_retained_thread(thread_id, thread.conversation_view, cx);
         cx.emit(AgentPanelEvent::ActiveViewChanged);
         cx.notify();
         Some(thread_id)
+    }
+
+    /// Insert a thread into `retained_threads` and run the standard cleanup
+    /// pass. This centralizes the post-insert hygiene that `retain_running_thread`
+    /// already does so the auto_prompt continuation path (`external_thread_background`)
+    /// and `create_thread_with_options` no longer bypass it — issue 006 found
+    /// those paths grew `retained_threads` without bound because they inserted
+    /// directly without invoking `cleanup_retained_threads`.
+    ///
+    /// `cleanup_retained_threads` enforces `MaxIdleRetainedThreads` (default 5)
+    /// but skips any thread that is currently `Generating`, loading contents,
+    /// producing a title/summary, or has a queued message. As a backstop for
+    /// the runaway case where every retained thread is generating (so cleanup
+    /// would be a no-op), we still enforce a hard cap of
+    /// [`MAX_RETAINED_THREADS`] by evicting the single oldest retained thread.
+    fn insert_retained_thread(
+        &mut self,
+        thread_id: ThreadId,
+        view: Entity<ConversationView>,
+        cx: &mut App,
+    ) {
+        // IndexMap preserves insertion order; shift_remove + insert refreshes
+        // the thread's FIFO position when re-parking an already-present id.
+        self.retained_threads.shift_remove(&thread_id);
+        self.retained_threads.insert(thread_id, view);
+        self.cleanup_retained_threads(cx);
+
+        // Hard cap backstop: if every retained thread was mid-generation,
+        // `cleanup_retained_threads` could not evict any of them. Respect the
+        // invariant by evicting the single oldest (FIFO order from IndexMap).
+        // The underlying agent-server thread keeps running and its metadata
+        // stays in `ThreadMetadataStore`, so the user can reopen it from the
+        // sidebar.
+        while self.retained_threads.len() > MAX_RETAINED_THREADS {
+            let Some(oldest_id) = self.retained_threads.keys().next().copied() else {
+                break;
+            };
+            self.retained_threads.shift_remove(&oldest_id);
+            log::info!(
+                "[agent_panel] retained_threads exceeded hard cap of {MAX_RETAINED_THREADS} \
+                 (all threads busy); evicted oldest thread {oldest_id:?} \
+                 (metadata preserved in ThreadMetadataStore)"
+            );
+        }
     }
 
     fn deploy_rules_library(
@@ -4309,7 +4359,7 @@ impl AgentPanel {
         self.workspace_id
     }
 
-    pub fn retained_threads(&self) -> &HashMap<ThreadId, Entity<ConversationView>> {
+    pub fn retained_threads(&self) -> &IndexMap<ThreadId, Entity<ConversationView>> {
         &self.retained_threads
     }
 
@@ -4471,8 +4521,7 @@ impl AgentPanel {
                 let thread_id = conversation_view.read(cx).thread_id;
                 self.draft_thread = None;
                 self._draft_editor_observation = None;
-                self.retained_threads.insert(thread_id, conversation_view);
-                self.cleanup_retained_threads(cx);
+                self.insert_retained_thread(thread_id, conversation_view, cx);
             }
             return;
         }
@@ -4483,8 +4532,7 @@ impl AgentPanel {
             return;
         }
 
-        self.retained_threads.insert(thread_id, conversation_view);
-        self.cleanup_retained_threads(cx);
+        self.insert_retained_thread(thread_id, conversation_view, cx);
     }
 
     fn cleanup_retained_threads(&mut self, cx: &App) {
@@ -4550,7 +4598,7 @@ impl AgentPanel {
             .take(n)
             .collect::<Vec<_>>();
         for id in to_remove {
-            self.retained_threads.remove(&id);
+            self.retained_threads.shift_remove(&id);
         }
     }
 
@@ -4731,7 +4779,7 @@ impl AgentPanel {
                             this.draft_thread = None;
                             this._draft_editor_observation = None;
                         }
-                        this.retained_threads.remove(&thread_id);
+                        this.retained_threads.shift_remove(&thread_id);
                         cx.emit(AgentPanelEvent::ThreadInteracted { thread_id });
                     }
                 },
@@ -4808,7 +4856,7 @@ impl AgentPanel {
             );
             return;
         }
-        if let Some(conversation_view) = self.retained_threads.remove(&thread_id) {
+        if let Some(conversation_view) = self.retained_threads.shift_remove(&thread_id) {
             self.try_make_empty_draft_ephemeral(conversation_view.clone(), cx);
             self.set_base_view(
                 BaseView::AgentThread { conversation_view },
@@ -7074,7 +7122,7 @@ impl AgentPanel {
     /// Drops a thread's `ConversationView` from `retained_threads` without
     /// deleting its metadata or kvp state. Simulates the post-restart
     pub fn test_unload_retained_thread(&mut self, id: ThreadId) -> bool {
-        self.retained_threads.remove(&id).is_some()
+        self.retained_threads.shift_remove(&id).is_some()
     }
 
     /// Opens an external thread using an arbitrary AgentServer.
@@ -13600,7 +13648,7 @@ mod tests {
         // so on_release → close_all_sessions fires only on A.
         drop(retained_conversation_a);
         panel.update(&mut cx, |panel, _cx| {
-            panel.retained_threads.remove(&_thread_id_a);
+            panel.retained_threads.shift_remove(&_thread_id_a);
         });
         cx.run_until_parked();
 
