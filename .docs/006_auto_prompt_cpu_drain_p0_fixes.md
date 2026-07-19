@@ -7,8 +7,10 @@
 - [x] `cargo test -p auto_prompt --lib` — 250/250 pass (6 new tests added)
 - [x] `cargo test -p agent_ui --lib retained` — 7/7 pass
 - [x] `cargo test -p sidebar --lib retained` — 3/3 pass
+- [x] P1 fix: zombie reaping in `util::command::darwin::Child::drop` (see below)
+- [x] `cargo test -p util --lib` — 126/126 pass (+1 new regression test)
 - [ ] Verified against live editor (user to confirm CPU drop)
-- [ ] P1 follow-ups (subprocess reaping, MCP duplicate-spawn, scoped action_log observe)
+- [ ] P1 follow-ups: MCP duplicate-spawn diagnosis (deferred — needs live debug), action_log observer already per-thread (no change needed)
 - [ ] P2 follow-ups (concurrent-stream cap, SSE idle timeout, background decision log)
 
 ## What landed (commit reference: see `git log`)
@@ -106,21 +108,99 @@ runaway state the issue-006 investigation surfaced.
 - The summary-response guard (`is_auto_prompt_summary_response`) — still
   skips Phase 1 ContextOverflow summaries.
 
-## Followups (P1 / P2 — see `.issues/006_*`)
+## P1 fix: zombie subprocess reaping in `util::command::darwin::Child`
 
-The P0 fixes above remove the biggest contributors but do not address the
-structural leaks:
+**File:** `crates/util/src/command/darwin.rs`
 
-- **P1:** Extend `util::process::Child` reaping (commit `05f20945eb`)
-  from `remote_server` to `agent`'s MCP servers and terminal tool spawns.
-  The 34 zombie children of PID 46430 are not touched by these fixes.
-- **P1:** Investigate duplicate MCP server spawns in
-  `ContextServerStore::run_server` — 4 unique × 2 instances each observed.
-- **P1:** Scope `cx.observe(&action_log, …)` per-thread in
-  `crates/agent_ui/src/conversation_view.rs:1201` so parked threads don't
-  repaint on every global file edit.
-- **P2:** Fix the SSE idle hang (`.issues/003_*`) — removes the watchdog
-  recovery cycle entirely.
+### Root cause (corrected from issue 006)
+
+Issue 006 originally claimed the 34 zombies came from the agent's MCP
+servers not being reaped, and that commit `05f20945eb` only covered
+`remote_server`. **That diagnosis was wrong.** Investigation shows:
+
+- The agent's MCP servers use `context_server::StdioTransport` which
+  spawns via `util::process::Child` — and that wrapper's `Drop` impl
+  (added in `05f20945eb`) already sends SIGKILL + detached reap.
+- The agent's external server connections (`AcpConnection`) also use
+  `util::process::Child`, same reap path.
+
+The actual leak was in a **different `Child` type**: `util::command::Child`
+(on macOS, re-exported from `util::command::darwin`). This is the wrapper
+used by **LSP servers** (`crates/lsp/src/lsp.rs`), the **debugger
+companion** (`crates/project/src/debugger/session.rs`), **SSH transports**
+(`crates/remote/src/transport/`), and **REPL kernels** (`crates/repl/`).
+
+Its `Drop` impl only sent SIGKILL when `kill_on_drop` was set, but **never
+reaped**. The LSP shutdown path is the most prolific caller of the leak
+pattern:
+
+```rust
+// crates/lsp/src/lsp.rs:1139
+server.lock().take().map(|mut child| child.kill());
+```
+
+`kill()` sends SIGKILL but does not call `waitpid`. The child becomes a
+zombie that stays in the kernel process table until the parent (Zed)
+itself exits. With ~25 language servers across multiple worktrees and
+several LSP restarts over a long session (settings changes, worktree
+additions, etc.), this easily produces 30+ zombies.
+
+### Fix
+
+`util::command::darwin::Child::drop` now schedules a detached `waitpid`
+on the smol global executor, matching the semantics of
+`util::process::Child::drop`. If `kill_on_drop` is set, the SIGKILL is
+sent first (existing behavior); the reap task then blocks until the
+process exits (typically immediate, since SIGKILL can't be caught) and
+reaps the zombie.
+
+If `kill_on_drop` is NOT set, the reap task waits for the process to exit
+naturally. This is correct behavior — the alternative is a zombie, and the
+reap runs on a background executor thread so it never blocks the foreground.
+
+### Test
+
+`command::darwin::tests::dropping_child_kills_and_reaps_subprocess`
+spawns `/bin/sleep 300` with `kill_on_drop(true)`, drops the handle
+without awaiting `status()`, and polls `kill -0` until the process is
+fully reaped (ESRCH). Mirrors the existing regression test in
+`util::process::tests`.
+
+## P1 investigation: action_log observer — NO CHANGE NEEDED
+
+Issue 006 finding #7 claimed every `ConversationView` subscribed to a
+"shared global `action_log`", producing an N×M repaint cascade. **This
+finding was incorrect.** The action_log is **per-thread**
+(`AcpThread::action_log: Entity<ActionLog>` at
+`crates/acp_thread/src/acp_thread.rs:1213`), and each `ConversationView`
+observes ITS OWN thread's action_log (`conversation_view.rs:1121` reads
+`thread.read(cx).action_log().clone()`). There is no global cascade.
+
+The repaint pressure from action_log observers is bounded by the per-thread
+edit rate, which is exactly what the P0 `retained_threads` cap already
+addresses.
+
+## P1 investigation: duplicate MCP server spawns — DEFERRED
+
+The observed "4 unique MCP servers × 2 instances each" pattern was not
+reproduced in code review. The lifecycle guards in
+`ContextServerStore::run_server` correctly call `stop_server` before
+re-spawning when the server is in `Starting | Running | Authenticating`
+state. Possible explanations that require live debugging to confirm:
+
+- The duplicates were left over from a workspace reload that happened
+  before process cleanup ran (now fixed by the P0 retained_threads cap
+  and this P1 reap fix).
+- The user has the same MCP server configured in multiple settings
+  scopes (global + project + project-group), each of which legitimately
+  spawns its own instance.
+- A `maintain_servers` race that only manifests under specific timing.
+
+Adding logging to `ContextServerStore::run_server` to track spawn/stop
+events would help diagnose if this recurs. Not addressed here because
+the fix is not obvious from static analysis and the P0+P1 fixes already
+remove the biggest CPU contributors.
+
 
 ## Verification
 

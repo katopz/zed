@@ -242,6 +242,35 @@ impl Drop for Child {
         if self.kill_on_drop && self.status.is_none() {
             let _ = self.kill();
         }
+        if self.status.is_none() {
+            // Reap the zombie so it doesn't outlive the handle. Matches the
+            // semantics of `util::process::Child::drop` (issue 006): callers
+            // such as the LSP shutdown path (`lsp.rs` ~line 1139) invoke
+            // `kill()` without ever awaiting `status()`, so without this
+            // detached reap every language-server restart would leave a
+            // kernel zombie parented by the editor. Long sessions accumulated
+            // 30+ zombies this way.
+            //
+            // We spawn on the smol global executor (lazily brought up on
+            // first use) so this never fails to schedule, and we move a copy
+            // of the pid — `waitpid` only needs the integer, not the handle.
+            let pid = self.pid;
+            smol::spawn(async move {
+                smol::unblock(move || {
+                    let mut raw: libc::c_int = 0;
+                    // Blocking waitpid: by the time Drop runs the caller has
+                    // usually already SIGKILL'd the process, so this returns
+                    // promptly. If the process is still alive (no kill_on_drop),
+                    // this will block until it exits naturally — acceptable for
+                    // a detached background task.
+                    unsafe {
+                        libc::waitpid(pid, &mut raw, 0);
+                    }
+                })
+                .await;
+            })
+            .detach();
+        }
     }
 }
 
@@ -899,5 +928,48 @@ mod tests {
             assert!(output.status.success());
             assert_eq!(output.stdout, b"piped input");
         });
+    }
+
+    /// Regression test for issue 006: dropping a `Child` without awaiting
+    /// `status()` used to leave a kernel zombie parented by the test runner
+    /// (and, in production, by the Zed editor). The LSP shutdown path
+    /// (`lsp.rs` ~line 1139) is the most prolific caller of this pattern —
+    /// it calls `kill()` but never reaps — so long sessions accumulated
+    /// 30+ zombies from language-server restarts alone.
+    ///
+    /// With the Drop impl in place, the detached `waitpid` task reaps the
+    /// child within a few hundred milliseconds of `kill()` being sent.
+    #[test]
+    fn dropping_child_kills_and_reaps_subprocess() {
+        let child = Command::new("/bin/sleep")
+            .arg("300")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("failed to spawn sleep");
+        let pid = child.id() as i32;
+        assert!(pid > 0, "child has a valid pid");
+
+        // Drop without awaiting status. The Drop impl sends SIGKILL (because
+        // kill_on_drop is set) and schedules a detached `waitpid` reap.
+        drop(child);
+
+        // Wait up to 5s for the process to be fully reaped (no longer
+        // present in the kernel process table at all). `kill -0` returns Ok
+        // for both live and zombie processes; once the process has been
+        // reaped it returns ESRCH.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let alive = unsafe { libc::kill(pid, 0) };
+            if alive != 0 {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "pid {pid} still present after 5s; Drop did not reap the child \
+                     (zombie leak regression)"
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
 }

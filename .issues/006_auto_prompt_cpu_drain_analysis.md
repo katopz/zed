@@ -5,9 +5,25 @@
 - [x] Root cause identified (multiple compounding causes — see below)
 - [x] Fix proposed (see "Recommended fixes" — pick subset per priority)
 - [x] P0 fixes landed (see `.docs/006_auto_prompt_cpu_drain_p0_fixes.md`)
-- [ ] P1 fixes (subprocess reaping, MCP dedup, scoped action_log observe)
+- [x] P1 fix landed: zombie reaping in `util::command::darwin::Child::drop` (see `.docs/006_*`)
+- [-] P1 investigation: MCP duplicate-spawn (deferred — needs live debug; guards look correct)
+- [-] P1 investigation: action_log observer (no change needed — already per-thread, NOT global)
 - [ ] P2 fixes (concurrent-stream cap, SSE idle timeout, background decision log)
-- [ ] GOAT verified (live CPU measurement after P0 lands)
+- [ ] GOAT verified (live CPU measurement after P0+P1 land)
+
+## Correction
+
+Original issue 006 diagnosis contained two errors that the P1 investigation
+surfaced:
+
+1. **Finding #1 (zombies)** claimed the agent's MCP servers were not reaped
+   by commit `05f20945eb`. **Wrong.** The agent path uses `util::process::Child`
+   (reaped). The actual leak was in `util::command::darwin::Child` (used by
+   LSP/debugger/SSH/REPL), whose `Drop` never called `waitpid`. Fixed in P1.
+
+2. **Finding #7 (action_log cascade)** claimed every ConversationView
+   subscribed to a shared global action_log. **Wrong.** `AcpThread.action_log`
+   is per-thread; each ConversationView observes its own. No change needed.
 
 ## Symptom
 
@@ -215,21 +231,23 @@ HTTP stream") recurs.
 
 ### P1 — Higher-impact, more code
 
-- [ ] **Reap agent-side subprocesses on drop.** Extend commit `05f20945eb`
-      (`fix(util): reap subprocesses on Child drop`) to cover `agent`'s MCP
-      stdio server handles and terminal tool spawns, not just `remote_server`.
-      Confirm by re-running the `awk '$2 == 46430 && $3 == "Z"'` check after
-      a session — should be 0 zombies.
-- [ ] **Investigate duplicate MCP server spawns.** Adding logging to
-      `ContextServerStore::run_server` to see why each of the 4 MCP servers
-      is spawned twice. Likely a `maintain_servers` race or a
-      workspace-reload path that doesn't `stop_server` before starting a new
-      one. The `std::process::Command` parent must `wait()` on the old child
-      before spawning the new.
-- [ ] **Scope `cx.observe(&action_log, ...)` per-thread.** Only notify the
-      ThreadView for buffers that thread actually tracks. Either filter inside
-      the observer closure (cheap check: is the changed buffer in this
-      thread's tracked set?) or move to per-buffer subscriptions.
+- [x] **Reap agent-side subprocesses on drop.** Investigated: commit `05f20945eb`
+      already covers the agent path via `util::process::Child`. The actual
+      leak was in a DIFFERENT `Child` type (`util::command::darwin::Child`,
+      used by LSP/debugger/SSH/REPL) whose Drop never called `waitpid`.
+      Fixed by adding a detached `waitpid` reap task to that Drop impl.
+      See `.docs/006_auto_prompt_cpu_drain_p0_fixes.md` for details.
+- [-] **Investigate duplicate MCP server spawns.** Code-review could not
+      reproduce. The `ContextServerStore::run_server` lifecycle guards
+      look correct (`stop_server` is called before re-spawn for Starting/
+      Running/Authenticating states). Deferred — would need live
+      instrumentation in `run_server` to diagnose. May also be explained
+      by multi-scope settings (same MCP server configured in global +
+      project + project-group).
+- [-] **Scope `cx.observe(&action_log, ...)` per-thread.** Investigation
+      showed the observer IS already per-thread (`AcpThread.action_log` is
+      a per-instance `Entity<ActionLog>`, not a shared global). No N×M
+      cascade exists. No change needed.
 
 ### P2 — Architectural
 
