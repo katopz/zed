@@ -620,7 +620,7 @@ When `AutoPromptNewThread` is dispatched, `AgentPanel::auto_prompt_new_thread()`
 When the token count is below the `same_thread_token_threshold` (default 60K), continuations are sent to the **same thread** instead of creating a new one:
 
 - **Native Zed agent**: the orchestration LLM's decision is emitted **as-is** (no static preamble prepended)
-- **ACP agents (Claude, etc.)**: `/compact` + decision only
+- **ACP agents (Claude, etc.)**: a minimal orchestration LLM call reasons over the agent's last 2-3 paragraphs and returns `{continue, confidence, next_prompt, reason}`. The verdict drives continue-vs-stop; `next_prompt` (when continue) is sent as-is. See `claude_agent.rs`.
 
 The last assistant message is **not** repeated — it's already visible in the thread history. Only the orchestration LLM's decision is sent, keeping the continuation concise and avoiding the two-voice failure mode where a generic "Continue from where we left off…" preamble would be bolted onto a substantive task instruction.
 
@@ -639,9 +639,9 @@ The fallback is intentionally minimal. Behavioral meta-instructions ("commit whe
 | Agent type | Tokens < threshold | Tokens >= threshold | Active thread gone |
 |------------|-------------------|--------------------|--------------------|
 | Native Zed agent | Same thread (native prompt) | **New thread** | New thread (fallback) |
-| ACP agents (Claude, etc.) | Same thread (`/compact`) | Same thread (`/compact`) | **Stop** (no new thread) |
+| ACP agents (Claude, etc.) | Same thread (orchestrator verdict) | Same thread (orchestrator verdict) | **Stop** (no new thread) |
 
-ACP agents **never** create new threads — they rely on conversation history in the same thread. If the active thread is gone when `dispatch_action` runs, the chain stops instead of falling back to a new thread.
+ACP agents **never** create new threads — they rely on conversation history in the same thread. The Claude path has no static continuation prompt, no max-iterations gate, no pre-stop verification, and no context-overflow flow: every non-cancel decision goes through the orchestration LLM, which is the sole decider. If the active thread is gone when `dispatch_action` runs, the chain stops instead of falling back to a new thread.
 
 ### User Interface - Retry and Cancel
 

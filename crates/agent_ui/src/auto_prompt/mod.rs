@@ -599,6 +599,7 @@ pub fn on_thread_stopped(
         auto_prompt::decide(thread, used_tools, stop_reason, cx)
     };
     log::info!("[auto_prompt] decision result: {:?}", decision);
+    let is_claude_agent_for_task = is_claude_agent;
 
     let mut profile_id = conversation_view
         .active_thread()
@@ -722,47 +723,52 @@ pub fn on_thread_stopped(
 
                 let config = auto_prompt::load_config_cached().unwrap_or_default();
 
-                let store_prompt_result = load_auto_prompt_system_prompt(cx).await;
-
                 let mut data = data;
-                match config.system_prompt.as_ref() {
-                    Some(prompt) => data.system_prompt = prompt.clone(),
-                    None => {
-                        // Check project AUTO_PROMPT.md first (project overrides global)
-                        let project_auto_prompt = data.work_dirs.as_ref().and_then(|dirs| {
-                            for dir in dirs {
-                                let path = dir.join("AUTO_PROMPT.md");
-                                if path.exists() {
-                                    if let Ok(content) = std::fs::read_to_string(&path) {
-                                        let trimmed = content.trim();
-                                        if !trimmed.is_empty() {
-                                            return Some(trimmed.to_string());
+
+                // Claude path keeps its own minimal system prompt and skips the
+                // native path's plan/summary/verification prompt overrides.
+                // The native path may still apply AUTO_PROMPT.md / store prompt.
+                if !is_claude_agent_for_task {
+                    let store_prompt_result = load_auto_prompt_system_prompt(cx).await;
+                    match config.system_prompt.as_ref() {
+                        Some(prompt) => data.system_prompt = prompt.clone(),
+                        None => {
+                            // Check project AUTO_PROMPT.md first (project overrides global)
+                            let project_auto_prompt = data.work_dirs.as_ref().and_then(|dirs| {
+                                for dir in dirs {
+                                    let path = dir.join("AUTO_PROMPT.md");
+                                    if path.exists() {
+                                        if let Ok(content) = std::fs::read_to_string(&path) {
+                                            let trimmed = content.trim();
+                                            if !trimmed.is_empty() {
+                                                return Some(trimmed.to_string());
+                                            }
                                         }
                                     }
                                 }
-                            }
-                            None
-                        });
+                                None
+                            });
 
-                        if let Some(project_prompt) = project_auto_prompt {
-                            data.system_prompt = project_prompt;
-                        } else if let Some((store_prompt, is_outdated)) = store_prompt_result {
-                            data.system_prompt = store_prompt;
-                            if is_outdated {
-                                if let Some(ref workspace) = workspace_weak {
-                                    let _ = workspace.update(cx, |workspace, cx| {
-                                        let toast = notifications::status_toast::StatusToast::new(
-                                            gpui::SharedString::from("Auto-prompt system prompt updated to a newer version. You can customize it via AUTO_PROMPT.md."),
-                                            cx,
-                                            |this, _| {
-                                                this.icon(ui::Icon::new(ui::IconName::Info)
-                                                    .color(ui::Color::Muted))
-                                                    .auto_dismiss(true)
-                                                    .dismiss_button(true)
-                                            },
-                                        );
-                                        workspace.toggle_status_toast(toast, cx);
-                                    });
+                            if let Some(project_prompt) = project_auto_prompt {
+                                data.system_prompt = project_prompt;
+                            } else if let Some((store_prompt, is_outdated)) = store_prompt_result {
+                                data.system_prompt = store_prompt;
+                                if is_outdated {
+                                    if let Some(ref workspace) = workspace_weak {
+                                        let _ = workspace.update(cx, |workspace, cx| {
+                                            let toast = notifications::status_toast::StatusToast::new(
+                                                gpui::SharedString::from("Auto-prompt system prompt updated to a newer version. You can customize it via AUTO_PROMPT.md."),
+                                                cx,
+                                                |this, _| {
+                                                    this.icon(ui::Icon::new(ui::IconName::Info)
+                                                        .color(ui::Color::Muted))
+                                                        .auto_dismiss(true)
+                                                        .dismiss_button(true)
+                                                },
+                                            );
+                                            workspace.toggle_status_toast(toast, cx);
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -788,7 +794,11 @@ pub fn on_thread_stopped(
                     }
                 }
 
-                let mut result = auto_prompt::decide_with_llm(data.clone(), cx).await;
+                let mut result = if is_claude_agent_for_task {
+                    auto_prompt::claude_agent::decide_claude_with_llm(data.clone(), cx).await
+                } else {
+                    auto_prompt::decide_with_llm(data.clone(), cx).await
+                };
 
                 // Retry loop with exponential backoff
                 while let Err(ref err) = result {
@@ -818,7 +828,11 @@ pub fn on_thread_stopped(
                     }
 
                     log::info!("[auto_prompt] Retrying LLM call (attempt {})", failure_count);
-                    result = auto_prompt::decide_with_llm(data.clone(), cx).await;
+                    result = if is_claude_agent_for_task {
+                        auto_prompt::claude_agent::decide_claude_with_llm(data.clone(), cx).await
+                    } else {
+                        auto_prompt::decide_with_llm(data.clone(), cx).await
+                    };
                 }
 
                 if let Some(ref tv) = thread_weak {
