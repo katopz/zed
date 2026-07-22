@@ -423,15 +423,15 @@ pub(crate) fn dispatch_action(
                 return;
             };
 
-            // Whether to steal keyboard focus for the new thread is governed
-            // entirely by the `auto_focus_new_thread` setting (default:
-            // false). The previous detection-based approach (panel hovered,
-            // panel has focus, any chat input has text) had too many edge
-            // cases and still stole focus in practice. Defaulting to
-            // never-focus keeps the new thread from interrupting the user;
-            // users who want the old auto-focus behavior can opt in via
-            // `"agent.auto_focus_new_thread": true`.
-            let focus = agent_settings::AgentSettings::get_global(cx).auto_focus_new_thread;
+            // Focus the new thread when either:
+            //   (a) the user explicitly asked for it (manual_auto_prompt sets
+            //       `focus_new_thread = true`), or
+            //   (b) the global `auto_focus_new_thread` setting is on.
+            // LLM-decided continuations leave `focus_new_thread = false` and
+            // defer entirely to the setting, so background chains never steal
+            // focus unless the user has opted in.
+            let focus = action.focus_new_thread
+                || agent_settings::AgentSettings::get_global(cx).auto_focus_new_thread;
             if focus {
                 workspace.focus_panel::<crate::AgentPanel>(window, cx);
             }
@@ -1240,6 +1240,7 @@ pub fn start_watchdog(
                             approximate_token_count: 0,
                             last_assistant_message: None,
                             force_new_thread: false,
+                            focus_new_thread: false,
                         }
                     }) {
                         Ok(action) => action,

@@ -190,6 +190,12 @@ pub struct AutoPromptAction {
     /// of token counts. Set after ContextOverflow Phase 2 (AI produced
     /// a summary) so the continuation always lands in a fresh thread.
     pub force_new_thread: bool,
+    /// When true, the new thread (if one is created) steals keyboard focus
+    /// regardless of the `auto_focus_new_thread` setting. Set by
+    /// `manual_auto_prompt` so a user-initiated continuation focuses the
+    /// thread they just asked for; LLM-decided continuations leave this
+    /// false and defer to the setting.
+    pub focus_new_thread: bool,
 }
 
 /// Outcome of an auto-prompt LLM decision.
@@ -493,6 +499,7 @@ impl LlmCallData {
             approximate_token_count: self.approximate_token_count,
             last_assistant_message: self.last_assistant_message.clone(),
             force_new_thread: false,
+            focus_new_thread: false,
         }
     }
 
@@ -980,6 +987,7 @@ pub fn decide(
             approximate_token_count: auto_prompt_ctx.approximate_token_count,
             last_assistant_message: _last_assistant_msg,
             force_new_thread: false,
+            focus_new_thread: false,
         });
     }
 
@@ -1017,6 +1025,7 @@ pub fn decide(
                 approximate_token_count: auto_prompt_ctx.approximate_token_count,
                 last_assistant_message: _last_assistant_msg,
                 force_new_thread: false,
+                focus_new_thread: false,
             },
             delay_ms: delay,
         };
@@ -1182,6 +1191,7 @@ pub async fn decide_with_llm(
                 approximate_token_count: data.approximate_token_count,
                 last_assistant_message: data.last_assistant_message.clone(),
                 force_new_thread: false,
+                focus_new_thread: false,
             }));
         } else if summary_state == 1 {
             // Phase 2: AI has responded with summary. The last_assistant_message
@@ -5971,6 +5981,7 @@ mod tests {
             approximate_token_count: 5000,
             last_assistant_message: None,
             force_new_thread: false,
+            focus_new_thread: false,
         };
         assert!(!action_false.force_new_thread);
 
@@ -5985,6 +5996,7 @@ mod tests {
             approximate_token_count: 200000,
             last_assistant_message: None,
             force_new_thread: false,
+            focus_new_thread: false,
         };
         // Simulate Phase 2: reset tokens, set force_new_thread = true
         action_true.actual_input_tokens = None;

@@ -7169,6 +7169,7 @@ impl ThreadView {
             approximate_token_count: 0,
             last_assistant_message,
             force_new_thread: false,
+            focus_new_thread: true,
         };
 
         let conversation_view = self.server_view.upgrade();

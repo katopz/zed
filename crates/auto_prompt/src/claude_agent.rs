@@ -235,6 +235,7 @@ pub async fn decide_claude_with_llm(
         approximate_token_count: 0,
         last_assistant_message: data.last_assistant_message.clone(),
         force_new_thread: false,
+        focus_new_thread: false,
     };
 
     Ok(AutoPromptOutcome::Continue(action))
