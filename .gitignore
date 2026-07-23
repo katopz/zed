@@ -61,3 +61,6 @@ crates/docs_preprocessor/actions.json
 
 # AutoPrompt Logs
 .logs
+
+# SDXC
+._*
