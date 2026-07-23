@@ -3,16 +3,16 @@ use convert_case::{Case, Casing};
 use credentials_provider::CredentialsProvider;
 use fs::Fs;
 use futures::{FutureExt, StreamExt, future::BoxFuture};
-use gpui::{AnyView, App, AsyncApp, Context, ElementId, Entity, SharedString, Task, TaskExt, Window};
+use gpui::{App, AsyncApp, Context, ElementId, Entity, SharedString, Task, TaskExt, Window};
 use http_client::{CustomHeaders, HttpClient};
 use parking_lot::Mutex as ParkingMutex;
 use language_model::{
     ApiKeyState, AuthenticateError, EnvVar, IconOrSvg, LanguageModel, LanguageModelCompletionError,
-    LanguageModelCompletionEvent, LanguageModelId, LanguageModelName, LanguageModelProvider,
-    LanguageModelProviderId, LanguageModelProviderName, LanguageModelProviderState,
-    LanguageModelRequest, LanguageModelToolChoice, LanguageModelToolSchemaFormat, RateLimiter,
+    LanguageModelCompletionEvent, LanguageModelEffortLevel, LanguageModelId, LanguageModelName,
+    LanguageModelProvider, LanguageModelProviderId, LanguageModelProviderName,
+    LanguageModelProviderState, LanguageModelRequest, LanguageModelToolChoice,
+    LanguageModelToolSchemaFormat, ProviderSettingsView, RateLimiter, SubPageProviderSettings,
 };
-use menu;
 use open_ai::{
     ResponseStreamEvent,
     responses::{Request as ResponseRequest, StreamEvent as ResponsesStreamEvent, stream_response},
@@ -38,6 +38,10 @@ use health::{
     key_health_path_for, reload_persisted_health, retry_stream,
     schedule_persist_key_health_inner, snapshot_health,
 };
+
+/// Placeholder text shown in the (empty) primary/secondary/tertiary API key
+/// input fields.
+const API_KEY_PLACEHOLDER: &str = "000000000000000000000000000000000000000000000000000";
 
 #[derive(Default, Clone, Debug, PartialEq)]
 pub struct OpenAiCompatibleSettings {
@@ -148,8 +152,8 @@ impl State {
     /// single retry loop into one disk write. Called after every request
     /// outcome (success or failure) from `stream_completion` / `stream_response`
     /// via the free-function form `schedule_persist_key_health_inner` (which
-    /// takes `Send`-safe handles, not `AsyncApp`), and from `reset_key_health`
-    /// when the user clears all credentials.
+    /// takes `Send`-safe handles, not `AsyncApp`), and from `clear_slot_backoff`
+    /// when the user clears or resets a key's backoff.
     fn schedule_persist_key_health(&self, cx: &App) {
         schedule_persist_key_health_inner(
             &self.key_health,
@@ -160,22 +164,16 @@ impl State {
         );
     }
 
-    /// Resets every slot's health to defaults (no failures, no backoff) and
-    /// schedules a debounced persist so the cleared state overwrites any stale
-    /// backoff on disk. Called from `reset_credentials` so a freshly-added key
-    /// value doesn't inherit backoff from a previously-removed key that occupied
-    /// the same slot — the new key is unknown and shouldn't be penalized for the
-    /// old key's failures, and the UI badge shouldn't show a stale countdown.
-    fn reset_key_health(&self, cx: &App) {
-        *self.key_health.lock() = KeyHealthTracker::default();
-        self.schedule_persist_key_health(cx);
-    }
-
     /// Clears a single slot's backoff (failures=0, backoff_until=None) and
-    /// schedules a debounced persist. Escape hatch for the UI "Clear" button:
-    /// the upstream quota may reset before the 5h backoff window elapses (e.g.
-    /// a per-minute tier), and without this the user is stuck waiting. Also
-    /// overwrites the persisted state so a process restart doesn't resurrect it.
+    /// schedules a debounced persist. Escape hatch for the UI "Clear" button,
+    /// and also called when a slot's key is reset so a freshly-added key value
+    /// doesn't inherit backoff from a previously-removed key that occupied the
+    /// same slot — the new key is unknown and shouldn't be penalized for the
+    /// old key's failures, and the UI badge shouldn't show a stale countdown.
+    /// The upstream quota may also reset before the 5h backoff window elapses
+    /// (e.g. a per-minute tier), and without this the user is stuck waiting.
+    /// Also overwrites the persisted state so a process restart doesn't
+    /// resurrect the stale backoff either.
     fn clear_slot_backoff(&self, slot: KeySlot, cx: &App) {
         let mut tracker = self.key_health.lock();
         let health = tracker.get_mut(slot);
@@ -535,34 +533,22 @@ impl LanguageModelProvider for OpenAiCompatibleLanguageModelProvider {
         self.state.update(cx, |state, cx| state.authenticate(cx))
     }
 
-    fn configuration_view(
-        &self,
-        _target_agent: language_model::ConfigurationViewTargetAgent,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> AnyView {
-        cx.new(|cx| {
-            ConfigurationView::new(self.state.clone(), self.http_client.clone(), window, cx)
-        })
-        .into()
+    fn settings_view(&self, _cx: &mut App) -> Option<ProviderSettingsView> {
+        let state = self.state.clone();
+        let http_client = self.http_client.clone();
+        Some(ProviderSettingsView::SubPage(SubPageProviderSettings::new(
+            move |window, cx| {
+                cx.new(|cx| {
+                    ConfigurationView::new(state.clone(), http_client.clone(), window, cx)
+                })
+                .into()
+            },
+        )))
     }
 
-    fn reset_credentials(&self, cx: &mut App) -> Task<Result<()>> {
-        self.state.update(cx, |state, cx| {
-            // Clear all per-slot backoff state. A freshly-added key value is
-            // unknown and shouldn't inherit failures recorded against the old
-            // key that occupied this slot; the persisted file is overwritten so
-            // a process restart doesn't resurrect the stale backoff either.
-            state.reset_key_health(cx);
-            let task1 = state.set_api_key(None, cx);
-            let task2 = state.set_api_key_2(None, cx);
-            let task3 = state.set_api_key_3(None, cx);
-            cx.background_spawn(async move {
-                task1.await?;
-                task2.await?;
-                task3.await
-            })
-        })
+    fn set_api_key(&self, api_key: Option<String>, cx: &mut App) -> Task<Result<()>> {
+        self.state
+            .update(cx, |state, cx| state.set_api_key(api_key, cx))
     }
 }
 
@@ -736,6 +722,79 @@ impl OpenAiCompatibleLanguageModel {
     }
 }
 
+fn default_thinking_reasoning_effort(model: &AvailableModel) -> Option<open_ai::ReasoningEffort> {
+    model
+        .reasoning_effort
+        .filter(|effort| *effort != open_ai::ReasoningEffort::None)
+}
+
+fn supported_thinking_effort_levels(model: &AvailableModel) -> Vec<LanguageModelEffortLevel> {
+    let Some(default_effort) = default_thinking_reasoning_effort(model) else {
+        return Vec::new();
+    };
+
+    open_ai::ReasoningEffort::OPENAI_COMPATIBLE_SELECTABLE
+        .into_iter()
+        .map(|effort| LanguageModelEffortLevel {
+            name: effort.label().into(),
+            value: effort.value().into(),
+            is_default: effort == default_effort,
+        })
+        .collect()
+}
+
+fn selected_thinking_reasoning_effort(
+    request: &LanguageModelRequest,
+) -> Option<open_ai::ReasoningEffort> {
+    request
+        .thinking_effort
+        .as_deref()
+        .and_then(|effort| effort.parse::<open_ai::ReasoningEffort>().ok())
+        .filter(|effort| *effort != open_ai::ReasoningEffort::None)
+}
+
+fn chat_completion_max_tokens_parameter(
+    model: &AvailableModel,
+) -> crate::provider::open_ai::ChatCompletionMaxTokensParameter {
+    if model.capabilities.max_tokens_parameter {
+        crate::provider::open_ai::ChatCompletionMaxTokensParameter::MaxTokens
+    } else {
+        crate::provider::open_ai::ChatCompletionMaxTokensParameter::MaxCompletionTokens
+    }
+}
+
+fn supports_none_reasoning_effort(model: &AvailableModel) -> bool {
+    model.reasoning_effort.is_some()
+}
+
+fn chat_completion_reasoning_effort(
+    request: &LanguageModelRequest,
+    model: &AvailableModel,
+) -> Option<open_ai::ReasoningEffort> {
+    if model.reasoning_effort == Some(open_ai::ReasoningEffort::None) {
+        return Some(open_ai::ReasoningEffort::None);
+    }
+
+    if request.thinking_allowed {
+        selected_thinking_reasoning_effort(request)
+            .or_else(|| default_thinking_reasoning_effort(model))
+    } else if supports_none_reasoning_effort(model) {
+        Some(open_ai::ReasoningEffort::None)
+    } else {
+        None
+    }
+}
+
+fn disable_response_thinking_for_none_effort(
+    request: &mut LanguageModelRequest,
+    model: &AvailableModel,
+) {
+    if model.reasoning_effort == Some(open_ai::ReasoningEffort::None) {
+        request.thinking_allowed = false;
+        request.thinking_effort = None;
+    }
+}
+
 impl LanguageModel for OpenAiCompatibleLanguageModel {
     fn id(&self) -> LanguageModelId {
         self.id.clone()
@@ -782,6 +841,14 @@ impl LanguageModel for OpenAiCompatibleLanguageModel {
         true
     }
 
+    fn supports_thinking(&self) -> bool {
+        default_thinking_reasoning_effort(&self.model).is_some()
+    }
+
+    fn supported_effort_levels(&self) -> Vec<LanguageModelEffortLevel> {
+        supported_thinking_effort_levels(&self.model)
+    }
+
     fn supports_split_token_display(&self) -> bool {
         true
     }
@@ -800,7 +867,7 @@ impl LanguageModel for OpenAiCompatibleLanguageModel {
 
     fn stream_completion(
         &self,
-        request: LanguageModelRequest,
+        mut request: LanguageModelRequest,
         cx: &AsyncApp,
     ) -> BoxFuture<
         'static,
@@ -812,16 +879,27 @@ impl LanguageModel for OpenAiCompatibleLanguageModel {
             LanguageModelCompletionError,
         >,
     > {
+        // `speed` can leak in from a parent thread's model; this provider never
+        // supports fast mode, and arbitrary compatible endpoints reject `service_tier`.
+        if !self.supports_fast_mode() {
+            request.speed = None;
+        }
+
         if self.model.capabilities.chat_completions {
-            let request = into_open_ai(
+            let reasoning_effort = chat_completion_reasoning_effort(&request, &self.model);
+            let request = match into_open_ai(
                 request,
                 &self.model.name,
                 self.model.capabilities.parallel_tool_calls,
                 self.model.capabilities.prompt_cache_key,
                 self.max_output_tokens(),
-                self.model.reasoning_effort,
+                chat_completion_max_tokens_parameter(&self.model),
+                reasoning_effort,
                 self.model.capabilities.interleaved_reasoning,
-            );
+            ) {
+                Ok(request) => request,
+                Err(error) => return async move { Err(error.into()) }.boxed(),
+            };
             let completions = self.stream_completion(request, cx);
             async move {
                 let mapper = OpenAiEventMapper::new();
@@ -829,16 +907,15 @@ impl LanguageModel for OpenAiCompatibleLanguageModel {
             }
             .boxed()
         } else {
+            disable_response_thinking_for_none_effort(&mut request, &self.model);
             let request = into_open_ai_response(
                 request,
                 &self.model.name,
                 self.model.capabilities.parallel_tool_calls,
                 self.model.capabilities.prompt_cache_key,
                 self.max_output_tokens(),
-                self.model
-                    .reasoning_effort
-                    .filter(|effort| *effort != open_ai::ReasoningEffort::None),
-                self.model.reasoning_effort == Some(open_ai::ReasoningEffort::None),
+                default_thinking_reasoning_effort(&self.model),
+                supports_none_reasoning_effort(&self.model),
             );
             let completions = self.stream_response(request, cx);
             async move {
@@ -961,27 +1038,9 @@ impl ConfigurationView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let api_key_editor = cx.new(|cx| {
-            InputField::new(
-                window,
-                cx,
-                "000000000000000000000000000000000000000000000000000",
-            )
-        });
-        let api_key_editor_2 = cx.new(|cx| {
-            InputField::new(
-                window,
-                cx,
-                "000000000000000000000000000000000000000000000000000",
-            )
-        });
-        let api_key_editor_3 = cx.new(|cx| {
-            InputField::new(
-                window,
-                cx,
-                "000000000000000000000000000000000000000000000000000",
-            )
-        });
+        let api_key_editor = cx.new(|cx| InputField::new(window, cx, API_KEY_PLACEHOLDER));
+        let api_key_editor_2 = cx.new(|cx| InputField::new(window, cx, API_KEY_PLACEHOLDER));
+        let api_key_editor_3 = cx.new(|cx| InputField::new(window, cx, API_KEY_PLACEHOLDER));
 
         cx.observe(&state, |_, _, cx| {
             cx.notify();
@@ -1093,7 +1152,14 @@ impl ConfigurationView {
         let state = self.state.clone();
         cx.spawn_in(window, async move |_, cx| {
             state
-                .update(cx, |state, cx| state.set_api_key(None, cx))
+                .update(cx, |state, cx| {
+                    // A freshly-cleared slot is unknown and shouldn't inherit
+                    // backoff recorded against whatever key previously occupied
+                    // it; also overwrites the persisted state so a restart
+                    // doesn't resurrect the stale backoff.
+                    state.clear_slot_backoff(KeySlot::Primary, cx);
+                    state.set_api_key(None, cx)
+                })
                 .await
         })
         .detach_and_log_err(cx);
@@ -1106,7 +1172,10 @@ impl ConfigurationView {
         let state = self.state.clone();
         cx.spawn_in(window, async move |_, cx| {
             state
-                .update(cx, |state, cx| state.set_api_key_2(None, cx))
+                .update(cx, |state, cx| {
+                    state.clear_slot_backoff(KeySlot::Secondary, cx);
+                    state.set_api_key_2(None, cx)
+                })
                 .await
         })
         .detach_and_log_err(cx);
@@ -1137,7 +1206,10 @@ impl ConfigurationView {
         let state = self.state.clone();
         cx.spawn_in(window, async move |_, cx| {
             state
-                .update(cx, |state, cx| state.set_api_key_3(None, cx))
+                .update(cx, |state, cx| {
+                    state.clear_slot_backoff(KeySlot::Tertiary, cx);
+                    state.set_api_key_3(None, cx)
+                })
                 .await
         })
         .detach_and_log_err(cx);
@@ -1563,8 +1635,68 @@ impl Render for ConfigurationView {
 mod tests {
     use super::*;
     use health::KeyHealth;
+    use serde_json::json;
     use std::future::Future;
     use std::pin::Pin;
+
+    fn available_model(reasoning_effort: Option<open_ai::ReasoningEffort>) -> AvailableModel {
+        AvailableModel {
+            name: "custom-model".to_string(),
+            display_name: None,
+            max_tokens: 128_000,
+            max_output_tokens: None,
+            max_completion_tokens: None,
+            reasoning_effort,
+            capabilities: ModelCapabilities {
+                chat_completions: false,
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn configured_reasoning_effort_supports_thinking() {
+        assert_eq!(
+            default_thinking_reasoning_effort(&available_model(Some(
+                open_ai::ReasoningEffort::High
+            ))),
+            Some(open_ai::ReasoningEffort::High)
+        );
+    }
+
+    #[test]
+    fn missing_or_none_reasoning_effort_does_not_support_thinking() {
+        assert_eq!(
+            default_thinking_reasoning_effort(&available_model(None)),
+            None
+        );
+        assert_eq!(
+            default_thinking_reasoning_effort(&available_model(Some(
+                open_ai::ReasoningEffort::None
+            ))),
+            None
+        );
+    }
+
+    #[test]
+    fn supported_thinking_effort_levels_use_configured_effort_as_default() {
+        let effort_levels = supported_thinking_effort_levels(&available_model(Some(
+            open_ai::ReasoningEffort::High,
+        )));
+        let values = effort_levels
+            .iter()
+            .map(|level| level.value.as_ref())
+            .collect::<Vec<_>>();
+
+        assert_eq!(values, ["minimal", "low", "medium", "high", "xhigh", "max"]);
+        assert_eq!(
+            effort_levels
+                .iter()
+                .find(|level| level.is_default)
+                .map(|level| level.value.as_ref()),
+            Some("high")
+        );
+    }
 
     /// Minimal `CredentialsProvider` impl for unit tests; not actually read
     /// since these tests construct `State` directly without going through
@@ -1711,65 +1843,13 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // reset_key_health contract
-    //
-    // `reset_key_health` (called from `reset_credentials`) replaces the
-    // tracker with `KeyHealthTracker::default()`. This test verifies that
-    // contract: a tracker poisoned across all slots reads back as all-clear
-    // after the same in-memory reset the method performs. The persist call
-    // inside `reset_key_health` is exercised by the persistence tests in
-    // `health.rs`; the wiring into `reset_credentials` is verified by code
-    // review (calling it requires an `App` context unavailable to these
-    // plain `#[test]`s).
-    // ------------------------------------------------------------------
-
-    #[test]
-    fn reset_key_health_clears_all_slots() {
-        let state = fake_state_with_no_keys();
-        // Poison every slot with distinct failure counts / backoff windows.
-        {
-            let mut tracker = state.key_health.lock();
-            tracker.primary = KeyHealth {
-                consecutive_failures: 3,
-                backoff_until: Some(Instant::now() + Duration::from_secs(300)),
-            };
-            tracker.secondary = KeyHealth {
-                consecutive_failures: 2,
-                backoff_until: Some(Instant::now() + Duration::from_secs(60)),
-            };
-            tracker.tertiary = KeyHealth {
-                consecutive_failures: 5,
-                backoff_until: Some(Instant::now() + Duration::from_secs(3600)),
-            };
-        }
-        // Sanity: all three slots report backed-off before reset.
-        let before = state.slot_health_snapshot();
-        assert!(before[0].is_backed_off && before[1].is_backed_off && before[2].is_backed_off);
-
-        // The exact in-memory operation `reset_key_health` performs.
-        {
-            let mut tracker = state.key_health.lock();
-            *tracker = KeyHealthTracker::default();
-        }
-
-        let after = state.slot_health_snapshot();
-        for (i, status) in after.iter().enumerate() {
-            assert!(!status.is_backed_off, "slot {i} should not be backed off after reset");
-            assert_eq!(status.consecutive_failures, 0, "slot {i} failures should be cleared");
-            assert_eq!(
-                status.backoff_remaining,
-                Duration::ZERO,
-                "slot {i} backoff_remaining should be zero after reset"
-            );
-        }
-    }
-
-    // ------------------------------------------------------------------
     // clear_slot_backoff contract
     //
-    // Like `reset_key_health` but per-slot: only the targeted slot's health is
-    // reset, siblings are untouched. This test verifies the in-memory mutation
-    // the method performs; the persist scheduling is exercised by `health.rs`.
+    // Verifies the in-memory mutation `clear_slot_backoff` performs: only the
+    // targeted slot's health is reset, siblings are untouched. This is also
+    // the method called from `ConfigurationView::reset_api_key*` when the
+    // user clears/resets a slot's key, and from the "Clear" button. The
+    // persist scheduling is exercised by the persistence tests in `health.rs`.
     // ------------------------------------------------------------------
 
     #[test]
@@ -1877,5 +1957,199 @@ mod tests {
             }
             other => panic!("expected Err, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn supported_thinking_effort_levels_hide_missing_or_none_effort() {
+        assert!(supported_thinking_effort_levels(&available_model(None)).is_empty());
+        assert!(
+            supported_thinking_effort_levels(&available_model(Some(
+                open_ai::ReasoningEffort::None
+            )))
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn chat_completion_reasoning_effort_honors_request_and_configured_effort() {
+        let model = available_model(Some(open_ai::ReasoningEffort::Medium));
+        let mut request = LanguageModelRequest {
+            thinking_allowed: true,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            chat_completion_reasoning_effort(&request, &model),
+            Some(open_ai::ReasoningEffort::Medium)
+        );
+
+        request.thinking_effort = Some("high".to_string());
+        assert_eq!(
+            chat_completion_reasoning_effort(&request, &model),
+            Some(open_ai::ReasoningEffort::High)
+        );
+
+        request.thinking_effort = Some("not-supported".to_string());
+        assert_eq!(
+            chat_completion_reasoning_effort(&request, &model),
+            Some(open_ai::ReasoningEffort::Medium)
+        );
+
+        request.thinking_allowed = false;
+        assert_eq!(
+            chat_completion_reasoning_effort(&request, &model),
+            Some(open_ai::ReasoningEffort::None)
+        );
+    }
+
+    #[test]
+    fn chat_completion_reasoning_effort_omits_missing_effort() {
+        let model = available_model(None);
+        let request = LanguageModelRequest {
+            thinking_allowed: false,
+            ..Default::default()
+        };
+
+        assert_eq!(chat_completion_reasoning_effort(&request, &model), None);
+    }
+
+    #[test]
+    fn chat_completion_reasoning_effort_preserves_explicit_none() {
+        let model = available_model(Some(open_ai::ReasoningEffort::None));
+        let request = LanguageModelRequest {
+            thinking_allowed: true,
+            thinking_effort: Some("high".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            chat_completion_reasoning_effort(&request, &model),
+            Some(open_ai::ReasoningEffort::None)
+        );
+    }
+
+    #[test]
+    fn chat_completion_max_tokens_parameter_defaults_to_max_completion_tokens() {
+        let model = available_model(Some(open_ai::ReasoningEffort::Medium));
+
+        assert_eq!(
+            chat_completion_max_tokens_parameter(&model),
+            crate::provider::open_ai::ChatCompletionMaxTokensParameter::MaxCompletionTokens
+        );
+    }
+
+    #[test]
+    fn chat_completion_max_tokens_parameter_uses_max_tokens_when_configured() {
+        let mut model = available_model(Some(open_ai::ReasoningEffort::Medium));
+        model.capabilities.max_tokens_parameter = true;
+
+        assert_eq!(
+            chat_completion_max_tokens_parameter(&model),
+            crate::provider::open_ai::ChatCompletionMaxTokensParameter::MaxTokens
+        );
+    }
+
+    #[test]
+    fn response_request_includes_reasoning_when_effort_is_configured() {
+        let model = available_model(Some(open_ai::ReasoningEffort::High));
+        let request = LanguageModelRequest {
+            thinking_allowed: true,
+            ..Default::default()
+        };
+
+        let request = into_open_ai_response(
+            request,
+            &model.name,
+            model.capabilities.parallel_tool_calls,
+            model.capabilities.prompt_cache_key,
+            model.max_output_tokens,
+            default_thinking_reasoning_effort(&model),
+            supports_none_reasoning_effort(&model),
+        );
+        let serialized = serde_json::to_value(request).unwrap();
+
+        assert_eq!(
+            serialized["reasoning"],
+            json!({ "effort": "high", "summary": "auto" })
+        );
+        assert_eq!(
+            serialized["include"],
+            json!(["reasoning.encrypted_content"])
+        );
+    }
+
+    #[test]
+    fn response_request_omits_reasoning_when_effort_is_missing() {
+        let model = available_model(None);
+        let request = LanguageModelRequest {
+            thinking_allowed: true,
+            ..Default::default()
+        };
+
+        let request = into_open_ai_response(
+            request,
+            &model.name,
+            model.capabilities.parallel_tool_calls,
+            model.capabilities.prompt_cache_key,
+            model.max_output_tokens,
+            default_thinking_reasoning_effort(&model),
+            supports_none_reasoning_effort(&model),
+        );
+        let serialized = serde_json::to_value(request).unwrap();
+
+        assert_eq!(serialized.get("reasoning"), None);
+        assert_eq!(serialized.get("include"), None);
+    }
+
+    #[test]
+    fn chat_completion_request_includes_selected_reasoning_effort() {
+        let mut model = available_model(Some(open_ai::ReasoningEffort::Medium));
+        model.capabilities.chat_completions = true;
+        let request = LanguageModelRequest {
+            thinking_allowed: true,
+            thinking_effort: Some("high".to_string()),
+            ..Default::default()
+        };
+        let reasoning_effort = chat_completion_reasoning_effort(&request, &model);
+
+        let request = into_open_ai(
+            request,
+            &model.name,
+            model.capabilities.parallel_tool_calls,
+            model.capabilities.prompt_cache_key,
+            model.max_output_tokens,
+            chat_completion_max_tokens_parameter(&model),
+            reasoning_effort,
+            model.capabilities.interleaved_reasoning,
+        )
+        .unwrap();
+        let serialized = serde_json::to_value(request).unwrap();
+
+        assert_eq!(serialized["reasoning_effort"], json!("high"));
+    }
+
+    #[test]
+    fn configured_reasoning_effort_supports_none_reasoning_effort() {
+        assert!(supports_none_reasoning_effort(&available_model(Some(
+            open_ai::ReasoningEffort::Medium
+        ))));
+        assert!(supports_none_reasoning_effort(&available_model(Some(
+            open_ai::ReasoningEffort::None
+        ))));
+        assert!(!supports_none_reasoning_effort(&available_model(None)));
+    }
+
+    #[test]
+    fn response_thinking_effort_preserves_explicit_none() {
+        let model = available_model(Some(open_ai::ReasoningEffort::None));
+        let mut request = LanguageModelRequest {
+            thinking_allowed: true,
+            thinking_effort: Some("high".to_string()),
+            ..Default::default()
+        };
+
+        disable_response_thinking_for_none_effort(&mut request, &model);
+        assert!(!request.thinking_allowed);
+        assert_eq!(request.thinking_effort, None);
     }
 }
