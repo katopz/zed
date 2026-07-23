@@ -869,6 +869,8 @@ mod tests {
         // `max_len - 3` would underflow for max_len < 3 without saturating_sub.
         let out = truncate_name("abcdefghij", 2);
         assert!(out.ends_with("..."));
+    }
+
     use std::path::Path;
     use zeta_prompt::{ExcerptRanges, RelatedExcerpt, Zeta2PromptInput};
 

@@ -207,7 +207,7 @@ impl AutoPromptContext {
                 AgentThreadEntry::AssistantMessage(msg) => {
                     for chunk in &msg.chunks {
                         let content = match chunk {
-                            acp_thread::AssistantMessageChunk::Message { block } => {
+                            acp_thread::AssistantMessageChunk::Message { block, .. } => {
                                 strip_code_blocks(block.to_markdown(cx))
                             }
                             acp_thread::AssistantMessageChunk::Thought { .. } => continue,
@@ -256,6 +256,7 @@ impl AutoPromptContext {
                     }
                 }
                 AgentThreadEntry::ContextCompaction(_) => {}
+                AgentThreadEntry::Elicitation(_) => {}
             }
         }
 
@@ -505,15 +506,15 @@ fn collect_plan_entries(thread: &AcpThread, cx: &App) -> Vec<PlanEntryContext> {
         .map(|entry| {
             let content = entry.content.read(cx).source().to_string();
             let status = match entry.status {
-                agent_client_protocol::schema::PlanEntryStatus::Pending => "pending",
-                agent_client_protocol::schema::PlanEntryStatus::InProgress => "in_progress",
-                agent_client_protocol::schema::PlanEntryStatus::Completed => "completed",
+                agent_client_protocol::schema::v1::PlanEntryStatus::Pending => "pending",
+                agent_client_protocol::schema::v1::PlanEntryStatus::InProgress => "in_progress",
+                agent_client_protocol::schema::v1::PlanEntryStatus::Completed => "completed",
                 _ => "unknown",
             };
             let priority = match entry.priority {
-                agent_client_protocol::schema::PlanEntryPriority::High => "high",
-                agent_client_protocol::schema::PlanEntryPriority::Medium => "medium",
-                agent_client_protocol::schema::PlanEntryPriority::Low => "low",
+                agent_client_protocol::schema::v1::PlanEntryPriority::High => "high",
+                agent_client_protocol::schema::v1::PlanEntryPriority::Medium => "medium",
+                agent_client_protocol::schema::v1::PlanEntryPriority::Low => "low",
                 _ => "unknown",
             };
             PlanEntryContext {
@@ -546,7 +547,7 @@ fn strip_code_blocks(content: &str) -> String {
 
 /// Extract file path from an Edit/Write tool call label and add to the list.
 fn collect_modified_file(tool: &ToolCall, cx: &App, modified_files: &mut Vec<String>) {
-    if !matches!(tool.kind, agent_client_protocol::schema::ToolKind::Edit) {
+    if !matches!(tool.kind, agent_client_protocol::schema::v1::ToolKind::Edit) {
         return;
     }
     let label = tool.label.read(cx).source().to_string();

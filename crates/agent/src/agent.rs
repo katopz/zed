@@ -2183,7 +2183,7 @@ impl NativeAgentConnection {
             thread.set_messages(messages, cx);
             thread.replay(cx)
         });
-        Self::handle_thread_events(events, acp_thread.downgrade(), cx)
+        Self::handle_thread_events(events, acp_thread.downgrade(), None, cx)
     }
 
     fn run_turn(

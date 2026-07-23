@@ -50,7 +50,7 @@ pub type State = ApiCompatibleProviderState<AnthropicCompatibleSettings>;
 
 fn available_model_to_anthropic_model(available: &AvailableModel) -> anthropic::Model {
     let mode = match available.mode.unwrap_or_default() {
-        settings::ModelMode::Default => AnthropicModelMode::Default,
+        settings::ModelMode::Auto => AnthropicModelMode::Auto,
         settings::ModelMode::Thinking { budget_tokens } => {
             AnthropicModelMode::Thinking { budget_tokens }
         }

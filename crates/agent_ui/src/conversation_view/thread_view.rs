@@ -7551,7 +7551,7 @@ impl ThreadView {
     /// unit-tested without rendering a view.
     fn branch_to_new_thread(
         &mut self,
-        up_to_user_message: Option<UserMessageId>,
+        up_to_user_message: Option<ClientUserMessageId>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -8224,8 +8224,8 @@ impl ThreadView {
                     .iter()
                     .filter_map(|chunk| {
                         let block = match chunk {
-                            acp_thread::AssistantMessageChunk::Message { block } => block,
-                            acp_thread::AssistantMessageChunk::Thought { block } => block,
+                            acp_thread::AssistantMessageChunk::Message { block, .. } => block,
+                            acp_thread::AssistantMessageChunk::Thought { block, .. } => block,
                         };
                         let text = block.to_markdown(cx).to_string();
                         if text.is_empty() { None } else { Some(text) }
@@ -12966,8 +12966,8 @@ impl ThreadView {
                                 format!("Switch to {}", fallback.name().0),
                             )
                             .label_size(LabelSize::Small)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.switch_to_data_retention_fallback_and_resend(cx);
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.switch_to_data_retention_fallback_and_resend(window, cx);
                             })),
                         )
                     })
@@ -12975,15 +12975,15 @@ impl ThreadView {
                         Button::new("accept-data-retention", "Accept")
                             .label_size(LabelSize::Small)
                             .style(ButtonStyle::Tinted(TintColor::Warning))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.accept_data_retention_and_resend(cx);
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.accept_data_retention_and_resend(window, cx);
                             })),
                     ),
             )
             .dismiss_action(self.dismiss_error_button(cx))
     }
 
-    fn accept_data_retention_and_resend(&mut self, cx: &mut Context<Self>) {
+    fn accept_data_retention_and_resend(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let fs = self.thread.read(cx).project().read(cx).fs().clone();
         // Resume the failed turn only once the in-memory settings reflect
         // consent, otherwise the resent request would be rejected again.
@@ -12993,15 +12993,19 @@ impl ThreadView {
                 .get_or_insert_default()
                 .anthropic_retention = Some(true);
         });
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             completion.await??;
-            this.update(cx, |this, cx| this.retry_generation(cx))?;
+            this.update_in(cx, |this, window, cx| this.retry_generation(window, cx))?;
             anyhow::Ok(())
         })
         .detach_and_log_err(cx);
     }
 
-    fn switch_to_data_retention_fallback_and_resend(&mut self, cx: &mut Context<Self>) {
+    fn switch_to_data_retention_fallback_and_resend(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(fallback) = self.data_retention_fallback_model(cx) else {
             return;
         };
@@ -13020,9 +13024,9 @@ impl ThreadView {
             return;
         };
         let select = selector.select_model(model_id, cx);
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             select.await?;
-            this.update(cx, |this, cx| this.retry_generation(cx))?;
+            this.update_in(cx, |this, window, cx| this.retry_generation(window, cx))?;
             anyhow::Ok(())
         })
         .detach_and_log_err(cx);
@@ -14065,7 +14069,7 @@ fn format_retries_elapsed(elapsed: Duration) -> String {
 /// be unit-tested without rendering a view.
 fn slice_messages_for_branch(
     messages: &[Arc<agent::Message>],
-    up_to: Option<&UserMessageId>,
+    up_to: Option<&ClientUserMessageId>,
 ) -> Option<Vec<Arc<agent::Message>>> {
     let Some(target_id) = up_to else {
         return Some(messages.to_vec());
@@ -14089,12 +14093,12 @@ fn slice_messages_for_branch(
 ///
 /// Extracted from `branch_to_new_thread` so the boundary logic can be
 /// unit-tested without rendering a view.
-fn transcript_entry_count(entries: &[AgentThreadEntry], up_to: Option<&UserMessageId>) -> usize {
+fn transcript_entry_count(entries: &[AgentThreadEntry], up_to: Option<&ClientUserMessageId>) -> usize {
     match up_to {
         Some(id) => entries
             .iter()
             .position(|entry| {
-                matches!(entry, AgentThreadEntry::UserMessage(m) if m.id.as_ref() == Some(id))
+                matches!(entry, AgentThreadEntry::UserMessage(m) if m.client_id.as_ref() == Some(id))
             })
             .map(|ix| ix + 1)
             .unwrap_or_else(|| entries.len()),
@@ -14135,7 +14139,7 @@ fn assistant_message_closes_turn(
 #[cfg(test)]
 mod branch_boundary_tests {
     use super::*;
-    use acp_thread::UserMessageId;
+    use acp_thread::ClientUserMessageId;
     use agent::{
         AgentMessage, Message as AgentMessageKind, UserMessage as NativeUserMessage,
         UserMessageContent,
@@ -14143,7 +14147,7 @@ mod branch_boundary_tests {
 
     // --- slice_messages_for_branch (native message slice) ---
 
-    fn native_user(id: &UserMessageId, text: &str) -> Arc<AgentMessageKind> {
+    fn native_user(id: &ClientUserMessageId, text: &str) -> Arc<AgentMessageKind> {
         Arc::new(AgentMessageKind::User(NativeUserMessage {
             id: id.clone(),
             content: vec![UserMessageContent::Text(text.to_string())].into(),
@@ -14161,7 +14165,7 @@ mod branch_boundary_tests {
 
     #[test]
     fn slice_none_up_to_forks_whole_conversation() {
-        let id_a = UserMessageId::new();
+        let id_a = ClientUserMessageId::new();
         let messages = vec![native_user(&id_a, "u1"), native_agent("a1")];
         let sliced =
             slice_messages_for_branch(&messages, None).expect("None up_to forks everything");
@@ -14172,8 +14176,8 @@ mod branch_boundary_tests {
 
     #[test]
     fn slice_some_up_to_is_inclusive_of_matching_user_message() {
-        let id_a = UserMessageId::new();
-        let id_b = UserMessageId::new();
+        let id_a = ClientUserMessageId::new();
+        let id_b = ClientUserMessageId::new();
         let messages = vec![
             native_user(&id_a, "u1"),
             native_agent("a1"),
@@ -14190,8 +14194,8 @@ mod branch_boundary_tests {
 
     #[test]
     fn slice_some_up_to_first_message_keeps_only_first() {
-        let id_a = UserMessageId::new();
-        let id_b = UserMessageId::new();
+        let id_a = ClientUserMessageId::new();
+        let id_b = ClientUserMessageId::new();
         let messages = vec![
             native_user(&id_a, "u1"),
             native_agent("a1"),
@@ -14205,8 +14209,8 @@ mod branch_boundary_tests {
 
     #[test]
     fn slice_unknown_up_to_returns_none_so_transcript_path_is_used() {
-        let id_a = UserMessageId::new();
-        let missing = UserMessageId::new();
+        let id_a = ClientUserMessageId::new();
+        let missing = ClientUserMessageId::new();
         let messages = vec![native_user(&id_a, "u1"), native_agent("a1")];
         assert!(
             slice_messages_for_branch(&messages, Some(&missing)).is_none(),
@@ -14218,15 +14222,15 @@ mod branch_boundary_tests {
     fn slice_up_to_pointing_at_an_assistant_message_is_not_a_match() {
         // Branch ids are user-message ids; an assistant message never matches,
         // so pointing `up_to` at an id that isn't any user message returns None.
-        let id_a = UserMessageId::new();
+        let id_a = ClientUserMessageId::new();
         let messages = vec![native_user(&id_a, "u1"), native_agent("a1")];
-        let not_in_thread = UserMessageId::new();
+        let not_in_thread = ClientUserMessageId::new();
         assert!(slice_messages_for_branch(&messages, Some(&not_in_thread)).is_none());
     }
 
     // --- transcript_entry_count (external ACP transcript fallback) ---
 
-    fn entry_user(id: Option<UserMessageId>, _text: &str) -> AgentThreadEntry {
+    fn entry_user(id: Option<ClientUserMessageId>, _text: &str) -> AgentThreadEntry {
         AgentThreadEntry::UserMessage(acp_thread::UserMessage {
             id,
             // `content`/`chunks` are irrelevant to the count logic under test;
@@ -14258,7 +14262,7 @@ mod branch_boundary_tests {
 
     #[test]
     fn transcript_some_up_to_is_inclusive_of_matching_entry() {
-        let id_b = UserMessageId::new();
+        let id_b = ClientUserMessageId::new();
         let entries = vec![
             entry_user(None, "u1"),
             entry_assistant(),
@@ -14274,7 +14278,7 @@ mod branch_boundary_tests {
         // The external path has no native history to fall back to, so an
         // unmatched branch id copies the entire thread rather than nothing.
         let entries = vec![entry_user(None, "u1"), entry_assistant()];
-        let missing = UserMessageId::new();
+        let missing = ClientUserMessageId::new();
         assert_eq!(transcript_entry_count(&entries, Some(&missing)), 2);
     }
 
@@ -14282,7 +14286,7 @@ mod branch_boundary_tests {
     fn transcript_first_matching_user_entry_when_ids_repeat_takes_first() {
         // `position` returns the first match. This documents the (reasonable)
         // behavior: branch-at-id forks up to the first occurrence of that id.
-        let id = UserMessageId::new();
+        let id = ClientUserMessageId::new();
         let entries = vec![
             entry_user(Some(id.clone()), "u1"),
             entry_assistant(),

@@ -1,6 +1,6 @@
 use acp_thread::{AgentThreadEntry, MentionUri, ThreadStatus, ToolCallStatus};
 use agent::ZED_AGENT_ID;
-use agent_client_protocol::schema as acp;
+use agent_client_protocol::schema::v1 as acp;
 use agent_servers::CLAUDE_AGENT_ID;
 use gpui::Window;
 use language_model::LanguageModelRegistry;
@@ -1064,7 +1064,8 @@ fn gather_watchdog_context(
             AgentThreadEntry::ToolCall(_)
             | AgentThreadEntry::AssistantMessage(_)
             | AgentThreadEntry::CompletedPlan(_)
-            | AgentThreadEntry::ContextCompaction(_) => {}
+            | AgentThreadEntry::ContextCompaction(_)
+            | AgentThreadEntry::Elicitation(_) => {}
         }
     }
 

@@ -423,6 +423,7 @@ pub fn is_backoff_worthy(err: &LanguageModelCompletionError) -> bool {
         | LanguageModelCompletionError::HttpSend { .. }
         | LanguageModelCompletionError::AuthenticationError { .. }
         | LanguageModelCompletionError::PermissionError { .. }
+        | LanguageModelCompletionError::PaymentRequired
         | LanguageModelCompletionError::Other(_) => true,
         LanguageModelCompletionError::PromptTooLarge { .. }
         | LanguageModelCompletionError::NoApiKey { .. }
@@ -431,7 +432,8 @@ pub fn is_backoff_worthy(err: &LanguageModelCompletionError) -> bool {
         | LanguageModelCompletionError::HttpResponseError { .. }
         | LanguageModelCompletionError::SerializeRequest { .. }
         | LanguageModelCompletionError::BuildRequestBody { .. }
-        | LanguageModelCompletionError::DeserializeResponse { .. } => false,
+        | LanguageModelCompletionError::DeserializeResponse { .. }
+        | LanguageModelCompletionError::DataRetentionConsentRequired { .. } => false,
     }
 }
 

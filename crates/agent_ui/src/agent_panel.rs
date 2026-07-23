@@ -30,9 +30,8 @@ use zed_actions::{
         ResolveConflictsWithAgent, ReviewBranchDiff, SelectAgent,
     },
     assistant::{
-        CreateSkillFromUrl, FocusAgent, ManageSkills, OpenGlobalAgentsMdRules,
-        OpenGlobalAutoPromptMd, OpenProjectAgentsMdRules, OpenProjectAutoPromptMd,
-        OpenSkillCreator, Toggle, ToggleFocus,
+        FocusAgent, ManageSkills, OpenGlobalAgentsMdRules, OpenGlobalAutoPromptMd,
+        OpenProjectAgentsMdRules, OpenProjectAutoPromptMd, Toggle, ToggleFocus,
     },
 };
 
@@ -265,7 +264,7 @@ fn project_auto_prompt_md_path(
     require_existing_file: bool,
     cx: &App,
 ) -> Option<PathBuf> {
-    let rel_path = util::rel_path::RelPath::unix("AUTO_PROMPT.md").ok()?;
+    let rel_path = util::rel_path::RelPath::from_unix_str("AUTO_PROMPT.md").ok()?;
     project
         .read(cx)
         .visible_worktrees(cx)
@@ -659,22 +658,6 @@ pub fn init(cx: &mut App) {
                 })
                 .register_action(|workspace, _: &OpenProjectAutoPromptMd, window, cx| {
                     open_project_auto_prompt(workspace, window, cx);
-                })
-                .register_action(|workspace, action: &OpenSkillCreator, window, cx| {
-                    if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
-                        workspace.focus_panel::<AgentPanel>(window, cx);
-                        panel.update(cx, |panel, cx| {
-                            panel.deploy_skill_creator(action, window, cx)
-                        });
-                    }
-                })
-                .register_action(|workspace, action: &CreateSkillFromUrl, window, cx| {
-                    if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
-                        workspace.focus_panel::<AgentPanel>(window, cx);
-                        panel.update(cx, |panel, cx| {
-                            panel.deploy_skill_creator_from_url(action, window, cx)
-                        });
-                    }
                 })
                 .register_action(|workspace, _: &Follow, window, cx| {
                     workspace.follow(CollaboratorId::Agent, window, cx);
@@ -4600,12 +4583,12 @@ impl AgentPanel {
                 }
                 if let Some(native_thread) = thread_view.as_native_thread(cx) {
                     let native = native_thread.read(cx);
-                    if native.is_generating_title()
-                        || native.is_generating_summary()
-                        || native.has_queued_message()
-                    {
+                    if native.is_generating_title() || native.is_generating_summary() {
                         return false;
                     }
+                }
+                if thread_view.has_queued_messages() {
+                    return false;
                 }
                 true
             })

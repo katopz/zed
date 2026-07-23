@@ -20,7 +20,7 @@ pub use context::{
 };
 pub use plan_registry::ActivePlanClaim;
 
-use agent_client_protocol::schema as acp;
+use agent_client_protocol::schema::v1 as acp;
 use anyhow::Context as _;
 use futures::{StreamExt, future, pin_mut};
 use gpui::App;

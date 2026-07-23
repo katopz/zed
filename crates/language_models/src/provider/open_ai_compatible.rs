@@ -947,6 +947,7 @@ async fn run_key_probe(http_client: Arc<dyn HttpClient>, inputs: KeyProbeInputs)
         stream: false,
         stream_options: None,
         max_completion_tokens: Some(1),
+        max_tokens: None,
         stop: Vec::new(),
         temperature: None,
         tool_choice: None,

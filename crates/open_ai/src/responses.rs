@@ -100,7 +100,7 @@ pub struct ResponseFunctionCallOutputItem {
     pub output: ResponseFunctionCallOutputContent,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponseCustomToolCallItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
@@ -109,7 +109,7 @@ pub struct ResponseCustomToolCallItem {
     pub input: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponseCustomToolCallOutputItem {
     pub call_id: String,
     pub output: ResponseFunctionCallOutputContent,

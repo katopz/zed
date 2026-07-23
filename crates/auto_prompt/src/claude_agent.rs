@@ -14,7 +14,7 @@
 //!      The orchestration LLM is the sole decider.
 //!   4. The only hard stops are: user cancel, or no model configured.
 
-use agent_client_protocol::schema as acp;
+use agent_client_protocol::schema::v1 as acp;
 use anyhow::Context as _;
 use futures::{StreamExt, pin_mut};
 use gpui::App;
