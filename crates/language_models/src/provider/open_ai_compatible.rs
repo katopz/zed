@@ -361,6 +361,29 @@ impl State {
             consecutive_failures: health.consecutive_failures,
         }
     }
+
+    /// Short label for the key most recently selected by `retry_stream`, for
+    /// display on the retry button so the user can see which of the configured
+    /// keys the in-flight turn picked. Returns `None` when no key has been used
+    /// yet (fresh process, no OpenAI-compatible multi-key provider) or when the
+    /// recorded slot has no key configured (e.g. it was removed mid-turn).
+    ///
+    /// Format: `K<index>` (1-indexed: K1=Primary, K2=Secondary, K3=Tertiary).
+    /// Index is preferred over a key preview here because the retry button is
+    /// always-visible chrome, whereas `truncate_key_preview` is only shown in
+    /// the settings page behind an explicit reveal.
+    fn last_used_key_label(&self) -> Option<String> {
+        let slot = self.key_health.lock().last_used_slot?;
+        let has_key = match slot {
+            KeySlot::Primary => self.api_key_state.has_key(),
+            KeySlot::Secondary => self.api_key_state_2.has_key(),
+            KeySlot::Tertiary => self.api_key_state_3.has_key(),
+        };
+        if !has_key {
+            return None;
+        }
+        Some(format!("K{}", slot_index(slot) + 1))
+    }
 }
 
 impl OpenAiCompatibleLanguageModelProvider {
@@ -855,6 +878,10 @@ impl LanguageModel for OpenAiCompatibleLanguageModel {
 
     fn telemetry_id(&self) -> String {
         format!("openai/{}", self.model.name)
+    }
+
+    fn last_used_key_label(&self, cx: &App) -> Option<String> {
+        self.state.read_with(cx, |state, _| state.last_used_key_label())
     }
 
     fn max_token_count(&self) -> u64 {

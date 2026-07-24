@@ -64,6 +64,11 @@ pub struct KeyHealthTracker {
     pub primary: KeyHealth,
     pub secondary: KeyHealth,
     pub tertiary: KeyHealth,
+    /// Ephemeral (never persisted): the slot most recently selected by
+    /// `select_from_candidates` inside `retry_stream`. Surfaced to the UI so the
+    /// retry button can show which key the in-flight turn is actually using.
+    /// Reset to `None` on load since a stale value across restarts is meaningless.
+    pub last_used_slot: Option<KeySlot>,
 }
 
 impl KeyHealthTracker {
@@ -101,6 +106,13 @@ impl KeyHealthTracker {
         health.consecutive_failures = health.consecutive_failures.saturating_add(1);
         let backoff = compute_backoff(health.consecutive_failures);
         health.backoff_until = Some(now + backoff);
+    }
+
+    /// Marks `slot` as the one currently being attempted, so the UI can show
+    /// which key an in-flight turn is using. Called from `retry_stream` right
+    /// after `select_from_candidates` picks a key — before the attempt resolves.
+    pub fn record_attempt(&mut self, slot: KeySlot) {
+        self.last_used_slot = Some(slot);
     }
 }
 
@@ -212,6 +224,10 @@ impl PersistedKeyHealthFile {
             primary: self.primary.to_health(now, elapsed_secs),
             secondary: self.secondary.to_health(now, elapsed_secs),
             tertiary: self.tertiary.to_health(now, elapsed_secs),
+            // `last_used_slot` is ephemeral runtime state — never restored
+            // from disk. A stale slot from a previous process would mislead
+            // the retry button label on the very first turn after launch.
+            last_used_slot: None,
         }
     }
 }
@@ -513,6 +529,14 @@ pub fn record_key_success(key_health: &Arc<ParkingMutex<KeyHealthTracker>>, slot
     health.record_success(slot);
 }
 
+/// Marks `slot` as the one being attempted right now, so the UI can surface
+/// which key the in-flight turn picked. Called from `retry_stream` immediately
+/// after `select_from_candidates` resolves, before `do_attempt` is awaited.
+pub fn record_key_attempt(key_health: &Arc<ParkingMutex<KeyHealthTracker>>, slot: KeySlot) {
+    let mut health = key_health.lock();
+    health.record_attempt(slot);
+}
+
 /// Updates per-key health after a failed request. Only backoff-worthy errors
 /// (see `is_backoff_worthy`) bump the failure counter and reschedule backoff;
 /// other errors are no-ops because they would recur on every key.
@@ -576,6 +600,9 @@ pub async fn retry_stream<S>(
         else {
             break;
         };
+        // Record which key this attempt is using before it resolves, so the UI
+        // can show which key the in-flight turn picked (retry button label).
+        record_key_attempt(key_health, slot);
 
         match do_attempt(api_key).await {
             Ok(stream) => {

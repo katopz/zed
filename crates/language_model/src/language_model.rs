@@ -92,6 +92,16 @@ pub trait LanguageModel: Send + Sync {
         None
     }
 
+    /// Short label identifying which key the most recent (or in-flight) request
+    /// used, for providers that rotate across multiple keys (e.g. OpenAI-
+    /// compatible with primary/secondary/tertiary slots). Returns `None` for
+    /// single-key providers (the default) — there's nothing to disambiguate.
+    /// Surfaced on the retry button so the user can see which key the stuck
+    /// turn picked (e.g. "K2" for the secondary slot).
+    fn last_used_key_label(&self, _cx: &App) -> Option<String> {
+        None
+    }
+
     /// Information about the cost of using this model, if available.
     fn model_cost_info(&self) -> Option<LanguageModelCostInfo> {
         None

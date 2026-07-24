@@ -8395,6 +8395,13 @@ impl ThreadView {
             .turn_fields
             .turn_started_at
             .map(|started_at| started_at.elapsed());
+        // Which key the in-flight turn picked, for multi-key providers (e.g.
+        // GLM with primary/secondary/tertiary slots). `None` for single-key
+        // providers, so nothing is appended to the retry label in that case.
+        let retry_key_label = self
+            .as_native_thread(cx)
+            .and_then(|thread| thread.read(cx).model())
+            .and_then(|model| model.last_used_key_label(cx));
 
         h_flex()
             .id("generating-spinner")
@@ -8459,7 +8466,14 @@ impl ThreadView {
                     ButtonLike::new("generating-retry")
                         .style(ButtonStyle::Tinted(TintColor::Warning))
                         .children(retry_elapsed.map(|elapsed| {
-                            Label::new(format_retries_elapsed(elapsed))
+                            let mut text = format_retries_elapsed(elapsed);
+                            if let Some(ref key) = retry_key_label {
+                                // e.g. "12s · K2" — the separator mirrors the
+                                // existing muted meta-label style.
+                                text.push_str(" \u{00b7} ");
+                                text.push_str(key);
+                            }
+                            Label::new(text)
                                 .size(LabelSize::XSmall)
                                 .color(Color::Muted)
                         }))
