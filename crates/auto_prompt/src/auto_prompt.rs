@@ -1165,11 +1165,35 @@ pub async fn decide_with_llm(
 
     let result = if data.context_exceeds_limit {
         let summary_state = summary_state_for(&session_id_str);
+
+        // If the last assistant message is already a voluntary summary (e.g. the
+        // agent followed an "Always end with TL;DR" instruction and self-summarized
+        // before context overflowed), skip Phase 1's redundant "Stop and summarize"
+        // request and go straight to Phase 2 — reuse the existing summary as the
+        // thread handoff. Saves a full assistant response of tokens.
+        //
+        // Only applies at summary_state==0 (Phase 1 has not fired yet). Once
+        // Phase 1 has fired (state==1) the response is already a Phase 1 summary
+        // and the normal Phase 2 path handles it.
+        let skip_phase_1 = summary_state == 0
+            && data
+                .last_assistant_message
+                .as_deref()
+                .map_or(false, looks_like_voluntary_summary);
+        if skip_phase_1 {
+            log::warn!(
+                "[auto_prompt::decide_with_llm] Last message is already a voluntary summary — skipping Phase 1, going straight to Phase 2 (session={session_id_str})"
+            );
+            // Keep summary_state==0 in the registry: we never asked for a summary,
+            // so there's nothing to clear. The Phase 2 branch below handles the
+            // handoff directly when `skip_phase_1` is set.
+        }
+
         log::info!(
-            "[auto_prompt::decide_with_llm] Context exceeds token limit — session={session_id_str} summary_state={summary_state}"
+            "[auto_prompt::decide_with_llm] Context exceeds token limit — session={session_id_str} summary_state={summary_state} skip_phase_1={skip_phase_1}"
         );
 
-        if summary_state == 0 {
+        if summary_state == 0 && !skip_phase_1 {
             // Phase 1: Request summarization. Return ContextOverflow so the
             // UI sends a "summarize" message to the current thread.
             //
@@ -1193,9 +1217,10 @@ pub async fn decide_with_llm(
                 force_new_thread: false,
                 focus_new_thread: false,
             }));
-        } else if summary_state == 1 {
-            // Phase 2: AI has responded with summary. The last_assistant_message
-            // IS the summary. Create a new thread with ThreadSummary flow.
+        } else if summary_state == 1 || skip_phase_1 {
+            // Phase 2: AI has responded with summary (or already had a voluntary
+            // summary, via `skip_phase_1`). The last_assistant_message IS the
+            // summary. Create a new thread with ThreadSummary flow.
             clear_summary_for_session(&session_id_str);
             log::info!(
                 "[auto_prompt::decide_with_llm] Summary received — creating new thread with ThreadSummary flow (session={session_id_str})"
@@ -3242,6 +3267,54 @@ fn is_list_or_heading_line(trimmed: &str) -> bool {
         let next = bytes[idx + 1];
         return (sep == b'.' || sep == b')') && (next == b' ' || next == b'\t');
     }
+    false
+}
+
+/// Detect whether an assistant message is ALREADY a summary suitable for a
+/// context-overflow thread handoff, so Phase 1's "Stop and summarize" request
+/// can be skipped.
+///
+/// Broader than `is_auto_prompt_summary_response` (which only matches responses
+/// to Phase 1's own prompt wording). This also catches VOLUNTARY summaries that
+/// agents produce following instructions like "Always end with TL;DR" — the
+/// common case when context overflows on an agent that already self-summarized.
+///
+/// A markdown heading (levels 1-3) containing "summary" or "tl;dr" is treated
+/// as a deliberate handoff signal. The Phase 1 response pattern (≥3 of 4
+/// markers: original task / accomplished / what remains / active plan) is also
+/// accepted via `is_auto_prompt_summary_response`.
+fn looks_like_voluntary_summary(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    // Phase 1 response pattern — catch auto_prompt's own echo.
+    if is_auto_prompt_summary_response(trimmed) {
+        return true;
+    }
+
+    // A markdown heading at level 1-3 containing "summary" / "tl;dr" / "tldr"
+    // is a deliberate handoff marker from the agent. Line-anchored and requires
+    // a space after the `#` run (strict ATX heading) so prose mentions like
+    // "see the Summary section" don't match.
+    for raw_line in trimmed.lines() {
+        let line = raw_line.trim_start();
+        let bytes = line.as_bytes();
+        let hash_count = line.chars().take_while(|c| *c == '#').count();
+        if !(1..=3).contains(&hash_count) {
+            continue;
+        }
+        // Require a space after the '#' run (e.g. "## Summary").
+        if bytes.len() <= hash_count || bytes[hash_count] != b' ' {
+            continue;
+        }
+        let lower = line.to_lowercase();
+        if lower.contains("summary") || lower.contains("tl;dr") || lower.contains("tldr") {
+            return true;
+        }
+    }
+
     false
 }
 
@@ -5534,6 +5607,115 @@ mod tests {
             )),
             "nothing left to do should suppress fallback"
         );
+    }
+
+    // ── looks_like_voluntary_summary ─────────────────────────────────────
+
+    #[test]
+    fn looks_like_voluntary_summary_user_real_world_transcript() {
+        // The exact message from the user's reported bug: an agent following
+        // an "Always end with TL;DR" instruction self-summarized with a
+        // `## Summary` heading. auto_prompt's Phase 1 then asked for ANOTHER
+        // summary, wasting a full response. This message MUST match so Phase 1
+        // is skipped and Phase 2 reuses it directly.
+        let msg = "Both commits are clean. The remaining uncommitted files \
+                   in riir-game-sdk (.docs/, Cargo.lock, README.md) and \
+                   poc-maxman (.docs/, Cargo.toml, Cargo.lock, README.md) are \
+                   from another agent's WIP — I left them untouched per the rule.
+
+## Summary
+
+Three commits landed across two repos:
+
+| Repo | Commit | What |
+|---|---|---|
+| `riir-game-sdk` | `8bad2ea` | `riir-games-cluster` crate skeleton |
+| `poc-maxman` | `31adb56` | AGENTS.md references to Issue 025 |
+
+### What was created
+
+**`riir-game-sdk/crates/riir-games-cluster/`** — skeleton crate, compiles clean.
+
+### What's NOT done (intentionally)
+
+- T2–T5 — actual code extraction, needs a plan.
+
+### Next step
+
+Ready to execute Issue 024 (Hero → Avatar rename)?";
+        assert!(
+            looks_like_voluntary_summary(msg),
+            "voluntary `## Summary` heading must trigger skip-Phase-1"
+        );
+    }
+
+    #[test]
+    fn looks_like_voluntary_summary_tldr_heading() {
+        assert!(looks_like_voluntary_summary("## TL;DR\n\nDid X, Y, Z. Next: do W."));
+        assert!(looks_like_voluntary_summary("### TL;DR\n\nDid the thing."));
+    }
+
+    #[test]
+    fn looks_like_voluntary_summary_summary_at_h1_h2_h3() {
+        assert!(looks_like_voluntary_summary("# Summary\n\nDone."));
+        assert!(looks_like_voluntary_summary("## Summary\n\nDone."));
+        assert!(looks_like_voluntary_summary("### Summary\n\nDone."));
+    }
+
+    #[test]
+    fn looks_like_voluntary_summary_phase1_response_still_matches() {
+        // The existing is_auto_prompt_summary_response pattern must still be
+        // accepted (≥3 of 4 markers) so Phase 2 handles it after Phase 1 fires.
+        let phase1_response = "## Original Task\n\nRefactor.\n\n## What Was \
+            Accomplished\n\nSplit done.\n\n## What Remains\n\nSome left.\n\n
+            ## Active Plan State\n\n- .plans/302 complete";
+        assert!(looks_like_voluntary_summary(phase1_response));
+    }
+
+    #[test]
+    fn looks_like_voluntary_summary_no_heading_no_match() {
+        // A normal working message with no summary heading must NOT match —
+        // otherwise Phase 1 would never fire and context would overflow with
+        // no handoff summary.
+        assert!(!looks_like_voluntary_summary(
+            "I committed the fix on develop. All tests pass."
+        ));
+        assert!(!looks_like_voluntary_summary(
+            "Working on the refactor now, 3 files done, 2 to go."
+        ));
+    }
+
+    #[test]
+    fn looks_like_voluntary_summary_prose_mention_no_match() {
+        // Prose that mentions the word "summary" but isn't a heading must NOT
+        // match — avoids false positives when the agent references a summary
+        // elsewhere (e.g. the agent ui's own summary, or a prior thread).
+        assert!(!looks_like_voluntary_summary(
+            "I added a summary field to the struct. Next I'll wire up the UI."
+        ));
+        assert!(!looks_like_voluntary_summary(
+            "See the summary section of the PR description for details."
+        ));
+    }
+
+    #[test]
+    fn looks_like_voluntary_summary_heading_no_space_no_match() {
+        // `#Summary` (no space) is not a valid ATX heading — reject it to keep
+        // the detector strict and avoid matching version strings like `#Summary`.
+        assert!(!looks_like_voluntary_summary("#Summary of changes"));
+    }
+
+    #[test]
+    fn looks_like_voluntary_summary_heading_too_deep_no_match() {
+        // `#### Summary` (level 4+) is too deep to be a deliberate handoff
+        // marker — reject to reduce false positives.
+        assert!(!looks_like_voluntary_summary("#### Summary\n\nnested note"));
+    }
+
+    #[test]
+    fn looks_like_voluntary_summary_empty_no_match() {
+        assert!(!looks_like_voluntary_summary(""));
+        assert!(!looks_like_voluntary_summary("   \n\n  "));
     }
 
     #[test]
