@@ -800,34 +800,72 @@ pub fn on_thread_stopped(
                     auto_prompt::decide_with_llm(data.clone(), cx).await
                 };
 
-                // Retry loop with exponential backoff
-                while let Err(ref err) = result {
-                    let failure_count = auto_prompt::increment_llm_failure_count();
-
-                    if failure_count > config.max_llm_retries {
-                        break; // Max retries exhausted
-                    }
-
-                    let delay = config.backoff_delay_ms(failure_count);
-                    log::warn!(
-                        "[auto_prompt] LLM call failed (attempt {}/{}): {err}, retrying in {}ms",
-                        failure_count,
-                        config.max_llm_retries,
-                        delay
-                    );
+                // Unified retry loop with exponential backoff. Handles two retry triggers:
+                //   1. `Err(err)` — orchestration LLM call itself failed (network/parse/timeout).
+                //   2. `Ok(RetryAfterBackoff { delay_ms, reason })` — call succeeded but the
+                //      decision was "defer" (issue 007: context overflow + had_error means
+                //      Phase 2 would create a doomed thread; wait for the rate limit to clear
+                //      and re-run the decision).
+                // Both paths share the same `llm_failure_count` budget and `max_llm_retries`
+                // cap; when exhausted, the loop exits and the terminal outcome (Stopped for
+                // RetryAfterBackoff, or the original Err) falls through to the match below.
+                loop {
+                    let (delay_ms, retry_label) = match &result {
+                        Err(err) => {
+                            let failure_count = auto_prompt::increment_llm_failure_count();
+                            if failure_count > config.max_llm_retries {
+                                break; // Max retries exhausted — fall through to error handler.
+                            }
+                            let delay = config.backoff_delay_ms(failure_count);
+                            log::warn!(
+                                "[auto_prompt] LLM call failed (attempt {}/{}): {err}, retrying in {}ms",
+                                failure_count,
+                                config.max_llm_retries,
+                                delay
+                            );
+                            (delay, format!("LLM call failure #{failure_count}"))
+                        }
+                        Ok(auto_prompt::AutoPromptOutcome::RetryAfterBackoff { delay_ms, reason }) => {
+                            // Issue 007 deferred decision. Counted against the same retry budget
+                            // as orchestration-call failures so a permanently-exhausted API
+                            // eventually surfaces a Stopped to the user instead of looping.
+                            let failure_count = auto_prompt::increment_llm_failure_count();
+                            if failure_count > config.max_llm_retries {
+                                log::warn!(
+                                    "[auto_prompt] RetryAfterBackoff exhausted {} retries — converting to Stopped ({reason})",
+                                    config.max_llm_retries
+                                );
+                                // Replace result with a terminal Stopped carrying the reason.
+                                result = Ok(auto_prompt::AutoPromptOutcome::Stopped {
+                                    reason: reason.clone(),
+                                });
+                                break;
+                            }
+                            log::warn!(
+                                "[auto_prompt] RetryAfterBackoff (attempt {}/{}) — deferring decision: {reason}, waiting {}ms",
+                                failure_count,
+                                config.max_llm_retries,
+                                delay_ms
+                            );
+                            (*delay_ms, format!("RetryAfterBackoff #{failure_count} ({reason})"))
+                        }
+                        Ok(_) => break, // Terminal success outcome — exit loop.
+                    };
 
                     cx.background_executor()
-                        .timer(std::time::Duration::from_millis(delay))
+                        .timer(std::time::Duration::from_millis(delay_ms))
                         .await;
 
                     if let Some(ref tv) = thread_weak {
                         if is_cancelled(tv, cx) {
-                            log::info!("[auto_prompt] Cancelled during retry delay");
+                            log::info!(
+                                "[auto_prompt] Cancelled during retry delay ({retry_label})"
+                            );
                             return;
                         }
                     }
 
-                    log::info!("[auto_prompt] Retrying LLM call (attempt {})", failure_count);
+                    log::info!("[auto_prompt] Retrying LLM call ({retry_label})");
                     result = if is_claude_agent_for_task {
                         auto_prompt::claude_agent::decide_claude_with_llm(data.clone(), cx).await
                     } else {
@@ -954,6 +992,25 @@ pub fn on_thread_stopped(
                                 );
                                 workspace.toggle_status_toast(status_toast, cx);
                             });
+                        }
+                    }
+                    Ok(auto_prompt::AutoPromptOutcome::RetryAfterBackoff { delay_ms, reason }) => {
+                        // Defensive: the unified retry loop above converts every
+                        // `RetryAfterBackoff` to `Stopped` once `max_llm_retries` is
+                        // exhausted, so this arm should be unreachable. If a future
+                        // refactor changes that invariant, fall back to a stop with
+                        // the same reason rather than silently dropping the outcome.
+                        log::warn!(
+                            "[auto_prompt] RetryAfterBackoff reached post-loop match unexpectedly — treating as Stopped ({delay_ms}ms, {reason})"
+                        );
+                        auto_prompt::reset_llm_failure_count();
+                        if let Some(ref tv) = thread_weak {
+                            if let Err(err) = tv.update(cx, |tv, cx| {
+                                tv.auto_prompt_state = AutoPromptState::Idle;
+                                cx.notify();
+                            }) {
+                                log::warn!("[auto_prompt] failed to reset state on unexpected RetryAfterBackoff: {err}");
+                            }
                         }
                     }
 

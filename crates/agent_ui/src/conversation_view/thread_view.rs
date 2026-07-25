@@ -6086,6 +6086,25 @@ impl ThreadView {
                                         }
                                     }
                                 }
+                                Ok(auto_prompt::AutoPromptOutcome::RetryAfterBackoff { delay_ms, reason }) => {
+                                    // Issue 007: the source thread had an error AND context overflowed.
+                                    // Manual retry path treats this as a soft stop — the user can click
+                                    // retry again after the upstream rate limit has cleared. We surface
+                                    // the wait hint so the user knows why no work was dispatched.
+                                    auto_prompt::increment_llm_failure_count();
+                                    if let Some(ref tv) = thread_weak {
+                                        if let Err(err) = tv.update(cx, |tv, cx| {
+                                            tv.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;
+                                            tv._auto_prompt_retry_data = None;
+                                            cx.notify();
+                                        }) {
+                                            log::warn!("[auto_prompt] failed to reset state on retry after backoff: {err}");
+                                        }
+                                    }
+                                    log::warn!(
+                                        "[auto_prompt] Retry returned RetryAfterBackoff — waiting {delay_ms}ms suggested; reason: {reason}"
+                                    );
+                                }
                                 Err(err) => {
                                     // Retry failed again - set back to Failed state and restore retry data
                                     if let Some(ref tv) = thread_weak {

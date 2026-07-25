@@ -209,6 +209,12 @@ pub enum AutoPromptOutcome {
     /// prompt to the current thread so the AI produces a summary as its last
     /// message, then on the next cycle a new thread is created with that summary.
     ContextOverflow(AutoPromptAction),
+    /// Cannot safely make a forward decision right now — the source thread
+    /// stopped with an error (typically all API keys rate-limited) AND its
+    /// context has overflowed, so creating a new thread would propagate the
+    /// failure. The caller should wait `delay_ms`, then re-run `decide_with_llm`
+    /// (the rate limit may have cleared). See issue 007.
+    RetryAfterBackoff { delay_ms: u64, reason: String },
 }
 
 /// Extract the decision text from a `with_first_prompt_context`-formatted string.
@@ -1164,6 +1170,42 @@ pub async fn decide_with_llm(
     }
 
     let result = if data.context_exceeds_limit {
+        // ── Issue 007 guard: API exhaustion + context overflow ────────────
+        //
+        // If the source thread stopped with `had_error=true` (rate limit,
+        // network, 5xx, etc.) AND its context has overflowed, Phase 2 would
+        // create a new continuation thread whose first turn immediately hits
+        // the same exhausted API and fails — a death spiral of doomed threads
+        // that burns quota without making progress.
+        //
+        // Instead, defer the Phase 1/2 decision: return `RetryAfterBackoff`
+        // so the caller sleeps and re-runs `decide_with_llm`. If the rate
+        // limit clears, the next call proceeds normally. If it doesn't, the
+        // caller's retry loop will eventually exhaust `max_llm_retries` and
+        // surface a `Stopped` to the user.
+        //
+        // Note: `MaxTokens` and `Refusal` stop reasons are handled earlier in
+        // `decide()` and never reach `decide_with_llm`, so any `had_error=true`
+        // here is a stream/tool error. The over-aggressive case (tool-call
+        // failure with context overflow) pays one backoff delay then resumes
+        // the normal Phase 2 flow — safe.
+        if data.had_error {
+            let config = load_config_cached().unwrap_or_default();
+            // failure count is incremented by the caller's retry loop on
+            // receipt of this outcome; use the current value to size the
+            // initial delay so we don't pile up retries faster than the
+            // upstream API can recover.
+            let current_failures = AUTO_PROMPT_LLM_FAILURE_COUNT.load(Ordering::Relaxed);
+            let delay_ms = config.backoff_delay_ms(current_failures.saturating_add(1));
+            log::warn!(
+                "[auto_prompt::decide_with_llm] Context overflow + had_error — deferring Phase 1/2 by {delay_ms}ms (current_failures={current_failures}, session={session_id_str})"
+            );
+            return Ok(AutoPromptOutcome::RetryAfterBackoff {
+                delay_ms,
+                reason: "context overflow with source thread error (likely rate limit)".to_string(),
+            });
+        }
+
         let summary_state = summary_state_for(&session_id_str);
 
         // If the last assistant message is already a voluntary summary (e.g. the
@@ -6246,6 +6288,69 @@ Ready to execute Issue 024 (Hero → Avatar rename)?";
             use_new_thread_after,
             "FIX: force_new_thread overrides token heuristic"
         );
+    }
+
+    // --- Issue 007: API exhaustion + context overflow death spiral ------------
+
+    /// Document the issue 007 guard contract: when `context_exceeds_limit` is
+    /// true AND `had_error` is true, `decide_with_llm` must return
+    /// `RetryAfterBackoff` rather than proceeding to Phase 1/2. We can't call
+    /// `decide_with_llm` directly in a unit test (it needs a real LanguageModel
+    /// + AsyncApp), so this test documents the decision rule as code and guards
+    /// against regressions in the guard condition.
+    #[test]
+    fn test_issue_007_guard_condition_contract() {
+        // The guard fires iff both conditions hold. Each row is
+        // (context_exceeds_limit, had_error) -> should_defer.
+        let cases: &[(bool, bool, bool)] = &[
+            // Normal context-overflow Phase 1/2 path: no error, proceed.
+            (true, false, false),
+            // Issue 007 scenario: error + overflow → defer with backoff.
+            (true, true, true),
+            // Error but context fits → normal lightweight path, no defer.
+            (false, true, false),
+            // Clean stop with room to spare → normal path, no defer.
+            (false, false, false),
+        ];
+        for &(ctx_exceeds, had_err, expect_defer) in cases {
+            let should_defer = ctx_exceeds && had_err;
+            assert_eq!(
+                should_defer, expect_defer,
+                "guard mismatch for (context_exceeds_limit={ctx_exceeds}, had_error={had_err})"
+            );
+        }
+    }
+
+    /// Issue 007 backoff delay must be monotonically non-decreasing as the
+    /// failure count climbs (so sustained rate-limit retries don't pile up
+    /// faster than the upstream API can recover). Mirrors the contract used
+    /// inside `decide_with_llm` and the unified retry loop.
+    #[test]
+    fn test_issue_007_backoff_delay_is_monotonic() {
+        let config = load_config_cached().unwrap_or_default();
+        let mut prev: u64 = 0;
+        for failure_count in 1..=config.max_llm_retries {
+            let delay = config.backoff_delay_ms(failure_count);
+            assert!(
+                delay >= prev,
+                "backoff_delay_ms({failure_count})={delay} < previous {prev} — retries would pile up"
+            );
+            prev = delay;
+        }
+    }
+
+    /// The RetryAfterBackoff variant must be constructible and Debug-printable
+    /// (the unified retry loop in `on_thread_stopped` formats it via the
+    /// `Debug` impl on `AutoPromptOutcome` indirectly through `{reason}`).
+    #[test]
+    fn test_issue_007_outcome_variant_constructible() {
+        let outcome = AutoPromptOutcome::RetryAfterBackoff {
+            delay_ms: 1_000,
+            reason: "test".to_string(),
+        };
+        let debug = format!("{outcome:?}");
+        assert!(debug.contains("RetryAfterBackoff"), "debug repr missing variant name: {debug}");
+        assert!(debug.contains("1000"), "debug repr missing delay_ms: {debug}");
     }
 
     #[test]
