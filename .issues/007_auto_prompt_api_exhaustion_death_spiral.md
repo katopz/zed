@@ -2,9 +2,13 @@
 
 ## Status
 - [x] Symptom identified (death spiral: failed thread → new thread → fails again)
-- [x] Root cause identified (`decide_with_llm` Phase 2 fires unconditionally on `context_exceeds_limit`, ignoring `had_error`)
-- [x] Fix implemented (new `RetryAfterBackoff` outcome + guard in `decide_with_llm`)
-- [x] Fix committed (`e2c73b2972` on `develop`)
+- [x] Root cause identified — TWO compounding bugs:
+  1. `decide_with_llm` Phase 2 fires unconditionally on `context_exceeds_limit`, ignoring `had_error`
+  2. **Schema migration regression (commit 9b063ddf)**: v1 `PersistedKeyHealthFile` (pre-Quaternary) rejected on parse with "missing field `quaternary`" → entire backoff state wiped → system thinks ALL slots are healthy → never rotates to the working slot 3 → every turn hits rate-limited slot 1 → `had_error=true`
+- [x] Fix #1 implemented (new `RetryAfterBackoff` outcome + guard in `decide_with_llm`) — commit `e2c73b2972`
+- [x] Fix #2 implemented (`#[serde(default)]` on `quaternary` + forward-compat migration in `reload_persisted_health`)
+- [x] Fix #1 committed (`e2c73b2972` on `develop`)
+- [ ] Fix #2 committed
 - [ ] GOAT verified (live behavior under real rate-limit conditions)
 
 ## Symptom
@@ -23,6 +27,11 @@ generation that wastes tokens.
 
 ## Root cause
 
+**TWO compounding bugs.** Fix #1 alone is insufficient — fix #2 is the actual
+root cause of the user's reported symptom (slot 3 never tried).
+
+### Bug #1: `decide_with_llm` ignores `had_error` on context overflow
+
 In `crates/auto_prompt/src/auto_prompt.rs::decide_with_llm`, the
 `context_exceeds_limit` branch unconditionally enters the Phase 1 / Phase 2
 state machine. The only guard is `summary_state` (per-session). There is no
@@ -34,6 +43,41 @@ The existing LLM-orchestration retry loop in
 only retries the *orchestration* LLM call (auto_prompt's own model call). It
 does not cover the case where `decide_with_llm` *succeeds* in producing a
 `Continue` action whose dispatch (the user-facing model call) then fails.
+
+### Bug #2: Schema migration regression wipes backoff state (THE REAL CAUSE)
+
+Commit `9b063ddf` (Quaternary key slot) added a new required field
+`quaternary` to `PersistedKeyHealthFile` and bumped `schema_version` 1→2.
+But the deserialization was **not forward-compatible**: serde rejected v1
+files with `"missing field `quaternary`"` BEFORE the `schema_version` check
+could fire. The schema_version check was effectively dead code for the actual
+migration case.
+
+The failure path returns `KeyHealthTracker::default()` — all slots healthy,
+zero failures, no backoff. This means:
+1. On boot, the system forgets that slots 1+2 are rate-limited.
+2. `select_from_candidates` picks slot 1 (or any) — it looks healthy.
+3. Slot 1 immediately returns 429 rate-limit error.
+4. `had_error=true` is set on the thread.
+5. auto_prompt fires, context has overflowed, my issue 007 guard triggers
+   `RetryAfterBackoff` — but the real problem is slot 3 was never tried.
+
+**Evidence** from `/Users/katopz/Library/Logs/Zed/Zed.log` (2026-07-25):
+```
+15:17:18 WARN failed to parse persisted key health at .../nanbeige4.1-3b.json: missing field `quaternary` at line 1 column 268
+15:17:18 WARN failed to parse persisted key health at .../GLM.json: missing field `quaternary` at line 1 column 290
+... (later, my new code fires because had_error=true)
+15:28:40 WARN RetryAfterBackoff (attempt 1/3) — deferring decision: context overflow with source thread error (likely rate limit)
+```
+
+The user's on-disk `nanbeige4.1-3b.json` still has the v1 shape with primary
+showing 87 consecutive failures and 14454s backoff remaining — all of which
+was being silently discarded on every boot.
+
+**Fix:** Add `#[serde(default)]` to the `quaternary` field (with
+`#[derive(Default)]` on `PersistedKeyHealth` — healthy default), and rewrite
+the schema_version check in `reload_persisted_health` to be forward-compatible:
+accept anything `<= CURRENT`, migrate up, reject only `> CURRENT`.
 
 ## Fix
 
@@ -76,9 +120,10 @@ as a soft stop (user can click retry again).
 
 | File | Change |
 |------|--------|
-| `crates/auto_prompt/src/auto_prompt.rs` | Add `RetryAfterBackoff` variant; guard in `decide_with_llm`; tests |
-| `crates/agent_ui/src/auto_prompt/mod.rs` | Handle `RetryAfterBackoff` in retry loop |
-| `crates/agent_ui/src/conversation_view/thread_view.rs` | Handle `RetryAfterBackoff` in manual retry path |
+| `crates/auto_prompt/src/auto_prompt.rs` | Add `RetryAfterBackoff` variant; guard in `decide_with_llm`; tests (fix #1) |
+| `crates/agent_ui/src/auto_prompt/mod.rs` | Handle `RetryAfterBackoff` in retry loop (fix #1) |
+| `crates/agent_ui/src/conversation_view/thread_view.rs` | Handle `RetryAfterBackoff` in manual retry path (fix #1) |
+| `crates/language_models/src/provider/open_ai_compatible/health.rs` | `#[serde(default)]` on `quaternary`; `#[derive(Default)]` on `PersistedKeyHealth`; forward-compat migration in `reload_persisted_health`; v1→v2 migration tests (fix #2) |
 
 ## Severity
 

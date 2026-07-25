@@ -133,7 +133,12 @@ impl KeyHealthTracker {
 
 /// On-disk representation of a single slot's health. `backoff_remaining_secs`
 /// is `backoff_until - now` at save time (or `null` if the slot is healthy).
-#[derive(Serialize, Deserialize, Debug, PartialEq)]
+///
+/// `Default` is a fully-healthy slot (zero failures, no backoff). Used by
+/// `#[serde(default)]` on `PersistedKeyHealthFile::quaternary` so that v1
+/// schema files (which predate the quaternary slot) deserialize successfully
+/// and migrate forward instead of being rejected wholesale — see issue 007.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Default)]
 pub struct PersistedKeyHealth {
     pub consecutive_failures: u32,
     pub backoff_remaining_secs: Option<f64>,
@@ -148,6 +153,16 @@ pub struct PersistedKeyHealth {
 /// closed. Without it, reloading would always push `backoff_until` forward
 /// by the elapsed wall-clock time, defeating the purpose of persistence
 /// (a 1ms backoff persisted 5h ago would reload as "1ms from now").
+///
+/// # Forward compatibility
+///
+/// `quaternary` is marked `#[serde(default)]` so that v1 schema files (which
+/// predate the Quaternary slot, commit 9b063ddf) deserialize successfully:
+/// serde fills in a healthy default for the missing field, the v1→v2
+/// migration in `reload_persisted_health` logs it, and the next save writes
+/// the full v2 shape. Without this, the entire file was rejected on parse
+/// ("missing field `quaternary`") which silently wiped ALL slot backoff
+/// state — causing the rate-limit rotation regression documented in issue 007.
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
 pub struct PersistedKeyHealthFile {
     pub schema_version: u32,
@@ -155,6 +170,7 @@ pub struct PersistedKeyHealthFile {
     pub primary: PersistedKeyHealth,
     pub secondary: PersistedKeyHealth,
     pub tertiary: PersistedKeyHealth,
+    #[serde(default)]
     pub quaternary: PersistedKeyHealth,
 }
 
@@ -292,14 +308,31 @@ pub async fn reload_persisted_health(fs: &Arc<dyn Fs>, path: &PathBuf) -> KeyHea
     };
     match serde_json::from_str::<PersistedKeyHealthFile>(&content) {
         Ok(file) => {
-            if file.schema_version != PERSISTED_KEY_HEALTH_SCHEMA_VERSION {
+            // Forward-compatible migration. Each step upgrades in place; we
+            // accept anything <= CURRENT and reject anything > CURRENT (a
+            // newer Zed wrote a file we can't safely read). Downgrades get a
+            // fresh tracker rather than silently misinterpreting fields.
+            //
+            // v1→v2 (commit 9b063ddf): added `quaternary` slot. v1 files
+            // have no `quaternary` field; with `#[serde(default)]` on the
+            // struct field, serde fills in a healthy default. We just carry
+            // it through — no field-level transform needed.
+            if file.schema_version > PERSISTED_KEY_HEALTH_SCHEMA_VERSION {
                 log::warn!(
-                    "ignoring persisted key health with schema_version {} (expected {}) at {}",
+                    "ignoring persisted key health with schema_version {} (expected <= {}) at {} — newer Zed wrote this file",
                     file.schema_version,
                     PERSISTED_KEY_HEALTH_SCHEMA_VERSION,
                     path.display()
                 );
                 return KeyHealthTracker::default();
+            }
+            if file.schema_version < PERSISTED_KEY_HEALTH_SCHEMA_VERSION {
+                log::info!(
+                    "migrating persisted key health from schema_version {} to {} at {}",
+                    file.schema_version,
+                    PERSISTED_KEY_HEALTH_SCHEMA_VERSION,
+                    path.display()
+                );
             }
             file.to_tracker(Instant::now())
         }
@@ -1457,6 +1490,61 @@ mod tests {
             .unwrap();
         let loaded = reload_persisted_health(&fs, &path).await;
         assert_eq!(loaded, KeyHealthTracker::default());
+    }
+
+    #[gpui::test]
+    async fn reload_persisted_health_v1_schema_migrates_with_healthy_quaternary(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // Issue 007 regression: v1 schema files (pre-Quaternary, commit 9b063ddf)
+        // have no `quaternary` field. Without `#[serde(default)]` on the field,
+        // serde rejected the whole file with "missing field `quaternary`",
+        // silently wiping ALL slot backoff state and breaking rate-limit
+        // rotation. After the fix, the file must parse, primary/secondary/
+        // tertiary state must survive, and quaternary must come in healthy.
+        let fs: Arc<dyn Fs> = fs::FakeFs::new(cx.background_executor.clone());
+        let path = PathBuf::from("/v1/provider.json");
+
+        // Raw JSON exactly as written by a pre-Quaternary Zed build. Three slots,
+        // schema_version 1, primary is backed off.
+        let v1_json = r#"{"schema_version":1,"saved_at_unix_secs":1700000000,"primary":{"consecutive_failures":3,"backoff_remaining_secs":14454.5},"secondary":{"consecutive_failures":0,"backoff_remaining_secs":null},"tertiary":{"consecutive_failures":0,"backoff_remaining_secs":null}}"#;
+        fs.atomic_write(path.clone(), v1_json.to_string()).await.unwrap();
+
+        let loaded = reload_persisted_health(&fs, &path).await;
+
+        // v1 state must survive the migration.
+        assert_eq!(loaded.primary.consecutive_failures, 3,
+            "primary failures must be preserved across v1→v2 migration");
+        assert!(loaded.primary.backoff_until.is_some(),
+            "primary backoff must be preserved (was 14454.5s in v1 file)");
+        assert_eq!(loaded.secondary.consecutive_failures, 0);
+        assert_eq!(loaded.tertiary.consecutive_failures, 0);
+
+        // Quaternary must come in as the healthy default — it didn't exist in v1.
+        assert_eq!(loaded.quaternary.consecutive_failures, 0,
+            "quaternary must default to 0 failures on v1 migration");
+        assert_eq!(loaded.quaternary.backoff_until, None,
+            "quaternary must default to no backoff on v1 migration");
+    }
+
+    #[gpui::test]
+    async fn reload_persisted_health_v1_missing_quaternary_does_not_log_parse_error(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // Companion to the migration test: a v1 file must deserialize cleanly
+        // (no "missing field `quaternary`" error path). This is a contract test
+        // — we can't capture log output directly, but we CAN assert that the
+        // returned tracker isn't the parse-error default (which would zero out
+        // primary's failures along with everything else).
+        let fs: Arc<dyn Fs> = fs::FakeFs::new(cx.background_executor.clone());
+        let path = PathBuf::from("/v1/contract.json");
+        let v1_json = r#"{"schema_version":1,"saved_at_unix_secs":1700000000,"primary":{"consecutive_failures":7,"backoff_remaining_secs":60.0},"secondary":{"consecutive_failures":0,"backoff_remaining_secs":null},"tertiary":{"consecutive_failures":0,"backoff_remaining_secs":null}}"#;
+        fs.atomic_write(path.clone(), v1_json.to_string()).await.unwrap();
+
+        let loaded = reload_persisted_health(&fs, &path).await;
+        // If the parse-error path fired, we'd get default() with 0 failures everywhere.
+        assert_eq!(loaded.primary.consecutive_failures, 7,
+            "v1 file must not fall through to parse-error default");
     }
 
     #[gpui::test]
