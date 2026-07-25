@@ -396,12 +396,44 @@ fn extract_json_object(raw: &str) -> &str {
     trimmed
 }
 
+/// Headings/labels that mark a paragraph as the start of a self-contained
+/// summary. Matched case-insensitively against the start of a paragraph.
+const SUMMARY_MARKERS: &[&str] = &["## summary", "# summary", "summary:", "tl;dr"];
+
+/// How many trailing paragraphs to scan for a summary marker. Bounded so a
+/// stray "summary:" mention deep in the transcript doesn't misfire.
+const SUMMARY_SEARCH_WINDOW: usize = 6;
+
+fn is_summary_heading(paragraph: &str) -> bool {
+    let lower = paragraph.trim_start().to_ascii_lowercase();
+    SUMMARY_MARKERS.iter().any(|marker| lower.starts_with(marker))
+}
+
 /// Truncate to the last N paragraphs within a char budget.
 ///
 /// Takes whole paragraphs from the end until the budget is exceeded, always
 /// including at least one paragraph so we never send an empty context.
+///
+/// Exception: if a summary heading (`SUMMARY_MARKERS`) appears among the
+/// last `SUMMARY_SEARCH_WINDOW` paragraphs, the agent has already
+/// self-summarized — everything from that heading to the end is a complete,
+/// self-contained signal on its own. Return just that instead of the usual
+/// last-3-paragraphs window, since the preceding blow-by-blow narration is
+/// redundant with what the summary already restates (cheaper and just as
+/// useful for the continue/stop decision).
 fn truncate_last_paragraphs(text: &str) -> String {
     let paragraphs: Vec<&str> = text.split("\n\n").collect();
+
+    let search_start = paragraphs.len().saturating_sub(SUMMARY_SEARCH_WINDOW);
+    if let Some(offset) = paragraphs[search_start..]
+        .iter()
+        .position(|p| is_summary_heading(p))
+    {
+        let summary = paragraphs[search_start + offset..].join("\n\n");
+        // Still bounded by the budget in case the "summary" itself is huge.
+        return crate::context::truncate_to_paragraph_budget(&summary, LAST_MESSAGE_BUDGET_CHARS);
+    }
+
     let mut taken: Vec<&str> = Vec::new();
     let mut total = 0usize;
     for paragraph in paragraphs.iter().rev() {
@@ -529,6 +561,53 @@ mod tests {
             paras[4..6].join("\n\n"),
             "should keep only the last paragraphs within the budget"
         );
+    }
+
+    #[test]
+    fn test_truncate_last_paragraphs_uses_only_summary_when_present() {
+        let text = "para one.\n\npara two.\n\npara three.\n\n\
+                     ## Summary\n\nEverything is done, nothing left to do.";
+        let out = truncate_last_paragraphs(text);
+        assert_eq!(
+            out, "## Summary\n\nEverything is done, nothing left to do.",
+            "should drop the preceding narration once a summary heading is found"
+        );
+    }
+
+    #[test]
+    fn test_truncate_last_paragraphs_ignores_summary_marker_outside_search_window() {
+        // "summary:" appears, but it's buried far earlier than the trailing
+        // SUMMARY_SEARCH_WINDOW paragraphs — must not misfire on it.
+        let mut paras = vec!["summary: this is just prose mentioning the word".to_string()];
+        paras.extend((0..8).map(|i| format!("para {i}.")));
+        let text = paras.join("\n\n");
+        let out = truncate_last_paragraphs(&text);
+        assert_eq!(
+            out,
+            paras[paras.len() - 3..].join("\n\n"),
+            "falls back to the normal last-3 window when no summary marker is trailing"
+        );
+    }
+
+    #[test]
+    fn test_truncate_last_paragraphs_caps_oversized_summary_to_budget() {
+        let filler = "x".repeat(LAST_MESSAGE_BUDGET_CHARS + 500);
+        let text = format!("para one.\n\n## Summary\n\n{filler}");
+        let out = truncate_last_paragraphs(&text);
+        assert!(
+            out.len() < text.len(),
+            "an oversized summary must still be capped by the char budget"
+        );
+        assert!(out.starts_with("## Summary"));
+    }
+
+    #[test]
+    fn test_is_summary_heading_matches_common_markers() {
+        assert!(is_summary_heading("## Summary"));
+        assert!(is_summary_heading("# summary of changes"));
+        assert!(is_summary_heading("Summary: all done"));
+        assert!(is_summary_heading("TL;DR: shipped it"));
+        assert!(!is_summary_heading("This paragraph mentions summary later"));
     }
 
     #[test]
