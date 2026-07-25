@@ -8,7 +8,7 @@
 - [x] Fix #1 implemented (new `RetryAfterBackoff` outcome + guard in `decide_with_llm`) — commit `e2c73b2972`
 - [x] Fix #2 implemented (`#[serde(default)]` on `quaternary` + forward-compat migration in `reload_persisted_health`)
 - [x] Fix #1 committed (`e2c73b2972` on `develop`)
-- [ ] Fix #2 committed
+- [x] Fix #2 committed (`2047a3a60f` on `develop`)
 - [ ] GOAT verified (live behavior under real rate-limit conditions)
 
 ## Symptom
