@@ -31,6 +31,7 @@ pub enum KeySlot {
     Primary,
     Secondary,
     Tertiary,
+    Quaternary,
 }
 
 /// Per-key backoff state. Persisted across restarts as relative durations
@@ -42,7 +43,7 @@ pub struct KeyHealth {
 }
 
 /// UI-facing projection of one slot's health + configuration state. Returned
-/// in a fixed `[Primary, Secondary, Tertiary]` order by `State::slot_health_snapshot`
+/// in a fixed `[Primary, Secondary, Tertiary, Quaternary]` order by `State::slot_health_snapshot`
 /// so the ConfigurationView can render a backoff badge without reaching into
 /// `KeyHealthTracker` directly (which lives behind a mutex in `State`).
 #[derive(Clone, Debug, PartialEq)]
@@ -64,6 +65,7 @@ pub struct KeyHealthTracker {
     pub primary: KeyHealth,
     pub secondary: KeyHealth,
     pub tertiary: KeyHealth,
+    pub quaternary: KeyHealth,
     /// Ephemeral (never persisted): the slot most recently selected by
     /// `select_from_candidates` inside `retry_stream`. Surfaced to the UI so the
     /// retry button can show which key the in-flight turn is actually using.
@@ -77,6 +79,7 @@ impl KeyHealthTracker {
             KeySlot::Primary => &self.primary,
             KeySlot::Secondary => &self.secondary,
             KeySlot::Tertiary => &self.tertiary,
+            KeySlot::Quaternary => &self.quaternary,
         }
     }
 
@@ -85,6 +88,7 @@ impl KeyHealthTracker {
             KeySlot::Primary => &mut self.primary,
             KeySlot::Secondary => &mut self.secondary,
             KeySlot::Tertiary => &mut self.tertiary,
+            KeySlot::Quaternary => &mut self.quaternary,
         }
     }
 
@@ -151,9 +155,10 @@ pub struct PersistedKeyHealthFile {
     pub primary: PersistedKeyHealth,
     pub secondary: PersistedKeyHealth,
     pub tertiary: PersistedKeyHealth,
+    pub quaternary: PersistedKeyHealth,
 }
 
-pub const PERSISTED_KEY_HEALTH_SCHEMA_VERSION: u32 = 1;
+pub const PERSISTED_KEY_HEALTH_SCHEMA_VERSION: u32 = 2;
 
 /// Subdirectory under `paths::data_dir()` holding one JSON file per provider.
 pub const PERSIST_DIR_NAME: &str = "openai_compatible_backoff";
@@ -205,6 +210,7 @@ impl PersistedKeyHealthFile {
             primary: PersistedKeyHealth::from_health(&tracker.primary, now),
             secondary: PersistedKeyHealth::from_health(&tracker.secondary, now),
             tertiary: PersistedKeyHealth::from_health(&tracker.tertiary, now),
+            quaternary: PersistedKeyHealth::from_health(&tracker.quaternary, now),
         }
     }
 
@@ -224,6 +230,7 @@ impl PersistedKeyHealthFile {
             primary: self.primary.to_health(now, elapsed_secs),
             secondary: self.secondary.to_health(now, elapsed_secs),
             tertiary: self.tertiary.to_health(now, elapsed_secs),
+            quaternary: self.quaternary.to_health(now, elapsed_secs),
             // `last_used_slot` is ephemeral runtime state — never restored
             // from disk. A stale slot from a previous process would mislead
             // the retry button label on the very first turn after launch.
@@ -1271,8 +1278,8 @@ mod tests {
         let persisted = PersistedKeyHealthFile::from_tracker(&tracker, now);
         let json = serde_json::to_value(&persisted).unwrap();
         let obj = json.as_object().unwrap();
-        assert_eq!(obj.len(), 5, "expected schema_version + saved_at + 3 slots");
-        assert_eq!(obj.get("schema_version").and_then(|v| v.as_u64()), Some(1));
+        assert_eq!(obj.len(), 6, "expected schema_version + saved_at + 4 slots");
+        assert_eq!(obj.get("schema_version").and_then(|v| v.as_u64()), Some(2));
         // saved_at_unix_secs is a positive integer (wall-clock).
         assert!(
             obj.get("saved_at_unix_secs").and_then(|v| v.as_u64()).unwrap_or(0) > 0,
@@ -1291,6 +1298,18 @@ mod tests {
             Some(0)
         );
         assert!(secondary.get("backoff_remaining_secs").unwrap().is_null());
+        let tertiary = obj.get("tertiary").unwrap().as_object().unwrap();
+        assert_eq!(
+            tertiary.get("consecutive_failures").and_then(|v| v.as_u64()),
+            Some(0)
+        );
+        assert!(tertiary.get("backoff_remaining_secs").unwrap().is_null());
+        let quaternary = obj.get("quaternary").unwrap().as_object().unwrap();
+        assert_eq!(
+            quaternary.get("consecutive_failures").and_then(|v| v.as_u64()),
+            Some(0)
+        );
+        assert!(quaternary.get("backoff_remaining_secs").unwrap().is_null());
     }
 
     #[test]
@@ -1310,6 +1329,10 @@ mod tests {
             tertiary: PersistedKeyHealth {
                 consecutive_failures: 2,
                 backoff_remaining_secs: Some(0.0),
+            },
+            quaternary: PersistedKeyHealth {
+                consecutive_failures: 0,
+                backoff_remaining_secs: None,
             },
         };
         let json = serde_json::to_string(&original).unwrap();
@@ -1421,6 +1444,10 @@ mod tests {
                 backoff_remaining_secs: None,
             },
             tertiary: PersistedKeyHealth {
+                consecutive_failures: 0,
+                backoff_remaining_secs: None,
+            },
+            quaternary: PersistedKeyHealth {
                 consecutive_failures: 0,
                 backoff_remaining_secs: None,
             },

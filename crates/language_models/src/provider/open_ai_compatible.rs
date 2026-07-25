@@ -62,6 +62,7 @@ pub struct State {
     api_key_state: ApiKeyState,
     api_key_state_2: ApiKeyState,
     api_key_state_3: ApiKeyState,
+    api_key_state_4: ApiKeyState,
     /// Shared across threads so the request closure (background executor) can
     /// record outcomes without going through GPUI's `Entity::update`.
     /// `parking_lot::Mutex` (not `std::sync::Mutex`) because the background
@@ -86,6 +87,11 @@ fn secondary_key_url(api_url: &str) -> SharedString {
 /// Derives a distinct keychain identifier for the tertiary API key from the provider URL.
 fn tertiary_key_url(api_url: &str) -> SharedString {
     SharedString::new(format!("{api_url}#tertiary"))
+}
+
+/// Derives a distinct keychain identifier for the quaternary API key from the provider URL.
+fn quaternary_key_url(api_url: &str) -> SharedString {
+    SharedString::new(format!("{api_url}#quaternary"))
 }
 
 /// Char-safe truncated preview of an API key for display: first 3 + `...` +
@@ -117,7 +123,7 @@ pub enum KeyProbeResult {
     Err(SharedString),
 }
 
-/// Maps a `KeySlot` to its fixed index in the `[Primary, Secondary, Tertiary]`
+/// Maps a `KeySlot` to its fixed index in the `[Primary, Secondary, Tertiary, Quaternary]`
 /// arrays used by `ConfigurationView` (`probe_results`, `probe_tasks`). Kept as
 /// a single helper so the two array sites and the `KeySlot` enum can't drift.
 fn slot_index(slot: KeySlot) -> usize {
@@ -125,6 +131,7 @@ fn slot_index(slot: KeySlot) -> usize {
         KeySlot::Primary => 0,
         KeySlot::Secondary => 1,
         KeySlot::Tertiary => 2,
+        KeySlot::Quaternary => 3,
     }
 }
 
@@ -144,6 +151,7 @@ impl State {
         self.api_key_state.has_key()
             || self.api_key_state_2.has_key()
             || self.api_key_state_3.has_key()
+            || self.api_key_state_4.has_key()
     }
 
     /// Schedules a debounced write of the current `key_health` snapshot to
@@ -192,10 +200,12 @@ impl State {
     fn key_preview(&self, slot: KeySlot) -> Option<String> {
         let secondary_url = secondary_key_url(&self.settings.api_url);
         let tertiary_url = tertiary_key_url(&self.settings.api_url);
+        let quaternary_url = quaternary_key_url(&self.settings.api_url);
         let (api_key_state, url): (&ApiKeyState, &str) = match slot {
             KeySlot::Primary => (&self.api_key_state, self.settings.api_url.as_str()),
             KeySlot::Secondary => (&self.api_key_state_2, secondary_url.as_ref()),
             KeySlot::Tertiary => (&self.api_key_state_3, tertiary_url.as_ref()),
+            KeySlot::Quaternary => (&self.api_key_state_4, quaternary_url.as_ref()),
         };
         let key = api_key_state.key(url)?;
         Some(truncate_key_preview(&key))
@@ -237,11 +247,24 @@ impl State {
         )
     }
 
+    fn set_api_key_4(&mut self, api_key: Option<String>, cx: &mut Context<Self>) -> Task<Result<()>> {
+        let credentials_provider = self.credentials_provider.clone();
+        let api_url = quaternary_key_url(&self.settings.api_url);
+        self.api_key_state_4.store(
+            api_url,
+            api_key,
+            |this| &mut this.api_key_state_4,
+            credentials_provider,
+            cx,
+        )
+    }
+
     fn authenticate(&mut self, cx: &mut Context<Self>) -> Task<Result<(), AuthenticateError>> {
         let credentials_provider = self.credentials_provider.clone();
         let api_url = SharedString::new(self.settings.api_url.clone());
         let secondary_url = secondary_key_url(&api_url);
         let tertiary_url = tertiary_key_url(&api_url);
+        let quaternary_url = quaternary_key_url(&api_url);
 
         let task1 = self.api_key_state.load_if_needed(
             api_url,
@@ -258,6 +281,12 @@ impl State {
         let task3 = self.api_key_state_3.load_if_needed(
             tertiary_url,
             |this| &mut this.api_key_state_3,
+            credentials_provider.clone(),
+            cx,
+        );
+        let task4 = self.api_key_state_4.load_if_needed(
+            quaternary_url,
+            |this| &mut this.api_key_state_4,
             credentials_provider,
             cx,
         );
@@ -266,7 +295,8 @@ impl State {
             let result1 = task1.await;
             let result2 = task2.await;
             let result3 = task3.await;
-            if result1.is_ok() || result2.is_ok() || result3.is_ok() {
+            let result4 = task4.await;
+            if result1.is_ok() || result2.is_ok() || result3.is_ok() || result4.is_ok() {
                 Ok(())
             } else {
                 result1
@@ -282,8 +312,9 @@ impl State {
         let primary_url = self.settings.api_url.as_str();
         let secondary_url = secondary_key_url(primary_url);
         let tertiary_url = tertiary_key_url(primary_url);
+        let quaternary_url = quaternary_key_url(primary_url);
 
-        let mut out = Vec::with_capacity(3);
+        let mut out = Vec::with_capacity(4);
         if let Some(key) = self.api_key_state.key(primary_url) {
             out.push((key, KeySlot::Primary));
         }
@@ -292,6 +323,9 @@ impl State {
         }
         if let Some(key) = self.api_key_state_3.key(&tertiary_url) {
             out.push((key, KeySlot::Tertiary));
+        }
+        if let Some(key) = self.api_key_state_4.key(&quaternary_url) {
+            out.push((key, KeySlot::Quaternary));
         }
         out
     }
@@ -305,10 +339,12 @@ impl State {
     fn probe_inputs(&self, slot: KeySlot) -> Option<KeyProbeInputs> {
         let secondary_url = secondary_key_url(&self.settings.api_url);
         let tertiary_url = tertiary_key_url(&self.settings.api_url);
+        let quaternary_url = quaternary_key_url(&self.settings.api_url);
         let (api_key_state, url): (&ApiKeyState, &str) = match slot {
             KeySlot::Primary => (&self.api_key_state, self.settings.api_url.as_str()),
             KeySlot::Secondary => (&self.api_key_state_2, secondary_url.as_ref()),
             KeySlot::Tertiary => (&self.api_key_state_3, tertiary_url.as_ref()),
+            KeySlot::Quaternary => (&self.api_key_state_4, quaternary_url.as_ref()),
         };
         let api_key = api_key_state.key(url)?;
         let model = self.settings.available_models.first()?.name.clone();
@@ -321,19 +357,20 @@ impl State {
         })
     }
 
-    /// Returns `[Primary, Secondary, Tertiary]` slot status for the UI. Clones
+    /// Returns `[Primary, Secondary, Tertiary, Quaternary]` slot status for the UI. Clones
     /// the tracker under the mutex (same pattern as `snapshot_health`) so the
     /// lock is not held across the per-slot computation. Used by
     /// `ConfigurationView::render` to draw a backoff badge with a live
     /// countdown. The ConfigurationView polls this on a 1s timer while the
     /// settings page is open; see `backoff_refresh_task`.
-    fn slot_health_snapshot(&self) -> [SlotHealthStatus; 3] {
+    fn slot_health_snapshot(&self) -> [SlotHealthStatus; 4] {
         let now = Instant::now();
         let tracker = self.key_health.lock().clone();
         [
             self.slot_status(KeySlot::Primary, &tracker, now),
             self.slot_status(KeySlot::Secondary, &tracker, now),
             self.slot_status(KeySlot::Tertiary, &tracker, now),
+            self.slot_status(KeySlot::Quaternary, &tracker, now),
         ]
     }
 
@@ -348,6 +385,7 @@ impl State {
             KeySlot::Primary => self.api_key_state.has_key(),
             KeySlot::Secondary => self.api_key_state_2.has_key(),
             KeySlot::Tertiary => self.api_key_state_3.has_key(),
+            KeySlot::Quaternary => self.api_key_state_4.has_key(),
         };
         let backoff_remaining = match health.backoff_until {
             Some(until) => until.saturating_duration_since(now),
@@ -378,6 +416,7 @@ impl State {
             KeySlot::Primary => self.api_key_state.has_key(),
             KeySlot::Secondary => self.api_key_state_2.has_key(),
             KeySlot::Tertiary => self.api_key_state_3.has_key(),
+            KeySlot::Quaternary => self.api_key_state_4.has_key(),
         };
         if !has_key {
             return None;
@@ -402,6 +441,7 @@ impl OpenAiCompatibleLanguageModelProvider {
         let api_key_env_var_name = format!("{}_API_KEY", id).to_case(Case::UpperSnake).into();
         let api_key_env_var_name_2 = format!("{}_API_KEY_2", id).to_case(Case::UpperSnake).into();
         let api_key_env_var_name_3 = format!("{}_API_KEY_3", id).to_case(Case::UpperSnake).into();
+        let api_key_env_var_name_4 = format!("{}_API_KEY_4", id).to_case(Case::UpperSnake).into();
         let state = cx.new(|cx| {
             cx.observe_global::<SettingsStore>(|this: &mut State, cx| {
                 let Some(settings) = resolve_settings(&this.id, cx).cloned() else {
@@ -412,6 +452,7 @@ impl OpenAiCompatibleLanguageModelProvider {
                     let api_url = SharedString::new(settings.api_url.as_str());
                     let secondary_url = secondary_key_url(&api_url);
                     let tertiary_url = tertiary_key_url(&api_url);
+                    let quaternary_url = quaternary_key_url(&api_url);
                     this.api_key_state.handle_url_change(
                         api_url,
                         |this| &mut this.api_key_state,
@@ -427,6 +468,12 @@ impl OpenAiCompatibleLanguageModelProvider {
                     this.api_key_state_3.handle_url_change(
                         tertiary_url,
                         |this| &mut this.api_key_state_3,
+                        credentials_provider.clone(),
+                        cx,
+                    );
+                    this.api_key_state_4.handle_url_change(
+                        quaternary_url,
+                        |this| &mut this.api_key_state_4,
                         credentials_provider,
                         cx,
                     );
@@ -474,6 +521,10 @@ impl OpenAiCompatibleLanguageModelProvider {
                 api_key_state_3: ApiKeyState::new(
                     tertiary_key_url(&settings.api_url),
                     EnvVar::new(api_key_env_var_name_3),
+                ),
+                api_key_state_4: ApiKeyState::new(
+                    quaternary_key_url(&settings.api_url),
+                    EnvVar::new(api_key_env_var_name_4),
                 ),
                 key_health,
                 key_health_dirty,
@@ -1039,16 +1090,17 @@ struct ConfigurationView {
     api_key_editor: Entity<InputField>,
     api_key_editor_2: Entity<InputField>,
     api_key_editor_3: Entity<InputField>,
+    api_key_editor_4: Entity<InputField>,
     state: Entity<State>,
     http_client: Arc<dyn HttpClient>,
     load_credentials_task: Option<Task<()>>,
-    /// Latest "Check" probe result per slot (Primary, Secondary, Tertiary), or
+    /// Latest "Check" probe result per slot (Primary, Secondary, Tertiary, Quaternary), or
     /// `None` if the slot hasn't been probed (or was reset on key change).
     /// Drives the button face label (`check(ok)` / `check(hit)` / `check(err)`).
-    probe_results: [Option<KeyProbeResult>; 3],
+    probe_results: [Option<KeyProbeResult>; 4],
     /// In-flight probe task per slot. When `Some`, the button shows `Check…` and
     /// is disabled. Stored so dropping the view cancels pending probes.
-    probe_tasks: [Option<Task<()>>; 3],
+    probe_tasks: [Option<Task<()>>; 4],
     /// Polls `slot_health_snapshot` every second while the settings page is open
     /// and calls `cx.notify()` only when the snapshot changes. Required because
     /// `key_health` is updated from background request closures through
@@ -1069,6 +1121,7 @@ impl ConfigurationView {
         let api_key_editor = cx.new(|cx| InputField::new(window, cx, API_KEY_PLACEHOLDER));
         let api_key_editor_2 = cx.new(|cx| InputField::new(window, cx, API_KEY_PLACEHOLDER));
         let api_key_editor_3 = cx.new(|cx| InputField::new(window, cx, API_KEY_PLACEHOLDER));
+        let api_key_editor_4 = cx.new(|cx| InputField::new(window, cx, API_KEY_PLACEHOLDER));
 
         cx.observe(&state, |_, _, cx| {
             cx.notify();
@@ -1100,7 +1153,7 @@ impl ConfigurationView {
         let backoff_refresh_task = cx.spawn_in(window, {
             let state = state.clone();
             async move |this, cx| {
-                let mut last_snapshot: [SlotHealthStatus; 3] =
+                let mut last_snapshot: [SlotHealthStatus; 4] =
                     state.read_with(cx, |state, _| state.slot_health_snapshot());
                 loop {
                     cx.background_executor()
@@ -1127,6 +1180,7 @@ impl ConfigurationView {
             api_key_editor,
             api_key_editor_2,
             api_key_editor_3,
+            api_key_editor_4,
             state,
             http_client,
             load_credentials_task,
@@ -1227,6 +1281,24 @@ impl ConfigurationView {
         .detach_and_log_err(cx);
     }
 
+    fn save_api_key_4(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        let api_key = self.api_key_editor_4.read(cx).text(cx).trim().to_string();
+        if api_key.is_empty() {
+            return;
+        }
+
+        self.api_key_editor_4
+            .update(cx, |input, cx| input.set_text("", window, cx));
+
+        let state = self.state.clone();
+        cx.spawn_in(window, async move |_, cx| {
+            state
+                .update(cx, |state, cx| state.set_api_key_4(Some(api_key), cx))
+                .await
+        })
+        .detach_and_log_err(cx);
+    }
+
     fn reset_api_key_3(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.api_key_editor_3
             .update(cx, |input, cx| input.set_text("", window, cx));
@@ -1237,6 +1309,22 @@ impl ConfigurationView {
                 .update(cx, |state, cx| {
                     state.clear_slot_backoff(KeySlot::Tertiary, cx);
                     state.set_api_key_3(None, cx)
+                })
+                .await
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn reset_api_key_4(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.api_key_editor_4
+            .update(cx, |input, cx| input.set_text("", window, cx));
+
+        let state = self.state.clone();
+        cx.spawn_in(window, async move |_, cx| {
+            state
+                .update(cx, |state, cx| {
+                    state.clear_slot_backoff(KeySlot::Quaternary, cx);
+                    state.set_api_key_4(None, cx)
                 })
                 .await
         })
@@ -1389,6 +1477,7 @@ impl ConfigurationView {
                 KeySlot::Primary => this.reset_api_key(window, cx),
                 KeySlot::Secondary => this.reset_api_key_2(window, cx),
                 KeySlot::Tertiary => this.reset_api_key_3(window, cx),
+                KeySlot::Quaternary => this.reset_api_key_4(window, cx),
             }));
 
         h_flex()
@@ -1470,6 +1559,10 @@ impl Render for ConfigurationView {
         let tertiary_env_var_name = state.api_key_state_3.env_var_name().clone();
         let tertiary_has_key = state.api_key_state_3.has_key();
 
+        let quaternary_env_var_set = state.api_key_state_4.is_from_env_var();
+        let quaternary_env_var_name = state.api_key_state_4.env_var_name().clone();
+        let quaternary_has_key = state.api_key_state_4.has_key();
+
         let api_url = state.settings.api_url.clone();
 
         // Per-slot health snapshot powers the backoff badge + countdown. Read
@@ -1479,6 +1572,7 @@ impl Render for ConfigurationView {
         let primary_status = &health_snapshot[0];
         let secondary_status = &health_snapshot[1];
         let tertiary_status = &health_snapshot[2];
+        let quaternary_status = &health_snapshot[3];
 
         // Truncated key previews (e.g. `sk-...x9F`) so the user can tell cards
         // apart. Only available for keychain-stored keys; env-var keys keep the
@@ -1486,6 +1580,7 @@ impl Render for ConfigurationView {
         let primary_preview = if primary_env_var_set { None } else { state.key_preview(KeySlot::Primary) };
         let secondary_preview = if secondary_env_var_set { None } else { state.key_preview(KeySlot::Secondary) };
         let tertiary_preview = if tertiary_env_var_set { None } else { state.key_preview(KeySlot::Tertiary) };
+        let quaternary_preview = if quaternary_env_var_set { None } else { state.key_preview(KeySlot::Quaternary) };
 
         // Primary API key section
         let primary_section = if !primary_has_key {
@@ -1646,6 +1741,63 @@ impl Render for ConfigurationView {
                 .into_any()
         };
 
+        // Quaternary API key section (optional, for load balancing + backoff rotation)
+        let quaternary_section = if !quaternary_has_key {
+            v_flex()
+                .on_action(cx.listener(Self::save_api_key_4))
+                .mt_2()
+                .child(
+                    Label::new("Additional API Key (optional)")
+                        .size(LabelSize::Small)
+                )
+                .child(
+                    Label::new(
+                        "Add a fourth key for broader load balancing. Failing keys are temporarily rotated out (up to 5h).",
+                    )
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+                )
+                .child(
+                    div()
+                        .pt(DynamicSpacing::Base04.rems(cx))
+                        .child(self.api_key_editor_4.clone())
+                )
+                .child(
+                    Label::new(
+                        format!("You can also set the {quaternary_env_var_name} environment variable and restart Zed."),
+                    )
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+                )
+                .into_any()
+        } else {
+            let label_text: SharedString = if quaternary_env_var_set {
+                format!("Quaternary API key set in {quaternary_env_var_name} environment variable").into()
+            } else if let Some(preview) = quaternary_preview.as_deref() {
+                format!("Quaternary: {preview}").into()
+            } else {
+                "Quaternary API key configured for load balancing".into()
+            };
+            h_flex()
+                .mt_1()
+                .p_1()
+                .justify_between()
+                .rounded_md()
+                .border_1()
+                .border_color(cx.theme().colors().border)
+                .bg(cx.theme().colors().background)
+                .child(Self::render_key_status_row(quaternary_status, label_text, "quaternary-backoff-badge"))
+                .child(self.render_key_actions(
+                    KeySlot::Quaternary,
+                    quaternary_status,
+                    quaternary_env_var_set,
+                    &quaternary_env_var_name,
+                    "quaternary",
+                    cx,
+                ))
+                .into_any()
+        };
+
         if self.load_credentials_task.is_some() {
             div().child(Label::new("Loading credentials…")).into_any()
         } else {
@@ -1654,6 +1806,7 @@ impl Render for ConfigurationView {
                 .child(primary_section)
                 .child(secondary_section)
                 .child(tertiary_section)
+                .child(quaternary_section)
                 .into_any()
         }
     }
@@ -1770,6 +1923,10 @@ mod tests {
             api_key_state_3: ApiKeyState::new(
                 tertiary_key_url("https://example.test"),
                 EnvVar::new("TEST_API_KEY_3".into()),
+            ),
+            api_key_state_4: ApiKeyState::new(
+                quaternary_key_url("https://example.test"),
+                EnvVar::new("TEST_API_KEY_4".into()),
             ),
             key_health: Arc::new(ParkingMutex::new(KeyHealthTracker::default())),
             key_health_dirty: Arc::new(ParkingMutex::new(None)),
@@ -1958,6 +2115,7 @@ mod tests {
         assert_eq!(slot_index(KeySlot::Primary), 0);
         assert_eq!(slot_index(KeySlot::Secondary), 1);
         assert_eq!(slot_index(KeySlot::Tertiary), 2);
+        assert_eq!(slot_index(KeySlot::Quaternary), 3);
     }
 
     #[test]
