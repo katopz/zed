@@ -4,6 +4,7 @@
 - [x] Symptom identified (death spiral: failed thread → new thread → fails again)
 - [x] Root cause identified (`decide_with_llm` Phase 2 fires unconditionally on `context_exceeds_limit`, ignoring `had_error`)
 - [x] Fix implemented (new `RetryAfterBackoff` outcome + guard in `decide_with_llm`)
+- [x] Fix committed (`e2c73b2972` on `develop`)
 - [ ] GOAT verified (live behavior under real rate-limit conditions)
 
 ## Symptom
