@@ -1167,6 +1167,24 @@ pub fn start_watchdog(
     let configured_model = registry.default_model()?;
     let model = configured_model.model.clone();
 
+    // Claude Code authenticates itself outside Zed's LanguageModelRegistry, so
+    // the watchdog's reasoning call only makes sense when Zed's default model
+    // is a real Anthropic model. Otherwise it would silently burn calls
+    // against whatever other provider is configured (possibly the same one
+    // that's rate-limited, if Claude is being used as a fallback for it).
+    let is_claude_agent = thread
+        .upgrade()
+        .map(|t| t.read(cx).connection().agent_id().as_ref() == CLAUDE_AGENT_ID)
+        .unwrap_or(false);
+    if is_claude_agent && model.provider_id() != language_model::ANTHROPIC_PROVIDER_ID {
+        log::info!(
+            "[auto_prompt::watchdog] Claude agent thread but default model provider is {:?}, \
+             not Anthropic — skipping watchdog",
+            model.provider_id()
+        );
+        return None;
+    }
+
     let timeout_secs = config.watchdog_timeout_secs;
     let thread_weak = thread;
 

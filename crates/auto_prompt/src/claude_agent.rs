@@ -12,7 +12,8 @@
 //!   2. Never set `force_new_thread = true` — always continue in the same thread.
 //!   3. No pre-stop verification, no max-iterations gate, no rules-based stop.
 //!      The orchestration LLM is the sole decider.
-//!   4. The only hard stops are: user cancel, or no model configured.
+//!   4. The only hard stops are: user cancel, no model configured, or the
+//!      configured default model is not Anthropic (see `decide_claude`).
 
 use agent_client_protocol::schema::v1 as acp;
 use anyhow::Context as _;
@@ -68,7 +69,12 @@ Rules:
 /// Decide the next auto-prompt action for a Claude (ACP) agent thread.
 ///
 /// Returns:
-/// - `NoAction` — cancelled, or no model configured.
+/// - `NoAction` — cancelled, no model configured, or the configured default
+///   model is not Anthropic (Claude Code's own auth is browser/subscription
+///   based and invisible to Zed's `LanguageModelRegistry`, so orchestrating
+///   its continuation requires a real Anthropic API key configured in Zed —
+///   falling back to another provider, e.g. an already-rate-limited one you
+///   switched to Claude to get away from, defeats the point).
 /// - `NeedsLlmCall(data)` — the caller spawns `decide_claude_with_llm(data)`.
 ///
 /// Never returns `DispatchNow` / `DispatchAfterDelay` / `ContextOverflow` —
@@ -99,6 +105,21 @@ pub fn decide_claude(
         return AutoPromptDecision::NoAction;
     };
     let model = configured_model.model;
+
+    // Claude Code authenticates itself (browser/subscription) outside Zed's
+    // LanguageModelRegistry, so the only way to orchestrate its continuation
+    // is with a real Anthropic-backed model configured as Zed's default. If
+    // the default model is some other provider, skip rather than silently
+    // burn calls against it — that provider may well be the one you're
+    // running Claude as a fallback for in the first place.
+    if model.provider_id() != language_model::ANTHROPIC_PROVIDER_ID {
+        log::info!(
+            "[auto_prompt::claude] Default model provider is {:?}, not Anthropic — \
+             skipping auto-continue for this Claude Code thread",
+            model.provider_id()
+        );
+        return AutoPromptDecision::NoAction;
+    }
 
     let thread_ref = thread.read(cx);
     let session_id = thread_ref.session_id().clone();
