@@ -2101,6 +2101,14 @@ pub struct AcpThread {
     pending_terminal_output: HashMap<acp::TerminalId, Vec<Vec<u8>>>,
     pending_terminal_exit: HashMap<acp::TerminalId, acp::TerminalExitStatus>,
     had_error: bool,
+    /// Narrower than `had_error`: true only when the completion request
+    /// itself failed (network/stream error from `run_turn`'s `Err` branch),
+    /// never for an individual failed tool call. `had_error` is set by any
+    /// tool call failing mid-turn — extremely common in normal agentic work
+    /// and unrelated to API availability — so code that reasons about actual
+    /// API exhaustion (e.g. auto_prompt's context-overflow backoff guard)
+    /// must check this field, not `had_error`.
+    had_api_error: bool,
     /// The user's unsent prompt text, persisted so it can be restored when reloading the thread.
     draft_prompt: Option<Vec<acp::ContentBlock>>,
     /// The initial scroll position for the thread view, set during session registration.
@@ -2321,6 +2329,7 @@ impl AcpThread {
             pending_terminal_output: HashMap::default(),
             pending_terminal_exit: HashMap::default(),
             had_error: false,
+            had_api_error: false,
             draft_prompt: None,
             ui_scroll_position: None,
             streaming_text_buffer: None,
@@ -2478,6 +2487,13 @@ impl AcpThread {
 
     pub fn had_error(&self) -> bool {
         self.had_error
+    }
+
+    /// True only when the completion request itself failed (a genuine
+    /// stream/network/API error), never for an individual failed tool call.
+    /// See the field doc on `had_api_error` for why this distinction matters.
+    pub fn had_api_error(&self) -> bool {
+        self.had_api_error
     }
 
     pub fn is_waiting_for_confirmation(&self) -> bool {
@@ -3869,6 +3885,7 @@ impl AcpThread {
     ) -> BoxFuture<'static, Result<Option<acp::PromptResponse>>> {
         self.clear_completed_plan_entries(cx);
         self.had_error = false;
+        self.had_api_error = false;
 
         let (tx, rx) = oneshot::channel();
         let cancel_task = self.cancel(cx);
@@ -4019,6 +4036,10 @@ impl AcpThread {
                             this.cancel_pending_turn_entries(cx);
                         }
                         this.had_error = true;
+                        // The completion request itself failed (network, timeout, 5xx,
+                        // rate limit, etc.) — unlike a failed tool call, this is a real
+                        // signal about API availability.
+                        this.had_api_error = true;
                         cx.emit(AcpThreadEvent::Error);
                         log::error!("Error in run turn: {:?}", e);
                         Err(e)

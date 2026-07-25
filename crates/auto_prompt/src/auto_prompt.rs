@@ -445,9 +445,16 @@ pub struct LlmCallData {
     /// Actual input token count from the thread's API usage response.
     /// Passed through to AutoPromptAction for dispatch decisions.
     pub actual_input_tokens: Option<u64>,
-    /// Whether the source thread had errors (rate limit, refusal, max tokens, etc.).
-    /// Used by the caller to decide whether to add a pre-call delay.
+    /// Whether the source thread had errors (rate limit, refusal, max tokens,
+    /// or merely a failed tool call). Used by the caller to decide whether to
+    /// add a pre-call delay — a broad, low-stakes use where over-triggering
+    /// just costs one extra wait, so the wider signal is fine here.
     pub had_error: bool,
+    /// Narrower than `had_error`: true only when the completion request
+    /// itself failed (network/stream error), never for a failed tool call.
+    /// Use this (not `had_error`) for decisions with a high cost of a false
+    /// positive, like the context-overflow backoff guard in `decide_with_llm`.
+    pub had_api_error: bool,
     /// Current stop lifecycle phase (Working, PreStop, Verified).
     /// Controls confidence thresholds and scopes the handbrake to post-verification.
     pub stop_phase: context::StopPhase,
@@ -485,6 +492,7 @@ impl std::fmt::Debug for LlmCallData {
             .field("profile_id", &self.profile_id)
             .field("actual_input_tokens", &self.actual_input_tokens)
             .field("had_error", &self.had_error)
+            .field("had_api_error", &self.had_api_error)
             .field("stop_phase", &self.stop_phase)
             .field("context_exceeds_limit", &self.context_exceeds_limit)
             .field("approximate_token_count", &self.approximate_token_count)
@@ -1122,6 +1130,7 @@ pub fn decide(
         profile_id: None,
         actual_input_tokens: auto_prompt_ctx.actual_input_tokens,
         had_error: auto_prompt_ctx.had_error,
+        had_api_error: auto_prompt_ctx.had_api_error,
         stop_phase,
         context_exceeds_limit,
         approximate_token_count: auto_prompt_ctx.approximate_token_count,
@@ -1172,24 +1181,28 @@ pub async fn decide_with_llm(
     let result = if data.context_exceeds_limit {
         // ── Issue 007 guard: API exhaustion + context overflow ────────────
         //
-        // If the source thread stopped with `had_error=true` (rate limit,
-        // network, 5xx, etc.) AND its context has overflowed, Phase 2 would
-        // create a new continuation thread whose first turn immediately hits
-        // the same exhausted API and fails — a death spiral of doomed threads
-        // that burns quota without making progress.
+        // If the source thread's completion request itself failed
+        // (`had_api_error=true`: rate limit, network, 5xx, etc.) AND its
+        // context has overflowed, Phase 2 would create a new continuation
+        // thread whose first turn immediately hits the same exhausted API
+        // and fails — a death spiral of doomed threads that burns quota
+        // without making progress.
         //
         // Instead, defer the Phase 1/2 decision: return `RetryAfterBackoff`
-        // so the caller sleeps and re-runs `decide_with_llm`. If the rate
-        // limit clears, the next call proceeds normally. If it doesn't, the
-        // caller's retry loop will eventually exhaust `max_llm_retries` and
-        // surface a `Stopped` to the user.
+        // so the caller sleeps and re-runs `decide_with_llm`. If retries are
+        // exhausted, the caller surfaces a `Stopped` to the user.
         //
-        // Note: `MaxTokens` and `Refusal` stop reasons are handled earlier in
-        // `decide()` and never reach `decide_with_llm`, so any `had_error=true`
-        // here is a stream/tool error. The over-aggressive case (tool-call
-        // failure with context overflow) pays one backoff delay then resumes
-        // the normal Phase 2 flow — safe.
-        if data.had_error {
+        // Deliberately checks `had_api_error`, NOT the broader `had_error`.
+        // `had_error` is also set by a single failed tool call anywhere in
+        // the turn (see `AcpThread::had_error` doc) — extremely common in
+        // normal agentic work and unrelated to API availability. Gating this
+        // guard on the broad signal previously misfired constantly: a long
+        // session with context overflow plus any one incidental tool-call
+        // failure (a grep with no matches, a bad `old_string` in an edit,
+        // etc.) would defer, exhaust `max_llm_retries`, and permanently stop
+        // with a misleading "likely rate limit" reason — even though the API
+        // was healthy and Phase 2 would have worked fine immediately.
+        if data.had_api_error {
             let config = load_config_cached().unwrap_or_default();
             // failure count is incremented by the caller's retry loop on
             // receipt of this outcome; use the current value to size the
@@ -6293,30 +6306,36 @@ Ready to execute Issue 024 (Hero → Avatar rename)?";
     // --- Issue 007: API exhaustion + context overflow death spiral ------------
 
     /// Document the issue 007 guard contract: when `context_exceeds_limit` is
-    /// true AND `had_error` is true, `decide_with_llm` must return
+    /// true AND `had_api_error` is true, `decide_with_llm` must return
     /// `RetryAfterBackoff` rather than proceeding to Phase 1/2. We can't call
     /// `decide_with_llm` directly in a unit test (it needs a real LanguageModel
     /// + AsyncApp), so this test documents the decision rule as code and guards
     /// against regressions in the guard condition.
+    ///
+    /// Deliberately keyed on `had_api_error` (completion request failed), not
+    /// the broader `had_error` (also set by any failed tool call). An earlier
+    /// version of this guard used `had_error` and misfired on ordinary tool
+    /// failures unrelated to API health, permanently stopping healthy threads
+    /// with a misleading "likely rate limit" reason.
     #[test]
     fn test_issue_007_guard_condition_contract() {
         // The guard fires iff both conditions hold. Each row is
-        // (context_exceeds_limit, had_error) -> should_defer.
+        // (context_exceeds_limit, had_api_error) -> should_defer.
         let cases: &[(bool, bool, bool)] = &[
-            // Normal context-overflow Phase 1/2 path: no error, proceed.
+            // Normal context-overflow Phase 1/2 path: no API error, proceed.
             (true, false, false),
-            // Issue 007 scenario: error + overflow → defer with backoff.
+            // Issue 007 scenario: API error + overflow → defer with backoff.
             (true, true, true),
-            // Error but context fits → normal lightweight path, no defer.
+            // API error but context fits → normal lightweight path, no defer.
             (false, true, false),
             // Clean stop with room to spare → normal path, no defer.
             (false, false, false),
         ];
-        for &(ctx_exceeds, had_err, expect_defer) in cases {
-            let should_defer = ctx_exceeds && had_err;
+        for &(ctx_exceeds, had_api_err, expect_defer) in cases {
+            let should_defer = ctx_exceeds && had_api_err;
             assert_eq!(
                 should_defer, expect_defer,
-                "guard mismatch for (context_exceeds_limit={ctx_exceeds}, had_error={had_err})"
+                "guard mismatch for (context_exceeds_limit={ctx_exceeds}, had_api_error={had_api_err})"
             );
         }
     }

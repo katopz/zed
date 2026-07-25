@@ -44,8 +44,14 @@ pub struct AutoPromptContext {
     pub doc_files: Vec<String>,
     /// Why the thread stopped (end_turn, max_tokens, cancelled, refusal).
     pub stop_reason: String,
-    /// Whether the thread encountered an error.
+    /// Whether the thread encountered an error (includes a merely-failed tool
+    /// call — very common in normal work and not indicative of API health).
     pub had_error: bool,
+    /// Narrower than `had_error`: true only when the completion request
+    /// itself failed (network/stream error), never for a failed tool call.
+    /// This is the signal to use when reasoning about actual API exhaustion.
+    #[serde(default)]
+    pub had_api_error: bool,
     /// Approximate token count of this context (chars / 4).
     pub approximate_token_count: usize,
     /// Actual input token count from the thread's API usage response.
@@ -185,6 +191,7 @@ impl AutoPromptContext {
         let session_id = thread.session_id().to_string();
         let title = thread.title().map(|t| t.to_string());
         let had_error = thread.had_error();
+        let had_api_error = thread.had_api_error();
 
         let entries = thread.entries();
         let entry_count = entries.len();
@@ -282,6 +289,7 @@ impl AutoPromptContext {
             doc_files,
             stop_reason,
             had_error,
+            had_api_error,
             approximate_token_count: 0,
             actual_input_tokens: thread.token_usage().map(|u| u.input_tokens),
             iteration_count,

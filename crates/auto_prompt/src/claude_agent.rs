@@ -171,6 +171,10 @@ pub fn decide_claude(
         profile_id: None,
         actual_input_tokens: None,
         had_error: matches!(stop_reason, acp::StopReason::Refusal),
+        // Unused by this path: `decide_claude_with_llm` never checks
+        // `had_api_error` (the issue-007 guard lives only in the native
+        // `decide_with_llm`), and `context_exceeds_limit` is always false here.
+        had_api_error: false,
         stop_phase: crate::context::StopPhase::Working,
         context_exceeds_limit: false,
         approximate_token_count: 0,
