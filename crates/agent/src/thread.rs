@@ -31,7 +31,7 @@ use futures::{
     FutureExt,
     channel::{mpsc, oneshot},
     future::Shared,
-    stream::FuturesUnordered,
+    stream::{BoxStream, FuturesUnordered},
 };
 use futures::{StreamExt, stream};
 use gpui::{
@@ -3813,7 +3813,9 @@ impl Thread {
         let task = cx
             .spawn(async move |this, cx| {
                 let mut summary = String::new();
-                let mut messages = model.stream_completion(request, cx).await.log_err()?;
+                let mut messages = stream_completion_with_retry(&model, &request, cx)
+                    .await
+                    .log_err()?;
                 while let Some(event) = messages.next().await {
                     let event = event.log_err()?;
                     let text = match event {
@@ -4870,13 +4872,57 @@ pub fn build_thread_title_request(
     request
 }
 
+/// Bounded retries for one-shot metadata calls (thread summary, thread
+/// title) after a failure.
+///
+/// These calls get none of the retry benefit the main conversation turn
+/// gets from user- and auto_prompt-level retry loops — each is a single
+/// `stream_completion` call with no caller-side retry of its own. Provider
+/// key rotation (`retry_stream`, in
+/// `language_models::provider::open_ai_compatible::health`) deliberately
+/// stops rotating within a single request on a rate limit — burning every
+/// remaining healthy key on one request would starve the *next* request —
+/// and expects that next request to land on a different, healthy key (the
+/// failed one is already marked unhealthy by then). Without an outer retry
+/// here, a summary/title generation that happens to land on the
+/// currently-rate-limited key just fails outright instead of getting that
+/// next request.
+const METADATA_GENERATION_MAX_RETRIES: u32 = 2;
+const METADATA_GENERATION_RETRY_DELAY: Duration = Duration::from_millis(500);
+
+async fn stream_completion_with_retry(
+    model: &Arc<dyn LanguageModel>,
+    request: &LanguageModelRequest,
+    cx: &AsyncApp,
+) -> std::result::Result<
+    BoxStream<'static, std::result::Result<LanguageModelCompletionEvent, LanguageModelCompletionError>>,
+    LanguageModelCompletionError,
+> {
+    let mut attempt = 0;
+    loop {
+        match model.stream_completion(request.clone(), cx).await {
+            Ok(stream) => return Ok(stream),
+            Err(err) if attempt < METADATA_GENERATION_MAX_RETRIES => {
+                attempt += 1;
+                log::warn!(
+                    "metadata generation call failed (attempt {attempt}/{METADATA_GENERATION_MAX_RETRIES}): {err:#}, retrying"
+                );
+                cx.background_executor()
+                    .timer(METADATA_GENERATION_RETRY_DELAY)
+                    .await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
 pub async fn stream_thread_title(
     model: Arc<dyn LanguageModel>,
     request: LanguageModelRequest,
     cx: &AsyncApp,
 ) -> Result<String> {
     let mut title = String::new();
-    let mut events = model.stream_completion(request, cx).await?;
+    let mut events = stream_completion_with_retry(&model, &request, cx).await?;
     while let Some(event) = events.next().await {
         let LanguageModelCompletionEvent::Text(text) = event? else {
             continue;
