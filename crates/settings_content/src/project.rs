@@ -130,6 +130,7 @@ pub struct WorktreeSettingsContent {
     ///   "**/.jj",
     ///   "**/CVS",
     ///   "**/.DS_Store",
+    ///   "**/._*",
     ///   "**/Thumbs.db",
     ///   "**/.classpath",
     ///   "**/.settings"

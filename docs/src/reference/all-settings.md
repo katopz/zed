@@ -2102,6 +2102,7 @@ The result is still `)))` and not `))))))`, which is what it would be by default
     "**/.jj",
     "**/CVS",
     "**/.DS_Store",
+    "**/._*",
     "**/Thumbs.db",
     "**/.classpath",
     "**/.settings"
