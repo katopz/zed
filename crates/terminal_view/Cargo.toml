@@ -24,6 +24,7 @@ db.workspace = true
 dirs.workspace = true
 editor.workspace = true
 futures.workspace = true
+gemini_browser.workspace = true
 gpui.workspace = true
 itertools.workspace = true
 language.workspace = true

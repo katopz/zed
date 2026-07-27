@@ -179,6 +179,20 @@ fn accessibility_tree_dump(window: &Window) -> String {
     })
 }
 
+/// Upper bound on how much of a file is sent to Gemini in one prompt.
+const MAX_GEMINI_FILE_BYTES: usize = 60_000;
+
+/// The prompt used by every "Ask Gemini" entry.
+///
+/// Worded to suit both code and prose, since the same entry appears over
+/// editor selections, rendered markdown, terminal output, and agent replies.
+fn explain_prompt(text: &str) -> String {
+    format!(
+        "Explain the following in two or three short paragraphs. If it is code, focus on what it \
+         does and why it might be written this way:\n\n{text}"
+    )
+}
+
 fn ask_gemini_in_browser(
     workspace: &mut Workspace,
     prompt: String,
@@ -190,18 +204,7 @@ fn ask_gemini_in_browser(
         return;
     };
     let task = browser.update(cx, |browser, cx| browser.ask(prompt, cx));
-    show_gemini_result(workspace, task, title, window, cx);
-}
 
-/// Opens a completed Gemini reply in a read-only Markdown buffer, or surfaces
-/// the failure as a workspace error.
-fn show_gemini_result(
-    workspace: &mut Workspace,
-    task: Task<anyhow::Result<String>>,
-    title: &'static str,
-    window: &mut Window,
-    cx: &mut Context<Workspace>,
-) {
     // Driving the browser takes a while, so acknowledge the request immediately
     // instead of leaving it with no visible effect until the reply lands.
     struct AskingGemini;
@@ -215,51 +218,78 @@ fn show_gemini_result(
                 workspace.dismiss_toast(&pending_toast, cx);
             })
             .log_err();
-
-        let text = match result {
-            Ok(text) => text,
-            Err(error) => {
-                log::error!("Gemini browser request failed: {error:#}");
-                workspace
-                    .update(cx, |workspace, cx| {
-                        workspace.show_error(format!("{error:#}"), cx);
-                    })
-                    .log_err();
-                return;
-            }
-        };
-
-        workspace
-            .update_in(cx, |workspace, window, cx| {
-                let languages = workspace.project().read(cx).languages().clone();
-                // Deliberately not registered with the project's buffer store:
-                // that keeps generated text out of project search and avoids
-                // `Project::create_local_buffer` panicking on remote projects.
-                let buffer = cx.new(|cx| language::Buffer::local(text, cx));
-                cx.spawn({
-                    let buffer = buffer.clone();
-                    async move |_, cx| {
-                        if let Ok(markdown) = languages.language_for_name("Markdown").await {
-                            buffer.update(cx, |buffer, cx| buffer.set_language(Some(markdown), cx));
-                        }
-                    }
-                })
-                .detach();
-
-                let editor = cx.new(|cx| {
-                    let mut editor = Editor::for_buffer(buffer, None, window, cx);
-                    editor.set_read_only(true);
-                    editor
-                        .buffer()
-                        .update(cx, |buffer, cx| buffer.set_title(title.to_string(), cx));
-                    editor
-                });
-                let pane = workspace.active_pane().clone();
-                workspace.add_item(pane, Box::new(editor), None, true, true, window, cx);
-            })
-            .log_err();
+        show_gemini_text(workspace, result, title, cx).await;
     })
     .detach();
+}
+
+/// Opens the result of an already-started Gemini task, without a pending toast.
+///
+/// Used for requests that do not send a prompt, so there is nothing slow to
+/// acknowledge beyond a first-run browser launch.
+fn show_gemini_task(
+    task: Task<anyhow::Result<String>>,
+    title: &'static str,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    cx.spawn_in(window, async move |workspace, cx| {
+        let result = task.await;
+        show_gemini_text(workspace, result, title, cx).await;
+    })
+    .detach();
+}
+
+/// Opens a completed Gemini reply in a read-only Markdown buffer, or surfaces
+/// the failure as a workspace error.
+async fn show_gemini_text(
+    workspace: WeakEntity<Workspace>,
+    result: anyhow::Result<String>,
+    title: &'static str,
+    cx: &mut AsyncWindowContext,
+) {
+    let text = match result {
+        Ok(text) => text,
+        Err(error) => {
+            log::error!("Gemini browser request failed: {error:#}");
+            workspace
+                .update(cx, |workspace, cx| {
+                    workspace.show_error(format!("{error:#}"), cx);
+                })
+                .log_err();
+            return;
+        }
+    };
+
+    workspace
+        .update_in(cx, |workspace, window, cx| {
+            let languages = workspace.project().read(cx).languages().clone();
+            // Deliberately not registered with the project's buffer store: that
+            // keeps generated text out of project search and avoids
+            // `Project::create_local_buffer` panicking on remote projects.
+            let buffer = cx.new(|cx| language::Buffer::local(text, cx));
+            cx.spawn({
+                let buffer = buffer.clone();
+                async move |_, cx| {
+                    if let Ok(markdown) = languages.language_for_name("Markdown").await {
+                        buffer.update(cx, |buffer, cx| buffer.set_language(Some(markdown), cx));
+                    }
+                }
+            })
+            .detach();
+
+            let editor = cx.new(|cx| {
+                let mut editor = Editor::for_buffer(buffer, None, window, cx);
+                editor.set_read_only(true);
+                editor
+                    .buffer()
+                    .update(cx, |buffer, cx| buffer.set_title(title.to_string(), cx));
+                editor
+            });
+            let pane = workspace.active_pane().clone();
+            workspace.add_item(pane, Box::new(editor), None, true, true, window, cx);
+        })
+        .log_err();
 }
 
 #[cfg(debug_assertions)]
@@ -1092,11 +1122,94 @@ fn register_actions(
                 let Some(selection) = selection else {
                     return;
                 };
-                let prompt = format!(
-                    "Explain the following code in two or three short paragraphs, focusing on \
-                     what it does and why it might be written this way:\n\n{selection}"
+                ask_gemini_in_browser(workspace, explain_prompt(&selection), "Gemini", window, cx);
+            },
+        )
+        .register_action(
+            |workspace: &mut Workspace,
+             action: &zed_actions::gemini_browser::AskGeminiAbout,
+             window: &mut Window,
+             cx: &mut Context<Workspace>| {
+                if action.text.trim().is_empty() {
+                    return;
+                }
+                ask_gemini_in_browser(
+                    workspace,
+                    explain_prompt(&action.text),
+                    "Gemini",
+                    window,
+                    cx,
                 );
-                ask_gemini_in_browser(workspace, prompt, "Gemini", window, cx);
+            },
+        )
+        .register_action(
+            |workspace: &mut Workspace,
+             action: &zed_actions::gemini_browser::AskGeminiAboutFile,
+             window: &mut Window,
+             cx: &mut Context<Workspace>| {
+                let Some(browser) = gemini_browser::GeminiBrowser::global(cx) else {
+                    return;
+                };
+                let path = action.path.clone();
+                let fs = workspace.app_state().fs.clone();
+                let title = "Gemini";
+
+                struct AskingGeminiAboutFile;
+                let pending_toast = NotificationId::unique::<AskingGeminiAboutFile>();
+                workspace.show_toast(
+                    Toast::new(pending_toast.clone(), "Asking Gemini\u{2026}"),
+                    cx,
+                );
+
+                cx.spawn_in(window, async move |workspace, cx| {
+                    let contents = match fs.load(&path).await {
+                        Ok(contents) => contents,
+                        Err(error) => {
+                            workspace
+                                .update(cx, |workspace, cx| {
+                                    workspace.dismiss_toast(&pending_toast, cx);
+                                    workspace.show_error(
+                                        format!("Could not read {}: {error:#}", path.display()),
+                                        cx,
+                                    );
+                                })
+                                .log_err();
+                            return;
+                        }
+                    };
+
+                    // Whole files can exceed what the composer will accept, so
+                    // send a bounded prefix and say so rather than silently
+                    // asking about a truncated file.
+                    let body = gemini_browser::truncate_at_char_boundary(
+                        &contents,
+                        MAX_GEMINI_FILE_BYTES,
+                    );
+                    let truncated = body.len() < contents.len();
+                    let name = path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().to_string())
+                        .unwrap_or_else(|| path.display().to_string());
+                    let mut prompt = format!(
+                        "Explain the file `{name}` in two or three short paragraphs, focusing on \
+                         what it does and why it might be written this way"
+                    );
+                    if truncated {
+                        prompt.push_str(" (only the first part of the file is included)");
+                    }
+                    prompt.push_str(":\n\n");
+                    prompt.push_str(body);
+
+                    let task = browser.update(cx, |browser, cx| browser.ask(prompt, cx));
+                    let result = task.await;
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            workspace.dismiss_toast(&pending_toast, cx);
+                        })
+                        .log_err();
+                    show_gemini_text(workspace, result, title, cx).await;
+                })
+                .detach();
             },
         )
         .register_action(
@@ -1128,7 +1241,7 @@ fn register_actions(
             },
         )
         .register_action(
-            |workspace: &mut Workspace,
+            |_workspace: &mut Workspace,
              _: &zed_actions::gemini_browser::DiagnoseGeminiBrowser,
              window: &mut Window,
              cx: &mut Context<Workspace>| {
@@ -1136,7 +1249,7 @@ fn register_actions(
                     return;
                 };
                 let task = browser.update(cx, |browser, cx| browser.diagnose(cx));
-                show_gemini_result(workspace, task, "Gemini Selectors", window, cx);
+                show_gemini_task(task, "Gemini Selectors", window, cx);
             },
         )
         .register_action(|_, _: &Minimize, window, _| {

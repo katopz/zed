@@ -248,6 +248,52 @@ look like the new reply.
    and which candidate selectors match, which is what to update in
    `COMPOSER_SELECTORS`/`RESPONSE_SELECTORS` in `gemini_page.rs`.
 
+### Increment 2: "Ask Gemini" everywhere there is a Copy-style entry
+
+Extends the entry point from the editor context menu to every surface with a
+Copy-ish action, per the user's follow-up.
+
+Two new actions in `zed_actions::gemini_browser`, both `no_json, no_register`
+(the `ChangeKeybinding` precedent) because they carry their payload from the
+menu that built them and there is nothing sensible to bind a key to:
+
+- `AskGeminiAbout { text }` — for menus that already hold the text.
+- `AskGeminiAboutFile { path }` — takes a path rather than text because a
+  synchronous menu builder cannot read a file off the main thread.
+
+The original `AskGeminiAboutSelection` (unit, registered) is kept so the
+editor case stays keybindable and discoverable in the palette.
+
+Surfaces wired up:
+
+| Surface | File | Text used |
+| --- | --- | --- |
+| Editor selection | `editor/src/mouse_context_menu.rs` | buffer text for the newest selection (increment 1) |
+| Markdown preview | `markdown_preview/src/markdown_preview_view.rs` | captured selection, markdown source preferred over rendered text so it matches "Copy as Markdown" |
+| Agent thread | `agent_ui/src/conversation_view/thread_view.rs` | captured selection of whichever chunk was right-clicked, mirroring "Copy Selection" |
+| Terminal | `terminal_view/src/terminal_view.rs` | `last_content.selection_text` |
+| Project panel | `project_panel/src/project_panel.rs` | file contents, read in the handler |
+
+Notes on the two non-obvious ones:
+
+- **Project panel.** The panel's "Copy" is a *file* operation (stages entries
+  for Paste), not copy-text — the text-ish entries there are "Copy Path" /
+  "Copy Relative Path", so "Ask Gemini" is grouped with those. It is offered
+  only for files (a directory has no contents to send) and only for local
+  worktrees, since the handler reads from disk directly. File contents are
+  capped at `MAX_GEMINI_FILE_BYTES` (60 KB) via
+  `truncate_at_char_boundary`, and the prompt says so explicitly rather than
+  silently asking about a truncated file.
+- **Terminal.** Not in the original list but included since it is the same
+  copy-the-selection shape and is arguably the most useful case (asking about
+  an error that just scrolled by). It sits next to the existing
+  "Add to Agent Thread" entry.
+
+Every entry is gated on `gemini_browser.enabled`, so with the feature off none
+of these menus change at all. One shared prompt (`explain_prompt`) is used
+across all surfaces, worded to suit both code and prose since the same entry
+now appears over source, rendered markdown, terminal output, and agent replies.
+
 ### Verification status
 
 - `cargo check -p gemini_browser`, `-p editor`, `-p zed --bin zed` — all clean
@@ -256,8 +302,15 @@ look like the new reply.
   guard).
 - `./script/clippy -p gemini_browser` — exit 0, including `cargo machete`
   (which caught two genuinely unused deps, `schemars` and `serde`, now removed).
-- `cargo clippy -p editor` / `-p zed --all-targets -- --deny warnings` — exit 0,
-  zero findings in the touched files.
+- `cargo clippy -p editor` / `-p zed --bins` / `-p zed_actions` /
+  `-p markdown_preview` / `-p terminal_view` / `-p project_panel` /
+  `-p agent_ui --lib`, all `-- --deny warnings` — exit 0, zero findings in the
+  touched files.
+- `cargo clippy -p agent_ui --all-targets` fails, but only in that crate's
+  **pre-existing** broken test code: `conversation_view.rs` (a file this work
+  never touches) references `LanguageModelRegistry` 8 times with 0 imports at
+  HEAD, and some `thread_view.rs` test helpers are out of date with the current
+  `acp_thread` structs. The library target lints clean.
 - **Not yet run: the release-profile `./script/clippy` for `editor`/`zed`.** The
   `target/release` directory is in a corrupted state in this working copy
   (duplicate `rustix` rmeta, `can't find crate for gpui` in untouched crates

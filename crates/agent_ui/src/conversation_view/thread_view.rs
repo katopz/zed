@@ -8718,6 +8718,35 @@ impl ThreadView {
                         })
                     });
 
+                    // Mirrors "Copy Selection": the markdown source of whichever
+                    // chunk the right-click captured a selection in.
+                    let gemini_enabled = {
+                        use settings::Settings as _;
+                        gemini_browser::GeminiBrowserSettings::get_global(cx).enabled
+                    };
+                    let ask_gemini_text = gemini_enabled
+                        .then(|| {
+                            chunks.and_then(|chunks| {
+                                chunks.iter().find_map(|chunk| {
+                                    let md = match chunk {
+                                        AssistantMessageChunk::Message { block, .. } => {
+                                            block.markdown()
+                                        }
+                                        AssistantMessageChunk::Thought { block, .. } => {
+                                            block.markdown()
+                                        }
+                                    };
+                                    md.and_then(|m| {
+                                        let m = m.read(cx);
+                                        m.context_menu_selected_markdown()
+                                            .or_else(|| m.context_menu_selected_text())
+                                            .cloned()
+                                    })
+                                })
+                            })
+                        })
+                        .flatten();
+
                     let copy_this_agent_response =
                         ContextMenuEntry::new("Copy This Agent Response").handler({
                             let entity = entity.clone();
@@ -8780,6 +8809,16 @@ impl ThreadView {
                             "Copy Selection",
                             Box::new(markdown::CopyAsMarkdown),
                         )
+                        .when_some(ask_gemini_text, |menu, text| {
+                            menu.entry("Ask Gemini", None, move |window, cx| {
+                                window.dispatch_action(
+                                    Box::new(zed_actions::gemini_browser::AskGeminiAbout {
+                                        text: text.to_string(),
+                                    }),
+                                    cx,
+                                );
+                            })
+                        })
                         .item(copy_this_agent_response)
                         .separator()
                         .item(scroll_item)

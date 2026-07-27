@@ -1118,6 +1118,17 @@ impl ProjectPanel {
             };
 
             let has_pasteable_content = self.has_pasteable_content(cx);
+            // Only offered for files: a directory has no contents to send, and
+            // only when the file is on this machine, since the contents are read
+            // from disk directly rather than through the project.
+            let ask_gemini_path = {
+                use settings::Settings as _;
+                gemini_browser::GeminiBrowserSettings::get_global(cx).enabled
+            }
+            .then(|| {
+                (!is_dir && is_local).then(|| worktree.absolutize(&entry.path))
+            })
+            .flatten();
             let context_menu = ContextMenu::build(window, cx, |menu, _, cx| {
                 menu.context(self.focus_handle.clone()).map(|menu| {
                     if is_read_only {
@@ -1183,6 +1194,14 @@ impl ProjectPanel {
                                 "Copy Relative Path",
                                 Box::new(zed_actions::workspace::CopyRelativePath),
                             )
+                            .when_some(ask_gemini_path.clone(), |menu, path| {
+                                menu.action(
+                                    "Ask Gemini",
+                                    Box::new(zed_actions::gemini_browser::AskGeminiAboutFile {
+                                        path,
+                                    }),
+                                )
+                            })
                             .when(has_git_repo, |menu| {
                                 menu.separator()
                                     .when(!is_dir && self.has_git_changes(entry_id), |menu| {

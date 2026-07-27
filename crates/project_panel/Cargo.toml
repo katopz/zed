@@ -24,6 +24,7 @@ file_icons.workspace = true
 futures.workspace = true
 git_ui.workspace = true
 git.workspace = true
+gemini_browser.workspace = true
 gpui.workspace = true
 itertools.workspace = true
 menu.workspace = true

@@ -1446,6 +1446,20 @@ impl Render for MarkdownPreviewView {
                                     {
                                         return None;
                                     }
+                                    // Prefer the markdown source over the rendered
+                                    // text, so Gemini sees the same thing "Copy as
+                                    // Markdown" would put on the clipboard.
+                                    let ask_gemini_text = {
+                                        use settings::Settings as _;
+                                        gemini_browser::GeminiBrowserSettings::get_global(cx)
+                                            .enabled
+                                    }
+                                    .then(|| {
+                                        selected_markdown
+                                            .clone()
+                                            .or_else(|| selected_text.clone())
+                                    })
+                                    .flatten();
                                     Some(ContextMenu::build(window, cx, move |menu, _, _cx| {
                                         menu.when_some(focus, |menu, focus| menu.context(focus))
                                             .when_some(selected_text, |menu, text| {
@@ -1478,6 +1492,18 @@ impl Render for MarkdownPreviewView {
                                                 menu.entry("Copy Link", None, move |_, cx| {
                                                     cx.write_to_clipboard(
                                                         ClipboardItem::new_string(url.to_string()),
+                                                    );
+                                                })
+                                            })
+                                            .when_some(ask_gemini_text, |menu, text| {
+                                                menu.entry("Ask Gemini", None, move |window, cx| {
+                                                    window.dispatch_action(
+                                                        Box::new(
+                                                            zed_actions::gemini_browser::AskGeminiAbout {
+                                                                text: text.to_string(),
+                                                            },
+                                                        ),
+                                                        cx,
                                                     );
                                                 })
                                             })

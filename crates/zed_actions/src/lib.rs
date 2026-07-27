@@ -444,7 +444,10 @@ pub mod theme {
 }
 
 pub mod gemini_browser {
-    use gpui::actions;
+    use gpui::{Action, actions};
+    use schemars::JsonSchema;
+    use serde::{Deserialize, Serialize};
+    use std::path::PathBuf;
 
     actions!(
         gemini_browser,
@@ -457,6 +460,28 @@ pub mod gemini_browser {
             DiagnoseGeminiBrowser
         ]
     );
+
+    /// Asks Gemini about a specific piece of text.
+    ///
+    /// Carries its own text so context menus outside the editor (markdown
+    /// preview, agent threads) can ask about content the editor selection does
+    /// not cover. Not registered, since it is only ever dispatched from a menu
+    /// that supplies the text — there is nothing sensible to bind a key to.
+    #[derive(PartialEq, Clone, Default, Debug, Action, JsonSchema, Serialize, Deserialize)]
+    #[action(namespace = gemini_browser, no_json, no_register)]
+    pub struct AskGeminiAbout {
+        pub text: String,
+    }
+
+    /// Asks Gemini about the contents of a file.
+    ///
+    /// Takes a path rather than text because the file has to be read off the
+    /// main thread, which a synchronous menu builder cannot do.
+    #[derive(PartialEq, Clone, Default, Debug, Action, JsonSchema, Serialize, Deserialize)]
+    #[action(namespace = gemini_browser, no_json, no_register)]
+    pub struct AskGeminiAboutFile {
+        pub path: PathBuf,
+    }
 }
 
 pub mod theme_selector {

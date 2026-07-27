@@ -525,6 +525,19 @@ impl TerminalView {
             .upgrade()
             .and_then(|workspace| workspace.read(cx).panel::<TerminalPanel>(cx))
             .is_some_and(|terminal_panel| terminal_panel.read(cx).assistant_enabled());
+        let ask_gemini_text = {
+            use settings::Settings as _;
+            gemini_browser::GeminiBrowserSettings::get_global(cx).enabled
+        }
+        .then(|| {
+            self.terminal()
+                .read(cx)
+                .last_content
+                .selection_text
+                .clone()
+                .filter(|text| !text.trim().is_empty())
+        })
+        .flatten();
         let context_menu = ContextMenu::build(window, cx, |menu, _, _| {
             menu.context(self.focus_handle.clone())
                 .when(self.shows_workspace_actions(), |menu| {
@@ -536,6 +549,16 @@ impl TerminalView {
                         .separator()
                 })
                 .action("Copy", Box::new(Copy))
+                .when_some(ask_gemini_text.clone(), |menu, text| {
+                    menu.entry("Ask Gemini", None, move |window, cx| {
+                        window.dispatch_action(
+                            Box::new(zed_actions::gemini_browser::AskGeminiAbout {
+                                text: text.clone(),
+                            }),
+                            cx,
+                        );
+                    })
+                })
                 .when(
                     !matches!(self.mode, TerminalMode::Embedded { .. }),
                     |menu| {
