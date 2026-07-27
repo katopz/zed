@@ -2469,6 +2469,16 @@
     "google": {
       "api_url": "https://generativelanguage.googleapis.com",
     },
+    // Drive gemini.google.com under your existing web subscription (Google
+    // AI Pro/Ultra, Workspace Gemini add-on) via a logged-in Chrome profile.
+    // Off by default — local-only PoC, never shipped as a default Zed feature.
+    // After enabling, click Sign in once in Settings → AI → Gemini Web to
+    // launch Chrome and log into gemini.google.com with your account.
+    "gemini_web": {
+      "enabled": false,
+      "headless": false,
+      "response_timeout_seconds": 120,
+    },
     "ollama": {
       "api_url": "http://localhost:11434",
     },

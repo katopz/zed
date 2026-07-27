@@ -9865,6 +9865,7 @@ dependencies = [
  "anthropic",
  "anyhow",
  "async-lock",
+ "async-tungstenite",
  "aws-config",
  "aws-credential-types",
  "aws-sigv4",
@@ -9892,6 +9893,7 @@ dependencies = [
  "futures 0.3.32",
  "google_ai",
  "gpui",
+ "gpui_platform",
  "gpui_tokio",
  "http_client",
  "language",
@@ -9917,6 +9919,7 @@ dependencies = [
  "serde_json",
  "settings",
  "sha2",
+ "shellexpand",
  "smol",
  "strum 0.27.2",
  "tokio",
@@ -9924,6 +9927,8 @@ dependencies = [
  "ui_input",
  "url",
  "util",
+ "uuid",
+ "workspace",
  "x_ai",
 ]
 
