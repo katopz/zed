@@ -221,40 +221,46 @@ Each `stream_completion_text(request, cx)` call:
 
 ### Branch setup
 
-- [ ] `git checkout de146c3528c8ad00b023609d08cbc2a032620e41`
-- [ ] `git checkout -b gemini_cli_proxy` (name per user's spec; the provider
-      id is still `gemini-web`, branch name is bikesheddable later)
-- [ ] Do NOT cherry-pick anything from `gemini_browser`. User said drop it.
-      Write fresh — the engine code isn't worth saving vs. clean room.
+- [x] `git checkout de146c3528c8ad00b023609d08cbc2a032620e41`
+- [x] `git checkout -b gemini_cli_proxy`
+- [x] Do NOT cherry-pick anything from `gemini_browser`. User said drop it.
+      Wrote fresh — the engine code isn't worth saving vs. clean room.
 
 ### Core implementation
 
-- [ ] `crates/language_models/src/provider/gemini_web.rs` skeleton:
+- [x] `crates/language_models/src/provider/gemini_web.rs` skeleton:
       provider + model structs, traits impl'd with stub methods.
-- [ ] Wire into `register_language_model_providers` (one line).
-- [ ] `GeminiWebSettings` in settings.rs, default-off in `default.json`.
-- [ ] `cdp` module: `Cdp` struct, `attach_to_page`, `evaluate`,
-      `insert_text`, `press_key`. Test against a real Chrome headless with
-      `about:blank` + `Runtime.evaluate('1+1')` returning `2`.
-- [ ] `chrome` module: `launch(profile_dir, headless)` launches Chrome with
-      `--user-data-dir` + `--remote-debugging-port=0` (let Chrome pick port),
-      reads the port from `DevToolsActivePort`, returns `(Child, port)`.
-      Reuse existing Chrome on same profile if already running.
-- [ ] `GeminiWebBrowserState`: GPUI entity owning Chrome child + CDP conn +
-      auth state. Serialize concurrent requests via smol channel.
-- [ ] `GeminiWebProvider::authenticate`: launch visible Chrome on profile,
-      navigate to `gemini.google.com`, poll for login completion, flip auth
-      state.
-- [ ] `GeminiWebModel::stream_completion_text`: serialize request →
-      `GeminiPage::ask` → emit single completion event.
+- [x] Wire into `register_language_model_providers` (one line).
+- [x] `GeminiWebSettings` in settings.rs, default-off in `default.json`.
+- [x] `cdp` module: `Cdp` struct, `attach_to_page`, `evaluate`,
+      `insert_text`, `press_key`. Connect via smol TcpStream +
+      async-tungstenite client_async, no runtime feature needed.
+- [x] `chrome` module: spawn via util::process::Child (process-group
+      kill on drop), wait for DevToolsActivePort, find Gemini target
+      via HTTP /json.
+- [x] `State`: GPUI entity owning Chrome child + cached ws URL + auth
+      state. Serialize concurrent requests via smol Semaphore(1).
+- [x] `GeminiWebLanguageModelProvider::authenticate`: spawn via
+      cx.spawn (not background_spawn — AsyncApp is !Send), launch
+      visible Chrome on profile, navigate to gemini.google.com,
+      poll for login completion via per-poll CDP connect, flip auth
+      state, cache ws_url.
+- [x] `GeminiWebModel::stream_completion`: extract everything Send
+      from cx up front (cx.update is sync), then build Send-only future
+      that connects to cached ws_url, drives GeminiPage::ask, emits
+      StartMessage/Text/Stop events.
+- [x] `cargo clippy -p language_models --lib --no-deps -- --deny warnings`
+      passes clean. `cargo build -p language_models --lib` passes.
 
 ### Live DOM tuning (the do-or-die step)
 
 - [ ] Build Zed, enable provider, click Sign-in, log in as
       `katopz@maxion.game`.
-- [ ] Run a `diagnose` action against the signed-in page → capture which
-      candidate selectors match for composer + response container.
-- [ ] Pin winning selectors, drop non-matching candidates.
+- [ ] Verify the candidate selectors in `COMPOSER_SELECTORS` and
+      `RESPONSE_SELECTORS` actually match the signed-in DOM. If not,
+      update them based on what `GeminiPage::diagnose` (currently dead
+      code, can be re-wired as a `gemini-web: diagnose` action later)
+      reports.
 - [ ] End-to-end smoke: native Zed agent with `provider: "gemini-web"`,
       model `gemini-web-3`, send a prompt, get a sensible reply.
 
