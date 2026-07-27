@@ -224,6 +224,10 @@ pub fn deploy_context_menu(
             editor.buffer.read(cx).as_singleton().as_ref(),
             cx,
         );
+        let gemini_browser_enabled = {
+            use settings::Settings as _;
+            gemini_browser::GeminiBrowserSettings::get_global(cx).enabled
+        };
 
         let is_markdown = editor
             .buffer()
@@ -282,6 +286,12 @@ pub fn deploy_context_menu(
                 )
                 .when(!disable_ai && has_selections, |this| {
                     this.action("Add to Agent Thread", Box::new(AddSelectionToThread))
+                })
+                .when(!disable_ai && has_selections && gemini_browser_enabled, |this| {
+                    this.action(
+                        "Ask Gemini",
+                        Box::new(zed_actions::gemini_browser::AskGeminiAboutSelection),
+                    )
                 })
                 .separator()
                 .action("Cut", Box::new(Cut))

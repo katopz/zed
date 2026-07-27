@@ -699,6 +699,7 @@ fn main() {
         zed::telemetry_log::init(cx);
         zed::remote_debug::init(cx);
         edit_prediction_ui::init(cx);
+        gemini_browser::init(cx);
         web_search::init(cx);
         web_search_providers::init(app_state.client.clone(), app_state.user_store.clone(), cx);
         snippet_provider::init(cx);

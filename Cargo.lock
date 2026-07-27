@@ -5780,6 +5780,7 @@ dependencies = [
  "futures 0.3.32",
  "futures-lite 1.13.0",
  "fuzzy",
+ "gemini_browser",
  "git",
  "gpui",
  "indoc",
@@ -7207,6 +7208,22 @@ dependencies = [
  "siphasher 0.3.11",
  "smallvec",
  "triomphe",
+]
+
+[[package]]
+name = "gemini_browser"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-tungstenite",
+ "futures 0.3.32",
+ "gpui",
+ "log",
+ "paths",
+ "serde_json",
+ "settings",
+ "smol",
+ "util",
 ]
 
 [[package]]
@@ -23236,6 +23253,7 @@ dependencies = [
  "file_finder",
  "fs",
  "futures 0.3.32",
+ "gemini_browser",
  "git",
  "git_hosting_providers",
  "git_ui",

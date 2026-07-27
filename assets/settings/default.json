@@ -2667,6 +2667,20 @@
     // Delay in milliseconds before showing the which-key popup.
     "delay_ms": 1000,
   },
+  // Ask Gemini through a Chrome session driven by Zed. Chrome runs in its own
+  // profile and must be signed in to Gemini once before it can answer.
+  "gemini_browser": {
+    // Whether to enable the browser-driven Gemini integration.
+    "enabled": false,
+    // Path to the Chrome or Chromium binary. When null, common install
+    // locations are searched.
+    "chrome_path": null,
+    // Run Chrome without a visible window. Signing in requires a visible
+    // window, so leave this off until the profile has a saved session.
+    "headless": false,
+    // How long to wait for a Gemini response before giving up, in seconds.
+    "response_timeout_seconds": 120,
+  },
   // The server to connect to. If the environment variable
   // ZED_SERVER_URL is set, it will override this setting.
   "server_url": "https://zed.dev",

@@ -280,6 +280,9 @@ pub struct SettingsContent {
     /// Settings for the which-key popup.
     pub which_key: Option<WhichKeySettingsContent>,
 
+    /// Settings for asking Gemini through a browser session.
+    pub gemini_browser: Option<GeminiBrowserSettingsContent>,
+
     /// Settings related to Vim mode in Zed.
     pub vim: Option<VimSettingsContent>,
 
@@ -1367,6 +1370,33 @@ pub struct WhichKeySettingsContent {
     ///
     /// Default: 700
     pub delay_ms: Option<u64>,
+}
+
+/// Settings for asking Gemini through a Chrome session driven by Zed.
+///
+/// This drives the Gemini web app in a separate Chrome profile using the Chrome
+/// DevTools Protocol, so the browser must be signed in to Gemini once before it
+/// can answer.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct GeminiBrowserSettingsContent {
+    /// Whether to enable the browser-driven Gemini integration.
+    ///
+    /// Default: false
+    pub enabled: Option<bool>,
+    /// Path to the Chrome or Chromium binary to drive. When unset, common
+    /// install locations are searched.
+    ///
+    /// Default: null
+    pub chrome_path: Option<String>,
+    /// Run Chrome without a visible window. Signing in to Gemini requires a
+    /// visible window, so leave this off until the profile has a saved session.
+    ///
+    /// Default: false
+    pub headless: Option<bool>,
+    /// How long to wait for a Gemini response before giving up, in seconds.
+    ///
+    /// Default: 120
+    pub response_timeout_seconds: Option<u64>,
 }
 
 // An ExtendingVec in the settings can only accumulate new values.

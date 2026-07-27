@@ -112,6 +112,7 @@ feedback.workspace = true
 file_finder.workspace = true
 fs.workspace = true
 futures.workspace = true
+gemini_browser.workspace = true
 git.workspace = true
 git_hosting_providers.workspace = true
 git_ui = { workspace = true, features = ["call"] }

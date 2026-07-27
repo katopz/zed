@@ -443,6 +443,22 @@ pub mod theme {
     actions!(theme, [ToggleMode]);
 }
 
+pub mod gemini_browser {
+    use gpui::actions;
+
+    actions!(
+        gemini_browser,
+        [
+            /// Asks Gemini about the selected text in a browser session and opens the reply.
+            AskGeminiAboutSelection,
+            /// Opens the Gemini browser window without sending a prompt, to sign in.
+            OpenGeminiBrowser,
+            /// Reports which Gemini page selectors currently match, for debugging.
+            DiagnoseGeminiBrowser
+        ]
+    );
+}
+
 pub mod theme_selector {
     use gpui::Action;
     use schemars::JsonSchema;

@@ -51,6 +51,7 @@ futures-lite.workspace = true
 fuzzy.workspace = true
 fs.workspace = true
 git.workspace = true
+gemini_browser.workspace = true
 gpui.workspace = true
 indoc.workspace = true
 edit_prediction_types.workspace = true
