@@ -1,37 +1,57 @@
-# Plan 012: Gemini web-session ACP proxy (`gemini-web-acp`)
+# Plan 012: `gemini-web` native LLM provider (web-session proxy)
 
-## Problem (revised — billing, not auth)
+## Problem
 
-**Prior framing was wrong.** The original assumption was "no API key available,
-so use the web session". The real driver is **billing isolation**:
+`gemini.google.com` runs against the user's existing flat-fee subscription
+(Google AI Pro/Ultra, or Workspace Gemini add-on). Every other access path
+bills separately, on top of that subscription:
 
-- The `gemini.google.com` web UI runs against the user's existing flat-fee
-  subscription (Google AI Pro/Ultra, or Workspace Gemini add-on).
-- `gemini-cli`'s "Sign in with Google" path for **Workspace** accounts
-  (`katopz@maxion.game`) routes through a GCP project + Vertex/Gemini for Cloud
-  API — **metered billing, separate from and on top of** the web subscription.
-- Personal-Gmail OAuth (`katopz@gmail.com`) is free-tier (60 req/min,
-  1000 req/day) but doesn't use the paid subscription either.
-- Result: any non-browser path means paying twice — once for the web
-  subscription the user already has, once for API/Vertex usage.
+| Path | Uses existing subscription? | Billing |
+|---|---|---|
+| Web UI (`gemini.google.com`) | ✅ Yes | $0 marginal |
+| `gemini-cli` OAuth + Workspace (`katopz@maxion.game`) | ❌ No | GCP/Vertex metered, on top |
+| `gemini-cli` OAuth + personal Gmail | ❌ No | Free tier, then hard stop |
+| `gemini-cli` API key | ❌ No | Metered |
+| **This plan: native provider driving the web UI** | ✅ Yes | $0 marginal |
 
-**The web session is the only path that uses the subscription the user already
-pays for.** That's why the proxy exists. Not a workaround for missing auth,
-a workaround for double-billing.
+The web session is the only path that uses the subscription the user already
+pays for. Goal: expose that web session as a native Zed LLM provider so the
+native Zed agent (and any custom agent that picks a model) can use it from
+the model dropdown, exactly like Claude / OpenAI / the existing Google API
+provider.
 
-## Architecture (CLI, no Zed UI)
+## Architecture: native LLM provider, not ACP, not UI features
 
-Per the user's "stick with cli no ui as possible" — this is a **standalone
-binary that speaks ACP over stdio**, registered in Zed as a custom agent.
-Zero changes to Zed's codebase. The user installs the binary, adds one entry
-to `agent_servers` in settings, and a "Gemini (web)" thread shows up in the
-agent panel next to Gemini CLI / Claude / Codex.
+Earlier iterations of this plan (and the abandoned `gemini_browser` branch)
+went ACP-external-agent and UI-everywhere respectively. Both wrong:
+
+- **ACP external agent** (like `claude-acp`, `gemini-cli`) means a separate
+  process that owns its own conversation, tools, history. Wrong shape — the
+  user wants to use Zed's native agent, which uses Zed's LLM providers, not
+  to start a separate thread type.
+- **UI-everywhere** (`gemini_browser` branch: right-click Ask Gemini in 5
+  surfaces, ~1700 lines across 12 Zed crates) was never validated against
+  real Gemini and made the surface area unmanageable. User explicitly said
+  "fuck it", drop all of it.
+
+**Native LLM provider** is the right shape:
+
+- Implement `LanguageModelProvider` for `GeminiWebProvider` and
+  `LanguageModel` for `GeminiWebModel` in
+  `crates/language_models/src/provider/gemini_web.rs`.
+- Register in `register_language_model_providers` (one line, no enum surgery
+  — `LanguageModelProviderId("gemini-web".into())`).
+- User picks "Gemini Web" from the model dropdown in agent settings, native
+  Zed agent uses it as `provider: "gemini-web"`, works with all Zed agent
+  features because it's a regular LLM provider.
+- Only implement `stream_completion_text` for v1 (no tool calling, no image
+  input). Tools/image deferred — those need extra CDP plumbing.
 
 ```
-Zed agent panel
-    │ ACP (JSON-RPC over stdio)
+Native Zed agent (or any custom agent)
+    │ uses normal LanguageModelRequest
     ▼
-gemini-web-acp binary  ◄── new crate, standalone
+GeminiWebModel::stream_completion_text   ◄── new code
     │ CDP (WebSocket on localhost)
     ▼
 Chrome with dedicated profile (logged in once)
@@ -40,209 +60,245 @@ Chrome with dedicated profile (logged in once)
 gemini.google.com  ◄── uses existing web subscription
 ```
 
-Why this shape and not the `gemini_browser` branch's shape:
-
-- **`gemini_browser` failed because it was UI-first**: right-click "Ask Gemini"
-  in 5 surfaces (editor, markdown preview, terminal, project panel, agent
-  threads), custom Zed actions, custom settings, modifications across 12+
-  Zed crates. ~2100 lines, never validated end-to-end against real Gemini.
-  Heavy surface area, fragile integration, no actual proof it answers.
-- **This plan is binary-first**: one new crate outside Zed's tree (or in
-  `crates/` but not wired into the Zed binary), one settings entry, zero
-  editor integration. Prove the proxy works as a CLI first; UI is a later
-  increment only if the CLI path lands.
-
 ## Scope
 
-### In scope
+### In scope (v1)
 
-- New Rust binary `gemini-web-acp` (name bikesheddable).
-- Minimal ACP server loop over stdio: handle `initialize`, `newSession`,
-  `prompt`, `cancel`, `sessionHistory`. Stream `session/update` events back.
-- CDP client to drive Chrome — port `crates/gemini_browser/src/cdp.rs`
-  from the `gemini_browser` branch (already proven to type-check and lint
-  clean, deliberately hand-written over `async-tungstenite`/smol to avoid
-  the tokio-in-smol problem `chromiumoxide` would introduce).
-- Gemini page automation — port `crates/gemini_browser/src/gemini_page.rs`,
-  but **the selectors must be tuned against the real signed-in DOM** before
-  this plan is considered done (this is the part `gemini_browser` never did).
-- One-time login flow: visible Chrome window on a dedicated profile dir, user
-  logs into `gemini.google.com` once with `katopz@maxion.game`, cookies
-  persist in the profile, all subsequent runs are headless.
-- CLI mode: `gemini-web-acp prompt "explain this code"` for non-ACP use
-  (smoke testing, scripting). Same binary, different entry point.
+- New file `crates/language_models/src/provider/gemini_web.rs`:
+  - `GeminiWebProvider` impl — `id`, `name`, `provided_models`,
+    `is_authenticated` (checks profile for valid session cookies),
+    `authenticate` (opens visible Chrome for one-time login),
+    `authentication_error_message` override (no API key to check),
+    `settings_view` (profile path + Chrome path + Sign-in button).
+  - `GeminiWebModel` impl — `id`, `name`, `provider_id`, `provider_name`,
+    `stream_completion_text`.
+  - Internal CDP client module — hand-written JSON-RPC over WebSocket using
+    `async-tungstenite` (already a workspace dep, smol stack — no tokio
+    infection). Only `Target` + `Runtime` + `Input` + `Page` domains. Drops
+    the `chromiumoxide` and `obscura` ideas from earlier iterations.
+  - Internal Chrome process management module — launch/reuse Chrome with
+    `--user-data-dir=<profile>` + `--remote-debugging-port=<port>`, read
+    `DevToolsActivePort`, process-group kill on provider drop.
+- Wire into `crates/language_models/src/language_models.rs`:
+  `register_language_model_providers` gets one new line.
+- New setting in `crates/language_models/src/settings.rs`:
+  `GeminiWebSettings { enabled, chrome_path, profile_dir, headless,
+  response_timeout_seconds }` (mirror `gemini_browser`'s setting shape —
+  that part was fine).
+- Default-off in `assets/settings/default.json`.
 
-### Out of scope (explicitly)
+### Deferred (separate increments, not this plan)
 
-- No Zed crate modifications. No `crates/editor`, `crates/agent_ui`,
-  `crates/zed` changes. No context menus, no actions, no settings additions
-  beyond the user's own `agent_servers` entry.
-- No obscura. No stealth/anti-fingerprinting. No `chromiumoxide`.
-- No thread-history import from Gemini (Gemini web has no thread-list API;
-  each Zed thread maps 1:1 to a fresh Gemini conversation).
-- No `open_links_in` link interception.
-- No GPUI texture-rendered browser pane.
+- Right-click "Ask Gemini" context menu entries. User explicitly deferred
+  this to a later plan once the provider lands.
+- Tool calling. Requires extra CDP plumbing to interact with Gemini's own
+  tool UI (search grounding, etc).
+- Image input. Requires uploading via the composer's file picker through CDP.
+- Streaming responses (v1 waits for text-stability, posts once). Streaming
+  needs a `MutationObserver` bridge from the page → CDP `Runtime.bindingEvent`
+  → provider → `LanguageModelCompletionEvent`.
+- Session-per-thread: v1 reuses one Gemini conversation for all Zed prompts
+  (each prompt is sent as a follow-up). 1:1 Zed-thread ↔ Gemini-conversation
+  mapping deferred.
 
-## Hard constraints (unchanged from prior 012)
+### Explicitly out
 
-- Real Chrome + real profile only. No stealth, no spoofing.
-- Single session, human-paced, no bulk automation, no multi-account.
-- Default-off — user has to install the binary and add the settings entry.
-  Never shipped as a default Zed feature.
-- If this ever needs to ship to other users, the answer is the real Gemini
-  API path, not this proxy.
+- No ACP server binary. Wrong shape.
+- No `obscura`, no `chromiumoxide`. Real Chrome via hand-written CDP.
+- No `stealth`/anti-fingerprinting. Real Chrome + real profile.
+- No new UI surfaces in `crates/editor`, `crates/agent_ui`, `crates/zed`,
+  etc. The only UI is the standard provider settings view (Sign-in button +
+  profile path field) that every other provider already has.
+
+## Hard constraints (unchanged from prior revisions)
+
+- Real Chrome + real profile only. No stealth.
+- Single session, human-paced, no bulk automation.
+- Default-off. Never shipped as a default Zed provider. The user opts in by
+  enabling the setting and clicking Sign-in once.
+- If this ever needs to ship to other users, the answer remains the real
+  Gemini API path (`crates/language_models/src/provider/google.rs`), not
+  this proxy.
 
 ## Components
 
-### 1. `crates/gemini_web_acp/` — the binary
+### 1. `crates/language_models/src/provider/gemini_web.rs`
 
-Single crate, single binary, library root `gemini_web_acp.rs`. Roughly:
+Single new file (keep file count low per house style). Internal structure:
 
-- `main.rs` — arg parse, dispatch to `acp_server::run()` or `cli::run(prompt)`.
-- `acp_server.rs` — stdio JSON-RPC loop, ACP method handlers, drives
-  `GeminiPage` per `prompt` request. **Depend on the published
-  `agent-client-protocol = "=1.3.0"` crate** (same version Zed uses —
-  verified in root `Cargo.toml`) to get all request/response/event types
-  for free. Only the stdio framing + dispatch loop is hand-rolled.
-- `cli.rs` — one-shot prompt → print response to stdout. For smoke testing.
-- `cdp.rs` — ported from `gemini_browser/src/cdp.rs` (412 lines,
-  `Target`/`Runtime`/`Input`/`Page` only, `async-tungstenite`/smol).
-- `gemini_page.rs` — ported + **live-tuned** from `gemini_browser/src/gemini_page.rs`.
-  Candidate selectors + `diagnose()` action reused; the actual winning
-  selectors get pinned only after live DOM inspection.
-- `chrome.rs` — launch/reuse Chrome with `--user-data-dir=<profile>` +
-  `--remote-debugging-port=<port>`, read `DevToolsActivePort`.
+- `GeminiWebProvider` — public struct implementing `LanguageModelProvider`.
+  Owns a `GeminiWebBrowserState: Entity<...>` (GPUI entity for change
+  notification when auth state flips).
+- `GeminiWebModel` — public struct implementing `LanguageModel`. Holds the
+  browser state ref + model id/name.
+- `GeminiWebBrowserState` — the long-lived state: Chrome process handle,
+  CDP connection, Gemini tab target id, last-known login state.
+- `cdp` — private module. `Cdp` struct speaking JSON-RPC over smol
+  `async-tungstenite`. Methods: `attach_to_page(origin, default_url)`,
+  `evaluate(js) -> Value`, `insert_text(text)`, `press_key(key)`,
+  `wait_for_selector(selector, timeout)`.
+- `chrome` — private module. `launch(profile_dir, headless) -> Child`,
+  `find_devtools_port(profile_dir) -> u16`, `reuse_existing(port) -> bool`.
+- `gemini_page` — private module. `GeminiPage` driving the page:
+  `open(cdp) -> Self`, `ask(prompt) -> String`, `diagnose() -> String`,
+  `is_logged_in() -> bool`. Candidate selectors for composer + response
+  container — **must be live-tuned against the real signed-in DOM** before
+  this plan is considered done.
 
-Estimated size: ~1000 lines total (vs `gemini_browser`'s ~2100 with UI).
+Estimated size: ~800 lines (one file, internal modules). Roughly the engine
+size of the abandoned `gemini_browser` branch minus all the UI integration.
 
-### 2. Settings entry (user's `settings.json`, not Zed defaults)
+### 2. Registration (one line)
 
-```jsonc
-"agent_servers": {
-  // ...existing claude-acp entry...
-  "gemini-web": {
-    "type": "custom",
-    "command": "/path/to/gemini-web-acp",
-    "args": ["--acp"],
-    "env": {
-      "GEMINI_WEB_PROFILE": "~/.local/share/gemini-web-acp/profile",
-      "GEMINI_WEB_HEADLESS": "1"
-    }
-  }
+`crates/language_models/src/language_models.rs`,
+in `register_language_model_providers`:
+
+```rust
+registry.register_provider(
+    Arc::new(GeminiWebLanguageModelProvider::new(cx)),
+    cx,
+);
+```
+
+`LanguageModelProviderId("gemini-web".into())` — dynamic, no enum surgery.
+
+### 3. Settings
+
+`crates/language_models/src/settings.rs`:
+
+```rust
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct GeminiWebSettings {
+    pub enabled: bool,                       // default false
+    pub chrome_path: Option<String>,         // null = autodetect
+    pub profile_dir: Option<PathBuf>,        // null = <zed-data>/gemini-web/profile
+    pub headless: bool,                      // default false (sign-in needs visible)
+    pub response_timeout_seconds: u64,       // default 120
 }
 ```
 
-Nothing in `assets/settings/default.json` or `crates/settings_content`. The
-user opts in by adding this entry themselves.
+Default-off in `assets/settings/default.json`. Standard settings UI shows
+profile path + Sign-in button (every provider already has a settings_view
+shape — mirror Google's).
 
-### 3. One-time login
+## One-time login flow
 
-First run with `GEMINI_WEB_HEADLESS=0` (or a `--login` flag):
+1. User enables `gemini_web.enabled` in settings.
+2. User opens the provider settings view, clicks **Sign in with Google**.
+3. `GeminiWebProvider::authenticate()` launches Chrome visibly on the
+   dedicated profile dir, navigates to `https://gemini.google.com`.
+4. User logs in once with `katopz@maxion.game` in that Chrome window.
+5. `GeminiWebBrowserState` polls for login completion (e.g. composer
+   selector appears, or URL changes from `/` to `/app`), flips
+   `is_authenticated` to true, `cx.notify()` triggers UI update.
+6. Cookies persist in profile dir. All subsequent requests are headless
+   and reuse the session.
+7. Future logins (cookie expiry) repeat the flow.
 
-```bash
-gemini-web-acp --login
-```
+## Per-request flow
 
-Opens Chrome visibly on the dedicated profile, navigates to
-`https://gemini.google.com`, user logs in once with `katopz@maxion.game`,
-closes the window. Profile persists cookies. All later `--acp` runs are
-headless and reuse the session.
+Each `stream_completion_text(request, cx)` call:
 
-## Decision: branch from `gemini_browser` or fresh?
-
-Three options, ranked:
-
-1. **Cherry-pick just `cdp.rs` + `gemini_page.rs` from `gemini_browser` (tip
-   `fefaa0ac`) onto a fresh `gemini_cli_proxy` branch off `de146c3`.** Keeps
-   the proven CDP code, drops all the UI integration (~1700 lines of it).
-   Recommended.
-2. **New branch, rewrite CDP client from scratch.** No — the existing one
-   already type-checks and lint-passes; rewriting is pure waste.
-3. **Continue on `gemini_browser` branch.** No — too much UI baggage in the
-   commit history and the branch name lies about what it does.
-
-Going with option 1 unless user objects.
+1. Build prompt string from `LanguageModelRequest` (messages → flat text,
+   same as `gemini-cli` proxy would). v1 ignores tools, images, system
+   prompts — prepends them as text.
+2. Acquire the shared `GeminiWebBrowserState` (one CDP connection, serialized
+   requests via a smol channel — Gemini's web composer is single-threaded,
+   can't handle concurrent prompts).
+3. `GeminiPage::ask(prompt)`:
+   - Ensure attached to `/app` page.
+   - `Input.insertText(prompt)` + submit (NOT JS text assignment — Gemini's
+     composer is Quill `contenteditable`, JS assignment leaves its internal
+     model empty and send stays disabled).
+   - Poll response text every 400ms via `Runtime.evaluate` until 3
+     consecutive unchanged polls (text-stability completion detection —
+     avoids depending on a "stop generating" class name that changes).
+   - Return final text.
+4. Emit `LanguageModelCompletionEvent::Text(text)` once with the full
+   response. Streaming deferred to a later increment.
 
 ## Tasks
 
 ### Branch setup
 
 - [ ] `git checkout de146c3528c8ad00b023609d08cbc2a032620e41`
-- [ ] `git checkout -b gemini_cli_proxy`
-- [ ] Extract `crates/gemini_browser/src/cdp.rs` and
-      `crates/gemini_browser/src/gemini_page.rs` from `fefaa0ac` into a new
-      `crates/gemini_web_acp/src/` (drop the `gemini_browser` crate shell,
-      Zed integration, settings, actions — keep only the two page-driving
-      files).
-- [ ] Decide crate location: in-tree under `crates/` (but NOT in the Zed
-      workspace `Cargo.toml` so it doesn't get built with Zed), or out-of-tree
-      in a separate repo. In-tree-not-in-workspace is simpler for now.
+- [ ] `git checkout -b gemini_cli_proxy` (name per user's spec; the provider
+      id is still `gemini-web`, branch name is bikesheddable later)
+- [ ] Do NOT cherry-pick anything from `gemini_browser`. User said drop it.
+      Write fresh — the engine code isn't worth saving vs. clean room.
 
 ### Core implementation
 
-- [ ] `main.rs`: arg parse, `--acp` / `--login` / `prompt <text>` modes.
-- [ ] `chrome.rs`: launch Chrome with dedicated profile + debug port, reuse
-      existing instance if already running on that profile (port from
-      `gemini_browser`).
-- [ ] `acp_server.rs`: minimal JSON-RPC stdio loop. Methods: `initialize`,
-      `newSession`, `prompt`, `cancel`. Events: `session/update` with
-      `MessageChunk` for streamed text.
-- [ ] `cli.rs`: one-shot mode, prints final response to stdout. For smoke
-      tests and scripting.
-- [ ] `cargo clippy` clean, `cargo test` for the char-boundary truncation
-      guard (port the existing test).
+- [ ] `crates/language_models/src/provider/gemini_web.rs` skeleton:
+      provider + model structs, traits impl'd with stub methods.
+- [ ] Wire into `register_language_model_providers` (one line).
+- [ ] `GeminiWebSettings` in settings.rs, default-off in `default.json`.
+- [ ] `cdp` module: `Cdp` struct, `attach_to_page`, `evaluate`,
+      `insert_text`, `press_key`. Test against a real Chrome headless with
+      `about:blank` + `Runtime.evaluate('1+1')` returning `2`.
+- [ ] `chrome` module: `launch(profile_dir, headless)` launches Chrome with
+      `--user-data-dir` + `--remote-debugging-port=0` (let Chrome pick port),
+      reads the port from `DevToolsActivePort`, returns `(Child, port)`.
+      Reuse existing Chrome on same profile if already running.
+- [ ] `GeminiWebBrowserState`: GPUI entity owning Chrome child + CDP conn +
+      auth state. Serialize concurrent requests via smol channel.
+- [ ] `GeminiWebProvider::authenticate`: launch visible Chrome on profile,
+      navigate to `gemini.google.com`, poll for login completion, flip auth
+      state.
+- [ ] `GeminiWebModel::stream_completion_text`: serialize request →
+      `GeminiPage::ask` → emit single completion event.
 
-### Live DOM tuning (the part `gemini_browser` skipped)
+### Live DOM tuning (the do-or-die step)
 
-- [ ] `gemini-web-acp --login` → log in as `katopz@maxion.game`.
-- [ ] Run a `diagnose` against the signed-in page (port the action from
-      `gemini_browser/src/gemini_page.rs::diagnose`) → capture which
-      candidate selectors actually match.
-- [ ] Pin the winning selectors in `gemini_page.rs::COMPOSER_SELECTORS`
-      and `RESPONSE_SELECTORS`. Remove candidates that don't match.
-- [ ] End-to-end smoke test: `gemini-web-acp prompt "what is 2+2"` returns
-      a sensible answer.
+- [ ] Build Zed, enable provider, click Sign-in, log in as
+      `katopz@maxion.game`.
+- [ ] Run a `diagnose` action against the signed-in page → capture which
+      candidate selectors match for composer + response container.
+- [ ] Pin winning selectors, drop non-matching candidates.
+- [ ] End-to-end smoke: native Zed agent with `provider: "gemini-web"`,
+      model `gemini-web-3`, send a prompt, get a sensible reply.
 
-### Zed integration (zero code changes — config only)
+### Polish (deferred increments)
 
-- [ ] Build the binary, note its path.
-- [ ] Add the `agent_servers.gemini-web` entry to user's settings.json.
-- [ ] Restart Zed, start a "Gemini (web)" thread from the agent panel,
-      send a prompt, confirm the response streams back.
-- [ ] Confirm billing: it uses the existing web subscription, not
-      Vertex/API metered billing. (Implicit — traffic goes to
-      `gemini.google.com`, not `aiplatform.googleapis.com`.)
+- [ ] Streaming responses via `MutationObserver` → CDP binding → completion
+      events.
+- [ ] 1:1 Zed-thread ↔ Gemini-conversation mapping (each Zed thread opens a
+      fresh Gemini conversation URL).
+- [ ] Tool calling (probably out of scope forever — Gemini web tools aren't
+      a public surface).
+- [ ] Graceful `Browser.close` on provider drop instead of process-group
+      kill (avoids "restore pages?" prompt on next Chrome launch).
+- [ ] Right-click "Ask Gemini" context-menu entries — separate increment
+      once the provider is solid.
 
-### Polish (deferred)
+### Validation
 
-- [ ] Graceful `Browser.close` on shutdown so the Chrome profile isn't
-      left dirty.
-- [ ] Streaming response (currently waits for text-stability before
-      returning the whole response).
-- [ ] Prompt-size cap with explicit notice when truncated.
-- [ ] `--headless` mode that doesn't need the login flow because the
-      profile already has cookies.
+- [ ] `cargo clippy -p language_models -- --deny warnings` clean.
+- [ ] `./script/clippy` clean on the touched files.
+- [ ] `cargo test -p language_models` — at minimum a test that
+      `truncate_at_char_boundary` is used when capping prompt size.
+- [ ] End-to-end: native Zed agent using the provider returns a real reply
+      from `gemini.google.com`.
 
 ## Open questions
 
-1. Crates workspace membership: in `crates/gemini_web_acp/` but excluded
-   from the root `Cargo.toml` workspace (so Zed doesn't build it), or
-   completely out-of-tree? In-tree-but-excluded is easier to develop.
-2. ~~ACP protocol version to target — needs checking what Zed currently
-   speaks.~~ **Resolved**: depend on `agent-client-protocol = "=1.3.0"`
-   (Zed's own pinned version, root `Cargo.toml`) — schema types come free.
-   Custom agents and registry agents go through the same `AgentConnection`
-   path in `crates/agent_servers/src/custom.rs`, so as long as we speak the
-   same JSON-RPC over stdio, Zed can't tell us apart from real gemini-cli.
-3. Does the user want streaming responses in the Zed thread, or is
-   "wait for full response, then post once" acceptable for v1? Streaming
-   is more work (MutationObserver bridge from page → CDP → ACP events).
+1. **Model list.** Gemini web doesn't expose model selection as a stable
+   API. v1 ships one model `gemini-web-3` (or whatever the default is).
+   Multi-model (Pro vs Flash vs 2.5 vs 3) deferred until we know how to
+   switch via the web UI reliably.
+2. **Concurrent requests.** Single CDP connection + serialized requests
+   means concurrent Zed agent calls queue. Acceptable for v1 (one user, one
+   conversation at a time). Flag for v2.
+3. **Cookie expiry handling.** When Gemini session expires mid-use, the
+   provider should flip `is_authenticated` to false and surface a re-auth
+   prompt. v1 just returns an error; v2 wires the polling.
 
 ## Summary
 
-The real ask is "use my existing Gemini web subscription from Zed without
-paying for API/Vertex on top". The `gemini_browser` branch had the right
-engine (hand-written CDP over smol) but the wrong shape (UI integration
-across 5 Zed surfaces, never validated). This plan keeps the engine, drops
-the UI, ships it as a standalone ACP server binary registered as a custom
-agent — the same way `gemini-cli` itself is shipped.
+Native Zed LLM provider in one new file
+(`crates/language_models/src/provider/gemini_web.rs`), registered in one
+line, default-off, that drives real Chrome via hand-written CDP to send
+prompts to `gemini.google.com` under the user's existing web subscription.
+The user picks it from the model dropdown like any other provider; the
+native Zed agent uses it like any other model. Right-click UI and streaming
+are deferred.
