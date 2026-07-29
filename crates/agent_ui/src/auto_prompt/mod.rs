@@ -400,6 +400,15 @@ pub(crate) fn dispatch_action(
 
     let decision_prompt = auto_prompt::extract_decision_prompt(&action.next_prompt);
 
+    // Continuation threads must inherit the agent of the thread they're
+    // continuing, not whatever agent happens to be the panel's stale
+    // `selected_agent` (which tracks the last-focused thread across the
+    // whole workspace, or a persisted cross-workspace value). Otherwise a
+    // GLM/native-agent conversation can silently continue as a Claude Code
+    // (or any other ACP) agent thread if the user last looked at one of
+    // those elsewhere in the panel.
+    let source_agent = conversation_view.agent_key().clone();
+
     // Create the new thread directly via AgentPanel instead of dispatching
     // a GPUI action. window.dispatch_action is unreliable when the user is
     // idle (no focused element in the Workspace focus chain) — the action
@@ -505,7 +514,7 @@ pub(crate) fn dispatch_action(
                 // the user is currently looking at.
                 let new_thread_id = if focus {
                     panel.external_thread(
-                        None,
+                        Some(source_agent.clone()),
                         None,
                         work_dirs,
                         action.from_title.clone().map(Into::into),
@@ -517,7 +526,7 @@ pub(crate) fn dispatch_action(
                     )
                 } else {
                     panel.external_thread_background(
-                        None,
+                        Some(source_agent.clone()),
                         None,
                         work_dirs,
                         action.from_title.clone().map(Into::into),
