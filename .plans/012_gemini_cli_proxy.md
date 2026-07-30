@@ -254,15 +254,30 @@ Each `stream_completion_text(request, cx)` call:
 
 ### Live DOM tuning (the do-or-die step)
 
-- [ ] Build Zed, enable provider, click Sign-in, log in as
+- [x] Build Zed, enable provider, click Sign-in, log in as
       `katopz@maxion.game`.
-- [ ] Verify the candidate selectors in `COMPOSER_SELECTORS` and
-      `RESPONSE_SELECTORS` actually match the signed-in DOM. If not,
-      update them based on what `GeminiPage::diagnose` (currently dead
-      code, can be re-wired as a `gemini-web: diagnose` action later)
-      reports.
-- [ ] End-to-end smoke: native Zed agent with `provider: "gemini-web"`,
-      model `gemini-web-3`, send a prompt, get a sensible reply.
+- [x] **VERIFIED END-TO-END against the real signed-in DOM.** Live CDP
+      probe against the running Chrome (`port 50837`, profile at
+      `~/.config/zed/gemini-web/profile`) confirmed:
+      - URL: `https://gemini.google.com/app` (logged in, not a sign-in page)
+      - Title: `Google Gemini`
+      - Composer selectors match: `div.ql-editor[contenteditable="true"]`
+        → 1, `rich-textarea div[contenteditable="true"]` → 2,
+        `div[contenteditable="true"][role="textbox"]` → 1,
+        `div[contenteditable="true"]` → 2. No changes needed.
+      - Response selectors match after submit:
+        `model-response message-content` → 1 (the descendant combinator
+        form, used by `response_block_count`), `message-content` → 1,
+        `.model-response-text` → 1, `div.markdown` → 1. No changes needed.
+      - Sent `"Say exactly the word PONG and nothing else."` via
+        `Input.insertText` + `Enter`; received `"PONG"` back at ~t=6s.
+        Full ask loop works as designed.
+- [ ] End-to-end smoke from inside Zed (not just the standalone CDP probe):
+      native Zed agent with `provider: "gemini-web"`, model `gemini-web-3`,
+      send a prompt, get a sensible reply. **Blocked on user reporting
+      whether the provider shows in the model dropdown after auth completes**
+      — the dropdown filters by `is_authenticated`, which flips only after
+      the `authenticate()` poll loop sees the composer selector.
 
 ### Polish (deferred increments)
 
