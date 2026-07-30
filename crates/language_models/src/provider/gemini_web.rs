@@ -18,11 +18,11 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use futures::{FutureExt, StreamExt, future::BoxFuture, stream::{BoxStream, self}};
 use gpui::{App, AsyncApp, Entity, FontWeight, Task};
 use language_model::{
-    InlineDescription, LanguageModel, LanguageModelCompletionError, LanguageModelCompletionEvent,
-    LanguageModelId, LanguageModelName, LanguageModelProvider, LanguageModelProviderId,
-    LanguageModelProviderName, LanguageModelProviderState, LanguageModelRequest,
-    LanguageModelToolChoice, LanguageModelToolSchemaFormat, MessageContent,
-    ProviderSettingsView, Role, StopReason, SubPageProviderSettings,
+    InlineDescription, InlineProviderSettings, LanguageModel, LanguageModelCompletionError,
+    LanguageModelCompletionEvent, LanguageModelId, LanguageModelName, LanguageModelProvider,
+    LanguageModelProviderId, LanguageModelProviderName, LanguageModelProviderState,
+    LanguageModelRequest, LanguageModelToolChoice, LanguageModelToolSchemaFormat,
+    MessageContent, ProviderSettingsView, Role, StopReason,
 };
 use parking_lot::Mutex;
 use schemars::JsonSchema;
@@ -248,27 +248,39 @@ impl LanguageModelProvider for GeminiWebLanguageModelProvider {
             .into()
     }
 
-    fn settings_view(&self, _cx: &mut App) -> Option<ProviderSettingsView> {
+    fn settings_view(&self, cx: &mut App) -> Option<ProviderSettingsView> {
+        // Use Inline (not SubPage) so the Sign-in button appears directly on
+        // the LLM Providers list page — same pattern as Copilot Chat. With
+        // SubPage the user had to click "Configure" first to even see the
+        // button, which is what caused the "no sign-in button" confusion.
+        let is_authenticated = self.state.read_with(cx, |s, _| s.is_authenticated());
+        let title = if is_authenticated { None } else { Some("Configure Gemini Web".into()) };
+        let description = if is_authenticated {
+            None
+        } else {
+            Some(InlineDescription::Text(
+                "Drive gemini.google.com under your existing web subscription \
+                 (Google AI Pro/Ultra, Workspace add-on) via a logged-in \
+                 Chrome profile. No API key, no Vertex, no extra billing."
+                    .into(),
+            ))
+        };
         let state = self.state.clone();
-        Some(ProviderSettingsView::SubPage(
-            SubPageProviderSettings::new(move |_window, cx| {
+        Some(ProviderSettingsView::Inline(InlineProviderSettings {
+            title,
+            description,
+            create_view: Arc::new(move |_window, cx| {
                 cx.new(|cx| {
-                    // Re-render this view whenever the State entity changes
-                    // (auth flips, in_progress flips) so the button label
-                    // updates immediately.
+                    // Re-render whenever State changes so the button label
+                    // flips immediately when auth_in_progress / authenticated flip.
                     let state_for_observe = state.clone();
                     cx.observe(&state_for_observe, |_, _, cx| cx.notify())
                         .detach();
                     ConfigurationView { state: state.clone() }
                 })
                 .into()
-            })
-            .description(InlineDescription::Text(
-                "Drive gemini.google.com under your existing web subscription via \
-                 a logged-in Chrome profile. Sign in once, then use as a model."
-                    .into(),
-            )),
-        ))
+            }),
+        }))
     }
 }
 
