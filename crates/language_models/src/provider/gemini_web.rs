@@ -113,6 +113,9 @@ pub struct State {
     /// selector matches and no sign-in prompt). Refreshed by `authenticate`
     /// and after each request when the response selector misses.
     authenticated: bool,
+    /// True while `authenticate()` is running (Chrome launched, polling
+    /// for login). Drives the "Signing in…" button state in the settings UI.
+    auth_in_progress: bool,
     /// Single-flight serialization for prompts. Gemini's web composer is
     /// single-threaded, so concurrent Zed agent requests must take this
     /// semaphore one at a time.
@@ -125,6 +128,7 @@ impl State {
             browser: Mutex::new(None),
             gemini_target_ws: Mutex::new(None),
             authenticated: false,
+            auth_in_progress: false,
             request_lock: Arc::new(smol::lock::Semaphore::new(1)),
         }
     }
@@ -227,85 +231,14 @@ impl LanguageModelProvider for GeminiWebLanguageModelProvider {
         let state = self.state.clone();
         let profile_dir = Self::profile_dir(cx).ok();
         let chrome = Self::chrome_binary(cx).ok();
+        // Flip auth_in_progress up front so the settings UI shows
+        // "Signing in…" immediately, before the spawn even starts.
+        state.update(cx, |s, _| s.auth_in_progress = true);
         cx.spawn(async move |cx| {
-            let chrome = chrome.ok_or_else(|| {
-                language_model::AuthenticateError::Other(anyhow!(
-                    "could not locate Chrome binary; set gemini_web.chrome_path"
-                ))
-            })?;
-            let profile_dir = profile_dir.ok_or_else(|| {
-                language_model::AuthenticateError::Other(anyhow!(
-                    "could not resolve profile dir"
-                ))
-            })?;
-
-            fs::create_dir_all(&profile_dir).await.map_err(|e| {
-                language_model::AuthenticateError::Other(anyhow!(
-                    "creating profile dir: {e}"
-                ))
-            })?;
-
-            // Kill any existing instance first — same profile, two Chromes
-            // is a hard error for Chrome.
-            state.update(cx, |s, _| {
-                if let Some(mut h) = s.browser.lock().take() {
-                    let _ = h._child.kill();
-                }
-            });
-
-            let mut cmd = std::process::Command::new(&chrome);
-            cmd.args(CHROME_FLAGS)
-                .arg(format!("--user-data-dir={}", profile_dir.display()))
-                .arg(GEMINI_APP_URL);
-            // Login flow always uses a visible window regardless of the
-            // headless setting — the user needs to actually see the page.
-            let child = util::process::Child::spawn(
-                cmd,
-                Stdio::null(),
-                Stdio::piped(),
-                Stdio::piped(),
-            )
-            .map_err(|e| {
-                language_model::AuthenticateError::Other(anyhow!("spawn chrome: {e}"))
-            })?;
-
-            let port = wait_for_devtools_port(&profile_dir, Duration::from_secs(10))
-                .await
-                .map_err(|e| {
-                    language_model::AuthenticateError::Other(anyhow!(
-                        "DevToolsActivePort: {e}"
-                    ))
-                })?;
-
-            // Find the Gemini target that Chrome opened on launch and cache
-            // its websocket URL so `stream_completion` can read it
-            // synchronously without crossing the Send boundary.
-            let ws_url = resolve_gemini_target_ws(port).await?;
-            state.update(cx, |s, _| {
-                *s.browser.lock() = Some(BrowserHandle {
-                    _child: child,
-                    debug_port: port,
-                });
-                *s.gemini_target_ws.lock() = Some(ws_url);
-            });
-
-            // Poll the Gemini page for login completion. Typical time: 5-60s
-            // depending on whether the user has 2FA, etc.
-            let deadline = Instant::now() + Duration::from_secs(300);
-            loop {
-                if Instant::now() > deadline {
-                    state.update(cx, |s, _| s.authenticated = false);
-                    return Err(language_model::AuthenticateError::Other(anyhow!(
-                        "login timed out after 5 minutes"
-                    )));
-                }
-                gpui_platform::background_executor().timer(Duration::from_millis(1500)).await;
-                let logged_in = check_login_via_http(port).await.unwrap_or_default();
-                if logged_in {
-                    state.update(cx, |s, _| s.authenticated = true);
-                    return Ok(());
-                }
-            }
+            // Always clear auth_in_progress on exit (success or failure).
+            let result = do_authenticate(state.clone(), profile_dir, chrome, cx).await;
+            state.update(cx, |s, _| s.auth_in_progress = false);
+            result
         })
     }
 
@@ -319,7 +252,16 @@ impl LanguageModelProvider for GeminiWebLanguageModelProvider {
         let state = self.state.clone();
         Some(ProviderSettingsView::SubPage(
             SubPageProviderSettings::new(move |_window, cx| {
-                cx.new(|_| ConfigurationView { state: state.clone() }).into()
+                cx.new(|cx| {
+                    // Re-render this view whenever the State entity changes
+                    // (auth flips, in_progress flips) so the button label
+                    // updates immediately.
+                    let state_for_observe = state.clone();
+                    cx.observe(&state_for_observe, |_, _, cx| cx.notify())
+                        .detach();
+                    ConfigurationView { state: state.clone() }
+                })
+                .into()
             })
             .description(InlineDescription::Text(
                 "Drive gemini.google.com under your existing web subscription via \
@@ -468,6 +410,103 @@ fn enqueue_request(
     // Replaced by the per-state `request_lock` semaphore acquired directly
     // in `stream_completion`. Kept briefly to avoid touching the trait
     // surface; will be removed in a follow-up.
+}
+
+/// Extracted body of `LanguageModelProvider::authenticate`. Wrapped by the
+/// trait impl so the trait impl can flip `auth_in_progress` on entry/exit
+/// without scattering that bookkeeping through the launch/poll loop.
+///
+/// `profile_dir` and `chrome` are pre-resolved `Option`s so the error path
+/// for missing Chrome / unwritable profile dir reads cleanly inside the
+/// spawned task rather than panicking in the trait impl.
+async fn do_authenticate(
+    state: Entity<State>,
+    profile_dir: Option<PathBuf>,
+    chrome: Option<String>,
+    cx: &mut AsyncApp,
+) -> Result<(), language_model::AuthenticateError> {
+    let chrome = chrome.ok_or_else(|| {
+        language_model::AuthenticateError::Other(anyhow!(
+            "could not locate Chrome binary; set gemini_web.chrome_path"
+        ))
+    })?;
+    let profile_dir = profile_dir.ok_or_else(|| {
+        language_model::AuthenticateError::Other(anyhow!(
+            "could not resolve profile dir"
+        ))
+    })?;
+
+    fs::create_dir_all(&profile_dir).await.map_err(|e| {
+        language_model::AuthenticateError::Other(anyhow!(
+            "creating profile dir: {e}"
+        ))
+    })?;
+
+    // Kill any existing instance first — same profile, two Chromes
+    // is a hard error for Chrome.
+    state.update(cx, |s, _| {
+        if let Some(mut h) = s.browser.lock().take() {
+            let _ = h._child.kill();
+        }
+    });
+
+    let mut cmd = std::process::Command::new(&chrome);
+    cmd.args(CHROME_FLAGS)
+        .arg(format!("--user-data-dir={}", profile_dir.display()))
+        .arg(GEMINI_APP_URL);
+    // Login flow always uses a visible window regardless of the
+    // headless setting — the user needs to actually see the page.
+    let child = util::process::Child::spawn(
+        cmd,
+        Stdio::null(),
+        Stdio::piped(),
+        Stdio::piped(),
+    )
+    .map_err(|e| {
+        language_model::AuthenticateError::Other(anyhow!("spawn chrome: {e}"))
+    })?;
+
+    let port = wait_for_devtools_port(&profile_dir, Duration::from_secs(10))
+        .await
+        .map_err(|e| {
+            language_model::AuthenticateError::Other(anyhow!(
+                "DevToolsActivePort: {e}"
+            ))
+        })?;
+
+    // Find the Gemini target that Chrome opened on launch and cache
+    // its websocket URL so `stream_completion` can read it
+    // synchronously without crossing the Send boundary.
+    let ws_url = resolve_gemini_target_ws(port).await.map_err(|e| {
+        language_model::AuthenticateError::Other(anyhow!(
+            "resolving Gemini target: {e}"
+        ))
+    })?;
+    state.update(cx, |s, _| {
+        *s.browser.lock() = Some(BrowserHandle {
+            _child: child,
+            debug_port: port,
+        });
+        *s.gemini_target_ws.lock() = Some(ws_url);
+    });
+
+    // Poll the Gemini page for login completion. Typical time: 5-60s
+    // depending on whether the user has 2FA, etc.
+    let deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+        if Instant::now() > deadline {
+            state.update(cx, |s, _| s.authenticated = false);
+            return Err(language_model::AuthenticateError::Other(anyhow!(
+                "login timed out after 5 minutes"
+            )));
+        }
+        gpui_platform::background_executor().timer(Duration::from_millis(1500)).await;
+        let logged_in = check_login_via_http(port).await.unwrap_or_default();
+        if logged_in {
+            state.update(cx, |s, _| s.authenticated = true);
+            return Ok(());
+        }
+    }
 }
 
 // ============================================================================
@@ -1143,9 +1182,30 @@ struct ConfigurationView {
     state: Entity<State>,
 }
 
+impl ConfigurationView {
+    fn trigger_sign_in(&mut self, cx: &mut Context<Self>) {
+        // Reconstruct the provider from the shared state entity and call
+        // its `authenticate` method. The trait impl flips `auth_in_progress`
+        // up front and clears it on exit; the `observe` registered in
+        // `settings_view` re-renders us when either flips.
+        let provider = GeminiWebLanguageModelProvider { state: self.state.clone() };
+        provider.authenticate(cx).detach_and_log_err(cx);
+    }
+}
+
 impl Render for ConfigurationView {
     fn render(&mut self, _window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let authenticated = self.state.read(cx).is_authenticated();
+        let state = self.state.read(cx);
+        let authenticated = state.is_authenticated();
+        let signing_in = state.auth_in_progress;
+        let button_label = if signing_in {
+            "Signing in…"
+        } else if authenticated {
+            "Re-sign in"
+        } else {
+            "Sign in"
+        };
+
         v_flex()
             .gap_2()
             .child(
@@ -1153,23 +1213,45 @@ impl Render for ConfigurationView {
                     .size(LabelSize::Large)
                     .weight(FontWeight::BOLD),
             )
-            .child(Label::new(if authenticated {
-                "Signed in. Use 'Gemini Web 3' from the model dropdown."
-            } else {
-                "Not signed in. Click Sign in above to log into \
-                 gemini.google.com once."
-            })
-            .color(if authenticated {
-                Color::Success
-            } else {
-                Color::Warning
-            }))
-            .child(Label::new(
-                "This provider drives a real Chrome window on a dedicated \
-                 profile, so it uses your existing Gemini web subscription \
-                 (Google AI Pro/Ultra, Workspace add-on). No API key, no \
-                 Vertex, no extra billing.",
-            ).color(Color::Muted))
+            .child(
+                Label::new(if authenticated {
+                    "Signed in. Pick 'Gemini Web 3' from the model dropdown to use it."
+                } else if signing_in {
+                    "A Chrome window opened. Log into gemini.google.com there — \
+                     this page updates automatically when login completes."
+                } else {
+                    "Not signed in. Click Sign in to launch Chrome and log into \
+                     gemini.google.com once. Cookies persist in the profile so \
+                     future sessions reuse the login."
+                })
+                .color(if authenticated {
+                    Color::Success
+                } else if signing_in {
+                    Color::Accent
+                } else {
+                    Color::Warning
+                }),
+            )
+            .child(
+                Button::new("gemini-web-sign-in", button_label)
+                    .full_width()
+                    .style(ButtonStyle::Outlined)
+                    .size(ButtonSize::Medium)
+                    .disabled(signing_in)
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.trigger_sign_in(cx);
+                    })),
+            )
+            .child(
+                Label::new(
+                    "This provider drives a real Chrome window on a dedicated \
+                     profile, so it uses your existing Gemini web subscription \
+                     (Google AI Pro/Ultra, Workspace add-on). No API key, no \
+                     Vertex, no extra billing.",
+                )
+                .color(Color::Muted)
+                .size(LabelSize::Small),
+            )
     }
 }
 
