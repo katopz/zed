@@ -5919,12 +5919,13 @@ impl ThreadView {
     }
 
     /// Compact icon button for the message-editor row that routes the current
-    /// thread context to Gemini Web in a new thread. See `ask_gemini`.
+    /// thread context (plus whatever the user has typed in the editor) to
+    /// Gemini Web in a new thread. See `ask_gemini`.
     fn render_ask_gemini_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
         IconButton::new("ask-gemini-editor", IconName::AiGemini)
             .icon_size(IconSize::Small)
             .icon_color(Color::Muted)
-            .tooltip(Tooltip::text("Ask Gemini Web"))
+            .tooltip(Tooltip::text("Ask Gemini Web (uses the text you've typed)"))
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.ask_gemini(window, cx);
             }))
@@ -7269,7 +7270,7 @@ impl ThreadView {
         let ask_gemini_button = IconButton::new("ask-gemini", IconName::AiGemini)
             .icon_size(IconSize::Small)
             .icon_color(Color::Muted)
-            .tooltip(Tooltip::text("Ask Gemini Web"))
+            .tooltip(Tooltip::text("Ask Gemini Web (uses the text you've typed)"))
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.ask_gemini(window, cx);
             }));
@@ -8363,6 +8364,13 @@ impl ThreadView {
         let title = thread.title().map(|t| t.to_string());
         let work_dirs = thread.work_dirs().cloned();
 
+        // Read the current message editor text — if the user typed something,
+        // that's what they want to ask Gemini. Otherwise fall back to the
+        // generic continuation prompt so the button still does something
+        // useful on an empty editor.
+        let editor_text = self.message_editor.read(cx).text(cx);
+        let editor_has_text = !editor_text.trim().is_empty();
+
         let first_user_message = thread.entries().iter().find_map(|entry| {
             if let acp_thread::AgentThreadEntry::UserMessage(msg) = entry {
                 let content = msg.content.to_markdown(cx).to_string();
@@ -8409,7 +8417,14 @@ impl ThreadView {
         // Gemini continuation prompt: same shape as manual_auto_prompt so the
         // new thread picks up where this one left off, but routed through the
         // Gemini Web model via the `model` override on CreateThreadOptions.
-        let raw_prompt = "Continue from where we left off.".to_string();
+        // If the user typed something in the editor, use that as the prompt
+        // (so they can ask Gemini a specific question); otherwise use the
+        // generic continuation prompt.
+        let raw_prompt = if editor_has_text {
+            editor_text.trim().to_string()
+        } else {
+            "Continue from where we left off.".to_string()
+        };
         let prompt_summary = auto_prompt::build_prompt_summary(
             None,
             title.as_deref(),
@@ -8468,6 +8483,15 @@ impl ThreadView {
                 }
             });
         });
+
+        // Clear the editor after dispatching so the user can immediately
+        // type the next question. Matches the behaviour of the normal
+        // send-message flow.
+        if editor_has_text {
+            self.message_editor.update(cx, |editor, cx| {
+                editor.clear(window, cx);
+            });
+        }
     }
 
     pub(crate) fn sync_editor_mode(&mut self, cx: &mut Context<Self>) {
