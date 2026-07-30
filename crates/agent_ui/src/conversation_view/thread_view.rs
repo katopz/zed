@@ -5948,24 +5948,19 @@ impl ThreadView {
             _ => None,
         };
 
-        let (label, label_color) = if is_processing {
-            ("Processing...", Color::Accent)
+        let (tooltip_text, icon_color) = if is_processing {
+            ("Auto-Prompt: Processing…", Color::Accent)
         } else if is_failed {
-            ("Retry", Color::Error)
+            ("Auto-Prompt: Failed — click to retry", Color::Error)
         } else if enabled {
-            ("Auto", Color::Accent)
+            ("Auto-Prompt: On", Color::Accent)
         } else {
-            ("Off", Color::Muted)
+            ("Auto-Prompt: Off", Color::Muted)
         };
 
-        Button::new("auto-prompt-toggle", label)
-            .start_icon(
-                Icon::new(IconName::Sparkle)
-                    .size(IconSize::XSmall)
-                    .color(label_color),
-            )
-            .label_size(LabelSize::XSmall)
-            .color(label_color)
+        IconButton::new("auto-prompt-toggle", IconName::Sparkle)
+            .icon_size(IconSize::Small)
+            .icon_color(icon_color)
             .when(enabled && !is_processing && !is_failed, |this| {
                 this.style(ButtonStyle::Tinted(TintColor::Accent))
             })
@@ -5974,10 +5969,10 @@ impl ThreadView {
                     if let Some(ref msg) = failed_error_message {
                         Tooltip::simple(format!("Auto-prompt failed: {msg}"), cx)
                     } else {
-                        Tooltip::simple("Auto-prompt failed — click to retry", cx)
+                        Tooltip::simple(tooltip_text, cx)
                     }
                 } else {
-                    Tooltip::for_action("Auto-Prompt", &crate::auto_prompt::ToggleAutoPrompt, cx)
+                    Tooltip::simple(tooltip_text, cx)
                 }
             })
             .on_click(cx.listener(move |this, _, window, cx| {
