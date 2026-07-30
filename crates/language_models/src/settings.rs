@@ -6,10 +6,10 @@ use settings::RegisterSetting;
 use crate::provider::{
     anthropic, anthropic::AnthropicSettings, anthropic_compatible::AnthropicCompatibleSettings,
     bedrock, bedrock::AmazonBedrockSettings, cloud::ZedDotDevSettings, deepseek::DeepSeekSettings,
-    google::GoogleSettings, llama_cpp::LlamaCppSettings, lmstudio::LmStudioSettings, mistral,
-    mistral::MistralSettings, ollama::OllamaSettings, open_ai::OpenAiSettings,
-    open_ai_compatible::OpenAiCompatibleSettings, open_router, open_router::OpenRouterSettings,
-    opencode, opencode::OpenCodeSettings, resolve_custom_headers,
+    gemini_web::GeminiWebSettings, google::GoogleSettings, llama_cpp::LlamaCppSettings,
+    lmstudio::LmStudioSettings, mistral, mistral::MistralSettings, ollama::OllamaSettings,
+    open_ai::OpenAiSettings, open_ai_compatible::OpenAiCompatibleSettings, open_router,
+    open_router::OpenRouterSettings, opencode, opencode::OpenCodeSettings, resolve_custom_headers,
     vercel_ai_gateway::VercelAiGatewaySettings, x_ai::XAiSettings,
 };
 
@@ -20,6 +20,7 @@ pub struct AllLanguageModelSettings {
     pub bedrock: AmazonBedrockSettings,
     pub deepseek: DeepSeekSettings,
     pub google: GoogleSettings,
+    pub gemini_web: GeminiWebSettings,
     pub llama_cpp: LlamaCppSettings,
     pub lmstudio: LmStudioSettings,
     pub mistral: MistralSettings,
@@ -54,6 +55,7 @@ impl settings::Settings for AllLanguageModelSettings {
         let bedrock = language_models.bedrock.unwrap();
         let deepseek = language_models.deepseek.unwrap();
         let google = language_models.google.unwrap();
+        let gemini_web = language_models.gemini_web.unwrap_or_default();
         let llama_cpp = language_models.llama_cpp.unwrap();
         let lmstudio = language_models.lmstudio.unwrap();
         let mistral = language_models.mistral.unwrap();
@@ -119,6 +121,15 @@ impl settings::Settings for AllLanguageModelSettings {
                 api_url: google.api_url.unwrap(),
                 available_models: google.available_models.unwrap_or_default(),
                 custom_headers: custom_headers_from("Google AI", google.custom_headers, &[]),
+            },
+            gemini_web: GeminiWebSettings {
+                enabled: gemini_web.enabled.unwrap_or(false),
+                chrome_path: gemini_web.chrome_path,
+                profile_dir: gemini_web.profile_dir,
+                headless: gemini_web.headless.unwrap_or(false),
+                response_timeout_seconds: gemini_web
+                    .response_timeout_seconds
+                    .unwrap_or(120),
             },
             llama_cpp: LlamaCppSettings {
                 api_url: llama_cpp.api_url.unwrap(),

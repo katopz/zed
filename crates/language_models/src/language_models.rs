@@ -285,6 +285,10 @@ fn register_language_model_providers(
         cx,
     );
     registry.register_provider(
+        Arc::new(crate::provider::gemini_web::GeminiWebLanguageModelProvider::new(cx)),
+        cx,
+    );
+    registry.register_provider(
         MistralLanguageModelProvider::global(
             client.http_client(),
             credentials_provider.clone(),
