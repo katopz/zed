@@ -1,3 +1,14 @@
+# Issue 012: `gemini-web` / `gemini_cli_proxy` — DEAD (captcha wall)
+
+> **Status: DEAD.** Removed from codebase. The native LLM provider that drove
+> `gemini.google.com` via Chrome DevTools Protocol hit Google's bot-detection
+> captcha after the first few requests, making it unusable as a reliable LLM
+> backend. All code, settings, UI buttons, and the `gemini-web` provider were
+> removed in a follow-up commit. Kept here as a tombstone so we don't retry
+> the same path without a captcha-solving story.
+
+---
+
 # Plan 012: `gemini-web` native LLM provider (web-session proxy)
 
 ## Problem

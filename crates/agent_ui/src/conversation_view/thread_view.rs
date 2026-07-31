@@ -4645,7 +4645,6 @@ impl ThreadView {
                                     .child(self.render_add_context_button(cx))
                                     .child(self.render_follow_toggle(cx))
                                     .child(self.render_auto_prompt_toggle(cx))
-                                    .child(self.render_ask_gemini_button(cx))
                                     .children(self.render_fast_mode_control(cx))
                                     .children(self.render_thinking_control(cx)),
                             )
@@ -5915,19 +5914,6 @@ impl ThreadView {
             })
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.toggle_following(window, cx);
-            }))
-    }
-
-    /// Compact icon button for the message-editor row that routes the current
-    /// thread context (plus whatever the user has typed in the editor) to
-    /// Gemini Web in a new thread. See `ask_gemini`.
-    fn render_ask_gemini_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        IconButton::new("ask-gemini-editor", IconName::AiGemini)
-            .icon_size(IconSize::Small)
-            .icon_color(Color::Muted)
-            .tooltip(Tooltip::text("Ask Gemini Web (uses the text you've typed)"))
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.ask_gemini(window, cx);
             }))
     }
 
@@ -7262,14 +7248,6 @@ impl ThreadView {
                 this.manual_auto_prompt(window, cx);
             }));
 
-        let ask_gemini_button = IconButton::new("ask-gemini", IconName::AiGemini)
-            .icon_size(IconSize::Small)
-            .icon_color(Color::Muted)
-            .tooltip(Tooltip::text("Ask Gemini Web (uses the text you've typed)"))
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.ask_gemini(window, cx);
-            }));
-
         let copy_response_button = copy_response_index.map(|response_index| {
             IconButton::new(("copy_agent_response", entry_ix), IconName::Copy)
                 .icon_size(IconSize::Small)
@@ -7425,7 +7403,6 @@ impl ThreadView {
             .when_some(feedback_buttons, |this, buttons| this.child(buttons))
             .when_some(copy_response_button, |this, button| this.child(button))
             .child(manual_auto_prompt_button)
-            .child(ask_gemini_button)
             .child(scroll_to_recent_user_prompt)
             .when_some(scroll_to_top, |this, button| this.child(button))
             .into_any_element()
@@ -8341,152 +8318,6 @@ impl ThreadView {
                 });
             }
         });
-    }
-
-    /// Ask Gemini Web: creates a new native-agent thread with the model
-    /// overridden to `gemini-web/gemini-web-3`, seeded with the current
-    /// thread's context (title, last assistant message, original user
-    /// message) and a continuation prompt. Leaves the current thread's model
-    /// and auto_prompt behaviour untouched — see issue 007 / user request:
-    /// "better add ask gemini button beside both auto/manual auto prompt
-    /// in thread. dont mess with old auto prompt behaviour".
-    ///
-    /// The Gemini Web provider streams via Chrome DevTools Protocol; the first
-    /// call launches Chrome if it isn't already running.
-    fn ask_gemini(&self, window: &mut Window, cx: &mut Context<Self>) {
-        let thread = self.thread.read(cx);
-        let from_session_id = thread.session_id().clone();
-        let title = thread.title().map(|t| t.to_string());
-        let work_dirs = thread.work_dirs().cloned();
-
-        // Read the current message editor text — if the user typed something,
-        // that's what they want to ask Gemini. Otherwise fall back to the
-        // generic continuation prompt so the button still does something
-        // useful on an empty editor.
-        let editor_text = self.message_editor.read(cx).text(cx);
-        let editor_has_text = !editor_text.trim().is_empty();
-
-        let first_user_message = thread.entries().iter().find_map(|entry| {
-            if let acp_thread::AgentThreadEntry::UserMessage(msg) = entry {
-                let content = msg.content.to_markdown(cx).to_string();
-                if !content.is_empty() {
-                    return Some(content);
-                }
-            }
-            None
-        });
-
-        let last_assistant_message = thread.entries().iter().rev().find_map(|entry| {
-            if let acp_thread::AgentThreadEntry::AssistantMessage(msg) = entry {
-                let content = msg
-                    .chunks
-                    .iter()
-                    .filter_map(|chunk| {
-                        let block = match chunk {
-                            acp_thread::AssistantMessageChunk::Message { block, .. } => block,
-                            acp_thread::AssistantMessageChunk::Thought { block, .. } => block,
-                        };
-                        let text = block.to_markdown(cx).to_string();
-                        if text.is_empty() { None } else { Some(text) }
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                if content.is_empty() {
-                    None
-                } else {
-                    Some(auto_prompt::truncate_to_paragraph_budget(
-                        &content,
-                        auto_prompt::AutoPromptContext::LAST_MESSAGE_PARAGRAPH_BUDGET,
-                    ))
-                }
-            } else {
-                None
-            }
-        });
-
-        let original_user_message = first_user_message
-            .as_deref()
-            .and_then(auto_prompt::extract_original_user_message)
-            .or_else(|| first_user_message.clone().filter(|s| !s.trim().is_empty()));
-
-        // Gemini continuation prompt: same shape as manual_auto_prompt so the
-        // new thread picks up where this one left off, but routed through the
-        // Gemini Web model via the `model` override on CreateThreadOptions.
-        // If the user typed something in the editor, use that as the prompt
-        // (so they can ask Gemini a specific question); otherwise use the
-        // generic continuation prompt.
-        let raw_prompt = if editor_has_text {
-            editor_text.trim().to_string()
-        } else {
-            "Continue from where we left off.".to_string()
-        };
-        let prompt_summary = auto_prompt::build_prompt_summary(
-            None,
-            title.as_deref(),
-            Some("ask Gemini Web continuation"),
-            last_assistant_message.as_deref(),
-            original_user_message.as_deref(),
-            first_user_message.as_deref(),
-        );
-        let next_prompt = auto_prompt::with_first_prompt_context(
-            raw_prompt,
-            prompt_summary.as_deref(),
-            title.as_deref(),
-            last_assistant_message.as_deref(),
-        );
-
-        let blocks = vec![acp::ContentBlock::Text(acp::TextContent::new(next_prompt))];
-        let initial_content = crate::AgentInitialContent::ContentBlock {
-            blocks,
-            auto_submit: true,
-            auto_prompt_enabled: false,
-            profile_id: None,
-        };
-
-        let workspace = self.workspace.clone();
-        window.defer(cx, move |window, cx| {
-            let Some(workspace) = workspace.upgrade() else {
-                log::warn!("[ask_gemini] workspace already dropped");
-                return;
-            };
-            let Some(panel) = workspace.read(cx).panel::<crate::AgentPanel>(cx) else {
-                log::warn!("[ask_gemini] no AgentPanel found in workspace");
-                return;
-            };
-            panel.update(cx, |panel, cx| {
-                let new_thread_id = panel.create_thread_with_options(
-                    crate::CreateThreadOptions {
-                        title: title.clone().map(Into::into),
-                        initial_content: Some(initial_content),
-                        agent: None,
-                        model: Some(
-                            "gemini-web/gemini-web-3".to_string(),
-                        ),
-                        work_dirs,
-                    },
-                    crate::AgentThreadSource::AgentPanel,
-                    window,
-                    cx,
-                );
-                // Preserve the continuation link so the new Gemini thread shows
-                // a "from" chip pointing back at this thread.
-                if let Some(store) = crate::thread_metadata_store::ThreadMetadataStore::try_global(cx)
-                {
-                    store.update(cx, |store, cx| {
-                        store.set_continued_from(new_thread_id, from_session_id.clone(), cx);
-                    });
-                }
-            });
-        });
-
-        // Clear the editor after dispatching so the user can immediately
-        // type the next question. Matches the behaviour of the normal
-        // send-message flow.
-        if editor_has_text {
-            self.message_editor.update(cx, |editor, cx| {
-                editor.clear(window, cx);
-            });
-        }
     }
 
     pub(crate) fn sync_editor_mode(&mut self, cx: &mut Context<Self>) {

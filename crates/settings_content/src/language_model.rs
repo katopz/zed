@@ -15,7 +15,6 @@ pub struct AllLanguageModelSettingsContent {
     pub bedrock: Option<AmazonBedrockSettingsContent>,
     pub deepseek: Option<DeepseekSettingsContent>,
     pub google: Option<GoogleSettingsContent>,
-    pub gemini_web: Option<GeminiWebSettingsContent>,
     #[serde(rename = "llama.cpp")]
     pub llama_cpp: Option<LlamaCppSettingsContent>,
     pub lmstudio: Option<LmStudioSettingsContent>,
@@ -500,26 +499,6 @@ pub struct GoogleSettingsContent {
     pub api_url: Option<String>,
     pub available_models: Option<Vec<GoogleAvailableModel>>,
     pub custom_headers: Option<HashMap<String, String>>,
-}
-
-#[with_fallible_options]
-#[derive(Default, Clone, Debug, Serialize, Deserialize, PartialEq, JsonSchema, MergeFrom)]
-pub struct GeminiWebSettingsContent {
-    /// Whether the `gemini-web` provider appears in the model dropdown.
-    /// Default off — this is a local-only PoC, never shipped as a default
-    /// Zed feature.
-    pub enabled: Option<bool>,
-    /// Path to the Chrome/Chromium binary. `None` means autodetect standard
-    /// install locations.
-    pub chrome_path: Option<String>,
-    /// Profile directory used by the dedicated Chrome instance. `None` means
-    /// `<zed-data-dir>/gemini-web/profile`.
-    pub profile_dir: Option<String>,
-    /// Run Chrome without a visible window. Leave off until the profile has
-    /// a valid signed-in session.
-    pub headless: Option<bool>,
-    /// How long to wait for a Gemini response before giving up, in seconds.
-    pub response_timeout_seconds: Option<u64>,
 }
 
 #[with_fallible_options]

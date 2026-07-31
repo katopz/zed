@@ -9,7 +9,6 @@ pub mod bedrock;
 pub mod cloud;
 pub mod copilot_chat;
 pub mod deepseek;
-pub mod gemini_web;
 pub mod google;
 pub mod llama_cpp;
 pub mod lmstudio;
