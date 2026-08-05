@@ -4645,6 +4645,7 @@ impl ThreadView {
                                     .child(self.render_add_context_button(cx))
                                     .child(self.render_follow_toggle(cx))
                                     .child(self.render_auto_prompt_toggle(cx))
+                                    .children(self.render_key_status_buttons(cx))
                                     .children(self.render_fast_mode_control(cx))
                                     .children(self.render_thinking_control(cx)),
                             )
@@ -5914,6 +5915,139 @@ impl ThreadView {
             })
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.toggle_following(window, cx);
+            }))
+    }
+
+    fn render_key_status_buttons(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        // Only render for OpenAI-compatible (and similar multi-key) providers.
+        // `key_slot_status` returns `None` for single-key providers (Copilot,
+        // Zed Cloud, Ollama, Anthropic, Bedrock direct, etc.) so the footer
+        // chips don't appear there.
+        let model = self
+            .as_native_thread(cx)
+            .and_then(|thread| thread.read(cx).model())?;
+        let summary = model.key_slot_status(cx)?;
+
+        // Build one chip per slot, in fixed [K1, K2, K3, K4] order. Slots with
+        // no configured key render as a muted "empty" placeholder so the user
+        // sees that the slot exists but is unconfigured (clicking does nothing).
+        let chips: Vec<AnyElement> = summary
+            .0
+            .iter()
+            .enumerate()
+            .map(|(idx, status)| {
+                self.render_one_key_status_chip(idx, status, cx)
+                    .into_any_element()
+            })
+            .collect();
+
+        Some(
+            h_flex()
+                .gap_0p5()
+                .children(chips)
+                .into_any_element(),
+        )
+    }
+
+    /// Renders a single K1/K2/K3/K4 chip. Color reflects the slot's state so
+    /// the user gets a one-glance read without opening the settings page:
+    ///   - Accent (filled)  — healthy + enabled (in rotation)
+    ///   - Warning          — enabled but currently in backoff (showing countdown)
+    ///   - Muted (outlined) — disabled (user pulled it out of rotation)
+    ///   - Muted (faint)    — no key configured for this slot
+    ///
+    /// Click toggles `enabled`. The toggle is a no-op for slots with no key.
+    fn render_one_key_status_chip(
+        &self,
+        slot_index: usize,
+        status: &language_model::ModelKeySlotStatus,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        // K1, K2, K3, K4 — 1-indexed because that's how the retry label and the
+        // settings page already refer to them.
+        let label = format!("K{}", slot_index + 1);
+
+        let (color, tooltip_text): (Color, SharedString) = if !status.has_key {
+            (
+                Color::Muted,
+                format!("K{}: no API key configured", slot_index + 1).into(),
+            )
+        } else if !status.enabled {
+            (
+                Color::Muted,
+                format!(
+                    "K{}: disabled (click to re-enable) — excluded from rotation",
+                    slot_index + 1
+                )
+                .into(),
+            )
+        } else if status.is_backed_off {
+            let countdown = language_models::provider::open_ai_compatible::format_backoff_remaining(
+                status.backoff_remaining,
+            );
+            (
+                Color::Warning,
+                format!(
+                    "K{}: in backoff ({countdown}), {} failure(s). Click to disable.",
+                    slot_index + 1,
+                    status.consecutive_failures
+                )
+                .into(),
+            )
+        } else {
+            (
+                Color::Accent,
+                format!(
+                    "K{}: healthy (in rotation). Click to disable temporarily.",
+                    slot_index + 1
+                )
+                .into(),
+            )
+        };
+
+        let has_key = status.has_key;
+        // Capture the post-click `enabled` value. `slot_index` and `next_enabled`
+        // are `Copy + 'static` so they move cleanly into the click handler; the
+        // model handle is fetched inside the handler via `this.as_native_thread`
+        // (same pattern as `render_thinking_control`) to avoid a borrow lifetime.
+        let next_enabled = !status.enabled;
+
+        Button::new(("key-status", slot_index), label)
+            .label_size(LabelSize::XSmall)
+            .color(color)
+            // Healthy + enabled gets the tinted fill ("in rotation");
+            // everything else is outlined/subtle so the user reads the muted
+            // and warning states as "needs attention".
+            .when(status.has_key && status.enabled && !status.is_backed_off, |this| {
+                this.style(ButtonStyle::Tinted(TintColor::Accent))
+            })
+            .when(!status.has_key, |this| {
+                this.disabled(true).style(ButtonStyle::Transparent)
+            })
+            .tooltip(move |_window, cx| Tooltip::simple(tooltip_text.clone(), cx))
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                if !has_key {
+                    return;
+                }
+                // Fetch the model inside the handler (not at build time) so the
+                // closure stays `'static` — see `render_thinking_control` for the
+                // same pattern. Shadowing `model` here releases the immutable
+                // borrow on `cx` from `thread.read(cx)` before we mutate via
+                // `set_key_slot_enabled(.., cx)`.
+                let model = this
+                    .as_native_thread(cx)
+                    .and_then(|thread| thread.read(cx).model());
+                let Some(model) = model else {
+                    return;
+                };
+                let model = model.clone();
+                log::info!(
+                    "[key_status] toggling K{} -> enabled={} (user click)",
+                    slot_index + 1,
+                    next_enabled
+                );
+                model.set_key_slot_enabled(slot_index, next_enabled, cx);
+                cx.notify();
             }))
     }
 

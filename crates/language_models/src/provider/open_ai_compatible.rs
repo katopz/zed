@@ -11,7 +11,8 @@ use language_model::{
     LanguageModelCompletionEvent, LanguageModelEffortLevel, LanguageModelId, LanguageModelName,
     LanguageModelProvider, LanguageModelProviderId, LanguageModelProviderName,
     LanguageModelProviderState, LanguageModelRequest, LanguageModelToolChoice,
-    LanguageModelToolSchemaFormat, ProviderSettingsView, RateLimiter, SubPageProviderSettings,
+    LanguageModelToolSchemaFormat, ModelKeySlotStatus, ModelKeySlotStatusSummary, ProviderSettingsView,
+    RateLimiter, SubPageProviderSettings,
 };
 use open_ai::{
     ResponseStreamEvent,
@@ -32,9 +33,13 @@ use crate::provider::open_ai::{
 pub use settings::OpenAiCompatibleAvailableModel as AvailableModel;
 pub use settings::OpenAiCompatibleModelCapabilities as ModelCapabilities;
 
+// Re-exported so the agent_ui footer chips can format backoff countdowns the
+// same way the ConfigurationView does, without duplicating the formatter.
+pub use health::format_backoff_remaining;
+
 mod health;
 use health::{
-    KeyHealthTracker, KeySlot, SlotHealthStatus, format_backoff_remaining,
+    KeyHealthTracker, KeySlot, SlotHealthStatus,
     key_health_path_for, reload_persisted_health, retry_stream,
     schedule_persist_key_health_inner, snapshot_health,
 };
@@ -135,6 +140,19 @@ fn slot_index(slot: KeySlot) -> usize {
     }
 }
 
+/// Inverse of [`slot_index`]. Used by `LanguageModel::set_key_slot_enabled`
+/// (which takes a `usize` from the UI) to map back to a `KeySlot`. Returns
+/// `None` for out-of-range indices so a stale UI can't panic the provider.
+fn slot_from_index(index: usize) -> Option<KeySlot> {
+    match index {
+        0 => Some(KeySlot::Primary),
+        1 => Some(KeySlot::Secondary),
+        2 => Some(KeySlot::Tertiary),
+        3 => Some(KeySlot::Quaternary),
+        _ => None,
+    }
+}
+
 /// Owned bundle of inputs needed to fire a single-key probe request from the
 /// UI thread. Built by `State::probe_inputs` and moved into a background task
 /// so the probe never holds a borrow on `State`.
@@ -187,6 +205,21 @@ impl State {
         let health = tracker.get_mut(slot);
         health.consecutive_failures = 0;
         health.backoff_until = None;
+        drop(tracker);
+        self.schedule_persist_key_health(cx);
+    }
+
+    /// Toggles the user-controlled `enabled` flag on a slot. Persisted to disk
+    /// so the choice survives restarts. Does not clear the failure counter or
+    /// backoff window — re-enabling a previously-disabled slot preserves its
+    /// prior health state. Called from the footer K1/K2/K3/K4 chips in
+    /// `ThreadView` and from the ConfigurationView checkbox.
+    fn set_slot_enabled(&self, slot: KeySlot, enabled: bool, cx: &App) {
+        let mut tracker = self.key_health.lock();
+        if tracker.get(slot).enabled == enabled {
+            return;
+        }
+        tracker.set_enabled(slot, enabled);
         drop(tracker);
         self.schedule_persist_key_health(cx);
     }
@@ -308,24 +341,38 @@ impl State {
     /// retry loop in `stream_completion` / `stream_response`, which needs the
     /// candidate list up-front so it can try keys one at a time without
     /// re-entering `Entity::read_with` from a `!Send` background context.
+    ///
+    /// Slots whose `enabled` flag is `false` (user-controlled toggle from the
+    /// footer chip / settings page) are omitted entirely — `select_from_candidates`
+    /// re-checks `enabled` defensively, but filtering here keeps the candidate
+    /// list short and matches user intent ("don't use this key right now").
     fn gather_candidates(&self) -> Vec<(Arc<str>, KeySlot)> {
         let primary_url = self.settings.api_url.as_str();
         let secondary_url = secondary_key_url(primary_url);
         let tertiary_url = tertiary_key_url(primary_url);
         let quaternary_url = quaternary_key_url(primary_url);
 
+        let enabled = self.key_health.lock();
         let mut out = Vec::with_capacity(4);
-        if let Some(key) = self.api_key_state.key(primary_url) {
-            out.push((key, KeySlot::Primary));
+        if enabled.get(KeySlot::Primary).enabled {
+            if let Some(key) = self.api_key_state.key(primary_url) {
+                out.push((key, KeySlot::Primary));
+            }
         }
-        if let Some(key) = self.api_key_state_2.key(&secondary_url) {
-            out.push((key, KeySlot::Secondary));
+        if enabled.get(KeySlot::Secondary).enabled {
+            if let Some(key) = self.api_key_state_2.key(&secondary_url) {
+                out.push((key, KeySlot::Secondary));
+            }
         }
-        if let Some(key) = self.api_key_state_3.key(&tertiary_url) {
-            out.push((key, KeySlot::Tertiary));
+        if enabled.get(KeySlot::Tertiary).enabled {
+            if let Some(key) = self.api_key_state_3.key(&tertiary_url) {
+                out.push((key, KeySlot::Tertiary));
+            }
         }
-        if let Some(key) = self.api_key_state_4.key(&quaternary_url) {
-            out.push((key, KeySlot::Quaternary));
+        if enabled.get(KeySlot::Quaternary).enabled {
+            if let Some(key) = self.api_key_state_4.key(&quaternary_url) {
+                out.push((key, KeySlot::Quaternary));
+            }
         }
         out
     }
@@ -397,6 +444,7 @@ impl State {
             is_backed_off,
             backoff_remaining,
             consecutive_failures: health.consecutive_failures,
+            enabled: health.enabled,
         }
     }
 
@@ -933,6 +981,37 @@ impl LanguageModel for OpenAiCompatibleLanguageModel {
 
     fn last_used_key_label(&self, cx: &App) -> Option<String> {
         self.state.read_with(cx, |state, _| state.last_used_key_label())
+    }
+
+    fn key_slot_status(&self, cx: &App) -> Option<ModelKeySlotStatusSummary> {
+        // Only meaningful for providers with at least one key configured. We
+        // still return the summary (with `has_key: false` slots) when zero keys
+        // are configured, so the footer can render the four chips as "empty".
+        // However, providers that aren't OpenAI-compatible never reach this
+        // impl, so this is the only `LanguageModel` impl that returns `Some`.
+        let snapshot = self.state.read_with(cx, |state, _| state.slot_health_snapshot());
+        Some(ModelKeySlotStatusSummary(snapshot.map(|s| ModelKeySlotStatus {
+            has_key: s.has_key,
+            enabled: s.enabled,
+            is_backed_off: s.is_backed_off,
+            backoff_remaining: s.backoff_remaining,
+            consecutive_failures: s.consecutive_failures,
+        })))
+    }
+
+    fn set_key_slot_enabled(&self, slot_index: usize, enabled: bool, cx: &mut App) {
+        let Some(slot) = slot_from_index(slot_index) else {
+            return;
+        };
+        self.state.read_with(cx, |state, _| {
+            state.set_slot_enabled(slot, enabled, cx);
+        });
+        // `set_slot_enabled` mutates `key_health` under a parking_lot mutex
+        // (not via `Entity::update`), so `cx.observe(&state, ...)` wouldn't
+        // fire. Notify explicitly so the footer re-renders immediately.
+        // `read_with` above ran on a `&App`; we now need a `&mut App` to nudge
+        // the state entity — this is a no-op if the entity is gone.
+        let _ = self.state.update(cx, |_, cx| cx.notify());
     }
 
     fn max_token_count(&self) -> u64 {
@@ -1961,7 +2040,7 @@ mod tests {
     #[test]
     fn slot_health_snapshot_fresh_state_is_all_clear() {
         // No keys configured, no failures — every slot should report
-        // `has_key: false`, `is_backed_off: false`, zero failures.
+        // `has_key: false`, `is_backed_off: false`, zero failures, `enabled: true`.
         let state = fake_state_with_no_keys();
         let snapshot = state.slot_health_snapshot();
         for status in &snapshot {
@@ -1969,6 +2048,7 @@ mod tests {
             assert!(!status.is_backed_off, "fresh slot should not be backed off");
             assert_eq!(status.consecutive_failures, 0);
             assert_eq!(status.backoff_remaining, Duration::ZERO);
+            assert!(status.enabled, "fresh slot should default to enabled");
         }
     }
 
@@ -1982,6 +2062,7 @@ mod tests {
             tracker.primary = KeyHealth {
                 consecutive_failures: 2,
                 backoff_until: Some(Instant::now() + Duration::from_secs(300)),
+                ..Default::default()
             };
         }
         let snapshot = state.slot_health_snapshot();
@@ -2013,6 +2094,7 @@ mod tests {
             tracker.secondary = KeyHealth {
                 consecutive_failures: 5,
                 backoff_until: Some(Instant::now() - Duration::from_secs(60)),
+                ..Default::default()
             };
         }
         let snapshot = state.slot_health_snapshot();
@@ -2046,14 +2128,17 @@ mod tests {
             tracker.primary = KeyHealth {
                 consecutive_failures: 3,
                 backoff_until: Some(Instant::now() + Duration::from_secs(300)),
+                ..Default::default()
             };
             tracker.secondary = KeyHealth {
                 consecutive_failures: 2,
                 backoff_until: Some(Instant::now() + Duration::from_secs(60)),
+                ..Default::default()
             };
             tracker.tertiary = KeyHealth {
                 consecutive_failures: 5,
                 backoff_until: Some(Instant::now() + Duration::from_secs(3600)),
+                ..Default::default()
             };
         }
 

@@ -14,6 +14,7 @@ use gpui::{AnyView, App, AsyncApp, Task, Window};
 use icons::IconName;
 use parking_lot::Mutex;
 use std::sync::Arc;
+use std::time::Duration;
 
 pub type CreateProviderSettingsView = Arc<dyn Fn(&mut Window, &mut App) -> AnyView + 'static>;
 
@@ -51,6 +52,44 @@ impl Default for LanguageModelTextStream {
         }
     }
 }
+
+/// UI-facing snapshot of one API-key slot for providers that rotate across
+/// multiple keys (OpenAI-compatible primary/secondary/tertiary/quaternary).
+///
+/// This is a provider-agnostic projection — it lives in the `language_model`
+/// crate so any UI (e.g. the chat footer key-status chips) can consume it
+/// without depending on `language_models` or knowing about the OpenAI-
+/// compatible `KeyHealth` internals. `has_key` reflects whether a secret is
+/// configured; `enabled` is the user-controlled toggle (a key can be present
+/// but disabled, in which case it's excluded from rotation).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModelKeySlotStatus {
+    pub has_key: bool,
+    pub enabled: bool,
+    pub is_backed_off: bool,
+    pub backoff_remaining: Duration,
+    pub consecutive_failures: u32,
+}
+
+impl Default for ModelKeySlotStatus {
+    fn default() -> Self {
+        Self {
+            has_key: false,
+            enabled: true,
+            is_backed_off: false,
+            backoff_remaining: Duration::ZERO,
+            consecutive_failures: 0,
+        }
+    }
+}
+
+/// Summary of a multi-key provider's per-slot status, returned by
+/// [`LanguageModel::key_slot_status`]. The four entries are always in the
+/// fixed order `[Primary, Secondary, Tertiary, Quaternary]` (1-indexed as
+/// K1/K2/K3/K4 in the UI). Providers that don't rotate keys return `None`
+/// from `key_slot_status`, so callers render nothing.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct ModelKeySlotStatusSummary(pub [ModelKeySlotStatus; 4]);
 
 pub trait LanguageModel: Send + Sync {
     fn id(&self) -> LanguageModelId;
@@ -101,6 +140,26 @@ pub trait LanguageModel: Send + Sync {
     fn last_used_key_label(&self, _cx: &App) -> Option<String> {
         None
     }
+
+    /// Per-slot status for multi-key providers, so the UI (e.g. the chat
+    /// footer K1/K2/K3/K4 chips) can render health + enable/disable state at
+    /// a glance. Returns `None` for providers that don't rotate keys (the
+    /// default) — callers should then render nothing.
+    ///
+    /// The returned summary is a snapshot taken under the provider's health
+    /// lock; callers that need live updates should poll on a timer (the
+    /// ConfigurationView uses a 1s interval) since the underlying state is
+    /// mutated from background request closures that bypass `cx.notify()`.
+    fn key_slot_status(&self, _cx: &App) -> Option<ModelKeySlotStatusSummary> {
+        None
+    }
+
+    /// Toggles the user-controlled `enabled` flag on one slot. `slot_index` is
+    /// 0-based into the same fixed `[Primary, Secondary, Tertiary, Quaternary]`
+    /// order used by [`Self::key_slot_status`]. Out-of-range indices are
+    /// silently ignored so a stale UI can't panic the provider. Default no-op
+    /// for providers that don't rotate keys.
+    fn set_key_slot_enabled(&self, _slot_index: usize, _enabled: bool, _cx: &mut App) {}
 
     /// Information about the cost of using this model, if available.
     fn model_cost_info(&self) -> Option<LanguageModelCostInfo> {

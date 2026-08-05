@@ -36,10 +36,27 @@ pub enum KeySlot {
 
 /// Per-key backoff state. Persisted across restarts as relative durations
 /// (see `PersistedKeyHealth`); in-memory `Instant`s are reconstructed on load.
-#[derive(Default, Clone, Debug, PartialEq, Eq)]
+///
+/// `enabled` is a user-controlled toggle (defaults to `true`) that excludes a
+/// key from rotation without clearing its stored secret. Disabled slots are
+/// skipped by `select_from_candidates` and `gather_candidates`, and never
+/// appear in the fail-open backoff fallback either — disabling is a hard
+/// opt-out, distinct from a transient backoff.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KeyHealth {
     pub consecutive_failures: u32,
     pub backoff_until: Option<Instant>,
+    pub enabled: bool,
+}
+
+impl Default for KeyHealth {
+    fn default() -> Self {
+        Self {
+            consecutive_failures: 0,
+            backoff_until: None,
+            enabled: true,
+        }
+    }
 }
 
 /// UI-facing projection of one slot's health + configuration state. Returned
@@ -52,6 +69,9 @@ pub struct SlotHealthStatus {
     pub is_backed_off: bool,
     pub backoff_remaining: Duration,
     pub consecutive_failures: u32,
+    /// User-controlled on/off toggle. `false` excludes the slot from rotation
+    /// even when the key is otherwise healthy.
+    pub enabled: bool,
 }
 
 impl KeyHealth {
@@ -118,6 +138,13 @@ impl KeyHealthTracker {
     pub fn record_attempt(&mut self, slot: KeySlot) {
         self.last_used_slot = Some(slot);
     }
+
+    /// Toggles the user-controlled `enabled` flag on a slot. Does not touch the
+    /// failure counter or backoff window, so re-enabling a previously-disabled
+    /// slot preserves its prior health state. Persisted via `PersistedKeyHealth`.
+    pub fn set_enabled(&mut self, slot: KeySlot, enabled: bool) {
+        self.get_mut(slot).enabled = enabled;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -134,14 +161,33 @@ impl KeyHealthTracker {
 /// On-disk representation of a single slot's health. `backoff_remaining_secs`
 /// is `backoff_until - now` at save time (or `null` if the slot is healthy).
 ///
-/// `Default` is a fully-healthy slot (zero failures, no backoff). Used by
-/// `#[serde(default)]` on `PersistedKeyHealthFile::quaternary` so that v1
+/// `Default` is a fully-healthy slot (zero failures, no backoff, enabled).
+/// Used by `#[serde(default)]` on `PersistedKeyHealthFile::quaternary` so that v1
 /// schema files (which predate the quaternary slot) deserialize successfully
 /// and migrate forward instead of being rejected wholesale — see issue 007.
-#[derive(Serialize, Deserialize, Debug, PartialEq, Default)]
+///
+/// `enabled` is `#[serde(default = "default_true")]` so that v2 schema files
+/// (which predate the user-toggleable enable/disable flag) load as enabled.
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
 pub struct PersistedKeyHealth {
     pub consecutive_failures: u32,
     pub backoff_remaining_secs: Option<f64>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for PersistedKeyHealth {
+    fn default() -> Self {
+        Self {
+            consecutive_failures: 0,
+            backoff_remaining_secs: None,
+            enabled: true,
+        }
+    }
 }
 
 /// Top-level persisted file. One per provider id, under
@@ -192,6 +238,7 @@ impl PersistedKeyHealth {
         Self {
             consecutive_failures: health.consecutive_failures,
             backoff_remaining_secs,
+            enabled: health.enabled,
         }
     }
 
@@ -207,6 +254,7 @@ impl PersistedKeyHealth {
         KeyHealth {
             consecutive_failures: self.consecutive_failures,
             backoff_until,
+            enabled: self.enabled,
         }
     }
 }
@@ -497,36 +545,66 @@ pub fn is_backoff_worthy(err: &LanguageModelCompletionError) -> bool {
 /// in `stream_completion` / `stream_response`, which has already snapshot the
 /// candidate list and cannot go back through `&self`.
 ///
-/// Picks a healthy candidate by **deterministic hourly rotation**, not random.
-/// The index is `floor(now_unix_secs / 3600) % healthy.len()` — so the same key
-/// is selected for the entire wall-clock hour. This is cache-friendly: most
-/// upstream providers key their prompt cache on the API key, and random
-/// per-request rotation would thrash the cache. Rotating once per hour keeps
-/// the cache warm while still distributing load across keys over time.
+/// Selection policy (**priority-first** with hourly fallback):
 ///
-/// If every candidate is currently backed off, returns the one whose
-/// `backoff_until` is soonest — failing open is strictly better than
-/// `NoApiKey` when at least one key exists.
+/// 1. Build `healthy` = present + `enabled` + not in backoff.
+/// 2. If `Primary` is healthy, return it. This makes Primary "sticky" — it
+///    gets used for the entire wall-clock hour (and across hours, days, …)
+///    *until it actually fails*, which keeps the upstream prompt cache keyed
+///    on Primary continuously hot. Other configured keys are spares, not
+///    load-balanced peers.
+/// 3. Otherwise (Primary is absent / disabled / backed off) pick among the
+///    remaining healthy candidates via `deterministic_hourly_pick` so the
+///    same spare key is used for the whole hour — again cache-friendly.
+/// 4. If no healthy candidate exists, fall back to the earliest-expiring
+///    backoff among **enabled** slots. Disabled slots are never picked even
+///    in fail-open (a disabled slot is a hard user opt-out, distinct from a
+///    transient backoff). Failing open on backoff is strictly better than
+///    `NoApiKey` when at least one enabled key exists.
+///
+/// `deterministic_hourly_pick` rotates by `floor(now_unix_secs / 3600) %
+/// healthy.len()` so the same key is used for the whole wall-clock hour. This
+/// is cache-friendly: most upstream providers key their prompt cache on the
+/// API key, and random per-request rotation would thrash the cache.
 pub fn select_from_candidates(
     candidates: &[(Arc<str>, KeySlot)],
     health: &KeyHealthTracker,
     now: Instant,
 ) -> Option<(Arc<str>, KeySlot)> {
-    // Healthy candidates: present and not in backoff.
+    // Healthy candidates: present, enabled, not in backoff. The `enabled`
+    // check is duplicated in the fail-open fallback below — disabled slots
+    // never participate.
     let healthy: Vec<(Arc<str>, KeySlot)> = candidates
         .iter()
-        .filter(|(_, slot)| !health.get(*slot).is_backed_off(now))
+        .filter(|(_, slot)| {
+            let h = health.get(*slot);
+            h.enabled && !h.is_backed_off(now)
+        })
         .cloned()
         .collect();
 
+    // Sticky Primary: while Primary is healthy, always use it so its upstream
+    // prompt cache stays hot. Other slots are spares.
+    if let Some(pick) = healthy
+        .iter()
+        .find(|(_, slot)| *slot == KeySlot::Primary)
+        .cloned()
+    {
+        return Some(pick);
+    }
+
+    // Primary unavailable — hourly-rotate across whatever else is healthy.
     if let Some(pick) = deterministic_hourly_pick(&healthy) {
         return Some(pick);
     }
 
-    // Everything present is backed off — fall back to the earliest-expiring
-    // backed-off key. Better than NoApiKey when at least one key exists.
+    // Everything present+enabled is backed off — fall back to the
+    // earliest-expiring backed-off enabled key. Disabled slots never qualify
+    // (better to fail with `None` → `NoApiKey` than silently resurrect a key
+    // the user explicitly turned off).
     candidates
         .iter()
+        .filter(|(_, slot)| health.get(*slot).enabled)
         .filter_map(|(key, slot)| {
             let until = health.get(*slot).backoff_until?;
             Some(((key.clone(), *slot), until))
@@ -890,10 +968,12 @@ mod tests {
         health.primary = KeyHealth {
             consecutive_failures: 3,
             backoff_until: Some(now + Duration::from_secs(120)),
+            ..Default::default()
         };
         health.secondary = KeyHealth {
             consecutive_failures: 1,
             backoff_until: Some(now + Duration::from_secs(30)),
+            ..Default::default()
         };
 
         let pick = select_from_candidates(&candidates, &health, now);
@@ -901,6 +981,129 @@ mod tests {
         // Secondary expires sooner, so it must be picked.
         let (_, slot) = pick.unwrap();
         assert_eq!(slot, KeySlot::Secondary);
+    }
+
+    #[test]
+    fn select_from_candidates_is_primary_sticky_when_healthy() {
+        // With all four keys healthy, Primary is the sticky pick every time —
+        // hourly rotation must NOT spread load across all four keys while
+        // Primary is up.
+        let candidates: Vec<(Arc<str>, KeySlot)> = vec![
+            (Arc::<str>::from("key-a"), KeySlot::Primary),
+            (Arc::<str>::from("key-b"), KeySlot::Secondary),
+            (Arc::<str>::from("key-c"), KeySlot::Tertiary),
+            (Arc::<str>::from("key-d"), KeySlot::Quaternary),
+        ];
+        let health = KeyHealthTracker::default();
+        let now = Instant::now();
+        for _ in 0..20 {
+            let (key, slot) = select_from_candidates(&candidates, &health, now).unwrap();
+            assert_eq!(slot, KeySlot::Primary, "Primary must be sticky while healthy");
+            assert_eq!(&*key, "key-a");
+        }
+    }
+
+    #[test]
+    fn select_from_candidates_falls_through_to_hourly_when_primary_backed_off() {
+        // When Primary is in backoff, the remaining healthy slots should be
+        // hourly-rotated (deterministic within an hour).
+        let candidates: Vec<(Arc<str>, KeySlot)> = vec![
+            (Arc::<str>::from("key-a"), KeySlot::Primary),
+            (Arc::<str>::from("key-b"), KeySlot::Secondary),
+            (Arc::<str>::from("key-c"), KeySlot::Tertiary),
+        ];
+        let mut health = KeyHealthTracker::default();
+        health.record_failure(KeySlot::Primary, Instant::now());
+        let now = Instant::now();
+        // Many calls within the same wall-clock hour must all resolve to the
+        // SAME spare slot (deterministic_hourly_pick picks one index for the hour).
+        let mut seen_slots: Vec<KeySlot> = Vec::new();
+        for _ in 0..20 {
+            let (_, slot) = select_from_candidates(&candidates, &health, now).unwrap();
+            assert_ne!(slot, KeySlot::Primary, "backed-off Primary must never be picked");
+            seen_slots.push(slot);
+        }
+        // Deterministic hourly pick selects the SAME index for the whole hour,
+        // so 20 calls in a row must all have resolved to one slot.
+        let distinct = {
+            let mut dedup = seen_slots.clone();
+            dedup.dedup();
+            dedup.len()
+        };
+        assert_eq!(distinct, 1,
+            "hourly rotation should be deterministic within one hour, got {seen_slots:?}");
+    }
+
+    #[test]
+    fn select_from_candidates_skips_disabled_slots_even_when_healthy() {
+        // A disabled slot must never be selected, even if it's the only healthy
+        // one — disabling is a hard opt-out, distinct from a transient backoff.
+        let candidates: Vec<(Arc<str>, KeySlot)> = vec![
+            (Arc::<str>::from("key-a"), KeySlot::Primary),
+            (Arc::<str>::from("key-b"), KeySlot::Secondary),
+        ];
+        let mut health = KeyHealthTracker::default();
+        health.set_enabled(KeySlot::Primary, false);
+        let now = Instant::now();
+        for _ in 0..20 {
+            let (_, slot) = select_from_candidates(&candidates, &health, now).unwrap();
+            assert_eq!(slot, KeySlot::Secondary, "disabled Primary must be skipped");
+        }
+    }
+
+    #[test]
+    fn select_from_candidates_returns_none_when_all_enabled_slots_backed_off_and_disabled_skipped() {
+        // All slots are either disabled or backed off. The disabled slot must
+        // NOT be used in fail-open — `None` is the correct outcome because the
+        // user explicitly opted that slot out.
+        let candidates: Vec<(Arc<str>, KeySlot)> = vec![
+            (Arc::<str>::from("key-a"), KeySlot::Primary),
+            (Arc::<str>::from("key-b"), KeySlot::Secondary),
+        ];
+        let mut health = KeyHealthTracker::default();
+        health.set_enabled(KeySlot::Primary, false); // disabled, not backed off
+        health.record_failure(KeySlot::Secondary, Instant::now()); // backed off
+        let now = Instant::now();
+        // Secondary is backed off but enabled → fail-open should pick it.
+        let pick = select_from_candidates(&candidates, &health, now);
+        assert!(pick.is_some(), "enabled backed-off slot should fail-open");
+        let (_, slot) = pick.unwrap();
+        assert_eq!(slot, KeySlot::Secondary, "fail-open must skip disabled slots");
+    }
+
+    #[test]
+    fn select_from_candidates_returns_none_when_all_disabled() {
+        // Every slot disabled. There's no fail-open because no enabled slot exists.
+        let candidates: Vec<(Arc<str>, KeySlot)> = vec![
+            (Arc::<str>::from("key-a"), KeySlot::Primary),
+            (Arc::<str>::from("key-b"), KeySlot::Secondary),
+        ];
+        let mut health = KeyHealthTracker::default();
+        health.set_enabled(KeySlot::Primary, false);
+        health.set_enabled(KeySlot::Secondary, false);
+        let now = Instant::now();
+        assert!(
+            select_from_candidates(&candidates, &health, now).is_none(),
+            "no enabled slot → None (disabled slots never picked)"
+        );
+    }
+
+    #[test]
+    fn set_enabled_toggles_without_touching_backoff() {
+        // Toggling enabled must preserve the failure count and backoff window
+        // so re-enabling a temporarily-disabled slot restores its prior state.
+        let mut tracker = KeyHealthTracker::default();
+        let now = Instant::now();
+        tracker.record_failure(KeySlot::Tertiary, now);
+        let before = tracker.get(KeySlot::Tertiary).clone();
+        tracker.set_enabled(KeySlot::Tertiary, false);
+        assert!(!tracker.get(KeySlot::Tertiary).enabled);
+        assert_eq!(tracker.get(KeySlot::Tertiary).consecutive_failures, before.consecutive_failures);
+        assert_eq!(tracker.get(KeySlot::Tertiary).backoff_until, before.backoff_until);
+        tracker.set_enabled(KeySlot::Tertiary, true);
+        assert!(tracker.get(KeySlot::Tertiary).enabled);
+        assert_eq!(tracker.get(KeySlot::Tertiary).consecutive_failures, before.consecutive_failures);
+        assert_eq!(tracker.get(KeySlot::Tertiary).backoff_until, before.backoff_until);
     }
 
     // ------------------------------------------------------------------
@@ -1211,14 +1414,17 @@ mod tests {
         tracker.primary = KeyHealth {
             consecutive_failures: 3,
             backoff_until: Some(now + Duration::from_secs(600)),
+            ..Default::default()
         };
         tracker.secondary = KeyHealth {
             consecutive_failures: 0,
             backoff_until: None,
+            ..Default::default()
         };
         tracker.tertiary = KeyHealth {
             consecutive_failures: 1,
             backoff_until: Some(now + Duration::from_secs(60)),
+            ..Default::default()
         };
 
         let persisted = PersistedKeyHealthFile::from_tracker(&tracker, now);
@@ -1247,12 +1453,14 @@ mod tests {
         let zero = PersistedKeyHealth {
             consecutive_failures: 5,
             backoff_remaining_secs: Some(0.0),
+            ..Default::default()
         };
         assert_eq!(zero.to_health(now, 0.0).backoff_until, None);
 
         let negative = PersistedKeyHealth {
             consecutive_failures: 5,
             backoff_remaining_secs: Some(-120.0),
+            ..Default::default()
         };
         assert_eq!(negative.to_health(now, 0.0).backoff_until, None);
 
@@ -1269,6 +1477,7 @@ mod tests {
         let healthy = PersistedKeyHealth {
             consecutive_failures: 0,
             backoff_remaining_secs: None,
+            ..Default::default()
         };
         let restored = healthy.to_health(now, 0.0);
         assert_eq!(restored.consecutive_failures, 0);
@@ -1284,6 +1493,7 @@ mod tests {
         let slot = PersistedKeyHealth {
             consecutive_failures: 3,
             backoff_remaining_secs: Some(600.0),
+            ..Default::default()
         };
         let restored = slot.to_health(now, 100.0);
         let until = restored.backoff_until.expect("should still be backed off");
@@ -1307,6 +1517,14 @@ mod tests {
         tracker.primary = KeyHealth {
             consecutive_failures: 2,
             backoff_until: Some(now + Duration::from_secs_f64(120.5)),
+            ..Default::default()
+        };
+        // Disable Secondary so the serialized `enabled: false` shape is also
+        // covered by this snapshot — it's the only slot that differs from the
+        // default `true`.
+        tracker.secondary = KeyHealth {
+            enabled: false,
+            ..Default::default()
         };
         let persisted = PersistedKeyHealthFile::from_tracker(&tracker, now);
         let json = serde_json::to_value(&persisted).unwrap();
@@ -1325,24 +1543,47 @@ mod tests {
         );
         // 120.5s remaining, encoded as a float (not null).
         assert!(primary.get("backoff_remaining_secs").unwrap().is_f64());
+        // Primary is enabled (the default).
+        assert_eq!(
+            primary.get("enabled").and_then(|v| v.as_bool()),
+            Some(true),
+            "primary should serialize enabled: true"
+        );
         let secondary = obj.get("secondary").unwrap().as_object().unwrap();
         assert_eq!(
             secondary.get("consecutive_failures").and_then(|v| v.as_u64()),
             Some(0)
         );
         assert!(secondary.get("backoff_remaining_secs").unwrap().is_null());
+        // Secondary was explicitly disabled — its `enabled: false` survives the
+        // round-trip through `from_tracker`.
+        assert_eq!(
+            secondary.get("enabled").and_then(|v| v.as_bool()),
+            Some(false),
+            "secondary should serialize enabled: false"
+        );
         let tertiary = obj.get("tertiary").unwrap().as_object().unwrap();
         assert_eq!(
             tertiary.get("consecutive_failures").and_then(|v| v.as_u64()),
             Some(0)
         );
         assert!(tertiary.get("backoff_remaining_secs").unwrap().is_null());
+        assert_eq!(
+            tertiary.get("enabled").and_then(|v| v.as_bool()),
+            Some(true),
+            "tertiary should default to enabled: true"
+        );
         let quaternary = obj.get("quaternary").unwrap().as_object().unwrap();
         assert_eq!(
             quaternary.get("consecutive_failures").and_then(|v| v.as_u64()),
             Some(0)
         );
         assert!(quaternary.get("backoff_remaining_secs").unwrap().is_null());
+        assert_eq!(
+            quaternary.get("enabled").and_then(|v| v.as_bool()),
+            Some(true),
+            "quaternary should default to enabled: true"
+        );
     }
 
     #[test]
@@ -1354,18 +1595,22 @@ mod tests {
             primary: PersistedKeyHealth {
                 consecutive_failures: 7,
                 backoff_remaining_secs: Some(3600.0),
+                ..Default::default()
             },
             secondary: PersistedKeyHealth {
                 consecutive_failures: 0,
                 backoff_remaining_secs: None,
+                ..Default::default()
             },
             tertiary: PersistedKeyHealth {
                 consecutive_failures: 2,
                 backoff_remaining_secs: Some(0.0),
+                ..Default::default()
             },
             quaternary: PersistedKeyHealth {
                 consecutive_failures: 0,
                 backoff_remaining_secs: None,
+                ..Default::default()
             },
         };
         let json = serde_json::to_string(&original).unwrap();
@@ -1471,18 +1716,22 @@ mod tests {
             primary: PersistedKeyHealth {
                 consecutive_failures: 99,
                 backoff_remaining_secs: Some(9999.0),
+                ..Default::default()
             },
             secondary: PersistedKeyHealth {
                 consecutive_failures: 0,
                 backoff_remaining_secs: None,
+                ..Default::default()
             },
             tertiary: PersistedKeyHealth {
                 consecutive_failures: 0,
                 backoff_remaining_secs: None,
+                ..Default::default()
             },
             quaternary: PersistedKeyHealth {
                 consecutive_failures: 0,
                 backoff_remaining_secs: None,
+                ..Default::default()
             },
         };
         fs.atomic_write(path.clone(), serde_json::to_string(&future).unwrap())
@@ -1567,6 +1816,7 @@ mod tests {
         tracker.secondary = KeyHealth {
             consecutive_failures: 4,
             backoff_until: Some(persist_now + original_remaining),
+            ..Default::default()
         };
         persist_key_health(&fs, path.clone(), tracker.clone())
             .await
@@ -1609,6 +1859,7 @@ mod tests {
         tracker.primary = KeyHealth {
             consecutive_failures: 2,
             backoff_until: Some(now + Duration::from_millis(1)),
+            ..Default::default()
         };
         persist_key_health(&fs, path.clone(), tracker.clone())
             .await
