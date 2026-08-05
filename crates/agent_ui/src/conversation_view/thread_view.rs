@@ -6078,206 +6078,241 @@ impl ThreadView {
             ("Auto-Prompt: Off", Color::Muted)
         };
 
-        IconButton::new("auto-prompt-toggle", IconName::Sparkle)
-            .icon_size(IconSize::Small)
-            .icon_color(icon_color)
-            .when(enabled && !is_processing && !is_failed, |this| {
-                this.style(ButtonStyle::Tinted(TintColor::Accent))
-            })
-            .tooltip(move |_, cx| {
-                if is_failed {
-                    if let Some(ref msg) = failed_error_message {
-                        Tooltip::simple(format!("Auto-prompt failed: {msg}"), cx)
-                    } else {
-                        Tooltip::simple(tooltip_text, cx)
-                    }
+        let build_tooltip = move |_window: &mut Window, cx: &mut App| {
+            if is_failed {
+                if let Some(ref msg) = failed_error_message {
+                    Tooltip::simple(format!("Auto-prompt failed: {msg}"), cx)
                 } else {
                     Tooltip::simple(tooltip_text, cx)
                 }
-            })
-            .on_click(cx.listener(move |this, _, window, cx| {
-                if is_processing {
-                    log::info!("[auto_prompt] Cancelling auto-prompt processing");
-                    this._auto_prompt_task = None;
-                    this.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;
-                    let session_id = this.thread.read(cx).session_id().to_string();
-                    auto_prompt::reset_iteration_with_session(&session_id);
-                    cx.notify();
-                    return;
-                }
-                if is_failed {
-                    log::info!("[auto_prompt] Manual retry triggered by user");
-                    if let Some(retry_data) = this._auto_prompt_retry_data.take() {
-                        let retry_data_for_restore = retry_data.clone();
-                        auto_prompt::reset_llm_failure_count(); // Reset counter for fresh retry
-                        this.auto_prompt_state = crate::auto_prompt::AutoPromptState::Processing;
-                        cx.notify();
+            } else {
+                Tooltip::simple(tooltip_text, cx)
+            }
+        };
 
-                        let conversation_view = this.server_view.clone();
+        // The processing state gets a visible text label (not just a tooltip) because
+        // it's the one state where the button is also a cancel target — users need to
+        // see at a glance that something is running and clickable, not discover it on hover.
+        if is_processing {
+            Button::new("auto-prompt-toggle", "Processing…")
+                .start_icon(
+                    Icon::new(IconName::Sparkle)
+                        .size(IconSize::XSmall)
+                        .color(icon_color),
+                )
+                .label_size(LabelSize::XSmall)
+                .color(icon_color)
+                .tooltip(build_tooltip)
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.handle_auto_prompt_toggle_click(window, cx);
+                }))
+                .into_any_element()
+        } else {
+            IconButton::new("auto-prompt-toggle", IconName::Sparkle)
+                .icon_size(IconSize::Small)
+                .icon_color(icon_color)
+                .when(enabled && !is_failed, |this| {
+                    this.style(ButtonStyle::Tinted(TintColor::Accent))
+                })
+                .tooltip(build_tooltip)
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.handle_auto_prompt_toggle_click(window, cx);
+                }))
+                .into_any_element()
+        }
+    }
 
-                        this._auto_prompt_task = Some(cx.spawn_in(window, async move |_this, cx| {
-                            let thread_weak = conversation_view
-                                .update_in(cx, |cv, _window, _cx| {
-                                    cv.active_thread()
-                                        .map(|tv| tv.downgrade())
+    fn handle_auto_prompt_toggle_click(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let is_processing = matches!(
+            self.auto_prompt_state,
+            crate::auto_prompt::AutoPromptState::Processing
+        );
+        let is_failed = matches!(
+            self.auto_prompt_state,
+            crate::auto_prompt::AutoPromptState::Failed(_)
+        );
+
+        if is_processing {
+            log::info!("[auto_prompt] Cancelling auto-prompt processing");
+            self._auto_prompt_task = None;
+            self.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;
+            let session_id = self.thread.read(cx).session_id().to_string();
+            auto_prompt::reset_iteration_with_session(&session_id);
+            cx.notify();
+            return;
+        }
+        if is_failed {
+            log::info!("[auto_prompt] Manual retry triggered by user");
+            if let Some(retry_data) = self._auto_prompt_retry_data.take() {
+                let retry_data_for_restore = retry_data.clone();
+                auto_prompt::reset_llm_failure_count(); // Reset counter for fresh retry
+                self.auto_prompt_state = crate::auto_prompt::AutoPromptState::Processing;
+                cx.notify();
+
+                let conversation_view = self.server_view.clone();
+
+                self._auto_prompt_task = Some(cx.spawn_in(window, async move |_this, cx| {
+                    let thread_weak = conversation_view
+                        .update_in(cx, |cv, _window, _cx| {
+                            cv.active_thread()
+                                .map(|tv| tv.downgrade())
+                        })
+                        .unwrap_or(None);
+
+                    let config = auto_prompt::load_config_cached().unwrap_or_default();
+
+                    if retry_data.had_error {
+                        let pre_call_delay = config.backoff_delay_ms(1);
+                        log::info!(
+                            "[auto_prompt] Retry: source thread had error, waiting {pre_call_delay}ms before LLM call"
+                        );
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_millis(pre_call_delay))
+                            .await;
+
+                        if let Some(ref tv) = thread_weak {
+                            if tv
+                                .read_with(cx, |tv, _| {
+                                    !matches!(
+                                        tv.auto_prompt_state,
+                                        crate::auto_prompt::AutoPromptState::Processing
+                                    )
                                 })
-                                .unwrap_or(None);
+                                .unwrap_or(true)
+                            {
+                                log::info!("[auto_prompt] Retry cancelled during pre-call delay");
+                                return;
+                            }
+                        }
+                    }
 
-                            let config = auto_prompt::load_config_cached().unwrap_or_default();
+                    let result = auto_prompt::decide_with_llm(retry_data, cx).await;
 
-                            if retry_data.had_error {
-                                let pre_call_delay = config.backoff_delay_ms(1);
-                                log::info!(
-                                    "[auto_prompt] Retry: source thread had error, waiting {pre_call_delay}ms before LLM call"
-                                );
-                                cx.background_executor()
-                                    .timer(std::time::Duration::from_millis(pre_call_delay))
-                                    .await;
+                    log::info!("[auto_prompt] Retry LLM call completed");
 
-                                if let Some(ref tv) = thread_weak {
-                                    if tv
-                                        .read_with(cx, |tv, _| {
-                                            !matches!(
-                                                tv.auto_prompt_state,
-                                                crate::auto_prompt::AutoPromptState::Processing
-                                            )
-                                        })
-                                        .unwrap_or(true)
-                                    {
-                                        log::info!("[auto_prompt] Retry cancelled during pre-call delay");
-                                        return;
-                                    }
+                    match result {
+                        Ok(auto_prompt::AutoPromptOutcome::Continue(action)) => {
+                            auto_prompt::reset_llm_failure_count();
+                            if let Some(ref tv) = thread_weak {
+                                if let Err(err) = tv.update(cx, |tv, cx| {
+                                    tv.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;
+                                    tv._auto_prompt_retry_data = None;
+                                    cx.notify();
+                                }) {
+                                    log::warn!("[auto_prompt] failed to reset state after retry: {err}");
                                 }
                             }
 
-                            let result = auto_prompt::decide_with_llm(retry_data, cx).await;
-
-                            log::info!("[auto_prompt] Retry LLM call completed");
-
-                            match result {
-                                Ok(auto_prompt::AutoPromptOutcome::Continue(action)) => {
-                                    auto_prompt::reset_llm_failure_count();
-                                    if let Some(ref tv) = thread_weak {
-                                        if let Err(err) = tv.update(cx, |tv, cx| {
-                                            tv.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;
-                                            tv._auto_prompt_retry_data = None;
-                                            cx.notify();
-                                        }) {
-                                            log::warn!("[auto_prompt] failed to reset state after retry: {err}");
-                                        }
-                                    }
-
-                                    log::info!("[auto_prompt] Retry succeeded - dispatching action");
-                                    match conversation_view.update_in(cx, |_cv, window, cx| {
-                                        crate::auto_prompt::dispatch_action(action, _cv, window, cx);
-                                    }) {
-                                        Ok(()) => {
-                                            log::info!("[auto_prompt] Retry dispatch submitted");
-                                        }
-                                        Err(err) => {
-                                            log::warn!("[auto_prompt] FAILED to dispatch retry action (view may have been dropped): {err}");
-                                        }
-                                    }
-                                }
-                                Ok(auto_prompt::AutoPromptOutcome::Stopped { reason }) => {
-                                    auto_prompt::reset_llm_failure_count();
-                                    if let Some(ref tv) = thread_weak {
-                                        if let Err(err) = tv.update(cx, |tv, cx| {
-                                            tv.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;
-                                            tv._auto_prompt_retry_data = None;
-                                            cx.notify();
-                                        }) {
-                                            log::warn!("[auto_prompt] failed to reset state on retry stop: {err}");
-                                        }
-                                    }
-                                    log::info!("[auto_prompt] Retry chain stopped: {reason}");
-                                }
-                                Ok(auto_prompt::AutoPromptOutcome::ContextOverflow(action)) => {
-                                    auto_prompt::reset_llm_failure_count();
-                                    if let Some(ref tv) = thread_weak {
-                                        if let Err(err) = tv.update(cx, |tv, cx| {
-                                            tv.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;
-                                            tv._auto_prompt_retry_data = None;
-                                            cx.notify();
-                                        }) {
-                                            log::warn!("[auto_prompt] failed to reset state on retry context overflow: {err}");
-                                        }
-                                    }
-                                    log::info!("[auto_prompt] Retry context overflow — dispatching summarization");
-                                    match conversation_view.update_in(cx, |_cv, window, cx| {
-                                        crate::auto_prompt::dispatch_action(action, _cv, window, cx);
-                                    }) {
-                                        Ok(()) => {
-                                            log::info!("[auto_prompt] Retry context overflow dispatch submitted");
-                                        }
-                                        Err(err) => {
-                                            log::warn!("[auto_prompt] FAILED to dispatch retry context overflow: {err}");
-                                        }
-                                    }
-                                }
-                                Ok(auto_prompt::AutoPromptOutcome::RetryAfterBackoff { delay_ms, reason }) => {
-                                    // Issue 007: the source thread had an error AND context overflowed.
-                                    // Manual retry path treats this as a soft stop — the user can click
-                                    // retry again after the upstream rate limit has cleared. We surface
-                                    // the wait hint so the user knows why no work was dispatched.
-                                    auto_prompt::increment_llm_failure_count();
-                                    if let Some(ref tv) = thread_weak {
-                                        if let Err(err) = tv.update(cx, |tv, cx| {
-                                            tv.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;
-                                            tv._auto_prompt_retry_data = None;
-                                            cx.notify();
-                                        }) {
-                                            log::warn!("[auto_prompt] failed to reset state on retry after backoff: {err}");
-                                        }
-                                    }
-                                    log::warn!(
-                                        "[auto_prompt] Retry returned RetryAfterBackoff — waiting {delay_ms}ms suggested; reason: {reason}"
-                                    );
+                            log::info!("[auto_prompt] Retry succeeded - dispatching action");
+                            match conversation_view.update_in(cx, |_cv, window, cx| {
+                                crate::auto_prompt::dispatch_action(action, _cv, window, cx);
+                            }) {
+                                Ok(()) => {
+                                    log::info!("[auto_prompt] Retry dispatch submitted");
                                 }
                                 Err(err) => {
-                                    // Retry failed again - set back to Failed state and restore retry data
-                                    if let Some(ref tv) = thread_weak {
-                                        if let Err(update_err) = tv.update(cx, |tv, cx| {
-                                            tv.auto_prompt_state = crate::auto_prompt::AutoPromptState::Failed(format!("{err:#}"));
-                                            tv._auto_prompt_retry_data = Some(retry_data_for_restore);
-                                            cx.notify();
-                                        }) {
-                                            log::warn!("[auto_prompt] failed to set Failed state after retry: {update_err}");
-                                        }
-                                    }
-                                    log::warn!(
-                                        "[auto_prompt] Retry failed: {err}"
-                                    );
+                                    log::warn!("[auto_prompt] FAILED to dispatch retry action (view may have been dropped): {err}");
                                 }
                             }
-                        }));
-                    } else {
-                        log::warn!("[auto_prompt] No retry data available, cannot retry");
-                        this.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;
-                        cx.notify();
+                        }
+                        Ok(auto_prompt::AutoPromptOutcome::Stopped { reason }) => {
+                            auto_prompt::reset_llm_failure_count();
+                            if let Some(ref tv) = thread_weak {
+                                if let Err(err) = tv.update(cx, |tv, cx| {
+                                    tv.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;
+                                    tv._auto_prompt_retry_data = None;
+                                    cx.notify();
+                                }) {
+                                    log::warn!("[auto_prompt] failed to reset state on retry stop: {err}");
+                                }
+                            }
+                            log::info!("[auto_prompt] Retry chain stopped: {reason}");
+                        }
+                        Ok(auto_prompt::AutoPromptOutcome::ContextOverflow(action)) => {
+                            auto_prompt::reset_llm_failure_count();
+                            if let Some(ref tv) = thread_weak {
+                                if let Err(err) = tv.update(cx, |tv, cx| {
+                                    tv.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;
+                                    tv._auto_prompt_retry_data = None;
+                                    cx.notify();
+                                }) {
+                                    log::warn!("[auto_prompt] failed to reset state on retry context overflow: {err}");
+                                }
+                            }
+                            log::info!("[auto_prompt] Retry context overflow — dispatching summarization");
+                            match conversation_view.update_in(cx, |_cv, window, cx| {
+                                crate::auto_prompt::dispatch_action(action, _cv, window, cx);
+                            }) {
+                                Ok(()) => {
+                                    log::info!("[auto_prompt] Retry context overflow dispatch submitted");
+                                }
+                                Err(err) => {
+                                    log::warn!("[auto_prompt] FAILED to dispatch retry context overflow: {err}");
+                                }
+                            }
+                        }
+                        Ok(auto_prompt::AutoPromptOutcome::RetryAfterBackoff { delay_ms, reason }) => {
+                            // Issue 007: the source thread had an error AND context overflowed.
+                            // Manual retry path treats this as a soft stop — the user can click
+                            // retry again after the upstream rate limit has cleared. We surface
+                            // the wait hint so the user knows why no work was dispatched.
+                            auto_prompt::increment_llm_failure_count();
+                            if let Some(ref tv) = thread_weak {
+                                if let Err(err) = tv.update(cx, |tv, cx| {
+                                    tv.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;
+                                    tv._auto_prompt_retry_data = None;
+                                    cx.notify();
+                                }) {
+                                    log::warn!("[auto_prompt] failed to reset state on retry after backoff: {err}");
+                                }
+                            }
+                            log::warn!(
+                                "[auto_prompt] Retry returned RetryAfterBackoff — waiting {delay_ms}ms suggested; reason: {reason}"
+                            );
+                        }
+                        Err(err) => {
+                            // Retry failed again - set back to Failed state and restore retry data
+                            if let Some(ref tv) = thread_weak {
+                                if let Err(update_err) = tv.update(cx, |tv, cx| {
+                                    tv.auto_prompt_state = crate::auto_prompt::AutoPromptState::Failed(format!("{err:#}"));
+                                    tv._auto_prompt_retry_data = Some(retry_data_for_restore);
+                                    cx.notify();
+                                }) {
+                                    log::warn!("[auto_prompt] failed to set Failed state after retry: {update_err}");
+                                }
+                            }
+                            log::warn!(
+                                "[auto_prompt] Retry failed: {err}"
+                            );
+                        }
                     }
-                    return;
-                }
-
-                let new_enabled = !this.auto_prompt_enabled;
-                this.auto_prompt_enabled = new_enabled;
-                log::info!(
-                    "auto_prompt: {}",
-                    if this.auto_prompt_enabled {
-                        "enabled"
-                    } else {
-                        "disabled"
-                    }
-                );
-                if let Some(workspace) = this.workspace.upgrade() {
-                    if let Some(panel) = workspace.read(cx).panel::<crate::AgentPanel>(cx) {
-                        panel.update(cx, |panel, _| {
-                            panel.set_auto_prompt_enabled(new_enabled);
-                        });
-                    }
-                }
+                }));
+            } else {
+                log::warn!("[auto_prompt] No retry data available, cannot retry");
+                self.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;
                 cx.notify();
-            }))
+            }
+            return;
+        }
+
+        let new_enabled = !self.auto_prompt_enabled;
+        self.auto_prompt_enabled = new_enabled;
+        log::info!(
+            "auto_prompt: {}",
+            if self.auto_prompt_enabled {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        );
+        if let Some(workspace) = self.workspace.upgrade() {
+            if let Some(panel) = workspace.read(cx).panel::<crate::AgentPanel>(cx) {
+                panel.update(cx, |panel, _| {
+                    panel.set_auto_prompt_enabled(new_enabled);
+                });
+            }
+        }
+        cx.notify();
     }
 }
 
