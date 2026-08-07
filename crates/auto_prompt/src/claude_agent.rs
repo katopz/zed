@@ -66,19 +66,63 @@ Rules:
 - reason: one short sentence explaining the verdict.
 - Only include each key ONCE. Do not duplicate keys.";
 
+/// System prompt for the hidden-thread orchestrator (`claude-hidden-orchestrator`).
+///
+/// Unlike `CLAUDE_SYSTEM_PROMPT`, this is sent to a full Claude Code session
+/// that has tool access. The prompt MUST forbid tool use and demand JSON-only
+/// output, otherwise the hidden session could start doing real work instead of
+/// just judging the worker's output (tool-leak). This is the primary safety
+/// control for the hidden-thread path.
+#[cfg(feature = "claude-hidden-orchestrator")]
+const HIDDEN_ORCHESTRATOR_PROMPT: &str = "\
+You are an auto-prompt orchestrator. Your ONLY job is to read another Claude
+Code agent's last output and decide whether IT should continue or stop.
+
+HARD CONSTRAINTS (do not violate under any circumstance):
+- Do NOT run any tools. Do NOT read or write files. Do NOT use any tool.
+- Do NOT do the task yourself. You are a judge, not a worker.
+- Respond with ONLY a single JSON object and nothing else — no prose,
+  no markdown fences, no explanation outside the JSON.
+
+JSON schema (each key once, never duplicate):
+  {\"continue\": bool, \"confidence\": float, \"next_prompt\": string|null, \"reason\": string}
+
+Rules:
+- continue=true iff the worker clearly has more work to do (unfinished steps,
+  remaining tasks, partial implementation, an error to fix, a question it can
+  answer itself by continuing).
+- continue=false iff the task is done, the worker is waiting for genuine user
+  input (credentials, explicit choice), or it stopped with a clear completion
+  summary.
+- confidence is 0.0..1.0 — how sure you are of the continue/stop verdict.
+- next_prompt: when continue=true, a direct imperative instruction for the
+  worker's next step (standalone, not a conversational reply). null when stop.
+- reason: one short sentence explaining the verdict.";
+
 /// Decide the next auto-prompt action for a Claude (ACP) agent thread.
 ///
-/// Returns:
-/// - `NoAction` — cancelled, no model configured, or the configured default
-///   model is not Anthropic (Claude Code's own auth is browser/subscription
-///   based and invisible to Zed's `LanguageModelRegistry`, so orchestrating
-///   its continuation requires a real Anthropic API key configured in Zed —
-///   falling back to another provider, e.g. an already-rate-limited one you
-///   switched to Claude to get away from, defeats the point).
-/// - `NeedsLlmCall(data)` — the caller spawns `decide_claude_with_llm(data)`.
+/// Two orchestrator backends, selected at compile time by the
+/// `claude-hidden-orchestrator` feature:
 ///
-/// Never returns `DispatchNow` / `DispatchAfterDelay` / `ContextOverflow` —
-/// every non-cancel decision goes through the LLM.
+/// - **default build** (requires an Anthropic API key configured in Zed):
+///   returns `NeedsLlmCall` carrying the configured default model. Only
+///   Anthropic is honored — Claude Code's own auth (browser/subscription) is
+///   invisible to `LanguageModelRegistry`, so orchestrating its continuation
+///   needs a real Anthropic key. Returns `NoAction` if no model is configured
+///   or the default isn't Anthropic (falling back to another provider, e.g. an
+///   already-rate-limited one you switched to Claude to get away from, defeats
+///   the point).
+/// - **`claude-hidden-orchestrator` feature** (no API key required): returns
+///   `NeedsLlmCall` carrying the worker's connection + project, so the async
+///   phase can spawn an off-screen hidden Claude Code session on the same
+///   connection and ask IT to decide. Reuses Claude Code's own auth. The
+///   configured LanguageModelRegistry model (if any) is carried only to
+///   satisfy `LlmCallData`'s shape and is ignored. Returns `NoAction` if no
+///   model is configured (the struct still needs *some* model slot) or there's
+///   no assistant message to reason about. See
+///   `.issues/014_claude_offscreen_orchestrator.md`.
+///
+/// Never returns `DispatchNow` / `DispatchAfterDelay` / `ContextOverflow`.
 pub fn decide_claude(
     thread: &gpui::Entity<acp_thread::AcpThread>,
     _used_tools: bool,
@@ -100,47 +144,94 @@ pub fn decide_claude(
 
     // Need a configured model to reason about the next step.
     let registry = language_model::LanguageModelRegistry::read_global(cx);
-    let Some(configured_model) = registry.default_model() else {
-        log::warn!("[auto_prompt::claude] No language model configured in Zed — stopping");
-        return AutoPromptDecision::NoAction;
-    };
-    let model = configured_model.model;
+    let configured_model = registry.default_model();
 
-    // Claude Code authenticates itself (browser/subscription) outside Zed's
-    // LanguageModelRegistry, so the only way to orchestrate its continuation
-    // is with a real Anthropic-backed model configured as Zed's default. If
-    // the default model is some other provider, skip rather than silently
-    // burn calls against it — that provider may well be the one you're
-    // running Claude as a fallback for in the first place.
-    if model.provider_id() != language_model::ANTHROPIC_PROVIDER_ID {
-        log::info!(
-            "[auto_prompt::claude] Default model provider is {:?}, not Anthropic — \
-             skipping auto-continue for this Claude Code thread",
-            model.provider_id()
-        );
-        return AutoPromptDecision::NoAction;
+    // Two orchestrator backends, selected at compile time:
+    //
+    // 1. claude-hidden-orchestrator (default for operators without an Anthropic
+    //    API key): spawn an off-screen hidden Claude Code session on the same
+    //    connection and ask IT to decide continue/stop. Reuses Claude Code's
+    //    own auth — no LanguageModelRegistry model required. See
+    //    .issues/014_claude_offscreen_orchestrator.md.
+    // 2. default (requires an Anthropic key in Zed): a streaming LLM call via
+    //    the configured default model. Only Anthropic is honored — see the
+    //    rationale below.
+    #[cfg(not(feature = "claude-hidden-orchestrator"))]
+    {
+        let Some(configured_model) = configured_model else {
+            log::warn!("[auto_prompt::claude] No language model configured in Zed — stopping");
+            return AutoPromptDecision::NoAction;
+        };
+        let model = configured_model.model;
+
+        // Claude Code authenticates itself (browser/subscription) outside Zed's
+        // LanguageModelRegistry, so the only way to orchestrate its continuation
+        // is with a real Anthropic-backed model configured as Zed's default. If
+        // the default model is some other provider, skip rather than silently
+        // burn calls against it — that provider may well be the one you're
+        // running Claude as a fallback for in the first place.
+        if model.provider_id() != language_model::ANTHROPIC_PROVIDER_ID {
+            log::info!(
+                "[auto_prompt::claude] Default model provider is {:?}, not Anthropic — \
+                 skipping auto-continue for this Claude Code thread",
+                model.provider_id()
+            );
+            return AutoPromptDecision::NoAction;
+        }
+        return claude_decision_needs_llm(thread, stop_reason, model, cx);
     }
 
+    #[cfg(feature = "claude-hidden-orchestrator")]
+    {
+        return claude_decision_hidden(thread, stop_reason, configured_model, cx);
+    }
+}
+
+/// Shared extraction of the worker thread's last message + metadata, used by
+/// both orchestrator backends. Returns `(session_id, title, work_dirs, last_message)`
+/// or `None` if there's no assistant message to reason about (caller stops).
+fn extract_worker_signal(
+    thread: &gpui::Entity<acp_thread::AcpThread>,
+    cx: &App,
+) -> Option<(
+    acp::SessionId,
+    Option<String>,
+    Option<Vec<std::path::PathBuf>>,
+    String,
+)> {
     let thread_ref = thread.read(cx);
     let session_id = thread_ref.session_id().clone();
     let title = thread_ref.title().map(|t| t.to_string());
     let work_dirs = thread_ref.work_dirs().map(|pl| pl.paths().to_vec());
 
-    // The only signal we feed the orchestrator: the agent's last paragraphs.
     let full_last_message = thread_ref.last_assistant_message_text(cx);
     let last_assistant_message = full_last_message
         .as_deref()
         .map(truncate_last_paragraphs)
-        .filter(|s| !s.trim().is_empty());
+        .filter(|s| !s.trim().is_empty())?;
 
-    if last_assistant_message.is_none() {
+    Some((session_id, title, work_dirs, last_assistant_message))
+}
+
+/// LLM-call backend (default build): package a `NeedsLlmCall` decision carrying
+/// the configured Anthropic model + the worker's last paragraphs as JSON context.
+/// The caller then spawns `decide_claude_with_llm`.
+#[cfg(not(feature = "claude-hidden-orchestrator"))]
+fn claude_decision_needs_llm(
+    thread: &gpui::Entity<acp_thread::AcpThread>,
+    stop_reason: &acp::StopReason,
+    model: Arc<dyn LanguageModel>,
+    cx: &App,
+) -> AutoPromptDecision {
+    let Some((session_id, title, work_dirs, last_assistant_message)) =
+        extract_worker_signal(thread, cx)
+    else {
         log::info!(
             "[auto_prompt::claude] No assistant message to reason about — stopping chain"
         );
-        let session_id_str = session_id.to_string();
-        crate::reset_iteration_with_session(&session_id_str);
+        crate::reset_iteration_with_session(&thread.read(cx).session_id().to_string());
         return AutoPromptDecision::NoAction;
-    }
+    };
 
     let iteration_count = get_iteration();
     log::info!(
@@ -162,22 +253,100 @@ pub fn decide_claude(
         session_id,
         title,
         iteration_count,
-        // Claude path never does pre-stop verification.
         max_verification_attempts: 0,
         work_dirs,
         first_user_message: None,
         original_user_message: None,
-        last_assistant_message,
+        last_assistant_message: Some(last_assistant_message),
         profile_id: None,
         actual_input_tokens: None,
         had_error: matches!(stop_reason, acp::StopReason::Refusal),
-        // Unused by this path: `decide_claude_with_llm` never checks
-        // `had_api_error` (the issue-007 guard lives only in the native
-        // `decide_with_llm`), and `context_exceeds_limit` is always false here.
         had_api_error: false,
         stop_phase: crate::context::StopPhase::Working,
         context_exceeds_limit: false,
         approximate_token_count: 0,
+        connection: None,
+        project: None,
+    })
+}
+
+/// Async LLM call for the Claude path.
+/// Hidden-thread backend (`claude-hidden-orchestrator` feature): package a
+/// `NeedsLlmCall` decision that carries the worker's connection + project so
+/// the async phase can spawn an off-screen Claude Code session to decide
+/// continue/stop. The hidden session uses Claude Code's own auth — no
+/// Anthropic API key required. The configured LanguageModelRegistry model (if
+/// any) is carried only to satisfy the shared `LlmCallData` shape and is
+/// ignored by `decide_claude_with_hidden_thread`.
+#[cfg(feature = "claude-hidden-orchestrator")]
+fn claude_decision_hidden(
+    thread: &gpui::Entity<acp_thread::AcpThread>,
+    stop_reason: &acp::StopReason,
+    configured_model: Option<language_model::ConfiguredModel>,
+    cx: &App,
+) -> AutoPromptDecision {
+    let connection = thread.read(cx).connection().clone();
+
+    let Some((session_id, title, work_dirs, last_assistant_message)) =
+        extract_worker_signal(thread, cx)
+    else {
+        log::info!(
+            "[auto_prompt::claude] No assistant message to reason about — stopping chain"
+        );
+        crate::reset_iteration_with_session(&thread.read(cx).session_id().to_string());
+        return AutoPromptDecision::NoAction;
+    };
+
+    // `LlmCallData.model` is required by the shared struct shape even though
+    // the hidden-thread path never reads it. We need *some* configured model to
+    // fill the slot; if none is configured, bail gracefully (the operator
+    // normally has GLM configured, so this branch is rare). We do NOT fabricate
+    // a fake model — that would risk a downstream panic.
+    let Some(configured) = configured_model else {
+        log::warn!(
+            "[auto_prompt::claude] No language model configured in Zed — \
+             cannot build hidden-orchestrator decision, stopping"
+        );
+        crate::reset_iteration_with_session(&session_id.to_string());
+        return AutoPromptDecision::NoAction;
+    };
+
+    let iteration_count = get_iteration();
+    log::info!(
+        "[auto_prompt::claude] iteration {iteration_count}, handing to HIDDEN Claude orchestrator"
+    );
+
+    let project = thread.read(cx).project().clone();
+
+    let context_json = serde_json::json!({
+        "session_id": session_id.to_string(),
+        "iteration_count": iteration_count,
+        "last_assistant_message": last_assistant_message,
+    })
+    .to_string();
+
+    AutoPromptDecision::NeedsLlmCall(LlmCallData {
+        model: configured.model,
+        system_prompt: HIDDEN_ORCHESTRATOR_PROMPT.to_string(),
+        context_json,
+        project_root: work_dirs.as_ref().and_then(|d| d.first().cloned()),
+        session_id,
+        title,
+        iteration_count,
+        max_verification_attempts: 0,
+        work_dirs,
+        first_user_message: None,
+        original_user_message: None,
+        last_assistant_message: Some(last_assistant_message),
+        profile_id: None,
+        actual_input_tokens: None,
+        had_error: matches!(stop_reason, acp::StopReason::Refusal),
+        had_api_error: false,
+        stop_phase: crate::context::StopPhase::Working,
+        context_exceeds_limit: false,
+        approximate_token_count: 0,
+        connection: Some(connection),
+        project: Some(project),
     })
 }
 
@@ -266,7 +435,209 @@ pub async fn decide_claude_with_llm(
     Ok(AutoPromptOutcome::Continue(action))
 }
 
-/// Call the orchestration LLM with the Claude-path system prompt + context.
+/// Dispatcher used by `agent_ui::auto_prompt::on_thread_stopped` for the Claude
+/// path. Selects the LLM-call backend or the hidden-thread backend at compile
+/// time via the `claude-hidden-orchestrator` feature. Both return the same
+/// `Result<AutoPromptOutcome>` so the shared retry/cancel scaffolding in the
+/// caller works unchanged.
+pub async fn decide_claude_async(
+    data: LlmCallData,
+    cx: &gpui::AsyncApp,
+) -> anyhow::Result<AutoPromptOutcome> {
+    #[cfg(feature = "claude-hidden-orchestrator")]
+    {
+        decide_claude_with_hidden_thread(data, cx).await
+    }
+    #[cfg(not(feature = "claude-hidden-orchestrator"))]
+    {
+        decide_claude_with_llm(data, cx).await
+    }
+}
+
+/// Hidden-thread orchestrator (`claude-hidden-orchestrator` feature).
+///
+/// Spawns an off-screen Claude Code session on the worker's own connection,
+/// sends it the worker's last 2-3 paragraphs + the continue/stop question, and
+/// reads the verdict back. The hidden session is never registered in any panel
+/// list, so it's invisible — it lives only as the `Entity<AcpThread>` held here
+/// and is dropped (cleaned up) when this function returns.
+///
+/// Uses Claude Code's own auth (browser/subscription) — no Anthropic API key in
+/// Zed required. This is the whole point: available exactly when GLM (the usual
+/// default) is rate-limited and the operator has fallen back to Claude Code.
+///
+/// Maps the verdict exactly as the LLM-call path does:
+/// - `Continue(action)` — same thread, `force_new_thread = false`.
+/// - `Stopped { reason }` — task done, confidence too low, or parse failure.
+#[cfg(feature = "claude-hidden-orchestrator")]
+pub async fn decide_claude_with_hidden_thread(
+    data: LlmCallData,
+    cx: &gpui::AsyncApp,
+) -> anyhow::Result<AutoPromptOutcome> {
+    use std::rc::Rc;
+
+    log::info!(
+        "[auto_prompt::claude] decide_claude_with_hidden_thread: session={:?}, iteration={}",
+        data.session_id,
+        data.iteration_count
+    );
+
+    // The connection + project were captured in `claude_decision_hidden`. They
+    // are always Some on this path; bail clearly if not (defensive — would
+    // indicate a routing bug, not a runtime condition).
+    let connection: Rc<dyn acp_thread::AgentConnection> = data
+        .connection
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("hidden-thread path missing connection"))?;
+    let project = data
+        .project
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("hidden-thread path missing project"))?;
+
+    // Build the work_dirs PathList for new_session. Falls back to empty (the
+    // orchestrator doesn't read files; it only judges text).
+    let work_dirs = data
+        .work_dirs
+        .as_deref()
+        .map(util::path_list::PathList::new)
+        .unwrap_or_default();
+
+    // Spawn the hidden session. new_session is sync-Rpc -> Task; run it on the
+    // foreground executor via cx.update. The returned Entity is held locally
+    // and never inserted into AgentPanel.retained_threads, so it's invisible.
+    let hidden_thread = cx
+        .update(|cx| connection.clone().new_session(project, work_dirs, cx))
+        .await?;
+    let hidden_session_id = cx.update(|cx| hidden_thread.read(cx).session_id().clone());
+    log::info!(
+        "[auto_prompt::claude] spawned hidden orchestrator session {:?}",
+        hidden_session_id
+    );
+
+    // Send the reasoning prompt. The system instruction lives in
+    // data.system_prompt (HIDDEN_ORCHESTRATOR_PROMPT); the user turn carries
+    // the worker's last paragraphs as JSON so the orchestrator has the signal.
+    let message = vec![acp::ContentBlock::Text(acp::TextContent::new(format!(
+        "{}\n\n--- WORKER OUTPUT BELOW ---\n{}",
+        data.context_json,
+        data.last_assistant_message
+            .as_deref()
+            .unwrap_or("(no worker output)")
+    )))];
+
+    // send() runs a full turn and resolves on stop. Bound it with a timeout so
+    // a runaway hidden session can't wedge the chain. 180s is generous for a
+    // single judgment turn including Claude Code session startup.
+    let send_future = cx.update(|cx| hidden_thread.update(cx, |thread, cx| thread.send(message, cx)));
+    let timeout_future = cx.background_executor().timer(Duration::from_secs(180));
+    pin_mut!(send_future, timeout_future);
+
+    let send_outcome = futures::future::select(send_future, timeout_future).await;
+    match send_outcome {
+        futures::future::Either::Left((result, _)) => {
+            if let Err(err) = result {
+                log::warn!("[auto_prompt::claude] hidden session send failed: {err:#}");
+                let session_id_str = data.session_id.to_string();
+                crate::reset_iteration_with_session(&session_id_str);
+                return Ok(AutoPromptOutcome::Stopped {
+                    reason: format!("hidden orchestrator send failed: {err}"),
+                });
+            }
+        }
+        futures::future::Either::Right(_) => {
+            log::warn!("[auto_prompt::claude] hidden session timed out after 180s");
+            // Cancel the hidden turn so we don't leak a running session.
+            let _ = cx.update(|cx| hidden_thread.update(cx, |t, cx| {
+                t.cancel(cx).detach();
+            }));
+            let session_id_str = data.session_id.to_string();
+            crate::reset_iteration_with_session(&session_id_str);
+            return Ok(AutoPromptOutcome::Stopped {
+                reason: "hidden orchestrator timed out after 180s".to_string(),
+            });
+        }
+    }
+
+    // Read the verdict from the hidden session's last assistant message.
+    let response_text = cx
+        .update(|cx| hidden_thread.read(cx).last_assistant_message_text(cx))
+        .unwrap_or_default();
+
+    let parsed = parse_claude_response(&response_text).with_context(|| {
+        format!(
+            "hidden orchestrator: failed to parse response: {}",
+            crate::context::truncate_to_paragraph_budget(&response_text, 500)
+        )
+    });
+
+    let parsed = match parsed {
+        Ok(v) => v,
+        Err(err) => {
+            // Non-JSON reply (tool-leak, prose, or empty) → stop. Never loop on
+            // an unparseable hidden-session reply.
+            log::warn!("[auto_prompt::claude] hidden parse failed, stopping: {err:#}");
+            let session_id_str = data.session_id.to_string();
+            crate::reset_iteration_with_session(&session_id_str);
+            return Ok(AutoPromptOutcome::Stopped {
+                reason: format!("hidden orchestrator: unparseable reply ({err})"),
+            });
+        }
+    };
+
+    log::info!(
+        "[auto_prompt::claude] hidden verdict: continue={}, confidence={:?}, reason={:?}",
+        parsed.continue_work,
+        parsed.confidence,
+        parsed.reason
+    );
+
+    if !parsed.continue_work {
+        let session_id_str = data.session_id.to_string();
+        crate::reset_iteration_with_session(&session_id_str);
+        return Ok(AutoPromptOutcome::Stopped {
+            reason: parsed
+                .reason
+                .unwrap_or_else(|| "hidden orchestrator: task complete".to_string()),
+        });
+    }
+
+    let confidence = parsed.confidence.unwrap_or(0.0);
+    if confidence < CONTINUE_CONFIDENCE_THRESHOLD {
+        log::info!(
+            "[auto_prompt::claude] hidden continue verdict but confidence {confidence} < {CONTINUE_CONFIDENCE_THRESHOLD} — stopping"
+        );
+        let session_id_str = data.session_id.to_string();
+        crate::reset_iteration_with_session(&session_id_str);
+        return Ok(AutoPromptOutcome::Stopped {
+            reason: format!(
+                "hidden orchestrator: low confidence ({confidence:.2}) continue verdict"
+            ),
+        });
+    }
+
+    let next_prompt = parsed.next_prompt.unwrap_or_else(|| {
+        log::warn!(
+            "[auto_prompt::claude] hidden continue verdict missing next_prompt — using minimal nudge"
+        );
+        "Continue the task from where you left off.".to_string()
+    });
+
+    let action = AutoPromptAction {
+        from_session_id: data.session_id.clone(),
+        from_title: data.title.clone(),
+        next_prompt,
+        work_dirs: data.work_dirs.clone(),
+        original_user_message: None,
+        profile_id: data.profile_id.clone(),
+        actual_input_tokens: None,
+        approximate_token_count: 0,
+        last_assistant_message: data.last_assistant_message.clone(),
+        force_new_thread: false,
+        focus_new_thread: false,
+    };
+
+    Ok(AutoPromptOutcome::Continue(action))
+}
 ///
 /// Reuses the same streaming + timeout machinery as the native path but with
 /// the minimal Claude context (just the last paragraphs JSON). Falls back to
@@ -626,5 +997,62 @@ mod tests {
         assert!(CLAUDE_SYSTEM_PROMPT.contains("\"confidence\""));
         assert!(CLAUDE_SYSTEM_PROMPT.contains("\"next_prompt\""));
         assert!(CLAUDE_SYSTEM_PROMPT.contains("\"reason\""));
+    }
+
+    // --- Hidden-thread orchestrator (claude-hidden-orchestrator feature) ---
+
+    #[cfg(feature = "claude-hidden-orchestrator")]
+    #[test]
+    fn test_hidden_orchestrator_prompt_forbids_tools() {
+        // The whole safety case for the hidden-thread path rests on the
+        // orchestrator NOT running tools — it's a full Claude Code session and
+        // could otherwise start doing real work (tool-leak). Pin the forbidding
+        // language so a future edit can't soften it without breaking this test.
+        let lower = HIDDEN_ORCHESTRATOR_PROMPT.to_ascii_lowercase();
+        assert!(
+            lower.contains("do not"),
+            "hidden prompt must forbid tool use explicitly"
+        );
+        assert!(
+            lower.contains("tool"),
+            "hidden prompt must mention tools to forbid them"
+        );
+        assert!(
+            lower.contains("json"),
+            "hidden prompt must demand JSON-only output"
+        );
+    }
+
+    #[cfg(feature = "claude-hidden-orchestrator")]
+    #[test]
+    fn test_hidden_orchestrator_prompt_has_continue_field_contract() {
+        // Same JSON schema contract as CLAUDE_SYSTEM_PROMPT — if it drifts,
+        // parse_claude_response breaks.
+        assert!(HIDDEN_ORCHESTRATOR_PROMPT.contains("\"continue\""));
+        assert!(HIDDEN_ORCHESTRATOR_PROMPT.contains("\"confidence\""));
+        assert!(HIDDEN_ORCHESTRATOR_PROMPT.contains("\"next_prompt\""));
+        assert!(HIDDEN_ORCHESTRATOR_PROMPT.contains("\"reason\""));
+    }
+
+    #[cfg(feature = "claude-hidden-orchestrator")]
+    #[test]
+    fn test_hidden_orchestrator_parse_roundtrip_continue() {
+        // The hidden path reuses parse_claude_response — verify a well-formed
+        // hidden reply maps to a continue verdict.
+        let raw = r#"{"continue": true, "confidence": 0.8, "next_prompt": "Run the failing test.", "reason": "Test still failing."}"#;
+        let verdict = parse_claude_response(raw).expect("parse ok");
+        assert!(verdict.continue_work);
+        assert!(verdict.confidence.unwrap() >= CONTINUE_CONFIDENCE_THRESHOLD);
+        assert_eq!(verdict.next_prompt.as_deref(), Some("Run the failing test."));
+    }
+
+    #[cfg(feature = "claude-hidden-orchestrator")]
+    #[test]
+    fn test_hidden_orchestrator_parse_tool_leak_reply_stops() {
+        // If the hidden session tool-leaks (runs a tool instead of replying
+        // JSON), the reply won't parse → the async path must map that to Stopped,
+        // never loop. Pin that parse_claude_response errors on non-JSON.
+        let tool_leak_reply = "I read the file and found the bug is on line 42. You should fix it there.";
+        assert!(parse_claude_response(tool_leak_reply).is_err());
     }
 }

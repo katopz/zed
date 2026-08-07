@@ -12,6 +12,14 @@ workspace = true
 path = "src/auto_prompt.rs"
 doctest = false
 
+[features]
+# GOAT-gated: spawn an off-screen hidden Claude Code session to decide
+# continue/stop for a Claude worker thread, instead of a LanguageModelRegistry
+# LLM call (which needs an Anthropic API key). Uses Claude Code's own auth.
+# See .issues/014_claude_offscreen_orchestrator.md.
+default = []
+claude-hidden-orchestrator = []
+
 [dependencies]
 acp_thread.workspace = true
 agent-client-protocol.workspace = true
@@ -23,5 +31,7 @@ language_model.workspace = true
 prompt_store.workspace = true
 log.workspace = true
 paths.workspace = true
+project.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+util.workspace = true

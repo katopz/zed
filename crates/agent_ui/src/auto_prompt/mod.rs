@@ -804,7 +804,7 @@ pub fn on_thread_stopped(
                 }
 
                 let mut result = if is_claude_agent_for_task {
-                    auto_prompt::claude_agent::decide_claude_with_llm(data.clone(), cx).await
+                    auto_prompt::claude_agent::decide_claude_async(data.clone(), cx).await
                 } else {
                     auto_prompt::decide_with_llm(data.clone(), cx).await
                 };
@@ -876,7 +876,7 @@ pub fn on_thread_stopped(
 
                     log::info!("[auto_prompt] Retrying LLM call ({retry_label})");
                     result = if is_claude_agent_for_task {
-                        auto_prompt::claude_agent::decide_claude_with_llm(data.clone(), cx).await
+                        auto_prompt::claude_agent::decide_claude_async(data.clone(), cx).await
                     } else {
                         auto_prompt::decide_with_llm(data.clone(), cx).await
                     };

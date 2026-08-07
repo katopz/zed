@@ -465,6 +465,13 @@ pub struct LlmCallData {
     /// Passed through to AutoPromptAction as fallback when actual_input_tokens
     /// is None.
     pub approximate_token_count: usize,
+    /// Claude hidden-thread orchestrator only: the worker thread's connection,
+    /// cloned so a second invisible Claude Code session can be spawned to decide
+    /// continue/stop. None on the native path and the LLM-call Claude path.
+    pub connection: Option<std::rc::Rc<dyn acp_thread::AgentConnection>>,
+    /// Claude hidden-thread orchestrator only: the project entity needed by
+    /// `new_session`. None on the native path and the LLM-call Claude path.
+    pub project: Option<gpui::Entity<project::Project>>,
 }
 
 impl std::fmt::Debug for LlmCallData {
@@ -1134,6 +1141,8 @@ pub fn decide(
         stop_phase,
         context_exceeds_limit,
         approximate_token_count: auto_prompt_ctx.approximate_token_count,
+        connection: None,
+        project: None,
     })
 }
 

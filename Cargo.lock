@@ -1414,9 +1414,11 @@ dependencies = [
  "language_model",
  "log",
  "paths",
+ "project",
  "prompt_store",
  "serde",
  "serde_json",
+ "util",
 ]
 
 [[package]]
