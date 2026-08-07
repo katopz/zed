@@ -1055,4 +1055,219 @@ mod tests {
         let tool_leak_reply = "I read the file and found the bug is on line 42. You should fix it there.";
         assert!(parse_claude_response(tool_leak_reply).is_err());
     }
+
+    // --- Async hidden-thread orchestrator (needs TestAppContext + Project +
+    //     StubAgentConnection harness). Covers the GOAT-gate items that can be
+    //     verified without a live Claude Code run: the hidden session spawns,
+    //     the verdict round-trips, and the outcome maps correctly. The
+    //     remaining GOAT items (no-tool-leak in production, sidebar invisibility,
+    //     no Anthropic key) need a live run. ---
+
+    #[cfg(feature = "claude-hidden-orchestrator")]
+    mod hidden_thread_async {
+        use super::*;
+        use acp_thread::StubAgentConnection;
+        use std::rc::Rc;
+
+        /// Minimal LlmCallData for the hidden-thread path. Only `connection`,
+        /// `project`, `system_prompt`, `context_json`, `session_id`,
+        /// `last_assistant_message`, and `work_dirs` are read by
+        /// `decide_claude_with_hidden_thread`; the rest are zeroed/filled with
+        /// a FakeLanguageModel placeholder.
+        fn build_test_data(
+            connection: Rc<dyn acp_thread::AgentConnection>,
+            project: gpui::Entity<project::Project>,
+            worker_output: &str,
+        ) -> LlmCallData {
+            LlmCallData {
+                model: Arc::new(language_model::fake_provider::FakeLanguageModel::default()),
+                system_prompt: HIDDEN_ORCHESTRATOR_PROMPT.to_string(),
+                context_json: serde_json::json!({
+                    "session_id": "test-worker",
+                    "iteration_count": 1,
+                    "last_assistant_message": worker_output,
+                })
+                .to_string(),
+                project_root: None,
+                session_id: acp::SessionId::new("test-worker"),
+                title: Some("worker".to_string()),
+                iteration_count: 1,
+                max_verification_attempts: 0,
+                work_dirs: Some(vec![]),
+                first_user_message: None,
+                original_user_message: None,
+                last_assistant_message: Some(worker_output.to_string()),
+                profile_id: None,
+                actual_input_tokens: None,
+                had_error: false,
+                had_api_error: false,
+                stop_phase: crate::context::StopPhase::Working,
+                context_exceeds_limit: false,
+                approximate_token_count: 0,
+                connection: Some(connection),
+                project: Some(project),
+            }
+        }
+
+        fn init_test(cx: &mut gpui::TestAppContext) {
+            cx.update(|cx| {
+                let mut settings_store = settings::SettingsStore::test(cx);
+                settings_store
+                    .register_setting::<feature_flags::FeatureFlagsSettings>();
+                cx.set_global(settings_store);
+            });
+        }
+
+        #[gpui::test]
+        async fn test_hidden_thread_continue_verdict_roundtrips(
+            cx: &mut gpui::TestAppContext,
+        ) {
+            init_test(cx);
+
+            let fs = fs::FakeFs::new(cx.executor());
+            let project = project::Project::test(fs, [], cx).await;
+
+            let connection = Rc::new(StubAgentConnection::new());
+            // Pre-set the hidden session's response: a well-formed continue
+            // verdict. The stub's `prompt` drains these updates and auto-ends
+            // the turn, so `thread.send` resolves immediately.
+            connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+                acp::ContentChunk::new(
+                    r#"{"continue": true, "confidence": 0.8, "next_prompt": "Run the failing test.", "reason": "Test still failing."}"#
+                        .into(),
+                ),
+            )]);
+
+            let data = build_test_data(connection, project, "Tests are still failing.");
+
+            let outcome = cx
+                .update(|cx| {
+                    cx.spawn(async move |cx| {
+                        decide_claude_with_hidden_thread(data, cx).await
+                    })
+                })
+                .await
+                .expect("hidden-thread decision succeeded");
+
+            match outcome {
+                AutoPromptOutcome::Continue(action) => {
+                    assert_eq!(action.next_prompt, "Run the failing test.");
+                    assert!(!action.force_new_thread);
+                    assert_eq!(action.from_session_id.to_string(), "test-worker");
+                }
+                other => panic!("expected Continue, got {other:?}"),
+            }
+        }
+
+        #[gpui::test]
+        async fn test_hidden_thread_stop_verdict_stops(cx: &mut gpui::TestAppContext) {
+            init_test(cx);
+
+            let fs = fs::FakeFs::new(cx.executor());
+            let project = project::Project::test(fs, [], cx).await;
+
+            let connection = Rc::new(StubAgentConnection::new());
+            connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+                acp::ContentChunk::new(
+                    r#"{"continue": false, "confidence": 0.9, "next_prompt": null, "reason": "Task complete."}"#
+                        .into(),
+                ),
+            )]);
+
+            let data = build_test_data(connection, project, "Done. All tests pass.");
+
+            let outcome = cx
+                .update(|cx| {
+                    cx.spawn(async move |cx| {
+                        decide_claude_with_hidden_thread(data, cx).await
+                    })
+                })
+                .await
+                .expect("hidden-thread decision succeeded");
+
+            match outcome {
+                AutoPromptOutcome::Stopped { reason } => {
+                    assert!(reason.contains("Task complete"));
+                }
+                other => panic!("expected Stopped, got {other:?}"),
+            }
+        }
+
+        #[gpui::test]
+        async fn test_hidden_thread_tool_leak_reply_stops(cx: &mut gpui::TestAppContext) {
+            init_test(cx);
+
+            let fs = fs::FakeFs::new(cx.executor());
+            let project = project::Project::test(fs, [], cx).await;
+
+            let connection = Rc::new(StubAgentConnection::new());
+            // Simulate a tool-leak: the hidden session returned prose instead
+            // of JSON. The async path must map this to Stopped, never loop.
+            connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+                acp::ContentChunk::new(
+                    "I read the file and the bug is on line 42.".into(),
+                ),
+            )]);
+
+            let data =
+                build_test_data(connection, project, "Investigating the bug in file.rs.");
+
+            let outcome = cx
+                .update(|cx| {
+                    cx.spawn(async move |cx| {
+                        decide_claude_with_hidden_thread(data, cx).await
+                    })
+                })
+                .await
+                .expect("hidden-thread decision succeeded");
+
+            match outcome {
+                AutoPromptOutcome::Stopped { reason } => {
+                    assert!(
+                        reason.contains("unparseable"),
+                        "tool-leak reply should stop with unparseable reason, got: {reason}"
+                    );
+                }
+                other => panic!("expected Stopped for tool-leak reply, got {other:?}"),
+            }
+        }
+
+        #[gpui::test]
+        async fn test_hidden_thread_low_confidence_stops(cx: &mut gpui::TestAppContext) {
+            init_test(cx);
+
+            let fs = fs::FakeFs::new(cx.executor());
+            let project = project::Project::test(fs, [], cx).await;
+
+            let connection = Rc::new(StubAgentConnection::new());
+            // continue=true but confidence below the 0.5 threshold → must stop.
+            connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+                acp::ContentChunk::new(
+                    r#"{"continue": true, "confidence": 0.2, "next_prompt": "maybe continue?", "reason": "unsure"}"#
+                        .into(),
+                ),
+            )]);
+
+            let data = build_test_data(connection, project, "Not sure if done.");
+
+            let outcome = cx
+                .update(|cx| {
+                    cx.spawn(async move |cx| {
+                        decide_claude_with_hidden_thread(data, cx).await
+                    })
+                })
+                .await
+                .expect("hidden-thread decision succeeded");
+
+            match outcome {
+                AutoPromptOutcome::Stopped { reason } => {
+                    assert!(
+                        reason.contains("low confidence"),
+                        "low-confidence continue should stop, got: {reason}"
+                    );
+                }
+                other => panic!("expected Stopped for low-confidence, got {other:?}"),
+            }
+        }
+    }
 }

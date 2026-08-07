@@ -17,6 +17,7 @@ fn default_context() -> AutoPromptContext {
         doc_files: vec![],
         stop_reason: String::new(),
         had_error: false,
+        had_api_error: false,
         approximate_token_count: 0,
         actual_input_tokens: None,
         iteration_count: 1,

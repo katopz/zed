@@ -35,3 +35,17 @@ project.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 util.workspace = true
+
+[dev-dependencies]
+# Test-only deps. The `test-support` features on acp_thread/project/gpui/fs/
+# language_model unlock StubAgentConnection, Project::test, TestAppContext,
+# FakeFs, and FakeLanguageModel respectively. Cargo unifies these with the
+# regular dep features during `cargo test`.
+acp_thread = { workspace = true, features = ["test-support"] }
+env_logger.workspace = true
+feature_flags.workspace = true
+fs = { workspace = true, features = ["test-support"] }
+gpui = { workspace = true, features = ["test-support"] }
+language_model = { workspace = true, features = ["test-support"] }
+project = { workspace = true, features = ["test-support"] }
+settings.workspace = true

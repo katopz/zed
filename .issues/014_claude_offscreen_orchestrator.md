@@ -58,17 +58,36 @@ worker (claude-acp) stops
 - [x] Feature flag `claude-hidden-orchestrator` (off by default) for GOAT gate.
 - [x] No-tool-leak mitigation: orchestrator system prompt forbids tool use,
       demands JSON-only output; reject non-JSON replies as stop.
-- [x] Tests: prompt contract (no-tool, JSON schema), parse roundtrip, tool-leak
-      reply -> stop. (Full async spawn test deferred — needs TestAppContext +
-      Project + StubAgentConnection harness.)
+- [x] Unit tests: prompt contract (no-tool, JSON schema), parse roundtrip,
+      tool-leak reply -> stop.
+- [x] Async spawn tests (TestAppContext + Project + StubAgentConnection):
+      `hidden_thread_async` module covers continue roundtrip, stop verdict,
+      tool-leak -> stop, low-confidence -> stop. Verifies the hidden session
+      spawns, the verdict round-trips, and outcomes map correctly — the
+      GOAT items verifiable without a live Claude Code run.
 
 ## GOAT gate (verify before promoting to default)
+Items verifiable via tests (DONE):
+- [x] Verdict round-trips: worker output -> hidden session -> JSON verdict ->
+      Continue/Stopped outcome. Covered by `test_hidden_thread_continue_verdict_roundtrips`
+      and `test_hidden_thread_stop_verdict_stops`.
+- [x] No tool-leak in parse path: non-JSON reply -> Stopped, never loops.
+      Covered by `test_hidden_thread_tool_leak_reply_stops`.
+- [x] Low-confidence continue -> Stopped. Covered by
+      `test_hidden_thread_low_confidence_stops`.
+
+Items requiring a live Zed run with the feature on (NOT done here):
 - [ ] Hidden session spawns and is invisible (not in sidebar/retained_threads).
-- [ ] Verdict round-trips: worker stops -> orchestrator returns
-      `{continue: true, next_prompt: "..."}` -> worker resumes with that prompt.
-- [ ] No tool-leak: orchestrator returns JSON, doesn't run tools.
+      The test uses a bare Entity<AcpThread> that is never registered in any
+      panel list — but sidebar invisibility can only be confirmed visually.
+- [ ] No tool-leak in production: the prompt forbids tools, but a real Claude
+      Code session has tool access. The test verifies the PARSE-side guard;
+      production tool-leak prevention needs a live run.
 - [ ] Concurrency safe: worker + orchestrator don't deadlock/double-cancel.
-- [ ] No Anthropic API key in Zed required (the whole point).
+      The test is single-threaded; real concurrency needs a live run.
+- [ ] No Anthropic API key in Zed required (the whole point). The test uses a
+      FakeLanguageModel placeholder and never calls a real API; the
+      no-key-in-production guarantee needs a live run.
 
 ## Risks (acknowledged, not blockers)
 - Latency: full second Claude session per decision (3-10s vs ~1s LLM call).
