@@ -102,15 +102,18 @@ Items verifiable via tests (DONE):
       used for Claude Code/ACP threads, where `claude_decision_hidden` captures the
       worker's `AcpConnection`.)
 
-Items requiring a live Zed run (deferred):
+Items with static + live-run verification:
+- [x] Concurrency isolation (static half verified): `test_hidden_thread_concurrent_decisions_isolate`
+      spawns two concurrent `decide_claude_with_hidden_thread` calls, verifies
+      each gets its own verdict (no cross-contamination), both sessions are
+      closed exactly once (no leak), and neither deadlocks. This proves the
+      orchestration layer has no shared mutable state between concurrent
+      invocations. Live run still needed to confirm no deadlock under real ACP
+      protocol multiplexing (two sessions on one OS process/connection).
 - [ ] Real Claude Code prompt compliance (no tool-leak in production).
       Static defense: 3-layer guard (prompt forbids tools + programmatic entry
       history check + parse-side JSON rejection). Live run confirms a real Claude
       Code session respects the no-tools constraint.
-- [ ] Concurrency under real ACP multiplexing.
-      Static analysis: the worker + hidden session are independent `Entity<AcpThread>`
-      on the GPUI executor with no shared mutable state between them. Live run
-      confirms no deadlock/double-cancel under real ACP protocol multiplexing.
 
 ## Risks (acknowledged, not blockers)
 - Latency: full second Claude session per decision (3-10s vs ~1s LLM call).
@@ -166,6 +169,7 @@ cargo build --release  # or: cargo run --release
 - [ ] If the orchestrator returns valid JSON AND used no tools → pass.
 
 ### Item 3: Concurrency under real ACP multiplexing
+      (static half verified by `test_hidden_thread_concurrent_decisions_isolate`)
 - [ ] Run a long worker task (20+ auto_prompt decisions). Monitor for:
       - Deadlock: worker or orchestrator hangs indefinitely (180s timeout
         should fire if so).
