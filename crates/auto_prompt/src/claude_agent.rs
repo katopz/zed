@@ -120,7 +120,7 @@ Rules:
 ///   satisfy `LlmCallData`'s shape and is ignored. Returns `NoAction` if no
 ///   model is configured (the struct still needs *some* model slot) or there's
 ///   no assistant message to reason about. See
-///   `.issues/014_claude_offscreen_orchestrator.md`.
+///   `.plans/013_agent_room_orchestrator.md`.
 ///
 /// Never returns `DispatchNow` / `DispatchAfterDelay` / `ContextOverflow`.
 pub fn decide_claude(
@@ -152,7 +152,7 @@ pub fn decide_claude(
     //    API key): spawn an off-screen hidden Claude Code session on the same
     //    connection and ask IT to decide continue/stop. Reuses Claude Code's
     //    own auth — no LanguageModelRegistry model required. See
-    //    .issues/014_claude_offscreen_orchestrator.md.
+    //    .plans/013_agent_room_orchestrator.md.
     // 2. default (requires an Anthropic key in Zed): a streaming LLM call via
     //    the configured default model. Only Anthropic is honored — see the
     //    rationale below.
@@ -595,6 +595,27 @@ async fn judge_with_hidden_session(
                 reason: "hidden orchestrator timed out after 180s".to_string(),
             });
         }
+    }
+
+    // Tool-leak guard (layer 2 of 3): the HIDDEN_ORCHESTRATOR_PROMPT forbids
+    // tool use (layer 1), and parse_claude_response rejects non-JSON replies
+    // (layer 3). But a real Claude Code session COULD ignore the prompt, run a
+    // tool, AND return valid JSON — which would be a false Continue. This guard
+    // catches that by inspecting the hidden session's entry history directly:
+    // any ToolCall since the last user message means the orchestrator did work
+    // instead of judging, so we stop regardless of what the JSON says.
+    let used_tools = cx
+        .update(|cx| hidden_thread.read(cx).used_tools_since_last_user_message());
+    if used_tools {
+        log::warn!(
+            "[auto_prompt::claude] hidden orchestrator used tools despite the no-tools constraint — stopping"
+        );
+        let session_id_str = data.session_id.to_string();
+        crate::reset_iteration_with_session(&session_id_str);
+        return Ok(AutoPromptOutcome::Stopped {
+            reason: "hidden orchestrator: tool-leak detected (used tools despite no-tools constraint)"
+                .to_string(),
+        });
     }
 
     // Read the verdict from the hidden session's last assistant message.
@@ -1158,9 +1179,13 @@ mod tests {
     // --- Async hidden-thread orchestrator (needs TestAppContext + Project +
     //     StubAgentConnection harness). Covers the GOAT-gate items that can be
     //     verified without a live Claude Code run: the hidden session spawns,
-    //     the verdict round-trips, and the outcome maps correctly. The
-    //     remaining GOAT items (no-tool-leak in production, sidebar invisibility,
-    //     no Anthropic key) need a live run. ---
+    //     the verdict round-trips, and the outcome maps correctly. Tool-leak is
+    //     defended at three layers (prompt + programmatic entry-history guard +
+    //     parse-side). Sidebar invisibility + no-API-key are structural (the
+    //     hidden session is a local Entity, never inserted into AgentPanel;
+    //     the path never calls stream_completion). What remains for live run:
+    //     concurrency under real ACP multiplexing, and prompt compliance of a
+    //     real Claude Code session. ---
 
     #[cfg(feature = "claude-hidden-orchestrator")]
     mod hidden_thread_async {
@@ -1328,6 +1353,62 @@ mod tests {
                     );
                 }
                 other => panic!("expected Stopped for tool-leak reply, got {other:?}"),
+            }
+        }
+
+        /// Tool-leak guard (layer 2): even if the hidden session returns valid
+        /// JSON (which parse_claude_response would accept → false Continue), the
+        /// programmatic entry-history guard catches that it used a ToolCall and
+        /// stops. This is the defense against a real Claude Code session that
+        /// ignores HIDDEN_ORCHESTRATOR_PROMPT's no-tools constraint, does the
+        /// work itself, AND returns well-formed JSON.
+        #[gpui::test]
+        async fn test_hidden_thread_tool_use_stops_even_with_valid_json(
+            cx: &mut gpui::TestAppContext,
+        ) {
+            init_test(cx);
+
+            let fs = fs::FakeFs::new(cx.executor());
+            let project = project::Project::test(fs, [], cx).await;
+
+            let connection = Rc::new(StubAgentConnection::new());
+            // The hidden session used a tool (ToolCall entry) AND returned valid
+            // JSON that would normally produce a Continue verdict. The guard
+            // must stop BEFORE parsing, because the tool use is the violation.
+            let valid_continue_json = r#"{"continue": true, "confidence": 0.9, "next_prompt": "Keep going.", "reason": "More work."}"#;
+            connection.set_next_prompt_updates(vec![
+                acp::SessionUpdate::ToolCall(
+                    acp::ToolCall::new("leaked-read", "Read file.rs")
+                        .kind(acp::ToolKind::Fetch)
+                        .status(acp::ToolCallStatus::Completed),
+                ),
+                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                    valid_continue_json.into(),
+                )),
+            ]);
+
+            let data =
+                build_test_data(connection, project, "Investigating the bug in file.rs.");
+
+            let outcome = cx
+                .update(|cx| {
+                    cx.spawn(async move |cx| {
+                        decide_claude_with_hidden_thread(data, cx).await
+                    })
+                })
+                .await
+                .expect("hidden-thread decision succeeded");
+
+            match outcome {
+                AutoPromptOutcome::Stopped { reason } => {
+                    assert!(
+                        reason.contains("tool-leak"),
+                        "tool-using hidden session should stop with tool-leak reason, got: {reason}"
+                    );
+                }
+                other => panic!(
+                    "expected Stopped for tool-leak with valid JSON, got {other:?}"
+                ),
             }
         }
 
