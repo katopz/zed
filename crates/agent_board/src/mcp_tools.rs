@@ -284,6 +284,7 @@ mod tests {
                     ts: 3000,
                 },
             ],
+            replies: vec![],
         };
         crate::board_state::set_room_snapshot(snapshot);
 
@@ -341,6 +342,7 @@ mod tests {
                 meta: String::new(),
                 ts: 5000,
             }],
+            replies: vec![],
         };
         crate::board_state::set_room_snapshot(snapshot);
 
@@ -371,6 +373,7 @@ mod tests {
             }],
             messages: vec![],
             states: vec![],
+            replies: vec![],
         };
         crate::board_state::set_room_snapshot(snapshot);
 

@@ -16,6 +16,7 @@ pub mod client;
 mod feeder;
 pub mod identity;
 pub mod mcp_tools;
+pub mod realtime_client;
 pub mod types;
 
 use std::sync::Arc;
@@ -87,6 +88,11 @@ pub struct AgentBoardConfig {
     /// from chat injection and auto_prompt context (Phase 2 point 5-6).
     #[serde(default)]
     pub muted: Vec<crate::types::MuteKey>,
+    /// Whether real-time push (SSE) is enabled (Plan 015). When true, the
+    /// panel maintains an SSE connection to the worker for instant reply
+    /// delivery. When false, falls back to the 15s feeder poll.
+    #[serde(default)]
+    pub realtime_enabled: bool,
 }
 
 fn default_ssh_key_path() -> String {
@@ -104,6 +110,7 @@ impl Default for AgentBoardConfig {
             room: String::new(),
             poll_interval_secs: default_poll_interval_secs(),
             muted: Vec::new(),
+            realtime_enabled: false,
         }
     }
 }
@@ -168,6 +175,12 @@ pub struct AgentBoardPanel {
     /// In-process MCP server exposing `get_agent_room` (Phase 2 point 9).
     /// Held alive to keep the Unix socket listening.
     mcp_server: Option<context_server::listener::McpServer>,
+    /// Real-time SSE client (Plan 015). When the 📡 toggle is on, this holds
+    /// an SSE connection to the worker for instant reply delivery. When off,
+    /// the system falls back to the 15s feeder poll.
+    realtime_client: Option<realtime_client::RealtimeClient>,
+    /// Whether the real-time push toggle is enabled. Persisted to config.
+    realtime_enabled: bool,
     /// Local session id we attribute remote claims relative to. In practice the
     /// board is per-device, so an empty string means "no local thread yet"; the
     /// plan_registry still reflects remote claims regardless.
@@ -199,6 +212,8 @@ impl AgentBoardPanel {
                 snapshot: None,
                 poll_task: None,
                 mcp_server: None,
+                realtime_client: None,
+                realtime_enabled: config.realtime_enabled,
                 local_session_id: String::new(),
                 _subscriptions: Vec::new(),
             };
@@ -298,6 +313,56 @@ impl AgentBoardPanel {
             })
             .detach();
         }
+        // Plan 015: start the real-time SSE client if the toggle is on.
+        // This connects to the worker's SSE endpoint and pushes replies to
+        // auto_prompt::peer_states for instant delivery to agent threads.
+        if self.realtime_enabled && self.realtime_client.is_none() {
+            self.start_realtime(cx);
+        }
+    }
+
+    /// Start or restart the real-time SSE client. Called when the 📡 toggle
+    /// is turned on or when the room/identity changes while enabled.
+    fn start_realtime(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        let Some(room) = self.resolved_room.clone() else {
+            return;
+        };
+        let identity = client.identity().clone();
+        let http = self.http.clone();
+        let base_url = self.config.worker_url.trim_end_matches('/').to_string();
+
+        self.realtime_client = Some(realtime_client::RealtimeClient::start(
+            http,
+            base_url,
+            room,
+            identity,
+            cx.background_executor().clone(),
+        ));
+        log::info!("[agent_board] real-time SSE client started (📡 toggle ON)");
+    }
+
+    /// Toggle the real-time push on/off. Called by the 📡 button in the panel.
+    pub fn toggle_realtime(&mut self, cx: &mut Context<Self>) {
+        self.realtime_enabled = !self.realtime_enabled;
+        self.config.realtime_enabled = self.realtime_enabled;
+        if let Err(error) = self.config.save() {
+            log::warn!("[agent_board] failed to save config: {error:#}");
+        }
+        if self.realtime_enabled {
+            self.start_realtime(cx);
+        } else {
+            self.realtime_client = None;
+            log::info!("[agent_board] real-time SSE client stopped (📡 toggle OFF)");
+        }
+        cx.notify();
+    }
+
+    /// Whether the real-time push is currently enabled.
+    pub fn realtime_enabled(&self) -> bool {
+        self.realtime_enabled
     }
 
     fn start_poll(&mut self, cx: &mut Context<Self>) {
@@ -616,9 +681,36 @@ impl Render for AgentBoardPanel {
                     .pb_1()
                     .child(
                         div()
-                            .text_sm()
-                            .text_color(accent)
-                            .child(SharedString::from("Agent Board".to_string())),
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(accent)
+                                    .child(SharedString::from("Agent Board".to_string())),
+                            )
+                            .child(
+                                div()
+                                    .id("realtime-toggle")
+                                    .cursor_pointer()
+                                    .text_xs()
+                                    .text_color(if self.realtime_enabled {
+                                        accent
+                                    } else {
+                                        muted
+                                    })
+                                    .hover(|style| style.text_color(accent))
+                                    .child(SharedString::from(if self.realtime_enabled {
+                                        "📡 ON"
+                                    } else {
+                                        "📡"
+                                    }))
+                                    .on_click(cx.listener(|this, _event, _window, cx| {
+                                        this.toggle_realtime(cx);
+                                    }))
+                                    .into_any_element(),
+                            ),
                     )
                     .child(
                         div()

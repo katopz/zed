@@ -62,6 +62,13 @@ static BROADCASTER: RwLock<Option<Arc<dyn AgentStateBroadcaster>>> = RwLock::new
 static NOTIFIED_SIGNATURES: LazyLock<RwLock<HashSet<String>>> =
     LazyLock::new(|| RwLock::new(HashSet::new()));
 
+/// Pending web replies (Plan 015): steering replies posted from the browser
+/// that are waiting to be injected into agent threads. Keyed by the 4-char
+/// session_id prefix so the agent_ui can resolve them by prefix-matching
+/// active session_ids. Drained by the notification timer in agent_panel.
+static WEB_REPLIES: LazyLock<RwLock<Vec<(String, String)>>> =
+    LazyLock::new(|| RwLock::new(Vec::new()));
+
 /// Register the agent-state broadcaster (called by `agent_board`'s panel
 /// during init). Pass `None` to unregister (board disabled). When no
 /// broadcaster is registered, [`broadcast_state`] is a silent no-op.
@@ -106,6 +113,30 @@ pub fn set_peer_states(states: Vec<PeerAgentState>, own_device_id: &str) {
         .collect();
     if let Ok(mut guard) = PEER_STATES.write() {
         *guard = Some(peers);
+    }
+}
+
+/// Inject a pending web reply (Plan 015). Called by the agent_board feeder
+/// when it finds a reply targeting this device in the room snapshot, or by
+/// the real-time SSE/WebSocket client when a reply is pushed. The reply is
+/// queued by its 4-char session-id prefix and drained by the agent_panel
+/// notification timer, which resolves the prefix to an active session and
+/// injects the text into the agent thread.
+pub fn inject_web_reply(session_prefix: String, text: String) {
+    if let Ok(mut guard) = WEB_REPLIES.write() {
+        guard.push((session_prefix, text));
+    }
+}
+
+/// Drain all pending web replies. Called by the agent_panel notification
+/// timer alongside `drain_unseen_notifications`. Returns `(session_prefix, text)`
+/// pairs. The caller resolves the prefix to an active AcpThread and injects
+/// the text via `send` (native: + steering; Claude: regular send).
+pub fn drain_web_replies() -> Vec<(String, String)> {
+    if let Ok(mut guard) = WEB_REPLIES.write() {
+        std::mem::take(&mut *guard)
+    } else {
+        Vec::new()
     }
 }
 
@@ -234,6 +265,9 @@ pub fn clear_for_test() {
         *guard = None;
     }
     if let Ok(mut guard) = NOTIFIED_SIGNATURES.write() {
+        guard.clear();
+    }
+    if let Ok(mut guard) = WEB_REPLIES.write() {
         guard.clear();
     }
 }
@@ -612,5 +646,41 @@ mod tests {
         // No broadcaster registered — should be a silent no-op, not a panic.
         broadcast_state("sess-1", None, "working", "test");
         // If we get here without panicking, the test passes.
+    }
+
+    // ── Web reply tests (Plan 015) ──
+
+    #[test]
+    fn inject_and_drain_web_reply() {
+        let _lock = setup();
+        inject_web_reply("f3a2".to_string(), "commit now".to_string());
+        let replies = drain_web_replies();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].0, "f3a2");
+        assert_eq!(replies[0].1, "commit now");
+    }
+
+    #[test]
+    fn drain_clears_pending_replies() {
+        let _lock = setup();
+        inject_web_reply("a1b2".to_string(), "reply 1".to_string());
+        let first = drain_web_replies();
+        assert_eq!(first.len(), 1);
+        // Second drain should be empty — the first drain cleared the queue.
+        let second = drain_web_replies();
+        assert!(second.is_empty(), "drain should clear pending replies");
+    }
+
+    #[test]
+    fn multiple_replies_different_sessions() {
+        let _lock = setup();
+        inject_web_reply("f3a2".to_string(), "reply for f3a2".to_string());
+        inject_web_reply("b1c9".to_string(), "reply for b1c9".to_string());
+        inject_web_reply("f3a2".to_string(), "second reply for f3a2".to_string());
+        let replies = drain_web_replies();
+        assert_eq!(replies.len(), 3);
+        assert_eq!(replies[0].0, "f3a2");
+        assert_eq!(replies[1].0, "b1c9");
+        assert_eq!(replies[2].0, "f3a2");
     }
 }

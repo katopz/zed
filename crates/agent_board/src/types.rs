@@ -125,6 +125,10 @@ pub struct RoomSnapshot {
     /// that support the `/state` endpoint; older workers omit the field.
     #[serde(default)]
     pub states: Vec<AgentStateMessage>,
+    /// Web UI steering replies (Plan 015). Only present in snapshots from
+    /// workers that support the `/reply` endpoint; older workers omit the field.
+    #[serde(default)]
+    pub replies: Vec<WebReply>,
 }
 
 /// Body for `POST /v1/rooms/{room}/status` — everything except `v` is
@@ -159,6 +163,30 @@ pub struct PostStateBody {
     pub state_text: String,
     #[serde(default)]
     pub meta: String,
+}
+
+/// A steering reply posted from the web UI (Plan 015). Targets a specific
+/// device + agent by session-id prefix. The target device picks it up via
+/// feeder poll (fallback) or real-time push (SSE/WebSocket) and injects it
+/// into the agent thread.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebReply {
+    pub v: u32,
+    /// The target device name (e.g. "m3", "SHIKUWA").
+    #[serde(default)]
+    pub target_device: String,
+    /// First 4 chars of the target agent's session_id (routing key).
+    #[serde(default)]
+    pub target_session_prefix: String,
+    /// The reply text (capped at 1024 chars by the worker).
+    #[serde(default)]
+    pub text: String,
+    /// Email of the poster (always the allowed email for now).
+    #[serde(default)]
+    pub author_email: String,
+    /// Unix millis.
+    #[serde(default)]
+    pub ts: i64,
 }
 
 /// Truncate a string to at most `max_bytes` without splitting a UTF-8
@@ -470,5 +498,79 @@ mod tests {
         assert!(json.contains("\"sub_agent_id\":\"sub-a\""));
         assert!(json.contains("\"state_text\":\"working\""));
         assert!(json.contains("\"meta\":\"plan: 013\""));
+    }
+
+    // ── WebReply wire contract (Plan 015) ──
+
+    #[test]
+    fn web_reply_serializes() {
+        let reply = WebReply {
+            v: SCHEMA_VERSION,
+            target_device: "m3".to_string(),
+            target_session_prefix: "f3a2".to_string(),
+            text: "stop and commit".to_string(),
+            author_email: "katopz@gmail.com".to_string(),
+            ts: 1700000000000,
+        };
+        let json = serde_json::to_string(&reply).unwrap();
+        let back: WebReply = serde_json::from_str(&json).unwrap();
+        assert_eq!(reply, back);
+    }
+
+    #[test]
+    fn worker_reply_output_deserializes() {
+        // Exact JSON shape from handlePostReply / handleGetRoom reply objects.
+        let json = r#"{
+            "v": 1,
+            "target_device": "SHIKUWA",
+            "target_session_prefix": "b1c9",
+            "text": "switch to develop first",
+            "author_email": "katopz@gmail.com",
+            "ts": 1700000000000
+        }"#;
+        let reply: WebReply = serde_json::from_str(json).unwrap();
+        assert_eq!(reply.target_device, "SHIKUWA");
+        assert_eq!(reply.target_session_prefix, "b1c9");
+        assert_eq!(reply.text, "switch to develop first");
+        assert_eq!(reply.author_email, "katopz@gmail.com");
+    }
+
+    #[test]
+    fn room_snapshot_with_replies_deserializes() {
+        let json = r#"{
+            "v": 1,
+            "room": "test",
+            "statuses": [],
+            "messages": [],
+            "states": [],
+            "replies": [
+                {
+                    "v": 1,
+                    "target_device": "m3",
+                    "target_session_prefix": "f3a2",
+                    "text": "commit now",
+                    "author_email": "katopz@gmail.com",
+                    "ts": 1700000000001
+                }
+            ]
+        }"#;
+        let snap: RoomSnapshot = serde_json::from_str(json).unwrap();
+        assert_eq!(snap.replies.len(), 1);
+        assert_eq!(snap.replies[0].target_device, "m3");
+        assert_eq!(snap.replies[0].target_session_prefix, "f3a2");
+    }
+
+    #[test]
+    fn room_snapshot_without_replies_defaults_empty() {
+        // Old worker that doesn't include replies field → empty vec, not error.
+        let json = r#"{
+            "v": 1,
+            "room": "test",
+            "statuses": [],
+            "messages": [],
+            "states": []
+        }"#;
+        let snap: RoomSnapshot = serde_json::from_str(json).unwrap();
+        assert!(snap.replies.is_empty());
     }
 }

@@ -95,6 +95,20 @@ impl BoardClient {
         Ok(state)
     }
 
+    /// `POST /v1/rooms/{room}/reply` — post a steering reply from the web UI
+    /// (Plan 015). Signed with ed25519 so Zed-originated replies also work.
+    /// The web UI uses the Google OAuth path instead.
+    pub async fn post_reply(
+        &self,
+        room: &str,
+        body: crate::types::WebReply,
+    ) -> Result<()> {
+        let body_text = serde_json::to_string(&body).context("serializing reply body")?;
+        let uri = format!("{}/v1/rooms/{}/reply", self.base_url, urlencoding(room));
+        self.send_signed(&uri, body_text.into_bytes()).await?;
+        Ok(())
+    }
+
     async fn send_signed(
         &self,
         uri: &str,

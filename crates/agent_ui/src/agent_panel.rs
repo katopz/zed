@@ -1842,6 +1842,9 @@ impl AgentPanel {
     /// remote agent states appear as muted notification cards in the
     /// conversation view. The task is held in `_notification_drain_task` so it
     /// lives for the panel's lifetime.
+    ///
+    /// Plan 015: also drains web steering replies, resolving them by session-id
+    /// prefix to the correct thread and injecting via `send` + steering flag.
     fn start_notification_drain(&mut self, cx: &mut Context<Self>) {
         let timer = cx.spawn(async move |this, cx| {
             loop {
@@ -1849,21 +1852,55 @@ impl AgentPanel {
                     .timer(std::time::Duration::from_secs(10))
                     .await;
 
+                // 1. Peer-state notifications → display-only in active thread.
                 let notifications = auto_prompt::peer_states::drain_unseen_notifications();
-                if notifications.is_empty() {
-                    continue;
+                if !notifications.is_empty() {
+                    this.update(cx, |panel, cx| {
+                        if let Some(thread) = panel.active_agent_thread(cx) {
+                            thread.update(cx, |thread, cx| {
+                                for text in &notifications {
+                                    thread.push_agent_board_notification(text.clone(), cx);
+                                }
+                            });
+                        }
+                    })
+                    .ok();
                 }
 
-                this.update(cx, |panel, cx| {
-                    if let Some(thread) = panel.active_agent_thread(cx) {
-                        thread.update(cx, |thread, cx| {
-                            for text in &notifications {
-                                thread.push_agent_board_notification(text.clone(), cx);
+                // 2. Web steering replies → inject into target threads.
+                let replies = auto_prompt::peer_states::drain_web_replies();
+                if !replies.is_empty() {
+                    this.update(cx, |panel, cx| {
+                        for (session_prefix, text) in &replies {
+                            if let Some(thread) =
+                                panel.thread_for_session_prefix(session_prefix, cx)
+                            {
+                                let text = text.clone();
+                                thread.update(cx, |thread, cx| {
+                                    let reply_text = format!("🌐 REPLY:[{session_prefix}] {text}");
+                                    let future = thread.send(vec![reply_text.into()], cx);
+                                    cx.background_executor()
+                                        .spawn(async move {
+                                            if let Err(error) = future.await {
+                                                log::warn!(
+                                                    "[agent_board] web reply send failed: {error:#}"
+                                                );
+                                            }
+                                        })
+                                        .detach();
+                                });
+                                log::info!(
+                                    "[agent_board] injected web reply for session prefix {session_prefix}"
+                                );
+                            } else {
+                                log::warn!(
+                                    "[agent_board] web reply for session prefix {session_prefix} has no matching thread — skipping"
+                                );
                             }
-                        });
-                    }
-                })
-                .ok();
+                        }
+                    })
+                    .ok();
+                }
             }
         });
         self._notification_drain_task = Some(timer);
@@ -4494,6 +4531,36 @@ impl AgentPanel {
                 conversation_view.read(cx).root_thread(cx)
             }
             _ => None,
+        }
+    }
+
+    /// Find an `AcpThread` by session-id prefix (Plan 015). Scans all active
+    /// and retained conversation views, returning the first whose
+    /// `session_id` starts with the given prefix. Logs a warning on collision
+    /// (multiple matches).
+    pub fn thread_for_session_prefix(
+        &self,
+        prefix: &str,
+        cx: &App,
+    ) -> Option<Entity<AcpThread>> {
+        let mut matches = Vec::new();
+        for view in self.conversation_views() {
+            if let Some(thread) = view.read(cx).root_thread(cx) {
+                let session_id = thread.read(cx).session_id().to_string();
+                if session_id.starts_with(prefix) {
+                    matches.push(thread);
+                }
+            }
+        }
+        match matches.len() {
+            0 => None,
+            1 => Some(matches.into_iter().next().unwrap()),
+            n => {
+                log::warn!(
+                    "[agent_board] session prefix '{prefix}' matched {n} threads — using first"
+                );
+                Some(matches.into_iter().next().unwrap())
+            }
         }
     }
 

@@ -59,13 +59,27 @@ pub async fn sync_round(
         .collect();
     auto_prompt::peer_states::set_peer_states(peer_states, identity.device_id());
 
-    // 3. Push our own status (local claims only) so other devices see us.
+    // 3. Phase 2 (Plan 015): drain web replies targeting this device. Each
+    //    reply is queued in auto_prompt's peer-states store, keyed by the
+    //    4-char session-id prefix. The agent_panel notification timer resolves
+    //    the prefix to an active session and injects the text.
+    let device_name = identity.device_name();
+    for reply in &snapshot.replies {
+        if reply.target_device == device_name {
+            auto_prompt::peer_states::inject_web_reply(
+                reply.target_session_prefix.clone(),
+                reply.text.clone(),
+            );
+        }
+    }
+
+    // 4. Push our own status (local claims only) so other devices see us.
     let body = build_local_status(identity, project_path);
     if let Err(error) = client.post_status(room, body).await {
         log::warn!("[agent_board] failed to post local status: {error:#}");
     }
 
-    // 4. Cache the snapshot globally for the MCP tool (`GetAgentRoom`) and any
+    // 5. Cache the snapshot globally for the MCP tool (`GetAgentRoom`) and any
     //    other consumer that needs the full room state without a GPUI handle.
     crate::board_state::set_room_snapshot(snapshot.clone());
 
