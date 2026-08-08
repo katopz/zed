@@ -514,15 +514,20 @@ pub async fn decide_claude_with_hidden_thread(
         hidden_session_id
     );
 
-    // Send the reasoning prompt. The system instruction lives in
-    // data.system_prompt (HIDDEN_ORCHESTRATOR_PROMPT); the user turn carries
-    // the worker's last paragraphs as JSON so the orchestrator has the signal.
+    // Send the reasoning prompt. The system instruction
+    // (HIDDEN_ORCHESTRATOR_PROMPT, stored in data.system_prompt) defines the
+    // judge role, the JSON schema, and the tool-use prohibition. The user turn
+    // carries the worker's last paragraphs as JSON so the orchestrator has the
+    // signal to judge. Both must be sent — without the system instruction the
+    // hidden session has no idea it's supposed to be a judge and will act as a
+    // normal Claude Code session (running tools, doing the task itself).
+    let worker_output = data
+        .last_assistant_message
+        .as_deref()
+        .unwrap_or("(no worker output)");
     let message = vec![acp::ContentBlock::Text(acp::TextContent::new(format!(
-        "{}\n\n--- WORKER OUTPUT BELOW ---\n{}",
-        data.context_json,
-        data.last_assistant_message
-            .as_deref()
-            .unwrap_or("(no worker output)")
+        "{}\n\n--- WORKER OUTPUT BELOW ---\nContext: {}\n\nWorker's last output:\n{}",
+        data.system_prompt, data.context_json, worker_output,
     )))];
 
     // send() runs a full turn and resolves on stop. Bound it with a timeout so
