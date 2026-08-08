@@ -148,8 +148,8 @@ coding at that moment. Agents talk to each other by posting to the board.
         (`peer_states::broadcast_state` call in Phase 2 branch of decide_with_llm)
 - [x] **Plan start hook**: when auto_prompt detects a new plan file claim
       (`plan_registry::try_claim` via `auto_claim_plan`), post `"starting: {plan}"` to the board.
-- [ ] Ring buffer on the worker: only last 10 state messages returned.
-      (Deferred — worker not deployed yet)
+- [x] Ring buffer on the worker: only last 10 state messages returned.
+      (`handleGetRoom` fetches `room:{room}:state:*`, sorts by `ts` desc, splices to `MAX_ROOM_STATES`)
 
 #### P2.3 — Chat visibility (points 3-4)
 - [x] When a remote `AgentStateMessage` arrives via the poll loop, inject it as
@@ -180,11 +180,10 @@ coding at that moment. Agents talk to each other by posting to the board.
       (peer_agent_states flows into the hidden path's LlmCallData)
 
 #### P2.6 — Bounds enforcement (points 7-8)
-- [ ] Worker: `AgentStateMessage.state_text` capped at 256 chars (truncate
-      with char-boundary check). `meta` capped at 256 chars.
-      (Client-side done via `truncate_to_byte_budget`; worker TODO)
-- [ ] Worker: only last 10 state messages returned per room (ring buffer).
-      (Deferred — worker not deployed)
+- [x] Worker: `AgentStateMessage.state_text` + `meta` capped at 256 bytes
+      (char-boundary safe truncation via `truncateToByteBudget` in worker JS).
+- [x] Worker: only last 10 state messages returned per room (ring buffer).
+      (`handleGetRoom` sorts by `ts` desc, splices to `MAX_ROOM_STATES`)
 - [x] Client-side: truncate before posting (defense in depth).
       `truncate_to_byte_budget` in types.rs + applied in BoardBroadcaster.
 
@@ -254,4 +253,8 @@ agent_ui ─→ auto_prompt ─→ (hidden orchestrator, plan_registry)
 - [ ] MCP tool returns room data.
 - [ ] Both Claude + native agent post + read the board.
 - [ ] Plan-start + summary-occurrence posts fire correctly.
-- [ ] 256 char + last-10 bounds enforced.
+- [x] 256 char + last-10 bounds enforced.
+      (Client-side: `truncate_to_byte_budget` + `MAX_STATE_TEXT_BYTES`. Worker-side:
+      `truncateToByteBudget` + `MAX_ROOM_STATES` ring buffer in `handleGetRoom` +
+      `handlePostState`. The worker now also serves the `POST /state` endpoint
+      that was previously missing — state broadcasts were silently 404'ing before.)

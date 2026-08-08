@@ -18,6 +18,8 @@
 import * as ed from "@noble/ed25519";
 
 const MAX_MESSAGES = 10;
+const MAX_ROOM_STATES = 10;
+const MAX_STATE_TEXT_BYTES = 256;
 const STALE_STATUS_SECS = 300;
 const TTL_SECS = 60 * 60 * 24 * 7; // 1 week
 
@@ -28,6 +30,21 @@ function b64decode(s) {
 function nowKey() {
   // Sortable key suffix: base36 of millis + short random.
   return Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
+}
+
+// Truncate a string to at most `maxBytes` UTF-8 bytes without splitting a
+// multi-byte character. Defense-in-depth: the Rust client pre-truncates with
+// the same logic (truncate_to_byte_budget); the worker re-applies so a
+// misbehaving or older client can't bloat the room.
+function truncateToByteBudget(text, maxBytes) {
+  const encoded = new TextEncoder().encode(text);
+  if (encoded.length <= maxBytes) return text;
+  // Walk back to a valid UTF-8 boundary. The TextDecoder `fatal: false` default
+  // replaces trailing partial sequences with U+FFFD, which is acceptable for a
+  // defense-in-depth cap.
+  let end = maxBytes;
+  while (end > 0 && (encoded[end] & 0xc0) === 0x80) end--;
+  return new TextDecoder().decode(encoded.subarray(0, end));
 }
 
 function json(body, status) {
@@ -105,10 +122,33 @@ async function handlePostMsg(env, room, body, verified) {
   return json(msg, 201);
 }
 
+async function handlePostState(env, room, body, verified) {
+  // Agent state broadcast (Phase 2 point 3-4). Stored under a separate KV
+  // prefix so the GET handler can ring-buffer independently from chat msgs.
+  // Both state_text and meta are capped at MAX_STATE_TEXT_BYTES (point 8).
+  const state = {
+    v: 1,
+    device_id: verified.deviceId,
+    device_name: String(body.device_name ?? ""),
+    session_id: String(body.session_id ?? ""),
+    sub_agent_id: body.sub_agent_id ? String(body.sub_agent_id) : null,
+    state_text: truncateToByteBudget(String(body.state_text ?? ""), MAX_STATE_TEXT_BYTES),
+    meta: truncateToByteBudget(String(body.meta ?? ""), MAX_STATE_TEXT_BYTES),
+    ts: Date.now(),
+  };
+  await env.AGENT_BOARD.put(
+    `room:${room}:state:${nowKey()}`,
+    JSON.stringify(state),
+    { expirationTtl: TTL_SECS }
+  );
+  return json(state, 201);
+}
+
 async function handleGetRoom(env, room) {
-  const [deviceList, msgList] = await Promise.all([
+  const [deviceList, msgList, stateList] = await Promise.all([
     env.AGENT_BOARD.list({ prefix: `room:${room}:device:`, limit: 64 }),
     env.AGENT_BOARD.list({ prefix: `room:${room}:msg:`, limit: MAX_MESSAGES + 5 }),
+    env.AGENT_BOARD.list({ prefix: `room:${room}:state:`, limit: MAX_ROOM_STATES + 5 }),
   ]);
   const nowSec = Date.now() / 1000;
   const statuses = [];
@@ -126,7 +166,14 @@ async function handleGetRoom(env, room) {
     if (raw !== null) messages.push(JSON.parse(raw));
   }
   messages.sort((a, b) => b.ts - a.ts).splice(MAX_MESSAGES);
-  return json({ v: 1, room, statuses, messages }, 200);
+  // Agent states (Phase 2 point 7): ring-buffer to last MAX_ROOM_STATES by ts.
+  const states = [];
+  for (const k of stateList.keys) {
+    const raw = await env.AGENT_BOARD.get(k.name);
+    if (raw !== null) states.push(JSON.parse(raw));
+  }
+  states.sort((a, b) => b.ts - a.ts).splice(MAX_ROOM_STATES);
+  return json({ v: 1, room, statuses, messages, states }, 200);
 }
 
 export default {
@@ -171,6 +218,20 @@ export default {
         return json({ error: "invalid json" }, 400);
       }
       return handlePostMsg(env, decodeURIComponent(msgMatch[1]), body, verified);
+    }
+
+    const stateMatch = path.match(/^\/v1\/rooms\/([^/]+)\/state$/);
+    if (stateMatch && request.method === "POST") {
+      const bodyText = await request.text();
+      const verified = await verifySignature(env, request.headers, bodyText);
+      if (!verified.ok) return json({ error: verified.error }, verified.status);
+      let body;
+      try {
+        body = JSON.parse(bodyText);
+      } catch {
+        return json({ error: "invalid json" }, 400);
+      }
+      return handlePostState(env, decodeURIComponent(stateMatch[1]), body, verified);
     }
 
     return json({ error: "not found" }, 404);

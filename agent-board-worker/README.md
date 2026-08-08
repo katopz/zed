@@ -9,9 +9,10 @@ other's work. See `../.plans/001_agent_board.md` for the full design.
 
 | Method | Path                       | Auth | Purpose                                  |
 |--------|----------------------------|------|------------------------------------------|
-| GET    | `/v1/rooms/{room}`         | none | Latest device statuses + last 10 msgs    |
+| GET    | `/v1/rooms/{room}`         | none | Latest device statuses + last 10 msgs + last 10 states |
 | POST   | `/v1/rooms/{room}/status`  | ed25519 | Latest-wins device status (heartbeat) |
 | POST   | `/v1/rooms/{room}/msg`     | ed25519 | Append a short message (TTL 1 week)   |
+| POST   | `/v1/rooms/{room}/state`   | ed25519 | Append an agent state broadcast (≤256 chars, last 10 retained) |
 | GET    | `/healthz`                 | none | Liveness                                 |
 
 Writes require headers `X-Device-Id`, `X-Timestamp`, `X-Sig`, `X-Pubkey`. The
@@ -66,6 +67,9 @@ the worker alone only needs the healthz + GET shape check.
 - `device:{device_id}` → base64 raw 32-byte ed25519 pubkey (allowlist)
 - `room:{room}:device:{device_id}` → latest-wins status JSON
 - `room:{room}:msg:{sortable_key}` → append-only message JSON
+- `room:{room}:state:{sortable_key}` → agent state broadcast JSON (Phase 2)
 
 All keys expire after 1 week (`DEFAULT_TTL_SECONDS`, configurable in
-`wrangler.toml`).
+`wrangler.toml`). Agent states (`state:` prefix) are ring-buffered to the last
+10 per room; `state_text` and `meta` are capped at 256 bytes server-side
+(defense-in-depth — the Rust client pre-truncates too).
