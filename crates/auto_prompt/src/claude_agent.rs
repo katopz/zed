@@ -514,13 +514,47 @@ pub async fn decide_claude_with_hidden_thread(
         hidden_session_id
     );
 
-    // Send the reasoning prompt. The system instruction
-    // (HIDDEN_ORCHESTRATOR_PROMPT, stored in data.system_prompt) defines the
-    // judge role, the JSON schema, and the tool-use prohibition. The user turn
-    // carries the worker's last paragraphs as JSON so the orchestrator has the
-    // signal to judge. Both must be sent — without the system instruction the
-    // hidden session has no idea it's supposed to be a judge and will act as a
-    // normal Claude Code session (running tools, doing the task itself).
+    // Run the judgment turn in a helper so we can guarantee session cleanup
+    // (close_session) on every exit path — success, error, timeout, parse
+    // failure. Without close_session, the session leaks: the connection's
+    // sessions map ref_count is never decremented and the underlying ACP
+    // process is never killed (CloseSessionRequest never sent).
+    let outcome = judge_with_hidden_session(&hidden_thread, &data, cx).await;
+
+    // Close the hidden session to free the underlying ACP process and remove
+    // it from the connection's sessions map. This decrements ref_count (set to
+    // 1 by new_session) and sends CloseSessionRequest when it hits 0.
+    if connection.supports_close_session() {
+        let close_result = cx
+            .update(|cx| connection.clone().close_session(&hidden_session_id, cx))
+            .await;
+        if let Err(err) = close_result {
+            log::warn!(
+                "[auto_prompt::claude] hidden session close failed: {err:#}"
+            );
+        }
+    }
+    drop(hidden_thread);
+
+    outcome
+}
+
+/// Send the orchestrator prompt to the hidden session, await its verdict, and
+/// map it to `AutoPromptOutcome`. Does NOT close the session — the caller is
+/// responsible for cleanup regardless of outcome.
+#[cfg(feature = "claude-hidden-orchestrator")]
+async fn judge_with_hidden_session(
+    hidden_thread: &gpui::Entity<acp_thread::AcpThread>,
+    data: &LlmCallData,
+    cx: &gpui::AsyncApp,
+) -> anyhow::Result<AutoPromptOutcome> {
+    // The system instruction (HIDDEN_ORCHESTRATOR_PROMPT, stored in
+    // data.system_prompt) defines the judge role, the JSON schema, and the
+    // tool-use prohibition. The user turn carries the worker's last paragraphs
+    // as JSON so the orchestrator has the signal to judge. Both must be sent
+    // — without the system instruction the hidden session has no idea it's
+    // supposed to be a judge and will act as a normal Claude Code session
+    // (running tools, doing the task itself).
     let worker_output = data
         .last_assistant_message
         .as_deref()
@@ -748,28 +782,44 @@ struct ClaudeVerdict {
 /// prose or markdown fences. Returns the input unchanged if no braces found.
 fn extract_json_object(raw: &str) -> &str {
     let trimmed = raw.trim();
-    if trimmed.starts_with('{') {
+    let Some(start) = trimmed.find('{') else {
         return trimmed;
-    }
-    if let Some(start) = trimmed.find('{') {
-        let rest = &trimmed[start..];
-        // Walk to the matching closing brace (depth-aware).
-        let mut depth = 0i32;
-        for (i, ch) in rest.char_indices() {
+    };
+    let rest = &trimmed[start..];
+    // Walk to the matching closing brace, tracking string literals so braces
+    // inside JSON string values don't prematurely close the object. We compare
+    // against byte values to avoid char-literal escaping ambiguity.
+    const BACKSLASH: char = '\u{005C}';
+    const QUOTE: char = '\u{0022}';
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (i, ch) in rest.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if in_string {
             match ch {
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return &rest[..=i];
-                    }
-                }
+                BACKSLASH => escaped = true,
+                QUOTE => in_string = false,
                 _ => {}
             }
+            continue;
         }
-        return rest;
+        match ch {
+            QUOTE => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &rest[..=i];
+                }
+            }
+            _ => {}
+        }
     }
-    trimmed
+    rest
 }
 
 /// Headings/labels that mark a paragraph as the start of a self-contained
@@ -879,6 +929,19 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_claude_response_trailing_prose() {
+        // The hidden orchestrator may add commentary after the JSON verdict.
+        // Regression for a bug where extract_json_object's starts_with('{')
+        // fast-path returned the trailing prose too, causing serde_json to
+        // reject valid JSON as trailing data.
+        let raw = "{\"continue\": true, \"confidence\": 0.8, \"next_prompt\": \"Go.\", \"reason\": \"more\"}\nI've analyzed the output.";
+        let verdict = parse_claude_response(raw).expect("parse ok");
+        assert!(verdict.continue_work);
+        assert_eq!(verdict.confidence, Some(0.8));
+        assert_eq!(verdict.next_prompt.as_deref(), Some("Go."));
+    }
+
+    #[test]
     fn test_extract_json_object_plain() {
         assert_eq!(extract_json_object(r#"{"a":1}"#), r#"{"a":1}"#);
     }
@@ -898,6 +961,37 @@ mod tests {
     #[test]
     fn test_extract_json_object_no_braces() {
         assert_eq!(extract_json_object("no json here"), "no json here");
+    }
+
+    #[test]
+    fn test_extract_json_object_trailing_prose() {
+        // A real Claude session may add commentary after the JSON. The
+        // starts_with('{') fast-path used to return the whole string,
+        // including the trailing prose, which serde_json rejects as trailing
+        // data — producing a false "Stopped" on a valid continue verdict.
+        let raw = "{\"continue\": true} Hope this helps!";
+        assert_eq!(extract_json_object(raw), r#"{"continue": true}"#);
+    }
+
+    #[test]
+    fn test_extract_json_object_close_brace_in_string() {
+        // A `}` inside a JSON string value must not close the object.
+        let raw = r#"{"reason": "has } char"}"#;
+        assert_eq!(extract_json_object(raw), r#"{"reason": "has } char"}"#);
+    }
+
+    #[test]
+    fn test_extract_json_object_open_brace_in_string() {
+        // An unbalanced `{` inside a string value must not inflate depth.
+        let raw = r#"{"reason": "has { char"}"#;
+        assert_eq!(extract_json_object(raw), r#"{"reason": "has { char"}"#);
+    }
+
+    #[test]
+    fn test_extract_json_object_escaped_quote_in_string() {
+        // An escaped `\"` inside a string must not terminate the string.
+        let raw = r#"{"reason": "has \" quote"}"#;
+        assert_eq!(extract_json_object(raw), r#"{"reason": "has \" quote"}"#);
     }
 
     #[test]
@@ -1354,6 +1448,95 @@ mod tests {
                 }
                 other => panic!("expected Stopped for missing confidence, got {other:?}"),
             }
+        }
+
+        #[gpui::test]
+        async fn test_hidden_thread_closes_session_when_supported(
+            cx: &mut gpui::TestAppContext,
+        ) {
+            // Regression: the hidden session must be closed via
+            // connection.close_session() after the judgment turn, so the
+            // underlying ACP process is killed and the session is removed
+            // from the connection's sessions map. Without this, every
+            // auto-prompt decision leaks a session (ref_count never
+            // decremented, process never killed).
+            init_test(cx);
+
+            let fs = fs::FakeFs::new(cx.executor());
+            let project = project::Project::test(fs, [], cx).await;
+
+            let connection = Rc::new(
+                StubAgentConnection::new().with_supports_close_session(true),
+            );
+            connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+                acp::ContentChunk::new(
+                    r#"{"continue": false, "confidence": 0.9, "next_prompt": null, "reason": "done"}"#
+                        .into(),
+                ),
+            )]);
+
+            let data = build_test_data(connection.clone(), project, "All done.");
+
+            let outcome = cx
+                .update(|cx| {
+                    cx.spawn(async move |cx| {
+                        decide_claude_with_hidden_thread(data, cx).await
+                    })
+                })
+                .await
+                .expect("hidden-thread decision succeeded");
+
+            assert!(
+                matches!(outcome, AutoPromptOutcome::Stopped { .. }),
+                "expected Stopped, got {outcome:?}"
+            );
+            assert_eq!(
+                connection.close_count(),
+                1,
+                "close_session must be called exactly once after the judgment turn"
+            );
+        }
+
+        #[gpui::test]
+        async fn test_hidden_thread_skips_close_when_not_supported(
+            cx: &mut gpui::TestAppContext,
+        ) {
+            // When the connection doesn't support close_session (the default
+            // for StubAgentConnection), the orchestrator must not try to call
+            // it — otherwise it would get an error every time.
+            init_test(cx);
+
+            let fs = fs::FakeFs::new(cx.executor());
+            let project = project::Project::test(fs, [], cx).await;
+
+            let connection = Rc::new(StubAgentConnection::new());
+            connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+                acp::ContentChunk::new(
+                    r#"{"continue": false, "confidence": 0.9, "next_prompt": null, "reason": "done"}"#
+                        .into(),
+                ),
+            )]);
+
+            let data = build_test_data(connection.clone(), project, "All done.");
+
+            let outcome = cx
+                .update(|cx| {
+                    cx.spawn(async move |cx| {
+                        decide_claude_with_hidden_thread(data, cx).await
+                    })
+                })
+                .await
+                .expect("hidden-thread decision succeeded");
+
+            assert!(
+                matches!(outcome, AutoPromptOutcome::Stopped { .. }),
+                "expected Stopped, got {outcome:?}"
+            );
+            assert_eq!(
+                connection.close_count(),
+                0,
+                "close_session must NOT be called when supports_close_session is false"
+            );
         }
     }
 }

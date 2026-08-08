@@ -66,9 +66,25 @@ worker (claude-acp) stops
 - [x] Unit tests: prompt contract (no-tool, JSON schema), parse roundtrip,
       tool-leak reply -> stop.
 - [x] Async spawn tests (TestAppContext + Project + StubAgentConnection):
-      `hidden_thread_async` module — 6 tests covering continue roundtrip, stop
+      `hidden_thread_async` module — 8 tests covering continue roundtrip, stop
       verdict, tool-leak -> stop, low-confidence -> stop, missing-next_prompt
-      fallback, missing-confidence -> stop (0.0 default).
+      fallback, missing-confidence -> stop (0.0 default), close-session-when-supported,
+      skip-close-when-not-supported.
+- [x] **Close hidden session after judgment** (session leak fix). The original
+      implementation spawned a hidden session via `new_session` (which increments
+      ref_count in the connection's sessions map) but never called `close_session`,
+      leaking the session and its underlying ACP process on every auto-prompt
+      decision. Now `decide_claude_with_hidden_thread` calls
+      `connection.close_session()` on every exit path (success, error, timeout,
+      parse failure) when `supports_close_session()` is true. Judgment logic
+      extracted into `judge_with_hidden_session` helper for guaranteed cleanup.
+- [x] **String-aware JSON extraction** (`extract_json_object` rewrite). The
+      original depth-aware walker didn't track string literals, so braces inside
+      JSON string values could prematurely close the object. Also fixed: the
+      `starts_with('{')` fast-path returned trailing prose alongside the JSON,
+      causing serde_json to reject valid verdicts as trailing data. New impl is
+      string-aware (tracks `in_string` + `escaped`) and always uses depth-aware
+      extraction.
 
 ## GOAT gate (verify before promoting to default)
 Items verifiable via tests (DONE):
@@ -79,6 +95,17 @@ Items verifiable via tests (DONE):
       Covered by `test_hidden_thread_tool_leak_reply_stops`.
 - [x] Low-confidence continue -> Stopped. Covered by
       `test_hidden_thread_low_confidence_stops`.
+- [x] Session cleanup: `close_session` is called on every exit path when
+      supported, preventing session/process leaks. Covered by
+      `test_hidden_thread_closes_session_when_supported` and
+      `test_hidden_thread_skips_close_when_not_supported`.
+- [x] JSON extraction robustness: trailing prose, braces/quotes inside JSON
+      strings handled by string-aware extractor. Covered by
+      `test_extract_json_object_trailing_prose`,
+      `test_extract_json_object_close_brace_in_string`,
+      `test_extract_json_object_open_brace_in_string`,
+      `test_extract_json_object_escaped_quote_in_string`,
+      `test_parse_claude_response_trailing_prose`.
 
 Items requiring a live Zed run with the feature on (NOT done here):
 - [ ] Hidden session spawns and is invisible (not in sidebar/retained_threads).

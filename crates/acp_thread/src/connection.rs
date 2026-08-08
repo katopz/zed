@@ -760,6 +760,8 @@ mod test_support {
         supports_load_session: bool,
         supports_session_additional_directories: bool,
         supports_retry: bool,
+        supports_close_session: bool,
+        close_count: Arc<AtomicUsize>,
         agent_id: AgentId,
         telemetry_id: SharedString,
     }
@@ -784,6 +786,8 @@ mod test_support {
                 supports_load_session: false,
                 supports_session_additional_directories: false,
                 supports_retry: false,
+                supports_close_session: false,
+                close_count: Arc::new(AtomicUsize::new(0)),
                 agent_id: AgentId::new("stub"),
                 telemetry_id: "stub".into(),
             }
@@ -817,6 +821,15 @@ mod test_support {
         pub fn with_supports_retry(mut self, supports_retry: bool) -> Self {
             self.supports_retry = supports_retry;
             self
+        }
+
+        pub fn with_supports_close_session(mut self, supports_close_session: bool) -> Self {
+            self.supports_close_session = supports_close_session;
+            self
+        }
+
+        pub fn close_count(&self) -> usize {
+            self.close_count.load(Ordering::SeqCst)
         }
 
         pub fn with_agent_id(mut self, agent_id: AgentId) -> Self {
@@ -938,6 +951,19 @@ mod test_support {
 
         fn supports_session_additional_directories(&self) -> bool {
             self.supports_session_additional_directories
+        }
+
+        fn supports_close_session(&self) -> bool {
+            self.supports_close_session
+        }
+
+        fn close_session(
+            self: Rc<Self>,
+            _session_id: &acp::SessionId,
+            _cx: &mut gpui::App,
+        ) -> Task<Result<()>> {
+            self.close_count.fetch_add(1, Ordering::SeqCst);
+            Task::ready(Ok(()))
         }
 
         fn load_session(
