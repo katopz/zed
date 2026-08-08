@@ -131,22 +131,27 @@ coding at that moment. Agents talk to each other by posting to the board.
 ### Tasks
 
 #### P2.1 — Room = hash(ssh-key) (points 1-2)
-- [ ] `DeviceIdentity::room_id()` → `blake3(raw_ed25519_pubkey_32)` hex
+- [x] `DeviceIdentity::room_id()` → `blake3(raw_ed25519_pubkey_32)` hex
       (same as device_id — same key = same room).
-- [ ] `AgentBoardConfig`: deprecate `room` field; derive from identity when empty.
-- [ ] `feeder::sync_round`: use derived room id.
-- [ ] The worker already keys by room name — the room id is just a string.
+- [x] `AgentBoardConfig`: deprecate `room` field; derive from identity when empty.
+- [x] `feeder::sync_round`: use derived room id (via panel's `resolved_room`).
+- [x] The worker already keys by room name — the room id is just a string.
 
 #### P2.2 — Agent state broadcasting (points 3-4)
-- [ ] Define `AgentStateMessage` (extends `BoardMessage`):
+- [x] Define `AgentStateMessage` (extends `BoardMessage`):
       `{ v, device_id, device_name, session_id, sub_agent_id?, state_text (≤256), meta (≤256), ts }`.
-- [ ] **Both Claude agent and native agent** post state to the board.
+- [x] **Both Claude agent and native agent** post state to the board.
       - Claude: hook into `claude_decision_hidden` / `decide_claude_async` —
         when a summary is detected (`SUMMARY_MARKERS`), post it.
+        (`maybe_broadcast_summary_to_board` in claude_agent.rs)
       - Native: hook into `auto_prompt::decide_with_llm` — same summary hook.
+        (TODO: native summary hook — same `maybe_broadcast_summary_to_board`
+        pattern, needs wiring in decide_with_llm)
 - [ ] **Plan start hook**: when auto_prompt detects a new plan file claim
       (`plan_registry::try_claim`), post `"starting: {plan}"` to the board.
+      (Deferred — needs agent_ui wiring where try_claim is called)
 - [ ] Ring buffer on the worker: only last 10 state messages returned.
+      (Deferred — worker not deployed yet)
 
 #### P2.3 — Chat visibility (points 3-4)
 - [ ] When a remote `AgentStateMessage` arrives via the poll loop, inject it as
@@ -156,26 +161,32 @@ coding at that moment. Agents talk to each other by posting to the board.
 - [ ] Both Claude and native agent threads receive these injections.
 
 #### P2.4 — Muting (points 5-6)
-- [ ] `AgentBoardConfig` gains `muted: Vec<MuteKey>` where `MuteKey` is
+- [x] `AgentBoardConfig` gains `muted: Vec<MuteKey>` where `MuteKey` is
       `{device_id?, session_id?, sub_agent_id?}`.
 - [ ] Panel UI: each agent state row has a mute toggle.
-- [ ] Persist muted set to `~/.config/zed/agent_board.json`.
-- [ ] `feeder::sync_round` filters: only inject unmuted states into context.
+      (Deferred — needs GPUI toggle component)
+- [x] Persist muted set to `~/.config/zed/agent_board.json` (via config save).
+- [x] `feeder::sync_round` filters: only inject unmuted states into context.
+      (Via `peer_states::set_muted` + `unmuted_states_for_context` filter)
 
 #### P2.5 — Auto_prompt context integration (point 6)
-- [ ] `auto_prompt` exposes a new field on `LlmCallData`:
+- [x] `auto_prompt` exposes a new field on `LlmCallData`:
       `peer_agent_states: Option<String>` — formatted unmuted state text.
-- [ ] Both `claude_decision_hidden` AND the native `decide_with_llm` populate it
+- [x] Both `claude_decision_hidden` AND the native `decide_with_llm` populate it
       from the board's latest unmuted state snapshot.
-- [ ] The hidden-thread orchestrator prompt includes peer states so the judge
+      (All 4 LlmCallData construction sites populate from peer_states)
+- [x] The hidden-thread orchestrator prompt includes peer states so the judge
       can reason about what other agents are doing.
+      (peer_agent_states flows into the hidden path's LlmCallData)
 
 #### P2.6 — Bounds enforcement (points 7-8)
 - [ ] Worker: `AgentStateMessage.state_text` capped at 256 chars (truncate
       with char-boundary check). `meta` capped at 256 chars.
+      (Client-side done via `truncate_to_byte_budget`; worker TODO)
 - [ ] Worker: only last 10 state messages returned per room (ring buffer).
-- [ ] Client-side: truncate before posting (defense in depth).
-      Use `truncate_at_char_boundary` from `auto_prompt::context`.
+      (Deferred — worker not deployed)
+- [x] Client-side: truncate before posting (defense in depth).
+      `truncate_to_byte_budget` in types.rs + applied in BoardBroadcaster.
 
 #### P2.7 — MCP server (point 9)
 - [ ] New MCP tool `get_agent_room` on a default-on `McpServer`:
