@@ -1294,6 +1294,15 @@ pub async fn decide_with_llm(
             // summary, via `skip_phase_1`). The last_assistant_message IS the
             // summary. Create a new thread with ThreadSummary flow.
             clear_summary_for_session(&session_id_str);
+
+            // Phase 2 (P2.2 native summary hook): broadcast the summary to the
+            // agent board so peer agents can see what this agent just concluded.
+            // Mirrors the claude_agent path's `maybe_broadcast_summary_to_board`.
+            // We already know this is a summary (summary_state==1 or voluntary),
+            // so no contains_summary check needed.
+            if let Some(summary) = data.last_assistant_message.as_deref() {
+                peer_states::broadcast_state(&session_id_str, None, summary, "summary");
+            }
             log::info!(
                 "[auto_prompt::decide_with_llm] Summary received — creating new thread with ThreadSummary flow (session={session_id_str})"
             );
@@ -3489,6 +3498,16 @@ fn auto_claim_plan(
         title.unwrap_or("auto_prompt continuation"),
     ) {
         log::info!("[auto_prompt] Auto-claimed plan {claimed} for session {session_id_str}");
+        // Phase 2 (P2.2 plan-start hook): announce to the agent board that this
+        // agent is starting work on a plan, so peer agents know what we're about
+        // to do. The meta field carries the plan filename for display.
+        let plan_name = claimed.rsplit('/').next().unwrap_or(&claimed);
+        peer_states::broadcast_state(
+            &session_id_str,
+            None,
+            &format!("starting: {plan_name}"),
+            &claimed,
+        );
     }
 }
 

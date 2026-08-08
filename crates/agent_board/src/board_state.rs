@@ -8,10 +8,16 @@ use std::sync::{Arc, RwLock};
 
 use auto_prompt::peer_states::AgentStateBroadcaster;
 use crate::client::BoardClient;
-use crate::types::{truncate_to_byte_budget, MAX_STATE_TEXT_BYTES};
+use crate::types::{truncate_to_byte_budget, RoomSnapshot, MAX_STATE_TEXT_BYTES};
 
 /// Global: writer handle (client + room) set by the panel after `try_start`.
 static WRITER: RwLock<Option<WriterHandle>> = RwLock::new(None);
+
+/// Global: latest room snapshot, set by the feeder after each poll round.
+/// Read by the MCP tool (`GetAgentRoom`) and any other consumer that needs the
+/// full room state (devices + states + messages) without holding a GPUI entity
+/// handle. Stored as an `Arc` so readers never block on a clone.
+static ROOM_SNAPSHOT: RwLock<Option<Arc<RoomSnapshot>>> = RwLock::new(None);
 
 struct WriterHandle {
     client: Arc<BoardClient>,
@@ -96,10 +102,27 @@ pub fn register_writer(
     auto_prompt::peer_states::register_broadcaster(Some(Arc::new(BoardBroadcaster)));
 }
 
+/// Store the latest room snapshot. Called by the feeder after each successful
+/// poll round. Wrapped in `Arc` for cheap concurrent reads.
+pub fn set_room_snapshot(snapshot: RoomSnapshot) {
+    if let Ok(mut guard) = ROOM_SNAPSHOT.write() {
+        *guard = Some(Arc::new(snapshot));
+    }
+}
+
+/// Read the latest room snapshot (clone of the `Arc`). Returns `None` when no
+/// poll has succeeded yet.
+pub fn current_room_snapshot() -> Option<Arc<RoomSnapshot>> {
+    ROOM_SNAPSHOT.read().ok()?.as_ref().cloned()
+}
+
 /// Clear the writer handle. Test-only.
 #[cfg(test)]
 pub fn clear_for_test() {
     if let Ok(mut guard) = WRITER.write() {
+        *guard = None;
+    }
+    if let Ok(mut guard) = ROOM_SNAPSHOT.write() {
         *guard = None;
     }
 }

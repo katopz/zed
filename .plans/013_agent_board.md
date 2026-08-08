@@ -145,11 +145,9 @@ coding at that moment. Agents talk to each other by posting to the board.
         when a summary is detected (`SUMMARY_MARKERS`), post it.
         (`maybe_broadcast_summary_to_board` in claude_agent.rs)
       - Native: hook into `auto_prompt::decide_with_llm` — same summary hook.
-        (TODO: native summary hook — same `maybe_broadcast_summary_to_board`
-        pattern, needs wiring in decide_with_llm)
-- [ ] **Plan start hook**: when auto_prompt detects a new plan file claim
-      (`plan_registry::try_claim`), post `"starting: {plan}"` to the board.
-      (Deferred — needs agent_ui wiring where try_claim is called)
+        (`peer_states::broadcast_state` call in Phase 2 branch of decide_with_llm)
+- [x] **Plan start hook**: when auto_prompt detects a new plan file claim
+      (`plan_registry::try_claim` via `auto_claim_plan`), post `"starting: {plan}"` to the board.
 - [ ] Ring buffer on the worker: only last 10 state messages returned.
       (Deferred — worker not deployed yet)
 
@@ -163,8 +161,7 @@ coding at that moment. Agents talk to each other by posting to the board.
 #### P2.4 — Muting (points 5-6)
 - [x] `AgentBoardConfig` gains `muted: Vec<MuteKey>` where `MuteKey` is
       `{device_id?, session_id?, sub_agent_id?}`.
-- [ ] Panel UI: each agent state row has a mute toggle.
-      (Deferred — needs GPUI toggle component)
+- [x] Panel UI: each agent state row has a mute toggle (🔊/🔇 click toggles).
 - [x] Persist muted set to `~/.config/zed/agent_board.json` (via config save).
 - [x] `feeder::sync_round` filters: only inject unmuted states into context.
       (Via `peer_states::set_muted` + `unmuted_states_for_context` filter)
@@ -189,13 +186,18 @@ coding at that moment. Agents talk to each other by posting to the board.
       `truncate_to_byte_budget` in types.rs + applied in BoardBroadcaster.
 
 #### P2.7 — MCP server (point 9)
-- [ ] New MCP tool `get_agent_room` on a default-on `McpServer`:
+- [x] New MCP tool `get_agent_room` on a default-on `McpServer`:
       - Input: `{}` (no args — returns current room snapshot).
       - Output: `{ room, devices: [{device_id, device_name, states: [...]}] }`.
+      (`GetAgentRoom` tool in `mcp_tools.rs`, registered on `McpServer` during `try_start`)
 - [ ] Register the MCP server as a default context server so all agents
       (native + Claude Code) can call it.
+      (Deferred — `McpServer` uses a Unix socket but `ContextServerConfiguration`
+      only supports stdio/HTTP. Needs a transport bridge or new config type.)
 - [ ] Include room summary in the system prompt:
       "You are in room X with N other agents. Their states: [last 10]."
+      (Deferred — peer states already injected via `LlmCallData.peer_agent_states`;
+      MCP tool provides on-demand query as a complement.)
 
 ### Perf/sec considerations
 - **Poll cadence**: 15s default is the floor for KV eventual consistency. Agent

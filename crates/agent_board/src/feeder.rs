@@ -65,6 +65,10 @@ pub async fn sync_round(
         log::warn!("[agent_board] failed to post local status: {error:#}");
     }
 
+    // 4. Cache the snapshot globally for the MCP tool (`GetAgentRoom`) and any
+    //    other consumer that needs the full room state without a GPUI handle.
+    crate::board_state::set_room_snapshot(snapshot.clone());
+
     Ok(snapshot)
 }
 

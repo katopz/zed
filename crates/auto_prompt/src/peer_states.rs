@@ -160,6 +160,20 @@ pub fn clear_for_test() {
 mod tests {
     use super::*;
 
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Acquire the global test lock and clear all peer-states globals. The
+    /// returned guard must be bound (`let _lock = setup();`) so it is held for
+    /// the duration of the test, serialising all peer_states tests (they share
+    /// process-global state). Mirrors the plan_registry test pattern.
+    fn setup() -> std::sync::MutexGuard<'static, ()> {
+        let guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        clear_for_test();
+        guard
+    }
+
     fn state(device_id: &str, name: &str, session_id: &str, text: &str) -> PeerAgentState {
         PeerAgentState {
             device_id: device_id.to_string(),
@@ -172,7 +186,7 @@ mod tests {
 
     #[test]
     fn excludes_own_device() {
-        clear_for_test();
+        let _lock = setup();
         set_peer_states(
             vec![
                 state("dev-a", "laptop", "s1", "debugging"),
@@ -187,14 +201,14 @@ mod tests {
 
     #[test]
     fn returns_none_when_empty() {
-        clear_for_test();
+        let _lock = setup();
         set_peer_states(vec![], "dev-a");
         assert!(unmuted_states_for_context().is_none());
     }
 
     #[test]
     fn filters_muted_device() {
-        clear_for_test();
+        let _lock = setup();
         set_peer_states(
             vec![state("dev-b", "desktop", "s2", "building")],
             "dev-a",
@@ -209,7 +223,7 @@ mod tests {
 
     #[test]
     fn caps_at_ten() {
-        clear_for_test();
+        let _lock = setup();
         let states: Vec<_> = (0..15)
             .map(|i| state("dev-b", "desktop", &format!("s{i}"), &format!("task-{i}")))
             .collect();
@@ -221,7 +235,7 @@ mod tests {
 
     #[test]
     fn shows_sub_agent_label() {
-        clear_for_test();
+        let _lock = setup();
         let mut s = state("dev-b", "desktop", "s2", "researching");
         s.sub_agent_id = Some("investigator".to_string());
         set_peer_states(vec![s], "dev-a");

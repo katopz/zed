@@ -15,6 +15,7 @@ pub mod board_state;
 pub mod client;
 mod feeder;
 pub mod identity;
+pub mod mcp_tools;
 pub mod types;
 
 use std::sync::Arc;
@@ -23,8 +24,8 @@ use std::time::Duration;
 use anyhow::{Context as _, Result};
 use gpui::{
     Action, App, AppContext, AsyncApp, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, ParentElement, Render, SharedString, Styled, Subscription,
-    Task, Window, actions, div, px,
+    InteractiveElement, IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement,
+    Styled, Subscription, Task, Window, actions, div, px,
 };
 use http_client::HttpClient;
 use serde::{Deserialize, Serialize};
@@ -35,6 +36,10 @@ use workspace::Workspace;
 use crate::client::BoardClient;
 use crate::identity::DeviceIdentity;
 use crate::types::{BoardMessage, RoomSnapshot};
+
+// The in-process MCP server (Phase 2 point 9) is held in the panel struct as
+// `mcp_server: Option<McpServer>` — kept alive for the panel's lifetime so the
+// Unix socket stays open. See the `mcp_server` field on `AgentBoardPanel`.
 
 actions!(
     agent_board,
@@ -160,6 +165,9 @@ pub struct AgentBoardPanel {
     snapshot: Option<RoomSnapshot>,
     /// Background poll task; dropped when the panel is dropped.
     poll_task: Option<Task<()>>,
+    /// In-process MCP server exposing `get_agent_room` (Phase 2 point 9).
+    /// Held alive to keep the Unix socket listening.
+    mcp_server: Option<context_server::listener::McpServer>,
     /// Local session id we attribute remote claims relative to. In practice the
     /// board is per-device, so an empty string means "no local thread yet"; the
     /// plan_registry still reflects remote claims regardless.
@@ -190,6 +198,7 @@ impl AgentBoardPanel {
                 resolved_room: None,
                 snapshot: None,
                 poll_task: None,
+                mcp_server: None,
                 local_session_id: String::new(),
                 _subscriptions: Vec::new(),
             };
@@ -262,6 +271,33 @@ impl AgentBoardPanel {
         self.resolved_room = Some(room);
         self.client = Some(client);
         self.start_poll(cx);
+
+        // Phase 2 point 9: spawn the in-process MCP server with the
+        // `get_agent_room` tool so agents can query the room on-demand. The
+        // server listens on a Unix socket; its path is logged so it can be
+        // configured as a context server.
+        if self.mcp_server.is_none() {
+            cx.spawn(async move |this, cx: &mut AsyncApp| {
+                let server_task = context_server::listener::McpServer::new(cx);
+                match server_task.await {
+                    Ok(mut server) => {
+                        server.add_tool(mcp_tools::GetAgentRoom);
+                        log::info!(
+                            "[agent_board] MCP server listening at {} (tool: get_agent_room)",
+                            server.socket_path().display()
+                        );
+                        let _ = this.update(cx, |this, cx| {
+                            this.mcp_server = Some(server);
+                            cx.notify();
+                        });
+                    }
+                    Err(error) => {
+                        log::warn!("[agent_board] failed to start MCP server: {error:#}");
+                    }
+                }
+            })
+            .detach();
+        }
     }
 
     fn start_poll(&mut self, cx: &mut Context<Self>) {
@@ -368,6 +404,33 @@ impl AgentBoardPanel {
     fn force_refresh_no_window(&mut self, cx: &mut Context<Self>) {
         self.start_poll(cx);
     }
+
+    /// Toggle mute on a specific agent state. Adds a `MuteKey` targeting the
+    /// exact device+session+sub_agent combo if not present; removes it if already
+    /// muted. Persists config + updates auto_prompt's runtime filter immediately.
+    fn toggle_mute(&mut self, key: crate::types::MuteKey, cx: &mut Context<Self>) {
+        if let Some(pos) = self.config.muted.iter().position(|m| *m == key) {
+            self.config.muted.remove(pos);
+        } else {
+            self.config.muted.push(key);
+        }
+        if let Err(error) = self.config.save() {
+            log::warn!("[agent_board] could not persist muted set: {error:#}");
+        }
+        // Sync the runtime filter so auto_prompt stops injecting muted states.
+        let muted: Vec<auto_prompt::peer_states::PeerStateMute> = self
+            .config
+            .muted
+            .iter()
+            .map(|m| auto_prompt::peer_states::PeerStateMute {
+                device_id: m.device_id.clone(),
+                session_id: m.session_id.clone(),
+                sub_agent_id: m.sub_agent_id.clone(),
+            })
+            .collect();
+        auto_prompt::peer_states::set_muted(muted);
+        cx.notify();
+    }
 }
 
 impl Focusable for AgentBoardPanel {
@@ -458,6 +521,72 @@ impl Render for AgentBoardPanel {
                             .text_color(fg)
                             .text_xs()
                             .child(SharedString::from(line))
+                            .into_any_element(),
+                    );
+                }
+            }
+        }
+
+        // Agent states (Phase 2): what each agent is doing right now, with a
+        // per-row mute toggle. Muted rows are dimmed; clicking the toggle adds/
+        // removes a MuteKey targeting this exact device+session+sub_agent.
+        if let Some(snapshot) = &self.snapshot {
+            if !snapshot.states.is_empty() {
+                children.push(
+                    div()
+                        .px_2()
+                        .pt_2()
+                        .pb_1()
+                        .text_color(muted)
+                        .text_xs()
+                        .child(SharedString::from("— agent states —"))
+                        .into_any_element(),
+                );
+                for state in &snapshot.states {
+                    let key = types::MuteKey {
+                        device_id: Some(state.device_id.clone()),
+                        session_id: Some(state.session_id.clone()),
+                        sub_agent_id: state.sub_agent_id.clone(),
+                    };
+                    let is_muted = self.config.muted.contains(&key);
+                    let sub_label = state.sub_agent_id.as_deref().unwrap_or("(main)");
+                    let text_color = if is_muted { muted } else { fg };
+                    let toggle_label = if is_muted { "🔇" } else { "🔊" };
+                    let line = format!(
+                        "{} · {}: {}",
+                        state.device_name, sub_label, state.state_text
+                    );
+                    let mute_id = format!(
+                        "mute-toggle:{}/{}/{}",
+                        state.device_id,
+                        state.session_id,
+                        state.sub_agent_id.as_deref().unwrap_or("")
+                    );
+                    children.push(
+                        div()
+                            .px_2()
+                            .py_0p5()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_1()
+                            .text_color(text_color)
+                            .text_xs()
+                            .child(SharedString::from(line))
+                            .child(
+                                div()
+                                    .id(mute_id)
+                                    .cursor_pointer()
+                                    .hover(|style| style.text_color(accent))
+                                    .child(SharedString::from(toggle_label))
+                                    .on_click(cx.listener({
+                                        let key = key.clone();
+                                        move |this, _event, _window, cx| {
+                                            this.toggle_mute(key.clone(), cx);
+                                        }
+                                    }))
+                                    .into_any_element(),
+                            )
                             .into_any_element(),
                     );
                 }

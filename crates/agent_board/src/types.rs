@@ -228,10 +228,12 @@ mod tests {
     fn truncate_multibyte_does_not_split_char() {
         // "é" is 2 bytes (0xC3 0xA9). Truncating at byte 1 must roll back to 0.
         assert_eq!(truncate_to_byte_budget("é", 1), "");
-        // "aé" — byte 2 lands mid-"é"; roll back to 1 ("a").
+        // "aé" — byte 1 lands mid-"é"; roll back to 1 ("a").
         assert_eq!(truncate_to_byte_budget("aé", 2), "a");
-        // "ébc" — byte 2 lands mid-"é"; roll back to 0.
-        assert_eq!(truncate_to_byte_budget("ébc", 2), "");
+        // "ébc" — byte 2 is the char boundary between "é" and "b"; keep "é".
+        assert_eq!(truncate_to_byte_budget("ébc", 2), "é");
+        // "ébc" — byte 1 lands mid-"é"; roll back to 0.
+        assert_eq!(truncate_to_byte_budget("ébc", 1), "");
     }
 
     #[test]
