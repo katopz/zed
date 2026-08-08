@@ -1,22 +1,53 @@
-# 015 — Agent Board Web UI (browser dashboard + steering replies)
+# 015 — Agent Board Web UI (browser dashboard + WebSocket steering)
 
 ## Goal
 A minimal single-page HTML dashboard served by the Cloudflare Worker so the
 operator can see all agent threads across devices in a browser, click any
 agent to expand its streaming timeline (accordion), and post **steering
 replies** that get injected into the target agent's thread on the target
-device.
+device — in real-time via WebSocket, no polling.
 
 **Example reply format** (visible in the web UI input bar):
 ```
-REPLY:[m3:a1] stop and commit, tests are green
-REPLY:[SHIKUWA:a1] switch to the develop branch first
+REPLY:[m3:f3a2] stop and commit, tests are green
+REPLY:[SHIKUWA:b1c9] switch to the develop branch first
 ```
 - `m3` / `SHIKUWA` = device names (from `DeviceIdentity::device_name()`)
-- `a1` = short agent label assigned by the UI (sequential per device)
+- `f3a2` / `b1c9` = first 4 chars of the agent's `session_id` (deterministic,
+  stable across page refreshes, resolvable by prefix-match on the device)
 
 **Security**: Google Sign-In (Google Identity Services). Only
 `katopz@gmail.com` is allowed. No other accounts can view or post.
+
+## Real-time model: WebSocket, not polling
+
+The board is **push-based** when WebSocket is active. No continuous polling.
+
+### Two trigger paths (no polling needed)
+
+**Path 1 — Zed → Browser (state updates)**:
+Zed posts state via HTTP (the existing feeder, unchanged). The Worker checks
+if any browser WebSocket is connected. If yes → auto-pushes the update to
+the browser instantly. The browser gets real-time without Zed needing a
+WebSocket. "Auto-accept" = the browser WebSocket just needs to be connected;
+no explicit broadcast request is needed.
+
+**Path 2 — Browser → Zed (steering replies)**:
+Browser sends reply via WebSocket → Durable Object relays → Zed receives
+instantly **if Zed's WebSocket toggle is ON**. If toggle is OFF → reply sits
+in KV, Zed picks up on next feeder poll (fallback, ~15s).
+
+### WebSocket lifecycle
+- **Browser**: connects WebSocket on page load, disconnects on page close.
+  Only open when the operator is actively looking at the dashboard.
+- **Zed**: has a manual WebSocket toggle (broadcast icon on the agent board
+  panel). When ON, Zed maintains a WebSocket connection to the worker. When
+  OFF, Zed falls back to the existing KV poll model.
+
+### Fallback: KV poll when no WebSocket
+When no WebSocket is connected (browser closed + Zed toggle off), the system
+falls back to the existing 15s KV poll. Replies are persisted in KV with 7d
+TTL so they survive disconnections.
 
 ## Substrate-first note (CRITICAL)
 
@@ -24,8 +55,7 @@ REPLY:[SHIKUWA:a1] switch to the develop branch first
 `crates/agent/src/thread.rs` ALREADY implements steering:
 - `Thread::set_end_turn_at_next_boundary(bool)` — when true, the current turn
   ends at the next message boundary instead of running to completion.
-- `ThreadEventStream::send_user_message()` — queues a `UserMessage` event.
-- The UI sets `end_turn_at_next_boundary` via `ThreadView::sync_queue_flag_to_native_thread`.
+- The UI sets this via `ThreadView::sync_queue_flag_to_native_thread`.
 
 **This plan EXTENDS the existing steering mechanism — it does not build a parallel one.**
 The web reply is just another source of queued messages that sets the steer flag.
@@ -33,7 +63,6 @@ The web reply is just another source of queued messages that sets the steer flag
 ### Existing ACP thread message injection
 `crates/acp_thread/src/acp_thread.rs`:
 - `AcpThread::send(Vec<acp::ContentBlock>)` — sends a user message.
-- `AcpThread::send_command(...)` — sends without displaying a user-message bubble.
 - `AcpThread::push_agent_board_notification(text)` — display-only (P2.3).
 
 **The reply injection uses `AcpThread::send` for both native and Claude agents.**
@@ -47,8 +76,8 @@ user message (per operator spec: "maybe just send as usual").
   `auto_prompt::peer_states::drain_unseen_notifications()` and pushes to the
   active `AcpThread`.
 
-**The reply drain extends this same timer** — it also checks for new web
-replies targeting this device's agents and injects them.
+**The reply drain extends this same timer** as the fallback path. When
+WebSocket is active, replies arrive via the WebSocket push path (faster).
 
 ### Existing worker endpoints
 `agent-board-worker/src/index.js`:
@@ -57,8 +86,9 @@ replies targeting this device's agents and injects them.
 - `POST /v1/rooms/{room}/msg` — append a chat message.
 - `POST /v1/rooms/{room}/state` — append an agent state broadcast.
 
-**New endpoints are added alongside these.** The existing ed25519 signature
-gate protects writes; the web UI adds a Google OAuth layer on top.
+**New endpoints added alongside these.** WebSocket upgrade at `GET /ws`.
+HTTP POST `/reply` for the fallback path. All existing ed25519-signed writes
+also trigger WebSocket relay to connected browsers (auto-accept).
 
 ### Wire types
 `crates/agent_board/src/types.rs` already has:
@@ -83,247 +113,309 @@ gate protects writes; the web UI adds a Google OAuth layer on top.
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  Browser (any device)                                       │
-│  ┌───────────────────────────────────────────────────────┐  │
-│  │  GET /  →  single-page HTML dashboard                 │  │
-│  │  - Google Sign-In button (katopz@gmail.com only)      │  │
-│  │  - Agent list (accordion: click to expand thread)     │  │
-│  │  - REPLY input bar: REPLY:[device:agent] text         │  │
-│  │  - Auto-refresh every 5s when expanded                 │  │
-│  └───────────────────────────────────────────────────────┘  │
-└──────────────────────────┬──────────────────────────────────┘
-                           │ HTTPS (Google ID token in Authorization header)
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│  Cloudflare Worker                                          │
-│  ┌───────────────────────────────────────────────────────┐  │
-│  │  GET /              → HTML page (static, no auth)      │  │
-│  │  GET /v1/rooms/:id  → room snapshot (no auth, read)    │  │
-│  │  POST /v1/rooms/:id/reply → store steering reply       │  │
-│  │    Requires: valid Google ID token (katopz@gmail.com)  │  │
-│  │    OR: valid ed25519 signature (existing devices)      │  │
-│  └───────────────────────────────────────────────────────┘  │
-│  KV: room:{room}:reply:{key} → reply JSON                   │
-└──────────────────────────┬──────────────────────────────────┘
-                           │ Poll every 15s
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│  Zed (m3 laptop)                                            │
-│  ┌───────────────────────────────────────────────────────┐  │
-│  │  feeder::sync_round → finds replies targeting m3       │  │
-│  │  → resolves agent label to session_id                  │  │
-│  │  → injects into target AcpThread                       │  │
-│  │    native: send() + set_end_turn_at_next_boundary      │  │
-│  │    claude: send() as regular user message              │  │
-│  └───────────────────────────────────────────────────────┘  │
-│  Agent Panel (chat): new "Web Replies" badge/input row       │
-│  shows pending + delivered replies from the web UI          │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│  Browser (operator, any device)                                     │
+│  ┌───────────────────────────────────────────────────────────────┐  │
+│  │  GET /  →  single-page HTML dashboard                         │  │
+│  │  - Google Sign-In button (katopz@gmail.com only)              │  │
+│  │  - Agent list (accordion: click to expand thread timeline)    │  │
+│  │  - REPLY input bar: REPLY:[device:sess4] text                 │  │
+│  │  - WebSocket connection (auto on page load)                   │  │
+│  └─────────────────────────┬─────────────────────────────────────┘  │
+└────────────────────────────┼────────────────────────────────────────┘
+                             │ WebSocket (bidirectional, real-time)
+                             │ Authorization: Bearer <google-id-token>
+                             ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  Cloudflare Worker + Durable Object                                 │
+│  ┌───────────────────────────────────────────────────────────────┐  │
+│  │  GET /              → HTML page (static, no auth)              │  │
+│  │  GET /v1/rooms/:id  → room snapshot (read, no auth)            │  │
+│  │  GET /ws?room=...   → WebSocket upgrade (Google token auth)    │  │
+│  │  POST /v1/rooms/:id/reply → store reply (Google or ed25519)    │  │
+│  │  POST /v1/rooms/:id/state  → existing, NOW also relay to WS    │  │
+│  │  POST /v1/rooms/:id/status → existing, NOW also relay to WS    │  │
+│  └─────────────────────────┬─────────────────────────────────────┘  │
+│                             │                                       │
+│  ┌─────────────────────────▼─────────────────────────────────────┐  │
+│  │  Durable Object: RoomCoordinator                               │  │
+│  │  - Holds WebSocket connections per room                        │  │
+│  │  - Receives writes from HTTP POSTs → relays to all WS clients  │  │
+│  │  - Receives WS messages → persists to KV + relays to others    │  │
+│  └─────────────────────────┬─────────────────────────────────────┘  │
+│  KV: room:{room}:reply:{key} → reply JSON (7d TTL, fallback path)   │
+└────────────────────────────┼────────────────────────────────────────┘
+                             │ WebSocket (if Zed toggle ON)
+                             │ OR HTTP poll (if Zed toggle OFF, fallback)
+                             ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  Zed (m3 laptop)                                                    │
+│  ┌───────────────────────────────────────────────────────────────┐  │
+│  │  Agent Board Panel                                            │  │
+│  │  - 📡 WebSocket toggle icon (click to enable real-time mode)   │  │
+│  │  - When ON: maintains WebSocket → receives replies instantly   │  │
+│  │  - When OFF: feeder poll loop picks up replies (~15s)          │  │
+│  │  - Either way: HTTP POSTs to worker (feeder) auto-relay to     │  │
+│  │    connected browsers via Durable Object                        │  │
+│  └───────────────────────────────────────────────────────────────┘  │
+│  Reply injection:                                                   │
+│  - Resolve sess4 prefix → active session_id                         │
+│  - Find AcpThread by session_id                                     │
+│  - Native: send() + set_end_turn_at_next_boundary(true)             │
+│  - Claude: send() as regular user message                           │
+│  Agent Panel chat: "🌐 Web Reply" badge for pending replies         │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Security model
 
 ### Google OAuth (web UI → worker)
-1. Browser loads `GET /` (static HTML, no auth needed — the page itself
-   contains no secrets, just the Google Sign-In client).
-2. User clicks "Sign in with Google" → Google Identity Services (GIS) popup.
+1. Browser loads `GET /` (static HTML, no secrets — just the GIS script tag).
+2. User clicks "Sign in with Google" → Google Identity Services popup.
 3. GIS returns a **Google ID token** (JWT, ~1h expiry).
-4. Browser stores token in `sessionStorage`, sends it as
-   `Authorization: Bearer <google-id-token>` on every write request.
+4. Browser sends token on WebSocket connection as the first message, and as
+   `Authorization: Bearer <google-id-token>` on HTTP POST /reply.
 5. Worker verifies the JWT:
    - Fetch Google JWKS from `https://www.googleapis.com/oauth2/v3/certs`
    (cache in Worker global, refresh every 1h).
-   - Verify signature + `iss: "https://accounts.google.com"` +
-   `aud: <client-id>` + `exp` not expired.
-   - Check `email == "katopz@gmail.com"` and `email_verified: true`.
-6. If valid → proceed with the write. If not → 401.
+   - Verify signature + `iss` + `aud` + `exp`.
+   - Check `email == ALLOWED_EMAIL` (env var, default `katopz@gmail.com`)
+   and `email_verified: true`.
+6. If valid → accept WebSocket / process write. If not → 401 / close WS.
 
 ### Existing ed25519 gate (Zed devices → worker)
-Unchanged. Zed devices still sign writes with their SSH key. The Google
-OAuth is a **second auth path** for the web UI only — the worker accepts
-either a valid Google ID token OR a valid ed25519 signature on writes.
+Unchanged. Zed devices still sign HTTP writes with their SSH key. The
+worker accepts either a valid Google ID token OR ed25519 signature.
+
+### WebSocket authentication
+- **Browser**: sends Google ID token as the first WebSocket message after
+  upgrade. Durable Object validates before accepting further messages.
+- **Zed**: sends ed25519-signed challenge response as the first WS message.
 
 ### No secrets in the worker
-- Google Client ID is public (embedded in the HTML + worker config).
-- No client secret needed for GIS ID token flow (token-only).
-- The `katopz@gmail.com` allowlist is hardcoded in the worker.
+- Google Client ID is public (embedded in HTML + worker config).
+- No client secret needed for GIS ID token flow.
+- The allowlist email is in worker config (env var).
+
+## Session routing: 4-char prefix
+
+The `session_id` is typically a UUID or opaque string. The REPLY format uses
+the **first 4 characters** as a human-readable routing token:
+
+```
+REPLY:[m3:f3a2] stop and commit
+            ^^^^
+            first 4 chars of session_id
+```
+
+**Resolution on the device**:
+- The device iterates its active `AcpThread` entities.
+- For each, it reads the session_id and checks `session_id.starts_with(reply_target_prefix)`.
+- If exactly one match → inject. If zero matches → log + skip (agent gone).
+- If multiple matches (collision) → inject into the first match + log a warning.
+
+**Collision risk**: with 4 hex chars, there are 65,536 possible prefixes.
+For 2-5 concurrent agents, the collision probability is negligible. The log
+warning makes any collision visible. If collisions become a real problem,
+the prefix length can be increased to 6 or 8 chars.
 
 ## Tasks
 
-### W1 — Worker HTML page + static assets
-- [ ] `GET /` → returns a single-page HTML dashboard (inline CSS + JS, no
-      external dependencies except Google Identity Services script).
-      The page is static — all data is fetched via `GET /v1/rooms/{room}`
-      from JS. No SSR.
+### W1 — Worker HTML page
+- [ ] `GET /` → returns single-page HTML dashboard (inline CSS + JS, ~15KB).
+      Static — no SSR, no framework. Data fetched via `GET /v1/rooms/{room}`
+      + real-time push via WebSocket.
 - [ ] HTML includes:
       - Google Sign-In button (GIS script from accounts.google.com).
-      - Room dashboard: list of devices, each with expandable agent states.
-      - REPLY input bar (shows `REPLY:[device:agent] ____` when an agent
-        item is clicked).
-      - Auto-refresh toggle (default 5s when an accordion is expanded).
-- [ ] HTML/CSS is minimal: system font, dark theme, responsive, no
-      framework. Vanilla JS only.
+      - Room dashboard: device sections, each with expandable agent items.
+      - REPLY input bar (shows `REPLY:[device:sess4] ____` when clicked).
+      - WebSocket auto-connect on page load + Google auth.
+      - Connection status indicator (🟢 connected / 🔴 disconnected).
 
-### W2 — Agent label assignment + accordion view
-- [ ] JS assigns short labels to agents: `a1`, `a2`, `a3`... per device,
-      sequentially by first-seen order. Stored in a JS `Map<session_id, label>`.
+### W2 — Accordion agent timeline view
 - [ ] Each device is a collapsible section. Clicking a device expands its
       agents. Clicking an agent expands its state timeline (last 10 states,
       newest first).
+- [ ] The timeline updates in real-time via WebSocket push (no manual refresh).
+      When a new state arrives for the expanded agent, it prepends to the list.
 - [ ] Clicking an agent item populates the REPLY input:
-      `REPLY:[{device_name}:{label}] ` and focuses the input.
-- [ ] The timeline auto-refreshes every 5s when expanded (re-fetches room
-      snapshot, filters states by device+session).
+      `REPLY:[{device_name}:{sess4}] ` and focuses the input.
+      `sess4` = `session_id.slice(0, 4)`.
+- [ ] Sending a reply: POST via WebSocket message `{ type: "reply", target_device, target_session_prefix, text }`.
 
-### W3 — Google OAuth verification in worker
-- [ ] `POST /v1/rooms/:room/reply` accepts either:
-      (a) `Authorization: Bearer <google-id-token>` (web UI path), or
-      (b) existing ed25519 headers (Zed device path).
-- [ ] Worker verifies Google ID token:
+### W3 — Durable Object: RoomCoordinator
+- [ ] `agent-board-worker/src/room_coordinator.js` — Durable Object class.
+      - `fetch(handler)` → WebSocket upgrade, stores connection in `this.sessions`.
+      - Validates auth on first WS message (Google token or ed25519 challenge).
+      - `webSocketMessage(ws, msg)` → parse JSON, persist to KV if needed,
+        relay to all OTHER connected WS clients in the same room.
+      - `webSocketClose(ws)` → remove from `this.sessions`.
+      - Exposes a static method `relayToRoom(env, room, message)` that
+        HTTP POST handlers call to push updates to connected browsers.
+- [ ] `wrangler.toml`: add `[[durable_objects]]` binding + `[[migrations]]`.
+- [ ] Room name → Durable Object ID: `env.ROOM_COORDINATOR.idFromName(room)`.
+
+### W4 — Worker: WebSocket upgrade + relay integration
+- [ ] `GET /ws?room={room}` → WebSocket upgrade route.
+      Creates/gets the RoomCoordinator DO for the room, forwards the upgrade.
+- [ ] Existing HTTP POST handlers (`/status`, `/msg`, `/state`) now also call
+      `RoomCoordinator.relayToRoom(env, room, JSON.stringify(payload))` after
+      KV write. This is the "auto-accept" path: any HTTP write from Zed
+      auto-relays to connected browsers via the DO.
+- [ ] `POST /v1/rooms/:room/reply` → stores reply in KV + relays via DO.
+      Auth: Google token (web) or ed25519 (Zed).
+
+### W5 — Google OAuth verification in worker
+- [ ] Worker verifies Google ID token for WebSocket auth + POST /reply:
       - Fetch + cache Google JWKS (1h TTL in global scope).
       - Verify JWT signature, `iss`, `aud`, `exp`.
-      - Assert `email == ALLOWED_EMAIL` (env var `ALLOWED_EMAIL`, default
-      `katopz@gmail.com`).
-- [ ] Store reply as `room:{room}:reply:{sortable_key}` in KV with 7d TTL.
-      Reply JSON: `{ v, target_device, target_session_id, text, author_email, ts }`.
+      - Assert `email == ALLOWED_EMAIL`.
+- [ ] The verification function is pure (takes token + JWKS, returns email)
+      so it's unit-testable with mock JWKS.
 
-### W4 — Reply wire type + client posting
+### W6 — Reply wire type + client
 - [ ] `agent_board/src/types.rs`: add `WebReply` struct:
-      `{ v, target_device, target_session_id, text, author_email, ts }`.
+      `{ v, target_device, target_session_prefix, text, author_email, ts }`.
+      `target_session_prefix` is the 4-char prefix (NOT the full session_id —
+      the web UI doesn't need the full id, and the prefix is the routing key).
 - [ ] `RoomSnapshot` gains `#[serde(default)] replies: Vec<WebReply>`.
-- [ ] `BoardClient::post_reply()` — POST to `/v1/rooms/{room}/reply` with
-      ed25519 signature (for Zed-originated replies if needed in the future).
-      The web UI uses the Google token path instead.
+- [ ] `BoardClient::post_reply()` — POST to `/v1/rooms/{room}/reply`
+      with ed25519 signature (for Zed-originated replies, future use).
 
-### W5 — Reply drain in feeder + session resolution
-- [ ] `agent_board/src/feeder.rs`: `sync_round` now also fetches replies.
-      For each reply where `reply.target_device == identity.device_name()`:
-      - Resolve `target_session_id` to an active thread.
-      - Call `auto_prompt::peer_states::inject_web_reply(session_id, text)`
-      (new function — stores pending replies in a process-global, keyed by
-      session_id).
-      - Delete the reply from local tracking (mark as delivered) so it
-      doesn't re-inject on the next poll.
-- [ ] `auto_prompt/src/peer_states.rs`: add `inject_web_reply(session_id, text)`
-      and `drain_web_replies() -> Vec<(String session_id, String text)>`.
-      Stored in a `LazyLock<RwLock<HashMap<String, Vec<String>>>>` keyed by
-      session_id.
+### W7 — Zed WebSocket client + toggle
+- [ ] `agent_board/src/websocket_client.rs` — new module.
+      `BoardWebSocket` struct: maintains a WebSocket connection to the worker.
+      - Connects to `wss://{worker_url}/ws?room={room}` with ed25519 auth.
+      - On message: parse JSON, if it's a reply targeting this device →
+        call `auto_prompt::peer_states::inject_web_reply(session_prefix, text)`.
+      - Auto-reconnect with exponential backoff (1s, 2s, 4s, 8s, max 30s).
+      - `fn is_connected(&self) -> bool`.
+- [ ] `agent_board/src/agent_board.rs`: add WebSocket toggle state to panel.
+      - 📡 icon in the panel header. Click toggles `websocket_enabled: bool`.
+      - Persist toggle state to `~/.config/zed/agent_board.json`.
+      - When ON: create `BoardWebSocket`, store in panel field.
+      - When OFF: drop the `BoardWebSocket` (disconnects).
 
-### W6 — Reply injection into agent threads (agent_panel)
+### W8 — Reply drain (fallback path via feeder poll)
+- [ ] `agent_board/src/feeder.rs`: `sync_round` now also fetches replies from
+      the room snapshot. For each reply where `target_device == device_name()`:
+      - Call `peer_states::inject_web_reply(target_session_prefix, text)`.
+      - (Reply stays in KV until TTL — it's idempotent on the injection side
+        via dedup, same pattern as notification signatures.)
+- [ ] `auto_prompt/src/peer_states.rs`: add:
+      - `inject_web_reply(session_prefix: String, text: String)` — stores in
+        a `LazyLock<RwLock<Vec<(String, String)>>>` process-global.
+      - `drain_web_replies() -> Vec<(String, String)>` — drains + clears.
+
+### W9 — Reply injection into agent threads (agent_panel)
 - [ ] `agent_ui/src/agent_panel.rs`: extend `start_notification_drain` to
       also call `peer_states::drain_web_replies()` on each tick (10s).
-      For each `(session_id, text)`:
-      - Find the `AcpThread` matching `session_id` (scan active threads,
-      not just the active one — the reply can target any thread).
-      - If found and it's a native agent: `thread.send(text)` +
-      `set_end_turn_at_next_boundary(true)` (steering).
-      - If found and it's a Claude agent: `thread.send(text)` (regular send).
-      - If not found: log + skip (the agent thread may have closed).
+      This is the fallback path — when WebSocket is active, replies arrive
+      faster via the WS push path but still go through the same drain.
+      For each `(session_prefix, text)`:
+      - Resolve prefix → session_id via active threads.
+      - Find the `AcpThread` matching that session_id.
+      - Native: `thread.send(text)` + `set_end_turn_at_next_boundary(true)`.
+      - Claude: `thread.send(text)`.
+      - Not found: log + skip.
 
-### W7 — Thread lookup by session_id
-- [ ] `agent_ui/src/agent_panel.rs`: add a method to find an `AcpThread`
-      by session_id across all active conversation views (not just the
-      active one). The reply can target any thread on this device.
-      `fn thread_for_session(&self, session_id: &str, cx: &App) -> Option<Entity<AcpThread>>`
+### W10 — Thread lookup by session_id prefix
+- [ ] `agent_ui/src/agent_panel.rs`: add
+      `fn thread_for_session_prefix(&self, prefix: &str, cx: &App) -> Option<Entity<AcpThread>>`.
+      Scans all active conversation views, matches `session_id.starts_with(prefix)`.
+      Logs a warning if multiple matches (collision).
 
-### W8 — Zed chat panel: web replies indicator
-- [ ] `agent_ui/src/conversation_view/thread_view.rs`: add a small badge
-      or input row in the chat panel showing pending web replies for the
-      current thread. Format: `🌐 REPLY:[device:agent] text` with a
-      "Deliver" button to manually inject (in case auto-inject was skipped).
-      This gives the operator visibility into web-originated replies from
-      within Zed, not just the browser.
+### W11 — Zed chat panel: web reply indicator
+- [ ] `agent_ui/src/conversation_view/thread_view.rs`: small badge in the
+      chat panel showing web-originated replies.
+      Format: `🌐 REPLY:[device:sess4] text` with accept/dismiss buttons.
+      Gives visibility into web replies from within Zed, not just the browser.
 
-### W9 — Worker contract tests
-- [ ] `agent_board/src/types.rs`: add tests for `WebReply` serialization
-      and `RoomSnapshot` with replies deserialization.
-- [ ] Verify the exact JSON shapes match what the worker JS produces.
-- [ ] Test that old snapshots without `replies` field still deserialize
-      (`#[serde(default)]`).
-
-### W10 — Reply drain + injection tests
-- [ ] `auto_prompt/src/peer_states.rs`: tests for `inject_web_reply` +
-      `drain_web_replies` round-trip. Multiple replies for the same
-      session. Replies for different sessions. Drain clears pending.
-- [ ] `agent_board/src/feeder.rs`: test that `sync_round` extracts
-      replies targeting the local device and calls `inject_web_reply`.
-
-### W11 — Google OAuth token verification test
-- [ ] Worker JS: add a unit-testable `verifyGoogleToken` function that
-      takes a mock JWKS provider + a fake JWT and returns the email.
-- [ ] Test the allowlist check: `katopz@gmail.com` → allow, anything else
-      → reject. (This is a pure function test — no real Google calls.)
+### W12 — Tests
+- [ ] `agent_board/src/types.rs`: `WebReply` serialization, `RoomSnapshot`
+      with replies deserialization, old snapshots without replies (default).
+- [ ] `auto_prompt/src/peer_states.rs`: `inject_web_reply` + `drain_web_replies`
+      round-trip. Multiple replies. Drain clears. Different sessions.
+- [ ] `agent_board/src/feeder.rs`: reply extraction from snapshot, targets
+      local device → calls `inject_web_reply`.
+- [ ] Worker JS: `verifyGoogleToken` with mock JWKS + fake JWT. Allowlist check.
+- [ ] Session prefix resolution: exact match, no match, collision (first match
+      + warning log).
 
 ## Perf/sec considerations
 
-- **Poll cost**: the feeder already polls every 15s. Adding replies to the
-  GET response adds ~1KB (10 replies × ~100 bytes). Negligible vs the
-  existing 5KB snapshot.
-- **Reply latency**: worst case 15s (poll interval) + 10s (drain timer) =
-  25s from web post to agent injection. This is acceptable for "steering"
-  — the operator is redirecting high-level strategy, not doing real-time
-  control. If faster delivery is needed later, the drain timer can be
-  reduced to 2-3s.
-- **KV write rate**: replies are low-volume (a few per session). No risk
-  of hitting KV limits.
-- **JWKS cache**: fetched once per hour per Worker isolate. The global
-  scope persists across requests within the same isolate. ~50KB of JSON,
-  negligible memory.
-- **HTML page size**: single-file inline CSS+JS, ~10-15KB gzipped. One-time
-  fetch, cached by the browser.
-- **No WebSocket/SSE**: the board is poll-based (KV). Real-time streaming
-  would require Durable Objects or D1, which is overkill for a single-user
-  dashboard. Auto-refresh every 5s is sufficient.
-- **Session_id exposure**: the web UI displays session_ids in the DOM for
-  the reply targeting. Since the GET endpoint is unauthenticated (read-only)
-  and the board is single-user, this is not a privacy concern.
+- **No continuous polling when WebSocket active**: both browser and Zed
+  receive pushes. Polling only runs as fallback when WebSocket is off.
+- **Durable Object cost**: single-user, low volume. DO persists per room,
+  handles 1-5 WebSocket connections. Well within free tier limits.
+- **WebSocket reconnect**: exponential backoff prevents thundering herd on
+  worker restart. Max 30s backoff.
+- **Relay latency**: WebSocket relay is <100ms (same-region DO). Reply from
+  browser → agent thread injection is <500ms total (WS relay + thread.send).
+- **KV still the source of truth**: WebSocket relay is ephemeral. KV
+  persists everything with 7d TTL. New WebSocket clients get full state via
+  `GET /v1/rooms/{room}` on connect, then incremental updates via WS.
+- **Durable Object hibernation**: Cloudflare's Hibernating WebSockets API
+  allows the DO to sleep between messages, reducing cost. The DO wakes on
+  any WebSocket message or HTTP relay request.
+- **HTTP POST relay overhead**: each existing POST (status/state/msg) adds
+  one DO fetch call (~1ms) to relay to connected browsers. Negligible vs
+  the existing KV write (~50ms).
+- **4-char prefix collision**: 65,536 possible prefixes. For ≤5 concurrent
+  agents, collision probability is <0.01%. Log warning makes any collision
+  visible. Prefix length configurable if needed.
 
 ## Risks
 
-- **Google OAuth complexity**: verifying JWTs in a Worker requires fetching
-  JWKS, which is an outbound HTTP call. Workers support `fetch()` from
-  within the handler. If JWKS fetch fails, writes fail closed (401) —
-  the operator can always use the Zed device path (ed25519) instead.
-- **Session resolution**: the web reply targets a session_id, but the agent
-  thread may have been closed or replaced. The injection silently skips
-  if no matching thread is found — the reply is logged but not lost (it
-  remains in KV until TTL expiry).
-- **Race condition**: two devices could both try to deliver the same reply
-  if the target device name is ambiguous. Mitigated by: only the device
-  whose `device_name()` matches `reply.target_device` picks up the reply.
-  Since device names are distinct per device, only one device picks it up.
-  The reply is marked as delivered in the local tracking (not in KV —
-  other devices don't need to know it was delivered).
-- **Reply spoofing**: a malicious actor could post a reply with a forged
-  `target_device`. The reply would be stored in KV but never picked up
-  (no device matches the forged name). The ed25519 gate prevents unsigned
-  writes from Zed devices; the Google gate prevents unsigned writes from
-  the web UI.
+- **Durable Object complexity**: DOs require a migration in wrangler.toml.
+  First deploy creates the DO namespace. Subsequent deploys are zero-downtime.
+  If the DO is unavailable, WebSocket relay fails → fallback to KV poll.
+  HTTP POSTs still work (they write to KV first, then attempt relay).
+- **WebSocket auth**: the first WS message carries the auth token. If the
+  token is invalid, the DO closes the connection with code 4001. The browser
+  must re-authenticate when the Google token expires (~1h). The JS client
+  auto-refreshes the token via GIS before expiry.
+- **Reply delivery guarantee**: replies are best-effort (at-most-once). If
+  the target device's WebSocket is off AND the poll misses the reply before
+  TTL expiry, the reply is lost. Mitigated by: 7d TTL is generous; the
+  operator can re-post from the browser. No ack/retry mechanism for v1.
+- **Session prefix collision**: two agents with the same first-4-char prefix.
+  The reply goes to the first match. Mitigated by warning log + the operator
+  seeing both agents in the dashboard and noticing if a reply goes to the
+  wrong one.
+- **Google JWKS fetch failure**: if the worker can't fetch JWKS (network
+  issue), auth fails closed (401). The operator can use the Zed device path
+  (ed25519) which doesn't depend on JWKS.
 
 ## Dependency direction
 ```
 agent_ui ─→ auto_prompt ─→ (peer_states, plan_registry)
     │              │
-    │              ▼ inject_web_reply (BY agent_board feeder)
-    ├────→ agent_board ──→ (identity, client, feeder, worker)
+    │              ▼ inject_web_reply (BY agent_board feeder or WS client)
+    ├────→ agent_board ──→ (identity, client, feeder, ws_client, worker)
     │              │
     │              ▼
     └────→ acp_thread (AcpThread::send for injection)
 ```
-No new crate dependencies. `auto_prompt::peer_states` gains
-`inject_web_reply` + `drain_web_replies` (same pattern as the existing
-notification drain). `agent_ui` gains thread-by-session-id lookup.
+No new crate dependencies. `agent_board` gains `websocket_client` module.
+`auto_prompt::peer_states` gains `inject_web_reply` + `drain_web_replies`.
 
 ## GOAT gate
 - [ ] Web UI loads at `GET /` and shows room dashboard.
 - [ ] Google Sign-In works; only `katopz@gmail.com` accepted.
+- [ ] WebSocket connects on page load; status indicator shows 🟢.
 - [ ] Clicking an agent expands its state timeline (accordion).
-- [ ] REPLY input populates `REPLY:[device:agent]` when clicking an item.
-- [ ] Reply posted from browser reaches the target Zed device within 25s.
+- [ ] REPLY input populates `REPLY:[device:sess4]` when clicking an item.
+- [ ] State updates from Zed appear in browser instantly via WebSocket (no refresh).
+- [ ] Reply posted from browser reaches target Zed device:
+      - WebSocket ON: <1s.
+      - WebSocket OFF: <15s (poll fallback).
 - [ ] Native agent thread receives the reply as a steering message.
 - [ ] Claude agent thread receives the reply as a regular user message.
-- [ ] Zed chat panel shows a web-reply indicator for pending replies.
+- [ ] Zed 📡 toggle: ON = instant replies, OFF = poll fallback.
+- [ ] Zed chat panel shows 🌐 badge for web-originated replies.
+- [ ] 4-char session prefix resolves correctly (exact match, no collision).
 - [ ] Replies targeting a non-existent session are silently skipped (no crash).
 - [ ] Wire contract: `WebReply` JSON round-trips between worker JS and Rust types.
-- [ ] Old room snapshots without `replies` field still deserialize (`#[serde(default)]`).
+- [ ] Old room snapshots without `replies` field still deserialize.
+- [ ] Worker auto-relays HTTP POSTs to connected browser WebSockets (auto-accept).
