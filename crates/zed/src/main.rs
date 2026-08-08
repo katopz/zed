@@ -770,6 +770,7 @@ fn main() {
         collab_ui::init(&app_state, cx);
         git_ui::init(cx);
         feedback::init(cx);
+        agent_board::init(app_state.client.http_client(), cx);
         markdown_preview::init(cx);
         csv_preview::init(cx);
         svg_preview::init(cx);

@@ -1,0 +1,44 @@
+[package]
+name = "agent_board"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/agent_board.rs"
+doctest = false
+
+[features]
+default = ["agent-board"]
+# GOAT gate: opt-in until cross-device claim visibility is proven. When the
+# feature is promoted to default it will still be individually disable-able.
+agent-board = []
+
+[dependencies]
+anyhow.workspace = true
+auto_prompt.workspace = true
+base64.workspace = true
+blake3.workspace = true
+chrono.workspace = true
+ed25519-dalek.workspace = true
+futures.workspace = true
+gpui.workspace = true
+hex.workspace = true
+http_client.workspace = true
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+smol.workspace = true
+ssh-key.workspace = true
+sysinfo.workspace = true
+ui.workspace = true
+workspace.workspace = true
+zed_actions.workspace = true
+
+[dev-dependencies]
+ed25519-dalek = { workspace = true, features = ["rand_core"] }
+rand = "0.8"

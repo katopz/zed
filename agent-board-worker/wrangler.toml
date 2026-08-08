@@ -1,0 +1,16 @@
+name = "agent-board-worker"
+main = "src/index.js"
+compatibility_date = "2024-12-01"
+
+# Create the namespace first:
+#   npx wrangler kv:namespace create AGENT_BOARD
+# then paste the id below.
+[[kv_namespaces]]
+binding = "AGENT_BOARD"
+id = "REPLACE_WITH_KV_NAMESPACE_ID"
+
+# All board keys expire after one week.
+[vars]
+DEFAULT_TTL_SECONDS = "604800"
+MAX_MESSAGES = "10"
+STALE_STATUS_SECS = "300"

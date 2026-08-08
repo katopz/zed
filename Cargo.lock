@@ -23586,6 +23586,7 @@ dependencies = [
  "activity_indicator",
  "agent",
  "agent-client-protocol",
+ "agent_board",
  "agent_servers",
  "agent_settings",
  "agent_skills",

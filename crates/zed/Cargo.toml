@@ -69,6 +69,7 @@ agent.workspace = true
 agent-client-protocol.workspace = true
 agent_settings.workspace = true
 agent_skills.workspace = true
+agent_board.workspace = true
 agent_ui = { workspace = true, features = ["audio"] }
 anyhow.workspace = true
 askpass.workspace = true
