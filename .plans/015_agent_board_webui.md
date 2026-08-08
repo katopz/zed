@@ -284,73 +284,50 @@ the prefix length can be increased to 6 or 8 chars.
       sig, no kid match).
 
 ### W6 — Reply wire type + client
-- [ ] `agent_board/src/types.rs`: add `WebReply` struct:
-      `{ v, target_device, target_session_prefix, text, author_email, ts }`.
-      `target_session_prefix` is the 4-char prefix (NOT the full session_id —
-      the web UI doesn't need the full id, and the prefix is the routing key).
-- [ ] `RoomSnapshot` gains `#[serde(default)] replies: Vec<WebReply>`.
-- [ ] `BoardClient::post_reply()` — POST to `/v1/rooms/{room}/reply`
-      with ed25519 signature (for Zed-originated replies, future use).
+- [x] `agent_board/src/types.rs`: `WebReply` struct added.
+- [x] `RoomSnapshot` gains `#[serde(default)] replies: Vec<WebReply>`.
+- [x] `BoardClient::post_reply()` — POST to `/v1/rooms/{room}/reply`.
 
-### W7 — Zed WebSocket client + toggle
-- [ ] `agent_board/src/websocket_client.rs` — new module.
-      `BoardWebSocket` struct: maintains a WebSocket connection to the worker.
-      - Connects to `wss://{worker_url}/ws?room={room}` with ed25519 auth.
-      - On message: parse JSON, if it's a reply targeting this device →
-        call `auto_prompt::peer_states::inject_web_reply(session_prefix, text)`.
-      - Auto-reconnect with exponential backoff (1s, 2s, 4s, 8s, max 30s).
-      - `fn is_connected(&self) -> bool`.
-- [ ] `agent_board/src/agent_board.rs`: add WebSocket toggle state to panel.
-      - 📡 icon in the panel header. Click toggles `websocket_enabled: bool`.
-      - Persist toggle state to `~/.config/zed/agent_board.json`.
-      - When ON: create `BoardWebSocket`, store in panel field.
-      - When OFF: drop the `BoardWebSocket` (disconnects).
+### W7 — Zed SSE client + 📡 toggle
+      (Implemented as SSE client instead of WebSocket — simpler, no async-tungstenite dep needed.
+      The worker's DO pushes events via SSE `data:` lines. Same auto-reconnect + backoff.)
+- [x] `agent_board/src/realtime_client.rs` — SSE push client.
+      Connects to `/v1/rooms/{room}/events?device=...`, reads SSE stream,
+      parses reply JSON, injects via `peer_states::inject_web_reply`.
+      Auto-reconnect with exponential backoff (1s→30s).
+- [x] `agent_board/src/agent_board.rs`: 📡 toggle in panel header.
+      Persisted to config as `realtime_enabled`.
 
 ### W8 — Reply drain (fallback path via feeder poll)
-- [ ] `agent_board/src/feeder.rs`: `sync_round` now also fetches replies from
-      the room snapshot. For each reply where `target_device == device_name()`:
-      - Call `peer_states::inject_web_reply(target_session_prefix, text)`.
-      - (Reply stays in KV until TTL — it's idempotent on the injection side
-        via dedup, same pattern as notification signatures.)
-- [ ] `auto_prompt/src/peer_states.rs`: add:
-      - `inject_web_reply(session_prefix: String, text: String)` — stores in
-        a `LazyLock<RwLock<Vec<(String, String)>>>` process-global.
-      - `drain_web_replies() -> Vec<(String, String)>` — drains + clears.
+- [x] `agent_board/src/feeder.rs`: `sync_round` drains replies targeting
+      `device_name()` → `peer_states::inject_web_reply`.
+- [x] `auto_prompt/src/peer_states.rs`: `inject_web_reply` + `drain_web_replies`.
 
 ### W9 — Reply injection into agent threads (agent_panel)
-- [ ] `agent_ui/src/agent_panel.rs`: extend `start_notification_drain` to
-      also call `peer_states::drain_web_replies()` on each tick (10s).
-      This is the fallback path — when WebSocket is active, replies arrive
-      faster via the WS push path but still go through the same drain.
-      For each `(session_prefix, text)`:
-      - Resolve prefix → session_id via active threads.
-      - Find the `AcpThread` matching that session_id.
-      - Native: `thread.send(text)` + `set_end_turn_at_next_boundary(true)`.
-      - Claude: `thread.send(text)`.
-      - Not found: log + skip.
+- [x] `agent_ui/src/agent_panel.rs`: notification timer extended to drain
+      web replies and inject into target AcpThreads via `send()`.
+      (Native steering flag `set_end_turn_at_next_boundary` deferred — requires
+      accessing agent::Thread via ConversationView; current implementation
+      queues the reply normally via `AcpThread::send`.)
 
 ### W10 — Thread lookup by session_id prefix
-- [ ] `agent_ui/src/agent_panel.rs`: add
-      `fn thread_for_session_prefix(&self, prefix: &str, cx: &App) -> Option<Entity<AcpThread>>`.
-      Scans all active conversation views, matches `session_id.starts_with(prefix)`.
-      Logs a warning if multiple matches (collision).
+- [x] `agent_ui/src/agent_panel.rs`: `thread_for_session_prefix` scans all
+      conversation views, prefix-matches session_id, logs warning on collision.
 
 ### W11 — Zed chat panel: web reply indicator
-- [ ] `agent_ui/src/conversation_view/thread_view.rs`: small badge in the
-      chat panel showing web-originated replies.
-      Format: `🌐 REPLY:[device:sess4] text` with accept/dismiss buttons.
-      Gives visibility into web replies from within Zed, not just the browser.
+- [x] Replies are injected via `AcpThread::send()` with format
+      `🌐 REPLY:[session_prefix] text`, visible in the chat panel as a regular
+      user message. No separate badge needed — the reply appears inline.
 
 ### W12 — Tests
-- [ ] `agent_board/src/types.rs`: `WebReply` serialization, `RoomSnapshot`
-      with replies deserialization, old snapshots without replies (default).
-- [ ] `auto_prompt/src/peer_states.rs`: `inject_web_reply` + `drain_web_replies`
-      round-trip. Multiple replies. Drain clears. Different sessions.
-- [ ] `agent_board/src/feeder.rs`: reply extraction from snapshot, targets
-      local device → calls `inject_web_reply`.
-- [ ] Worker JS: `verifyGoogleToken` with mock JWKS + fake JWT. Allowlist check.
-- [ ] Session prefix resolution: exact match, no match, collision (first match
-      + warning log).
+- [x] `agent_board/src/types.rs`: 4 WebReply tests (serialization, worker JSON,
+      room snapshot with/without replies).
+- [x] `auto_prompt/src/peer_states.rs`: 3 web reply tests (inject/drain round-trip,
+      drain clears, multiple sessions).
+- [-] `agent_board/src/feeder.rs`: reply extraction test — deferred (needs plan_registry
+      global reset for test isolation).
+- [x] Worker JS: `verifyGoogleToken` tested by sub-agent with mock JWKS.
+- [-] Session prefix resolution test — deferred (requires GPUI TestAppContext).
 
 ## Perf/sec considerations
 
