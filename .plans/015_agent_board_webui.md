@@ -222,10 +222,10 @@ the prefix length can be increased to 6 or 8 chars.
 ## Tasks
 
 ### W1 — Worker HTML page
-- [ ] `GET /` → returns single-page HTML dashboard (inline CSS + JS, ~15KB).
+- [x] `GET /` → returns single-page HTML dashboard (inline CSS + JS, ~15KB).
       Static — no SSR, no framework. Data fetched via `GET /v1/rooms/{room}`
       + real-time push via WebSocket.
-- [ ] HTML includes:
+- [x] HTML includes:
       - Google Sign-In button (GIS script from accounts.google.com).
       - Room dashboard: device sections, each with expandable agent items.
       - REPLY input bar (shows `REPLY:[device:sess4] ____` when clicked).
@@ -233,45 +233,55 @@ the prefix length can be increased to 6 or 8 chars.
       - Connection status indicator (🟢 connected / 🔴 disconnected).
 
 ### W2 — Accordion agent timeline view
-- [ ] Each device is a collapsible section. Clicking a device expands its
+- [x] Each device is a collapsible section. Clicking a device expands its
       agents. Clicking an agent expands its state timeline (last 10 states,
       newest first).
-- [ ] The timeline updates in real-time via WebSocket push (no manual refresh).
+- [x] The timeline updates in real-time via WebSocket push (no manual refresh).
       When a new state arrives for the expanded agent, it prepends to the list.
-- [ ] Clicking an agent item populates the REPLY input:
+- [x] Clicking an agent item populates the REPLY input:
       `REPLY:[{device_name}:{sess4}] ` and focuses the input.
       `sess4` = `session_id.slice(0, 4)`.
-- [ ] Sending a reply: POST via WebSocket message `{ type: "reply", target_device, target_session_prefix, text }`.
+- [x] Sending a reply: POST via WebSocket message `{ type: "reply", target_device, target_session_prefix, text }`.
 
 ### W3 — Durable Object: RoomCoordinator
-- [ ] `agent-board-worker/src/room_coordinator.js` — Durable Object class.
+- [x] `agent-board-worker/src/index.js` — Durable Object class `RoomCoordinator`
+      (kept in the same file per the task spec, not a separate
+      `room_coordinator.js`, to match the task's explicit instruction).
       - `fetch(handler)` → WebSocket upgrade, stores connection in `this.sessions`.
       - Validates auth on first WS message (Google token or ed25519 challenge).
-      - `webSocketMessage(ws, msg)` → parse JSON, persist to KV if needed,
-        relay to all OTHER connected WS clients in the same room.
-      - `webSocketClose(ws)` → remove from `this.sessions`.
-      - Exposes a static method `relayToRoom(env, room, message)` that
-        HTTP POST handlers call to push updates to connected browsers.
-- [ ] `wrangler.toml`: add `[[durable_objects]]` binding + `[[migrations]]`.
-- [ ] Room name → Durable Object ID: `env.ROOM_COORDINATOR.idFromName(room)`.
+      - `onWebSocketMessage(ws, msg)` → parse JSON, persist to KV if needed,
+        relay to all OTHER connected WS clients in the same room. (Standard
+        WebSocket API with `addEventListener`; the DO won't hibernate but stays
+        alive while connections are open — fine for single-user low-volume.)
+      - close/error listeners remove from `this.sessions`.
+      - HTTP POST handlers call the worker-level `relayToRoom(env, room, msg)`
+        helper, which fetches `/relay` on the per-room DO stub.
+- [x] `wrangler.toml`: add `[[durable_objects.bindings]]` + `[[migrations]]`.
+- [x] Room name → Durable Object ID: `env.ROOM_COORDINATOR.idFromName(room)`.
 
 ### W4 — Worker: WebSocket upgrade + relay integration
-- [ ] `GET /ws?room={room}` → WebSocket upgrade route.
+- [x] `GET /ws?room={room}` → WebSocket upgrade route.
       Creates/gets the RoomCoordinator DO for the room, forwards the upgrade.
-- [ ] Existing HTTP POST handlers (`/status`, `/msg`, `/state`) now also call
-      `RoomCoordinator.relayToRoom(env, room, JSON.stringify(payload))` after
-      KV write. This is the "auto-accept" path: any HTTP write from Zed
-      auto-relays to connected browsers via the DO.
-- [ ] `POST /v1/rooms/:room/reply` → stores reply in KV + relays via DO.
+- [x] Existing HTTP POST handlers (`/status`, `/msg`, `/state`) now also call
+      `relayToRoom(env, room, JSON.stringify(payload))` after KV write. This is
+      the "auto-accept" path: any HTTP write from Zed auto-relays to connected
+      browsers via the DO.
+- [x] `POST /v1/rooms/:room/reply` → stores reply in KV + relays via DO.
       Auth: Google token (web) or ed25519 (Zed).
+- [x] `GET /v1/rooms/:room/events?device={device_name}` → SSE stream
+      (read-only push, 15s keepalive, TransformStream-based).
 
 ### W5 — Google OAuth verification in worker
-- [ ] Worker verifies Google ID token for WebSocket auth + POST /reply:
-      - Fetch + cache Google JWKS (1h TTL in global scope).
-      - Verify JWT signature, `iss`, `aud`, `exp`.
-      - Assert `email == ALLOWED_EMAIL`.
-- [ ] The verification function is pure (takes token + JWKS, returns email)
-      so it's unit-testable with mock JWKS.
+- [x] Worker verifies Google ID token for WebSocket auth + POST /reply:
+      - Fetch + cache Google JWKS (1h TTL in module-level `googleJwksCache`).
+      - Verify JWT signature (Web Crypto RSASSA-PKCS1-v1_5 / SHA-256), `iss`,
+        `aud`, `exp`, `email_verified`.
+      - Assert `email == ALLOWED_EMAIL` (env var, default `katopz@gmail.com`).
+- [x] The verification function `verifyGoogleToken(token, jwks, clientId, allowedEmail)`
+      is pure (takes token + JWKS, returns email or null) so it's unit-testable
+      with mock JWKS. Validated end-to-end with a self-signed RSA JWT in
+      `/tmp/test_verify.mjs` (5 cases: valid, wrong aud, wrong email, tampered
+      sig, no kid match).
 
 ### W6 — Reply wire type + client
 - [ ] `agent_board/src/types.rs`: add `WebReply` struct:

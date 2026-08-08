@@ -9,8 +9,22 @@ compatibility_date = "2024-12-01"
 binding = "AGENT_BOARD"
 id = "REPLACE_WITH_KV_NAMESPACE_ID"
 
+# Durable Object: per-room WebSocket/SSE coordinator.
+[[durable_objects.bindings]]
+name = "ROOM_COORDINATOR"
+class_name = "RoomCoordinator"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["RoomCoordinator"]
+
 # All board keys expire after one week.
 [vars]
 DEFAULT_TTL_SECONDS = "604800"
 MAX_MESSAGES = "10"
 STALE_STATUS_SECS = "300"
+# Google OAuth (web UI → worker). The Client ID is public; GIS ID-token flow
+# needs no client secret. Set this to your OAuth Web Client ID.
+GOOGLE_CLIENT_ID = ""
+# Email allowlist for the web dashboard. Change if you are not katopz.
+ALLOWED_EMAIL = "katopz@gmail.com"
