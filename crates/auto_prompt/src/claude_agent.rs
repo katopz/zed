@@ -120,7 +120,7 @@ Rules:
 ///   satisfy `LlmCallData`'s shape and is ignored. Returns `NoAction` if no
 ///   model is configured (the struct still needs *some* model slot) or there's
 ///   no assistant message to reason about. See
-///   `.plans/013_agent_room_orchestrator.md`.
+///   `.plans/014_claude_offscreen_orchestrator.md`.
 ///
 /// Never returns `DispatchNow` / `DispatchAfterDelay` / `ContextOverflow`.
 pub fn decide_claude(
@@ -152,7 +152,7 @@ pub fn decide_claude(
     //    API key): spawn an off-screen hidden Claude Code session on the same
     //    connection and ask IT to decide continue/stop. Reuses Claude Code's
     //    own auth — no LanguageModelRegistry model required. See
-    //    .plans/013_agent_room_orchestrator.md.
+    //    .plans/014_claude_offscreen_orchestrator.md.
     // 2. default (requires an Anthropic key in Zed): a streaming LLM call via
     //    the configured default model. Only Anthropic is honored — see the
     //    rationale below.
@@ -1617,6 +1617,57 @@ mod tests {
                 connection.close_count(),
                 0,
                 "close_session must NOT be called when supports_close_session is false"
+            );
+        }
+
+        /// No-API-key guarantee (GOAT item): the hidden-thread path must NEVER
+        /// call the LanguageModel's stream_completion. It uses Claude Code's
+        /// own auth via the ACP connection, not Zed's LanguageModelRegistry.
+        /// This test captures the FakeLanguageModel and asserts completion_count
+        /// stays 0 after a full Continue verdict roundtrip — if the hidden path
+        /// ever regressed to calling the model (e.g. by accidentally routing to
+        /// decide_claude_with_llm), this count would be 1.
+        #[gpui::test]
+        async fn test_hidden_thread_never_calls_language_model(
+            cx: &mut gpui::TestAppContext,
+        ) {
+            init_test(cx);
+
+            let fs = fs::FakeFs::new(cx.executor());
+            let project = project::Project::test(fs, [], cx).await;
+
+            let connection = Rc::new(StubAgentConnection::new());
+            connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+                acp::ContentChunk::new(
+                    r#"{"continue": true, "confidence": 0.9, "next_prompt": "Keep going.", "reason": "More work."}"#
+                        .into(),
+                ),
+            )]);
+
+            let model = Arc::new(
+                language_model::fake_provider::FakeLanguageModel::default(),
+            );
+            let mut data =
+                build_test_data(connection, project, "Investigating the bug in file.rs.");
+            data.model = model.clone();
+
+            let outcome = cx
+                .update(|cx| {
+                    cx.spawn(async move |cx| {
+                        decide_claude_with_hidden_thread(data, cx).await
+                    })
+                })
+                .await
+                .expect("hidden-thread decision succeeded");
+
+            assert!(
+                matches!(outcome, AutoPromptOutcome::Continue { .. }),
+                "expected Continue, got {outcome:?}"
+            );
+            assert_eq!(
+                model.completion_count(),
+                0,
+                "hidden-thread path must never call stream_completion on the LanguageModel"
             );
         }
     }
