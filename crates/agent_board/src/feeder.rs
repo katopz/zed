@@ -42,7 +42,24 @@ pub async fn sync_round(
     //    re-claimed under a composite session id.
     inject_remote_claims(&snapshot, local_session_id);
 
-    // 2. Push our own status (local claims only) so other devices see us.
+    // 2. Phase 2: store the latest agent states in auto_prompt's process-global
+    //    peer-states store so the deciders can inject what peer agents are
+    //    doing into their context. Translates the board wire type into
+    //    auto_prompt's dependency-free PeerAgentState.
+    let peer_states: Vec<auto_prompt::peer_states::PeerAgentState> = snapshot
+        .states
+        .iter()
+        .map(|s| auto_prompt::peer_states::PeerAgentState {
+            device_id: s.device_id.clone(),
+            device_name: s.device_name.clone(),
+            session_id: s.session_id.clone(),
+            sub_agent_id: s.sub_agent_id.clone(),
+            state_text: s.state_text.clone(),
+        })
+        .collect();
+    auto_prompt::peer_states::set_peer_states(peer_states, identity.device_id());
+
+    // 3. Push our own status (local claims only) so other devices see us.
     let body = build_local_status(identity, project_path);
     if let Err(error) = client.post_status(room, body).await {
         log::warn!("[agent_board] failed to post local status: {error:#}");

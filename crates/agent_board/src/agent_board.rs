@@ -1,7 +1,7 @@
 //! agent_board — a multi-device, multi-agent notepad board that mirrors
 //! `auto_prompt::plan_registry` to/from a Cloudflare KV worker.
 //!
-//! See `.plans/001_agent_board.md` for the full design. The short version:
+//! See `.plans/013_agent_board.md` for the full design. The short version:
 //! - `SetRoom` / `JoinRoom` (the user's "foo"/"bar") connect this device to a
 //!   room name, persisted to `~/.config/zed/agent_board.json`.
 //! - A background task polls the worker, injects remote claims into the local
@@ -11,10 +11,11 @@
 //! - `auto_prompt`'s existing `format_claims_for_context()` picks up remote
 //!   claims with no core changes, so agents reason about each other's work.
 
-mod client;
+pub mod board_state;
+pub mod client;
 mod feeder;
-mod identity;
-mod types;
+pub mod identity;
+pub mod types;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -54,7 +55,6 @@ actions!(
 );
 
 pub const AGENT_BOARD_KEY: &str = "AgentBoard";
-const DEFAULT_ROOM: &str = "zed-agent-board";
 
 // ---------------------------------------------------------------------------
 // Config — `~/.config/zed/agent_board.json` (mirrors auto_prompt's pattern).
@@ -70,19 +70,22 @@ pub struct AgentBoardConfig {
     /// Base URL of the deployed worker, e.g. `https://agent-board.<acct>.workers.dev`.
     #[serde(default)]
     pub worker_url: String,
-    /// Room name both devices agree on.
-    #[serde(default = "default_room")]
+    /// Room name both devices agree on. When empty (default), the room is
+    /// derived from the SSH key as `blake3(raw_pubkey)` hex — so two devices
+    /// with the same key auto-join the same room (Phase 2 point 1-2).
+    #[serde(default)]
     pub room: String,
     /// Poll cadence in seconds. KV is eventually consistent; 15s is a sane floor.
     #[serde(default = "default_poll_interval_secs")]
     pub poll_interval_secs: u64,
+    /// Mute targets: agent states matching any [`MuteKey`] here are suppressed
+    /// from chat injection and auto_prompt context (Phase 2 point 5-6).
+    #[serde(default)]
+    pub muted: Vec<crate::types::MuteKey>,
 }
 
 fn default_ssh_key_path() -> String {
     "~/.ssh/id_ed25519".to_string()
-}
-fn default_room() -> String {
-    DEFAULT_ROOM.to_string()
 }
 fn default_poll_interval_secs() -> u64 {
     15
@@ -93,8 +96,9 @@ impl Default for AgentBoardConfig {
         Self {
             ssh_key_path: default_ssh_key_path(),
             worker_url: String::new(),
-            room: default_room(),
+            room: String::new(),
             poll_interval_secs: default_poll_interval_secs(),
+            muted: Vec::new(),
         }
     }
 }
@@ -149,6 +153,9 @@ pub struct AgentBoardPanel {
     http: Arc<dyn HttpClient>,
     /// Lazily-built client once an identity + worker URL are available.
     client: Option<Arc<BoardClient>>,
+    /// Room name resolved from config (explicit) or identity (derived).
+    /// None until `try_start` succeeds.
+    resolved_room: Option<String>,
     /// Latest snapshot rendered into the panel.
     snapshot: Option<RoomSnapshot>,
     /// Background poll task; dropped when the panel is dropped.
@@ -180,6 +187,7 @@ impl AgentBoardPanel {
                 config: config.clone(),
                 http,
                 client: None,
+                resolved_room: None,
                 snapshot: None,
                 poll_task: None,
                 local_session_id: String::new(),
@@ -217,11 +225,41 @@ impl AgentBoardPanel {
             }
         };
         let identity = Arc::new(identity);
+        // Phase 2 point 1-2: room = hash(ssh-key). When config.room is empty
+        // (default), derive from the identity so two devices sharing a key
+        // auto-join the same room. An explicit config.room still overrides.
+        let room = if self.config.room.trim().is_empty() {
+            identity.room_id().to_string()
+        } else {
+            self.config.room.clone()
+        };
         let client = Arc::new(BoardClient::new(
             self.http.clone(),
             self.config.worker_url.clone(),
             identity,
         ));
+        // Phase 2: register the muted set + writer handle so auto_prompt can
+        // both read peer states (via peer_states::unmuted_states_for_context)
+        // and post agent states (via board_state::post_state) without holding a
+        // GPUI entity handle. The muted set translates the board's MuteKey into
+        // auto_prompt's dependency-free PeerStateMute at the boundary.
+        let muted: Vec<auto_prompt::peer_states::PeerStateMute> = self
+            .config
+            .muted
+            .iter()
+            .map(|m| auto_prompt::peer_states::PeerStateMute {
+                device_id: m.device_id.clone(),
+                session_id: m.session_id.clone(),
+                sub_agent_id: m.sub_agent_id.clone(),
+            })
+            .collect();
+        auto_prompt::peer_states::set_muted(muted);
+        board_state::register_writer(
+            Some(client.clone()),
+            Some(room.clone()),
+            cx.background_executor().clone(),
+        );
+        self.resolved_room = Some(room);
         self.client = Some(client);
         self.start_poll(cx);
     }
@@ -231,7 +269,9 @@ impl AgentBoardPanel {
             return;
         };
         let identity = client.identity().clone();
-        let room = self.config.room.clone();
+        let Some(room) = self.resolved_room.clone() else {
+            return;
+        };
         let project_path = String::new();
         let local_session_id = self.local_session_id.clone();
         let interval = Duration::from_secs(self.config.poll_interval_secs.max(5));
@@ -284,6 +324,7 @@ impl AgentBoardPanel {
         }
         // Restart the poll loop bound to the new room.
         self.client = None;
+        self.resolved_room = None;
         self.try_start(cx);
         cx.notify();
     }
@@ -302,7 +343,10 @@ impl AgentBoardPanel {
             log::warn!("[agent_board] not connected to a worker; cannot post message");
             return;
         };
-        let room = self.config.room.clone();
+        let room = self
+            .resolved_room
+            .clone()
+            .unwrap_or_else(|| self.config.room.clone());
         let device_name = client.identity().device_name().to_string();
         let body = types::PostMessageBody {
             device_name,
@@ -341,7 +385,10 @@ impl Render for AgentBoardPanel {
         let accent = colors.text_accent;
 
         let connected = self.client.is_some();
-        let room = self.config.room.clone();
+        let room = self
+            .resolved_room
+            .clone()
+            .unwrap_or_else(|| self.config.room.clone());
 
         let mut children: Vec<gpui::AnyElement> = Vec::new();
 

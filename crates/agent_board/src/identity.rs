@@ -77,6 +77,14 @@ impl DeviceIdentity {
         &self.location_hash
     }
 
+    /// Room id = `blake3(raw_ed25519_pubkey_32)` hex. This is the same value as
+    /// [`device_id`](Self::device_id) — by design: two devices sharing the same
+    /// SSH key auto-join the same room (operator spec Phase 2 point 1-2). The
+    /// room id is just the device id repurposed as a room name.
+    pub fn room_id(&self) -> &str {
+        &self.device_id
+    }
+
     /// Raw 32-byte verifying key, base64-encoded, for the `X-Pubkey` header.
     pub fn public_key_b64(&self) -> String {
         B64.encode(self.public_key_32)

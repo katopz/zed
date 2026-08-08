@@ -11,6 +11,7 @@ pub mod context;
 pub(crate) mod debug_log;
 pub mod lightweight_context;
 mod pending_question;
+pub mod peer_states;
 pub mod plan_registry;
 pub mod watchdog;
 
@@ -472,6 +473,12 @@ pub struct LlmCallData {
     /// Claude hidden-thread orchestrator only: the project entity needed by
     /// `new_session`. None on the native path and the LLM-call Claude path.
     pub project: Option<gpui::Entity<project::Project>>,
+    /// Phase 2 (agent board): formatted text describing what peer agents on
+    /// other devices are doing right now, populated from the agent board's
+    /// latest unmuted state snapshot. None when no board is configured or no
+    /// peers are active. Injected into the LLM/hidden-thread context so the
+    /// decider can reason about concurrent work.
+    pub peer_agent_states: Option<String>,
 }
 
 impl std::fmt::Debug for LlmCallData {
@@ -1143,6 +1150,7 @@ pub fn decide(
         approximate_token_count: auto_prompt_ctx.approximate_token_count,
         connection: None,
         project: None,
+        peer_agent_states: peer_states::unmuted_states_for_context(),
     })
 }
 

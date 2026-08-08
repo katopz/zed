@@ -210,6 +210,9 @@ fn extract_worker_signal(
         .map(truncate_last_paragraphs)
         .filter(|s| !s.trim().is_empty())?;
 
+    // Phase 2: broadcast the summary to the agent board if the worker self-summarized.
+    maybe_broadcast_summary_to_board(&session_id, full_last_message.as_deref());
+
     Some((session_id, title, work_dirs, last_assistant_message))
 }
 
@@ -246,8 +249,8 @@ fn claude_decision_needs_llm(
     .to_string();
 
     AutoPromptDecision::NeedsLlmCall(LlmCallData {
-        model,
-        system_prompt: CLAUDE_SYSTEM_PROMPT.to_string(),
+        model: configured.model,
+        system_prompt: HIDDEN_ORCHESTRATOR_PROMPT.to_string(),
         context_json,
         project_root: work_dirs.as_ref().and_then(|d| d.first().cloned()),
         session_id,
@@ -267,6 +270,7 @@ fn claude_decision_needs_llm(
         approximate_token_count: 0,
         connection: None,
         project: None,
+        peer_agent_states: crate::peer_states::unmuted_states_for_context(),
     })
 }
 
@@ -347,6 +351,7 @@ fn claude_decision_hidden(
         approximate_token_count: 0,
         connection: Some(connection),
         project: Some(project),
+        peer_agent_states: crate::peer_states::unmuted_states_for_context(),
     })
 }
 
@@ -856,6 +861,37 @@ fn is_summary_heading(paragraph: &str) -> bool {
     SUMMARY_MARKERS.iter().any(|marker| lower.starts_with(marker))
 }
 
+/// Check if any paragraph in the text starts with a summary marker. Used to
+/// trigger the board broadcast (Phase 2: post summary to board so peer agents
+/// know what this agent concluded).
+fn contains_summary(text: &str) -> bool {
+    text.split("\n\n").any(is_summary_heading)
+}
+
+/// Phase 2 hook: when the worker's last message contains a self-summary
+/// (`SUMMARY_MARKERS`), broadcast it to the agent board so peer agents on other
+/// devices can see what this agent concluded. Fire-and-forget — no-op when no
+/// board is configured (the broadcaster is a silent skip).
+fn maybe_broadcast_summary_to_board(
+    session_id: &acp::SessionId,
+    full_last_message: Option<&str>,
+) {
+    let Some(message) = full_last_message else {
+        return;
+    };
+    if !contains_summary(message) {
+        return;
+    }
+    // Broadcast the summary text. The board truncates to 256 chars. The meta
+    // field carries the session id for display.
+    crate::peer_states::broadcast_state(
+        &session_id.to_string(),
+        None,
+        message,
+        "summary",
+    );
+}
+
 /// Truncate to the last N paragraphs within a char budget.
 ///
 /// Takes whole paragraphs from the end until the budget is exceeded, always
@@ -1230,6 +1266,7 @@ mod tests {
                 approximate_token_count: 0,
                 connection: Some(connection),
                 project: Some(project),
+                peer_agent_states: None,
             }
         }
 
@@ -1668,6 +1705,118 @@ mod tests {
                 model.completion_count(),
                 0,
                 "hidden-thread path must never call stream_completion on the LanguageModel"
+            );
+        }
+
+        /// Concurrency isolation: two concurrent hidden-thread decisions
+        /// (simulating two workers stopping simultaneously) must complete
+        /// independently with correct verdicts and no cross-contamination.
+        /// Each decision gets its own connection, its own hidden session, and
+        /// its own verdict — proving the orchestration logic has no shared
+        /// mutable state between concurrent invocations.
+        ///
+        /// This is the static half of the 'Concurrency under real ACP
+        /// multiplexing' GOAT item. The live run confirms no deadlock under
+        /// real ACP protocol multiplexing (two sessions on one OS process);
+        /// this test confirms no deadlock or state leakage in the orchestration
+        /// layer itself.
+        #[gpui::test]
+        async fn test_hidden_thread_concurrent_decisions_isolate(
+            cx: &mut gpui::TestAppContext,
+        ) {
+            init_test(cx);
+
+            let fs = fs::FakeFs::new(cx.executor());
+            let project = project::Project::test(fs, [], cx).await;
+
+            // Two separate connections (simulating two worker threads, each
+            // with its own AcpConnection). The StubAgentConnection's
+            // next_prompt_updates is shared per-connection, so two concurrent
+            // decisions on the same stub connection would deadlock (first
+            // caller drains the updates, second caller waits forever). Separate
+            // connections avoid that stub limitation while still testing the
+            // orchestration layer's concurrency safety.
+            let connection_a = Rc::new(
+                StubAgentConnection::new().with_supports_close_session(true),
+            );
+            let connection_b = Rc::new(
+                StubAgentConnection::new().with_supports_close_session(true),
+            );
+
+            // Decision A: continue, run the failing test.
+            connection_a.set_next_prompt_updates(vec![
+                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                    r#"{"continue": true, "confidence": 0.9, "next_prompt": "Run test A.", "reason": "A still failing."}"#.into(),
+                )),
+            ]);
+            // Decision B: stop, task complete.
+            connection_b.set_next_prompt_updates(vec![
+                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                    r#"{"continue": false, "confidence": 0.9, "next_prompt": null, "reason": "B done."}"#.into(),
+                )),
+            ]);
+
+            let data_a = build_test_data(
+                connection_a.clone(),
+                project.clone(),
+                "Worker A: tests still failing.",
+            );
+            let data_b = build_test_data(
+                connection_b.clone(),
+                project.clone(),
+                "Worker B: all tests pass.",
+            );
+
+            // Spawn both decisions BEFORE awaiting either, so they run
+            // concurrently on the GPUI executor. If there were shared mutable
+            // state or a lock ordering issue, one or both would deadlock or
+            // produce the wrong verdict.
+            let task_a = cx.update(|cx| {
+                cx.spawn(async move |cx| {
+                    decide_claude_with_hidden_thread(data_a, cx).await
+                })
+            });
+            let task_b = cx.update(|cx| {
+                cx.spawn(async move |cx| {
+                    decide_claude_with_hidden_thread(data_b, cx).await
+                })
+            });
+
+            let outcome_a = task_a
+                .await
+                .expect("concurrent decision A succeeded");
+            let outcome_b = task_b
+                .await
+                .expect("concurrent decision B succeeded");
+
+            // Verify no cross-contamination: A continues, B stops.
+            match outcome_a {
+                AutoPromptOutcome::Continue(action) => {
+                    assert_eq!(
+                        action.next_prompt, "Run test A.",
+                        "decision A should get its own verdict, not B's"
+                    );
+                }
+                other => panic!("expected Continue for A, got {other:?}"),
+            }
+            match outcome_b {
+                AutoPromptOutcome::Stopped { reason } => {
+                    assert!(
+                        reason.contains("B done"),
+                        "decision B should get its own verdict, not A's: {reason}"
+                    );
+                }
+                other => panic!("expected Stopped for B, got {other:?}"),
+            }
+
+            // Both hidden sessions must be closed (no leak under concurrency).
+            assert_eq!(
+                connection_a.close_count(), 1,
+                "decision A's hidden session must be closed exactly once"
+            );
+            assert_eq!(
+                connection_b.close_count(), 1,
+                "decision B's hidden session must be closed exactly once"
             );
         }
     }

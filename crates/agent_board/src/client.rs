@@ -80,6 +80,21 @@ impl BoardClient {
         Ok(message)
     }
 
+    /// `POST /v1/rooms/{room}/state` — append an agent state broadcast
+    /// (Phase 2). The worker keeps only the last [`MAX_ROOM_STATES`] per room
+    /// and truncates `state_text`/`meta` to [`MAX_STATE_TEXT_BYTES`].
+    pub async fn post_state(
+        &self,
+        room: &str,
+        body: crate::types::PostStateBody,
+    ) -> Result<crate::types::AgentStateMessage> {
+        let body_text = serde_json::to_string(&body).context("serializing state body")?;
+        let uri = format!("{}/v1/rooms/{}/state", self.base_url, urlencoding(room));
+        let response = self.send_signed(&uri, body_text.into_bytes()).await?;
+        let state = read_json(response).await.context("decoding posted state")?;
+        Ok(state)
+    }
+
     async fn send_signed(
         &self,
         uri: &str,
