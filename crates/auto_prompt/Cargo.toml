@@ -13,11 +13,11 @@ path = "src/auto_prompt.rs"
 doctest = false
 
 [features]
-# GOAT-gated: spawn an off-screen hidden Claude Code session to decide
-# continue/stop for a Claude worker thread, instead of a LanguageModelRegistry
-# LLM call (which needs an Anthropic API key). Uses Claude Code's own auth.
-# See .issues/014_claude_offscreen_orchestrator.md.
-default = []
+# Spawn an off-screen hidden Claude Code session to decide continue/stop for
+# a Claude worker thread, instead of a LanguageModelRegistry LLM call (which
+# needs an Anthropic API key). Uses Claude Code's own auth. Default-on: no
+# flag needed. See .plans/014_claude_offscreen_orchestrator.md.
+default = ["claude-hidden-orchestrator"]
 claude-hidden-orchestrator = []
 
 [dependencies]
