@@ -264,6 +264,7 @@ impl AutoPromptContext {
                 }
                 AgentThreadEntry::ContextCompaction(_) => {}
                 AgentThreadEntry::Elicitation(_) => {}
+                AgentThreadEntry::AgentBoardNotification(_) => {}
             }
         }
 

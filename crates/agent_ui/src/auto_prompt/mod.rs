@@ -1131,7 +1131,8 @@ fn gather_watchdog_context(
             | AgentThreadEntry::AssistantMessage(_)
             | AgentThreadEntry::CompletedPlan(_)
             | AgentThreadEntry::ContextCompaction(_)
-            | AgentThreadEntry::Elicitation(_) => {}
+            | AgentThreadEntry::Elicitation(_)
+            | AgentThreadEntry::AgentBoardNotification(_) => {}
         }
     }
 

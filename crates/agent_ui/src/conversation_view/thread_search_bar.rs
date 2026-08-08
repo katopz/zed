@@ -948,6 +948,7 @@ fn collect_markdowns(
         }
         AgentThreadEntry::Elicitation(_) => {}
         AgentThreadEntry::ContextCompaction(_) => {}
+        AgentThreadEntry::AgentBoardNotification(_) => {}
     }
     out
 }

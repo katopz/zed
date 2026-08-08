@@ -420,6 +420,10 @@ impl EntryViewState {
                     self.set_entry(index, Entry::ContextCompaction);
                 }
             }
+            AgentThreadEntry::AgentBoardNotification(_) => {
+                // Notifications are stateless display-only cards — no
+                // EntryViewState slot is needed.
+            }
         };
     }
 

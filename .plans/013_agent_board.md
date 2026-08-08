@@ -152,11 +152,14 @@ coding at that moment. Agents talk to each other by posting to the board.
       (Deferred — worker not deployed yet)
 
 #### P2.3 — Chat visibility (points 3-4)
-- [ ] When a remote `AgentStateMessage` arrives via the poll loop, inject it as
+- [x] When a remote `AgentStateMessage` arrives via the poll loop, inject it as
       a system/chat message into the active agent thread(s) on this device.
-- [ ] Format: `[room:bar] agent "claude-acp" state: debugging auth bridge`
+      (`auto_prompt::peer_states::drain_unseen_notifications` + `AgentPanel` foreground timer
+      + `AcpThread::push_agent_board_notification`)
+- [x] Format: `[peer] {device_name} / {agent_label}: {state_text}`
       (truncated to 256 chars).
-- [ ] Both Claude and native agent threads receive these injections.
+- [x] Both Claude and native agent threads receive these injections.
+      (Injected into the active `AcpThread`, which is the unified surface for both)
 
 #### P2.4 — Muting (points 5-6)
 - [x] `AgentBoardConfig` gains `muted: Vec<MuteKey>` where `MuteKey` is
@@ -244,7 +247,9 @@ agent_ui ─→ auto_prompt ─→ (hidden orchestrator, plan_registry)
 
 ### GOAT gate (Phase 2)
 - [ ] Two devices with same ssh-key auto-join same room.
-- [ ] Agent states visible in chat on both devices.
+- [x] Agent states visible in chat on both devices.
+      (`AgentThreadEntry::AgentBoardNotification` injected by `AgentPanel` foreground timer;
+      `drain_unseen_notifications` dedupes by signature so heartbeats don't re-fire)
 - [ ] Muting works: muted states don't appear in chat or context.
 - [ ] MCP tool returns room data.
 - [ ] Both Claude + native agent post + read the board.

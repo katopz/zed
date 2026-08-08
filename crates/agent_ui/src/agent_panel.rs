@@ -1408,6 +1408,11 @@ pub struct AgentPanel {
     _thread_metadata_store_subscription: Subscription,
     last_context_source: Option<AgentContextSource>,
 
+    /// Background timer that drains peer-agent-state notifications from
+    /// `auto_prompt::peer_states` and injects them into the active agent
+    /// thread as `AgentBoardNotification` entries. Held to keep the task alive.
+    _notification_drain_task: Option<Task<()>>,
+
     is_active: bool,
 }
 
@@ -1787,7 +1792,7 @@ impl AgentPanel {
         })
         .detach();
 
-        let panel = Self {
+        let mut panel = Self {
             workspace_id,
             base_view,
             last_created_entry_kind: AgentPanelEntryKind::Thread,
@@ -1822,11 +1827,46 @@ impl AgentPanel {
             _active_draft_reclaim_observation: None,
             _thread_metadata_store_subscription,
             last_context_source: None,
+            _notification_drain_task: None,
             is_active: false,
         };
 
         panel.ensure_native_agent_connection(cx);
+        panel.start_notification_drain(cx);
         panel
+    }
+
+    /// Start a foreground timer (every ~10s) that drains peer-agent-state
+    /// notifications from `auto_prompt::peer_states` and pushes them into the
+    /// active agent thread. This is the P2.3 "chat visibility" injection —
+    /// remote agent states appear as muted notification cards in the
+    /// conversation view. The task is held in `_notification_drain_task` so it
+    /// lives for the panel's lifetime.
+    fn start_notification_drain(&mut self, cx: &mut Context<Self>) {
+        let timer = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(10))
+                    .await;
+
+                let notifications = auto_prompt::peer_states::drain_unseen_notifications();
+                if notifications.is_empty() {
+                    continue;
+                }
+
+                this.update(cx, |panel, cx| {
+                    if let Some(thread) = panel.active_agent_thread(cx) {
+                        thread.update(cx, |thread, cx| {
+                            for text in &notifications {
+                                thread.push_agent_board_notification(text.clone(), cx);
+                            }
+                        });
+                    }
+                })
+                .ok();
+            }
+        });
+        self._notification_drain_task = Some(timer);
     }
 
     pub fn toggle_focus(

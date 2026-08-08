@@ -4060,6 +4060,7 @@ mod tests {
                     acp_thread::AgentThreadEntry::Elicitation(_) => "elicitation",
                     acp_thread::AgentThreadEntry::CompletedPlan(_) => "plan",
                     acp_thread::AgentThreadEntry::ContextCompaction(_) => "compaction",
+                    acp_thread::AgentThreadEntry::AgentBoardNotification(_) => "board_notification",
                 })
                 .collect::<Vec<_>>()
         });

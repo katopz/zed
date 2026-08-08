@@ -393,6 +393,20 @@ pub enum AgentThreadEntry {
     Elicitation(ElicitationEntryId),
     CompletedPlan(Vec<PlanEntry>),
     ContextCompaction(ContextCompaction),
+    /// A notification injected by the agent board — a peer agent state broadcast
+    /// (e.g. what another agent/device is working on). Display-only; never sent
+    /// to the model backend.
+    AgentBoardNotification(AgentBoardNotification),
+}
+
+/// A peer-agent notification injected into the thread by the agent board.
+/// Rendered as a compact, muted card so the user can see what other agents
+/// across devices are doing. These entries are ephemeral UI annotations and
+/// do not participate in the model's conversation history.
+#[derive(Debug, Clone)]
+pub struct AgentBoardNotification {
+    /// Pre-formatted display text (already truncated to ≤256 chars).
+    pub text: SharedString,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -785,6 +799,7 @@ impl AgentThreadEntry {
             Self::Elicitation(_) => false,
             Self::CompletedPlan(_) => false,
             Self::ContextCompaction(_) => false,
+            Self::AgentBoardNotification(_) => false,
         }
     }
 
@@ -803,6 +818,9 @@ impl AgentThreadEntry {
                 md
             }
             Self::ContextCompaction(_) => "--- Context Compacted ---\n\n".to_string(),
+            Self::AgentBoardNotification(notification) => {
+                format!("{}\n\n", notification.text)
+            }
         }
     }
 
@@ -2517,7 +2535,8 @@ impl AcpThread {
                 | AgentThreadEntry::Elicitation(_)
                 | AgentThreadEntry::AssistantMessage(_)
                 | AgentThreadEntry::CompletedPlan(_)
-                | AgentThreadEntry::ContextCompaction(_) => {}
+                | AgentThreadEntry::ContextCompaction(_)
+                | AgentThreadEntry::AgentBoardNotification(_) => {}
             }
         }
         false
@@ -2547,7 +2566,8 @@ impl AcpThread {
                 | AgentThreadEntry::Elicitation(_)
                 | AgentThreadEntry::AssistantMessage(_)
                 | AgentThreadEntry::CompletedPlan(_)
-                | AgentThreadEntry::ContextCompaction(_) => {}
+                | AgentThreadEntry::ContextCompaction(_)
+                | AgentThreadEntry::AgentBoardNotification(_) => {}
             }
         }
 
@@ -2568,7 +2588,8 @@ impl AcpThread {
                 | AgentThreadEntry::Elicitation(_)
                 | AgentThreadEntry::AssistantMessage(_)
                 | AgentThreadEntry::CompletedPlan(_)
-                | AgentThreadEntry::ContextCompaction(_) => {}
+                | AgentThreadEntry::ContextCompaction(_)
+                | AgentThreadEntry::AgentBoardNotification(_) => {}
             }
         }
 
@@ -2582,7 +2603,8 @@ impl AcpThread {
                 AgentThreadEntry::AssistantMessage(..)
                 | AgentThreadEntry::CompletedPlan(..)
                 | AgentThreadEntry::ContextCompaction(_)
-                | AgentThreadEntry::Elicitation(_) => continue,
+                | AgentThreadEntry::Elicitation(_)
+                | AgentThreadEntry::AgentBoardNotification(_) => continue,
                 AgentThreadEntry::ToolCall(..) => return true,
             }
         }
@@ -3080,6 +3102,22 @@ impl AcpThread {
         } else {
             self.push_entry(AgentThreadEntry::ContextCompaction(compaction), cx);
         }
+    }
+
+    /// Push an agent-board notification into the thread. Called by `agent_ui`
+    /// when new peer-agent states arrive via the board poll loop. The
+    /// notification is display-only — it never reaches the model backend.
+    pub fn push_agent_board_notification(
+        &mut self,
+        text: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        self.push_entry(
+            AgentThreadEntry::AgentBoardNotification(AgentBoardNotification {
+                text: text.into(),
+            }),
+            cx,
+        );
     }
 
     pub fn update_context_compaction(

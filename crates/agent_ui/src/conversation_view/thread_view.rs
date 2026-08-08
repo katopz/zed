@@ -4254,6 +4254,40 @@ impl ThreadView {
             .into_any()
     }
 
+    fn render_agent_board_notification(
+        &self,
+        notification: &acp_thread::AgentBoardNotification,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors();
+        div()
+            .px_5()
+            .w_full()
+            .child(
+                h_flex()
+                    .my_1()
+                    .gap_1p5()
+                    .px_3()
+                    .py_1p5()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(colors.border_variant.opacity(0.5))
+                    .bg(colors.editor_background.opacity(0.3))
+                    .child(
+                        Icon::new(IconName::Bell)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(colors.text_muted)
+                            .child(notification.text.clone()),
+                    ),
+            )
+            .into_any()
+    }
+
     fn toggle_compaction_expansion(
         &mut self,
         entry_ix: usize,
@@ -7065,6 +7099,9 @@ impl ThreadView {
             AgentThreadEntry::ContextCompaction(compaction) => {
                 self.render_context_compaction(entry_ix, compaction, window, cx)
             }
+            AgentThreadEntry::AgentBoardNotification(notification) => {
+                self.render_agent_board_notification(notification, cx)
+            }
         };
 
         let is_subagent_output = self.is_subagent()
@@ -9033,7 +9070,8 @@ impl ThreadView {
                 | AgentThreadEntry::Elicitation(_)
                 | AgentThreadEntry::AssistantMessage(_)
                 | AgentThreadEntry::CompletedPlan(_)
-                | AgentThreadEntry::ContextCompaction(_) => {}
+                | AgentThreadEntry::ContextCompaction(_)
+                | AgentThreadEntry::AgentBoardNotification(_) => {}
             }
         }
 

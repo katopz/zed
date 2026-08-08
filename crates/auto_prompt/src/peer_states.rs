@@ -14,7 +14,8 @@
 //! translates its config `MuteKey`s into these plain-struct filters when it
 //! calls [`set_muted`].
 
-use std::sync::{Arc, RwLock};
+use std::collections::HashSet;
+use std::sync::{Arc, LazyLock, RwLock};
 
 /// A trait object that broadcasts agent states to the board. Implemented by
 /// `agent_board` (which holds the HTTP client + room), registered globally by
@@ -52,6 +53,14 @@ pub struct PeerAgentState {
 static PEER_STATES: RwLock<Option<Vec<PeerAgentState>>> = RwLock::new(None);
 static MUTED: RwLock<Vec<PeerStateMute>> = RwLock::new(Vec::new());
 static BROADCASTER: RwLock<Option<Arc<dyn AgentStateBroadcaster>>> = RwLock::new(None);
+
+/// Signatures of peer states that have already been injected as chat
+/// notifications. A signature is `{device_id}\x1f{session_id}\x1f{sub_agent_id}\x1f{state_text}`
+/// — when the same agent posts the same state_text again (heartbeat), we skip
+/// re-notifying. When the state_text changes, the signature changes and a new
+/// notification fires.
+static NOTIFIED_SIGNATURES: LazyLock<RwLock<HashSet<String>>> =
+    LazyLock::new(|| RwLock::new(HashSet::new()));
 
 /// Register the agent-state broadcaster (called by `agent_board`'s panel
 /// during init). Pass `None` to unregister (board disabled). When no
@@ -128,6 +137,76 @@ pub fn unmuted_states_for_context() -> Option<String> {
     Some(out)
 }
 
+/// Drain peer states that haven't been notified to the UI yet. Returns
+/// formatted notification strings and marks them as seen so heartbeats
+/// (same state_text re-broadcast) don't re-trigger notifications.
+/// Called by `agent_ui` on a foreground timer to inject into the active
+/// agent thread. Muted states are excluded.
+pub fn drain_unseen_notifications() -> Vec<String> {
+    let states = match PEER_STATES.read() {
+        Ok(guard) => guard.clone(),
+        Err(_) => return Vec::new(),
+    };
+    let Some(states) = states else {
+        return Vec::new();
+    };
+    let muted = MUTED
+        .read()
+        .map(|g| g.clone())
+        .unwrap_or_default();
+
+    let (mut seen, mut notifications) = match NOTIFIED_SIGNATURES.write() {
+        Ok(mut guard) => (std::mem::take(&mut *guard), Vec::new()),
+        Err(_) => (HashSet::new(), Vec::new()),
+    };
+
+    for state in &states {
+        if muted.iter().any(|m| matches_mute(m, state)) {
+            continue;
+        }
+        let sig = format_signature(state);
+        if !seen.contains(&sig) {
+            seen.insert(sig.clone());
+            let label = state.sub_agent_id.as_deref().unwrap_or("(main)");
+            let text = truncate_to_char_boundary(&state.state_text, 256);
+            notifications.push(format!(
+                "[peer] {} / {}: {}",
+                state.device_name, label, text
+            ));
+        }
+    }
+
+    if let Ok(mut guard) = NOTIFIED_SIGNATURES.write() {
+        *guard = seen;
+    }
+
+    notifications
+}
+
+fn format_signature(state: &PeerAgentState) -> String {
+    format!(
+        "{}\x1f{}\x1f{}\x1f{}",
+        state.device_id,
+        state.session_id,
+        state.sub_agent_id.as_deref().unwrap_or(""),
+        state.state_text,
+    )
+}
+
+/// Truncate a string to at most `max_bytes` bytes, rolling back to the
+/// previous UTF-8 char boundary if the cut point falls mid-character.
+/// Process-killing to slice without this check.
+fn truncate_to_char_boundary(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 fn matches_mute(mute: &PeerStateMute, state: &PeerAgentState) -> bool {
     mute.device_id
         .as_deref()
@@ -153,6 +232,9 @@ pub fn clear_for_test() {
     }
     if let Ok(mut guard) = BROADCASTER.write() {
         *guard = None;
+    }
+    if let Ok(mut guard) = NOTIFIED_SIGNATURES.write() {
+        guard.clear();
     }
 }
 
@@ -241,5 +323,57 @@ mod tests {
         set_peer_states(vec![s], "dev-a");
         let ctx = unmuted_states_for_context().unwrap();
         assert!(ctx.contains("investigator"));
+    }
+
+    #[test]
+    fn drain_returns_new_states_only_once() {
+        let _lock = setup();
+        set_peer_states(
+            vec![state("dev-b", "desktop", "s2", "debugging auth")],
+            "dev-a",
+        );
+        let first = drain_unseen_notifications();
+        assert_eq!(first.len(), 1);
+        assert!(first[0].contains("desktop"));
+        assert!(first[0].contains("debugging auth"));
+
+        // Same state re-broadcast (heartbeat) → no new notification.
+        let second = drain_unseen_notifications();
+        assert!(second.is_empty(), "heartbeat should not re-notify");
+    }
+
+    #[test]
+    fn drain_detects_state_text_change() {
+        let _lock = setup();
+        set_peer_states(
+            vec![state("dev-b", "desktop", "s2", "debugging")],
+            "dev-a",
+        );
+        let _ = drain_unseen_notifications();
+
+        // Agent updates its state text → new notification fires.
+        set_peer_states(
+            vec![state("dev-b", "desktop", "s2", "fixed the bug")],
+            "dev-a",
+        );
+        let second = drain_unseen_notifications();
+        assert_eq!(second.len(), 1);
+        assert!(second[0].contains("fixed the bug"));
+    }
+
+    #[test]
+    fn drain_excludes_muted() {
+        let _lock = setup();
+        set_muted(vec![PeerStateMute {
+            device_id: Some("dev-b".to_string()),
+            session_id: None,
+            sub_agent_id: None,
+        }]);
+        set_peer_states(
+            vec![state("dev-b", "desktop", "s2", "working")],
+            "dev-a",
+        );
+        let notifications = drain_unseen_notifications();
+        assert!(notifications.is_empty(), "muted states should not notify");
     }
 }
