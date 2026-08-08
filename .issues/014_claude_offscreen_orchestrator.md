@@ -58,13 +58,17 @@ worker (claude-acp) stops
 - [x] Feature flag `claude-hidden-orchestrator` (off by default) for GOAT gate.
 - [x] No-tool-leak mitigation: orchestrator system prompt forbids tool use,
       demands JSON-only output; reject non-JSON replies as stop.
+- [x] **Send HIDDEN_ORCHESTRATOR_PROMPT in the message** (fix in `2c2b78f58a`).
+      The original implementation stored the prompt in `data.system_prompt` but
+      never included it in the message — the hidden session got no judge
+      instructions, no JSON schema, no tool-use prohibition. Now prepended to
+      the context + worker output in the single user turn.
 - [x] Unit tests: prompt contract (no-tool, JSON schema), parse roundtrip,
       tool-leak reply -> stop.
 - [x] Async spawn tests (TestAppContext + Project + StubAgentConnection):
-      `hidden_thread_async` module covers continue roundtrip, stop verdict,
-      tool-leak -> stop, low-confidence -> stop. Verifies the hidden session
-      spawns, the verdict round-trips, and outcomes map correctly — the
-      GOAT items verifiable without a live Claude Code run.
+      `hidden_thread_async` module — 6 tests covering continue roundtrip, stop
+      verdict, tool-leak -> stop, low-confidence -> stop, missing-next_prompt
+      fallback, missing-confidence -> stop (0.0 default).
 
 ## GOAT gate (verify before promoting to default)
 Items verifiable via tests (DONE):
