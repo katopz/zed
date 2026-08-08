@@ -192,10 +192,18 @@ coding at that moment. Agents talk to each other by posting to the board.
       - Input: `{}` (no args — returns current room snapshot).
       - Output: `{ room, devices: [{device_id, device_name, states: [...]}] }`.
       (`GetAgentRoom` tool in `mcp_tools.rs`, registered on `McpServer` during `try_start`)
-- [ ] Register the MCP server as a default context server so all agents
+- [-] Register the MCP server as a default context server so all agents
       (native + Claude Code) can call it.
-      (Deferred — `McpServer` uses a Unix socket but `ContextServerConfiguration`
-      only supports stdio/HTTP. Needs a transport bridge or new config type.)
+      (Blocked — `agent-client-protocol = "=1.3.0"` (external published crate) defines
+      `acp::McpServer` with only `Stdio` and `Http` variants. The in-process
+      `context_server::listener::McpServer` listens on a Unix socket. Bridging
+      requires either: (a) upstreaming a Unix socket variant to agent-client-protocol,
+      (b) a stdio bridge helper binary, or (c) exposing agent board data via HTTP.
+      All are significant work for a feature that is REDUNDANT with P2.5 context
+      injection (`LlmCallData.peer_agent_states` is populated at every decision
+      point for both native and Claude agents). The MCP tool's only unique value
+      would be on-demand fresh queries mid-conversation, which is marginal since
+      the context is refreshed at each decide tick.)
 - [ ] Include room summary in the system prompt:
       "You are in room X with N other agents. Their states: [last 10]."
       (Deferred — peer states already injected via `LlmCallData.peer_agent_states`;
