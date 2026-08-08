@@ -1269,5 +1269,86 @@ mod tests {
                 other => panic!("expected Stopped for low-confidence, got {other:?}"),
             }
         }
+
+        #[gpui::test]
+        async fn test_hidden_thread_missing_next_prompt_uses_fallback_nudge(
+            cx: &mut gpui::TestAppContext,
+        ) {
+            init_test(cx);
+
+            let fs = fs::FakeFs::new(cx.executor());
+            let project = project::Project::test(fs, [], cx).await;
+
+            let connection = Rc::new(StubAgentConnection::new());
+            // continue=true with high confidence but next_prompt is null.
+            // The code must fall back to the default nudge.
+            connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+                acp::ContentChunk::new(
+                    r#"{"continue": true, "confidence": 0.9, "next_prompt": null, "reason": "keep going"}"#
+                        .into(),
+                ),
+            )]);
+
+            let data = build_test_data(connection, project, "Still working on it.");
+
+            let outcome = cx
+                .update(|cx| {
+                    cx.spawn(async move |cx| {
+                        decide_claude_with_hidden_thread(data, cx).await
+                    })
+                })
+                .await
+                .expect("hidden-thread decision succeeded");
+
+            match outcome {
+                AutoPromptOutcome::Continue(action) => {
+                    assert_eq!(
+                        action.next_prompt,
+                        "Continue the task from where you left off."
+                    );
+                }
+                other => panic!("expected Continue with fallback nudge, got {other:?}"),
+            }
+        }
+
+        #[gpui::test]
+        async fn test_hidden_thread_missing_confidence_stops(cx: &mut gpui::TestAppContext) {
+            init_test(cx);
+
+            let fs = fs::FakeFs::new(cx.executor());
+            let project = project::Project::test(fs, [], cx).await;
+
+            let connection = Rc::new(StubAgentConnection::new());
+            // continue=true but confidence field is entirely absent.
+            // parse_claude_response returns confidence=None, which
+            // unwrap_or(0.0) makes 0.0 < threshold → must stop.
+            connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+                acp::ContentChunk::new(
+                    r#"{"continue": true, "next_prompt": "do something", "reason": "unsure"}"#
+                        .into(),
+                ),
+            )]);
+
+            let data = build_test_data(connection, project, "Not sure if done.");
+
+            let outcome = cx
+                .update(|cx| {
+                    cx.spawn(async move |cx| {
+                        decide_claude_with_hidden_thread(data, cx).await
+                    })
+                })
+                .await
+                .expect("hidden-thread decision succeeded");
+
+            match outcome {
+                AutoPromptOutcome::Stopped { reason } => {
+                    assert!(
+                        reason.contains("low confidence"),
+                        "missing confidence (0.0) should stop, got: {reason}"
+                    );
+                }
+                other => panic!("expected Stopped for missing confidence, got {other:?}"),
+            }
+        }
     }
 }
