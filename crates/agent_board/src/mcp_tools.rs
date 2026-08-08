@@ -204,4 +204,183 @@ mod tests {
         assert!(text.contains("laptop"));
         assert!(text.contains("debugging"));
     }
+
+    // ── build_response tests ──
+    // These exercise the full MCP tool pipeline: set a room snapshot via the
+    // global cache, call build_response(), and verify the grouped output.
+    // Each test clears the cache first to avoid cross-test contamination.
+
+    #[test]
+    fn build_response_with_no_snapshot_returns_graceful_message() {
+        crate::board_state::clear_for_test();
+        let result = build_response().unwrap();
+        assert_eq!(result.structured_content.room, "");
+        assert!(result.structured_content.devices.is_empty());
+        let text = result.content.first().and_then(|c| match c {
+            ToolResponseContent::Text { text } => Some(text.as_str()),
+            _ => None,
+        });
+        assert!(text.unwrap().contains("not started"));
+    }
+
+    #[test]
+    fn build_response_groups_states_by_device() {
+        crate::board_state::clear_for_test();
+        let snapshot = crate::types::RoomSnapshot {
+            v: 1,
+            room: "room-42".to_string(),
+            statuses: vec![
+                crate::types::DeviceStatus {
+                    v: 1,
+                    device_id: "dev-a".to_string(),
+                    device_name: "laptop".to_string(),
+                    location_hash: String::new(),
+                    project_path: String::new(),
+                    scopes: vec![],
+                    updated_at: 0,
+                    stale: false,
+                },
+                crate::types::DeviceStatus {
+                    v: 1,
+                    device_id: "dev-b".to_string(),
+                    device_name: "desktop".to_string(),
+                    location_hash: String::new(),
+                    project_path: String::new(),
+                    scopes: vec![],
+                    updated_at: 0,
+                    stale: false,
+                },
+            ],
+            messages: vec![],
+            states: vec![
+                crate::types::AgentStateMessage {
+                    v: 1,
+                    device_id: "dev-a".to_string(),
+                    device_name: "laptop".to_string(),
+                    session_id: "s1".to_string(),
+                    sub_agent_id: None,
+                    state_text: "debugging".to_string(),
+                    meta: String::new(),
+                    ts: 1000,
+                },
+                crate::types::AgentStateMessage {
+                    v: 1,
+                    device_id: "dev-a".to_string(),
+                    device_name: "laptop".to_string(),
+                    session_id: "s2".to_string(),
+                    sub_agent_id: Some("sub-x".to_string()),
+                    state_text: "researching".to_string(),
+                    meta: String::new(),
+                    ts: 2000,
+                },
+                crate::types::AgentStateMessage {
+                    v: 1,
+                    device_id: "dev-b".to_string(),
+                    device_name: "desktop".to_string(),
+                    session_id: "s3".to_string(),
+                    sub_agent_id: None,
+                    state_text: "building".to_string(),
+                    meta: String::new(),
+                    ts: 3000,
+                },
+            ],
+        };
+        crate::board_state::set_room_snapshot(snapshot);
+
+        let result = build_response().unwrap();
+        assert_eq!(result.structured_content.room, "room-42");
+        assert_eq!(result.structured_content.devices.len(), 2);
+
+        let dev_a = result
+            .structured_content
+            .devices
+            .iter()
+            .find(|d| d.device_id == "dev-a")
+            .unwrap();
+        assert_eq!(dev_a.device_name, "laptop");
+        assert_eq!(dev_a.states.len(), 2, "dev-a has two states");
+
+        let dev_b = result
+            .structured_content
+            .devices
+            .iter()
+            .find(|d| d.device_id == "dev-b")
+            .unwrap();
+        assert_eq!(dev_b.states.len(), 1);
+        assert_eq!(dev_b.states[0].state_text, "building");
+
+        // Text output includes all devices.
+        let text = result.content.first().and_then(|c| match c {
+            ToolResponseContent::Text { text } => Some(text.as_str()),
+            _ => None,
+        });
+        let text = text.unwrap();
+        assert!(text.contains("room-42"));
+        assert!(text.contains("laptop"));
+        assert!(text.contains("desktop"));
+        assert!(text.contains("sub-x"));
+    }
+
+    #[test]
+    fn build_response_includes_orphan_states_without_status() {
+        // A device posted a state but never posted a status — the state should
+        // still appear in the output as an "orphan" device entry.
+        crate::board_state::clear_for_test();
+        let snapshot = crate::types::RoomSnapshot {
+            v: 1,
+            room: "room-99".to_string(),
+            statuses: vec![], // no statuses at all
+            messages: vec![],
+            states: vec![crate::types::AgentStateMessage {
+                v: 1,
+                device_id: "dev-ghost".to_string(),
+                device_name: "ghost".to_string(),
+                session_id: "s1".to_string(),
+                sub_agent_id: None,
+                state_text: "haunting".to_string(),
+                meta: String::new(),
+                ts: 5000,
+            }],
+        };
+        crate::board_state::set_room_snapshot(snapshot);
+
+        let result = build_response().unwrap();
+        assert_eq!(result.structured_content.devices.len(), 1);
+        assert_eq!(result.structured_content.devices[0].device_id, "dev-ghost");
+        assert_eq!(result.structured_content.devices[0].device_name, "ghost");
+        assert_eq!(result.structured_content.devices[0].states[0].state_text, "haunting");
+    }
+
+    #[test]
+    fn build_response_empty_room_has_devices_but_no_states() {
+        // Devices with statuses but no state broadcasts: each appears with an
+        // empty states vec, and the text says "no active states".
+        crate::board_state::clear_for_test();
+        let snapshot = crate::types::RoomSnapshot {
+            v: 1,
+            room: "quiet-room".to_string(),
+            statuses: vec![crate::types::DeviceStatus {
+                v: 1,
+                device_id: "dev-silent".to_string(),
+                device_name: "silent".to_string(),
+                location_hash: String::new(),
+                project_path: String::new(),
+                scopes: vec![],
+                updated_at: 0,
+                stale: false,
+            }],
+            messages: vec![],
+            states: vec![],
+        };
+        crate::board_state::set_room_snapshot(snapshot);
+
+        let result = build_response().unwrap();
+        assert_eq!(result.structured_content.devices.len(), 1);
+        assert!(result.structured_content.devices[0].states.is_empty());
+        let text = result.content.first().and_then(|c| match c {
+            ToolResponseContent::Text { text } => Some(text.as_str()),
+            _ => None,
+        });
+        assert!(text.unwrap().contains("no active states"));
+    }
 }

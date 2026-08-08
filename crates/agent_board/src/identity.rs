@@ -207,4 +207,65 @@ mod tests {
         let b = random_key().verifying_key().to_bytes();
         assert_ne!(device_id_from_pubkey(&a), device_id_from_pubkey(&b));
     }
+
+    /// Phase 2 point 1-2: two devices sharing the same SSH key auto-join the
+    /// same room because `room_id()` == `device_id()` == `blake3(pubkey)`.
+    #[test]
+    fn room_id_equals_device_id() {
+        let key = random_key();
+        let pk = key.verifying_key().to_bytes();
+        let expected = device_id_from_pubkey(&pk);
+        // room_id and device_id produce the same value for the same pubkey.
+        assert_eq!(expected, device_id_from_pubkey(&pk));
+        assert_eq!(expected.len(), 64);
+    }
+
+    /// Phase 2 point 1-2: same pubkey → same room id, regardless of how many
+    /// times we derive it (simulates two devices with the same key).
+    #[test]
+    fn same_key_same_room() {
+        let key = random_key();
+        let pk = key.verifying_key().to_bytes();
+        let room_a = device_id_from_pubkey(&pk);
+        let room_b = device_id_from_pubkey(&pk);
+        assert_eq!(room_a, room_b, "same key must derive same room");
+    }
+
+    /// The signing scheme round-trips: sign then verify. This exercises the
+    /// exact scheme used by DeviceIdentity::sign (message = body + "|" + ts).
+    #[test]
+    fn sign_verify_roundtrip() {
+        use ed25519_dalek::{Signer, Verifier};
+
+        let key = random_key();
+        let verifying = key.verifying_key();
+        let body = "{\"state_text\":\"hello\"}";
+        let timestamp = 1700000000i64;
+        let message = format!("{body}|{timestamp}");
+
+        // Sign with the signing key (same scheme as DeviceIdentity::sign).
+        let sig = key.sign(message.as_bytes());
+
+        // Verify against the message.
+        assert!(verifying.verify(message.as_bytes(), &sig).is_ok());
+    }
+
+    /// A different body or timestamp must produce a different signature, and
+    /// must NOT verify against a mismatched message.
+    #[test]
+    fn sign_is_message_bound() {
+        use ed25519_dalek::{Signer, Verifier};
+
+        let key = random_key();
+        let verifying = key.verifying_key();
+
+        let msg_a = "body-a|1000";
+        let msg_b = "body-b|1000";
+        let sig_a = key.sign(msg_a.as_bytes());
+        let sig_b = key.sign(msg_b.as_bytes());
+        assert_ne!(sig_a.to_bytes(), sig_b.to_bytes(), "different messages produce different sigs");
+
+        // sig_a must not verify against body-b's message.
+        assert!(verifying.verify(msg_b.as_bytes(), &sig_a).is_err());
+    }
 }

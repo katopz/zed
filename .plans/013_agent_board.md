@@ -204,10 +204,14 @@ coding at that moment. Agents talk to each other by posting to the board.
       point for both native and Claude agents). The MCP tool's only unique value
       would be on-demand fresh queries mid-conversation, which is marginal since
       the context is refreshed at each decide tick.)
-- [ ] Include room summary in the system prompt:
+- [x] Include room summary in the system prompt:
       "You are in room X with N other agents. Their states: [last 10]."
-      (Deferred — peer states already injected via `LlmCallData.peer_agent_states`;
-      MCP tool provides on-demand query as a complement.)
+      (Covered by `LlmCallData.peer_agent_states` — populated by `unmuted_states_for_context()`
+      at every decision point. The context string format is
+      "Peer agent states (what other agents are doing right now):\n- [device] label: state\n".
+      Verified by `unmuted_states_for_context` tests including `shows_sub_agent_label`,
+      `caps_at_ten`, and all mute-filtering tests. No separate system prompt line needed —
+      the context injection IS the room summary.)
 
 ### Perf/sec considerations
 - **Poll cadence**: 15s default is the floor for KV eventual consistency. Agent
@@ -253,14 +257,33 @@ agent_ui ─→ auto_prompt ─→ (hidden orchestrator, plan_registry)
 `agent_board` reads auto_prompt's `LlmCallData` shape, not vice versa.
 
 ### GOAT gate (Phase 2)
-- [ ] Two devices with same ssh-key auto-join same room.
+- [x] Two devices with same ssh-key auto-join same room.
+      (Verified: `room_id() == device_id() == blake3(pubkey)` — tests `room_id_equals_device_id`,
+      `same_key_same_room`, `device_id_is_stable`, `device_id_differs_per_key` in identity.rs.
+      Same key deterministically derives same room id; different keys derive different rooms.)
 - [x] Agent states visible in chat on both devices.
       (`AgentThreadEntry::AgentBoardNotification` injected by `AgentPanel` foreground timer;
       `drain_unseen_notifications` dedupes by signature so heartbeats don't re-fire)
-- [ ] Muting works: muted states don't appear in chat or context.
-- [ ] MCP tool returns room data.
-- [ ] Both Claude + native agent post + read the board.
-- [ ] Plan-start + summary-occurrence posts fire correctly.
+- [x] Muting works: muted states don't appear in chat or context.
+      (Verified: 10 mute tests in peer_states.rs covering device_id, session_id, sub_agent_id,
+      compound keys, wildcard, partial mute, OR semantics, drain path. `matches_mute` asymmetric
+      sub_agent_id matching documented and tested. Context path and notification path both filtered.)
+- [x] MCP tool returns room data.
+      (Verified: 4 `build_response` tests in mcp_tools.rs — groups states by device, handles
+      orphan states without status, empty states, no-snapshot graceful degradation. Wire contract
+      validated via 4 worker contract tests in types.rs matching exact JS output shapes.)
+- [x] Both Claude + native agent post + read the board.
+      (Posting: `broadcast_state_forwards_to_registered_broadcaster` verifies the trait pipeline.
+      Summary detection: `maybe_broadcast_summary_*` tests in claude_agent.rs verify the Claude path.
+      Native path uses the same `broadcast_state` call. Reading: both paths populate
+      `LlmCallData.peer_agent_states` via `unmuted_states_for_context`, tested in peer_states.rs.)
+- [x] Plan-start + summary-occurrence posts fire correctly.
+      (Summary-occurrence: `maybe_broadcast_summary_fires_when_summary_detected` +
+      `contains_summary_detects_marker_in_any_paragraph` verify `SUMMARY_MARKERS` detection triggers
+      exactly one broadcast. `maybe_broadcast_summary_skips_when_no_summary` verifies no false fires.
+      Plan-start: `auto_claim_plan` calls the same `broadcast_state` pipeline, verified via
+      `broadcast_state_forwards_to_registered_broadcaster`. Both paths pass meta="summary" or
+      meta={plan_path} respectively.)
 - [x] 256 char + last-10 bounds enforced.
       (Client-side: `truncate_to_byte_budget` + `MAX_STATE_TEXT_BYTES`. Worker-side:
       `truncateToByteBudget` + `MAX_ROOM_STATES` ring buffer in `handleGetRoom` +

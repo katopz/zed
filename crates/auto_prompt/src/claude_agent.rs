@@ -1137,6 +1137,106 @@ mod tests {
         assert!(!is_summary_heading("This paragraph mentions summary later"));
     }
 
+    // ── contains_summary + maybe_broadcast_summary_to_board (GOAT gate: posting hooks) ──
+
+    #[test]
+    fn test_contains_summary_detects_marker_in_any_paragraph() {
+        // Summary marker in the first paragraph.
+        assert!(contains_summary("## summary\n\ndetails"));
+        // Summary marker in a later paragraph.
+        assert!(contains_summary("para one.\n\nsummary: concluded work"));
+        // No summary marker.
+        assert!(!contains_summary("just regular text\n\nno summary here"));
+        // Empty string.
+        assert!(!contains_summary(""));
+    }
+
+    /// Mock broadcaster for verifying the posting pipeline. Records all calls.
+    struct RecordingBroadcaster {
+        calls: std::sync::Mutex<Vec<(String, Option<String>, String, String)>>,
+    }
+
+    impl crate::peer_states::AgentStateBroadcaster for RecordingBroadcaster {
+        fn broadcast(
+            &self,
+            session_id: &str,
+            sub_agent_id: Option<&str>,
+            state_text: &str,
+            meta: &str,
+        ) {
+            self.calls.lock().unwrap().push((
+                session_id.to_string(),
+                sub_agent_id.map(|s| s.to_string()),
+                state_text.to_string(),
+                meta.to_string(),
+            ));
+        }
+    }
+
+    #[test]
+    fn maybe_broadcast_summary_fires_when_summary_detected() {
+        let _lock = crate::peer_states::lock_for_test();
+        crate::peer_states::clear_for_test();
+        let mock = std::sync::Arc::new(RecordingBroadcaster {
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        crate::peer_states::register_broadcaster(Some(mock.clone()));
+
+        let session_id = acp::SessionId::new("test-session");
+        let message = "Working on stuff.\n\n## summary\n\nFixed the bug and wrote tests.";
+        maybe_broadcast_summary_to_board(&session_id, Some(message));
+
+        let calls = mock.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "summary should trigger exactly one broadcast");
+        assert_eq!(calls[0].0, "test-session");
+        assert_eq!(calls[0].3, "summary", "meta should be 'summary'");
+        assert!(calls[0].2.contains("Fixed the bug"));
+    }
+
+    #[test]
+    fn maybe_broadcast_summary_skips_when_no_summary() {
+        let _lock = crate::peer_states::lock_for_test();
+        crate::peer_states::clear_for_test();
+        let mock = std::sync::Arc::new(RecordingBroadcaster {
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        crate::peer_states::register_broadcaster(Some(mock.clone()));
+
+        let session_id = acp::SessionId::new("test-session");
+        // Regular text without any summary marker — must NOT broadcast.
+        maybe_broadcast_summary_to_board(&session_id, Some("just working on stuff"));
+
+        let calls = mock.calls.lock().unwrap();
+        assert!(calls.is_empty(), "no broadcast when summary marker absent");
+    }
+
+    #[test]
+    fn maybe_broadcast_summary_skips_when_no_message() {
+        let _lock = crate::peer_states::lock_for_test();
+        crate::peer_states::clear_for_test();
+        let mock = std::sync::Arc::new(RecordingBroadcaster {
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        crate::peer_states::register_broadcaster(Some(mock.clone()));
+
+        let session_id = acp::SessionId::new("test-session");
+        // No last message at all (None) — must NOT broadcast or panic.
+        maybe_broadcast_summary_to_board(&session_id, None);
+
+        let calls = mock.calls.lock().unwrap();
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn maybe_broadcast_summary_skips_when_no_broadcaster() {
+        let _lock = crate::peer_states::lock_for_test();
+        crate::peer_states::clear_for_test();
+        // No broadcaster registered — must be a silent no-op, not a panic.
+        let session_id = acp::SessionId::new("test-session");
+        maybe_broadcast_summary_to_board(&session_id, Some("## summary\n\ndone"));
+        // If we reach here without panicking, the test passes.
+    }
+
     #[test]
     fn test_confidence_threshold_is_reasonable() {
         // Guard against accidental drift — this threshold is the only thing

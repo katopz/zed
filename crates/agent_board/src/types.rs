@@ -358,4 +358,117 @@ mod tests {
         };
         assert!(key.matches(&state));
     }
+
+    // ── Worker contract validation ──
+    // These verify that the exact JSON shapes produced by the Cloudflare Worker
+    // (agent-board-worker/src/index.js) deserialize correctly into the Rust
+    // wire types. If the worker's output shape drifts, these catch it without
+    // needing a live deployment.
+
+    #[test]
+    fn worker_state_output_deserializes() {
+        // Exact JSON shape from handlePostState in the worker.
+        let json = r#"{
+            "v": 1,
+            "device_id": "a1b2c3",
+            "device_name": "m3-laptop",
+            "session_id": "sess-42",
+            "sub_agent_id": null,
+            "state_text": "debugging auth bridge",
+            "meta": "summary",
+            "ts": 1700000000000
+        }"#;
+        let state: AgentStateMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(state.device_id, "a1b2c3");
+        assert_eq!(state.device_name, "m3-laptop");
+        assert_eq!(state.session_id, "sess-42");
+        assert!(state.sub_agent_id.is_none());
+        assert_eq!(state.state_text, "debugging auth bridge");
+        assert_eq!(state.meta, "summary");
+    }
+
+    #[test]
+    fn worker_state_with_sub_agent_deserializes() {
+        let json = r#"{
+            "v": 1,
+            "device_id": "dev-x",
+            "device_name": "desktop",
+            "session_id": "sess-1",
+            "sub_agent_id": "investigator",
+            "state_text": "researching",
+            "meta": "plan: 013",
+            "ts": 1700000000001
+        }"#;
+        let state: AgentStateMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(state.sub_agent_id.as_deref(), Some("investigator"));
+    }
+
+    #[test]
+    fn worker_room_snapshot_with_states_deserializes() {
+        // Exact JSON shape from handleGetRoom with states populated.
+        let json = r#"{
+            "v": 1,
+            "room": "room-abc",
+            "statuses": [
+                {
+                    "v": 1,
+                    "device_id": "dev-a",
+                    "device_name": "laptop",
+                    "location_hash": "hash1",
+                    "project_path": "/home/user/project",
+                    "scopes": [],
+                    "updated_at": 1700000000000,
+                    "stale": false
+                }
+            ],
+            "messages": [
+                {
+                    "v": 1,
+                    "device_id": "dev-a",
+                    "device_name": "laptop",
+                    "text": "hello world",
+                    "ts": 1700000000000
+                }
+            ],
+            "states": [
+                {
+                    "v": 1,
+                    "device_id": "dev-a",
+                    "device_name": "laptop",
+                    "session_id": "sess-1",
+                    "sub_agent_id": null,
+                    "state_text": "building feature X",
+                    "meta": "plan: 013",
+                    "ts": 1700000000001
+                }
+            ]
+        }"#;
+        let snap: RoomSnapshot = serde_json::from_str(json).unwrap();
+        assert_eq!(snap.room, "room-abc");
+        assert_eq!(snap.statuses.len(), 1);
+        assert_eq!(snap.messages.len(), 1);
+        assert_eq!(snap.states.len(), 1);
+        assert_eq!(snap.states[0].state_text, "building feature X");
+    }
+
+    #[test]
+    fn worker_post_state_body_serializes_correctly() {
+        // Verify that PostStateBody serializes to the JSON shape the worker's
+        // handlePostState expects to parse.
+        let body = crate::types::PostStateBody {
+            device_name: "laptop".to_string(),
+            session_id: "sess-1".to_string(),
+            sub_agent_id: Some("sub-a".to_string()),
+            state_text: "working".to_string(),
+            meta: "plan: 013".to_string(),
+        };
+        let json = serde_json::to_string(&body).unwrap();
+        // The worker reads body.device_name, body.session_id,
+        // body.sub_agent_id, body.state_text, body.meta.
+        assert!(json.contains("\"device_name\":\"laptop\""));
+        assert!(json.contains("\"session_id\":\"sess-1\""));
+        assert!(json.contains("\"sub_agent_id\":\"sub-a\""));
+        assert!(json.contains("\"state_text\":\"working\""));
+        assert!(json.contains("\"meta\":\"plan: 013\""));
+    }
 }

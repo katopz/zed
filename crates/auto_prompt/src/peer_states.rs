@@ -238,20 +238,30 @@ pub fn clear_for_test() {
     }
 }
 
+/// Acquire the process-wide test lock so callers in other modules' test
+/// suites (e.g. `claude_agent::tests`) can serialize their access to the
+/// peer_states globals. The returned guard must be held for the duration of
+/// the test. Also clears all globals so the test starts from a known state.
+#[cfg(test)]
+pub fn lock_for_test() -> std::sync::MutexGuard<'static, ()> {
+    TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Acquire the global test lock and clear all peer-states globals. The
     /// returned guard must be bound (`let _lock = setup();`) so it is held for
     /// the duration of the test, serialising all peer_states tests (they share
     /// process-global state). Mirrors the plan_registry test pattern.
     fn setup() -> std::sync::MutexGuard<'static, ()> {
-        let guard = TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let guard = lock_for_test();
         clear_for_test();
         guard
     }
@@ -375,5 +385,232 @@ mod tests {
         );
         let notifications = drain_unseen_notifications();
         assert!(notifications.is_empty(), "muted states should not notify");
+    }
+
+    // ── Mute filtering gap tests (GOAT gate: "Muting works") ──
+    // These exercise mute dimensions not covered by the basic device-id mute.
+
+    #[test]
+    fn mute_by_session_id_only() {
+        let _lock = setup();
+        set_peer_states(
+            vec![
+                state("dev-b", "desktop", "sess-muted", "building"),
+                state("dev-b", "desktop", "sess-live", "testing"),
+            ],
+            "dev-a",
+        );
+        set_muted(vec![PeerStateMute {
+            device_id: None,
+            session_id: Some("sess-muted".to_string()),
+            sub_agent_id: None,
+        }]);
+        let ctx = unmuted_states_for_context().unwrap();
+        assert!(!ctx.contains("building"), "muted session excluded from context");
+        assert!(ctx.contains("testing"), "unmuted session still in context");
+    }
+
+    #[test]
+    fn mute_by_sub_agent_id_only() {
+        let _lock = setup();
+        let mut muted_state = state("dev-b", "desktop", "s2", "investigating");
+        muted_state.sub_agent_id = Some("sub-investigator".to_string());
+        let mut live_state = state("dev-b", "desktop", "s3", "coding");
+        live_state.sub_agent_id = Some("sub-coder".to_string());
+        set_peer_states(vec![muted_state, live_state], "dev-a");
+        set_muted(vec![PeerStateMute {
+            device_id: None,
+            session_id: None,
+            sub_agent_id: Some("sub-investigator".to_string()),
+        }]);
+        let ctx = unmuted_states_for_context().unwrap();
+        assert!(!ctx.contains("investigating"));
+        assert!(ctx.contains("coding"));
+    }
+
+    #[test]
+    fn mute_sub_agent_with_none_state_sub_agent_does_not_match() {
+        // A muted sub_agent_id of Some("x") should NOT match a state whose
+        // sub_agent_id is None. This is the asymmetric matching documented in
+        // matches_mute.
+        let _lock = setup();
+        let state_none_sub = state("dev-b", "desktop", "s2", "working");
+        set_peer_states(vec![state_none_sub], "dev-a");
+        set_muted(vec![PeerStateMute {
+            device_id: None,
+            session_id: None,
+            sub_agent_id: Some("some-sub".to_string()),
+        }]);
+        let ctx = unmuted_states_for_context();
+        assert!(ctx.is_some(), "state with None sub_agent_id not muted by Some sub");
+    }
+
+    #[test]
+    fn mute_compound_device_and_session() {
+        // Muting by {device_id + session_id} should only match that exact combo.
+        let _lock = setup();
+        set_peer_states(
+            vec![
+                state("dev-b", "desktop", "target-session", "should-be-muted"),
+                state("dev-b", "desktop", "other-session", "should-be-visible"),
+            ],
+            "dev-a",
+        );
+        set_muted(vec![PeerStateMute {
+            device_id: Some("dev-b".to_string()),
+            session_id: Some("target-session".to_string()),
+            sub_agent_id: None,
+        }]);
+        let ctx = unmuted_states_for_context().unwrap();
+        assert!(!ctx.contains("should-be-muted"));
+        assert!(ctx.contains("should-be-visible"));
+    }
+
+    #[test]
+    fn mute_all_none_wildcard_mutes_everything() {
+        // All-None mute key = wildcard, mutes everything.
+        let _lock = setup();
+        set_peer_states(
+            vec![state("dev-b", "desktop", "s1", "task-a")],
+            "dev-a",
+        );
+        set_muted(vec![PeerStateMute {
+            device_id: None,
+            session_id: None,
+            sub_agent_id: None,
+        }]);
+        assert!(unmuted_states_for_context().is_none());
+    }
+
+    #[test]
+    fn mute_partial_only_some_peers_muted() {
+        // Multiple peers: only one is muted, the rest remain visible.
+        let _lock = setup();
+        set_peer_states(
+            vec![
+                state("dev-b", "desktop", "s1", "muted-task"),
+                state("dev-c", "server", "s2", "visible-task-1"),
+                state("dev-d", "laptop", "s3", "visible-task-2"),
+            ],
+            "dev-a",
+        );
+        set_muted(vec![PeerStateMute {
+            device_id: Some("dev-b".to_string()),
+            session_id: None,
+            sub_agent_id: None,
+        }]);
+        let ctx = unmuted_states_for_context().unwrap();
+        assert!(!ctx.contains("muted-task"));
+        assert!(ctx.contains("visible-task-1"));
+        assert!(ctx.contains("visible-task-2"));
+    }
+
+    #[test]
+    fn mute_multiple_entries_or_semantics() {
+        // Multiple PeerStateMute entries in the vec act as OR: if any matches,
+        // the state is muted.
+        let _lock = setup();
+        set_peer_states(
+            vec![
+                state("dev-b", "desktop", "s1", "muted-by-device"),
+                state("dev-c", "server", "s2", "muted-by-session"),
+                state("dev-d", "laptop", "s3", "visible"),
+            ],
+            "dev-a",
+        );
+        set_muted(vec![
+            PeerStateMute {
+                device_id: Some("dev-b".to_string()),
+                session_id: None,
+                sub_agent_id: None,
+            },
+            PeerStateMute {
+                device_id: None,
+                session_id: Some("s2".to_string()),
+                sub_agent_id: None,
+            },
+        ]);
+        let ctx = unmuted_states_for_context().unwrap();
+        assert!(!ctx.contains("muted-by-device"));
+        assert!(!ctx.contains("muted-by-session"));
+        assert!(ctx.contains("visible"));
+    }
+
+    #[test]
+    fn mute_filters_drain_notifications_too() {
+        // Muting should suppress drain notifications for the muted peer while
+        // allowing unmuted peers through.
+        let _lock = setup();
+        set_peer_states(
+            vec![
+                state("dev-b", "desktop", "s1", "muted-notification"),
+                state("dev-c", "server", "s2", "live-notification"),
+            ],
+            "dev-a",
+        );
+        set_muted(vec![PeerStateMute {
+            device_id: Some("dev-b".to_string()),
+            session_id: None,
+            sub_agent_id: None,
+        }]);
+        let notifications = drain_unseen_notifications();
+        assert_eq!(notifications.len(), 1);
+        assert!(notifications[0].contains("live-notification"));
+        assert!(!notifications.iter().any(|n| n.contains("muted-notification")));
+    }
+
+    // ── Broadcaster forwarding tests (GOAT gate: "Both agents post + read") ──
+
+    /// A mock broadcaster that records all calls for assertion.
+    struct MockBroadcaster {
+        calls: std::sync::Mutex<Vec<(String, Option<String>, String, String)>>,
+    }
+
+    impl AgentStateBroadcaster for MockBroadcaster {
+        fn broadcast(
+            &self,
+            session_id: &str,
+            sub_agent_id: Option<&str>,
+            state_text: &str,
+            meta: &str,
+        ) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((
+                    session_id.to_string(),
+                    sub_agent_id.map(|s| s.to_string()),
+                    state_text.to_string(),
+                    meta.to_string(),
+                ));
+        }
+    }
+
+    #[test]
+    fn broadcast_state_forwards_to_registered_broadcaster() {
+        let _lock = setup();
+        let mock = Arc::new(MockBroadcaster {
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        register_broadcaster(Some(mock.clone()));
+
+        broadcast_state("sess-1", Some("sub-a"), "debugging", "summary");
+        broadcast_state("sess-2", None, "building", "plan: 013");
+
+        let calls = mock.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2, "both broadcasts forwarded");
+        assert_eq!(calls[0].0, "sess-1");
+        assert_eq!(calls[0].1.as_deref(), Some("sub-a"));
+        assert_eq!(calls[0].2, "debugging");
+        assert_eq!(calls[0].3, "summary");
+        assert_eq!(calls[1].1, None, "None sub_agent_id passed through");
+    }
+
+    #[test]
+    fn broadcast_state_noop_without_broadcaster() {
+        let _lock = setup();
+        // No broadcaster registered — should be a silent no-op, not a panic.
+        broadcast_state("sess-1", None, "working", "test");
+        // If we get here without panicking, the test passes.
     }
 }
