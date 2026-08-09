@@ -6691,7 +6691,7 @@ pub(crate) mod tests {
         cx.update(|cx| {
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);
-            LanguageModelRegistry::test(cx);
+            language_model::LanguageModelRegistry::test(cx);
             // Use an isolated DB so parallel tests can't overwrite each
             // other's global keys (e.g. the last-created entry kind).
             cx.set_global(db::AppDatabase::test_new());
@@ -11866,7 +11866,7 @@ pub(crate) mod tests {
         // Grab the registered FakeLanguageModel so we can feed the reasoning
         // response via `as_fake()`.
         let fake_model = cx.read(|cx| {
-            LanguageModelRegistry::read_global(cx)
+            language_model::LanguageModelRegistry::read_global(cx)
                 .default_model()
                 .expect("no default model")
                 .model
@@ -12053,7 +12053,7 @@ pub(crate) mod tests {
         init_test(cx);
 
         let fake_model = cx.read(|cx| {
-            LanguageModelRegistry::read_global(cx)
+            language_model::LanguageModelRegistry::read_global(cx)
                 .default_model()
                 .expect("no default model")
                 .model
