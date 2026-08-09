@@ -50,6 +50,19 @@ Project instructions override personal `AGENTS.md` when they conflict.
 
 External Agents and Terminal Threads may read their own native instruction files directly. Do not assume Zed's instruction loader controls those agents.
 
+## Sharing Instructions With Claude Code {#claude-code}
+
+Claude Code reads `CLAUDE.md` and does not read `AGENTS.md`, so running both agents otherwise means maintaining two copies of the same instructions. Zed can symlink one onto the other instead, keeping a single source of truth:
+
+| Setting                            | Default | Effect                                                             |
+| ---------------------------------- | ------- | ------------------------------------------------------------------ |
+| `agent.claude_md_symlink`          | `true`  | Links `~/.claude/CLAUDE.md` to your personal `AGENTS.md`            |
+| `agent.project_claude_md_symlink`  | `false` | Links `CLAUDE.md` to `AGENTS.md` in the root of each project opened |
+
+Both are conservative: an existing `CLAUDE.md` — whether a regular file or a symlink you aimed somewhere else — is never replaced, and no link is created when there is no `AGENTS.md` to point at. The global link is only created when `~/.claude` exists, i.e. when Claude Code is actually installed. Disabling either setting stops new links from being created but does not remove links that already exist.
+
+Project links are off by default because they add an untracked `CLAUDE.md` to the repository. If you enable it for a repository you do not want to commit the link to, add `CLAUDE.md` to `.git/info/exclude`.
+
 ## Instructions vs. Skills {#instructions-vs-skills}
 
 | Use          | Best for                | Example                                                     |

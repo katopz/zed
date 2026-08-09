@@ -8228,6 +8228,48 @@ fn ai_page(cx: &App) -> SettingsPage {
                 files: USER,
             }),
             SettingsPageItem::SettingItem(SettingItem {
+                title: "Share Rules With Claude Code",
+                description: "Symlink ~/.claude/CLAUDE.md to your global AGENTS.md, so Claude Code reads the same personal instructions. Never replaces an existing CLAUDE.md.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("agent.claude_md_symlink"),
+                    pick: |settings_content| {
+                        settings_content.agent.as_ref()?.claude_md_symlink.as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .agent
+                            .get_or_insert_default()
+                            .claude_md_symlink = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Share Project Rules With Claude Code",
+                description: "Symlink CLAUDE.md to AGENTS.md in each project root. Adds an untracked file to the repository.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("agent.project_claude_md_symlink"),
+                    pick: |settings_content| {
+                        settings_content
+                            .agent
+                            .as_ref()?
+                            .project_claude_md_symlink
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .agent
+                            .get_or_insert_default()
+                            .project_claude_md_symlink = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
                 title: "Enable Feedback",
                 description: "Show voting thumbs up/down icon buttons for feedback on agent edits.",
                 field: Box::new(SettingField {

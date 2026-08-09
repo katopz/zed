@@ -15,7 +15,7 @@ pub mod visual_tests;
 #[cfg(target_os = "windows")]
 pub(crate) mod windows_only_instance;
 
-use agent_settings::{UserAgentsMdState, init_user_agents_md};
+use agent_settings::{AgentSettings, UserAgentsMdState, init_user_agents_md};
 use agent_ui::AgentDiffToolbar;
 use anyhow::Context as _;
 pub use app_menus::*;
@@ -2060,6 +2060,38 @@ pub fn watch_user_agents_md(fs: Arc<dyn fs::Fs>, cx: &mut App) {
             });
         }
     });
+}
+
+/// Keeps `~/.claude/CLAUDE.md` symlinked to the user-global `AGENTS.md` while
+/// `agent.claude_md_symlink` is enabled.
+///
+/// The link is attempted at startup and again whenever the setting is switched
+/// back on, so enabling it doesn't require a restart. Turning it off never
+/// removes an existing link — deleting a file the user may have come to rely on
+/// is not something a settings toggle should do silently.
+pub fn maintain_global_claude_md_symlink(fs: Arc<dyn fs::Fs>, cx: &mut App) {
+    fn link(fs: Arc<dyn fs::Fs>, cx: &mut App) {
+        cx.background_spawn(async move {
+            agent_settings::claude_md_symlink::link_global_claude_md(fs.as_ref())
+                .await
+                .log_err();
+        })
+        .detach();
+    }
+
+    let mut was_enabled = AgentSettings::get_global(cx).claude_md_symlink;
+    if was_enabled {
+        link(fs.clone(), cx);
+    }
+
+    cx.observe_global::<SettingsStore>(move |cx| {
+        let is_enabled = AgentSettings::get_global(cx).claude_md_symlink;
+        if is_enabled && !was_enabled {
+            link(fs.clone(), cx);
+        }
+        was_enabled = is_enabled;
+    })
+    .detach();
 }
 
 pub fn watch_settings_files(fs: Arc<dyn fs::Fs>, cx: &mut App) {

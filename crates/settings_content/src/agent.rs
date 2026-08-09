@@ -278,6 +278,23 @@ pub struct AgentSettingsContent {
     ///
     /// Default: false
     pub single_file_review: Option<bool>,
+    /// Whether to symlink `~/.claude/CLAUDE.md` to your user-global `AGENTS.md`,
+    /// so Claude Code reads the same personal instructions Zed's agent does.
+    ///
+    /// Only applies when Claude Code is installed (`~/.claude` exists) and an
+    /// `AGENTS.md` exists. An existing `CLAUDE.md` is never replaced.
+    ///
+    /// Default: true
+    pub claude_md_symlink: Option<bool>,
+    /// Whether to symlink `CLAUDE.md` to `AGENTS.md` in the root of each project
+    /// you open, so Claude Code reads the same project instructions Zed's agent
+    /// does.
+    ///
+    /// Off by default because it adds an untracked file to the repository. An
+    /// existing `CLAUDE.md` is never replaced.
+    ///
+    /// Default: false
+    pub project_claude_md_symlink: Option<bool>,
     /// Additional parameters for language model requests. When making a request
     /// to a model, parameters will be taken from the last entry in this list
     /// that matches the model's provider and name. In each entry, both provider

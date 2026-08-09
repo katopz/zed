@@ -1150,6 +1150,13 @@
     },
     // When enabled, agent edits will be displayed in single-file editors for review
     "single_file_review": false,
+    // Symlink `~/.claude/CLAUDE.md` to your user-global `AGENTS.md`, so Claude Code
+    // reads the same personal instructions Zed's agent does. Only applies when
+    // Claude Code is installed. An existing `CLAUDE.md` is never replaced.
+    "claude_md_symlink": true,
+    // Symlink `CLAUDE.md` to `AGENTS.md` in the root of each project you open. Off
+    // by default because it adds an untracked file to the repository.
+    "project_claude_md_symlink": false,
     // Settings for automatic agent context compaction, which summarizes earlier
     // messages to free up room in the model's context window once it grows too
     // large.

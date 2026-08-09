@@ -34,6 +34,7 @@ use acp_thread::{
     ThreadStatus, TokenUsageRatio,
 };
 use agent_client_protocol::schema::v1 as acp;
+use agent_settings::{AgentSettings, claude_md_symlink};
 use agent_skills::{
     AGENTS_DIR_NAME, MAX_SKILL_DESCRIPTIONS_SIZE, MAX_SKILL_FILE_SIZE, ProjectSkillGroup,
     SKILL_FILE_NAME, Skill, SkillIndex, SkillLoadError, SkillLoadWarning, SkillScopeId,
@@ -453,6 +454,18 @@ static RULES_FILE_REL_PATHS: LazyLock<Vec<Arc<RelPath>>> = LazyLock::new(|| {
                 .map(|path| path.into_arc())
         })
         .collect()
+});
+
+static AGENTS_MD_REL_PATH: LazyLock<Option<Arc<RelPath>>> = LazyLock::new(|| {
+    RelPath::from_unix_str(claude_md_symlink::AGENTS_MD)
+        .ok()
+        .map(|path| path.into_arc())
+});
+
+static CLAUDE_MD_REL_PATH: LazyLock<Option<Arc<RelPath>>> = LazyLock::new(|| {
+    RelPath::from_unix_str(claude_md_symlink::CLAUDE_MD)
+        .ok()
+        .map(|path| path.into_arc())
 });
 
 static AGENTS_PREFIX: LazyLock<Option<Arc<RelPath>>> = LazyLock::new(|| {
@@ -1235,6 +1248,12 @@ impl NativeAgent {
                 scan_complete.await;
             }
 
+            if let Some(link_task) =
+                cx.update(|cx| Self::link_project_claude_md(&worktree, &project, cx))
+            {
+                link_task.await;
+            }
+
             let rules_task = cx.update(|cx| Self::load_worktree_rules_file(worktree, project, cx));
 
             let (rules_file, rules_file_error) = match rules_task {
@@ -1252,6 +1271,47 @@ impl NativeAgent {
             context.rules_file = rules_file;
             (context, rules_file_error)
         })
+    }
+
+    /// Symlinks `CLAUDE.md` onto this worktree's `AGENTS.md`, so Claude Code
+    /// reads the same project instructions the native agent does.
+    ///
+    /// Returns `None` — touching the filesystem not at all — unless the
+    /// worktree is local, has an `AGENTS.md`, and has no `CLAUDE.md` yet. The
+    /// entry lookups are in-memory, so the steady state after the link exists
+    /// costs nothing on the repeated project-context refreshes.
+    fn link_project_claude_md(
+        worktree: &Entity<Worktree>,
+        project: &Entity<Project>,
+        cx: &App,
+    ) -> Option<Task<()>> {
+        if !AgentSettings::get_global(cx).project_claude_md_symlink {
+            return None;
+        }
+
+        let fs = project.read(cx).fs().clone();
+        let worktree = worktree.read(cx);
+        // Remote worktrees don't live on the filesystem `fs` addresses.
+        worktree.as_local()?;
+
+        let has_agents_md = AGENTS_MD_REL_PATH
+            .as_ref()
+            .and_then(|path| worktree.entry_for_path(path))
+            .is_some_and(|entry| entry.is_file());
+        let has_claude_md = CLAUDE_MD_REL_PATH
+            .as_ref()
+            .and_then(|path| worktree.entry_for_path(path))
+            .is_some();
+        if !has_agents_md || has_claude_md {
+            return None;
+        }
+
+        let worktree_root = worktree.abs_path();
+        Some(cx.background_spawn(async move {
+            claude_md_symlink::link_project_claude_md(fs.as_ref(), &worktree_root)
+                .await
+                .log_err();
+        }))
     }
 
     fn load_worktree_rules_file(

@@ -1005,6 +1005,8 @@ mod tests {
             notify_when_agent_waiting: NotifyWhenAgentWaiting::default(),
             play_sound_when_agent_done: PlaySoundWhenAgentDone::Never,
             single_file_review: false,
+            claude_md_symlink: false,
+            project_claude_md_symlink: false,
             model_parameters: vec![],
             auto_compact: agent_settings::AutoCompactSettings {
                 enabled: false,
