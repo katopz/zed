@@ -73,6 +73,23 @@ worker (claude-acp) stops
 - [x] **String-aware JSON extraction** (`extract_json_object` rewrite).
 - [x] **Programmatic tool-leak guard** (layer 2 of 3): inspect hidden session's
       entry history for ToolCall entries since last user message; stop if found.
+- [x] **Context-parity fix**: the hidden orchestrator now receives the same
+      `plan_summary` (unchecked task counts), `stop_phase`, `current_paths`,
+      and `had_error` context as the native-agent GLM path. Before this fix,
+      the hidden path's `context_json` had only `session_id` + `iteration_count`
+      + `last_assistant_message` — no plan state — so a worker that emitted a
+      completion summary with `[ ]` items still in the plan looked "done" and
+      the orchestrator stopped. Now `claude_decision_hidden` calls
+      `read_plan_files` (same as the native path) and `judge_with_hidden_session`
+      calls `build_lightweight_orchestration_context` to build the same
+      lightweight context the GLM path uses.
+- [x] **Prompt upgrade**: `HIDDEN_ORCHESTRATOR_PROMPT` ported with the
+      task-awareness rules from `default_auto_prompt_system_prompt.txt`:
+      plan_summary-aware continuation (unchecked tasks → continue),
+      "NEVER declare done/blocked when unchecked tasks remain", GPU/benchmark
+      tasks are continue-not-stop, permission-seeking auto-answer, stop_phase
+      thresholds, lowest-numbered-plan priority. The no-tools + JSON-only hard
+      constraints are preserved.
 
 ## GOAT gate
 Items verifiable via tests (DONE):

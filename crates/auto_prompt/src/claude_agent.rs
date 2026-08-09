@@ -73,10 +73,17 @@ Rules:
 /// output, otherwise the hidden session could start doing real work instead of
 /// just judging the worker's output (tool-leak). This is the primary safety
 /// control for the hidden-thread path.
+///
+/// Decision rules are ported from `default_auto_prompt_system_prompt.txt` so the
+/// hidden path has the same task-awareness as the native-agent GLM path:
+/// plan_summary awareness (unchecked `[ ]` tasks → continue), stop-phase
+/// thresholds, permission-seeking auto-answer, and the "never declare done/blocked
+/// when unchecked tasks remain" rule. See .plans/014 (context-parity fix).
 #[cfg(feature = "claude-hidden-orchestrator")]
 const HIDDEN_ORCHESTRATOR_PROMPT: &str = "\
 You are an auto-prompt orchestrator. Your ONLY job is to read another Claude
-Code agent's last output and decide whether IT should continue or stop.
+Code agent's last output and the plan context, then decide whether IT should
+continue or stop.
 
 HARD CONSTRAINTS (do not violate under any circumstance):
 - Do NOT run any tools. Do NOT read or write files. Do NOT use any tool.
@@ -87,16 +94,63 @@ HARD CONSTRAINTS (do not violate under any circumstance):
 JSON schema (each key once, never duplicate):
   {\"continue\": bool, \"confidence\": float, \"next_prompt\": string|null, \"reason\": string}
 
-Rules:
-- continue=true iff the worker clearly has more work to do (unfinished steps,
-  remaining tasks, partial implementation, an error to fix, a question it can
-  answer itself by continuing).
-- continue=false iff the task is done, the worker is waiting for genuine user
-  input (credentials, explicit choice), or it stopped with a clear completion
-  summary.
+You receive:
+- Context JSON with: stop_phase (Working/PreStop/Verified), iteration_count,
+  had_error, last_assistant_message, plan_summary (list of plans with unchecked
+  task counts). READ plan_summary — it is the most important continue signal.
+- Worker's last output (2-3 paragraphs).
+
+## Decision rules (in priority order):
+
+1. CHECK plan_summary FIRST. This is the strongest signal:
+   - If ANY plan has unchecked tasks (unchecked > 0) → continue=true,
+     confidence >= 0.8. The worker is NOT done.
+   - NEVER declare a plan \"done\" or \"blocked\" when it has unchecked tasks.
+     \"Blocked on GPU/training/benchmark\" is NOT a valid stop reason — those
+     are tasks to implement, not skip.
+   - If a task requires GPU training → next_prompt = \"Implement the GPU training
+     task. Set up the pipeline and benchmarks.\"
+   - If a task requires benchmarks → next_prompt = \"Implement the benchmark.
+     Write the benchmark code and run it.\"
+   - Prefer the LOWEST-NUMBERED plan with unchecked tasks. Do NOT skip to a
+     newer plan just because it looks easier.
+   - next_prompt should reference the plan file: \"Continue with [task] from
+     .plans/NNN. Mark completed steps as [x].\"
+
+2. CHECK last_assistant_message for completion signals:
+   - Mentions \"remaining\", \"next step\", \"still need\", \"todo\", or lists unchecked
+     work → continue=true, confidence >= 0.7, next_prompt = that work as instruction.
+   - Summarizes completion with NOTHING left (AND plan_summary is empty) →
+     continue=false, confidence >= 0.8.
+   - Says \"done\" BUT plan_summary shows unchecked tasks → plan_summary wins,
+     continue=true.
+
+3. PERMISSION-SEEKING questions → answer automatically by restating the task:
+   - \"Want me to implement X?\" → continue=true, confidence >= 0.8,
+     next_prompt = \"Implement X as described. Production grade only.\"
+   - \"Should I proceed?\" → continue=true, confidence >= 0.8,
+     next_prompt = \"Proceed with the work described. Production grade only.\"
+   - Do NOT prefix next_prompt with \"Yes\", \"Sure\", \"OK\" — next_prompt is a
+     standalone instruction, not a conversational reply.
+
+4. USER-DECISION questions → stop (genuinely needs the human):
+   - Triggers: \"I won't pick for you\", \"you decide\", \"need your input\",
+     \"awaiting your decision\".
+   - → continue=false, confidence >= 0.7. Another nudge produces the same
+     question; stop so the user sees it.
+
+5. STOP-PHASE thresholds (stop_phase is in the Context JSON):
+   - Working phase: lenient — when in doubt, lean toward continuing.
+   - PreStop phase: strict — the worker already tried to stop once. Only
+     continue if unchecked tasks clearly remain (confidence >= 0.8).
+   - Verified phase: very strict — only continue on hard evidence of remaining work.
+
+6. iteration_count > 15 → continue=false (runaway loop guard).
+
+7. No active task / greeting / small talk → continue=false, confidence >= 0.8.
+   Do NOT fabricate work.
+
 - confidence is 0.0..1.0 — how sure you are of the continue/stop verdict.
-- next_prompt: when continue=true, a direct imperative instruction for the
-  worker's next step (standalone, not a conversational reply). null when stop.
 - reason: one short sentence explaining the verdict.";
 
 /// Decide the next auto-prompt action for a Claude (ACP) agent thread.
@@ -277,11 +331,35 @@ fn claude_decision_needs_llm(
 /// Async LLM call for the Claude path.
 /// Hidden-thread backend (`claude-hidden-orchestrator` feature): package a
 /// `NeedsLlmCall` decision that carries the worker's connection + project so
-/// the async phase can spawn an off-screen Claude Code session to decide
-/// continue/stop. The hidden session uses Claude Code's own auth — no
-/// Anthropic API key required. The configured LanguageModelRegistry model (if
-/// any) is carried only to satisfy the shared `LlmCallData` shape and is
-/// ignored by `decide_claude_with_hidden_thread`.
+/// Compute the stop lifecycle phase from the process-global verification
+/// counter, mirroring the native-agent path's logic. The hidden orchestrator
+/// needs this to apply the correct confidence threshold (Working: lenient,
+/// PreStop/Verified: strict) and to include it in the context JSON so the
+/// hidden session can see it.
+#[cfg(feature = "claude-hidden-orchestrator")]
+fn compute_claude_stop_phase() -> crate::context::StopPhase {
+    use std::sync::atomic::Ordering;
+    let verification_count = crate::VERIFICATION_COUNT.load(Ordering::Relaxed);
+    let max = crate::AutoPromptConfig::load()
+        .map(|c| c.max_verification_attempts)
+        .unwrap_or(2);
+    if verification_count == 0 {
+        crate::context::StopPhase::Working
+    } else if verification_count >= max {
+        crate::context::StopPhase::Verified
+    } else {
+        crate::context::StopPhase::PreStop
+    }
+}
+
+/// Hidden-thread orchestrator decision builder (feature `claude-hidden-orchestrator`).
+///
+/// Captures the worker thread's connection + project so the async phase can
+/// spawn an off-screen hidden Claude Code session to decide continue/stop.
+/// The hidden session uses Claude Code's own auth — no Anthropic API key
+/// required. The configured LanguageModelRegistry model (if any) is carried
+/// only to satisfy the shared `LlmCallData` shape and is ignored by
+/// `decide_claude_with_hidden_thread`.
 #[cfg(feature = "claude-hidden-orchestrator")]
 fn claude_decision_hidden(
     thread: &gpui::Entity<acp_thread::AcpThread>,
@@ -322,10 +400,21 @@ fn claude_decision_hidden(
 
     let project = thread.read(cx).project().clone();
 
+    // Read plan files from disk (same as the native-agent path) so the
+    // hidden orchestrator can see unchecked tasks. Without this, a worker
+    // that emits a completion summary with `[ ]` items still in the plan
+    // looks "done" — the orchestrator has no signal that work remains.
+    // See .plans/014_claude_offscreen_orchestrator.md (context-parity fix).
+    let plan_files = crate::read_plan_files(&thread.read(cx), None);
+    let stop_phase = compute_claude_stop_phase();
+
     let context_json = serde_json::json!({
         "session_id": session_id.to_string(),
         "iteration_count": iteration_count,
         "last_assistant_message": last_assistant_message,
+        "stop_phase": format!("{:?}", stop_phase),
+        "had_error": matches!(stop_reason, acp::StopReason::Refusal),
+        "plan_files": plan_files,
     })
     .to_string();
 
@@ -346,7 +435,7 @@ fn claude_decision_hidden(
         actual_input_tokens: None,
         had_error: matches!(stop_reason, acp::StopReason::Refusal),
         had_api_error: false,
-        stop_phase: crate::context::StopPhase::Working,
+        stop_phase: stop_phase,
         context_exceeds_limit: false,
         approximate_token_count: 0,
         connection: Some(connection),
@@ -564,10 +653,26 @@ async fn judge_with_hidden_session(
         .last_assistant_message
         .as_deref()
         .unwrap_or("(no worker output)");
-    let message = vec![acp::ContentBlock::Text(acp::TextContent::new(format!(
-        "{}\n\n--- WORKER OUTPUT BELOW ---\nContext: {}\n\nWorker's last output:\n{}",
-        data.system_prompt, data.context_json, worker_output,
-    )))];
+
+    // Build the same lightweight context the native-agent GLM path uses: parses
+    // context_json for plan_files, computes plan_summary (unchecked task counts
+    // per plan file), and includes stop_phase + iteration_count + had_error.
+    // Without this, the hidden session only sees the raw worker output and has
+    // no signal that plan tasks remain — causing false stops on completion
+    // summaries that still have `[ ]` items. See .plans/014 (context-parity).
+    let lightweight_context = crate::lightweight_context::build_lightweight_orchestration_context(
+        &data.context_json,
+        &data.stop_phase,
+        data.iteration_count,
+        data.had_error,
+    );
+
+    let message = vec![acp::ContentBlock::Text(acp::TextContent::new(
+        format!(
+            "{}\n\n--- CONTEXT + WORKER OUTPUT BELOW ---\n\nContext JSON:\n{}\n\nWorker's last output:\n{}",
+            data.system_prompt, lightweight_context, worker_output,
+        ),
+    ))];
 
     // send() runs a full turn and resolves on stop. Bound it with a timeout so
     // a runaway hidden session can't wedge the chain. 180s is generous for a
@@ -1255,6 +1360,36 @@ mod tests {
         assert!(CLAUDE_SYSTEM_PROMPT.contains("\"reason\""));
     }
 
+    #[cfg(feature = "claude-hidden-orchestrator")]
+    #[test]
+    fn test_hidden_orchestrator_prompt_has_plan_summary_awareness() {
+        // Context-parity fix: the hidden orchestrator must be aware of plan_summary
+        // so it doesn't stop on a completion summary when plan tasks remain.
+        // Pin the key decision rules so a future edit can't silently regress.
+        let prompt = HIDDEN_ORCHESTRATOR_PROMPT;
+        assert!(
+            prompt.contains("plan_summary"),
+            "hidden prompt must reference plan_summary (the primary continue signal)"
+        );
+        assert!(
+            prompt.contains("unchecked"),
+            "hidden prompt must reference unchecked tasks"
+        );
+        assert!(
+            prompt.contains("NEVER"),
+            "hidden prompt must have a NEVER-declare-done rule for unchecked tasks"
+        );
+        assert!(
+            prompt.to_ascii_lowercase().contains("gpu training")
+                || prompt.to_ascii_lowercase().contains("benchmark"),
+            "hidden prompt must treat GPU/benchmark tasks as continue, not stop"
+        );
+        assert!(
+            prompt.contains("stop_phase"),
+            "hidden prompt must reference stop_phase for phase-aware thresholds"
+        );
+    }
+
     // --- Hidden-thread orchestrator (claude-hidden-orchestrator feature) ---
 
     #[cfg(feature = "claude-hidden-orchestrator")]
@@ -1918,6 +2053,73 @@ mod tests {
                 connection_b.close_count(), 1,
                 "decision B's hidden session must be closed exactly once"
             );
+        }
+
+        /// Plan-summary awareness (context-parity fix): when the worker outputs a
+        /// completion summary BUT the plan_summary shows unchecked tasks, the
+        /// orchestrator must CONTINUE, not stop. This is the exact scenario the
+        /// fix addresses: a worker says "done" with `[ ]` items still in the
+        /// plan — the GLM path already continues via plan_summary, and now the
+        /// hidden Claude path does too.
+        #[gpui::test]
+        async fn test_hidden_thread_continues_when_plan_has_unchecked_tasks(
+            cx: &mut gpui::TestAppContext,
+        ) {
+            init_test(cx);
+
+            let fs = fs::FakeFs::new(cx.executor());
+            let project = project::Project::test(fs, [], cx).await;
+
+            let connection = Rc::new(
+                StubAgentConnection::new().with_supports_close_session(true),
+            );
+            // The hidden session sees plan_summary with unchecked tasks and
+            // returns continue (the new prompt rule fires). The worker's own
+            // output says "all done" — plan_summary must win.
+            connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+                acp::ContentChunk::new(
+                    r#"{"continue": true, "confidence": 0.9, "next_prompt": "Continue with T4.4 from .plans/330. Mark completed steps as [x].", "reason": "Plan 330 has unchecked tasks."}"#.into(),
+                ),
+            )]);
+
+            let mut data = build_test_data(
+                connection.clone(),
+                project,
+                "## Summary\n\nAll done. T4.4 blocked on M3.",
+            );
+            // Inject plan_files into context_json so
+            // build_lightweight_orchestration_context sees unchecked tasks.
+            data.context_json = serde_json::json!({
+                "session_id": "test-worker",
+                "iteration_count": 1,
+                "last_assistant_message": "## Summary\n\nAll done. T4.4 blocked on M3.",
+                "plan_files": [{
+                    "path": ".plans/330_test.md",
+                    "content": "- [x] T4.1 done\n- [x] T4.2 done\n- [ ] T4.4 sweep\n- [ ] T5.3 NF-CoT\n"
+                }],
+            }).to_string();
+
+            let outcome = cx
+                .update(|cx| {
+                    cx.spawn(async move |cx| {
+                        decide_claude_with_hidden_thread(data, cx).await
+                    })
+                })
+                .await
+                .expect("hidden-thread decision succeeded");
+
+            match outcome {
+                AutoPromptOutcome::Continue(action) => {
+                    assert!(
+                        action.next_prompt.contains("330"),
+                        "next_prompt should reference the plan with unchecked tasks, got: {}",
+                        action.next_prompt
+                    );
+                }
+                other => panic!(
+                    "expected Continue when plan has unchecked tasks, got {other:?}"
+                ),
+            }
         }
     }
 }
