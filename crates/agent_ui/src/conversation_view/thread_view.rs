@@ -5975,12 +5975,7 @@ impl ThreadView {
             })
             .collect();
 
-        Some(
-            h_flex()
-                .gap_0p5()
-                .children(chips)
-                .into_any_element(),
-        )
+        Some(h_flex().gap_0p5().children(chips).into_any_element())
     }
 
     /// Renders a single K1/K2/K3/K4 chip. Color reflects the slot's state so
@@ -6052,9 +6047,10 @@ impl ThreadView {
             // Healthy + enabled gets the tinted fill ("in rotation");
             // everything else is outlined/subtle so the user reads the muted
             // and warning states as "needs attention".
-            .when(status.has_key && status.enabled && !status.is_backed_off, |this| {
-                this.style(ButtonStyle::Tinted(TintColor::Accent))
-            })
+            .when(
+                status.has_key && status.enabled && !status.is_backed_off,
+                |this| this.style(ButtonStyle::Tinted(TintColor::Accent)),
+            )
             .when(!status.has_key, |this| {
                 this.disabled(true).style(ButtonStyle::Transparent)
             })
@@ -7468,6 +7464,26 @@ impl ThreadView {
                 }))
         });
 
+        let copy_summary_button = copy_response_index
+            .filter(|&response_index| {
+                Self::get_agent_summary_content(thread.read(cx).entries(), response_index, cx)
+                    .is_some()
+            })
+            .map(|response_index| {
+                IconButton::new(("copy_agent_summary", entry_ix), IconName::TextSnippet)
+                    .icon_size(IconSize::Small)
+                    .icon_color(Color::Muted)
+                    .tooltip(Tooltip::text("Copy Summary"))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let entries = this.thread.read(cx).entries();
+                        if let Some(text) =
+                            Self::get_agent_summary_content(entries, response_index, cx)
+                        {
+                            cx.write_to_clipboard(ClipboardItem::new_string(text));
+                        }
+                    }))
+            });
+
         let scroll_to_recent_user_prompt = IconButton::new(
             ("scroll_to_recent_user_prompt", entry_ix),
             IconName::UserArrowUp,
@@ -7607,6 +7623,7 @@ impl ThreadView {
                 },
             )
             .when_some(feedback_buttons, |this, buttons| this.child(buttons))
+            .when_some(copy_summary_button, |this, button| this.child(button))
             .when_some(copy_response_button, |this, button| this.child(button))
             .child(manual_auto_prompt_button)
             .child(scroll_to_recent_user_prompt)
@@ -8053,13 +8070,7 @@ impl ThreadView {
                             return;
                         };
                         panel.update(cx, |panel, cx| {
-                            panel.open_thread(
-                                from_session_id.clone(),
-                                None,
-                                None,
-                                window,
-                                cx,
-                            );
+                            panel.open_thread(from_session_id.clone(), None, None, window, cx);
                         });
                     }),
             );
@@ -8115,13 +8126,7 @@ impl ThreadView {
                             return;
                         };
                         panel.update(cx, |panel, cx| {
-                            panel.open_thread(
-                                to_session_id.clone(),
-                                None,
-                                None,
-                                window,
-                                cx,
-                            );
+                            panel.open_thread(to_session_id.clone(), None, None, window, cx);
                         });
                     }),
             );
@@ -8693,9 +8698,7 @@ impl ThreadView {
                                 text.push_str(" \u{00b7} ");
                                 text.push_str(key);
                             }
-                            Label::new(text)
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted)
+                            Label::new(text).size(LabelSize::XSmall).color(Color::Muted)
                         }))
                         .child(
                             h_flex()
@@ -9041,6 +9044,15 @@ impl ThreadView {
 
         let text = parts.join("\n\n");
         if text.is_empty() { None } else { Some(text) }
+    }
+
+    fn get_agent_summary_content(
+        entries: &[AgentThreadEntry],
+        entry_index: usize,
+        cx: &App,
+    ) -> Option<String> {
+        let content = Self::get_agent_message_content(entries, entry_index, cx)?;
+        extract_summary_section(&content)
     }
 
     fn is_blocked_on_terminal_command(&self, cx: &App) -> bool {
@@ -9680,42 +9692,39 @@ impl ThreadView {
                 | ToolCallStatus::InProgress
                 | ToolCallStatus::Completed
                 | ToolCallStatus::Failed
-                | ToolCallStatus::Canceled => v_flex()
-                    .when(should_show_raw_input, |this| {
-                        this.mt_1p5().w_full().child(
-                            v_flex()
-                                .ml(rems(0.4))
-                                .px_3p5()
-                                .pb_1()
-                                .gap_1()
-                                .border_l_1()
-                                .border_color(self.tool_card_border_color(cx))
-                                .child(input_output_header("Raw Input:".into()))
-                                .children(tool_call.raw_input_markdown.clone().map(|input| {
-                                    div().id(("tool-call-raw-input-markdown", entry_ix)).child(
-                                        self.render_markdown(
-                                            input,
-                                            self.markdown_style_for_thread(
-                                                MarkdownStyle::themed(
-                                                    MarkdownFont::Agent,
-                                                    window,
+                | ToolCallStatus::Canceled => {
+                    v_flex()
+                        .when(should_show_raw_input, |this| {
+                            this.mt_1p5().w_full().child(
+                                v_flex()
+                                    .ml(rems(0.4))
+                                    .px_3p5()
+                                    .pb_1()
+                                    .gap_1()
+                                    .border_l_1()
+                                    .border_color(self.tool_card_border_color(cx))
+                                    .child(input_output_header("Raw Input:".into()))
+                                    .children(tool_call.raw_input_markdown.clone().map(|input| {
+                                        div().id(("tool-call-raw-input-markdown", entry_ix)).child(
+                                            self.render_markdown(
+                                                input,
+                                                self.markdown_style_for_thread(
+                                                    MarkdownStyle::themed(
+                                                        MarkdownFont::Agent,
+                                                        window,
+                                                        cx,
+                                                    ),
                                                     cx,
                                                 ),
                                                 cx,
                                             ),
-                                            cx,
-                                        ),
-                                    )
-                                }))
-                                .child(input_output_header("Output:".into())),
-                        )
-                    })
-                    .children(
-                        tool_call
-                            .content
-                            .iter()
-                            .enumerate()
-                            .map(|(content_ix, content)| {
+                                        )
+                                    }))
+                                    .child(input_output_header("Output:".into())),
+                            )
+                        })
+                        .children(tool_call.content.iter().enumerate().map(
+                            |(content_ix, content)| {
                                 div().id(("tool-call-output", entry_ix)).child(
                                     self.render_tool_call_content(
                                         active_session_id,
@@ -9740,19 +9749,19 @@ impl ThreadView {
                             let tool_call_id = tool_call.id.clone();
 
                             this.child(
-                            div()
-                                .ml(rems(0.4))
-                                .px_3p5()
-                                .pt_2()
-                                .border_l_1()
-                                .border_color(self.tool_card_border_color(cx))
-                                .child(
-                                    IconButton::new(button_id, IconName::ChevronUp)
-                                        .full_width()
-                                        .style(ButtonStyle::Outlined)
-                                        .icon_color(Color::Muted)
-                                        .on_click(cx.listener({
-                                            move |this: &mut Self,
+                                div()
+                                    .ml(rems(0.4))
+                                    .px_3p5()
+                                    .pt_2()
+                                    .border_l_1()
+                                    .border_color(self.tool_card_border_color(cx))
+                                    .child(
+                                        IconButton::new(button_id, IconName::ChevronUp)
+                                            .full_width()
+                                            .style(ButtonStyle::Outlined)
+                                            .icon_color(Color::Muted)
+                                            .on_click(cx.listener({
+                                                move |this: &mut Self,
                                                   _,
                                                   window,
                                                   cx: &mut Context<Self>| {
@@ -9762,17 +9771,18 @@ impl ThreadView {
                                                 this.refresh_thread_search(window, cx);
                                                 cx.notify();
                                             }
-                                        })),
-                                ),
-                        )
+                                            })),
+                                    ),
+                            )
                         })
-                        .into_any(),
-                    ToolCallStatus::Rejected => Empty.into_any(),
+                        .into_any()
                 }
-                .into()
-            } else {
-                None
-            };
+                ToolCallStatus::Rejected => Empty.into_any(),
+            }
+            .into()
+        } else {
+            None
+        };
 
         let permission_buttons =
             if let ToolCallStatus::WaitingForConfirmation { options, .. } = &tool_call.status {
@@ -13201,9 +13211,11 @@ impl ThreadView {
                                 format!("Switch to {}", fallback.name().0),
                             )
                             .label_size(LabelSize::Small)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.switch_to_data_retention_fallback_and_resend(window, cx);
-                            })),
+                            .on_click(cx.listener(
+                                |this, _, window, cx| {
+                                    this.switch_to_data_retention_fallback_and_resend(window, cx);
+                                },
+                            )),
                         )
                     })
                     .child(
@@ -13966,6 +13978,98 @@ fn strip_leading_command(text: &str, command_name: &str) -> String {
         .unwrap_or_else(|| trimmed.to_string())
 }
 
+/// Bold-only lines (`**Summary**`) act as headings too, but rank below every
+/// ATX level so any real heading — or another bold line — closes their section.
+const BOLD_PSEUDO_HEADING_LEVEL: usize = 7;
+
+/// Parses `line` as a markdown heading, returning its level and title text.
+fn parse_markdown_heading(line: &str) -> Option<(usize, &str)> {
+    let trimmed = line.trim();
+
+    let level = trimmed.chars().take_while(|&c| c == '#').count();
+    if level > 0 {
+        if level > 6 {
+            return None;
+        }
+        let rest = &trimmed[level..];
+        if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+            return None;
+        }
+        return Some((level, rest.trim().trim_end_matches('#').trim()));
+    }
+
+    let inner = trimmed
+        .strip_prefix("**")
+        .and_then(|rest| rest.strip_suffix("**"))?;
+    (!inner.is_empty() && !inner.contains("**"))
+        .then_some((BOLD_PSEUDO_HEADING_LEVEL, inner.trim()))
+}
+
+/// Whether a heading title names a summary section, e.g. `Summary`,
+/// `## Summary of changes`, `**Summary:**`, or `### 📋 Summary`.
+fn is_summary_heading(title: &str) -> bool {
+    title.split_whitespace().any(|word| {
+        word.trim_matches(|c: char| !c.is_alphanumeric())
+            .eq_ignore_ascii_case("summary")
+    })
+}
+
+/// Extracts the last summary section of a markdown document, from its heading
+/// through to the next heading of the same or higher level. Returns `None` when
+/// there's no summary heading or the section has no body.
+fn extract_summary_section(markdown: &str) -> Option<String> {
+    let mut headings: Vec<(usize, usize, bool)> = Vec::new();
+    let mut open_fence: Option<char> = None;
+    let mut offset = 0;
+
+    for line in markdown.split_inclusive('\n') {
+        let trimmed = line.trim();
+        let fence = trimmed.chars().next().filter(|&c| {
+            (c == '`' || c == '~')
+                && trimmed
+                    .chars()
+                    .take_while(|&candidate| candidate == c)
+                    .count()
+                    >= 3
+        });
+
+        match (fence, open_fence) {
+            (Some(fence), Some(open)) if fence == open => open_fence = None,
+            (Some(fence), None) => open_fence = Some(fence),
+            (_, None) => {
+                if let Some((level, title)) = parse_markdown_heading(trimmed) {
+                    headings.push((offset, level, is_summary_heading(title)));
+                }
+            }
+            _ => {}
+        }
+
+        offset += line.len();
+    }
+
+    let (index, start, level) =
+        headings
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, &(start, level, is_summary))| {
+                is_summary.then_some((index, start, level))
+            })?;
+
+    let end = headings[index + 1..]
+        .iter()
+        .find(|&&(_, next_level, _)| next_level <= level)
+        .map(|&(next_start, _, _)| next_start)
+        .unwrap_or(markdown.len());
+
+    let section = markdown.get(start..end)?.trim_end();
+    let body_is_empty = section
+        .split_once('\n')
+        .is_none_or(|(_, body)| body.trim().is_empty());
+
+    (!body_is_empty).then(|| section.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -14033,6 +14137,69 @@ mod tests {
         );
         // No matching prefix: returns the trimmed input unchanged.
         assert_eq!(strip_leading_command("hello", "compact"), "hello");
+    }
+
+    #[test]
+    fn test_extract_summary_section() {
+        // Runs to the next heading of the same or higher level.
+        assert_eq!(
+            extract_summary_section(
+                "Some preamble.\n\n## Summary\n\n- did a thing\n- did another\n\n## Next steps\n\nmore"
+            )
+            .as_deref(),
+            Some("## Summary\n\n- did a thing\n- did another")
+        );
+
+        // Deeper headings stay inside the section; the trailing section runs to
+        // the end of the document.
+        assert_eq!(
+            extract_summary_section("### 📋 Summary of changes\n\n#### Files\n\n- `a.rs`\n")
+                .as_deref(),
+            Some("### 📋 Summary of changes\n\n#### Files\n\n- `a.rs`")
+        );
+
+        // Bold-only lines act as headings, and are closed by the next one.
+        assert_eq!(
+            extract_summary_section("**Summary:**\n\nall good\n\n**Caveats**\n\nnone").as_deref(),
+            Some("**Summary:**\n\nall good")
+        );
+
+        // The last summary heading wins.
+        assert_eq!(
+            extract_summary_section(
+                "## Summary\n\nfirst\n\n## Detail\n\nx\n\n## Summary\n\nsecond"
+            )
+            .as_deref(),
+            Some("## Summary\n\nsecond")
+        );
+
+        // Headings inside fenced code blocks are not summaries or terminators.
+        assert_eq!(
+            extract_summary_section("## Summary\n\n```md\n## Not a heading\n```\n\ndone")
+                .as_deref(),
+            Some("## Summary\n\n```md\n## Not a heading\n```\n\ndone")
+        );
+
+        assert_eq!(extract_summary_section("just prose, no headings"), None);
+        assert_eq!(extract_summary_section("## Results\n\nnothing here"), None);
+        // A summary heading with an empty body isn't worth copying.
+        assert_eq!(extract_summary_section("blah\n\n## Summary\n\n"), None);
+    }
+
+    #[test]
+    fn test_parse_markdown_heading() {
+        assert_eq!(parse_markdown_heading("## Summary"), Some((2, "Summary")));
+        assert_eq!(
+            parse_markdown_heading("  ### Summary ###  "),
+            Some((3, "Summary"))
+        );
+        assert_eq!(parse_markdown_heading("**Summary**"), Some((7, "Summary")));
+        // Needs whitespace after the hashes, and at most six of them.
+        assert_eq!(parse_markdown_heading("#hashtag"), None);
+        assert_eq!(parse_markdown_heading("####### too deep"), None);
+        // Partially bold lines are prose, not headings.
+        assert_eq!(parse_markdown_heading("**bold** and more"), None);
+        assert_eq!(parse_markdown_heading("plain text"), None);
     }
 
     #[gpui::test]
@@ -14328,7 +14495,10 @@ fn slice_messages_for_branch(
 ///
 /// Extracted from `branch_to_new_thread` so the boundary logic can be
 /// unit-tested without rendering a view.
-fn transcript_entry_count(entries: &[AgentThreadEntry], up_to: Option<&ClientUserMessageId>) -> usize {
+fn transcript_entry_count(
+    entries: &[AgentThreadEntry],
+    up_to: Option<&ClientUserMessageId>,
+) -> usize {
     match up_to {
         Some(id) => entries
             .iter()
@@ -14358,10 +14528,7 @@ fn transcript_entry_count(entries: &[AgentThreadEntry], up_to: Option<&ClientUse
 ///
 /// Extracted from `render_turn_end_separator` so the boundary logic can be
 /// unit-tested without rendering a view.
-fn assistant_message_closes_turn(
-    entries: &[AgentThreadEntry],
-    entry_ix: usize,
-) -> bool {
+fn assistant_message_closes_turn(entries: &[AgentThreadEntry], entry_ix: usize) -> bool {
     let Some(rest) = entries.get(entry_ix + 1..) else {
         // entry_ix is the last entry — vacuously closes the turn.
         return true;
@@ -14585,11 +14752,7 @@ mod branch_boundary_tests {
         // non-assistant entry (e.g. a canceled ToolCall after Stop). The
         // preceding assistant message MUST still close the turn so "Branch
         // New Thread" shows alongside "Restore Checkpoint".
-        let entries = vec![
-            entry_user(None, "u1"),
-            entry_assistant(),
-            entry_other(),
-        ];
+        let entries = vec![entry_user(None, "u1"), entry_assistant(), entry_other()];
         assert!(
             assistant_message_closes_turn(&entries, 1),
             "trailing non-assistant entry must not suppress the turn separator"
