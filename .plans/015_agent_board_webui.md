@@ -324,10 +324,11 @@ the prefix length can be increased to 6 or 8 chars.
       room snapshot with/without replies).
 - [x] `auto_prompt/src/peer_states.rs`: 3 web reply tests (inject/drain round-trip,
       drain clears, multiple sessions).
-- [-] `agent_board/src/feeder.rs`: reply extraction test — deferred (needs plan_registry
-      global reset for test isolation).
+- [x] `agent_board/src/feeder.rs`: reply extraction test — reply filter extracted into
+      pure `extract_replies_for_device` fn, 3 tests (match, skip other device, empty snapshot).
 - [x] Worker JS: `verifyGoogleToken` tested by sub-agent with mock JWKS.
-- [-] Session prefix resolution test — deferred (requires GPUI TestAppContext).
+- [x] Session prefix resolution test — `test_thread_for_session_prefix_resolves_active_thread`
+      in `agent_panel.rs` (full id lookup, prefix lookup, unknown prefix → None).
 
 ## Perf/sec considerations
 
@@ -401,8 +402,13 @@ No new crate dependencies. `agent_board` gains `websocket_client` module.
 - [ ] Claude agent thread receives the reply as a regular user message.
 - [ ] Zed 📡 toggle: ON = instant replies, OFF = poll fallback.
 - [ ] Zed chat panel shows 🌐 badge for web-originated replies.
-- [ ] 4-char session prefix resolves correctly (exact match, no collision).
-- [ ] Replies targeting a non-existent session are silently skipped (no crash).
-- [ ] Wire contract: `WebReply` JSON round-trips between worker JS and Rust types.
-- [ ] Old room snapshots without `replies` field still deserialize.
+- [x] 4-char session prefix resolves correctly (exact match, no collision).
+      Verified by `test_thread_for_session_prefix_resolves_active_thread` in `agent_panel.rs`.
+- [x] Replies targeting a non-existent session are silently skipped (no crash).
+      Verified by `test_thread_for_session_prefix_resolves_active_thread` (unknown prefix → None) +
+      `extract_replies_skips_other_devices` (wrong device → empty, no crash).
+- [x] Wire contract: `WebReply` JSON round-trips between worker JS and Rust types.
+      Verified by `web_reply_serializes` + `worker_reply_output_deserializes` in `types.rs`.
+- [x] Old room snapshots without `replies` field still deserialize.
+      Verified by `room_snapshot_without_replies_defaults_empty` in `types.rs`.
 - [ ] Worker auto-relays HTTP POSTs to connected browser WebSockets (auto-accept).

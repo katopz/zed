@@ -14634,10 +14634,12 @@ mod branch_boundary_tests {
 
     fn entry_user(id: Option<ClientUserMessageId>, _text: &str) -> AgentThreadEntry {
         AgentThreadEntry::UserMessage(acp_thread::UserMessage {
-            id,
+            protocol_id: None,
+            client_id: id,
+            is_optimistic: false,
             // `content`/`chunks` are irrelevant to the count logic under test;
             // `Empty` avoids needing a Markdown entity + cx to construct.
-            content: ContentBlock::Empty,
+            content: acp_thread::ContentBlock::Empty,
             chunks: vec![],
             checkpoint: None,
             indented: false,
@@ -14709,6 +14711,7 @@ mod branch_boundary_tests {
     fn entry_other() -> AgentThreadEntry {
         AgentThreadEntry::ContextCompaction(acp_thread::ContextCompaction {
             id: ContextCompactionId(std::sync::Arc::from("")),
+            status: acp_thread::ContextCompactionStatus::Completed,
             summary: None,
         })
     }

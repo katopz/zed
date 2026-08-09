@@ -35,7 +35,10 @@ pub async fn sync_round(
     project_path: &str,
     local_session_id: &str,
 ) -> Result<RoomSnapshot> {
-    let snapshot = client.get_room(room).await.context("fetching room snapshot")?;
+    let snapshot = client
+        .get_room(room)
+        .await
+        .context("fetching room snapshot")?;
 
     // 1. Inject remote claims into the local registry so auto_prompt's existing
     //    context builder picks them up. Each remote device's scopes are
@@ -64,13 +67,8 @@ pub async fn sync_round(
     //    4-char session-id prefix. The agent_panel notification timer resolves
     //    the prefix to an active session and injects the text.
     let device_name = identity.device_name();
-    for reply in &snapshot.replies {
-        if reply.target_device == device_name {
-            auto_prompt::peer_states::inject_web_reply(
-                reply.target_session_prefix.clone(),
-                reply.text.clone(),
-            );
-        }
+    for (prefix, text) in extract_replies_for_device(&snapshot, device_name) {
+        auto_prompt::peer_states::inject_web_reply(prefix, text);
     }
 
     // 4. Push our own status (local claims only) so other devices see us.
@@ -84,6 +82,23 @@ pub async fn sync_round(
     crate::board_state::set_room_snapshot(snapshot.clone());
 
     Ok(snapshot)
+}
+
+/// Extract the `(target_session_prefix, text)` pairs from a room snapshot
+/// that target the given device. Pure filter — no side effects — so it can be
+/// unit-tested without touching the global `plan_registry` or `peer_states`
+/// stores. The caller (`sync_round`) injects each pair into the peer-states
+/// reply queue.
+pub(crate) fn extract_replies_for_device(
+    snapshot: &RoomSnapshot,
+    device_name: &str,
+) -> Vec<(String, String)> {
+    snapshot
+        .replies
+        .iter()
+        .filter(|reply| reply.target_device == device_name)
+        .map(|reply| (reply.target_session_prefix.clone(), reply.text.clone()))
+        .collect()
 }
 
 /// Re-claim every remote scope into the local `plan_registry`. Local (non-remote)
@@ -187,5 +202,64 @@ mod tests {
     #[test]
     fn remote_prefix_is_namespaced() {
         assert!(REMOTE_SESSION_PREFIX.starts_with("remote:"));
+    }
+
+    fn make_reply(target_device: &str, prefix: &str, text: &str) -> crate::types::WebReply {
+        use crate::types::WebReply;
+        WebReply {
+            v: 1,
+            target_device: target_device.to_string(),
+            target_session_prefix: prefix.to_string(),
+            text: text.to_string(),
+            author_email: "katopz@gmail.com".to_string(),
+            ts: 1700000000000,
+        }
+    }
+
+    fn snapshot_with_replies(replies: Vec<crate::types::WebReply>) -> RoomSnapshot {
+        RoomSnapshot {
+            v: 1,
+            room: "test".to_string(),
+            statuses: Vec::new(),
+            messages: Vec::new(),
+            states: Vec::new(),
+            replies,
+        }
+    }
+
+    #[test]
+    fn extract_replies_for_matching_device() {
+        let snapshot = snapshot_with_replies(vec![
+            make_reply("m3", "f3a2", "stop and commit"),
+            make_reply("SHIKUWA", "b1c9", "switch to develop"),
+            make_reply("m3", "9d0e", "rebase first"),
+        ]);
+        let result = extract_replies_for_device(&snapshot, "m3");
+        assert_eq!(result.len(), 2);
+        assert_eq!(
+            result[0],
+            ("f3a2".to_string(), "stop and commit".to_string())
+        );
+        assert_eq!(result[1], ("9d0e".to_string(), "rebase first".to_string()));
+    }
+
+    #[test]
+    fn extract_replies_skips_other_devices() {
+        let snapshot = snapshot_with_replies(vec![
+            make_reply("SHIKUWA", "b1c9", "switch to develop"),
+            make_reply("SHIKUWA", "a2f1", "another"),
+        ]);
+        let result = extract_replies_for_device(&snapshot, "m3");
+        assert!(
+            result.is_empty(),
+            "no replies should match a different device"
+        );
+    }
+
+    #[test]
+    fn extract_replies_empty_snapshot() {
+        let snapshot = snapshot_with_replies(Vec::new());
+        let result = extract_replies_for_device(&snapshot, "m3");
+        assert!(result.is_empty());
     }
 }

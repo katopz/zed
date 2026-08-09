@@ -34,7 +34,7 @@ use gpui::{
     linear_gradient, list, pulsating_between,
 };
 use language::{Buffer, Language, Rope};
-use language_model::LanguageModelCompletionError;
+use language_model::{LanguageModelCompletionError, LanguageModelRegistry};
 use markdown::{
     CodeBlockRenderer, CopyButtonVisibility, Markdown, MarkdownElement, MarkdownFont, MarkdownStyle,
 };
@@ -1827,10 +1827,8 @@ impl ConversationView {
 
                     let sent_queued_message = if let Some(active) = self.root_thread_view() {
                         active.update(cx, |active, cx| {
-                            let is_first_editor_focused = active
-                                .message_queue
-                                .first()
-                                .is_some_and(|entry| {
+                            let is_first_editor_focused =
+                                active.message_queue.first().is_some_and(|entry| {
                                     entry.editor.focus_handle(cx).is_focused(window)
                                 });
                             if let Some(entry) = active
@@ -2021,13 +2019,7 @@ impl ConversationView {
         let parent_session_id = connected
             .threads
             .get(subagent_session_id)
-            .and_then(|tv| {
-                tv.read(cx)
-                    .thread
-                    .read(cx)
-                    .parent_session_id()
-                    .cloned()
-            });
+            .and_then(|tv| tv.read(cx).thread.read(cx).parent_session_id().cloned());
         let Some(parent_session_id) = parent_session_id else {
             return;
         };
@@ -11905,18 +11897,16 @@ pub(crate) mod tests {
         cx.run_until_parked();
 
         // Pre-timeout: thread is stuck Generating and the watchdog is armed.
-        let (status, watchdog_armed) =
-            active_thread(&conversation_view, cx).read_with(cx, |view, cx| {
-                (
-                    view.thread.read(cx).status(),
-                    view._watchdog_task.is_some(),
-                )
+        let (status, watchdog_armed) = active_thread(&conversation_view, cx)
+            .read_with(cx, |view, cx| {
+                (view.thread.read(cx).status(), view._watchdog_task.is_some())
             });
         assert_eq!(status, acp_thread::ThreadStatus::Generating);
         assert!(watchdog_armed, "watchdog should be armed while generating");
 
         // Advance the mock clock past the 1s window so the timer fires.
-        cx.executor().advance_clock(std::time::Duration::from_secs(2));
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(2));
         cx.run_until_parked();
 
         // The watchdog's reasoning call should now be parked inside
@@ -11936,10 +11926,12 @@ pub(crate) mod tests {
 
         // Post-HALT: the worker was cancelled and the timeout-notice prompt was
         // dispatched to the same thread, starting a new (also stuck) generation.
-        let (status, markdown) =
-            active_thread(&conversation_view, cx).read_with(cx, |view, cx| {
-                (view.thread.read(cx).status(), view.thread.read(cx).to_markdown(cx))
-            });
+        let (status, markdown) = active_thread(&conversation_view, cx).read_with(cx, |view, cx| {
+            (
+                view.thread.read(cx).status(),
+                view.thread.read(cx).to_markdown(cx),
+            )
+        });
         assert_eq!(
             status,
             acp_thread::ThreadStatus::Generating,
@@ -11997,12 +11989,9 @@ pub(crate) mod tests {
 
         // Generation 1 ran: thread is back to Idle and the watchdog was
         // cancelled by session_id via the Stopped handler.
-        let (status, watchdog_armed) =
-            active_thread(&conversation_view, cx).read_with(cx, |view, cx| {
-                (
-                    view.thread.read(cx).status(),
-                    view._watchdog_task.is_some(),
-                )
+        let (status, watchdog_armed) = active_thread(&conversation_view, cx)
+            .read_with(cx, |view, cx| {
+                (view.thread.read(cx).status(), view._watchdog_task.is_some())
             });
         assert_eq!(
             status,
@@ -12027,12 +12016,9 @@ pub(crate) mod tests {
         // a task from generation 1 whose `started_at` predated this send.
         // After the fix, `arm_watchdog` drops the stale task (already None here)
         // and creates a fresh one with `Instant::now()`.
-        let (status, watchdog_armed) =
-            active_thread(&conversation_view, cx).read_with(cx, |view, cx| {
-                (
-                    view.thread.read(cx).status(),
-                    view._watchdog_task.is_some(),
-                )
+        let (status, watchdog_armed) = active_thread(&conversation_view, cx)
+            .read_with(cx, |view, cx| {
+                (view.thread.read(cx).status(), view._watchdog_task.is_some())
             });
         assert_eq!(
             status,
@@ -12099,8 +12085,8 @@ pub(crate) mod tests {
             .read_with(cx, |view, cx| view.thread.read(cx).session_id().clone());
 
         // Sanity: thread is generating, watchdog armed.
-        let (status, watchdog_armed) =
-            active_thread(&conversation_view, cx).read_with(cx, |view, cx| {
+        let (status, watchdog_armed) = active_thread(&conversation_view, cx)
+            .read_with(cx, |view, cx| {
                 (view.thread.read(cx).status(), view._watchdog_task.is_some())
             });
         assert_eq!(status, acp_thread::ThreadStatus::Generating);
@@ -12110,13 +12096,12 @@ pub(crate) mod tests {
         // streaming chunk via send_update (set_next_prompt_updates only
         // applies to the NEXT prompt call, but this session is already
         // hanging). This bumps the activity counter.
-        cx.executor().advance_clock(std::time::Duration::from_secs(1));
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(1));
         cx.update(|_, cx| {
             connection.send_update(
                 session_id.clone(),
-                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
-                    "working...".into(),
-                )),
+                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new("working...".into())),
                 cx,
             );
         });
@@ -12124,7 +12109,8 @@ pub(crate) mod tests {
 
         // Advance past the original 2s window (total 3s). Without the activity
         // reset, the watchdog would have fired by now.
-        cx.executor().advance_clock(std::time::Duration::from_secs(2));
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(2));
         cx.run_until_parked();
 
         // The watchdog should NOT have called the reasoning LLM — the stream
@@ -12137,7 +12123,8 @@ pub(crate) mod tests {
 
         // Now stop feeding updates and advance past the timeout again.
         // With no activity for a full window, the watchdog should fire.
-        cx.executor().advance_clock(std::time::Duration::from_secs(3));
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(3));
         cx.run_until_parked();
 
         assert_eq!(

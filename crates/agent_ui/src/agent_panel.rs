@@ -4538,11 +4538,7 @@ impl AgentPanel {
     /// and retained conversation views, returning the first whose
     /// `session_id` starts with the given prefix. Logs a warning on collision
     /// (multiple matches).
-    pub fn thread_for_session_prefix(
-        &self,
-        prefix: &str,
-        cx: &App,
-    ) -> Option<Entity<AcpThread>> {
+    pub fn thread_for_session_prefix(&self, prefix: &str, cx: &App) -> Option<Entity<AcpThread>> {
         let mut matches = Vec::new();
         for view in self.conversation_views() {
             if let Some(thread) = view.read(cx).root_thread(cx) {
@@ -7939,6 +7935,51 @@ mod tests {
             assert!(
                 panel.active_terminal_id().is_some(),
                 "the single initial terminal should become active"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_thread_for_session_prefix_resolves_active_thread(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_visible_panel(cx).await;
+        open_thread_with_connection(&panel, StubAgentConnection::new(), &mut cx);
+        cx.run_until_parked();
+
+        let session_id = active_session_id(&panel, &cx).to_string();
+        assert!(
+            !session_id.is_empty(),
+            "stub session id should be non-empty"
+        );
+
+        // Full session id and its first char both resolve to the active thread.
+        // (Stub session ids are short numeric strings like "0", so we use a
+        // 1-char prefix instead of the production 4-char prefix.)
+        let prefix = &session_id[..1];
+        panel.read_with(&cx, |panel, cx| {
+            let found = panel.thread_for_session_prefix(&session_id, cx);
+            assert!(
+                found.is_some(),
+                "full session id lookup should find the thread"
+            );
+            let found = found.unwrap();
+            assert_eq!(
+                found.read(cx).session_id().to_string(),
+                session_id,
+                "resolved thread should match the active session"
+            );
+
+            let found_prefix = panel.thread_for_session_prefix(prefix, cx);
+            assert!(
+                found_prefix.is_some(),
+                "prefix lookup should find the active thread"
+            );
+
+            // Non-existent prefix returns None (no crash).
+            assert!(
+                panel
+                    .thread_for_session_prefix("zzz-not-a-session", cx)
+                    .is_none(),
+                "unknown prefix should resolve to None"
             );
         });
     }
@@ -11504,9 +11545,7 @@ mod tests {
         // ONLY potential guard would be _auto_prompt_task (which we deliberately
         // do NOT guard on).
         panel.update(&mut cx, |panel, cx| {
-            let view = panel
-                .active_conversation_view()
-                .expect("thread B active");
+            let view = panel.active_conversation_view().expect("thread B active");
             let thread_view = view
                 .read(cx)
                 .root_thread_view()
