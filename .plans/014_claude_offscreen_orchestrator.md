@@ -129,8 +129,25 @@ Items with static + live-run verification:
       protocol multiplexing (two sessions on one OS process/connection).
 - [ ] Real Claude Code prompt compliance (no tool-leak in production).
       Static defense: 3-layer guard (prompt forbids tools + programmatic entry
-      history check + parse-side JSON rejection). Live run confirms a real Claude
-      Code session respects the no-tools constraint.
+      history check + parse-side JSON rejection). Live run confirms a real
+      Claude Code session respects the no-tools constraint.
+      STATUS (2026-08-14): live harness built + validated —
+      `script/verify-hidden-orchestrator-compliance.sh`. It extracts the exact
+      `HIDDEN_ORCHESTRATOR_PROMPT` from `claude_agent.rs` (no drift), composes
+      the byte-exact message `judge_with_hidden_session` sends, runs real
+      headless `claude` in a bait workspace (unchecked plan file on disk that
+      plan_summary references — a leaking judge would Read it, and Read is
+      permitted headlessly so a leak is genuinely observable), then asserts:
+      zero tool_use/tool_result/toolUseResult events, num_turns == 1, verdict
+      parses per `parse_claude_response` (string-aware first-{...}), and rule-1
+      compliance (unchecked plan → continue, confidence ≥ 0.5).
+      First live attempt was quota-blocked: the operator's Claude subscription
+      hit its seven-day limit (resets 2026-08-14 22:00 Asia/Bangkok; the
+      harness detects this and exits 2 = BLOCKED with the reset time — not a
+      compliance failure). Re-run after reset:
+      `script/verify-hidden-orchestrator-compliance.sh` (exit 0 = compliant).
+      Static suite re-validated same day: `cargo test -p auto_prompt` →
+      329 + 40 passed, 0 failed (incl. all 17 hidden-orchestrator tests).
 
 ## Risks (acknowledged, not blockers)
 - Latency: full second Claude session per decision (3-10s vs ~1s LLM call).
@@ -153,6 +170,12 @@ Items with static + live-run verification:
 
 ## Live-run verification checklist
 Run these after building Zed with the feature (default-on, no flag needed):
+
+> Headless shortcut for Item 2 (no GUI needed):
+> `script/verify-hidden-orchestrator-compliance.sh` drives a real Claude Code
+> turn through the byte-exact orchestrator message and asserts no-tool-leak +
+> JSON compliance. Exit 0 = pass, 1 = violation, 2 = quota-blocked (rerun
+> after the printed reset time).
 
 ### Build
 ```bash
