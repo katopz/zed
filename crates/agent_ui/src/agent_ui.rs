@@ -7,6 +7,7 @@ mod agent_registry_ui;
 mod auto_prompt;
 
 mod buffer_codegen;
+mod claude_usage;
 mod completion_provider;
 mod config_options;
 mod context;

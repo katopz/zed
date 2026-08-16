@@ -1,11 +1,13 @@
 use crate::{
     DEFAULT_THREAD_TITLE, SelectPermissionGranularity,
     agent_configuration::configure_context_server_modal::default_markdown_style,
+    claude_usage::{ClaudeUsage, ClaudeUsageStore, UsageWindow},
     conversation_view::thread_search_bar::{ThreadSearchBar, ThreadSearchBarEvent},
     open_abs_path_at_point,
     thread_metadata_store::{ThreadId, ThreadMetadataStore},
 };
 use agent_client_protocol::schema::v1 as acp;
+use chrono::{DateTime, Local, Utc};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
@@ -904,6 +906,13 @@ impl ThreadView {
         let show_codex_windows_warning = cfg!(windows)
             && project.upgrade().is_some_and(|p| p.read(cx).is_local())
             && agent_id.as_ref() == "Codex";
+
+        // Subscription usage is only meaningful for the Claude agent, and
+        // observing the store is what starts polling for it.
+        if agent_id.as_ref() == agent_servers::CLAUDE_AGENT_ID {
+            let usage_store = ClaudeUsageStore::global(cx);
+            subscriptions.push(cx.observe(&usage_store, |_, _, cx| cx.notify()));
+        }
 
         if let Some(project) = project.upgrade() {
             subscriptions.push(cx.subscribe(&project, {
@@ -4688,6 +4697,7 @@ impl ThreadView {
                                     .min_w_0()
                                     .flex_wrap()
                                     .gap_1()
+                                    .children(self.render_claude_usage(cx))
                                     .children(self.render_token_usage(cx))
                                     .children(self.profile_selector.clone())
                                     .map(|this| match self.config_options_view.clone() {
@@ -4924,6 +4934,52 @@ impl ThreadView {
         self.as_native_thread(cx)
             .and_then(|thread| thread.read(cx).model())
             .is_some_and(|model| model.supports_split_token_display())
+    }
+
+    /// Rings for the Claude subscription's rolling 5-hour and weekly limits,
+    /// sitting next to the per-thread context ring.
+    fn render_claude_usage(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if self.agent_id.as_ref() != agent_servers::CLAUDE_AGENT_ID {
+            return None;
+        }
+
+        let usage = ClaudeUsageStore::try_global(cx)?.read(cx).usage()?.clone();
+        if usage.is_empty() {
+            return None;
+        }
+
+        let separator_color = Color::Custom(cx.theme().colors().text_disabled.opacity(0.6));
+        let build_tooltip = {
+            let usage = usage.clone();
+            move |_window: &mut Window, cx: &mut App| {
+                let usage = usage.clone();
+                cx.new(move |_cx| ClaudeUsageTooltip {
+                    usage,
+                    separator_color,
+                })
+                .into()
+            }
+        };
+
+        Some(
+            h_flex()
+                .id("claude_usage")
+                .flex_shrink_0()
+                .gap_1p5()
+                .mr_1()
+                .children(
+                    usage
+                        .five_hour
+                        .map(|window| render_usage_ring("5h", window, cx)),
+                )
+                .children(
+                    usage
+                        .seven_day
+                        .map(|window| render_usage_ring("7d", window, cx)),
+                )
+                .hoverable_tooltip(build_tooltip)
+                .into_any_element(),
+        )
     }
 
     fn render_token_usage(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
@@ -6343,6 +6399,85 @@ impl ThreadView {
             }
         }
         cx.notify();
+    }
+}
+
+fn render_usage_ring(label: &'static str, window: UsageWindow, cx: &App) -> impl IntoElement {
+    let progress_color = if window.used >= 0.85 {
+        cx.theme().status().warning
+    } else {
+        cx.theme().colors().text_muted
+    };
+
+    h_flex()
+        .gap_0p5()
+        .child(
+            Label::new(label)
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
+        )
+        .child(
+            CircularProgress::new(window.used, 1.0, px(16.0), cx)
+                .stroke_width(px(2.))
+                .progress_color(progress_color),
+        )
+}
+
+fn format_usage_percentage(window: UsageWindow) -> String {
+    format!("{}%", (window.used * 100.0).round() as u32)
+}
+
+fn format_usage_reset(resets_at: DateTime<Utc>) -> String {
+    format!(
+        "resets {}",
+        ui::utils::format_distance_from_now(
+            ui::utils::DateTimeType::Local(resets_at.with_timezone(&Local)),
+            false,
+            true,
+            true,
+        )
+    )
+}
+
+struct ClaudeUsageTooltip {
+    usage: ClaudeUsage,
+    separator_color: Color,
+}
+
+impl Render for ClaudeUsageTooltip {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let separator_color = self.separator_color;
+        let windows = [
+            ("5-hour", self.usage.five_hour),
+            ("Weekly", self.usage.seven_day),
+            ("Weekly (Opus)", self.usage.seven_day_opus),
+        ];
+
+        ui::tooltip_container(cx, move |container, _cx| {
+            container
+                .min_w_40()
+                .child(
+                    Label::new("Claude Usage")
+                        .color(Color::Muted)
+                        .size(LabelSize::Small),
+                )
+                .children(windows.into_iter().filter_map(|(label, window)| {
+                    let window = window?;
+                    Some(
+                        h_flex()
+                            .gap_0p5()
+                            .child(Label::new(label).color(Color::Muted).mr_0p5())
+                            .child(Label::new(format_usage_percentage(window)))
+                            .when_some(window.resets_at, |this, resets_at| {
+                                this.child(Label::new("\u{2022}").color(separator_color).mx_1())
+                                    .child(
+                                        Label::new(format_usage_reset(resets_at))
+                                            .color(Color::Muted),
+                                    )
+                            }),
+                    )
+                }))
+        })
     }
 }
 
