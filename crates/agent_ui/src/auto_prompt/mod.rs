@@ -578,10 +578,65 @@ pub fn on_thread_stopped(
     window: &mut Window,
     cx: &mut gpui::Context<crate::ConversationView>,
 ) -> Option<gpui::Task<()>> {
-    log::warn!(
-        "[auto_prompt] *** ENTRY POINT *** on_thread_stopped called: used_tools={}, stop_reason={:?}",
+    run_auto_prompt(
+        conversation_view,
+        thread,
         used_tools,
-        stop_reason
+        stop_reason,
+        None,
+        window,
+        cx,
+    )
+}
+
+/// Entry point for the user-clicked (manual) auto-prompt button.
+///
+/// Runs the *same* orchestration path as the automatic trigger so the
+/// continuation reasons about the agent's last paragraphs instead of sending a
+/// static "Continue from where we left off." — which is what a manual click
+/// used to do.
+///
+/// `fallback` is dispatched verbatim only when the orchestrator declines to
+/// produce a continuation (`NoAction`, `Stopped`, or a failed orchestration
+/// call). A click is an explicit request to continue, so the thread must always
+/// receive something; the automatic path, by contrast, correctly sends nothing.
+pub fn on_manual_auto_prompt(
+    conversation_view: &crate::ConversationView,
+    thread: &gpui::Entity<acp_thread::AcpThread>,
+    fallback: auto_prompt::AutoPromptAction,
+    window: &mut Window,
+    cx: &mut gpui::Context<crate::ConversationView>,
+) -> Option<gpui::Task<()>> {
+    run_auto_prompt(
+        conversation_view,
+        thread,
+        true,
+        &acp::StopReason::EndTurn,
+        Some(fallback),
+        window,
+        cx,
+    )
+}
+
+/// Shared implementation of [`on_thread_stopped`] and [`on_manual_auto_prompt`].
+///
+/// `manual_fallback` is `Some` only for the manual path; it marks the run as
+/// user-initiated (focus the continuation, always send something).
+fn run_auto_prompt(
+    conversation_view: &crate::ConversationView,
+    thread: &gpui::Entity<acp_thread::AcpThread>,
+    used_tools: bool,
+    stop_reason: &acp::StopReason,
+    manual_fallback: Option<auto_prompt::AutoPromptAction>,
+    window: &mut Window,
+    cx: &mut gpui::Context<crate::ConversationView>,
+) -> Option<gpui::Task<()>> {
+    let is_manual = manual_fallback.is_some();
+    log::warn!(
+        "[auto_prompt] *** ENTRY POINT *** on_thread_stopped called: used_tools={}, stop_reason={:?}, manual={}",
+        used_tools,
+        stop_reason,
+        is_manual
     );
 
     if matches!(stop_reason, acp::StopReason::MaxTokens) {
@@ -617,13 +672,24 @@ pub fn on_thread_stopped(
     log::info!("[auto_prompt] captured profile_id: {:?}", profile_id);
 
     match decision {
-        auto_prompt::AutoPromptDecision::NoAction => {
-            log::info!("[auto_prompt] NoAction - taking no action");
-            None
-        }
+        auto_prompt::AutoPromptDecision::NoAction => match manual_fallback {
+            // The user asked for a continuation, so send the generic one rather
+            // than silently doing nothing.
+            Some(mut fallback) => {
+                log::info!("[auto_prompt] NoAction on manual run - dispatching generic fallback");
+                fallback.profile_id = profile_id.take().or(fallback.profile_id);
+                dispatch_action(fallback, conversation_view, window, cx);
+                None
+            }
+            None => {
+                log::info!("[auto_prompt] NoAction - taking no action");
+                None
+            }
+        },
 
         auto_prompt::AutoPromptDecision::DispatchNow(mut action) => {
             action.profile_id = profile_id.take();
+            action.focus_new_thread |= is_manual;
             log::info!(
                 "[auto_prompt] DispatchNow - dispatching action with prompt: {}",
                 action.next_prompt
@@ -637,6 +703,7 @@ pub fn on_thread_stopped(
             delay_ms,
         } => {
             action.profile_id = profile_id.take();
+            action.focus_new_thread |= is_manual;
             log::info!(
                 "[auto_prompt] DispatchAfterDelay - scheduling action in {}ms with prompt: {}",
                 delay_ms,
@@ -892,8 +959,9 @@ pub fn on_thread_stopped(
                 log::info!("[auto_prompt] ASYNC TASK: LLM call completed");
 
                 match result {
-                    Ok(auto_prompt::AutoPromptOutcome::Continue(action)) => {
+                    Ok(auto_prompt::AutoPromptOutcome::Continue(mut action)) => {
                         auto_prompt::reset_llm_failure_count();
+                        action.focus_new_thread |= is_manual;
                         if let Some(ref tv) = thread_weak {
                             if let Err(err) = tv.update(cx, |tv, cx| {
                                 // Clear the task BEFORE dispatch so send_content() doesn't
@@ -984,6 +1052,24 @@ pub fn on_thread_stopped(
                         }
                         log::info!("[auto_prompt] Chain stopped: {reason}");
 
+                        // Manual run: the user explicitly asked to continue, so
+                        // honor the click with the generic continuation even
+                        // though the orchestrator judged the task complete.
+                        if let Some(fallback) = manual_fallback.clone() {
+                            log::info!(
+                                "[auto_prompt] Manual run - orchestrator stopped ({reason}), dispatching generic fallback"
+                            );
+                            match _view.update_in(cx, |_view, window, cx| {
+                                dispatch_action(fallback, _view, window, cx);
+                            }) {
+                                Ok(()) => {}
+                                Err(err) => log::warn!(
+                                    "[auto_prompt] FAILED to dispatch manual fallback (view may have been dropped): {err}"
+                                ),
+                            }
+                            return;
+                        }
+
                         if let Some(ref workspace) = workspace_weak {
                             let _ = workspace.update(cx, |workspace, cx| {
                                 let status_toast = StatusToast::new(
@@ -1026,6 +1112,36 @@ pub fn on_thread_stopped(
                     Err(err) => {
                         // Max retries exhausted (already tried in the loop above)
                         let error_message = format!("{err:#}");
+
+                        // Manual run: never leave a click with nothing sent —
+                        // degrade to the generic continuation instead of the
+                        // Failed state (which only offers a retry affordance).
+                        if let Some(fallback) = manual_fallback.clone() {
+                            log::warn!(
+                                "[auto_prompt] Manual run - orchestration failed ({error_message}), dispatching generic fallback"
+                            );
+                            if let Some(ref tv) = thread_weak {
+                                if let Err(update_err) = tv.update(cx, |tv, cx| {
+                                    tv._auto_prompt_task = None;
+                                    tv.auto_prompt_state = AutoPromptState::Idle;
+                                    cx.notify();
+                                }) {
+                                    log::warn!(
+                                        "[auto_prompt] failed to reset state before manual fallback: {update_err}"
+                                    );
+                                }
+                            }
+                            match _view.update_in(cx, |_view, window, cx| {
+                                dispatch_action(fallback, _view, window, cx);
+                            }) {
+                                Ok(()) => {}
+                                Err(dispatch_err) => log::warn!(
+                                    "[auto_prompt] FAILED to dispatch manual fallback (view may have been dropped): {dispatch_err}"
+                                ),
+                            }
+                            return;
+                        }
+
                         if let Some(ref tv) = thread_weak {
                             if let Err(update_err) = tv.update(cx, |tv, cx| {
                                 tv.auto_prompt_state =

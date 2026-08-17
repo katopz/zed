@@ -8559,7 +8559,7 @@ impl ThreadView {
         open_markdown_in_workspace(thread_title, markdown, workspace, window, cx)
     }
 
-    fn manual_auto_prompt(&self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn manual_auto_prompt(&self, window: &mut Window, cx: &mut Context<Self>) {
         let thread = self.thread.read(cx);
         let actual_input_tokens = thread.token_usage().map(|u| u.input_tokens);
         let session_id = thread.session_id().clone();
@@ -8628,7 +8628,12 @@ impl ThreadView {
             last_assistant_message.as_deref(),
         );
 
-        let action = auto_prompt::AutoPromptAction {
+        // Generic continuation used only if the orchestration LLM declines to
+        // produce one. The click itself routes through the same orchestrator as
+        // the automatic trigger (`on_manual_auto_prompt`), so the prompt the
+        // agent actually receives normally reasons about its last paragraphs
+        // rather than being this static nudge.
+        let fallback_action = auto_prompt::AutoPromptAction {
             from_session_id: session_id,
             from_title: title,
             next_prompt,
@@ -8644,13 +8649,23 @@ impl ThreadView {
 
         let conversation_view = self.server_view.upgrade();
         let thread_view_weak = cx.weak_entity();
+        let thread = self.thread.clone();
         window.defer(cx, move |window, cx| {
             if let Some(conversation_view) = conversation_view {
                 conversation_view.update(cx, |cv, cx| {
-                    crate::auto_prompt::dispatch_action(action, cv, window, cx);
+                    let task = crate::auto_prompt::on_manual_auto_prompt(
+                        cv,
+                        &thread,
+                        fallback_action,
+                        window,
+                        cx,
+                    );
                     if let Some(tv) = thread_view_weak.upgrade() {
                         tv.update(cx, |tv, cx| {
                             tv.auto_prompt_enabled = true;
+                            if let Some(task) = task {
+                                tv._auto_prompt_task = Some(task);
+                            }
                             cx.notify();
                         });
                     }

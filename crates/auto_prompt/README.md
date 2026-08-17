@@ -622,6 +622,21 @@ When the token count is below the `same_thread_token_threshold` (default 60K), c
 - **Native Zed agent**: the orchestration LLM's decision is emitted **as-is** (no static preamble prepended)
 - **ACP agents (Claude, etc.)**: a minimal orchestration LLM call reasons over the agent's last 2-3 paragraphs and returns `{continue, confidence, next_prompt, reason}`. The verdict drives continue-vs-stop; `next_prompt` (when continue) is sent as-is. See `claude_agent.rs`.
 
+### Manual auto-prompt (sparkle button)
+
+Clicking the sparkle button in a thread runs the **same** orchestration path as the automatic `Stopped` trigger — `agent_ui::auto_prompt::on_manual_auto_prompt()` calls `run_auto_prompt()` with `stop_reason = EndTurn` and a fallback action. So a manual click reasons about the agent's last paragraphs (and, on the hidden-orchestrator path, the plan files) exactly like an automatic continuation.
+
+The difference from the automatic path is only what happens when the orchestrator declines:
+
+| Orchestrator outcome | Automatic trigger | Manual click |
+|---|---|---|
+| `Continue` / `DispatchNow` | dispatch the decision | dispatch the decision (focused) |
+| `NoAction` | send nothing | dispatch the generic `"Continue from where we left off."` fallback |
+| `Stopped { reason }` | toast, send nothing | dispatch the generic fallback |
+| Orchestration call failed | `Failed` state + retry affordance | dispatch the generic fallback |
+
+A click is an explicit request to continue, so the thread must always receive something — but the static nudge is now the last resort, not the only behavior.
+
 The last assistant message is **not** repeated — it's already visible in the thread history. Only the orchestration LLM's decision is sent, keeping the continuation concise and avoiding the two-voice failure mode where a generic "Continue from where we left off…" preamble would be bolted onto a substantive task instruction.
 
 **`build_continuation_prompt(decision)` behavior** (`agent_ui/src/auto_prompt/mod.rs`):
@@ -629,7 +644,7 @@ The last assistant message is **not** repeated — it's already visible in the t
 | Decision content | Emitted message |
 |------------------|-----------------|
 | Substantive task (e.g. "Scaffold the issue file at…", "Implement X. Production grade only.") | The decision, unchanged |
-| Bare generic "Continue from where we left off." (manual auto-prompt, overflow fallback) | `"Continue from where we left off."` (minimal fallback) |
+| Bare generic "Continue from where we left off." (overflow fallback, orchestrator declined on a manual run) | `"Continue from where we left off."` (minimal fallback) |
 | Empty | `"Continue from where we left off."` (minimal fallback) |
 
 The fallback is intentionally minimal. Behavioral meta-instructions ("commit when done", "review remaining work") belong in the agent's system prompt or the user's `AGENTS.md`, not bolted onto every same-thread continuation — otherwise a reply like "Yes, I love you" to "Do you love me?" would get prefixed with "Continue from where we left off. Summarize prior context internally…", producing an absurd two-paragraph message.
