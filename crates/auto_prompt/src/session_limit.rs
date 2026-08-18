@@ -1,17 +1,27 @@
-//! Parsing of provider session-limit messages that embed a reset time.
+//! Retry scheduling for subscription rate-limit windows (5-hour session and
+//! weekly), from two sources in order of trust:
 //!
-//! Claude Code reports subscription-window exhaustion as
-//! `Internal error: You've hit your session limit · resets 1:20am
-//! (Asia/Bangkok): {"errorKind": "rate_limit"}` — delivered either as a
-//! turn-level error (captured by `AcpThread::last_api_error`) or as a
-//! synthetic message in the transcript (visible as the last assistant
-//! message). The reset time is rendered in the *machine's* local timezone
-//! (that is what the "(Asia/Bangkok)" label is), so the parsed wall-clock
-//! time is interpreted in `Local` and the continuation is scheduled at
-//! reset + margin (default 60s). See `.plans/018_session_limit_scheduled_retry.md`.
+//! 1. **Usage API** — agent_ui's poller (the endpoint backing the usage
+//!    rings) pushes exact absolute `resets_at` timestamps per window into
+//!    [`record_usage_hint`]; when the turn error indicates a limit and a
+//!    window reads exhausted, we schedule at its reset (handles the weekly
+//!    window without knowing its error-text format). See
+//!    `.plans/019_weekly_limit_api_scheduled_retry.md`.
+//! 2. **Error-text parsing** — Claude Code reports session exhaustion as
+//!    `Internal error: You've hit your session limit · resets 1:20am
+//!    (Asia/Bangkok): {"errorKind": "rate_limit"}`, delivered either as a
+//!    turn-level error (captured by `AcpThread::last_api_error`) or as a
+//!    synthetic message in the transcript (visible as the last assistant
+//!    message). The reset time is rendered in the *machine's* local timezone
+//!    (that is what the "(Asia/Bangkok)" label is), so the parsed wall-clock
+//!    time is interpreted in `Local`.
+//!
+//! The continuation is scheduled at reset + margin (default 60s).
+//! See `.plans/018_session_limit_scheduled_retry.md`.
 
-use chrono::{DateTime, Local, NaiveDate, NaiveTime, TimeZone, Timelike};
+use chrono::{DateTime, Local, NaiveDate, NaiveTime, TimeZone, Timelike, Utc};
 use gpui::App;
+use std::sync::Mutex;
 
 /// Default margin added to the parsed reset time before retrying, in seconds.
 pub const DEFAULT_SESSION_LIMIT_MARGIN_SECS: u64 = 60;
@@ -25,9 +35,44 @@ pub struct SessionLimitReset {
     pub retry_at: DateTime<Local>,
     /// Milliseconds from parse time until `retry_at`.
     pub retry_delay_ms: u64,
-    /// Human-readable retry time, e.g. `1:21am (Asia/Bangkok)`.
+    /// Human-readable retry time, e.g. `1:21am (Asia/Bangkok)` or `Thu 3:05am`.
     pub retry_display: String,
 }
+
+/// One rate-limit window as reported by the usage endpoint backing the
+/// usage rings (`claude_usage.rs` in agent_ui).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct UsageWindowHint {
+    /// Fraction of the window's allowance consumed, in `0.0..=1.0`.
+    pub used: f32,
+    /// Exact absolute reset timestamp.
+    pub resets_at: Option<DateTime<Utc>>,
+}
+
+/// Latest known usage for the subscription windows. Pushed by agent_ui's
+/// usage poller via [`record_usage_hint`] — the auto_prompt decision
+/// functions cannot depend on agent_ui, so the data crosses as a plain
+/// static instead of a parameter.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct UsageHint {
+    pub five_hour: Option<UsageWindowHint>,
+    pub seven_day: Option<UsageWindowHint>,
+    pub seven_day_opus: Option<UsageWindowHint>,
+}
+
+static USAGE_HINT: Mutex<Option<UsageHint>> = Mutex::new(None);
+
+/// Called by the agent_ui usage poller after each successful poll.
+pub fn record_usage_hint(hint: UsageHint) {
+    *USAGE_HINT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hint);
+}
+
+/// A window counts as exhausted only at ~100% — the endpoint reports whole
+/// percents, so 0.99 absorbs rounding while anything lower means a
+/// transient error rather than window exhaustion.
+const EXHAUSTED_THRESHOLD: f32 = 0.99;
 
 /// Quick guard used to keep limit-synthetic messages out of context payloads
 /// (e.g. `last_assistant_message` on a scheduled continuation).
@@ -35,10 +80,37 @@ pub fn looks_like_session_limit(text: &str) -> bool {
     text.to_ascii_lowercase().contains("session limit")
 }
 
+/// The error text indicates a subscription rate-limit error (any window).
+fn is_rate_limit_error(text: &str) -> bool {
+    let lowered = text.to_ascii_lowercase();
+    lowered.contains("rate_limit")
+        || lowered.contains("session limit")
+        || lowered.contains("weekly limit")
+        || lowered.contains("weekly chat limit")
+}
+
+/// The error text names the weekly (7-day) window specifically.
+pub fn error_mentions_weekly(text: &str) -> bool {
+    let lowered = text.to_ascii_lowercase();
+    lowered.contains("weekly")
+        || lowered.contains("7-day")
+        || lowered.contains("7 day")
+        || lowered.contains("seven day")
+        || lowered.contains("seven-day")
+}
+
 /// Parse a session-limit reset schedule from `text`, interpreting the
 /// wall-clock time in the local timezone at `Local::now()`.
 pub fn parse_session_limit(text: &str, margin_secs: u64) -> Option<SessionLimitReset> {
     build_session_limit(text, Local::now(), margin_secs)
+}
+
+/// Resolve a retry schedule from a turn error text: the recorded usage hint
+/// first (exact absolute reset timestamps from the usage endpoint), then the
+/// plan-018 text parser as fallback.
+pub fn session_limit_from_error_text(text: &str, margin_secs: u64) -> Option<SessionLimitReset> {
+    usage_hint_limit(text, margin_secs, Local::now())
+        .or_else(|| parse_session_limit(text, margin_secs))
 }
 
 /// Check a thread's last turn error, then its last assistant message, for a
@@ -50,13 +122,73 @@ pub fn session_limit_from_thread(
 ) -> Option<SessionLimitReset> {
     thread
         .last_api_error()
-        .and_then(|text| parse_session_limit(text, margin_secs))
+        .and_then(|text| session_limit_from_error_text(text, margin_secs))
         .or_else(|| {
             thread
                 .last_assistant_message_text(cx)
                 .as_deref()
                 .and_then(|text| parse_session_limit(text, margin_secs))
         })
+}
+
+/// Resolve the retry schedule from the recorded usage hint.
+///
+/// Window selection keys off the error phrasing so we never wait on an
+/// inferred window: a session-phrased error trusts `five_hour` even when a
+/// weekly window is also exhausted (if stacked, the retry fails with a
+/// weekly error and reschedules once — self-correcting); a weekly-phrased
+/// error trusts the weekly windows; a bare `rate_limit` kind with a healthy
+/// 5h window must be the weekly constraint.
+fn usage_hint_limit(
+    error_text: &str,
+    margin_secs: u64,
+    now: DateTime<Local>,
+) -> Option<SessionLimitReset> {
+    if !is_rate_limit_error(error_text) {
+        return None;
+    }
+    let hint = USAGE_HINT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()?;
+    let weekly_reset = max_exhausted_reset(&[hint.seven_day, hint.seven_day_opus]);
+    if error_mentions_weekly(error_text) {
+        return weekly_reset.map(|reset| build_from_absolute(reset, now, margin_secs));
+    }
+    if let Some(five_hour_reset) = exhausted_reset(hint.five_hour) {
+        return Some(build_from_absolute(five_hour_reset, now, margin_secs));
+    }
+    if !looks_like_session_limit(error_text) {
+        return weekly_reset.map(|reset| build_from_absolute(reset, now, margin_secs));
+    }
+    None
+}
+
+fn exhausted_reset(window: Option<UsageWindowHint>) -> Option<DateTime<Utc>> {
+    let window = window?;
+    (window.used >= EXHAUSTED_THRESHOLD)
+        .then_some(window.resets_at)
+        .flatten()
+}
+
+fn max_exhausted_reset(windows: &[Option<UsageWindowHint>]) -> Option<DateTime<Utc>> {
+    windows.iter().filter_map(|window| exhausted_reset(*window)).max()
+}
+
+/// Build a schedule from an exact absolute reset timestamp (usage API).
+fn build_from_absolute(
+    reset_at_utc: DateTime<Utc>,
+    now: DateTime<Local>,
+    margin_secs: u64,
+) -> SessionLimitReset {
+    let reset_at = reset_at_utc.with_timezone(&Local);
+    let retry_at = reset_at + chrono::Duration::seconds(margin_secs as i64);
+    SessionLimitReset {
+        retry_delay_ms: (retry_at - now).num_milliseconds().max(0) as u64,
+        retry_display: format_absolute_display(retry_at, now),
+        reset_at,
+        retry_at,
+    }
 }
 
 /// Deterministic core of [`parse_session_limit`].
@@ -159,6 +291,24 @@ fn local_from_naive(date: NaiveDate, time: NaiveTime) -> Option<DateTime<Local>>
 }
 
 fn format_retry_display(retry_at: DateTime<Local>, timezone_label: Option<&str>) -> String {
+    match timezone_label {
+        Some(label) => format!("{} ({label})", format_clock(retry_at)),
+        None => format_clock(retry_at),
+    }
+}
+
+/// `H:MMam/pm`, prefixed with the weekday when the retry lands on another
+/// day (weekly resets can be days out), e.g. `Thu 3:05am`.
+fn format_absolute_display(retry_at: DateTime<Local>, now: DateTime<Local>) -> String {
+    let clock = format_clock(retry_at);
+    if retry_at.date_naive() == now.date_naive() {
+        clock
+    } else {
+        format!("{} {clock}", retry_at.format("%a"))
+    }
+}
+
+fn format_clock(retry_at: DateTime<Local>) -> String {
     let hour = retry_at.hour();
     let (hour_12, meridiem) = match hour {
         0 => (12, "am"),
@@ -166,10 +316,7 @@ fn format_retry_display(retry_at: DateTime<Local>, timezone_label: Option<&str>)
         12 => (12, "pm"),
         _ => (hour - 12, "pm"),
     };
-    match timezone_label {
-        Some(label) => format!("{hour_12}:{:02}{meridiem} ({label})", retry_at.minute()),
-        None => format!("{hour_12}:{:02}{meridiem}", retry_at.minute()),
-    }
+    format!("{hour_12}:{:02}{meridiem}", retry_at.minute())
 }
 
 #[cfg(test)]
@@ -305,5 +452,102 @@ mod tests {
         assert!(looks_like_session_limit(SAMPLE_ERROR));
         assert!(looks_like_session_limit("SESSION LIMIT reached"));
         assert!(!looks_like_session_limit("connection refused"));
+    }
+
+    #[test]
+    fn usage_hint_resolution_matrix() {
+        use super::{EXHAUSTED_THRESHOLD, USAGE_HINT, usage_hint_limit};
+
+        fn window(used: f32, resets_at: DateTime<Local>) -> super::UsageWindowHint {
+            super::UsageWindowHint {
+                used,
+                resets_at: Some(resets_at.with_timezone(&Utc)),
+            }
+        }
+
+        let now = local(2026, 8, 18, 12, 0); // Tuesday
+        let five_reset = local(2026, 8, 18, 15, 0); // today 3pm
+        let seven_day_reset = local(2026, 8, 21, 9, 0); // Friday
+        let opus_reset = local(2026, 8, 22, 10, 0); // Saturday
+
+        let bare_rate_limit = "Internal error: {\"errorKind\": \"rate_limit\"}";
+        let weekly_text = "You've reached your weekly chat limit. Try again later.";
+
+        // Shared static: reset, then run every scenario sequentially.
+        *USAGE_HINT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+
+        // 1. No hint recorded → nothing to resolve.
+        assert!(usage_hint_limit(bare_rate_limit, 60, now).is_none());
+
+        // 2. five_hour exhausted + bare errorKind → exact five_hour reset.
+        record_usage_hint(super::UsageHint {
+            five_hour: Some(window(1.0, five_reset)),
+            seven_day: Some(window(0.5, seven_day_reset)),
+            seven_day_opus: None,
+        });
+        let limit = usage_hint_limit(bare_rate_limit, 60, now).unwrap();
+        assert_eq!(limit.retry_at, local(2026, 8, 18, 15, 1));
+        assert_eq!(limit.retry_display, "3:01pm");
+
+        // 3. Weekly phrasing wins over an exhausted five_hour; max of the
+        //    weekly windows (seven_day Friday < opus Saturday).
+        record_usage_hint(super::UsageHint {
+            five_hour: Some(window(1.0, five_reset)),
+            seven_day: Some(window(1.0, seven_day_reset)),
+            seven_day_opus: Some(window(1.0, opus_reset)),
+        });
+        let limit = usage_hint_limit(weekly_text, 60, now).unwrap();
+        assert_eq!(limit.retry_at, local(2026, 8, 22, 10, 1));
+        assert_eq!(limit.retry_display, "Sat 10:01am");
+
+        // 4. Session phrasing trusts five_hour even when weekly is stacked.
+        let limit = usage_hint_limit(SAMPLE_ERROR, 60, now).unwrap();
+        assert_eq!(limit.retry_at, local(2026, 8, 18, 15, 1));
+
+        // 5. Bare errorKind + healthy five_hour + exhausted weekly → weekly.
+        record_usage_hint(super::UsageHint {
+            five_hour: Some(window(0.95, five_reset)),
+            seven_day: Some(window(1.0, seven_day_reset)),
+            seven_day_opus: None,
+        });
+        let limit = usage_hint_limit(bare_rate_limit, 60, now).unwrap();
+        assert_eq!(limit.retry_at, local(2026, 8, 21, 9, 1));
+        assert_eq!(limit.retry_display, "Fri 9:01am");
+
+        // 6. Session phrasing + healthy five_hour → defer to text parsing.
+        assert!(usage_hint_limit(SAMPLE_ERROR, 60, now).is_none());
+
+        // 7. Non-rate-limit text never consults the hint.
+        assert!(usage_hint_limit("connection refused", 60, now).is_none());
+
+        // 8. Below the exhaustion threshold → window counts as healthy.
+        record_usage_hint(super::UsageHint {
+            five_hour: Some(window(EXHAUSTED_THRESHOLD - 0.01, five_reset)),
+            seven_day: Some(window(0.98, seven_day_reset)),
+            seven_day_opus: None,
+        });
+        assert!(usage_hint_limit(bare_rate_limit, 60, now).is_none());
+
+        // 9. `session_limit_from_error_text` falls back to text parsing when
+        //    the hint declines (session phrasing, healthy five_hour) —
+        //    scenario 6's data is still recorded.
+        let limit = session_limit_from_error_text(SAMPLE_ERROR, 60).unwrap();
+        assert!(limit.retry_display.ends_with("(Asia/Bangkok)"));
+
+        // 10. A passed `resets_at` (stale hint) clamps to an immediate retry.
+        record_usage_hint(super::UsageHint {
+            five_hour: Some(window(1.0, local(2026, 8, 18, 11, 0))),
+            seven_day: None,
+            seven_day_opus: None,
+        });
+        let limit = usage_hint_limit(bare_rate_limit, 60, now).unwrap();
+        assert_eq!(limit.retry_delay_ms, 0);
+        assert_eq!(limit.reset_at, local(2026, 8, 18, 11, 0));
+
+        *USAGE_HINT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
 }

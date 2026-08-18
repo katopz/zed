@@ -96,6 +96,9 @@ impl ClaudeUsageStore {
                     .await
                 {
                     Ok(usage) => {
+                        // Feed auto_prompt's session-limit scheduler — exact
+                        // `resets_at` timestamps beat parsing error text.
+                        auto_prompt::session_limit::record_usage_hint((&usage).into());
                         let applied = this.update(cx, |this, cx| {
                             this.failing = false;
                             if this.usage.as_ref() != Some(&usage) {
@@ -308,6 +311,25 @@ impl ResetsAt {
 fn normalize_utilization(raw: f32) -> f32 {
     let fraction = if raw >= 1.0 { raw / 100.0 } else { raw };
     fraction.clamp(0.0, 1.0)
+}
+
+impl From<UsageWindow> for auto_prompt::session_limit::UsageWindowHint {
+    fn from(window: UsageWindow) -> Self {
+        Self {
+            used: window.used,
+            resets_at: window.resets_at,
+        }
+    }
+}
+
+impl From<&ClaudeUsage> for auto_prompt::session_limit::UsageHint {
+    fn from(usage: &ClaudeUsage) -> Self {
+        Self {
+            five_hour: usage.five_hour.map(Into::into),
+            seven_day: usage.seven_day.map(Into::into),
+            seven_day_opus: usage.seven_day_opus.map(Into::into),
+        }
+    }
 }
 
 #[cfg(test)]

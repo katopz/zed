@@ -1815,32 +1815,38 @@ impl ConversationView {
                     // Error = thread stopped. Always cancel the watchdog.
                     crate::auto_prompt::cancel_watchdog_for_thread(self, &session_id, cx);
 
-                    // Session limit: when the error text carries a reset time
+                    // Session/weekly limit: when the error text carries a
+                    // reset time (parsed, or resolved from the usage-API hint)
                     // and auto-prompt will schedule the retry, surface the
                     // schedule instead of the generic error notification.
-                    let session_limit = thread.read(cx).last_api_error().and_then(|text| {
-                        auto_prompt::session_limit::parse_session_limit(
-                            text,
-                            auto_prompt::load_config_cached()
-                                .map(|config| config.session_limit_margin_secs)
-                                .unwrap_or(
-                                    auto_prompt::session_limit::DEFAULT_SESSION_LIMIT_MARGIN_SECS,
-                                ),
-                        )
+                    let margin_secs = auto_prompt::load_config_cached()
+                        .map(|config| config.session_limit_margin_secs)
+                        .unwrap_or(auto_prompt::session_limit::DEFAULT_SESSION_LIMIT_MARGIN_SECS);
+                    let error_text = thread.read(cx).last_api_error().map(str::to_string);
+                    let session_limit = error_text.as_deref().and_then(|text| {
+                        auto_prompt::session_limit::session_limit_from_error_text(text, margin_secs)
                     });
+                    let limit_kind = if error_text
+                        .as_deref()
+                        .is_some_and(auto_prompt::session_limit::error_mentions_weekly)
+                    {
+                        "Weekly"
+                    } else {
+                        "Session"
+                    };
                     let auto_prompt_enabled = self
                         .active_thread()
                         .is_some_and(|tv| tv.read(cx).auto_prompt_enabled);
                     let (notification, icon) = match (&session_limit, auto_prompt_enabled) {
                         (Some(limit), true) => (
                             format!(
-                                "Session limit reached — auto-continue scheduled at {}",
+                                "{limit_kind} limit reached — auto-continue scheduled at {}",
                                 limit.retry_display
                             ),
                             IconName::Info,
                         ),
                         (Some(_), false) => (
-                            "Agent stopped: session limit reached".to_string(),
+                            format!("Agent stopped: {limit_kind} limit reached"),
                             IconName::Warning,
                         ),
                         (None, _) => {
