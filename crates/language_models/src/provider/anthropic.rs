@@ -439,7 +439,7 @@ mod tests {
         );
         let model = available_model_to_anthropic_model(&available);
 
-        assert_eq!(model.mode, AnthropicModelMode::Default);
+        assert_eq!(model.mode, AnthropicModelMode::Auto);
         assert!(!model.supports_thinking);
         assert!(!model.supports_adaptive_thinking);
         assert!(model.supported_effort_levels.is_empty());

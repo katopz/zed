@@ -994,7 +994,7 @@ mod tests {
             "claude-sonnet-4-5".to_string(),
             1.0,
             4096,
-            AnthropicModelMode::Default,
+            AnthropicModelMode::Auto,
             AnthropicPromptCacheMode::Disabled,
         )
         .unwrap();
