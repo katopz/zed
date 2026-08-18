@@ -1,5 +1,7 @@
 # 018 — Session limit: schedule auto_prompt retry at provider reset time
 
+**Commit:** `0db4af571a` (develop)
+
 ## Problem
 
 When the Claude agent hits its subscription session limit, the turn fails with:
