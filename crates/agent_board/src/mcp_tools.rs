@@ -208,10 +208,13 @@ mod tests {
     // ── build_response tests ──
     // These exercise the full MCP tool pipeline: set a room snapshot via the
     // global cache, call build_response(), and verify the grouped output.
-    // Each test clears the cache first to avoid cross-test contamination.
+    // Each test clears the cache first and holds `TEST_LOCK` for its whole
+    // body so parallel test threads never interleave global writes.
 
     #[test]
     fn build_response_with_no_snapshot_returns_graceful_message() {
+        let _state_guard =
+            crate::board_state::TEST_LOCK.lock().expect("board-state test lock poisoned");
         crate::board_state::clear_for_test();
         let result = build_response().unwrap();
         assert_eq!(result.structured_content.room, "");
@@ -225,6 +228,8 @@ mod tests {
 
     #[test]
     fn build_response_groups_states_by_device() {
+        let _state_guard =
+            crate::board_state::TEST_LOCK.lock().expect("board-state test lock poisoned");
         crate::board_state::clear_for_test();
         let snapshot = crate::types::RoomSnapshot {
             v: 1,
@@ -326,6 +331,8 @@ mod tests {
     fn build_response_includes_orphan_states_without_status() {
         // A device posted a state but never posted a status — the state should
         // still appear in the output as an "orphan" device entry.
+        let _state_guard =
+            crate::board_state::TEST_LOCK.lock().expect("board-state test lock poisoned");
         crate::board_state::clear_for_test();
         let snapshot = crate::types::RoomSnapshot {
             v: 1,
@@ -357,6 +364,8 @@ mod tests {
     fn build_response_empty_room_has_devices_but_no_states() {
         // Devices with statuses but no state broadcasts: each appears with an
         // empty states vec, and the text says "no active states".
+        let _state_guard =
+            crate::board_state::TEST_LOCK.lock().expect("board-state test lock poisoned");
         crate::board_state::clear_for_test();
         let snapshot = crate::types::RoomSnapshot {
             v: 1,

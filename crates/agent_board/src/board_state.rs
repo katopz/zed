@@ -4,7 +4,7 @@
 //! broadcaster during `try_start`; when the board isn't configured, no
 //! broadcaster is registered and `broadcast_state` is a silent no-op.
 
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use auto_prompt::peer_states::AgentStateBroadcaster;
 use crate::client::BoardClient;
@@ -18,6 +18,12 @@ static WRITER: RwLock<Option<WriterHandle>> = RwLock::new(None);
 /// full room state (devices + states + messages) without holding a GPUI entity
 /// handle. Stored as an `Arc` so readers never block on a clone.
 static ROOM_SNAPSHOT: RwLock<Option<Arc<RoomSnapshot>>> = RwLock::new(None);
+
+/// Serializes tests that mutate the crate-global state above. Test binaries
+/// run `#[test]`s in parallel, so `clear_for_test`/`set_room_snapshot` calls
+/// from different tests race without this lock.
+#[cfg(test)]
+pub(crate) static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 struct WriterHandle {
     client: Arc<BoardClient>,
