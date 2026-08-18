@@ -1755,9 +1755,18 @@ mod tests {
         let path = PathBuf::from("/v1/provider.json");
 
         // Raw JSON exactly as written by a pre-Quaternary Zed build. Three slots,
-        // schema_version 1, primary is backed off.
-        let v1_json = r#"{"schema_version":1,"saved_at_unix_secs":1700000000,"primary":{"consecutive_failures":3,"backoff_remaining_secs":14454.5},"secondary":{"consecutive_failures":0,"backoff_remaining_secs":null},"tertiary":{"consecutive_failures":0,"backoff_remaining_secs":null}}"#;
-        fs.atomic_write(path.clone(), v1_json.to_string()).await.unwrap();
+        // schema_version 1, primary is backed off. `saved_at_unix_secs` is "now"
+        // rather than a hardcoded historical timestamp: `to_health` deliberately
+        // loads already-elapsed backoffs as healthy, so a stale timestamp would
+        // expire the 14454.5s window and defeat the assertion below.
+        let saved_at_unix_secs = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let v1_json = format!(
+            r#"{{"schema_version":1,"saved_at_unix_secs":{saved_at_unix_secs},"primary":{{"consecutive_failures":3,"backoff_remaining_secs":14454.5}},"secondary":{{"consecutive_failures":0,"backoff_remaining_secs":null}},"tertiary":{{"consecutive_failures":0,"backoff_remaining_secs":null}}}}"#
+        );
+        fs.atomic_write(path.clone(), v1_json).await.unwrap();
 
         let loaded = reload_persisted_health(&fs, &path).await;
 

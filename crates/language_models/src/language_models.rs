@@ -391,6 +391,14 @@ mod tests {
         let settings_store = SettingsStore::test(cx);
         cx.set_global(settings_store);
         cx.set_global(db::AppDatabase::test_new());
+        // `OpenAiCompatibleLanguageModelProvider::new` reads the global `Fs` to
+        // load persisted key health; without this, every test constructing a
+        // compatible provider panics with "no state of type fs::GlobalFs exists".
+        // `FakeFs` is empty, so the load hits NotFound and starts fresh.
+        <dyn fs::Fs>::set_global(
+            fs::FakeFs::new(cx.background_executor().clone()),
+            cx,
+        );
         let app_version = AppVersion::global(cx);
         release_channel::init_test(app_version, release_channel::ReleaseChannel::Dev, cx);
         gpui_tokio::init(cx);
