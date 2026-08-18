@@ -7,19 +7,23 @@
 //!    window reads exhausted, we schedule at its reset (handles the weekly
 //!    window without knowing its error-text format). See
 //!    `.plans/019_weekly_limit_api_scheduled_retry.md`.
-//! 2. **Error-text parsing** — Claude Code reports session exhaustion as
-//!    `Internal error: You've hit your session limit · resets 1:20am
-//!    (Asia/Bangkok): {"errorKind": "rate_limit"}`, delivered either as a
-//!    turn-level error (captured by `AcpThread::last_api_error`) or as a
-//!    synthetic message in the transcript (visible as the last assistant
-//!    message). The reset time is rendered in the *machine's* local timezone
+//! 2. **Error-text parsing** — Claude Code reports window exhaustion as
+//!    `You've hit your session limit · resets 1:20am (Asia/Bangkok)` (or
+//!    `weekly limit` / `Opus limit`, with a weekday prefix on weekly resets,
+//!    e.g. `resets Mon 12:00am`), delivered either as a turn-level error
+//!    (captured by `AcpThread::last_api_error`, usually wrapped as
+//!    `Internal error: …: {"errorKind": "rate_limit"}`) or as a synthetic
+//!    message in the transcript (visible as the last assistant message).
+//!    The reset time is rendered in the *machine's* local timezone
 //!    (that is what the "(Asia/Bangkok)" label is), so the parsed wall-clock
 //!    time is interpreted in `Local`.
 //!
 //! The continuation is scheduled at reset + margin (default 60s).
 //! See `.plans/018_session_limit_scheduled_retry.md`.
 
-use chrono::{DateTime, Local, NaiveDate, NaiveTime, TimeZone, Timelike, Utc};
+use chrono::{
+    DateTime, Datelike, Local, NaiveDate, NaiveTime, TimeZone, Timelike, Utc, Weekday,
+};
 use gpui::App;
 use std::sync::Mutex;
 
@@ -74,25 +78,34 @@ pub fn record_usage_hint(hint: UsageHint) {
 /// transient error rather than window exhaustion.
 const EXHAUSTED_THRESHOLD: f32 = 0.99;
 
+/// Subscription-limit phrases Claude Code prints in its error and splash
+/// text, one per window family: `session limit` (5-hour), `weekly limit` /
+/// `weekly chat limit` (7-day), `opus limit` (7-day, Opus-only).
+const LIMIT_PHRASES: [&str; 4] = [
+    "session limit",
+    "weekly limit",
+    "weekly chat limit",
+    "opus limit",
+];
+
 /// Quick guard used to keep limit-synthetic messages out of context payloads
 /// (e.g. `last_assistant_message` on a scheduled continuation).
-pub fn looks_like_session_limit(text: &str) -> bool {
-    text.to_ascii_lowercase().contains("session limit")
+pub fn looks_like_usage_limit(text: &str) -> bool {
+    let lowered = text.to_ascii_lowercase();
+    LIMIT_PHRASES.iter().any(|phrase| lowered.contains(phrase))
 }
 
 /// The error text indicates a subscription rate-limit error (any window).
 fn is_rate_limit_error(text: &str) -> bool {
-    let lowered = text.to_ascii_lowercase();
-    lowered.contains("rate_limit")
-        || lowered.contains("session limit")
-        || lowered.contains("weekly limit")
-        || lowered.contains("weekly chat limit")
+    text.to_ascii_lowercase().contains("rate_limit") || looks_like_usage_limit(text)
 }
 
-/// The error text names the weekly (7-day) window specifically.
+/// The error text names a weekly (7-day) window — the all-model `seven_day`
+/// or the Opus-only `seven_day_opus` behind an "Opus limit" message.
 pub fn error_mentions_weekly(text: &str) -> bool {
     let lowered = text.to_ascii_lowercase();
-    lowered.contains("weekly")
+    lowered.contains("opus limit")
+        || lowered.contains("weekly")
         || lowered.contains("7-day")
         || lowered.contains("7 day")
         || lowered.contains("seven day")
@@ -127,7 +140,18 @@ pub fn session_limit_from_thread(
             thread
                 .last_assistant_message_text(cx)
                 .as_deref()
-                .and_then(|text| parse_session_limit(text, margin_secs))
+                .and_then(|text| {
+                    // Assistant messages are arbitrary text, so require the
+                    // splash shape (limit phrase + `resets`) before trusting
+                    // the usage hint — prose that merely quotes a limit
+                    // phrase must never schedule a retry.
+                    let splash_shaped = looks_like_usage_limit(text)
+                        && text.to_ascii_lowercase().contains("resets");
+                    if !splash_shaped {
+                        return None;
+                    }
+                    session_limit_from_error_text(text, margin_secs)
+                })
         })
 }
 
@@ -158,7 +182,7 @@ fn usage_hint_limit(
     if let Some(five_hour_reset) = exhausted_reset(hint.five_hour) {
         return Some(build_from_absolute(five_hour_reset, now, margin_secs));
     }
-    if !looks_like_session_limit(error_text) {
+    if !looks_like_usage_limit(error_text) {
         return weekly_reset.map(|reset| build_from_absolute(reset, now, margin_secs));
     }
     None
@@ -185,7 +209,7 @@ fn build_from_absolute(
     let retry_at = reset_at + chrono::Duration::seconds(margin_secs as i64);
     SessionLimitReset {
         retry_delay_ms: (retry_at - now).num_milliseconds().max(0) as u64,
-        retry_display: format_absolute_display(retry_at, now),
+        retry_display: format_display(retry_at, now, None),
         reset_at,
         retry_at,
     }
@@ -200,10 +224,17 @@ pub(crate) fn build_session_limit(
     // `to_ascii_lowercase` preserves byte lengths, so indices found in the
     // lowered copy are valid slices of the original text.
     let lowered = text.to_ascii_lowercase();
-    let session_limit_ix = lowered.find("session limit")?;
-    let resets_ix = lowered[session_limit_ix..].find("resets")? + session_limit_ix;
+    let limit_ix = LIMIT_PHRASES
+        .iter()
+        .filter_map(|phrase| lowered.find(phrase))
+        .min()?;
+    let resets_ix = lowered[limit_ix..].find("resets")? + limit_ix;
     let after = &text[resets_ix + "resets".len()..];
 
+    let (weekday, after) = match parse_weekday(after) {
+        Some((weekday, consumed)) => (Some(weekday), &after[consumed..]),
+        None => (None, after),
+    };
     let (hour, minute, pm, consumed) = parse_clock(after)?;
     let timezone_label = parse_paren_zone(&after[consumed..]);
 
@@ -213,20 +244,73 @@ pub(crate) fn build_session_limit(
         (hour, _) => hour,
     };
     let time = NaiveTime::from_hms_opt(hour_24, minute, 0)?;
-    let today = now.date_naive();
-    let mut reset_at = local_from_naive(today, time)?;
-    if reset_at <= now {
-        let tomorrow = today.succ_opt()?;
-        reset_at = local_from_naive(tomorrow, time)?;
-    }
+    let reset_at = resolve_reset_at(now, weekday, time)?;
     let retry_at = reset_at + chrono::Duration::seconds(margin_secs as i64);
     let retry_delay_ms = (retry_at - now).num_milliseconds().max(0) as u64;
     Some(SessionLimitReset {
         reset_at,
         retry_at,
         retry_delay_ms,
-        retry_display: format_retry_display(retry_at, timezone_label.as_deref()),
+        retry_display: format_display(retry_at, now, timezone_label.as_deref()),
     })
+}
+
+/// Next occurrence of `time`: on the parsed weekday when one is present
+/// (weekly resets can be days out), else today or tomorrow (a session
+/// window never exceeds five hours, so the clock time alone pins the date).
+fn resolve_reset_at(
+    now: DateTime<Local>,
+    weekday: Option<Weekday>,
+    time: NaiveTime,
+) -> Option<DateTime<Local>> {
+    let today = now.date_naive();
+    match weekday {
+        None => {
+            let mut reset_at = local_from_naive(today, time)?;
+            if reset_at <= now {
+                reset_at = local_from_naive(today.succ_opt()?, time)?;
+            }
+            Some(reset_at)
+        }
+        Some(weekday) => {
+            for day_offset in 0..=7 {
+                let date = today + chrono::Duration::days(day_offset);
+                if date.weekday() != weekday {
+                    continue;
+                }
+                if let Some(reset_at) = local_from_naive(date, time) {
+                    if reset_at > now {
+                        return Some(reset_at);
+                    }
+                }
+            }
+            None
+        }
+    }
+}
+
+/// Parse an optional leading weekday token (`Mon`, `Tuesday`, …) as printed
+/// by weekly-limit messages (`resets Mon 12:00am`). Returns the weekday and
+/// the bytes consumed.
+fn parse_weekday(s: &str) -> Option<(Weekday, usize)> {
+    let bytes = s.as_bytes();
+    let start = bytes.iter().position(|b| b.is_ascii_alphabetic())?;
+    let mut end = start;
+    while end < bytes.len() && bytes[end].is_ascii_alphabetic() {
+        end += 1;
+    }
+    let word = s[start..end].to_ascii_lowercase();
+    let weekday = match word.as_str() {
+        "mon" | "monday" => Weekday::Mon,
+        "tue" | "tues" | "tuesday" => Weekday::Tue,
+        "wed" | "weds" | "wednesday" => Weekday::Wed,
+        "thu" | "thur" | "thurs" | "thursday" => Weekday::Thu,
+        "fri" | "friday" => Weekday::Fri,
+        "sat" | "saturday" => Weekday::Sat,
+        "sun" | "sunday" => Weekday::Sun,
+        _ => return None,
+    };
+    Some((weekday, end))
 }
 
 /// Parse `H:MMam` / `H:MM pm` starting at the first ASCII digit in `s`.
@@ -290,22 +374,23 @@ fn local_from_naive(date: NaiveDate, time: NaiveTime) -> Option<DateTime<Local>>
     }
 }
 
-fn format_retry_display(retry_at: DateTime<Local>, timezone_label: Option<&str>) -> String {
-    match timezone_label {
-        Some(label) => format!("{} ({label})", format_clock(retry_at)),
-        None => format_clock(retry_at),
-    }
-}
-
 /// `H:MMam/pm`, prefixed with the weekday when the retry lands on another
-/// day (weekly resets can be days out), e.g. `Thu 3:05am`.
-fn format_absolute_display(retry_at: DateTime<Local>, now: DateTime<Local>) -> String {
+/// day (weekly resets can be days out), e.g. `Thu 3:05am` or
+/// `Thu 3:05am (Asia/Bangkok)`.
+fn format_display(
+    retry_at: DateTime<Local>,
+    now: DateTime<Local>,
+    timezone_label: Option<&str>,
+) -> String {
     let clock = format_clock(retry_at);
-    if retry_at.date_naive() == now.date_naive() {
-        clock
-    } else {
-        format!("{} {clock}", retry_at.format("%a"))
+    let mut display = clock;
+    if retry_at.date_naive() != now.date_naive() {
+        display = format!("{} {display}", retry_at.format("%a"));
     }
+    if let Some(label) = timezone_label {
+        display = format!("{display} ({label})");
+    }
+    display
 }
 
 fn format_clock(retry_at: DateTime<Local>) -> String {
@@ -351,7 +436,7 @@ mod tests {
             limit.retry_delay_ms,
             (expected_retry - now).num_milliseconds() as u64
         );
-        assert_eq!(limit.retry_display, "1:21am (Asia/Bangkok)");
+        assert_eq!(limit.retry_display, "Wed 1:21am (Asia/Bangkok)");
     }
 
     #[test]
@@ -379,13 +464,13 @@ mod tests {
         let now = local(2026, 8, 18, 23, 0);
         let limit = build_session_limit(&text, now, 60).unwrap();
         assert_eq!(limit.retry_at, local(2026, 8, 19, 0, 6));
-        assert_eq!(limit.retry_display, "12:06am (Asia/Bangkok)");
+        assert_eq!(limit.retry_display, "Wed 12:06am (Asia/Bangkok)");
 
         let text = "You've hit your session limit · resets 11:59pm (Asia/Bangkok)";
         let now = local(2026, 8, 18, 10, 0);
         let limit = build_session_limit(text, now, 60).unwrap();
         assert_eq!(limit.retry_at, local(2026, 8, 19, 0, 0));
-        assert_eq!(limit.retry_display, "12:00am (Asia/Bangkok)");
+        assert_eq!(limit.retry_display, "Wed 12:00am (Asia/Bangkok)");
     }
 
     #[test]
@@ -395,6 +480,44 @@ mod tests {
         let limit = build_session_limit(text, now, 0).unwrap();
         assert_eq!(limit.retry_at, local(2026, 8, 18, 5, 0));
         assert_eq!(limit.retry_display, "5:00am");
+    }
+
+    #[test]
+    fn parses_weekly_weekday_form() {
+        let text = "You've hit your weekly limit · resets Mon 9:30am";
+        let now = local(2026, 8, 18, 12, 0); // Tuesday
+        let limit = build_session_limit(text, now, 60).unwrap();
+        // Next Monday after Tue 2026-08-18 is 2026-08-24.
+        assert_eq!(limit.reset_at, local(2026, 8, 24, 9, 30));
+        assert_eq!(limit.retry_at, local(2026, 8, 24, 9, 31));
+        assert_eq!(limit.retry_display, "Mon 9:31am");
+    }
+
+    #[test]
+    fn weekday_time_passed_rolls_to_next_week() {
+        let text = "You've hit your weekly limit · resets Monday 9:30am";
+        let now = local(2026, 8, 24, 10, 0); // Monday, past 9:30am
+        let limit = build_session_limit(text, now, 60).unwrap();
+        assert_eq!(limit.reset_at, local(2026, 8, 31, 9, 30));
+    }
+
+    #[test]
+    fn weekday_time_ahead_stays_today() {
+        let text = "You've hit your weekly limit · resets Mon 9:30am";
+        let now = local(2026, 8, 24, 8, 0); // Monday, before 9:30am
+        let limit = build_session_limit(text, now, 60).unwrap();
+        assert_eq!(limit.reset_at, local(2026, 8, 24, 9, 30));
+        // Same-day retry carries no weekday prefix (matches `format_display`).
+        assert_eq!(limit.retry_display, "9:31am");
+    }
+
+    #[test]
+    fn parses_opus_limit_form() {
+        let text = "You've hit your Opus limit · resets 3:45pm";
+        let now = local(2026, 8, 18, 14, 0);
+        let limit = build_session_limit(text, now, 60).unwrap();
+        assert_eq!(limit.retry_at, local(2026, 8, 18, 15, 46));
+        assert_eq!(limit.retry_display, "3:46pm");
     }
 
     #[test]
@@ -449,9 +572,22 @@ mod tests {
 
     #[test]
     fn looks_like_guard() {
-        assert!(looks_like_session_limit(SAMPLE_ERROR));
-        assert!(looks_like_session_limit("SESSION LIMIT reached"));
-        assert!(!looks_like_session_limit("connection refused"));
+        assert!(looks_like_usage_limit(SAMPLE_ERROR));
+        assert!(looks_like_usage_limit("SESSION LIMIT reached"));
+        assert!(looks_like_usage_limit(
+            "You've hit your weekly limit · resets Mon 12:00am"
+        ));
+        assert!(looks_like_usage_limit("You've hit your Opus limit · resets 3:45pm"));
+        assert!(!looks_like_usage_limit("connection refused"));
+    }
+
+    #[test]
+    fn weekly_and_opus_phrasing_routes_to_weekly_windows() {
+        assert!(error_mentions_weekly(
+            "You've hit your weekly limit · resets Mon 12:00am"
+        ));
+        assert!(error_mentions_weekly("You've hit your Opus limit · resets 3:45pm"));
+        assert!(!error_mentions_weekly(SAMPLE_ERROR));
     }
 
     #[test]
@@ -545,6 +681,31 @@ mod tests {
         let limit = usage_hint_limit(bare_rate_limit, 60, now).unwrap();
         assert_eq!(limit.retry_delay_ms, 0);
         assert_eq!(limit.reset_at, local(2026, 8, 18, 11, 0));
+
+        // 11. Opus phrasing routes to the weekly windows even when only
+        //     seven_day_opus is exhausted.
+        record_usage_hint(super::UsageHint {
+            five_hour: Some(window(0.5, five_reset)),
+            seven_day: Some(window(0.5, seven_day_reset)),
+            seven_day_opus: Some(window(1.0, opus_reset)),
+        });
+        let limit =
+            usage_hint_limit("You've hit your Opus limit · resets 3:45pm", 60, now).unwrap();
+        assert_eq!(limit.retry_at, local(2026, 8, 22, 10, 1));
+        assert_eq!(limit.retry_display, "Sat 10:01am");
+
+        // 12. Weekly text with no hint → text fallback parses the weekday.
+        //     (Real `Local::now()` — only weekday-invariant facts asserted.)
+        *USAGE_HINT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        let limit = session_limit_from_error_text(
+            "You've hit your weekly limit · resets Mon 9:30am",
+            60,
+        )
+        .unwrap();
+        assert_eq!(limit.reset_at.weekday(), Weekday::Mon);
+        assert!(limit.retry_display.ends_with("9:31am"));
 
         *USAGE_HINT
             .lock()

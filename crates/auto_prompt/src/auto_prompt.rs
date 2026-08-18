@@ -1060,11 +1060,12 @@ pub fn decide(
         };
     }
 
-    // Session limit: the provider embeds the reset time in the turn error or
+    // Usage limit: the provider embeds the reset time in the turn error or
     // a synthetic message (e.g. Claude Code's "You've hit your session limit
-    // · resets 1:20am (Asia/Bangkok)"). Schedule the continuation at
-    // reset + margin instead of burning the orchestration call against the
-    // same exhausted quota. See .plans/018_session_limit_scheduled_retry.md.
+    // · resets 1:20am (Asia/Bangkok)"; weekly/Opus variants carry a weekday
+    // prefix). Schedule the continuation at reset + margin instead of
+    // burning the orchestration call against the same exhausted quota.
+    // See .plans/018_session_limit_scheduled_retry.md.
     if let Some(limit) = crate::session_limit::session_limit_from_thread(
         &thread.read(cx),
         cx,
@@ -1083,7 +1084,7 @@ pub fn decide(
             }),
         );
         let last_assistant_message = _last_assistant_msg
-            .filter(|message| !crate::session_limit::looks_like_session_limit(message));
+            .filter(|message| !crate::session_limit::looks_like_usage_limit(message));
         let next_prompt = with_first_prompt_context(
             "The provider session limit window has reset. Continue from where we left off.".to_string(),
             build_prompt_summary(

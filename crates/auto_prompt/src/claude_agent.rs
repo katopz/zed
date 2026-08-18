@@ -223,7 +223,7 @@ pub fn decide_claude(
             let thread_ref = thread.read(cx);
             let last_assistant_message = thread_ref
                 .last_assistant_message_text(cx)
-                .filter(|message| !crate::session_limit::looks_like_session_limit(message));
+                .filter(|message| !crate::session_limit::looks_like_usage_limit(message));
             let action = AutoPromptAction {
                 from_session_id: thread_ref.session_id().clone(),
                 from_title: thread_ref.title().map(|title| title.to_string()),
