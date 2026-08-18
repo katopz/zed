@@ -1,5 +1,7 @@
 # 019 — Weekly limit: schedule auto_prompt retry from the usage API
 
+**Commit:** `6d7dbbce7a` (develop)
+
 ## Problem
 
 Plan 018 schedules retries from the *parsed error text* ("resets 1:20am"). Two
