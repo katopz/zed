@@ -44,8 +44,11 @@ built since the upstream sync `cc07356651`).
 - [x] Tests: anthropic 18/18, agent_board 37/37 across 6 runs (flake gone),
       language_models 144/147 — 3 failures proven pre-existing on clean HEAD
       (see `.issues/014`), flagged not fixed
-- [-] Defer: repair the 3 pre-existing `language_models` test failures
+- [x] Defer→done: repair the 3 pre-existing `language_models` test failures
       (`.issues/014_language_models_preexisting_test_failures.md`)
+      — resolved 2026-08-19 in `03fb59612b` (FakeFs global in init_test +
+      now-relative v1 fixture timestamp); 147/147 across 4 runs, issue file
+      removed
 
 ## Notes
 
