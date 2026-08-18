@@ -34,12 +34,10 @@ log.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-smol.workspace = true
 ssh-key.workspace = true
 sysinfo.workspace = true
 ui.workspace = true
 workspace.workspace = true
-zed_actions.workspace = true
 
 [dev-dependencies]
 ed25519-dalek = { workspace = true, features = ["rand_core"] }
