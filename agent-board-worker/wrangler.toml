@@ -23,8 +23,10 @@ new_classes = ["RoomCoordinator"]
 DEFAULT_TTL_SECONDS = "604800"
 MAX_MESSAGES = "10"
 STALE_STATUS_SECS = "300"
-# Google OAuth (web UI → worker). The Client ID is public; GIS ID-token flow
-# needs no client secret. Set this to your OAuth Web Client ID.
-GOOGLE_CLIENT_ID = ""
-# Email allowlist for the web dashboard. Change if you are not katopz.
-ALLOWED_EMAIL = "katopz@gmail.com"
+# GitHub OAuth (web UI → worker), device flow. The Client ID is public; the
+# device flow needs no client secret. Create an OAuth App (any callback URL,
+# e.g. the worker URL) and ENABLE the Device Flow checkbox in its advanced
+# settings, then paste its client id here.
+GITHUB_CLIENT_ID = ""
+# Login allowlist for the web dashboard (GitHub login, not email).
+ALLOWED_LOGIN = "katopz"

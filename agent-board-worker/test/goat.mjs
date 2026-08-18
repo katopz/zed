@@ -161,9 +161,9 @@ async function main() {
     const res = await fetch(`${WORKER}/?room=${ROOM}`);
     const html = await res.text();
     report("T1 GET / → 200", res.status === 200, `${res.status}`);
-    const markers = ["reply", "toggleDev", "toggleAg", "setStatus", "connect", "gsi/client"];
+    const markers = ["reply", "toggleDev", "toggleAg", "setStatus", "connect", "ghbtn", "auth/github/device"];
     const missing = markers.filter((m) => !html.includes(m));
-    report("T1 dashboard markers present", missing.length === 0, missing.length ? `missing: ${missing}` : "reply input, accordion, status, ws, gsi");
+    report("T1 dashboard markers present", missing.length === 0, missing.length ? `missing: ${missing}` : "reply input, accordion, status, ws, github sign-in");
   }
 
   // T2 — room snapshot (empty ok)
@@ -251,14 +251,32 @@ async function main() {
     a.ws.close(); b.ws.close();
   }
 
-  // T8 — WS negative: garbage token → close 4001
+  // T8 — WS negative: garbage token → close 4001 (GitHub verification fails closed)
   {
     const c = await wsConnect(ROOM);
     const closed = await new Promise((resolve) => {
       c.ws.addEventListener("close", (ev) => resolve(ev.code));
-      wsSend(c.ws, { type: "auth", google_token: "garbage.token.here" });
+      wsSend(c.ws, { type: "auth", github_token: "ghp_garbageTokenInvalid" });
     });
     report("T8 WS bad token → close 4001", closed === 4001, `code=${closed}`);
+  }
+
+  // T8b — WS positive with a real GitHub token (optional: only when
+  // AGENT_BOARD_GITHUB_PAT is provided). Verifies the allowlist: a PAT for
+  // ALLOWED_LOGIN passes, anything else closes 4001.
+  if (process.env.AGENT_BOARD_GITHUB_PAT) {
+    const c = await wsConnect(ROOM);
+    const outcome = await new Promise((resolve) => {
+      const to = setTimeout(() => resolve("timeout"), 15000);
+      c.ws.addEventListener("close", (ev) => { clearTimeout(to); resolve("close:" + ev.code); });
+      c.ws.addEventListener("message", (ev) => {
+        const m = JSON.parse(ev.data);
+        if (m.type === "auth_ok") { clearTimeout(to); resolve("auth_ok"); }
+      });
+      wsSend(c.ws, { type: "auth", github_token: process.env.AGENT_BOARD_GITHUB_PAT });
+    });
+    report("T8b WS real GitHub token → auth_ok", outcome === "auth_ok", outcome);
+    try { c.ws.close(); } catch (_) {}
   }
 
   // T9 — unknown device rejected (allowlist after bootstrap).

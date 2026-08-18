@@ -211,7 +211,7 @@ mod tests {
             target_device: target_device.to_string(),
             target_session_prefix: prefix.to_string(),
             text: text.to_string(),
-            author_email: "katopz@gmail.com".to_string(),
+            author_login: "katopz".to_string(),
             ts: 1700000000000,
         }
     }

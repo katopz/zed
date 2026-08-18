@@ -16,8 +16,8 @@ REPLY:[SHIKUWA:b1c9] switch to the develop branch first
 - `f3a2` / `b1c9` = first 4 chars of the agent's `session_id` (deterministic,
   stable across page refreshes, resolvable by prefix-match on the device)
 
-**Security**: Google Sign-In (Google Identity Services). Only
-`katopz@gmail.com` is allowed. No other accounts can view or post.
+**Security**: GitHub Sign-In (OAuth device flow — same identity model as
+Zed itself). Only the allowlisted login (`katopz`) can view or post.
 
 ## Real-time model: WebSocket, not polling
 
@@ -117,7 +117,7 @@ also trigger WebSocket relay to connected browsers (auto-accept).
 │  Browser (operator, any device)                                     │
 │  ┌───────────────────────────────────────────────────────────────┐  │
 │  │  GET /  →  single-page HTML dashboard                         │  │
-│  │  - Google Sign-In button (katopz@gmail.com only)              │  │
+│  │  - GitHub Sign-In button (device flow, katopz only)             │  │
 │  │  - Agent list (accordion: click to expand thread timeline)    │  │
 │  │  - REPLY input bar: REPLY:[device:sess4] text                 │  │
 │  │  - WebSocket connection (auto on page load)                   │  │
@@ -169,19 +169,19 @@ also trigger WebSocket relay to connected browsers (auto-accept).
 
 ## Security model
 
-### Google OAuth (web UI → worker)
-1. Browser loads `GET /` (static HTML, no secrets — just the GIS script tag).
-2. User clicks "Sign in with Google" → Google Identity Services popup.
-3. GIS returns a **Google ID token** (JWT, ~1h expiry).
+### GitHub sign-in, device flow (web UI → worker) — replaces Google OAuth
+1. Browser loads `GET /` (static HTML, no secrets).
+2. Operator clicks "Sign in with GitHub" → dashboard fetches
+   `POST /auth/github/device` → shows the `user_code` + a link to
+   `github.com/login/device` (device flow: no client secret exists anywhere).
+3. Operator authorizes on GitHub → dashboard polls
+   `POST /auth/github/poll` until GitHub issues the access token.
 4. Browser sends token on WebSocket connection as the first message, and as
-   `Authorization: Bearer <google-id-token>` on HTTP POST /reply.
-5. Worker verifies the JWT:
-   - Fetch Google JWKS from `https://www.googleapis.com/oauth2/v3/certs`
-   (cache in Worker global, refresh every 1h).
-   - Verify signature + `iss` + `aud` + `exp`.
-   - Check `email == ALLOWED_EMAIL` (env var, default `katopz@gmail.com`)
-   and `email_verified: true`.
-6. If valid → accept WebSocket / process write. If not → 401 / close WS.
+   `Authorization: Bearer <github-token>` on HTTP POST /reply.
+5. Worker verifies the token: `GET api.github.com/user` (opaque tokens can't
+   be verified locally), caches sha256(token) → login for 10 min, asserts
+   `login == ALLOWED_LOGIN` (default `katopz`).
+6. If valid → accept WebSocket / process write. If not → 401 / close WS 4001.
 
 ### Existing ed25519 gate (Zed devices → worker)
 Unchanged. Zed devices still sign HTTP writes with their SSH key. The
@@ -193,9 +193,8 @@ worker accepts either a valid Google ID token OR ed25519 signature.
 - **Zed**: sends ed25519-signed challenge response as the first WS message.
 
 ### No secrets in the worker
-- Google Client ID is public (embedded in HTML + worker config).
-- No client secret needed for GIS ID token flow.
-- The allowlist email is in worker config (env var).
+- GitHub Client ID is public (device flow needs no client secret).
+- The allowlist login is in worker config (env var).
 
 ## Session routing: 4-char prefix
 
@@ -226,7 +225,8 @@ the prefix length can be increased to 6 or 8 chars.
       Static — no SSR, no framework. Data fetched via `GET /v1/rooms/{room}`
       + real-time push via WebSocket.
 - [x] HTML includes:
-      - Google Sign-In button (GIS script from accounts.google.com).
+      - GitHub Sign-In button (device flow: user_code + link to
+        github.com/login/device).
       - Room dashboard: device sections, each with expandable agent items.
       - REPLY input bar (shows `REPLY:[device:sess4] ____` when clicked).
       - WebSocket auto-connect on page load + Google auth.
@@ -271,12 +271,15 @@ the prefix length can be increased to 6 or 8 chars.
 - [x] `GET /v1/rooms/:room/events?device={device_name}` → SSE stream
       (read-only push, 15s keepalive, TransformStream-based).
 
-### W5 — Google OAuth verification in worker
+### W5 — GitHub sign-in verification in worker
+      (2026-08-18: replaced Google OAuth — Zed itself signs in with GitHub,
+      so the board follows suit; device flow preserves the no-secrets-in-
+      worker property. Old GIS/JWKS code removed.)
 - [x] Worker verifies Google ID token for WebSocket auth + POST /reply:
       - Fetch + cache Google JWKS (1h TTL in module-level `googleJwksCache`).
       - Verify JWT signature (Web Crypto RSASSA-PKCS1-v1_5 / SHA-256), `iss`,
         `aud`, `exp`, `email_verified`.
-      - Assert `email == ALLOWED_EMAIL` (env var, default `katopz@gmail.com`).
+      - Assert `login == ALLOWED_LOGIN` (env var, default `katopz`).
 - [x] The verification function `verifyGoogleToken(token, jwks, clientId, allowedEmail)`
       is pure (takes token + JWKS, returns email or null) so it's unit-testable
       with mock JWKS. Validated end-to-end with a self-signed RSA JWT in
@@ -327,6 +330,9 @@ the prefix length can be increased to 6 or 8 chars.
 - [x] `agent_board/src/feeder.rs`: reply extraction test — reply filter extracted into
       pure `extract_replies_for_device` fn, 3 tests (match, skip other device, empty snapshot).
 - [x] Worker JS: `verifyGoogleToken` tested by sub-agent with mock JWKS.
+      (2026-08-18: superseded — Google OAuth replaced by GitHub device flow;
+      `verifyGithubToken` verified live: bad token → WS close 4001, unconfigured
+      client id → 503 fail-closed, all 16 GOAT checks PASS post-swap.)
 - [x] Session prefix resolution test — `test_thread_for_session_prefix_resolves_active_thread`
       in `agent_panel.rs` (full id lookup, prefix lookup, unknown prefix → None).
 
@@ -400,14 +406,16 @@ No new crate dependencies. `agent_board` gains `websocket_client` module.
       VERIFIED (2026-08-18, live): https://agent-board-worker.foxfox.workers.dev
       → 200, 11.2KB HTML with reply input, accordion (toggleDev/toggleAg),
       status indicator, WS connect logic, GIS script tag. `test/goat.mjs` T1.
-- [ ] Google Sign-In works; only `katopz@gmail.com` accepted.
-      BLOCKED: `GOOGLE_CLIENT_ID` empty in wrangler.toml (needs an OAuth Web
-      Client ID + redeploy). JWT verification logic is unit-tested (W5);
-      live browser flow pending.
+- [ ] GitHub sign-in works; only `katopz` accepted.
+      (2026-08-18: Google Sign-In replaced with GitHub device flow.)
+      BLOCKED: `GITHUB_CLIENT_ID` empty in wrangler.toml (create an OAuth
+      App with Device Flow enabled → paste client id → redeploy). Token
+      verification (`api.github.com/user` + allowlist) + bad-token close
+      4001 verified live; the real browser flow needs the client id.
 - [ ] WebSocket connects on page load; status indicator shows 🟢.
       Mechanism VERIFIED live (T7: WS upgrade + ed25519 auth_ok + fan-out;
-      T8: bad token → close 4001). Browser-rendered 🟢 pending GOOGLE_CLIENT_ID
-      (Google path is the only browser auth).
+      T8: bad token → close 4001). Browser-rendered 🟢 pending GITHUB_CLIENT_ID
+      (GitHub path is the only browser auth).
 - [ ] Clicking an agent expands its state timeline (accordion).
       Browser-UX item — needs interactive session (JS handlers verified present
       in served HTML, T1).
@@ -449,12 +457,14 @@ No new crate dependencies. `agent_board` gains `websocket_client` module.
 
 ### Deployment record (2026-08-18)
 - Worker: https://agent-board-worker.foxfox.workers.dev (version
-  b21df3b1-c0ab-4d99-87ec-b7a18c2187a7)
+  d5a45644-ca75-4146-aac4-970239d7a1c1 — GitHub sign-in build)
 - KV `AGENT_BOARD`: d2cdb46dee30430b96dbf5b439ed318b
 - First device (bootstrap): operator's real SSH identity — matches Zed's
   `DeviceIdentity` derivation, no extra registration needed.
 - Zed config: `~/.config/zed/agent_board.json` (worker_url + realtime_enabled).
-- GOAT suite: `agent-board-worker/test/goat.mjs` — 16/16 PASS (exit 0).
+- GOAT suite: `agent-board-worker/test/goat.mjs` — 16/16 PASS (exit 0)
+  post-GitHub-swap (T1 markers now ghbtn + auth/github/device; T8 sends a
+  garbage GitHub token → 4001).
 - Known limitation (T9): KV-list eventual consistency opens a ≤60s
   self-registration race at cold bootstrap only; steady state 403s unknown
   devices. Probe keys from the race were deleted; allowlist holds exactly

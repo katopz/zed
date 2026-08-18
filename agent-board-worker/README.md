@@ -22,24 +22,35 @@ other's work. See `../.plans/001_agent_board.md` for the full design.
 | Method | Path                            | Auth                | Purpose                              |
 |--------|---------------------------------|---------------------|--------------------------------------|
 | GET    | `/`                             | none                | Single-page HTML dashboard (~15KB).  |
-| GET    | `/ws?room={room}`               | Google token (1st WS message) | WebSocket real-time push.     |
+| GET    | `/ws?room={room}`               | GitHub token (1st WS message) | WebSocket real-time push.     |
 | GET    | `/v1/rooms/{room}/events`       | none (read-only)    | SSE stream of room events.           |
-| POST   | `/v1/rooms/{room}/reply`        | Google token OR ed25519 | Store operator reply, relay to WS/SSE. |
+| POST   | `/v1/rooms/{room}/reply`        | GitHub token OR ed25519 | Store operator reply, relay to WS/SSE. |
+| POST   | `/auth/github/device`           | none                | Start device-flow sign-in (user_code). |
+| POST   | `/auth/github/poll`             | none                | Poll for the device-flow token.      |
 
 Writes require headers `X-Device-Id`, `X-Timestamp`, `X-Sig`, `X-Pubkey`. The
 signature is `ed25519_sign(request_body_text + "|" + timestamp)` over the raw
 bytes (no pre-hash). The first device self-registers; subsequent devices must be
 added to the allowlist (KV key `device:{device_id}` = pubkey base64).
 
-### Browser auth (Google OAuth)
+### Browser auth (GitHub, device flow — replaces Google OAuth)
 
-The dashboard uses Google Identity Services (GIS) ID-token flow. The browser
-sends the JWT as the first WebSocket message or as `Authorization: Bearer
-<jwt>` on `POST /reply`. The worker verifies the signature against Google's
-JWKS (cached 1h), checks `iss`, `aud`, `exp`, `email_verified`, and asserts
-`email == ALLOWED_EMAIL` (env var, default `katopz@gmail.com`). No client
-secret is needed for the ID-token flow; the `GOOGLE_CLIENT_ID` env var is
-public and embedded in the dashboard HTML.
+The dashboard signs in with GitHub via the OAuth **device flow** — the same
+identity model Zed itself uses (GitHub sign-in). Why device flow: it needs
+only a public `GITHUB_CLIENT_ID`, so the worker keeps its "no secrets"
+property (no client secret, ever). Flow: the dashboard fetches a `user_code`
+from `POST /auth/github/device`, the operator authorizes at
+`github.com/login/device`, the dashboard polls `POST /auth/github/poll` until
+GitHub issues the token, then sends it as the first WebSocket message
+(`{type:"auth", github_token}`) or as `Authorization: Bearer <token>` on
+`POST /reply`. Tokens are opaque, so verification asks `api.github.com/user`
+whose token it is (cached 10 min by sha256(token)) and asserts
+`login == ALLOWED_LOGIN` (env var, default `katopz`).
+
+**Setup** (one-time): GitHub → Settings → Developer settings → OAuth Apps →
+New OAuth App (callback URL can be the worker URL; it is unused by device
+flow) → enable **Device Flow** in the app's advanced settings → paste the
+client id into `GITHUB_CLIENT_ID` in `wrangler.toml` → `npx wrangler deploy`.
 
 ### Durable Object
 
@@ -118,9 +129,9 @@ POSTs still succeed — the KV write happens first, the relay is best-effort.
 - First device registered (bootstrap): the operator's real SSH-key identity
   (`device_id` = blake3 of `~/.ssh/id_ed25519` pubkey) — same identity Zed's
   `DeviceIdentity` derives, so the panel needs no extra registration step.
-- `GOOGLE_CLIENT_ID` is still empty — browser Google Sign-In disabled until
-  an OAuth Web Client ID is set (`wrangler.toml` → redeploy). ed25519 paths
-  (Zed device) are fully live.
+- `GITHUB_CLIENT_ID` is still empty — browser GitHub Sign-In disabled until
+  an OAuth App client id is set (device flow enabled, see setup above) and
+  redeployed. ed25519 paths (Zed device) are fully live.
 - Zed-side config lives at `~/.config/zed/agent_board.json`
   (`worker_url` + `realtime_enabled: true`).
 

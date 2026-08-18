@@ -181,9 +181,9 @@ pub struct WebReply {
     /// The reply text (capped at 1024 chars by the worker).
     #[serde(default)]
     pub text: String,
-    /// Email of the poster (always the allowed email for now).
+    /// GitHub login of the poster (always the allowlisted login for now).
     #[serde(default)]
-    pub author_email: String,
+    pub author_login: String,
     /// Unix millis.
     #[serde(default)]
     pub ts: i64,
@@ -509,7 +509,7 @@ mod tests {
             target_device: "m3".to_string(),
             target_session_prefix: "f3a2".to_string(),
             text: "stop and commit".to_string(),
-            author_email: "katopz@gmail.com".to_string(),
+            author_login: "katopz".to_string(),
             ts: 1700000000000,
         };
         let json = serde_json::to_string(&reply).unwrap();
@@ -525,14 +525,14 @@ mod tests {
             "target_device": "SHIKUWA",
             "target_session_prefix": "b1c9",
             "text": "switch to develop first",
-            "author_email": "katopz@gmail.com",
+            "author_login": "katopz",
             "ts": 1700000000000
         }"#;
         let reply: WebReply = serde_json::from_str(json).unwrap();
         assert_eq!(reply.target_device, "SHIKUWA");
         assert_eq!(reply.target_session_prefix, "b1c9");
         assert_eq!(reply.text, "switch to develop first");
-        assert_eq!(reply.author_email, "katopz@gmail.com");
+        assert_eq!(reply.author_login, "katopz");
     }
 
     #[test]
@@ -549,7 +549,7 @@ mod tests {
                     "target_device": "m3",
                     "target_session_prefix": "f3a2",
                     "text": "commit now",
-                    "author_email": "katopz@gmail.com",
+                    "author_login": "katopz",
                     "ts": 1700000000001
                 }
             ]

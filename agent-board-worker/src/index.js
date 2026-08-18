@@ -12,9 +12,11 @@
 //
 // Browser-facing routes (Plan 015 W1-W5):
 //   GET  /                                 → single-page HTML dashboard
-//   GET  /ws?room=...                      → WebSocket upgrade (Google token auth)
+//   GET  /ws?room=...                      → WebSocket upgrade (GitHub token auth)
 //   GET  /v1/rooms/:room/events?device=... → SSE stream (read-only event push)
-//   POST /v1/rooms/:room/reply             → store operator reply (Google or ed25519)
+//   POST /v1/rooms/:room/reply             → store operator reply (GitHub or ed25519)
+//   POST /auth/github/device               → start GitHub device-flow sign-in
+//   POST /auth/github/poll                 → poll for the device-flow token
 //
 // Signing note: clients sign the *raw request body text + "|" + timestamp*
 // bytes directly. ed25519 signs arbitrary-length messages internally, so no
@@ -31,26 +33,15 @@ const TTL_SECS = 60 * 60 * 24 * 7; // 1 week
 
 const encoder = new TextEncoder();
 
-// Module-level JWKS cache for Google ID token verification (W5).
-// Refreshed at most every hour; served stale if a refresh fetch fails.
-const GOOGLE_JWKS_URL = "https://www.googleapis.com/oauth2/v3/certs";
-const GOOGLE_JWKS_TTL_MS = 60 * 60 * 1000;
-let googleJwksCache = null;
-let googleJwksCacheAt = 0;
+// Module-level verification cache for GitHub tokens (W5, replaces Google
+// JWT/JWKS). GitHub tokens are opaque — the only way to verify one is to ask
+// api.github.com whose it is — so cache sha256(token) → login for 10 min to
+// avoid an API round-trip on every WS auth / reply POST.
+const GITHUB_VERIFY_TTL_MS = 10 * 60 * 1000;
+const githubTokenCache = new Map(); // hex(sha256(token)) -> { login, expiresAt }
 
 function b64decode(s) {
   return Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
-}
-
-// Base64url decode → raw bytes. JWT/JWK use URL-safe base64 with no padding.
-function b64urlDecode(s) {
-  let normalized = s.replace(/-/g, "+").replace(/_/g, "/");
-  while (normalized.length % 4 !== 0) normalized += "=";
-  return Uint8Array.from(atob(normalized), (c) => c.charCodeAt(0));
-}
-
-function b64urlDecodeStr(s) {
-  return new TextDecoder().decode(b64urlDecode(s));
 }
 
 function nowKey() {
@@ -118,117 +109,114 @@ async function verifySignature(env, headers, bodyText) {
   });
   return { ok: true, deviceId };
 }
-
 // ───────────────────────────────────────────────────────────────────────────
-// W5 — Google OAuth verification (web UI → worker)
-// ───────────────────────────────────────────────────────────────────────────
-
-async function getGoogleJwks() {
-  const now = Date.now();
-  if (googleJwksCache && now - googleJwksCacheAt < GOOGLE_JWKS_TTL_MS) {
-    return googleJwksCache;
-  }
-  try {
-    const res = await fetch(GOOGLE_JWKS_URL);
-    if (!res.ok) throw new Error(`JWKS HTTP ${res.status}`);
-    const data = await res.json();
-    googleJwksCache = data;
-    googleJwksCacheAt = now;
-    return data;
-  } catch (err) {
-    // Serve stale cache if we have one — better than hard-failing auth when
-    // Google's endpoint has a transient blip.
-    if (googleJwksCache) return googleJwksCache;
-    throw err;
-  }
-}
-
-// Pure-ish: takes token + cached JWKS + expected claims, returns the verified
-// email or null. Stateless w.r.t. global caches so it can be unit-tested with
-// a fixture JWKS + signed JWT.
+// W5 — GitHub sign-in, device flow (web UI → worker). Replaces Google OAuth:
+// Zed itself signs in with GitHub, so the board follows suit.
 //
-// Verifies: JWT structure, signature (RS256 via Web Crypto), iss, aud, exp,
-// email_verified, and that email matches the allowlist (when non-empty).
-async function verifyGoogleToken(token, jwks, clientId, allowedEmail) {
-  if (!token || !jwks || !Array.isArray(jwks.keys)) return null;
-  const parts = token.split(".");
-  if (parts.length !== 3) return null;
-  const [headerB64, payloadB64, sigB64] = parts;
+// Why device flow: it needs ONLY a public client_id — no client secret in the
+// worker (same "no secrets" property the Google path had). The browser gets a
+// user_code, authorizes at github.com/login/device, and the dashboard polls
+// until GitHub issues the access token. Verification of that token is an
+// api.github.com/user call (GitHub tokens are opaque — there is no local
+// signature to check), cached 10 min keyed by sha256(token).
+// ───────────────────────────────────────────────────────────────────────────
 
-  let header, payload;
-  try {
-    header = JSON.parse(b64urlDecodeStr(headerB64));
-    payload = JSON.parse(b64urlDecodeStr(payloadB64));
-  } catch {
-    return null;
-  }
+const GITHUB_API_USER = "https://api.github.com/user";
+const GITHUB_DEVICE_URL = "https://github.com/login/device/code";
+const GITHUB_TOKEN_URL = "https://github.com/login/oauth/access_token";
 
-  // Claim checks (do these before the signature work — cheaper to fail fast).
-  if (
-    payload.iss !== "https://accounts.google.com" &&
-    payload.iss !== "accounts.google.com"
-  ) {
-    return null;
-  }
-  if (clientId && payload.aud !== clientId) return null;
-  if (typeof payload.exp !== "number" || payload.exp < Date.now() / 1000) {
-    return null;
-  }
-  if (payload.email_verified !== true) return null;
-  if (allowedEmail && payload.email !== allowedEmail) return null;
-
-  // Find the signing key by `kid`.
-  const jwk = jwks.keys.find(
-    (k) => k.kid === header.kid && k.kty === "RSA"
-  );
-  if (!jwk) return null;
-
-  try {
-    const cryptoKey = await crypto.subtle.importKey(
-      "jwk",
-      jwk,
-      { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
-      false,
-      ["verify"]
-    );
-    const signingInput = new TextEncoder().encode(`${headerB64}.${payloadB64}`);
-    const signature = b64urlDecode(sigB64);
-    const ok = await crypto.subtle.verify(
-      { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
-      cryptoKey,
-      signature,
-      signingInput
-    );
-    if (!ok) return null;
-  } catch {
-    return null;
-  }
-  return payload.email ?? null;
+async function sha256Hex(text) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-// Convenience wrapper: fetches/caches JWKS then delegates. Returns
-// { ok: true, email } or { ok: false, error }.
-async function authenticateGoogleToken(env, token) {
+// Verify a GitHub user token: ask GitHub whose it is, then check the login
+// against the allowlist. Returns { ok: true, login } or { ok: false, error }.
+async function verifyGithubToken(env, token) {
   if (!token) return { ok: false, error: "missing token" };
-  if (!env.GOOGLE_CLIENT_ID) {
-    return { ok: false, error: "GOOGLE_CLIENT_ID not configured" };
+  const allowedLogin = (env.ALLOWED_LOGIN || "katopz").toLowerCase();
+  const key = await sha256Hex(token);
+  const cached = githubTokenCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.login.toLowerCase() === allowedLogin
+      ? { ok: true, login: cached.login }
+      : { ok: false, error: `login ${cached.login} not allowlisted` };
   }
-  const allowedEmail = env.ALLOWED_EMAIL || "katopz@gmail.com";
   try {
-    const jwks = await getGoogleJwks();
-    const email = await verifyGoogleToken(
-      token,
-      jwks,
-      env.GOOGLE_CLIENT_ID,
-      allowedEmail
-    );
-    if (!email) return { ok: false, error: "invalid token" };
-    return { ok: true, email };
+    const res = await fetch(GITHUB_API_USER, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: "application/vnd.github+json",
+        // GitHub's API rejects requests without a User-Agent.
+        "User-Agent": "agent-board-worker",
+      },
+    });
+    if (res.status === 401) return { ok: false, error: "invalid token" };
+    if (!res.ok) return { ok: false, error: `github api ${res.status}` };
+    const user = await res.json();
+    const login = String(user.login ?? "");
+    if (!login) return { ok: false, error: "token has no login" };
+    if (login.toLowerCase() !== allowedLogin) {
+      return { ok: false, error: `login ${login} not allowlisted` };
+    }
+    githubTokenCache.set(key, { login, expiresAt: Date.now() + GITHUB_VERIFY_TTL_MS });
+    return { ok: true, login };
   } catch (err) {
+    // Fail closed on network errors (mirrors the old JWKS-fetch stance).
     return { ok: false, error: String(err.message || err) };
   }
 }
 
+// POST /auth/github/device — start the flow. Returns the user_code the
+// operator types at github.com/login/device plus the device_code the dashboard
+// polls with. No secrets involved; client_id is public by design.
+async function handleGithubDeviceStart(env) {
+  if (!env.GITHUB_CLIENT_ID) {
+    return json({ error: "GITHUB_CLIENT_ID not configured" }, 503);
+  }
+  const res = await fetch(GITHUB_DEVICE_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json", "User-Agent": "agent-board-worker" },
+    body: JSON.stringify({ client_id: env.GITHUB_CLIENT_ID, scope: "read:user" }),
+  });
+  if (!res.ok) return json({ error: `github device ${res.status}` }, 502);
+  const data = await res.json();
+  return json(
+    {
+      device_code: data.device_code,
+      user_code: data.user_code,
+      verification_uri: data.verification_uri,
+      interval: data.interval ?? 5,
+      expires_in: data.expires_in ?? 900,
+    },
+    200
+  );
+}
+
+// POST /auth/github/poll { device_code } — poll GitHub's token endpoint.
+// Maps the device-flow error taxonomy to a simple status for the dashboard.
+async function handleGithubDevicePoll(env, deviceCode) {
+  if (!env.GITHUB_CLIENT_ID) {
+    return json({ error: "GITHUB_CLIENT_ID not configured" }, 503);
+  }
+  if (!deviceCode) return json({ error: "missing device_code" }, 400);
+  const res = await fetch(GITHUB_TOKEN_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json", "User-Agent": "agent-board-worker" },
+    body: JSON.stringify({
+      client_id: env.GITHUB_CLIENT_ID,
+      device_code: deviceCode,
+      grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+    }),
+  });
+  if (!res.ok) return json({ error: `github token ${res.status}` }, 502);
+  const data = await res.json();
+  if (data.access_token) return json({ status: "ok", access_token: data.access_token }, 200);
+  if (data.error === "authorization_pending" || data.error === "slow_down") {
+    return json({ status: "pending" }, 202);
+  }
+  return json({ status: "error", error: String(data.error ?? "unknown") }, 200);
+}
 // ───────────────────────────────────────────────────────────────────────────
 // Durable Object relay helper (W3/W4)
 // ───────────────────────────────────────────────────────────────────────────
@@ -309,7 +297,7 @@ async function handlePostState(env, room, body, verified) {
   return json(state, 201);
 }
 
-async function handlePostReply(env, room, body, authorEmail) {
+async function handlePostReply(env, room, body, authorLogin) {
   // Operator reply (Plan 015 W6). Stored under `room:{room}:reply:` so the
   // existing GET handler can ring-buffer and the Zed feeder can drain it.
   // The 4-char `target_session_prefix` is the routing key — the web UI never
@@ -319,7 +307,7 @@ async function handlePostReply(env, room, body, authorEmail) {
     target_device: String(body.target_device ?? ""),
     target_session_prefix: String(body.target_session_prefix ?? ""),
     text: String(body.text ?? "").slice(0, 1024),
-    author_email: authorEmail ?? "",
+    author_login: authorLogin ?? "",
     ts: Date.now(),
   };
   await env.AGENT_BOARD.put(
@@ -377,14 +365,13 @@ async function handleGetRoom(env, room) {
 // W1 — Worker HTML dashboard (inline, ~15KB budget, no framework)
 // ───────────────────────────────────────────────────────────────────────────
 
-function dashboardHtml(roomId, clientId) {
+function dashboardHtml(roomId, githubEnabled) {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Agent Board</title>
-<script src="https://accounts.google.com/gsi/client" async defer></script>
 <style>
 *{box-sizing:border-box}
 body{font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:0;padding:12px 12px 64px;background:#1b1b1b;color:#e4e4e4}
@@ -418,6 +405,14 @@ h1{font-size:15px;margin:0;font-weight:600}
 #replybar button:hover{background:#4a7dc8}
 #replybar button:disabled{background:#333;color:#666;cursor:not-allowed}
 .empty{color:#777;font-style:italic;padding:20px;text-align:center}
+#ghbtn{display:none;padding:5px 12px;background:#24292f;color:#fff;border:1px solid #444;border-radius:3px;cursor:pointer;font:600 12px/1.4 -apple-system,sans-serif}
+#ghbtn:hover{background:#32383f}
+#modal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:10;align-items:center;justify-content:center}
+#modal.open{display:flex}
+#modalbox{background:#262626;border:1px solid #3a3a3a;border-radius:6px;padding:20px;max-width:380px;text-align:center}
+#ucode{font:700 24px/1.3 ui-monospace,Menlo,monospace;letter-spacing:3px;margin:12px 0;color:#8ce28c}
+#modalbox a{color:#6ea8e0}
+#mstate{color:#999;font-size:12px;margin-top:10px}
 </style>
 </head>
 <body>
@@ -425,7 +420,7 @@ h1{font-size:15px;margin:0;font-weight:600}
   <h1>📡 Agent Board · <span id="room"></span></h1>
   <div id="right">
     <span id="status" class="bad">🔴 off</span>
-    <div id="g_id"></div>
+    <button id="ghbtn">Sign in with GitHub</button>
   </div>
 </header>
 <div id="dash"><div class="empty">Sign in to load the room.</div></div>
@@ -433,12 +428,18 @@ h1{font-size:15px;margin:0;font-weight:600}
   <input id="reply" placeholder="REPLY:[device:sess4] message" autocomplete="off">
   <button id="send" disabled>Send</button>
 </div>
+<div id="modal"><div id="modalbox">
+  <div>Enter this code on GitHub:</div>
+  <div id="ucode"></div>
+  <a id="vlink" href="#" target="_blank" rel="noopener">github.com/login/device</a>
+  <div id="mstate">waiting for authorization…</div>
+</div></div>
 <script>
 const ROOM = ${JSON.stringify(roomId)};
-const CID = ${JSON.stringify(clientId || "")};
+const GH_ENABLED = ${JSON.stringify(Boolean(githubEnabled))};
 document.getElementById("room").textContent = ROOM;
 
-let token = null, email = null, ws = null, backoff = 1000;
+let token = sessionStorage.getItem("ab_gh_token") || null, login = null, ws = null, backoff = 1000;
 let devices = {};                 // name -> { agents: { sess4 -> {session_id, states:[]} } }
 let expandedDev = new Set();      // device names whose body is open
 let expandedAg = new Set();       // "name:sess4" keys whose body is open
@@ -447,14 +448,6 @@ function setStatus(ok) {
   const el = document.getElementById("status");
   el.textContent = ok ? "🟢 on" : "🔴 off";
   el.className = ok ? "ok" : "bad";
-}
-function b64url(s) {
-  let n = s.replace(/-/g, "+").replace(/_/g, "/");
-  while (n.length % 4) n += "=";
-  return atob(n);
-}
-function decodeJwt(t) {
-  try { return JSON.parse(b64url(t.split(".")[1])); } catch (e) { return null; }
 }
 function esc(s) {
   return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
@@ -466,33 +459,71 @@ function fmtTime(ts) {
   try { return new Date(ts).toLocaleTimeString(); } catch (e) { return ""; }
 }
 
-function onCred(cred) {
-  token = cred.credential;
-  const c = decodeJwt(token);
-  email = (c && c.email) || null;
+// ── GitHub device-flow sign-in ──
+function onAuthed(t) {
+  token = t;
+  sessionStorage.setItem("ab_gh_token", t);
+  document.getElementById("ghbtn").style.display = "none";
   document.getElementById("replybar").style.display = "flex";
   document.getElementById("send").disabled = false;
   connect();
   fetchRoom();
 }
-window.onCred = onCred;
 
-function initGsi() {
-  if (initGsi.done || !window.google || !window.google.accounts) return;
-  if (!CID) return; // no client id configured — sign-in disabled
-  initGsi.done = true;
-  google.accounts.id.initialize({ client_id: CID, callback: onCred });
-  google.accounts.id.renderButton(document.getElementById("g_id"), {
-    theme: "filled_black", size: "medium", shape: "pill",
-  });
+function showSignIn() {
+  const btn = document.getElementById("ghbtn");
+  btn.style.display = GH_ENABLED ? "inline-block" : "none";
+  if (!GH_ENABLED) btn.title = "GITHUB_CLIENT_ID not configured on the worker";
 }
-const gsiTimer = setInterval(function () {
-  if (window.google && window.google.accounts) {
-    clearInterval(gsiTimer);
-    initGsi();
+
+async function ghSignIn() {
+  const modal = document.getElementById("modal");
+  const state = document.getElementById("mstate");
+  const ucode = document.getElementById("ucode");
+  const vlink = document.getElementById("vlink");
+  try {
+    const res = await fetch("/auth/github/device", { method: "POST" });
+    const data = await res.json();
+    if (!res.ok) { state.textContent = data.error || "failed to start sign-in"; return; }
+    ucode.textContent = data.user_code;
+    vlink.href = data.verification_uri || "https://github.com/login/device";
+    state.textContent = "waiting for authorization…";
+    modal.classList.add("open");
+    const deadline = Date.now() + (data.expires_in || 900) * 1000;
+    let interval = (data.interval || 5) * 1000;
+    const deviceCode = data.device_code;
+    (async function poll() {
+      if (Date.now() > deadline || !modal.classList.contains("open")) return;
+      await new Promise((r) => setTimeout(r, interval));
+      try {
+        const pr = await fetch("/auth/github/poll", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ device_code: deviceCode }),
+        });
+        const pd = await pr.json();
+        if (pd.status === "ok") {
+          modal.classList.remove("open");
+          onAuthed(pd.access_token);
+          return;
+        }
+        if (pd.status === "error") {
+          state.textContent = "sign-in failed: " + (pd.error || "unknown") + " — try again";
+          return;
+        }
+        if (pd.status === "pending" && pr.headers.get("retry-after")) interval += 5000;
+        state.textContent = "waiting for authorization…";
+        poll();
+      } catch (e) {
+        state.textContent = "network error — retrying";
+        poll();
+      }
+    })();
+  } catch (e) {
+    state.textContent = "network error: " + String(e);
   }
-}, 200);
-setTimeout(function () { clearInterval(gsiTimer); }, 15000);
+}
+document.getElementById("ghbtn").addEventListener("click", ghSignIn);
 
 function connect() {
   if (!token) return;
@@ -502,7 +533,7 @@ function connect() {
   ws.onopen = function () {
     setStatus(true);
     backoff = 1000;
-    ws.send(JSON.stringify({ type: "auth", google_token: token }));
+    ws.send(JSON.stringify({ type: "auth", github_token: token }));
   };
   ws.onmessage = function (ev) {
     let m;
@@ -512,13 +543,12 @@ function connect() {
   };
   ws.onclose = function (ev) {
     setStatus(false);
-    // 4001 = auth failed (token expired / wrong email). Re-render the sign-in
-    // button so the user can re-auth; otherwise exponential-backoff reconnect.
+    // 4001 = auth failed (token revoked / wrong login). Drop the stored token
+    // and show the sign-in button again; otherwise backoff-reconnect.
     if (ev.code === 4001) {
       token = null;
-      email = null;
-      initGsi.done = false;
-      initGsi();
+      sessionStorage.removeItem("ab_gh_token");
+      showSignIn();
       return;
     }
     setTimeout(connect, backoff);
@@ -652,7 +682,7 @@ function sendReply() {
   if (ws && ws.readyState === 1) {
     ws.send(JSON.stringify(payload));
   } else {
-    // Fallback: HTTP POST with the Google bearer token.
+    // Fallback: HTTP POST with the GitHub bearer token.
     fetch("/v1/rooms/" + encodeURIComponent(ROOM) + "/reply", {
       method: "POST",
       headers: { "Authorization": "Bearer " + token, "Content-Type": "application/json" },
@@ -665,6 +695,13 @@ document.getElementById("send").addEventListener("click", sendReply);
 document.getElementById("reply").addEventListener("keydown", function (e) {
   if (e.key === "Enter") sendReply();
 });
+document.getElementById("modal").addEventListener("click", function (e) {
+  if (e.target.id === "modal") e.target.classList.remove("open"); // cancel
+});
+
+// Boot: restore a stored token (auto-connect), otherwise show sign-in.
+if (token) onAuthed(token);
+else showSignIn();
 </script>
 </body>
 </html>`;
@@ -688,9 +725,23 @@ export default {
     // W1 — Dashboard HTML. Static, no auth.
     if (path === "/") {
       const roomId = url.searchParams.get("room") ?? "zed-agent-board";
-      return new Response(dashboardHtml(roomId, env.GOOGLE_CLIENT_ID), {
+      return new Response(dashboardHtml(roomId, Boolean(env.GITHUB_CLIENT_ID)), {
         headers: { "content-type": "text/html; charset=utf-8" },
       });
+    }
+
+    // W5 — GitHub device-flow sign-in (replaces Google GIS).
+    if (path === "/auth/github/device" && request.method === "POST") {
+      return handleGithubDeviceStart(env);
+    }
+    if (path === "/auth/github/poll" && request.method === "POST") {
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return json({ error: "invalid json" }, 400);
+      }
+      return handleGithubDevicePoll(env, body.device_code);
     }
 
     // W4 — WebSocket upgrade. Forwarded to the per-room RoomCoordinator DO,
@@ -709,7 +760,7 @@ export default {
 
     // W4 — SSE stream. Forwarded to the DO, which holds the connection open
     // and pushes events. Read-only; auth is optional here (events are room
-    // state broadcasts, not privileged data). Optional ?token=<google-jwt>
+    // state broadcasts, not privileged data). Optional ?token=<github-token>
     // is validated if present.
     const eventsMatch = path.match(/^\/v1\/rooms\/([^/]+)\/events$/);
     if (eventsMatch && request.method === "GET") {
@@ -762,20 +813,20 @@ export default {
       return handlePostState(env, decodeURIComponent(stateMatch[1]), body, verified);
     }
 
-    // W4 — Operator reply. Auth: Google bearer token (web) OR ed25519 (Zed).
+    // W4 — Operator reply. Auth: GitHub bearer token (web) OR ed25519 (Zed).
     const replyMatch = path.match(/^\/v1\/rooms\/([^/]+)\/reply$/);
     if (replyMatch && request.method === "POST") {
       const room = decodeURIComponent(replyMatch[1]);
       const bodyText = await request.text();
-      let authorEmail = null;
+      let authorLogin = null;
 
-      // Try Google token first.
+      // Try GitHub token first.
       const authHeader = request.headers.get("Authorization") ?? "";
       const bearer = authHeader.match(/^Bearer\s+(.+)$/i);
       if (bearer) {
-        const result = await authenticateGoogleToken(env, bearer[1]);
+        const result = await verifyGithubToken(env, bearer[1]);
         if (result.ok) {
-          authorEmail = result.email;
+          authorLogin = result.login;
         } else {
           return json({ error: "auth: " + result.error }, 401);
         }
@@ -791,7 +842,7 @@ export default {
       } catch {
         return json({ error: "invalid json" }, 400);
       }
-      return handlePostReply(env, room, body, authorEmail);
+      return handlePostReply(env, room, body, authorLogin);
     }
 
     return json({ error: "not found" }, 404);
@@ -811,7 +862,7 @@ export class RoomCoordinator {
   constructor(state, env) {
     this.state = state;
     this.env = env;
-    // ws -> { room, authed, source, email, device_id }
+    // ws -> { room, authed, source, login, device_id }
     this.sessions = new Map();
     // Set<WritableStreamDefaultWriter> for SSE clients
     this.sseWriters = new Set();
@@ -832,7 +883,7 @@ export class RoomCoordinator {
         room,
         authed: false,
         source: null,
-        email: null,
+        login: null,
         device_id: null,
       });
 
@@ -887,7 +938,7 @@ export class RoomCoordinator {
       }
       meta.authed = true;
       meta.source = result.source;
-      meta.email = result.email;
+      meta.login = result.login;
       meta.device_id = result.device_id;
       try { ws.send(JSON.stringify({ type: "auth_ok" })); } catch (_) {}
       return;
@@ -908,7 +959,7 @@ export class RoomCoordinator {
         target_device: String(parsed.target_device ?? ""),
         target_session_prefix: String(parsed.target_session_prefix ?? ""),
         text: String(parsed.text ?? "").slice(0, 1024),
-        author_email: meta.email ?? "",
+        author_login: meta.login ?? "",
         ts: Date.now(),
       };
       try {
@@ -935,17 +986,17 @@ export class RoomCoordinator {
   }
 
   // Authenticate the first WS message. Two paths:
-  //   - { type: "auth", google_token: "<JWT>" }   → browser via Google OAuth
+  //   - { type: "auth", github_token: "<token>" } → browser via GitHub device flow
   //   - { type: "auth", sig, pubkey, device_id, timestamp } → Zed via ed25519
   //   The ed25519 path mirrors verifySignature but with an empty body (the
   //   client signs "|"+timestamp, same canonical form the HTTP path uses).
   async authenticate(auth, room) {
     if (!auth || typeof auth !== "object") return { ok: false, error: "bad auth shape" };
 
-    if (auth.google_token) {
-      const result = await authenticateGoogleToken(this.env, auth.google_token);
+    if (auth.github_token) {
+      const result = await verifyGithubToken(this.env, auth.github_token);
       if (!result.ok) return result;
-      return { ok: true, source: "google", email: result.email, device_id: null };
+      return { ok: true, source: "github", login: result.login, device_id: null };
     }
 
     if (auth.sig && auth.pubkey && auth.device_id && auth.timestamp) {
@@ -969,7 +1020,7 @@ export class RoomCoordinator {
         await this.env.AGENT_BOARD.put(`device:${auth.device_id}`, auth.pubkey, {
           expirationTtl: TTL_SECS,
         });
-        return { ok: true, source: "ed25519", email: null, device_id: auth.device_id };
+        return { ok: true, source: "ed25519", login: null, device_id: auth.device_id };
       } catch (err) {
         return { ok: false, error: "verify threw: " + String(err) };
       }
