@@ -1,0 +1,12 @@
+{
+  "name": "agent-board-goat-tests",
+  "private": true,
+  "type": "module",
+  "description": "Live GOAT-gate verification for the deployed agent-board worker (Plan 015). Signs with the operator's real SSH key so requests are byte-identical to Zed's DeviceIdentity.",
+  "scripts": {
+    "goat": "node goat.mjs"
+  },
+  "dependencies": {
+    "blake3": "^2.1.7"
+  }
+}

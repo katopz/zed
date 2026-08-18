@@ -374,6 +374,13 @@ the prefix length can be increased to 6 or 8 chars.
 - **Google JWKS fetch failure**: if the worker can't fetch JWKS (network
   issue), auth fails closed (401). The operator can use the Zed device path
   (ed25519) which doesn't depend on JWKS.
+- **KV bootstrap race (found live 2026-08-18)**: the device-allowlist gate
+  reads `KV list` (eventually consistent, ≤60s). A second device registering
+  within that window after the *first-ever* registration can self-register
+  before the list converges. Observed once during GOAT testing (probe cleaned
+  up); steady state rejects unknown devices (403, verified T9). If this ever
+  matters in practice, move the allowlist to a Durable Object (strongly
+  consistent) — noted as follow-up, not blocking for a single-operator tool.
 
 ## Dependency direction
 ```
@@ -389,19 +396,43 @@ No new crate dependencies. `agent_board` gains `websocket_client` module.
 `auto_prompt::peer_states` gains `inject_web_reply` + `drain_web_replies`.
 
 ## GOAT gate
-- [ ] Web UI loads at `GET /` and shows room dashboard.
+- [x] Web UI loads at `GET /` and shows room dashboard.
+      VERIFIED (2026-08-18, live): https://agent-board-worker.foxfox.workers.dev
+      → 200, 11.2KB HTML with reply input, accordion (toggleDev/toggleAg),
+      status indicator, WS connect logic, GIS script tag. `test/goat.mjs` T1.
 - [ ] Google Sign-In works; only `katopz@gmail.com` accepted.
+      BLOCKED: `GOOGLE_CLIENT_ID` empty in wrangler.toml (needs an OAuth Web
+      Client ID + redeploy). JWT verification logic is unit-tested (W5);
+      live browser flow pending.
 - [ ] WebSocket connects on page load; status indicator shows 🟢.
+      Mechanism VERIFIED live (T7: WS upgrade + ed25519 auth_ok + fan-out;
+      T8: bad token → close 4001). Browser-rendered 🟢 pending GOOGLE_CLIENT_ID
+      (Google path is the only browser auth).
 - [ ] Clicking an agent expands its state timeline (accordion).
+      Browser-UX item — needs interactive session (JS handlers verified present
+      in served HTML, T1).
 - [ ] REPLY input populates `REPLY:[device:sess4]` when clicking an item.
-- [ ] State updates from Zed appear in browser instantly via WebSocket (no refresh).
+      Browser-UX item — same as above.
+- [x] State updates from Zed appear in browser instantly via WebSocket (no refresh).
+      VERIFIED (2026-08-18, live): signed POST /status + /state → relayed to
+      connected SSE and WS clients in 889–906ms warm (<1s). `test/goat.mjs`
+      T3/T4/T7.
 - [ ] Reply posted from browser reaches target Zed device:
       - WebSocket ON: <1s.
       - WebSocket OFF: <15s (poll fallback).
+      Worker side VERIFIED live (T6): POST /reply → 201 → typed SSE relay
+      (<1s) + KV persistence (snapshot poll path for the 15s feeder).
+      Zed side: reply drain + injection unit-tested (W8/W9/W10), live panel
+      run pending (~/.config/zed/agent_board.json now points at the worker
+      with realtime_enabled=true).
 - [ ] Native agent thread receives the reply as a steering message.
+      Needs live Zed panel session (GUI).
 - [ ] Claude agent thread receives the reply as a regular user message.
+      Needs live Zed panel session (GUI).
 - [ ] Zed 📡 toggle: ON = instant replies, OFF = poll fallback.
+      Needs live Zed panel session (GUI).
 - [ ] Zed chat panel shows 🌐 badge for web-originated replies.
+      Needs live Zed panel session (GUI).
 - [x] 4-char session prefix resolves correctly (exact match, no collision).
       Verified by `test_thread_for_session_prefix_resolves_active_thread` in `agent_panel.rs`.
 - [x] Replies targeting a non-existent session are silently skipped (no crash).
@@ -409,6 +440,22 @@ No new crate dependencies. `agent_board` gains `websocket_client` module.
       `extract_replies_skips_other_devices` (wrong device → empty, no crash).
 - [x] Wire contract: `WebReply` JSON round-trips between worker JS and Rust types.
       Verified by `web_reply_serializes` + `worker_reply_output_deserializes` in `types.rs`.
+      Live-corroborated 2026-08-18: T6 typed relay + snapshot parse.
 - [x] Old room snapshots without `replies` field still deserialize.
       Verified by `room_snapshot_without_replies_defaults_empty` in `types.rs`.
-- [ ] Worker auto-relays HTTP POSTs to connected browser WebSockets (auto-accept).
+- [x] Worker auto-relays HTTP POSTs to connected browser WebSockets (auto-accept).
+      VERIFIED (2026-08-18, live): signed POST /status relayed to a connected
+      WS client (ed25519-authed) via the DO. `test/goat.mjs` T7.
+
+### Deployment record (2026-08-18)
+- Worker: https://agent-board-worker.foxfox.workers.dev (version
+  b21df3b1-c0ab-4d99-87ec-b7a18c2187a7)
+- KV `AGENT_BOARD`: d2cdb46dee30430b96dbf5b439ed318b
+- First device (bootstrap): operator's real SSH identity — matches Zed's
+  `DeviceIdentity` derivation, no extra registration needed.
+- Zed config: `~/.config/zed/agent_board.json` (worker_url + realtime_enabled).
+- GOAT suite: `agent-board-worker/test/goat.mjs` — 16/16 PASS (exit 0).
+- Known limitation (T9): KV-list eventual consistency opens a ≤60s
+  self-registration race at cold bootstrap only; steady state 403s unknown
+  devices. Probe keys from the race were deleted; allowlist holds exactly
+  the operator device.

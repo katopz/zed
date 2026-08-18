@@ -110,3 +110,38 @@ The first `npx wrangler deploy` after adding `RoomCoordinator` runs the
 `[[migrations]] tag = "v1"` block and creates the DO namespace. Subsequent
 deploys are zero-downtime. If the DO is unavailable (e.g. region issue), HTTP
 POSTs still succeed — the KV write happens first, the relay is best-effort.
+
+## Live deployment (2026-08-18)
+
+- URL: `https://agent-board-worker.foxfox.workers.dev`
+- KV namespace `AGENT_BOARD`: `d2cdb46dee30430b96dbf5b439ed318b`
+- First device registered (bootstrap): the operator's real SSH-key identity
+  (`device_id` = blake3 of `~/.ssh/id_ed25519` pubkey) — same identity Zed's
+  `DeviceIdentity` derives, so the panel needs no extra registration step.
+- `GOOGLE_CLIENT_ID` is still empty — browser Google Sign-In disabled until
+  an OAuth Web Client ID is set (`wrangler.toml` → redeploy). ed25519 paths
+  (Zed device) are fully live.
+- Zed-side config lives at `~/.config/zed/agent_board.json`
+  (`worker_url` + `realtime_enabled: true`).
+
+### GOAT verification suite
+
+`test/goat.mjs` (run from `agent-board-worker/test/`):
+
+```bash
+npm install
+node goat.mjs https://agent-board-worker.foxfox.workers.dev goat-test
+```
+
+Signs with the operator's real SSH key (byte-identical to Zed's requests) and
+asserts 16 checks: dashboard HTML markers, room snapshot, SSE relay latency
+(<1s warm), status/state/msg/reply POSTs, typed reply relay + KV persistence,
+WS ed25519 auth + fan-out, bad-token close 4001, unknown-device 403, and
+anti-replay 401. Exit 0 = all pass.
+
+Known KV caveat surfaced by T9: the device-allowlist bootstrap gate reads
+`KV list`, which is eventually consistent (≤60s). A second device registering
+within that window of the *first-ever* registration can self-register before
+the list converges. Steady state rejects unknown devices correctly. Single-
+user tool: accepted tradeoff; a strongly consistent DO registry is the fix if
+this ever matters.
