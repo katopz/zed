@@ -532,6 +532,7 @@ pub fn is_backoff_worthy(err: &LanguageModelCompletionError) -> bool {
         LanguageModelCompletionError::PromptTooLarge { .. }
         | LanguageModelCompletionError::NoApiKey { .. }
         | LanguageModelCompletionError::BadRequestFormat { .. }
+        | LanguageModelCompletionError::InvalidEncryptedContent { .. }
         | LanguageModelCompletionError::ApiEndpointNotFound { .. }
         | LanguageModelCompletionError::HttpResponseError { .. }
         | LanguageModelCompletionError::SerializeRequest { .. }

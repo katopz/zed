@@ -40,5 +40,9 @@ ui.workspace = true
 workspace.workspace = true
 
 [dev-dependencies]
+# See auto_prompt's dev-dependencies note on test-support feature unification;
+# workspace/test-support compiles the `RemoteConnectionIdentity::Mock` match
+# arm that project/test-support's remote/test-support requires.
+workspace = { workspace = true, features = ["test-support"] }
 ed25519-dalek = { workspace = true, features = ["rand_core"] }
 rand = "0.8"

@@ -12,10 +12,12 @@ use language_model::{
     LanguageModelToolResultContent, LanguageModelToolSchemaFormat, LanguageModelToolUse,
     MessageContent, ProviderSettingsView, RateLimiter, Role, StopReason, TokenUsage, env_var,
 };
+use open_ai::completion::ReasoningDetailsAccumulator;
 use open_router::{
     Model, ModelMode as OpenRouterModelMode, OPEN_ROUTER_API_URL, ResponseStreamEvent, list_models,
 };
 use settings::{OpenRouterAvailableModel as AvailableModel, Settings, SettingsStore};
+use sha2::{Digest as _, Sha256};
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 use ui::IconName;
@@ -28,7 +30,6 @@ const PROVIDER_NAME: LanguageModelProviderName = LanguageModelProviderName::new(
 const API_KEY_ENV_VAR_NAME: &str = "OPENROUTER_API_KEY";
 static API_KEY_ENV_VAR: LazyLock<EnvVar> = env_var!(API_KEY_ENV_VAR_NAME);
 pub(crate) const RESERVED_HEADER_NAMES: &[&str] = &["HTTP-Referer", "X-Title"];
-const MAX_OPEN_ROUTER_SESSION_ID_LENGTH: usize = 256;
 
 #[derive(Default, Clone, Debug, PartialEq)]
 pub struct OpenRouterSettings {
@@ -620,10 +621,10 @@ pub fn into_open_router(
 
 fn open_router_session_id(thread_id: Option<String>) -> Option<String> {
     thread_id.map(|thread_id| {
-        thread_id
-            .chars()
-            .take(MAX_OPEN_ROUTER_SESSION_ID_LENGTH)
-            .collect()
+        let mut hasher = Sha256::new();
+        hasher.update(b"zed-openrouter-session-v1\0");
+        hasher.update(thread_id.as_bytes());
+        format!("{:x}", hasher.finalize())
     })
 }
 
@@ -717,14 +718,14 @@ fn add_message_content_part(
 
 pub struct OpenRouterEventMapper {
     tool_calls_by_index: HashMap<usize, RawToolCall>,
-    reasoning_details: Option<serde_json::Value>,
+    reasoning_details: ReasoningDetailsAccumulator,
 }
 
 impl OpenRouterEventMapper {
     pub fn new() -> Self {
         Self {
             tool_calls_by_index: HashMap::default(),
-            reasoning_details: None,
+            reasoning_details: ReasoningDetailsAccumulator::default(),
         }
     }
 
@@ -776,12 +777,10 @@ impl OpenRouterEventMapper {
             return events;
         };
 
-        if let Some(details) = choice.delta.reasoning_details.clone() {
-            // Emit reasoning_details immediately
-            events.push(Ok(LanguageModelCompletionEvent::ReasoningDetails(
-                details.clone(),
-            )));
-            self.reasoning_details = Some(details);
+        if let Some(details) = choice.delta.reasoning_details.clone()
+            && let Some(details) = self.reasoning_details.push(details)
+        {
+            events.push(Ok(LanguageModelCompletionEvent::ReasoningDetails(details)));
         }
 
         if let Some(reasoning) = choice.delta.reasoning.clone() {
@@ -842,7 +841,6 @@ impl OpenRouterEventMapper {
 
         match choice.finish_reason.as_deref() {
             Some("stop") => {
-                // Don't emit reasoning_details here - already emitted immediately when captured
                 events.push(Ok(LanguageModelCompletionEvent::Stop(StopReason::EndTurn)));
             }
             Some("tool_calls") => {
@@ -867,12 +865,10 @@ impl OpenRouterEventMapper {
                     }
                 }));
 
-                // Don't emit reasoning_details here - already emitted immediately when captured
                 events.push(Ok(LanguageModelCompletionEvent::Stop(StopReason::ToolUse)));
             }
             Some(stop_reason) => {
                 log::error!("Unexpected OpenRouter stop_reason: {stop_reason:?}",);
-                // Don't emit reasoning_details here - already emitted immediately when captured
                 events.push(Ok(LanguageModelCompletionEvent::Stop(StopReason::EndTurn)));
             }
             None => {}
@@ -1036,46 +1032,21 @@ mod tests {
             }
         }
 
-        // Assertions
         assert!(has_tool_use, "Should have emitted ToolUse event");
-        assert!(
-            !reasoning_details_events.is_empty(),
-            "Should have emitted ReasoningDetails events"
-        );
-
-        // We should have received multiple reasoning_details events (text, encrypted, empty)
-        // The agent layer is responsible for keeping only the first non-empty one
-        assert!(
-            reasoning_details_events.len() >= 2,
-            "Should have multiple reasoning_details events from streaming"
-        );
-
-        // Verify at least one contains the encrypted data
-        let has_encrypted = reasoning_details_events.iter().any(|details| {
-            if let serde_json::Value::Array(arr) = details {
-                arr.iter().any(|item| {
-                    item["type"] == "reasoning.encrypted"
-                        && item["data"]
-                            .as_str()
-                            .map_or(false, |s| s.contains("EtgDCtUDAdHtim9OF5jm4aeZSBAtl"))
-                })
-            } else {
-                false
-            }
-        });
-        assert!(
-            has_encrypted,
-            "Should have at least one reasoning_details with encrypted data"
-        );
-
-        // Verify thought_signature was captured
-        assert!(
-            thought_signature_value.is_some(),
-            "Tool use should have thought_signature"
+        assert_eq!(reasoning_details_events.len(), 2);
+        let final_details = reasoning_details_events
+            .last()
+            .and_then(serde_json::Value::as_array)
+            .and_then(|details| details.first())
+            .expect("accumulated reasoning details");
+        assert_eq!(final_details["text"], "Let me analyze this request...");
+        assert_eq!(
+            final_details["data"],
+            "EtgDCtUDAdHtim9OF5jm4aeZSBAtl/randomized123"
         );
         assert_eq!(
-            thought_signature_value.unwrap(),
-            "sha256:test_signature_xyz789"
+            thought_signature_value.as_deref(),
+            Some("sha256:test_signature_xyz789")
         );
     }
 
@@ -1113,7 +1084,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_session_id_uses_thread_id() {
+    async fn test_session_id_is_stable_without_exposing_thread_id() {
         let model = open_router::Model::new(
             "openai/gpt-4o",
             Some("GPT-4o"),
@@ -1123,9 +1094,9 @@ mod tests {
             None,
             None,
         );
-        let expected_session_id = "a".repeat(MAX_OPEN_ROUTER_SESSION_ID_LENGTH);
+        let thread_id = "internal-thread-id";
         let request = LanguageModelRequest {
-            thread_id: Some(format!("{expected_session_id}extra")),
+            thread_id: Some(thread_id.to_string()),
             messages: vec![language_model::LanguageModelRequestMessage {
                 role: Role::User,
                 content: vec![MessageContent::Text("Hello".to_string())],
@@ -1138,8 +1109,13 @@ mod tests {
         let result = into_open_router(request, &model, None).unwrap();
 
         assert_eq!(
-            result.session_id.as_deref(),
-            Some(expected_session_id.as_str())
+            result.session_id,
+            open_router_session_id(Some(thread_id.into()))
+        );
+        assert_ne!(result.session_id.as_deref(), Some(thread_id));
+        assert_ne!(
+            result.session_id,
+            open_router_session_id(Some("another-thread-id".into()))
         );
     }
 

@@ -570,7 +570,7 @@ impl Entry {
         self.content_map()?
             .get(&diff.entity_id())
             .cloned()
-            .map(|entity| entity.downcast::<Editor>().unwrap())
+            .and_then(|entity| entity.downcast::<Editor>().ok())
     }
 
     pub fn terminal(
@@ -580,7 +580,7 @@ impl Entry {
         self.content_map()?
             .get(&terminal.entity_id())
             .cloned()
-            .map(|entity| entity.downcast::<TerminalView>().unwrap())
+            .and_then(|entity| entity.downcast::<TerminalView>().ok())
     }
 
     pub fn scroll_handle_for_assistant_message_chunk(
