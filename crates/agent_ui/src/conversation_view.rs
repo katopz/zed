@@ -2960,7 +2960,7 @@ impl ConversationView {
         )
     }
 
-    fn notify_with_sound(
+    pub(crate) fn notify_with_sound(
         &mut self,
         caption: impl Into<SharedString>,
         icon: IconName,

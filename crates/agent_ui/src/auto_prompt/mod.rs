@@ -701,12 +701,14 @@ fn run_auto_prompt(
         auto_prompt::AutoPromptDecision::DispatchAfterDelay {
             mut action,
             delay_ms,
+            reason,
         } => {
             action.profile_id = profile_id.take();
             action.focus_new_thread |= is_manual;
             log::info!(
-                "[auto_prompt] DispatchAfterDelay - scheduling action in {}ms with prompt: {}",
+                "[auto_prompt] DispatchAfterDelay - scheduling action in {}ms (reason: {:?}) with prompt: {}",
                 delay_ms,
+                reason,
                 action.next_prompt
             );
 
@@ -747,6 +749,17 @@ fn run_auto_prompt(
                 }
 
                 match _view.update_in(cx, |_view, window, cx| {
+                    // Mirror the "limit reached — auto-continue scheduled at …"
+                    // notification: when the scheduled retry finally fires, tell
+                    // the user the chain is resuming.
+                    if reason == auto_prompt::AutoPromptDelayReason::UsageLimitReset {
+                        _view.notify_with_sound(
+                            "Usage limit window reset — auto-continue resuming",
+                            IconName::Info,
+                            window,
+                            cx,
+                        );
+                    }
                     dispatch_action(action, _view, window, cx);
                 }) {
                     Ok(()) => {

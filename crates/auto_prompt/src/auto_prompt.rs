@@ -406,6 +406,16 @@ pub fn extract_original_user_message(first_user_message: &str) -> Option<String>
     }
 }
 
+/// Why a [`AutoPromptDecision::DispatchAfterDelay`] is waiting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoPromptDelayReason {
+    /// A usage-limit window (session/weekly/Opus) reset schedule parsed from
+    /// the provider's error text or usage API.
+    UsageLimitReset,
+    /// Generic backoff before retrying (e.g. after a refusal).
+    Backoff,
+}
+
 /// Result of the auto-prompt decision logic.
 #[derive(Debug)]
 pub enum AutoPromptDecision {
@@ -417,6 +427,8 @@ pub enum AutoPromptDecision {
     DispatchAfterDelay {
         action: AutoPromptAction,
         delay_ms: u64,
+        /// Why the dispatch is delayed; drives the resume notification.
+        reason: AutoPromptDelayReason,
     },
     /// Need to call LLM asynchronously to determine the next step.
     NeedsLlmCall(LlmCallData),
@@ -1057,6 +1069,7 @@ pub fn decide(
                 focus_new_thread: false,
             },
             delay_ms: delay,
+            reason: AutoPromptDelayReason::Backoff,
         };
     }
 
@@ -1114,6 +1127,7 @@ pub fn decide(
                 focus_new_thread: false,
             },
             delay_ms: limit.retry_delay_ms,
+            reason: AutoPromptDelayReason::UsageLimitReset,
         };
     }
 

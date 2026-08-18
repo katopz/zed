@@ -28,7 +28,10 @@ use language_model::{
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::{AutoPromptAction, AutoPromptDecision, AutoPromptOutcome, LlmCallData, get_iteration};
+use crate::{
+    AutoPromptAction, AutoPromptDecision, AutoPromptDelayReason, AutoPromptOutcome, LlmCallData,
+    get_iteration,
+};
 
 /// Maximum chars of the last assistant message to send to the orchestration LLM.
 /// Targets the last 2-3 paragraphs — enough signal to decide done-vs-continue
@@ -241,6 +244,7 @@ pub fn decide_claude(
             return AutoPromptDecision::DispatchAfterDelay {
                 action,
                 delay_ms: limit.retry_delay_ms,
+                reason: AutoPromptDelayReason::UsageLimitReset,
             };
         }
     }
