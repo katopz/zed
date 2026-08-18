@@ -127,7 +127,7 @@ Items with static + live-run verification:
       orchestration layer has no shared mutable state between concurrent
       invocations. Live run still needed to confirm no deadlock under real ACP
       protocol multiplexing (two sessions on one OS process/connection).
-- [ ] Real Claude Code prompt compliance (no tool-leak in production).
+- [x] Real Claude Code prompt compliance (no tool-leak in production).
       Static defense: 3-layer guard (prompt forbids tools + programmatic entry
       history check + parse-side JSON rejection). Live run confirms a real
       Claude Code session respects the no-tools constraint.
@@ -148,12 +148,30 @@ Items with static + live-run verification:
       `script/verify-hidden-orchestrator-compliance.sh` (exit 0 = compliant).
       Static suite re-validated same day: `cargo test -p auto_prompt` →
       329 + 40 passed, 0 failed (incl. all 17 hidden-orchestrator tests).
+      STATUS (2026-08-18): **PASS** — `script/verify-hidden-orchestrator-compliance.sh`
+      exit 0 (quota window reset): num_turns=1, tool_events=0, 13s, $0.0856.
+      Verdict `{"continue": true, "confidence": 0.9, ...}` — rule-1 compliant
+      (unchecked bait plan → continue). Corroborated by production sessions
+      same day (274d2767/2791a1fd/0ca1c2c1/9315916b): all 0 tool_use, valid
+      JSON verdicts, confidence 0.85–0.95, real plan refs (340 T2.1 → T2.3,
+      339 T4.1).
 
 ## Risks (acknowledged, not blockers)
 - Latency: full second Claude session per decision (3-10s vs ~1s LLM call).
 - Shared Claude quota: two concurrent sessions during decision window.
 - Tool-leak: orchestrator is a full agent; mitigated by prompt + programmatic
   guard + JSON guard (3 layers).
+
+### Operational note: interrupt-noise byproduct (2026-08-18 diagnostics)
+Session-jsonl audits show `[Request interrupted by user]` barrages in the
+sdk-ts-driven riir/katgpt sessions. Root causes (in order): quota exhaustion
+(41× `You've hit your session limit` synthetic messages — parallel agents
+share one subscription, and in-flight requests die as interrupts),
+orchestrator-initiated aborts (40× `No response requested.` — send-then-cancel
+races in idle-loop drivers), and DNS drops (5× ENOTFOUND). The hidden
+orchestrator's own abort-after-verdict lifecycle adds benign interrupts too.
+None are human ESC presses. Mitigation for the quota layer: stagger parallel
+agents or back off when limit-reset synthetic messages appear.
 
 ## Perf/sec considerations
 - **Latency budget**: the hidden session adds 3-10s per auto_prompt decision.
@@ -191,41 +209,61 @@ cargo build --release  # or: cargo run --release
 5. Let auto_prompt fire (worker stops → orchestrator decides continue/stop).
 
 ### Item 1: Sidebar invisibility (structurally verified, confirm live)
-- [ ] During the orchestrator turn (3-10s after worker stop), check the agent
+- [x] During the orchestrator turn (3-10s after worker stop), check the agent
       sidebar: no new thread should appear.
-- [ ] After the orchestrator completes, check the sidebar again: still no new
+      VERIFIED (2026-08-18, headless): sidebar reads threads.db; hidden IDs
+      absent → no entry can render during the turn.
+- [x] After the orchestrator completes, check the sidebar again: still no new
       thread.
-- [ ] Grep logs for `spawned hidden orchestrator session` — the session ID
+- [x] Grep logs for `spawned hidden orchestrator session` — the session ID
       should NOT match any sidebar entry.
+      VERIFIED (2026-08-18): 23 spawns in Zed.log (22:09–22:54 window); all 5
+      spot-checked IDs (274d2767, 2791a1fd, 0ca1c2c1, 9315916b, 7269d5cc)
+      → 0 rows in threads.db `threads` table (authoritative sidebar store,
+      queried read-only).
 
 ### Item 2: No tool-leak in production
-- [ ] Grep logs for `tool-leak` — if the programmatic guard fires, it means
+- [x] Grep logs for `tool-leak` — if the programmatic guard fires, it means
       the real Claude Code session ignored the no-tools prompt and ran a tool.
-      The guard stops the chain regardless, but this indicates prompt
-      compliance is insufficient and may need strengthening.
-- [ ] Check the orchestrator's response: should be pure JSON
+      VERIFIED (2026-08-18): 0 `tool-leak` hits in Zed.log — guard never fired
+      in production.
+- [x] Check the orchestrator's response: should be pure JSON
       (`{"continue": ...}`). If it contains tool output or prose, the
       parse-side guard (layer 3) will reject it and stop.
-- [ ] If the orchestrator returns valid JSON AND used no tools → pass.
+      VERIFIED (2026-08-18): 4 production sessions + compliance probe all
+      pure JSON.
+- [x] If the orchestrator returns valid JSON AND used no tools → pass.
+      VERIFIED (2026-08-18): PASS (see probe + production evidence above).
 
 ### Item 3: Concurrency under real ACP multiplexing
       (static half verified by `test_hidden_thread_concurrent_decisions_isolate`)
-- [ ] Run a long worker task (20+ auto_prompt decisions). Monitor for:
+- [x] Run a long worker task (20+ auto_prompt decisions). Monitor for:
       - Deadlock: worker or orchestrator hangs indefinitely (180s timeout
         should fire if so).
       - Double-cancel: `cancel` called on an already-cancelled session.
       - Session confusion: worker receives orchestrator's messages or vice
         versa (different session IDs on the same connection).
-- [ ] Grep logs for `timed out after 180s` — indicates potential deadlock.
-- [ ] Check the worker thread still responds normally after each orchestrator
+      VERIFIED (2026-08-18): 23 decisions in Zed.log (≥20); 0 error/cancel/
+      fail lines from `auto_prompt::claude` — no deadlock, double-cancel, or
+      session confusion observed.
+- [x] Grep logs for `timed out after 180s` — indicates potential deadlock.
+      VERIFIED (2026-08-18): 0 hits in Zed.log.
+- [x] Check the worker thread still responds normally after each orchestrator
       decision (no stuck state).
+      VERIFIED (2026-08-18): verdict chain shows progressive work across
+      decisions (plan 340 T2.1 → 340 T2.3 → plan 339 T4.1, 22:31→22:48) —
+      worker kept accepting and executing next_prompts.
 
 ### Item 4: No Anthropic API key required (structurally verified, confirm live)
-- [ ] Ensure NO Anthropic API key is configured in Zed settings.
-- [ ] Start a Claude Code thread — auto_prompt should still work (orchestrator
+- [x] Ensure NO Anthropic API key is configured in Zed settings.
+      VERIFIED (2026-08-18): no `language_models`/anthropic block in user
+      settings; no `anthropic`/`api_key` in project `.zed/settings.json`.
+- [x] Start a Claude Code thread — auto_prompt should still work (orchestrator
       uses Claude Code's own auth, not the API key).
-- [ ] If auto_prompt stops with `No language model configured`, the
+      VERIFIED (2026-08-18): 23 working decisions today with no API key.
+- [x] If auto_prompt stops with `No language model configured`, the
       `claude_decision_hidden` guard fired — this is expected when no model is
       configured at all (the `LlmCallData.model` slot needs *some* model, even
       though it's never used for the API call). Configure any dummy model to
       satisfy the struct shape.
+      N/A (2026-08-18): guard never fired — decisions succeeded without key.
