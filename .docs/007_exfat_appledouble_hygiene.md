@@ -45,3 +45,36 @@ only dangling commits (harmless old reflog states).
 Only real fix is hosting the repo on an APFS volume (native xattrs, no sidecars).
 Until then, run the `find -delete` sweep before big operations (upstream merges, gc)
 to keep git output and tooling clean.
+
+## 2026-08-19 addendum — full-workspace builds melt the volume down
+
+A `cargo check --workspace` against the on-volume `target/` created a **66 GB
+`target/debug`** (the fork's default target only ever held `release/` artifacts;
+previous sessions always used `/tmp` targets). Two failure modes followed:
+
+1. **Spotlight indexer wedge**: `mdworker_shared` processes stuck in `U` state
+   (uninterruptible I/O) for 25+ minutes while trying to index the new files;
+   system load average hit 32. fskit (the exFAT driver) collapses under this
+   concurrent I/O — even `git status` from the editor wedged.
+2. **Build-script hang**: the `webrtc-sys` build script (heavy I/O: downloads and
+   prebuilds libwebrtc) was the first to hang in `U` state; killing it required
+   `kill -9` and the whole build had to be abandoned.
+
+Recovery (all applied 2026-08-19):
+
+```
+mdutil -i off /Volumes/SDXC1TB      # worked WITHOUT sudo; prints
+                                    # "kMDConfigSearchLevelFSSearchOnly"
+touch /Volumes/SDXC1TB/.metadata_never_index
+find target/debug -delete           # rm is sandbox-blocked; find -delete works
+```
+
+Rules going forward:
+
+- **Never run workspace-scale builds against the on-volume `target/`.** Always
+  `export CARGO_TARGET_DIR=/tmp/<plan>_target` and remove it when done (this is
+  the standing workspace rule; this incident is why it exists).
+- The on-volume `target/release` cache (kept for `./script/clippy`) predates this
+  incident; if a release rebuild is ever needed, move it to `/tmp` too.
+- `mdutil -s /Volumes/SDXC1TB` should report "Indexing disabled." — re-check after
+  volume remounts.
