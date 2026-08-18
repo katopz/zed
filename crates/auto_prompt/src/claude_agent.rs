@@ -10,8 +10,10 @@
 //! Contract (do not change without explicit owner sign-off):
 //!   1. Never return `ContextOverflow` — no token-limit triggers.
 //!   2. Never set `force_new_thread = true` — always continue in the same thread.
-//!   3. No pre-stop verification, no max-iterations gate, no rules-based stop.
-//!      The orchestration LLM is the sole decider.
+//!   3. No pre-stop verification, no max-iterations gate, no rules-based stop
+//!      — except the session-limit rule (`decide_claude`), which schedules a
+//!      same-thread continuation at the provider's embedded reset time
+//!      instead of consulting the (equally rate-limited) orchestrator.
 //!   4. The only hard stops are: user cancel, no model configured, or the
 //!      configured default model is not Anthropic (see `decide_claude`).
 
@@ -176,7 +178,10 @@ You receive:
 ///   no assistant message to reason about. See
 ///   `.plans/014_claude_offscreen_orchestrator.md`.
 ///
-/// Never returns `DispatchNow` / `DispatchAfterDelay` / `ContextOverflow`.
+/// Returns `DispatchAfterDelay` only when a session-limit reset time was
+/// parsed from the worker's turn error or synthetic message (scheduled at
+/// reset + margin; see `session_limit`). Otherwise never returns
+/// `DispatchNow` / `DispatchAfterDelay` / `ContextOverflow`.
 pub fn decide_claude(
     thread: &gpui::Entity<acp_thread::AcpThread>,
     _used_tools: bool,
@@ -194,6 +199,50 @@ pub fn decide_claude(
         let session_id_str = thread.read(cx).session_id().to_string();
         crate::reset_iteration_with_session(&session_id_str);
         return AutoPromptDecision::NoAction;
+    }
+
+    // Session limit: the reset time is embedded in the turn error or the
+    // synthetic message ("You've hit your session limit · resets 1:20am
+    // (Asia/Bangkok)"). Schedule the continuation at reset + margin instead
+    // of asking the hidden orchestrator — it shares the subscription and
+    // would hit the same limit. Runs before the model lookup: no model needs
+    // to be configured, because no orchestrator is consulted.
+    // See .plans/018_session_limit_scheduled_retry.md.
+    {
+        let margin_secs = crate::load_config_cached()
+            .map(|config| config.session_limit_margin_secs)
+            .unwrap_or(crate::session_limit::DEFAULT_SESSION_LIMIT_MARGIN_SECS);
+        if let Some(limit) =
+            crate::session_limit::session_limit_from_thread(&thread.read(cx), cx, margin_secs)
+        {
+            log::warn!(
+                "[auto_prompt::claude] PATH=session_limit: reset at {} — scheduling continuation in {}ms",
+                limit.retry_display,
+                limit.retry_delay_ms
+            );
+            let thread_ref = thread.read(cx);
+            let last_assistant_message = thread_ref
+                .last_assistant_message_text(cx)
+                .filter(|message| !crate::session_limit::looks_like_session_limit(message));
+            let action = AutoPromptAction {
+                from_session_id: thread_ref.session_id().clone(),
+                from_title: thread_ref.title().map(|title| title.to_string()),
+                next_prompt: "The Claude session limit window has reset. Continue from where you left off."
+                    .to_string(),
+                work_dirs: thread_ref.work_dirs().map(|pl| pl.paths().to_vec()),
+                original_user_message: None,
+                profile_id: None,
+                actual_input_tokens: thread_ref.token_usage().map(|usage| usage.input_tokens),
+                approximate_token_count: 0,
+                last_assistant_message,
+                force_new_thread: false,
+                focus_new_thread: false,
+            };
+            return AutoPromptDecision::DispatchAfterDelay {
+                action,
+                delay_ms: limit.retry_delay_ms,
+            };
+        }
     }
 
     // Need a configured model to reason about the next step.

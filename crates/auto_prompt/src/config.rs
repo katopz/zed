@@ -52,6 +52,13 @@ pub struct AutoPromptConfig {
     #[serde(default = "default_same_thread_token_threshold")]
     pub same_thread_token_threshold: usize,
 
+    /// Extra margin (seconds) added to a parsed session-limit reset time
+    /// before auto-prompt dispatches the continuation. Claude reports e.g.
+    /// "resets 1:20am (Asia/Bangkok)"; we schedule at reset + this margin
+    /// (default 60s) to avoid racing the enforcement window.
+    #[serde(default = "default_session_limit_margin_secs")]
+    pub session_limit_margin_secs: u64,
+
     /// Watchdog: seconds the worker thread may stay in `Generating` without
     /// stopping before a reasoning LLM is asked whether to keep waiting or
     /// halt. The watchdog is the only mechanism that recovers from a worker
@@ -97,6 +104,10 @@ fn default_same_thread_token_threshold() -> usize {
     0
 }
 
+fn default_session_limit_margin_secs() -> u64 {
+    crate::session_limit::DEFAULT_SESSION_LIMIT_MARGIN_SECS
+}
+
 fn default_watchdog_timeout_secs() -> u64 {
     600
 }
@@ -115,6 +126,7 @@ impl Default for AutoPromptConfig {
             max_verification_attempts: default_max_verification_attempts(),
             max_llm_retries: default_max_llm_retries(),
             same_thread_token_threshold: default_same_thread_token_threshold(),
+            session_limit_margin_secs: default_session_limit_margin_secs(),
             watchdog_timeout_secs: default_watchdog_timeout_secs(),
             watchdog_enabled: default_watchdog_enabled(),
         }
@@ -191,6 +203,11 @@ impl AutoPromptConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or_else(default_same_thread_token_threshold);
 
+        let session_limit_margin_secs = std::env::var("ZED_AUTO_PROMPT_SESSION_LIMIT_MARGIN_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(default_session_limit_margin_secs);
+
         let watchdog_timeout_secs = std::env::var("ZED_AUTO_PROMPT_WATCHDOG_TIMEOUT_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -209,6 +226,7 @@ impl AutoPromptConfig {
             max_verification_attempts,
             max_llm_retries,
             same_thread_token_threshold,
+            session_limit_margin_secs,
             watchdog_timeout_secs,
             watchdog_enabled,
         }

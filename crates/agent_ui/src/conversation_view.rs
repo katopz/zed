@@ -34,7 +34,7 @@ use gpui::{
     linear_gradient, list, pulsating_between,
 };
 use language::{Buffer, Language, Rope};
-use language_model::{LanguageModelCompletionError, LanguageModelRegistry};
+use language_model::LanguageModelCompletionError;
 use markdown::{
     CodeBlockRenderer, CopyButtonVisibility, Markdown, MarkdownElement, MarkdownFont, MarkdownStyle,
 };
@@ -1815,12 +1815,39 @@ impl ConversationView {
                     // Error = thread stopped. Always cancel the watchdog.
                     crate::auto_prompt::cancel_watchdog_for_thread(self, &session_id, cx);
 
-                    self.notify_with_sound(
-                        "Agent stopped due to an error",
-                        IconName::Warning,
-                        window,
-                        cx,
-                    );
+                    // Session limit: when the error text carries a reset time
+                    // and auto-prompt will schedule the retry, surface the
+                    // schedule instead of the generic error notification.
+                    let session_limit = thread.read(cx).last_api_error().and_then(|text| {
+                        auto_prompt::session_limit::parse_session_limit(
+                            text,
+                            auto_prompt::load_config_cached()
+                                .map(|config| config.session_limit_margin_secs)
+                                .unwrap_or(
+                                    auto_prompt::session_limit::DEFAULT_SESSION_LIMIT_MARGIN_SECS,
+                                ),
+                        )
+                    });
+                    let auto_prompt_enabled = self
+                        .active_thread()
+                        .is_some_and(|tv| tv.read(cx).auto_prompt_enabled);
+                    let (notification, icon) = match (&session_limit, auto_prompt_enabled) {
+                        (Some(limit), true) => (
+                            format!(
+                                "Session limit reached — auto-continue scheduled at {}",
+                                limit.retry_display
+                            ),
+                            IconName::Info,
+                        ),
+                        (Some(_), false) => (
+                            "Agent stopped: session limit reached".to_string(),
+                            IconName::Warning,
+                        ),
+                        (None, _) => {
+                            ("Agent stopped due to an error".to_string(), IconName::Warning)
+                        }
+                    };
+                    self.notify_with_sound(notification, icon, window, cx);
                     // Call auto-prompt for error events (e.g., rate limits)
                     // Same pattern as Stopped handler: queued user messages take priority.
                     let used_tools = thread.read(cx).used_tools_since_last_user_message();

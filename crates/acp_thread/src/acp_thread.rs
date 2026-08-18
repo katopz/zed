@@ -2127,6 +2127,11 @@ pub struct AcpThread {
     /// API exhaustion (e.g. auto_prompt's context-overflow backoff guard)
     /// must check this field, not `had_error`.
     had_api_error: bool,
+    /// Text of the last turn-level API error (`run_turn`'s `Err` branch),
+    /// e.g. Claude Code's `Internal error: You've hit your session limit ·
+    /// resets 1:20am (Asia/Bangkok): {"errorKind": "rate_limit"}`.
+    /// Cleared at the start of every turn, alongside `had_api_error`.
+    last_api_error: Option<String>,
     /// The user's unsent prompt text, persisted so it can be restored when reloading the thread.
     draft_prompt: Option<Vec<acp::ContentBlock>>,
     /// The initial scroll position for the thread view, set during session registration.
@@ -2348,6 +2353,7 @@ impl AcpThread {
             pending_terminal_exit: HashMap::default(),
             had_error: false,
             had_api_error: false,
+            last_api_error: None,
             draft_prompt: None,
             ui_scroll_position: None,
             streaming_text_buffer: None,
@@ -2512,6 +2518,12 @@ impl AcpThread {
     /// See the field doc on `had_api_error` for why this distinction matters.
     pub fn had_api_error(&self) -> bool {
         self.had_api_error
+    }
+
+    /// Text of the last turn-level API error, if any. Only meaningful while
+    /// `had_api_error()` is true (cleared at the start of every turn).
+    pub fn last_api_error(&self) -> Option<&str> {
+        self.last_api_error.as_deref()
     }
 
     pub fn is_waiting_for_confirmation(&self) -> bool {
@@ -3924,6 +3936,7 @@ impl AcpThread {
         self.clear_completed_plan_entries(cx);
         self.had_error = false;
         self.had_api_error = false;
+        self.last_api_error = None;
 
         let (tx, rx) = oneshot::channel();
         let cancel_task = self.cancel(cx);
@@ -4078,6 +4091,7 @@ impl AcpThread {
                         // rate limit, etc.) — unlike a failed tool call, this is a real
                         // signal about API availability.
                         this.had_api_error = true;
+                        this.last_api_error = Some(format!("{e:#}"));
                         cx.emit(AcpThreadEvent::Error);
                         log::error!("Error in run turn: {:?}", e);
                         Err(e)

@@ -13,6 +13,7 @@ pub mod lightweight_context;
 mod pending_question;
 pub mod peer_states;
 pub mod plan_registry;
+pub mod session_limit;
 pub mod watchdog;
 
 pub use config::AutoPromptConfig;
@@ -1056,6 +1057,62 @@ pub fn decide(
                 focus_new_thread: false,
             },
             delay_ms: delay,
+        };
+    }
+
+    // Session limit: the provider embeds the reset time in the turn error or
+    // a synthetic message (e.g. Claude Code's "You've hit your session limit
+    // · resets 1:20am (Asia/Bangkok)"). Schedule the continuation at
+    // reset + margin instead of burning the orchestration call against the
+    // same exhausted quota. See .plans/018_session_limit_scheduled_retry.md.
+    if let Some(limit) = crate::session_limit::session_limit_from_thread(
+        &thread.read(cx),
+        cx,
+        config.session_limit_margin_secs,
+    ) {
+        log::warn!(
+            "[auto_prompt::decide] PATH=session_limit: reset at {} — scheduling continuation in {}ms",
+            limit.retry_display,
+            limit.retry_delay_ms
+        );
+        debug_log::write_log(
+            "session_limit_scheduled",
+            serde_json::json!({
+                "retry_at": limit.retry_at.to_rfc3339(),
+                "delay_ms": limit.retry_delay_ms,
+            }),
+        );
+        let last_assistant_message = _last_assistant_msg
+            .filter(|message| !crate::session_limit::looks_like_session_limit(message));
+        let next_prompt = with_first_prompt_context(
+            "The provider session limit window has reset. Continue from where we left off.".to_string(),
+            build_prompt_summary(
+                None,
+                thread_title.as_deref(),
+                Some("session limit reset, retrying"),
+                last_assistant_message.as_deref(),
+                original_user_message.as_deref(),
+                auto_prompt_ctx.first_user_message.as_deref(),
+            )
+            .as_deref(),
+            thread_title.as_deref(),
+            last_assistant_message.as_deref(),
+        );
+        return AutoPromptDecision::DispatchAfterDelay {
+            action: AutoPromptAction {
+                from_session_id: session_id,
+                from_title: thread_title,
+                next_prompt,
+                work_dirs,
+                original_user_message,
+                profile_id: None,
+                actual_input_tokens: auto_prompt_ctx.actual_input_tokens,
+                approximate_token_count: auto_prompt_ctx.approximate_token_count,
+                last_assistant_message,
+                force_new_thread: false,
+                focus_new_thread: false,
+            },
+            delay_ms: limit.retry_delay_ms,
         };
     }
 
