@@ -871,7 +871,9 @@ fn now_unix_ms() -> i64 {
 }
 
 // ---------------------------------------------------------------------------
-// Tests — the projection is pure, so every rule is unit-testable.
+// Tests — the projection is pure, so every rule is unit-testable. The panel
+// smoke test below additionally exercises the gpui construction path against
+// an inert (local-only) runtime.
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -1188,5 +1190,164 @@ mod tests {
         let snap = snapshot(vec![status("SHIKUWA", false, NOW, scopes)], vec![]);
         let board = build_work_board(&snap, &[], "m3", NOW);
         assert_eq!(board.len(), WORK_BOARD_ROW_CAP);
+    }
+
+    // -----------------------------------------------------------------------
+    // Panel smoke test (P6, previously deferred): construct the panel against
+    // an inert local-only runtime, drive the roster-prefill / send / render
+    // paths, and prove both panels share ONE runtime entity (the
+    // single-poll-loop GOAT invariant). Hermetic by construction: default
+    // config ⇒ no worker URL ⇒ no network, no MCP socket, no poll task; the
+    // fake HTTP client 404s if anything ever escapes.
+    // -----------------------------------------------------------------------
+
+    /// Trivial window root so the test never forces a full Workspace frame
+    /// render — the workspace entity exists for the panel constructors'
+    // `Context<Workspace>`, not for drawing.
+    struct SmokeRoot;
+
+    impl Render for SmokeRoot {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    #[gpui::test]
+    async fn panel_smoke_local_only(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+
+        cx.update(|cx| {
+            BoardRuntime::init_global_with_config(
+                http_client::FakeHttpClient::with_404_response(),
+                crate::AgentBoardConfig::default(),
+                cx,
+            );
+        });
+
+        let fake_fs = fs::FakeFs::new(cx.executor());
+        let project = project::Project::test(fake_fs, [], cx).await;
+        let window = cx.add_window(|_window, _cx| SmokeRoot);
+        let workspace = window
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| Workspace::test_new(project.clone(), window, cx))
+            })
+            .unwrap();
+        let cx = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+
+        // Both panels construct against the ONE shared runtime entity.
+        let war_room = workspace.update_in(cx, |_, window, cx| {
+            WarRoomPanel::new(window, cx)
+        });
+        let board_panel = workspace.update_in(cx, |workspace, window, cx| {
+            crate::AgentBoardPanel::new(workspace, window, cx)
+        });
+        let shared_runtime = cx.update(|_window, cx| BoardRuntime::global(cx).entity_id());
+        assert_eq!(
+            war_room.read_with(cx, |panel, _| panel.runtime.entity_id()),
+            shared_runtime
+        );
+        assert_eq!(
+            board_panel.read_with(cx, |panel, _| panel.runtime().entity_id()),
+            shared_runtime,
+            "the status board and the war room must share one runtime (one poll loop)"
+        );
+
+        // Local-only runtime: no rounds, not connected.
+        cx.update(|_window, cx| {
+            let runtime = BoardRuntime::global(cx);
+            let runtime = runtime.read(cx);
+            assert_eq!(runtime.poll_rounds(), 0);
+            assert!(!runtime.connected());
+        });
+
+        // Roster click path: prefill fills the input with an @mention.
+        war_room.update_in(cx, |panel, window, cx| {
+            panel.prefill_mention("SHIKUWA:b1c9", window, cx)
+        });
+        let input_text = war_room.read_with(cx, |panel, cx| panel.input.read(cx).text(cx));
+        assert_eq!(input_text, "@SHIKUWA:b1c9 ");
+
+        // Render draws the full element tree (header / work board / roster /
+        // feed / input) through the framework's draw cycle — layout, prepaint
+        // and interaction-state registration all included — without panicking
+        // against an empty snapshot.
+        cx.draw(
+            gpui::point(px(0.), px(0.)),
+            gpui::size(px(400.), px(700.)),
+            |_, _| war_room.clone().into_any_element(),
+        );
+
+        // Feed a realistic snapshot through the runtime's post-poll hook —
+        // two devices racing one plan, a released marker, a mention message,
+        // a stale scope — then draw again. This exercises the render path
+        // with non-empty data (work board rows incl. the race row, roster
+        // entries, interleaved feed) and the poll_rounds counter once more.
+        let now = now_unix_ms();
+        let race_path = "/repo/.plans/024_a.md";
+        let snapshot = RoomSnapshot {
+            v: 1,
+            room: "test-room".to_string(),
+            statuses: vec![
+                status(
+                    "m3",
+                    false,
+                    now - 10_000,
+                    vec![scope("f3a2ffff", race_path, "war room")],
+                ),
+                status(
+                    "SHIKUWA",
+                    false,
+                    now - 20_000,
+                    vec![scope("b1c9ffff", race_path, "war room too")],
+                ),
+                status(
+                    "OLD",
+                    true,
+                    now - STALE_AFTER_MS - 1,
+                    vec![scope("aaaa1111", "/repo/.plans/old.md", "ancient")],
+                ),
+            ],
+            messages: vec![BoardMessage {
+                v: 1,
+                device_id: "id-SHIKUWA".to_string(),
+                device_name: "SHIKUWA".to_string(),
+                sender: "operator".to_string(),
+                text: "@m3:f3a2 run cargo clippy".to_string(),
+                ts: now - 5_000,
+            }],
+            states: vec![released_state("SHIKUWA", "b1c9ffff", "/repo/.plans/023_b.md", now - 60_000)],
+            replies: Vec::new(),
+        };
+        cx.update(|_window, cx| {
+            BoardRuntime::global(cx).update(cx, |runtime, cx| {
+                runtime.on_snapshot(snapshot, cx)
+            });
+        });
+        cx.update(|_window, cx| {
+            assert_eq!(BoardRuntime::global(cx).read(cx).poll_rounds(), 1);
+        });
+        cx.draw(
+            gpui::point(px(0.), px(0.)),
+            gpui::size(px(400.), px(700.)),
+            |_, _| war_room.clone().into_any_element(),
+        );
+
+        // Send with no worker: warn + clear the input, never panic.
+        war_room.update_in(cx, |panel, window, cx| {
+            panel.input.update(cx, |editor, cx| {
+                editor.set_text("@SHIKUWA:b1c9 run clippy", &mut *window, cx)
+            });
+            panel.send_input(window, cx);
+        });
+        let after_send = war_room.read_with(cx, |panel, cx| panel.input.read(cx).text(cx));
+        assert_eq!(after_send, "");
+
+        drop(war_room);
+        drop(board_panel);
+        cx.run_until_parked();
     }
 }

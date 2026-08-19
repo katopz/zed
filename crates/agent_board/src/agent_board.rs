@@ -206,7 +206,7 @@ impl AgentBoardPanel {
         })
     }
 
-    fn runtime(&self) -> &Entity<BoardRuntime> {
+    pub(crate) fn runtime(&self) -> &Entity<BoardRuntime> {
         &self.runtime
     }
 }

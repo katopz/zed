@@ -47,14 +47,26 @@ pub struct BoardRuntime {
 }
 
 impl BoardRuntime {
-    /// Create the global runtime entity. Safe to call multiple times; the
-    /// first entity wins and later calls return it (panels never spawn a
-    /// second poll loop).
+    /// Create the global runtime entity, loading the config from disk. Safe
+    /// to call multiple times; the first entity wins and later calls return
+    /// it (panels never spawn a second poll loop).
     pub fn init_global(http: Arc<dyn HttpClient>, cx: &mut App) -> Entity<Self> {
+        let config = AgentBoardConfig::load();
+        Self::init_global_with_config(http, config, cx)
+    }
+
+    /// Config-injecting variant of [`Self::init_global`] for callers that
+    /// already hold a config, and for hermetic tests: a default config has an
+    /// empty `worker_url`, so the runtime stays fully inert (no poll loop, no
+    /// MCP socket, no SSE — no network escapes the test).
+    pub fn init_global_with_config(
+        http: Arc<dyn HttpClient>,
+        config: AgentBoardConfig,
+        cx: &mut App,
+    ) -> Entity<Self> {
         if let Some(existing) = Self::try_global(cx) {
             return existing;
         }
-        let config = AgentBoardConfig::load();
         let runtime = cx.new(|cx| {
             let mut runtime = Self {
                 http,
@@ -111,6 +123,13 @@ impl BoardRuntime {
 
     pub fn poll_rounds(&self) -> u64 {
         self.poll_rounds
+    }
+
+    /// Whether the poll task exists. Local-only runtimes (empty `worker_url`)
+    /// never start one — tests assert this to prove no network leaks.
+    #[cfg(test)]
+    pub(crate) fn has_poll_task(&self) -> bool {
+        self.poll_task.is_some()
     }
 
     // -----------------------------------------------------------------------
@@ -299,7 +318,8 @@ impl BoardRuntime {
     }
 
     /// Post-snapshot hook: scan mentions (P1), cache, notify views.
-    fn on_snapshot(&mut self, snapshot: RoomSnapshot, cx: &mut Context<Self>) {
+    /// `pub(crate)` so panel tests can drive rounds without a worker.
+    pub(crate) fn on_snapshot(&mut self, snapshot: RoomSnapshot, cx: &mut Context<Self>) {
         self.poll_rounds += 1;
         log::debug!(
             "[agent_board] sync round #{} complete (room={})",
@@ -402,4 +422,82 @@ impl BoardRuntime {
 
 fn hostname() -> String {
     sysinfo::System::host_name().unwrap_or_else(|| "unknown".to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Tests — the single-poll-loop invariant (Plan 024 P0 / GOAT gate), verified
+// hermetically: a default config keeps the runtime inert, `init_global` is
+// idempotent, and `poll_rounds` counts snapshots once per round regardless of
+// how many panel views exist.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::RoomSnapshot;
+    use gpui::TestAppContext;
+
+    fn inert_http() -> Arc<dyn HttpClient> {
+        // Local-only runtimes never issue requests; if one ever does, the 404
+        // fails the round instead of hitting the network.
+        http_client::FakeHttpClient::with_404_response()
+    }
+
+    fn empty_snapshot() -> RoomSnapshot {
+        RoomSnapshot {
+            v: 1,
+            room: "test-room".to_string(),
+            statuses: Vec::new(),
+            messages: Vec::new(),
+            states: Vec::new(),
+            replies: Vec::new(),
+        }
+    }
+
+    #[gpui::test]
+    async fn init_is_idempotent_one_runtime_per_process(cx: &mut TestAppContext) {
+        let first = cx.update(|cx| {
+            BoardRuntime::init_global_with_config(inert_http(), AgentBoardConfig::default(), cx)
+        });
+        let second = cx.update(|cx| {
+            BoardRuntime::init_global_with_config(inert_http(), AgentBoardConfig::default(), cx)
+        });
+        let global = cx.update(|cx| BoardRuntime::global(cx));
+        assert_eq!(
+            first.entity_id(),
+            second.entity_id(),
+            "re-init must return the existing entity, not spawn a second poll loop"
+        );
+        assert_eq!(first.entity_id(), global.entity_id());
+    }
+
+    #[gpui::test]
+    async fn local_only_config_starts_no_poll_task_or_socket(cx: &mut TestAppContext) {
+        let runtime = cx.update(|cx| {
+            BoardRuntime::init_global_with_config(inert_http(), AgentBoardConfig::default(), cx)
+        });
+        cx.run_until_parked();
+        runtime.read_with(cx, |runtime, _| {
+            assert!(!runtime.connected());
+            assert!(!runtime.has_poll_task(), "local-only runtime must not poll");
+            assert!(runtime.mcp_server.is_none());
+            assert!(runtime.realtime_client.is_none());
+            assert_eq!(runtime.poll_rounds(), 0);
+        });
+    }
+
+    #[gpui::test]
+    async fn poll_rounds_counts_each_snapshot_once_shared_by_all_views(cx: &mut TestAppContext) {
+        let runtime = cx.update(|cx| {
+            BoardRuntime::init_global_with_config(inert_http(), AgentBoardConfig::default(), cx)
+        });
+        // Two rounds arrive (as the single poll loop would deliver them)…
+        runtime.update(cx, |runtime, cx| runtime.on_snapshot(empty_snapshot(), cx));
+        runtime.update(cx, |runtime, cx| runtime.on_snapshot(empty_snapshot(), cx));
+        // …and every view of the shared runtime sees the same single counter.
+        cx.update(|cx| {
+            assert_eq!(BoardRuntime::global(cx).read(cx).poll_rounds(), 2);
+        });
+        runtime.read_with(cx, |runtime, _| assert_eq!(runtime.poll_rounds(), 2));
+    }
 }

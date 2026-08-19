@@ -342,16 +342,31 @@ Collab but not adjacent) — zero upstream-file churn, but not the requested
 - [x] `feeder.rs`: `extract_mentions_for_device` tests (routes own-device,
       skips others, honors watermark, `@all` deferred).
 - [x] `mention_guard`: cooldown window, hourly cap, self-mention drop.
-- [x] `types.rs`: sender-field round-trip + old-snapshot default.
+- [x] `types.rs`: sender-field round-trip + old-snapshot default
+      (`board_message_old_payload_defaults_empty_sender`, legacy
+      `PostMessageBody` without `sender`).
+- [x] `runtime.rs` tests: `init_is_idempotent_one_runtime_per_process`,
+      `local_only_config_starts_no_poll_task_or_socket`,
+      `poll_rounds_counts_each_snapshot_once_shared_by_all_views` — the
+      single-poll-loop GOAT invariant, verified hermetically via
+      `init_global_with_config` (config-injection seam; production
+      `init_global` still loads `~/.config/zed/agent_board.json`).
 - [x] `war_room.rs`: `build_work_board` projection tests — fresh/stale/
       released states, 5h cutoff boundary, race flag on two devices doing
       the same plan, merge of local claims + remote scopes by path.
-- [-] Panel smoke test (gpui test): render with empty runtime (local-only),
-      roster click fills input, send posts via mocked client. Deferred: the
-      editor-crate dependency makes the gpui test harness heavy for this
-      crate; projection + routing logic is fully covered by unit tests.
+- [x] Panel smoke test (gpui test): `war_room::tests::panel_smoke_local_only`
+      — constructs both panels against one inert local-only runtime (default
+      config ⇒ no worker ⇒ no network/MCP/poll; fake HTTP client 404s if
+      anything escapes), asserts both panels + the global resolve to the SAME
+      runtime entity (single-poll-loop invariant), prefill → `@label ` in the
+      input, framework `cx.draw` of the full tree against an empty snapshot,
+      `on_snapshot` with a realistic room (two devices racing one plan,
+      released marker, mention message, stale scope) → `poll_rounds == 1` →
+      draw again, then send-with-no-worker clears the input without panic.
 - [x] `./script/clippy` clean; `cargo test -p agent_board -p agent_ui` green.
-      (agent_board: clippy clean, 73/73 tests. agent_ui untouched by design.)
+      (agent_board: scoped `cargo clippy -p agent_board --all-targets` clean
+      — repo-wide script skipped under sibling-agent build load; 77/77 tests
+      incl. the gpui harness. agent_ui untouched by design.)
 
 ### P7 — Pinned work board (todolist)
 
@@ -449,19 +464,37 @@ No new crates. `agent_ui` is NOT touched except tests. `workspace`, `outline_pan
 - [ ] Agent → agent mention via `post_agent_board_message` → routed + injected.
 - [ ] Self-mention dropped; cooldown + hourly cap log-and-suppress (forced
       storm test).
-- [ ] Work board: two devices `Doing` the same plan → race flag renders
+- [x] Work board: two devices `Doing` the same plan → race flag renders
       (warning color + ⚠) within one sync round; single-owner items don't.
-- [ ] Work board: item older than 5h disappears on next notify; `released:`
+      — AUTOMATED: `race_flag_on_two_devices_doing_same_plan`,
+      `same_device_two_sessions_is_not_a_race`,
+      `merges_local_claims_and_remote_scopes_by_path` (projection);
+      `panel_smoke_local_only` drives `on_snapshot` with a live race and
+      draws the race row within the same round (render path).
+- [x] Work board: item older than 5h disappears on next notify; `released:`
       state pins a `Released` item within the window.
-- [ ] Both panels open → exactly one poll loop (verified by log count over
+      — AUTOMATED: `five_hour_cutoff_drops_old_items` (incl. boundary),
+      `released_state_pins_released_item`,
+      `local_claim_converts_clock_epochs`; data-driven draw in
+      `panel_smoke_local_only` renders released + stale rows.
+- [x] Both panels open → exactly one poll loop (verified by log count over
       60s).
+      — AUTOMATED: `init_is_idempotent_one_runtime_per_process` +
+      `panel_smoke_local_only` (both panels bound to the SAME runtime
+      entity) + `poll_rounds_counts_each_snapshot_once_shared_by_all_views`.
+      Live log-count over 60s remains an optional visual confirmation.
 - [ ] Panel closed → zero render/notify work from the war room (profiler or
       log silence).
-- [ ] Old worker payloads (no `sender`) and old snapshots deserialize
+- [x] Old worker payloads (no `sender`) and old snapshots deserialize
       (existing serde-default tests extended).
-- [ ] `./script/clippy` + `cargo test -p agent_board` green.
-- [ ] (deferred-blocked) Web chat input usable end-to-end — requires 015 W5
-      `GITHUB_CLIENT_ID`; mark `- [-]` until unblocked.
+      — AUTOMATED: `board_message_old_payload_defaults_empty_sender` +
+      legacy-`PostMessageBody` test in `types.rs`; deployed worker
+      (v2b3d70d5) round-trips the field.
+- [x] `./script/clippy` + `cargo test -p agent_board` green.
+      — scoped `cargo clippy -p agent_board --all-targets` clean
+      (repo-wide script skipped under sibling-agent build load); 77/77 tests.
+- [-] (deferred-blocked) Web chat input usable end-to-end — requires 015 W5
+      `GITHUB_CLIENT_ID`; blocked, untouched.
 
 ## Deferred (explicitly out of v1)
 

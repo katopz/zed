@@ -22,6 +22,7 @@ new_classes = ["RoomCoordinator"]
 [vars]
 DEFAULT_TTL_SECONDS = "604800"
 MAX_MESSAGES = "100"
+MAX_ROOM_STATES = "50"
 STALE_STATUS_SECS = "300"
 # GitHub OAuth (web UI → worker), device flow. The Client ID is public; the
 # device flow needs no client secret. Create an OAuth App (any callback URL,
