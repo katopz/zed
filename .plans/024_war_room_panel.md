@@ -259,112 +259,121 @@ Collab but not adjacent) — zero upstream-file churn, but not the requested
 
 ### P0 — Runtime singleton (DRY + perf precondition)
 
-- [ ] `agent_board/src/runtime.rs`: `BoardRuntime` entity (GPUI Global):
+- [x] `agent_board/src/runtime.rs`: `BoardRuntime` entity (GPUI Global):
       config load, identity, client, room resolution, poll task, SSE client,
       MCP server — moved verbatim from `AgentBoardPanel::{try_start,
       start_poll, start_realtime}` (net code motion, no behavior change).
-- [ ] `agent_board::init` starts the runtime when `worker_url` is configured;
+- [x] `agent_board::init` starts the runtime when `worker_url` is configured;
       runtime `cx.notify()` on each snapshot; `board_state` globals unchanged.
-- [ ] Refactor `AgentBoardPanel` to a pure view over the runtime (drop its
+- [x] Refactor `AgentBoardPanel` to a pure view over the runtime (drop its
       owned poll/SSE/MCP fields; keep actions/mute UI). Its Toggle action
       must not create a second runtime.
-- [ ] Verify single poll loop with both panels open (log line or counter).
+- [x] Verify single poll loop with both panels open (log line or counter):
+      `runtime poll loop starting (single instance per process)` at start +
+      `sync round #N` debug log per round — `poll_rounds()` counter exposed
+      for the GOAT log-count check.
 
 ### P1 — Mention routing
 
-- [ ] `agent_board/src/mentions.rs`: pure `parse_mention(&str) ->
+- [x] `agent_board/src/mentions.rs`: pure `parse_mention(&str) ->
       Option<Mention{device, prefix, text}>` + `sender_label()` helpers.
-- [ ] `feeder.rs`: `extract_mentions_for_device(&snapshot, device_name,
+- [x] `feeder.rs`: `extract_mentions_for_device(&snapshot, device_name,
       watermark) -> Vec<(prefix, text)>` (mirror of
-      `extract_replies_for_device`), wired into `sync_round` step 3; ts
-      high-water mark persisted in the runtime (in-memory; re-inject risk
-      after restart bounded by cooldown — acceptable, documented).
-- [ ] Cooldown + rate-cap guard (pure fn `mention_guard`) + config fields
+      `extract_replies_for_device`), wired into runtime `on_snapshot` (sync
+      step 3); ts high-water mark persisted in the runtime (in-memory
+      process-global; re-inject risk after restart bounded by cooldown —
+      acceptable, documented).
+- [x] Cooldown + rate-cap guard (pure fn `mention_guard`) + config fields
       `mention_cooldown_secs: u64 = 60`, `mention_max_per_hour: u32 = 20`.
-- [ ] Injection format `📢 war-room [@sender] text` via existing
-      `inject_web_reply` (no new injection path).
+- [x] Injection format `📢 war-room [@sender] text` via existing
+      `inject_web_reply` (no new injection path). SSE push path scans the
+      same watermark/guard so 📡-on delivers mentions <1s.
 
 ### P2 — Worker + wire (small, backward compatible)
 
-- [ ] `MAX_MESSAGES` 10 → 100, `MAX_ROOM_STATES` 10 → 50 (`index.js` consts +
+- [x] `MAX_MESSAGES` 10 → 100, `MAX_ROOM_STATES` 10 → 50 (`index.js` consts +
       `wrangler.toml` vars; states cap raised so `released:` terminal markers
       survive chatty rooms within the 5h window).
-- [ ] `BoardMessage`/`PostMessageBody` gain `#[serde(default)] sender`;
+- [x] `BoardMessage`/`PostMessageBody` gain `#[serde(default)] sender`;
       worker passes it through on `/msg`; old payloads default `""`.
 
 ### P3 — WarRoomPanel
 
-- [ ] `war_room.rs`: panel entity + render (header / **work board** / roster /
+- [x] `war_room.rs`: panel entity + render (header / **work board** / roster /
       feed / input) per the design above; local-only state; 📡 toggle bound to
       runtime. Work board is a pure child render of the projection — no
       separate entity, no extra notifications.
-- [ ] `actions!(war_room, [Toggle, ToggleFocus, Refresh])` +
+- [x] `actions!(war_room, [Toggle, ToggleFocus, Refresh])` +
       `workspace.register_action` wiring in `agent_board::init`.
-- [ ] `zed.rs initialize_panels`: eager add (`WarRoomPanel::new` is cheap —
+- [x] `zed.rs initialize_panels`: eager add (`WarRoomPanel::new` is cheap —
       no I/O; all network lives in the runtime).
-- [ ] Priority renumber: Outline 6→7, Debug 7→8; WarRoom = 6.
-- [ ] Icon `UserGroup`, tooltip "War Room", `icon_label` = pending-mention
-      count when panel closed (cheap: unwatched-mention counter in runtime,
-      cleared on open).
+- [x] Priority renumber: Outline 6→7, Debug 7→8; WarRoom = 6.
+- [x] Icon `UserGroup`, tooltip "War Room", `icon_label` = pending-mention
+      count when panel closed (unwatched-mention counter in mentions.rs,
+      cleared on Toggle/ToggleFocus).
 
 ### P4 — Agent voice (MCP write tool)
 
-- [ ] `board_state::post_message(text, sender)` writer fn (same shape as the
+- [x] `board_state::post_message(text, sender)` writer fn (same shape as the
       broadcaster: clone handle, spawn, log-fail).
-- [ ] MCP tool `post_agent_board_message { text }` (`mcp_tools.rs`, default
-      annotations: not read-only, not destructive); agents compose
+- [x] MCP tool `post_agent_board_message { text, sender }` (`mcp_tools.rs`,
+      default annotations: not read-only, not destructive); agents compose
       `@target:sess4 …` using `get_agent_room` output.
-- [ ] `get_agent_room` output gains the work board (merged scopes + states,
+- [x] `get_agent_room` output gains the work board (merged scopes + states,
       same `WorkItem` shape as the panel) so agents can query "what's safe
       to grab" explicitly.
-- [ ] Self-mention drop + prompt guidance embedded in the tool description
+- [x] Self-mention drop + prompt guidance embedded in the tool description
       ("mention cooldowns apply; do not spam peers").
 
 ### P5 — Web UI (optional mobility, rides on 015)
 
-- [ ] General chat input (posts `/msg`, `sender: "web"`); `@device:sess4`
+- [-] General chat input (posts `/msg`, `sender: "web"`); `@device:sess4`
       syntax documented in the placeholder; `REPLY:` kept as private alias.
-- [ ] Feed pane next to the accordion (messages already arrive via SSE/DO
-      relay — display only).
-- [ ] **Blocked on**: 015 W5 `GITHUB_CLIENT_ID` (OAuth app creation). Worker
+      — BLOCKED on 015 W5 `GITHUB_CLIENT_ID`; do not touch while blocked.
+- [-] Feed pane next to the accordion (messages already arrive via SSE/DO
+      relay — display only). BLOCKED with the above.
+- [-] **Blocked on**: 015 W5 `GITHUB_CLIENT_ID` (OAuth app creation). Worker
       contract needs zero changes.
 
 ### P6 — Tests & gates
 
-- [ ] `mentions.rs`: parse tests (valid, mid-text non-routing, self-device,
+- [x] `mentions.rs`: parse tests (valid, mid-text non-routing, self-device,
       bad prefix, empty text).
-- [ ] `feeder.rs`: `extract_mentions_for_device` tests (routes own-device,
+- [x] `feeder.rs`: `extract_mentions_for_device` tests (routes own-device,
       skips others, honors watermark, `@all` deferred).
-- [ ] `mention_guard`: cooldown window, hourly cap, self-mention drop.
-- [ ] `types.rs`: sender-field round-trip + old-snapshot default.
-- [ ] `war_room.rs`: `build_work_board` projection tests — fresh/stale/
+- [x] `mention_guard`: cooldown window, hourly cap, self-mention drop.
+- [x] `types.rs`: sender-field round-trip + old-snapshot default.
+- [x] `war_room.rs`: `build_work_board` projection tests — fresh/stale/
       released states, 5h cutoff boundary, race flag on two devices doing
       the same plan, merge of local claims + remote scopes by path.
-- [ ] Panel smoke test (gpui test): render with empty runtime (local-only),
-      roster click fills input, send posts via mocked client.
-- [ ] `./script/clippy` clean; `cargo test -p agent_board -p agent_ui` green.
+- [-] Panel smoke test (gpui test): render with empty runtime (local-only),
+      roster click fills input, send posts via mocked client. Deferred: the
+      editor-crate dependency makes the gpui test harness heavy for this
+      crate; projection + routing logic is fully covered by unit tests.
+- [x] `./script/clippy` clean; `cargo test -p agent_board -p agent_ui` green.
+      (agent_board: clippy clean, 73/73 tests. agent_ui untouched by design.)
 
 ### P7 — Pinned work board (todolist)
 
-- [ ] Pure projection `build_work_board(snapshot, local_claims, now) ->
+- [x] Pure projection `build_work_board(snapshot, local_claims, now) ->
       Vec<WorkItem>` in `war_room.rs` (merge key: normalized plan path;
       states per the spec; 5h `last_activity_ts` cutoff; race flag when ≥2
       devices `Doing` the same plan).
-- [ ] Release broadcast: at the existing chain-stop release hook
+- [x] Release broadcast: at the existing chain-stop release hook
       (`auto_prompt`, where `release_all_for_session` is called), emit
       `broadcast_state(sess, None, "released: {plan_name}", plan_path)` per
       released claim — rides `/state`; no new endpoint. Honest terminal only
-      (`released`, not `done`) unless a trivially-true completion signal
-      exists at the same call site.
-- [ ] Panel: pinned section render (order: race-flagged `Doing` → `Doing` →
+      (`released`, not `done`) — no completion signal exists at the call
+      site, so `Released` is the honest terminal.
+- [x] Panel: pinned section render (order: race-flagged `Doing` → `Doing` →
       `Stale` → `Released`; ~20-row cap; collapsible summary row);
       recompute only on runtime notify (15s poll / SSE push), never on a
       timer of its own.
-- [ ] `get_agent_room` MCP output extension (see P4).
-- [ ] Clock note: local claims use `time_monotonic_secs` (no wall clock) —
+- [x] `get_agent_room` MCP output extension (see P4).
+- [x] Clock note: local claims use `time_monotonic_secs` (no wall clock) —
       `claimed_ago_secs` converts via `now - claimed_ago`; remote items use
-      wall-clock `updated_at`/`ts`. The projection must not mix the two
-      epochs — normalize to wall-clock `now` at the call site.
+      wall-clock `updated_at`/`ts`. The projection normalizes to wall-clock
+      `now_ms` at the call site and never mixes epochs.
 
 ## Perf/sec considerations
 
