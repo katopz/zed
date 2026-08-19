@@ -21,7 +21,7 @@ new_classes = ["RoomCoordinator"]
 # All board keys expire after one week.
 [vars]
 DEFAULT_TTL_SECONDS = "604800"
-MAX_MESSAGES = "10"
+MAX_MESSAGES = "100"
 STALE_STATUS_SECS = "300"
 # GitHub OAuth (web UI → worker), device flow. The Client ID is public; the
 # device flow needs no client secret. Create an OAuth App (any callback URL,

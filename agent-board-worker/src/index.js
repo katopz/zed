@@ -25,8 +25,8 @@
 
 import * as ed from "@noble/ed25519";
 
-const MAX_MESSAGES = 10;
-const MAX_ROOM_STATES = 10;
+const MAX_MESSAGES = 100;
+const MAX_ROOM_STATES = 50;
 const MAX_STATE_TEXT_BYTES = 256;
 const STALE_STATUS_SECS = 300;
 const TTL_SECS = 60 * 60 * 24 * 7; // 1 week
@@ -264,6 +264,7 @@ async function handlePostMsg(env, room, body, verified) {
     v: 1,
     device_id: verified.deviceId,
     device_name: body.device_name ?? "",
+    sender: String(body.sender ?? "").slice(0, 64),
     text: String(body.text ?? "").slice(0, 1024),
     ts: Date.now(),
   };
