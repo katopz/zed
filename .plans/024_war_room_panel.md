@@ -363,10 +363,49 @@ Collab but not adjacent) — zero upstream-file churn, but not the requested
       `on_snapshot` with a realistic room (two devices racing one plan,
       released marker, mention message, stale scope) → `poll_rounds == 1` →
       draw again, then send-with-no-worker clears the input without panic.
+      Setup extracted to `setup_local_only_harness` (shared with the closed
+      and priority tests).
+- [x] Mention pipeline end-to-end (gpui test):
+      `runtime::tests::mention_pipeline_storm_cooldown_cap_and_delivery` —
+      drives `on_snapshot` rounds through the runtime with the
+      `set_device_name_for_tests` seam (no worker): agent→agent delivery
+      with the `📢 war-room [@sender]` label, 25-msg self-mention storm →
+      zero injections (no feedback loop), 25-msg same-target cooldown storm
+      → zero duplicates, per-target cooldown isolation, hourly cap allows
+      exactly N then log-and-suppresses the next storm, SSE push path
+      (`handle_board_message`) delivers once and blocks the watermark replay,
+      and a 100-message snapshot → scan+guard+inject measured < 1s (the
+      local slice of the <1s 📡 GOAT bound; network dominates the rest).
+      Sole owner of the process-global mention statics (tests run parallel).
+- [x] Panel-closed silence (gpui test):
+      `war_room::tests::panel_closed_silence_zero_render_work_after_drop` —
+      a `#[cfg(test)] PANEL_RENDER_COUNT` counter proves the panel renders
+      while alive (draw → delta > 0) and does ZERO render work after the
+      entity is dropped (observe-subscription dies with it) while the
+      runtime keeps syncing (`poll_rounds` advances). Mention injection is
+      panel-independent by construction — the pipeline test delivers with
+      no panel in existence at all.
+- [x] Duplicate-priority panic path (gpui test, `#[should_panic]`):
+      `war_room::tests::duplicate_activation_priority_panics_in_debug_builds`
+      — adds WarRoomPanel (priority 6) + `workspace::dock::test::TestPanel`
+      impostor (also 6) to a real test workspace → `Dock::add_panel` panics
+      in debug builds, proving the guard fires and WarRoom's priority
+      participates in the dock ordering that places its icon directly
+      behind CollabPanel (5).
+- [x] Panel screenshot artifact (example):
+      `cargo run -p agent_board --example war_room_screenshot` renders the
+      panel against an inert runtime + realistic room (race ⚠, released,
+      stale, live mention, roster prefill) through the real Metal compositor
+      (offscreen `VisualTestAppContext`), One Dark forced, and saves a
+      pixel-faithful PNG. Artifact committed at `.plans/024_war_room_panel.png`
+      (920×1560). Note: requires `gpui_platform/font-kit` dev-feature —
+      without it font registration silently no-ops and text never renders.
 - [x] `./script/clippy` clean; `cargo test -p agent_board -p agent_ui` green.
       (agent_board: scoped `cargo clippy -p agent_board --all-targets` clean
-      — repo-wide script skipped under sibling-agent build load; 77/77 tests
-      incl. the gpui harness. agent_ui untouched by design.)
+      — repo-wide script skipped under sibling-agent build load; 80/80 tests
+      incl. the gpui harnesses and the `#[should_panic]` priority test; the
+      `war_room_screenshot` example builds clean too. agent_ui untouched by
+      design.)
 
 ### P7 — Pinned work board (todolist)
 
@@ -454,23 +493,53 @@ No new crates. `agent_ui` is NOT touched except tests. `workspace`, `outline_pan
 
 ## GOAT gate
 
-- [ ] Icon renders directly behind Collab Panel in the activity bar
+- [-] (partial) Icon renders directly behind Collab Panel in the activity bar
       (screenshot, default settings, debug build — duplicate-priority panic
       path exercised).
-- [ ] Operator @mention from Zed panel → visible in web feed AND injected
-      into target thread (<1s 📡 on / <15s poll off; `📢 war-room` line in
-      the thread).
-- [ ] @mention from web UI (no local agents) → injected on the OWNING device.
-- [ ] Agent → agent mention via `post_agent_board_message` → routed + injected.
-- [ ] Self-mention dropped; cooldown + hourly cap log-and-suppress (forced
+      — AUTOMATED: priority 6 locked by
+      `panel_closed_silence_zero_render_work_after_drop`; duplicate-priority
+      panic path EXERCISED by
+      `duplicate_activation_priority_panics_in_debug_builds` (#[should_panic]);
+      pixel-faithful panel render committed at `.plans/024_war_room_panel.png`
+      (via `examples/war_room_screenshot`). Adjacency (Collab 5 / WarRoom 6 /
+      Outline 7) verified by grep across the panel crates; the ACTIVITY BAR
+      screenshot itself needs a live debug-build session (live-GUI remainder).
+- [-] (partial) Operator @mention from Zed panel → visible in web feed AND
+      injected into target thread (<1s 📡 on / <15s poll off; `📢 war-room`
+      line in the thread).
+      — AUTOMATED (local slice): 100-message snapshot → scan+guard+inject
+      measured < 1s in `mention_pipeline_storm_cooldown_cap_and_delivery`;
+      the `📢 war-room [@sender]` label format is asserted verbatim; the
+      <15s poll cadence is the runtime's interval config. LIVE remainder:
+      network legs (SSE push + thread drain) need a live 📡 session.
+- [-] (partial) @mention from web UI (no local agents) → injected on the
+      OWNING device.
+      — AUTOMATED (receiving half): `sender: "web"` mentions route + inject
+      + label in `mention_pipeline_storm_cooldown_cap_and_delivery`. LIVE
+      remainder: posting from the web UI — blocked on P5 (015 W5
+      `GITHUB_CLIENT_ID`).
+- [-] (partial) Agent → agent mention via `post_agent_board_message` →
+      routed + injected.
+      — AUTOMATED (receiving half): sender `m3:aaaa` → `@m3:f3a2` delivered
+      into the reply queue with the sibling-agent label (same pipeline
+      test); sibling-vs-self discrimination covered by
+      `scan_same_device_sibling_agent_is_routed`. LIVE remainder: the MCP
+      `post_agent_board_message` round-trip through the deployed worker
+      needs a live agent session.
+- [x] Self-mention dropped; cooldown + hourly cap log-and-suppress (forced
       storm test).
+      — AUTOMATED: `mention_pipeline_storm_cooldown_cap_and_delivery` —
+      25-msg self-mention storm → zero injections (no feedback loop);
+      25-msg cooldown storm → zero duplicates; hourly cap allows exactly N
+      per hour then suppresses the follow-up storm; per-target isolation.
 - [x] Work board: two devices `Doing` the same plan → race flag renders
       (warning color + ⚠) within one sync round; single-owner items don't.
       — AUTOMATED: `race_flag_on_two_devices_doing_same_plan`,
       `same_device_two_sessions_is_not_a_race`,
       `merges_local_claims_and_remote_scopes_by_path` (projection);
       `panel_smoke_local_only` drives `on_snapshot` with a live race and
-      draws the race row within the same round (render path).
+      draws the race row within the same round (render path); the ⚠ warning
+      color is visible in `.plans/024_war_room_panel.png`.
 - [x] Work board: item older than 5h disappears on next notify; `released:`
       state pins a `Released` item within the window.
       — AUTOMATED: `five_hour_cutoff_drops_old_items` (incl. boundary),
@@ -483,8 +552,14 @@ No new crates. `agent_ui` is NOT touched except tests. `workspace`, `outline_pan
       `panel_smoke_local_only` (both panels bound to the SAME runtime
       entity) + `poll_rounds_counts_each_snapshot_once_shared_by_all_views`.
       Live log-count over 60s remains an optional visual confirmation.
-- [ ] Panel closed → zero render/notify work from the war room (profiler or
+- [x] Panel closed → zero render/notify work from the war room (profiler or
       log silence).
+      — AUTOMATED:
+      `panel_closed_silence_zero_render_work_after_drop` — render-count
+      delta stays at zero after the panel entity is dropped while the
+      runtime keeps syncing; injection is panel-independent (pipeline test
+      delivers with no panel in existence). Live profiler remains an
+      optional visual confirmation.
 - [x] Old worker payloads (no `sender`) and old snapshots deserialize
       (existing serde-default tests extended).
       — AUTOMATED: `board_message_old_payload_defaults_empty_sender` +

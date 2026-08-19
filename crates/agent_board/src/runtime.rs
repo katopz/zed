@@ -31,6 +31,10 @@ pub struct BoardRuntime {
     config: AgentBoardConfig,
     /// Lazily-built client once an identity + worker URL are available.
     client: Option<Arc<BoardClient>>,
+    /// Local device name (present iff a client exists). Gates the mention
+    /// scan in [`Self::on_snapshot`] — the scan needs only the name, not the
+    /// client, so tests drive mention rounds without a worker via the seam.
+    device_name: Option<String>,
     /// Room name resolved from config (explicit) or identity (derived).
     resolved_room: Option<String>,
     /// Latest snapshot, mirrored for panel rendering.
@@ -72,6 +76,7 @@ impl BoardRuntime {
                 http,
                 config,
                 client: None,
+                device_name: None,
                 resolved_room: None,
                 snapshot: None,
                 poll_task: None,
@@ -132,6 +137,14 @@ impl BoardRuntime {
         self.poll_task.is_some()
     }
 
+    /// Test seam: drive mention rounds through [`Self::on_snapshot`] on an
+    /// inert (local-only) runtime — the scan runs because a device name is
+    /// set, no worker required.
+    #[cfg(test)]
+    pub(crate) fn set_device_name_for_tests(&mut self, device_name: &str) {
+        self.device_name = Some(device_name.to_string());
+    }
+
     // -----------------------------------------------------------------------
     // Start / lifecycle — moved verbatim from AgentBoardPanel (P0).
     // -----------------------------------------------------------------------
@@ -164,6 +177,9 @@ impl BoardRuntime {
             }
         };
         let identity = Arc::new(identity);
+        // Captured before the identity moves into the client — `on_snapshot`
+        // scans mentions with just the name.
+        let device_name = identity.device_name().to_string();
         // Room = hash(ssh-key) by default so two devices sharing a key auto-join
         // the same room; an explicit config.room overrides.
         let room = if self.config.room.trim().is_empty() {
@@ -197,6 +213,7 @@ impl BoardRuntime {
             self.config.mention_max_per_hour,
         );
         self.resolved_room = Some(room);
+        self.device_name = Some(device_name);
         self.client = Some(client);
         self.start_poll(cx);
         self.start_mcp_server(cx);
@@ -318,16 +335,16 @@ impl BoardRuntime {
     }
 
     /// Post-snapshot hook: scan mentions (P1), cache, notify views.
-    /// `pub(crate)` so panel tests can drive rounds without a worker.
-    pub(crate) fn on_snapshot(&mut self, snapshot: RoomSnapshot, cx: &mut Context<Self>) {
+    /// Public so harnesses outside the crate (screenshot example, future
+    /// embedders) can drive rounds without a worker.
+    pub fn on_snapshot(&mut self, snapshot: RoomSnapshot, cx: &mut Context<Self>) {
         self.poll_rounds += 1;
         log::debug!(
             "[agent_board] sync round #{} complete (room={})",
             self.poll_rounds,
             snapshot.room
         );
-        if let Some(client) = &self.client {
-            let device_name = client.identity().device_name();
+        if let Some(device_name) = self.device_name.as_deref() {
             let watermark = crate::mentions::watermark_ms();
             let scan =
                 crate::feeder::extract_mentions_for_device(&snapshot, device_name, watermark);
@@ -434,7 +451,7 @@ fn hostname() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::RoomSnapshot;
+    use crate::types::{BoardMessage, RoomSnapshot};
     use gpui::TestAppContext;
 
     fn inert_http() -> Arc<dyn HttpClient> {
@@ -499,5 +516,218 @@ mod tests {
             assert_eq!(BoardRuntime::global(cx).read(cx).poll_rounds(), 2);
         });
         runtime.read_with(cx, |runtime, _| assert_eq!(runtime.poll_rounds(), 2));
+    }
+
+    fn board_message(device_name: &str, sender: &str, text: &str, ts: i64) -> BoardMessage {
+        BoardMessage {
+            v: 1,
+            device_id: String::new(),
+            device_name: device_name.to_string(),
+            sender: sender.to_string(),
+            text: text.to_string(),
+            ts,
+        }
+    }
+
+    fn snapshot_with_messages(messages: Vec<BoardMessage>) -> RoomSnapshot {
+        RoomSnapshot {
+            v: 1,
+            room: "test-room".to_string(),
+            statuses: Vec::new(),
+            messages,
+            states: Vec::new(),
+            replies: Vec::new(),
+        }
+    }
+
+    /// The mention pipeline end-to-end through the runtime's post-poll hook:
+    /// scan → loop guard → `inject_web_reply`. Also proves injection is
+    /// panel-independent — no panel entity exists in this test at all, so
+    /// mentions deliver with every panel closed.
+    ///
+    /// SOLE OWNER of the process-global mention state (watermark, guard,
+    /// replies queue, unwatched counter): tests run in parallel in one
+    /// process, so no other test may touch those statics.
+    ///
+    /// Covers the GOAT items: self-mention storm (dropped, no feedback),
+    /// cooldown + hourly cap (log-and-suppress), agent → agent and web
+    /// routing with the `📢 war-room` label, SSE/poll watermark sharing, and
+    /// the local slice of the <1s 📡 injection bound.
+    #[gpui::test]
+    async fn mention_pipeline_storm_cooldown_cap_and_delivery(cx: &mut TestAppContext) {
+        let runtime = cx.update(|cx| {
+            BoardRuntime::init_global_with_config(inert_http(), AgentBoardConfig::default(), cx)
+        });
+        runtime.update(cx, |runtime, _| runtime.set_device_name_for_tests("m3"));
+
+        // 60s cooldown / 3 per hour — small enough to force every branch.
+        crate::mentions::configure_guard(60, 3);
+        let _ = auto_prompt::peer_states::drain_web_replies();
+        crate::mentions::clear_unwatched_mentions();
+
+        // The base sits exactly on an hour boundary (4_102_444_800_000 is a
+        // multiple of 3_600_000) and in 2100, above any realistic watermark;
+        // every timestamp below is base + offset < 1h, so one hour bucket
+        // holds for the whole test and the watermark (monotonic) is honored.
+        let base = 4_102_444_800_000_i64;
+
+        // ── Agent → agent: sibling m3:aaaa commands m3:f3a2 ──
+        runtime.update(cx, |runtime, cx| {
+            runtime.on_snapshot(
+                snapshot_with_messages(vec![board_message(
+                    "m3",
+                    "m3:aaaa",
+                    "@m3:f3a2 rebase please",
+                    base,
+                )]),
+                cx,
+            )
+        });
+        assert_eq!(
+            auto_prompt::peer_states::drain_web_replies(),
+            vec![
+                ("f3a2".to_string(), "📢 war-room [@m3:aaaa] rebase please".to_string())
+            ],
+        );
+        assert_eq!(crate::mentions::unwatched_mention_count(), 1);
+
+        // ── Self-mention storm: 25 self-mentions in one round — all dropped,
+        //    zero injections, no feedback loop ──
+        runtime.update(cx, |runtime, cx| {
+            runtime.on_snapshot(
+                snapshot_with_messages(
+                    (0..25)
+                        .map(|i| {
+                            board_message("m3", "m3:f3a2", "@m3:f3a2 keep going", base + 1 + i)
+                        })
+                        .collect(),
+                ),
+                cx,
+            )
+        });
+        assert!(
+            auto_prompt::peer_states::drain_web_replies().is_empty(),
+            "self-mentions must never inject"
+        );
+        assert_eq!(crate::mentions::unwatched_mention_count(), 1);
+
+        // ── Cooldown storm: 25 web mentions of the SAME target inside its
+        //    cooldown window — every one suppressed, zero duplicates ──
+        runtime.update(cx, |runtime, cx| {
+            runtime.on_snapshot(
+                snapshot_with_messages(
+                    (0..25)
+                        .map(|i| board_message("phone", "web", "@m3:f3a2 do it", base + 100 + i))
+                        .collect(),
+                ),
+                cx,
+            )
+        });
+        assert!(
+            auto_prompt::peer_states::drain_web_replies().is_empty(),
+            "cooldown must suppress the storm"
+        );
+        assert_eq!(crate::mentions::unwatched_mention_count(), 1);
+
+        // ── Per-target isolation: the storm above locks f3a2, not bbbb —
+        //    an agent's cooldown never silences its siblings ──
+        runtime.update(cx, |runtime, cx| {
+            runtime.on_snapshot(
+                snapshot_with_messages(vec![board_message(
+                    "phone",
+                    "web",
+                    "@m3:bbbb deploy",
+                    base + 200,
+                )]),
+                cx,
+            )
+        });
+        assert_eq!(
+            auto_prompt::peer_states::drain_web_replies(),
+            vec![("bbbb".to_string(), "📢 war-room [@web] deploy".to_string())],
+        );
+        assert_eq!(crate::mentions::unwatched_mention_count(), 2);
+
+        // ── Hourly cap: `configure_guard` REPLACES the guard (fresh budget —
+        //    production only calls it once at startup), so reconfigure with
+        //    no cooldown to probe the cap in isolation: exactly 3 injections
+        //    for f3a2 this hour, the rest log-and-suppress ──
+        crate::mentions::configure_guard(0, 3);
+        runtime.update(cx, |runtime, cx| {
+            runtime.on_snapshot(
+                snapshot_with_messages(vec![
+                    board_message("phone", "web", "@m3:f3a2 two", base + 300),
+                    board_message("phone", "web", "@m3:f3a2 three", base + 301),
+                    board_message("phone", "web", "@m3:f3a2 four", base + 302),
+                ]),
+                cx,
+            )
+        });
+        let replies = auto_prompt::peer_states::drain_web_replies();
+        assert_eq!(replies.len(), 3, "a fresh budget allows exactly the cap");
+        assert!(replies.iter().all(|(prefix, _)| prefix == "f3a2"));
+        assert_eq!(crate::mentions::unwatched_mention_count(), 5);
+
+        // A second storm the same hour: the cap is exhausted — zero more.
+        runtime.update(cx, |runtime, cx| {
+            runtime.on_snapshot(
+                snapshot_with_messages(vec![
+                    board_message("phone", "web", "@m3:f3a2 five", base + 310),
+                    board_message("phone", "web", "@m3:f3a2 six", base + 311),
+                    board_message("phone", "web", "@m3:f3a2 seven", base + 312),
+                ]),
+                cx,
+            )
+        });
+        assert!(
+            auto_prompt::peer_states::drain_web_replies().is_empty(),
+            "the exhausted hourly cap must suppress further mentions"
+        );
+        assert_eq!(crate::mentions::unwatched_mention_count(), 5);
+
+        // ── The SSE push path shares the watermark with the poll path: a
+        //    pushed message delivers once; the same push again is a no-op ──
+        let pushed = board_message("phone", "web", "@m3:cccc fresh", base + 400);
+        assert_eq!(
+            crate::mentions::handle_board_message(&pushed, "m3"),
+            crate::mentions::ScanOutcome::Routed
+        );
+        assert_eq!(
+            auto_prompt::peer_states::drain_web_replies(),
+            vec![("cccc".to_string(), "📢 war-room [@web] fresh".to_string())],
+        );
+        assert_eq!(
+            crate::mentions::handle_board_message(&pushed, "m3"),
+            crate::mentions::ScanOutcome::NotRouted,
+            "a re-pushed message is below the watermark — no double delivery"
+        );
+        assert!(auto_prompt::peer_states::drain_web_replies().is_empty());
+        assert_eq!(crate::mentions::unwatched_mention_count(), 6);
+
+        // ── Latency: one round over a 100-message snapshot (scan + guard +
+        //    inject). The GOAT bound is <1s end-to-end with 📡 on; this local
+        //    slice must sit far under it — network dominates the real bound. ──
+        let burst: Vec<BoardMessage> = (0..100)
+            .map(|i| board_message("phone", "web", &format!("@m3:dddd cmd {i}"), base + 500 + i))
+            .collect();
+        let snapshot = snapshot_with_messages(burst);
+        let started = std::time::Instant::now();
+        runtime.update(cx, |runtime, cx| runtime.on_snapshot(snapshot, cx));
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "snapshot→injection took {elapsed:?}; GOAT bound is 1s"
+        );
+        // dddd is a fresh target: the cap bounds the burst to three injections.
+        assert_eq!(
+            auto_prompt::peer_states::drain_web_replies().len(),
+            3,
+            "the hourly cap bounds the burst"
+        );
+        assert_eq!(crate::mentions::unwatched_mention_count(), 9);
+
+        // Leave the process-global state tidy for any future test.
+        let _ = auto_prompt::peer_states::drain_web_replies();
+        crate::mentions::clear_unwatched_mentions();
     }
 }

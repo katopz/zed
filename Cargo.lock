@@ -376,6 +376,7 @@ name = "agent_board"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "assets",
  "auto_prompt",
  "base64 0.22.1",
  "blake3",
@@ -386,6 +387,7 @@ dependencies = [
  "fs",
  "futures 0.3.32",
  "gpui",
+ "gpui_platform",
  "hex",
  "http_client",
  "log",

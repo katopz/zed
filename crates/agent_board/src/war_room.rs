@@ -287,7 +287,10 @@ impl EventEmitter<PanelEvent> for WarRoomPanel {}
 impl WarRoomPanel {
     /// Construct the panel. Cheap by design (no I/O — the runtime owns the
     /// network), so eager registration in `initialize_panels` is free.
-    pub fn new(window: &mut Window, cx: &mut Context<Workspace>) -> Entity<Self> {
+    /// Takes `&mut App`, not a workspace context: the panel uses nothing
+    /// Workspace-specific, and the decoupling lets non-workspace harnesses
+    /// (e.g. the screenshot example) build it directly.
+    pub fn new(window: &mut Window, cx: &mut App) -> Entity<Self> {
         let runtime = BoardRuntime::global(cx);
         cx.new(|cx| {
             let focus_handle = cx.focus_handle();
@@ -320,7 +323,10 @@ impl WarRoomPanel {
         });
     }
 
-    fn prefill_mention(&mut self, label: &str, window: &mut Window, cx: &mut Context<Self>) {
+    /// Prefill the input with `@label ` and focus it — the roster-click
+    /// affordance. Public so external harnesses (screenshot example) can
+    /// drive the same path.
+    pub fn prefill_mention(&mut self, label: &str, window: &mut Window, cx: &mut Context<Self>) {
         let text = format!("@{label} ");
         let input = self.input.clone();
         input.update(cx, |editor, cx| {
@@ -754,6 +760,8 @@ impl Focusable for WarRoomPanel {
 
 impl Render for WarRoomPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(test)]
+        PANEL_RENDER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let theme = cx.theme();
         let colors = theme.colors();
         let fg = colors.text;
@@ -875,6 +883,19 @@ fn now_unix_ms() -> i64 {
 // smoke test below additionally exercises the gpui construction path against
 // an inert (local-only) runtime.
 // ---------------------------------------------------------------------------
+
+/// Process-global count of `WarRoomPanel::render` calls. The panel-closed
+/// GOAT check asserts the delta stays at zero after the panel is dropped;
+/// tests that draw the panel serialize on `PANEL_TEST_LOCK` because cargo
+/// runs tests in parallel within one process.
+#[cfg(test)]
+static PANEL_RENDER_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Serializes tests that assert on [`PANEL_RENDER_COUNT`] deltas — the
+/// counter is process-global and cargo runs tests in parallel.
+#[cfg(test)]
+static PANEL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 mod tests {
@@ -1212,14 +1233,24 @@ mod tests {
         }
     }
 
-    #[gpui::test]
-    async fn panel_smoke_local_only(cx: &mut gpui::TestAppContext) {
+    /// Shared harness for the panel gpui tests: settings + an inert
+    /// local-only runtime (default config ⇒ no worker ⇒ no network / MCP /
+    /// poll; the fake HTTP client 404s if anything escapes) + a window rooted
+    /// by [`SmokeRoot`] (never a full Workspace frame) + both panels bound to
+    /// the ONE shared runtime entity.
+    async fn setup_local_only_harness(
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        gpui::WindowHandle<SmokeRoot>,
+        Entity<Workspace>,
+        Entity<WarRoomPanel>,
+        Entity<crate::AgentBoardPanel>,
+    ) {
         cx.update(|cx| {
             let settings_store = settings::SettingsStore::test(cx);
             cx.set_global(settings_store);
             theme_settings::init(theme::LoadThemes::JustBase, cx);
         });
-
         cx.update(|cx| {
             BoardRuntime::init_global_with_config(
                 http_client::FakeHttpClient::with_404_response(),
@@ -1236,15 +1267,26 @@ mod tests {
                 cx.new(|cx| Workspace::test_new(project.clone(), window, cx))
             })
             .unwrap();
+        let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        let war_room = workspace.update_in(visual, |_, window, cx| {
+            WarRoomPanel::new(window, cx)
+        });
+        let board_panel = workspace.update_in(visual, |workspace, window, cx| {
+            crate::AgentBoardPanel::new(workspace, window, cx)
+        });
+        (window, workspace, war_room, board_panel)
+    }
+
+    #[gpui::test]
+    async fn panel_smoke_local_only(cx: &mut gpui::TestAppContext) {
+        // Setup renders nothing (no draws), so the lock only needs to cover
+        // the draw/assert section — acquired after the await to keep the
+        // guard off await points.
+        let (window, _workspace, war_room, board_panel) = setup_local_only_harness(cx).await;
+        let _panel_lock = PANEL_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let cx = &mut gpui::VisualTestContext::from_window(window.into(), cx);
 
         // Both panels construct against the ONE shared runtime entity.
-        let war_room = workspace.update_in(cx, |_, window, cx| {
-            WarRoomPanel::new(window, cx)
-        });
-        let board_panel = workspace.update_in(cx, |workspace, window, cx| {
-            crate::AgentBoardPanel::new(workspace, window, cx)
-        });
         let shared_runtime = cx.update(|_window, cx| BoardRuntime::global(cx).entity_id());
         assert_eq!(
             war_room.read_with(cx, |panel, _| panel.runtime.entity_id()),
@@ -1349,5 +1391,98 @@ mod tests {
         drop(war_room);
         drop(board_panel);
         cx.run_until_parked();
+    }
+
+    /// Panel-closed GOAT check: once the war room view is dropped (the
+    /// strongest form of "closed"), runtime notifies cause ZERO panel render
+    /// work — the observe-subscription died with the entity, so the panel is
+    /// out of the render tree entirely. Mention injection itself keeps
+    /// flowing: it lives on the runtime (`mention_pipeline_*` in runtime.rs
+    /// proves delivery with no panel in existence at all).
+    #[gpui::test]
+    async fn panel_closed_silence_zero_render_work_after_drop(cx: &mut gpui::TestAppContext) {
+        let (window, workspace, war_room, board_panel) = setup_local_only_harness(cx).await;
+        let _panel_lock = PANEL_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let cx = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+
+        // The dock priority stays locked at 6 — directly behind CollabPanel
+        // (5); OutlinePanel was renumbered to 7 for exactly this slot.
+        war_room.read_with(cx, |panel, _| {
+            assert_eq!(panel.activation_priority(), 6);
+        });
+
+        // Baseline: drawing the panel renders it.
+        let before = PANEL_RENDER_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+        cx.draw(
+            gpui::point(px(0.), px(0.)),
+            gpui::size(px(400.), px(700.)),
+            |_, _| war_room.clone().into_any_element(),
+        );
+        assert!(
+            PANEL_RENDER_COUNT.load(std::sync::atomic::Ordering::Relaxed) > before,
+            "the draw must have rendered the live panel"
+        );
+
+        // "Closed": drop the view entity — its observe-subscription on the
+        // runtime goes with it.
+        drop(war_room);
+        cx.run_until_parked();
+        let closed_at = PANEL_RENDER_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+
+        // The runtime keeps syncing (the global holds it), but the dropped
+        // panel must do zero render work in response.
+        let now = now_unix_ms();
+        let snapshot = snapshot(
+            vec![status(
+                "SHIKUWA",
+                false,
+                now - 10_000,
+                vec![scope("b1c9ffff", "/repo/.plans/024_a.md", "silence probe")],
+            )],
+            vec![],
+        );
+        cx.update(|_window, cx| {
+            BoardRuntime::global(cx).update(cx, |runtime, cx| {
+                runtime.on_snapshot(snapshot, cx)
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            PANEL_RENDER_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+            closed_at,
+            "a dropped war room panel must not render on runtime notify"
+        );
+        cx.update(|_window, cx| {
+            assert_eq!(
+                BoardRuntime::global(cx).read(cx).poll_rounds(),
+                1,
+                "the runtime itself kept syncing while the panel was closed"
+            );
+        });
+
+        drop(board_panel);
+        drop(workspace);
+        cx.run_until_parked();
+    }
+
+    /// The duplicate-priority panic path: `Dock::add_panel` panics in debug
+    /// builds when two panels share an activation priority. WarRoom sits at
+    /// 6; a TestPanel impostor at 6 must trip the guard — proving the check
+    /// fires and, transitively, that WarRoom's priority participates in the
+    /// dock ordering that places its icon directly behind CollabPanel.
+    #[gpui::test]
+    #[should_panic(expected = "have the same activation priority")]
+    async fn duplicate_activation_priority_panics_in_debug_builds(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (window, workspace, war_room, _board_panel) = setup_local_only_harness(cx).await;
+        let cx = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_panel(war_room.clone(), window, cx);
+            let impostor =
+                workspace::dock::test::TestPanel::new(DockPosition::Left, 6, cx);
+            let impostor = cx.new(|_| impostor);
+            workspace.add_panel(impostor, window, cx);
+        });
     }
 }
