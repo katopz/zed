@@ -18,6 +18,7 @@ use anyhow::{Context, Result};
 
 use crate::client::BoardClient;
 use crate::identity::DeviceIdentity;
+use crate::mentions::{MentionRoute, ScanOutcome, scan_message_for_device};
 use crate::types::{ActiveScope, PostStatusBody, RoomSnapshot, ScopeKind};
 
 /// Prefix used for session ids that originate from a remote device, so we can
@@ -99,6 +100,48 @@ pub(crate) fn extract_replies_for_device(
         .filter(|reply| reply.target_device == device_name)
         .map(|reply| (reply.target_session_prefix.clone(), reply.text.clone()))
         .collect()
+}
+
+/// Result of a mention scan over a snapshot (Plan 024 P1): the routes that
+/// target this device, plus the watermark the caller should persist so these
+/// messages are never re-scanned.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct MentionScan {
+    pub routes: Vec<MentionRoute>,
+    pub new_watermark_ts: i64,
+}
+
+/// Pure mention extraction (Plan 024 P1): every message newer than
+/// `watermark_ts` whose first token is a routing mention `@device:prefix4`
+/// targeting `device_name`. Self-mentions (`sender == device:prefix`) are
+/// skipped. The caller applies the loop guard + injection.
+pub(crate) fn extract_mentions_for_device(
+    snapshot: &RoomSnapshot,
+    device_name: &str,
+    watermark_ts: i64,
+) -> MentionScan {
+    let mut scan = MentionScan {
+        routes: Vec::new(),
+        new_watermark_ts: watermark_ts,
+    };
+    for message in &snapshot.messages {
+        scan.new_watermark_ts = scan.new_watermark_ts.max(message.ts);
+        if message.ts <= watermark_ts {
+            continue;
+        }
+        let (outcome, route) = scan_message_for_device(message, device_name);
+        if let ScanOutcome::SelfMention = outcome {
+            log::debug!(
+                "[agent_board] dropping self-mention from {}: {}",
+                message.sender,
+                message.text
+            );
+        }
+        if let Some(route) = route {
+            scan.routes.push(route);
+        }
+    }
+    scan
 }
 
 /// Re-claim every remote scope into the local `plan_registry`. Local (non-remote)
@@ -261,5 +304,99 @@ mod tests {
         let snapshot = snapshot_with_replies(Vec::new());
         let result = extract_replies_for_device(&snapshot, "m3");
         assert!(result.is_empty());
+    }
+
+    // ── extract_mentions_for_device (Plan 024 P1) ──
+
+    fn board_message(
+        device_name: &str,
+        sender: &str,
+        text: &str,
+        ts: i64,
+    ) -> crate::types::BoardMessage {
+        crate::types::BoardMessage {
+            v: 1,
+            device_id: String::new(),
+            device_name: device_name.to_string(),
+            sender: sender.to_string(),
+            text: text.to_string(),
+            ts,
+        }
+    }
+
+    fn snapshot_with_messages(messages: Vec<crate::types::BoardMessage>) -> RoomSnapshot {
+        RoomSnapshot {
+            v: 1,
+            room: "test".to_string(),
+            statuses: Vec::new(),
+            messages,
+            states: Vec::new(),
+            replies: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn mentions_route_own_device() {
+        let snapshot = snapshot_with_messages(vec![
+            board_message("phone", "web", "@m3:f3a2 stop and commit", 1000),
+            board_message("SHIKUWA", "operator", "@SHIKUWA:b1c9 rebase", 2000),
+            board_message("m3", "m3:aaaa", "@m3:9d0e mind rebasing?", 3000),
+        ]);
+        let scan = extract_mentions_for_device(&snapshot, "m3", 0);
+        assert_eq!(scan.routes.len(), 2);
+        assert_eq!(scan.routes[0].prefix, "f3a2");
+        assert_eq!(scan.routes[0].text, "stop and commit");
+        assert_eq!(scan.routes[0].sender_label, "web");
+        assert_eq!(scan.routes[1].prefix, "9d0e");
+        assert_eq!(scan.new_watermark_ts, 3000);
+    }
+
+    #[test]
+    fn mentions_skip_other_devices_and_plain_text() {
+        let snapshot = snapshot_with_messages(vec![
+            board_message("phone", "web", "@SHIKUWA:b1c9 rebase", 1000),
+            board_message("phone", "web", "just chatting, no mention", 2000),
+        ]);
+        let scan = extract_mentions_for_device(&snapshot, "m3", 0);
+        assert!(scan.routes.is_empty());
+        // Watermark still advances over non-mention messages.
+        assert_eq!(scan.new_watermark_ts, 2000);
+    }
+
+    #[test]
+    fn mentions_honor_watermark() {
+        let snapshot = snapshot_with_messages(vec![
+            board_message("phone", "web", "@m3:f3a2 old command", 1000),
+            board_message("phone", "web", "@m3:f3a2 new command", 2000),
+        ]);
+        let scan = extract_mentions_for_device(&snapshot, "m3", 1000);
+        assert_eq!(scan.routes.len(), 1);
+        assert_eq!(scan.routes[0].text, "new command");
+        assert_eq!(scan.new_watermark_ts, 2000);
+    }
+
+    #[test]
+    fn mentions_drop_self_mention() {
+        let snapshot = snapshot_with_messages(vec![board_message(
+            "m3",
+            "m3:f3a2",
+            "@m3:f3a2 keep going",
+            1000,
+        )]);
+        let scan = extract_mentions_for_device(&snapshot, "m3", 0);
+        assert!(scan.routes.is_empty());
+        assert_eq!(scan.new_watermark_ts, 1000);
+    }
+
+    #[test]
+    fn mentions_at_all_is_deferred() {
+        let snapshot = snapshot_with_messages(vec![board_message(
+            "phone",
+            "web",
+            "@all stop everything",
+            1000,
+        )]);
+        let scan = extract_mentions_for_device(&snapshot, "m3", 0);
+        assert!(scan.routes.is_empty());
     }
 }

@@ -382,6 +382,7 @@ dependencies = [
  "chrono",
  "context_server",
  "ed25519-dalek",
+ "editor",
  "futures 0.3.32",
  "gpui",
  "hex",

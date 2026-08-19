@@ -58,7 +58,7 @@ pub struct DeviceStatus {
 }
 
 /// A short notepad message appended to the room feed. Capped at 1024 chars by
-/// the worker. Only the most recent 10 are returned.
+/// the worker. Only the most recent 100 are returned.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BoardMessage {
     pub v: u32,
@@ -66,6 +66,11 @@ pub struct BoardMessage {
     pub device_id: String,
     #[serde(default)]
     pub device_name: String,
+    /// Who composed the message: `"operator"` (Zed panel), `"web"` (Plan 015
+    /// dashboard), or the posting agent's `device:sess4` label. Empty for
+    /// payloads from workers that predate the field (Plan 024).
+    #[serde(default)]
+    pub sender: String,
     pub text: String,
     /// Unix millis.
     pub ts: i64,
@@ -77,9 +82,10 @@ pub struct BoardMessage {
 /// of the Phase 2 spec).
 pub const MAX_STATE_TEXT_BYTES: usize = 256;
 
-/// How many state messages the room retains (ring buffer). Matches the
-/// operator's "last 10" bound (point 7).
-pub const MAX_ROOM_STATES: usize = 10;
+/// How many state messages the room retains (ring buffer). Raised from 10 to
+/// 50 in Plan 024 so `released:` terminal markers survive chatty rooms within
+/// the work board's 5h window. Matches the worker's `MAX_ROOM_STATES`.
+pub const MAX_ROOM_STATES: usize = 50;
 
 /// A structured agent state broadcast: what an agent is doing/thinking right
 /// now. Agents yell these at the board at plan-start and summary-occurrence so
@@ -146,6 +152,9 @@ pub struct PostStatusBody {
 pub struct PostMessageBody {
     #[serde(default)]
     pub device_name: String,
+    /// See [`BoardMessage::sender`]. Defaults to empty for old callers.
+    #[serde(default)]
+    pub sender: String,
     pub text: String,
 }
 
@@ -312,6 +321,59 @@ mod tests {
         }"#;
         let snap: RoomSnapshot = serde_json::from_str(json).unwrap();
         assert!(snap.states.is_empty());
+    }
+
+    #[test]
+    fn board_message_sender_round_trip() {
+        let msg = BoardMessage {
+            v: SCHEMA_VERSION,
+            device_id: "abc123".to_string(),
+            device_name: "m3".to_string(),
+            sender: "web".to_string(),
+            text: "@SHIKUWA:b1c9 run cargo clippy".to_string(),
+            ts: 1700000000_000,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let back: BoardMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(msg, back);
+        assert!(json.contains("\"sender\":\"web\""));
+    }
+
+    #[test]
+    fn board_message_old_payload_defaults_empty_sender() {
+        // A payload written by a worker that predates the `sender` field must
+        // deserialize with an empty sender, not fail.
+        let json = r#"{
+            "v": 1,
+            "device_id": "abc123",
+            "device_name": "m3",
+            "text": "hello",
+            "ts": 1700000000000
+        }"#;
+        let msg: BoardMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.sender, "");
+        assert_eq!(msg.text, "hello");
+    }
+
+    #[test]
+    fn post_message_body_serializes_sender() {
+        let body = PostMessageBody {
+            device_name: "m3".to_string(),
+            sender: "operator".to_string(),
+            text: "stop after the current step".to_string(),
+        };
+        let json = serde_json::to_string(&body).unwrap();
+        let back: PostMessageBody = serde_json::from_str(&json).unwrap();
+        assert_eq!(body, back);
+
+        // Old-shape payload (no sender) still deserializes.
+        let legacy_json = serde_json::json!({
+            "device_name": "m3",
+            "text": "hi",
+        })
+        .to_string();
+        let legacy: PostMessageBody = serde_json::from_str(&legacy_json).unwrap();
+        assert_eq!(legacy.sender, "");
     }
 
     fn sample_state(

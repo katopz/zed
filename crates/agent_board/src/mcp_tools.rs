@@ -16,6 +16,8 @@ use gpui::AsyncApp;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::war_room::{WorkItem, build_work_board};
+
 /// Returns the current agent room snapshot: all devices, their latest agent
 /// states (what each agent is doing right now), and the last short messages.
 /// Call this when you want to know what peer agents are working on.
@@ -44,13 +46,17 @@ pub struct RoomDeviceState {
 pub struct GetAgentRoomOutput {
     pub room: String,
     pub devices: Vec<RoomDevice>,
+    /// Pinned work board (Plan 024 P7): who is doing/stale/released on which
+    /// plan, race conflicts flagged. Read this before grabbing a plan.
+    #[serde(default)]
+    pub work_board: Vec<WorkItem>,
 }
 
 /// MCP tool: get the current agent room snapshot.
 ///
-/// Registered on a default-on `McpServer` during panel init so both native and
-/// Claude Code agents can call `get_agent_room` to discover what peer agents are
-/// doing. No arguments — returns the full room.
+/// Registered on a default-on `McpServer` during runtime init so both native
+/// and Claude Code agents can call `get_agent_room` to discover what peer
+/// agents are doing. No arguments — returns the full room.
 #[derive(Clone)]
 pub struct GetAgentRoom;
 
@@ -76,6 +82,74 @@ impl McpServerTool for GetAgentRoom {
     ) -> impl std::future::Future<Output = anyhow::Result<ToolResponse<Self::Output>>> {
         let result = build_response();
         std::future::ready(result)
+    }
+}
+
+/// Input for `post_agent_board_message` (Plan 024 P4).
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct PostAgentBoardMessageInput {
+    /// Message text. Use `@device:sess4 <text>` to command another agent
+    /// (labels come from `get_agent_room`). Mention cooldowns apply; do not
+    /// spam peers.
+    pub text: String,
+    /// Your own `device:sess4` label when known — self-mentions are dropped
+    /// by the routing guard.
+    #[serde(default)]
+    pub sender: String,
+}
+
+/// Output for `post_agent_board_message`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PostAgentBoardMessageOutput {
+    pub posted: bool,
+}
+
+/// MCP tool: post a message to the shared war-room feed. Gives agents a
+/// voice: ask peers, answer the operator, or `@device:sess4`-command another
+/// agent through the same mention routing the operator uses.
+#[derive(Clone)]
+pub struct PostAgentBoardMessage;
+
+impl McpServerTool for PostAgentBoardMessage {
+    type Input = PostAgentBoardMessageInput;
+    type Output = PostAgentBoardMessageOutput;
+    const NAME: &'static str = "post_agent_board_message";
+
+    fn annotations(&self) -> context_server::types::ToolAnnotations {
+        context_server::types::ToolAnnotations {
+            title: Some("Post Agent Board Message".to_string()),
+            read_only_hint: Some(false),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(false),
+            open_world_hint: Some(false),
+        }
+    }
+
+    fn run(
+        &self,
+        input: Self::Input,
+        _cx: &mut AsyncApp,
+    ) -> impl std::future::Future<Output = anyhow::Result<ToolResponse<Self::Output>>> {
+        let posted = !input.text.trim().is_empty();
+        if posted {
+            let sender = if input.sender.trim().is_empty() {
+                "agent".to_string()
+            } else {
+                input.sender.trim().to_string()
+            };
+            crate::board_state::post_message(input.text.trim(), &sender);
+        }
+        let output = PostAgentBoardMessageOutput { posted };
+        std::future::ready(Ok(ToolResponse {
+            content: vec![ToolResponseContent::Text {
+                text: if posted {
+                    "posted to the war room feed".to_string()
+                } else {
+                    "not posted: empty text".to_string()
+                },
+            }],
+            structured_content: output,
+        }))
     }
 }
 
@@ -125,6 +199,12 @@ fn build_response() -> anyhow::Result<ToolResponse<GetAgentRoomOutput>> {
             let output = GetAgentRoomOutput {
                 room: snapshot.room.clone(),
                 devices,
+                work_board: build_work_board(
+                    &snapshot,
+                    &auto_prompt::plan_registry::active_claims(),
+                    &crate::board_state::device_name().unwrap_or_default(),
+                    now_unix_ms(),
+                ),
             };
             let text = format_room_text(&output);
             Ok(ToolResponse {
@@ -141,10 +221,18 @@ fn build_response() -> anyhow::Result<ToolResponse<GetAgentRoomOutput>> {
                 structured_content: GetAgentRoomOutput {
                     room: String::new(),
                     devices: Vec::new(),
+                    work_board: Vec::new(),
                 },
             })
         }
     }
+}
+
+fn now_unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// Human-readable summary for the text content of the response. Agents that
@@ -153,8 +241,24 @@ fn format_room_text(output: &GetAgentRoomOutput) -> String {
     if output.room.is_empty() {
         return "No room configured.".to_string();
     }
-    let mut lines = Vec::with_capacity(output.devices.len() + 1);
+    let mut lines = Vec::with_capacity(output.devices.len() + output.work_board.len() + 1);
     lines.push(format!("Room: {}", output.room));
+    if !output.work_board.is_empty() {
+        lines.push("Work board (do NOT pick plans marked doing/stale):".to_string());
+        for item in &output.work_board {
+            let flag = if item.race { " [RACE]" } else { "" };
+            lines.push(format!(
+                "  {} {flag} {} — {}",
+                match item.state {
+                    crate::war_room::WorkState::Doing => "doing",
+                    crate::war_room::WorkState::Stale => "stale",
+                    crate::war_room::WorkState::Released => "released",
+                },
+                item.plan_name,
+                item.owner_labels.join(", "),
+            ));
+        }
+    }
     for device in &output.devices {
         if device.states.is_empty() {
             lines.push(format!("  {} ({}): no active states", device.device_name, device.device_id));
@@ -180,6 +284,7 @@ mod tests {
         let output = GetAgentRoomOutput {
             room: String::new(),
             devices: Vec::new(),
+            work_board: Vec::new(),
         };
         assert_eq!(format_room_text(&output), "No room configured.");
     }
@@ -198,6 +303,7 @@ mod tests {
                     meta: String::new(),
                 }],
             }],
+            work_board: Vec::new(),
         };
         let text = format_room_text(&output);
         assert!(text.contains("test-room"));
@@ -358,6 +464,55 @@ mod tests {
         assert_eq!(result.structured_content.devices[0].device_id, "dev-ghost");
         assert_eq!(result.structured_content.devices[0].device_name, "ghost");
         assert_eq!(result.structured_content.devices[0].states[0].state_text, "haunting");
+    }
+
+    #[test]
+    fn build_response_includes_work_board_from_scopes() {
+        let _state_guard =
+            crate::board_state::TEST_LOCK.lock().expect("board-state test lock poisoned");
+        crate::board_state::clear_for_test();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let snapshot = crate::types::RoomSnapshot {
+            v: 1,
+            room: "room-wb".to_string(),
+            statuses: vec![crate::types::DeviceStatus {
+                v: 1,
+                device_id: "dev-a".to_string(),
+                device_name: "laptop".to_string(),
+                location_hash: String::new(),
+                project_path: String::new(),
+                scopes: vec![crate::types::ActiveScope {
+                    session_id: "b1c9ffff".to_string(),
+                    plan_file: Some("/repo/.plans/024_war.md".to_string()),
+                    task_summary: "war room work".to_string(),
+                    scope_kind: crate::types::ScopeKind::Plan,
+                }],
+                updated_at: now - 30_000,
+                stale: false,
+            }],
+            messages: vec![],
+            states: vec![],
+            replies: vec![],
+        };
+        crate::board_state::set_room_snapshot(snapshot);
+
+        let result = build_response().unwrap();
+        assert_eq!(result.structured_content.work_board.len(), 1);
+        let item = &result.structured_content.work_board[0];
+        assert_eq!(item.plan_name, "024_war.md");
+        assert_eq!(item.state, crate::war_room::WorkState::Doing);
+        assert_eq!(item.owner_labels, vec!["laptop:b1c9".to_string()]);
+
+        let text = result.content.first().and_then(|c| match c {
+            ToolResponseContent::Text { text } => Some(text.as_str()),
+            _ => None,
+        });
+        let text = text.unwrap();
+        assert!(text.contains("Work board"));
+        assert!(text.contains("024_war.md"));
     }
 
     #[test]

@@ -7,26 +7,31 @@
 //! - A background task polls the worker, injects remote claims into the local
 //!   `plan_registry`, and posts this device's local claims as its status.
 //! - The panel renders the room: active device statuses (what each agent is
-//!   working on) + the last 10 short messages.
+//!   working on) + the last short messages.
 //! - `auto_prompt`'s existing `format_claims_for_context()` picks up remote
 //!   claims with no core changes, so agents reason about each other's work.
+//!
+//! Plan 024: the network surface lives in [`runtime::BoardRuntime`] (one per
+//! process); this panel and [`war_room::WarRoomPanel`] are pure views over it.
 
 pub mod board_state;
 pub mod client;
 mod feeder;
 pub mod identity;
 pub mod mcp_tools;
+pub mod mentions;
 pub mod realtime_client;
+pub mod runtime;
 pub mod types;
+pub mod war_room;
 
 use std::sync::Arc;
-use std::time::Duration;
 
-use anyhow::{Context as _, Result};
+use anyhow::Context as _;
 use gpui::{
-    Action, App, AppContext, AsyncApp, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement,
-    Styled, Subscription, Task, Window, actions, div, px,
+    Action, App, AppContext, Context, Entity, EventEmitter, Focusable, InteractiveElement,
+    IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
+    Subscription, actions, div, px,
 };
 use http_client::HttpClient;
 use serde::{Deserialize, Serialize};
@@ -34,13 +39,8 @@ use ui::ActiveTheme;
 use workspace::dock::{DockPosition, Panel, PanelEvent};
 use workspace::Workspace;
 
-use crate::client::BoardClient;
-use crate::identity::DeviceIdentity;
-use crate::types::{BoardMessage, RoomSnapshot};
-
-// The in-process MCP server (Phase 2 point 9) is held in the panel struct as
-// `mcp_server: Option<McpServer>` — kept alive for the panel's lifetime so the
-// Unix socket stays open. See the `mcp_server` field on `AgentBoardPanel`.
+use crate::runtime::BoardRuntime;
+use crate::types::BoardMessage;
 
 actions!(
     agent_board,
@@ -65,6 +65,16 @@ pub const AGENT_BOARD_KEY: &str = "AgentBoard";
 // ---------------------------------------------------------------------------
 // Config — `~/.config/zed/agent_board.json` (mirrors auto_prompt's pattern).
 // ---------------------------------------------------------------------------
+
+/// Default per-target cooldown between mention injections (Plan 024 P1).
+fn default_mention_cooldown_secs() -> u64 {
+    60
+}
+
+/// Default per-target mention-injection cap per hour (Plan 024 P1).
+fn default_mention_max_per_hour() -> u32 {
+    20
+}
 
 /// Settings for the agent board. Single-user tool, so no secrets here; the SSH
 /// private key authorizes writes to the worker.
@@ -93,6 +103,14 @@ pub struct AgentBoardConfig {
     /// delivery. When false, falls back to the 15s feeder poll.
     #[serde(default)]
     pub realtime_enabled: bool,
+    /// Minimum seconds between mention-injections per target session
+    /// (Plan 024 loop guard).
+    #[serde(default = "default_mention_cooldown_secs")]
+    pub mention_cooldown_secs: u64,
+    /// Maximum mention-injections per target session per hour (Plan 024 loop
+    /// guard).
+    #[serde(default = "default_mention_max_per_hour")]
+    pub mention_max_per_hour: u32,
 }
 
 fn default_ssh_key_path() -> String {
@@ -111,12 +129,14 @@ impl Default for AgentBoardConfig {
             poll_interval_secs: default_poll_interval_secs(),
             muted: Vec::new(),
             realtime_enabled: false,
+            mention_cooldown_secs: default_mention_cooldown_secs(),
+            mention_max_per_hour: default_mention_max_per_hour(),
         }
     }
 }
 
 impl AgentBoardConfig {
-    fn config_path() -> Result<std::path::PathBuf> {
+    fn config_path() -> anyhow::Result<std::path::PathBuf> {
         let home = std::env::var_os("HOME").context("HOME is not set")?;
         Ok(std::path::Path::new(&home)
             .join(".config")
@@ -124,7 +144,7 @@ impl AgentBoardConfig {
             .join("agent_board.json"))
     }
 
-    fn load() -> Self {
+    pub(crate) fn load() -> Self {
         let Ok(path) = Self::config_path() else {
             return Self::default();
         };
@@ -140,7 +160,7 @@ impl AgentBoardConfig {
         }
     }
 
-    fn save(&self) -> Result<()> {
+    pub(crate) fn save(&self) -> anyhow::Result<()> {
         let path = Self::config_path()?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
@@ -153,375 +173,69 @@ impl AgentBoardConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Panel
+// Panel — a pure view over the shared BoardRuntime (Plan 024 P0).
 // ---------------------------------------------------------------------------
 
-/// The agent board panel: a dockable view of the room.
+/// The agent board panel: a dockable view of the room. All networking,
+/// polling, and MCP ownership lives in [`BoardRuntime`].
 pub struct AgentBoardPanel {
-    focus_handle: FocusHandle,
-    config: AgentBoardConfig,
-    /// App-wide HTTP handle, retained so the client can be rebuilt when the
-    /// room or identity changes without reaching back into globals.
-    http: Arc<dyn HttpClient>,
-    /// Lazily-built client once an identity + worker URL are available.
-    client: Option<Arc<BoardClient>>,
-    /// Room name resolved from config (explicit) or identity (derived).
-    /// None until `try_start` succeeds.
-    resolved_room: Option<String>,
-    /// Latest snapshot rendered into the panel.
-    snapshot: Option<RoomSnapshot>,
-    /// Background poll task; dropped when the panel is dropped.
-    poll_task: Option<Task<()>>,
-    /// In-process MCP server exposing `get_agent_room` (Phase 2 point 9).
-    /// Held alive to keep the Unix socket listening.
-    mcp_server: Option<context_server::listener::McpServer>,
-    /// Real-time SSE client (Plan 015). When the 📡 toggle is on, this holds
-    /// an SSE connection to the worker for instant reply delivery. When off,
-    /// the system falls back to the 15s feeder poll.
-    realtime_client: Option<realtime_client::RealtimeClient>,
-    /// Whether the real-time push toggle is enabled. Persisted to config.
-    realtime_enabled: bool,
-    /// Local session id we attribute remote claims relative to. In practice the
-    /// board is per-device, so an empty string means "no local thread yet"; the
-    /// plan_registry still reflects remote claims regardless.
-    local_session_id: String,
-    _subscriptions: Vec<Subscription>,
+    focus_handle: gpui::FocusHandle,
+    runtime: Entity<BoardRuntime>,
+    _subscription: Subscription,
 }
 
 impl EventEmitter<PanelEvent> for AgentBoardPanel {}
 
 impl AgentBoardPanel {
-    /// Construct a panel and attach it to a workspace. Also kicks off the poll
-    /// loop if the worker URL + identity are configured.
+    /// Construct a panel bound to the shared runtime. Requires
+    /// [`init`] to have run (the runtime global to exist).
     pub fn new(
-        http: Arc<dyn HttpClient>,
         _workspace: &mut Workspace,
-        _window: &mut Window,
+        _window: &mut gpui::Window,
         cx: &mut Context<Workspace>,
     ) -> Entity<Self> {
-        let config = AgentBoardConfig::load();
-
+        let runtime = BoardRuntime::global(cx);
         cx.new(|cx| {
             let focus_handle = cx.focus_handle();
-            let mut panel = Self {
+            let _subscription = cx.observe(&runtime, |_, _, cx| cx.notify());
+            Self {
                 focus_handle,
-                config: config.clone(),
-                http,
-                client: None,
-                resolved_room: None,
-                snapshot: None,
-                poll_task: None,
-                mcp_server: None,
-                realtime_client: None,
-                realtime_enabled: config.realtime_enabled,
-                local_session_id: String::new(),
-                _subscriptions: Vec::new(),
-            };
-            panel.try_start(cx);
-            panel
-        })
-    }
-
-    /// Build the client from the config + a device identity. No-op (logs) when
-    /// the worker URL or SSH key is missing — the board is strictly additive,
-    /// so an unconfigured device simply falls back to local-only plan_registry.
-    fn try_start(&mut self, cx: &mut Context<Self>) {
-        if self.config.worker_url.trim().is_empty() {
-            log::info!(
-                "[agent_board] worker_url not set in config; running local-only (no remote sync)"
-            );
-            return;
-        }
-        let key_path = match identity::expand_ssh_path(&self.config.ssh_key_path) {
-            Ok(path) => path,
-            Err(error) => {
-                log::warn!("[agent_board] ssh key not found: {error:#}; not starting sync");
-                return;
-            }
-        };
-        let device_name = hostname();
-        let location_hash = identity::location_hash();
-        let identity = match DeviceIdentity::load(&key_path, device_name, location_hash) {
-            Ok(identity) => identity,
-            Err(error) => {
-                log::warn!("[agent_board] failed to load device identity: {error:#}");
-                return;
-            }
-        };
-        let identity = Arc::new(identity);
-        // Phase 2 point 1-2: room = hash(ssh-key). When config.room is empty
-        // (default), derive from the identity so two devices sharing a key
-        // auto-join the same room. An explicit config.room still overrides.
-        let room = if self.config.room.trim().is_empty() {
-            identity.room_id().to_string()
-        } else {
-            self.config.room.clone()
-        };
-        let client = Arc::new(BoardClient::new(
-            self.http.clone(),
-            self.config.worker_url.clone(),
-            identity,
-        ));
-        // Phase 2: register the muted set + writer handle so auto_prompt can
-        // both read peer states (via peer_states::unmuted_states_for_context)
-        // and post agent states (via board_state::post_state) without holding a
-        // GPUI entity handle. The muted set translates the board's MuteKey into
-        // auto_prompt's dependency-free PeerStateMute at the boundary.
-        let muted: Vec<auto_prompt::peer_states::PeerStateMute> = self
-            .config
-            .muted
-            .iter()
-            .map(|m| auto_prompt::peer_states::PeerStateMute {
-                device_id: m.device_id.clone(),
-                session_id: m.session_id.clone(),
-                sub_agent_id: m.sub_agent_id.clone(),
-            })
-            .collect();
-        auto_prompt::peer_states::set_muted(muted);
-        board_state::register_writer(
-            Some(client.clone()),
-            Some(room.clone()),
-            cx.background_executor().clone(),
-        );
-        self.resolved_room = Some(room);
-        self.client = Some(client);
-        self.start_poll(cx);
-
-        // Phase 2 point 9: spawn the in-process MCP server with the
-        // `get_agent_room` tool so agents can query the room on-demand. The
-        // server listens on a Unix socket; its path is logged so it can be
-        // configured as a context server.
-        if self.mcp_server.is_none() {
-            cx.spawn(async move |this, cx: &mut AsyncApp| {
-                let server_task = context_server::listener::McpServer::new(cx);
-                match server_task.await {
-                    Ok(mut server) => {
-                        server.add_tool(mcp_tools::GetAgentRoom);
-                        log::info!(
-                            "[agent_board] MCP server listening at {} (tool: get_agent_room)",
-                            server.socket_path().display()
-                        );
-                        let _ = this.update(cx, |this, cx| {
-                            this.mcp_server = Some(server);
-                            cx.notify();
-                        });
-                    }
-                    Err(error) => {
-                        log::warn!("[agent_board] failed to start MCP server: {error:#}");
-                    }
-                }
-            })
-            .detach();
-        }
-        // Plan 015: start the real-time SSE client if the toggle is on.
-        // This connects to the worker's SSE endpoint and pushes replies to
-        // auto_prompt::peer_states for instant delivery to agent threads.
-        if self.realtime_enabled && self.realtime_client.is_none() {
-            self.start_realtime(cx);
-        }
-    }
-
-    /// Start or restart the real-time SSE client. Called when the 📡 toggle
-    /// is turned on or when the room/identity changes while enabled.
-    fn start_realtime(&mut self, cx: &mut Context<Self>) {
-        let Some(client) = self.client.clone() else {
-            return;
-        };
-        let Some(room) = self.resolved_room.clone() else {
-            return;
-        };
-        let identity = client.identity().clone();
-        let http = self.http.clone();
-        let base_url = self.config.worker_url.trim_end_matches('/').to_string();
-
-        self.realtime_client = Some(realtime_client::RealtimeClient::start(
-            http,
-            base_url,
-            room,
-            identity,
-            cx.background_executor().clone(),
-        ));
-        log::info!("[agent_board] real-time SSE client started (📡 toggle ON)");
-    }
-
-    /// Toggle the real-time push on/off. Called by the 📡 button in the panel.
-    pub fn toggle_realtime(&mut self, cx: &mut Context<Self>) {
-        self.realtime_enabled = !self.realtime_enabled;
-        self.config.realtime_enabled = self.realtime_enabled;
-        if let Err(error) = self.config.save() {
-            log::warn!("[agent_board] failed to save config: {error:#}");
-        }
-        if self.realtime_enabled {
-            self.start_realtime(cx);
-        } else {
-            self.realtime_client = None;
-            log::info!("[agent_board] real-time SSE client stopped (📡 toggle OFF)");
-        }
-        cx.notify();
-    }
-
-    /// Whether the real-time push is currently enabled.
-    pub fn realtime_enabled(&self) -> bool {
-        self.realtime_enabled
-    }
-
-    fn start_poll(&mut self, cx: &mut Context<Self>) {
-        let Some(client) = self.client.clone() else {
-            return;
-        };
-        let identity = client.identity().clone();
-        let Some(room) = self.resolved_room.clone() else {
-            return;
-        };
-        let project_path = String::new();
-        let local_session_id = self.local_session_id.clone();
-        let interval = Duration::from_secs(self.config.poll_interval_secs.max(5));
-
-        // One immediate round, then periodic.
-        let task = cx.spawn(async move |this, cx: &mut AsyncApp| {
-            loop {
-                let client = client.clone();
-                let identity = identity.clone();
-                let room = room.clone();
-                let project_path = project_path.clone();
-                let local_session_id = local_session_id.clone();
-                let result = cx
-                    .background_spawn(async move {
-                        feeder::sync_round(&client, &identity, &room, &project_path, &local_session_id)
-                            .await
-                    })
-                    .await;
-                match result {
-                    Ok(snapshot) => {
-                        this.update(cx, |this, cx| {
-                            this.snapshot = Some(snapshot);
-                            cx.notify();
-                        })
-                        .ok();
-                    }
-                    Err(error) => {
-                        log::debug!("[agent_board] sync round failed: {error:#}");
-                    }
-                }
-                cx.background_executor().timer(interval).await;
-            }
-        });
-        self.poll_task = Some(task);
-    }
-
-    fn force_refresh(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        // Cheap path: just nudge the poll loop by restarting it, which fires an
-        // immediate round. Avoids a second concurrent fetch.
-        self.start_poll(cx);
-    }
-
-    fn set_room(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        let Some(room) = prompt_string("Set agent board room name", &self.config.room) else {
-            return;
-        };
-        self.config.room = room.trim().to_string();
-        if let Err(error) = self.config.save() {
-            log::warn!("[agent_board] could not persist config: {error:#}");
-        }
-        // Restart the poll loop bound to the new room.
-        self.client = None;
-        self.resolved_room = None;
-        self.try_start(cx);
-        cx.notify();
-    }
-
-    fn join_room(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // JoinRoom and SetRoom are functionally identical on KV (no join
-        // semantics) — keep both actions for UX intent.
-        self.set_room(window, cx);
-    }
-
-    fn post_message(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        let Some(text) = prompt_string("Post a short message to the board", "") else {
-            return;
-        };
-        let Some(client) = self.client.clone() else {
-            log::warn!("[agent_board] not connected to a worker; cannot post message");
-            return;
-        };
-        let room = self
-            .resolved_room
-            .clone()
-            .unwrap_or_else(|| self.config.room.clone());
-        let device_name = client.identity().device_name().to_string();
-        let body = types::PostMessageBody {
-            device_name,
-            text,
-        };
-        cx.spawn(async move |this, cx: &mut AsyncApp| {
-            let result = cx
-                .background_spawn(async move { client.post_message(&room, body).await })
-                .await;
-            if let Err(error) = result {
-                log::warn!("[agent_board] post_message failed: {error:#}");
-            } else {
-                let _ = this.update(cx, |this, cx| this.force_refresh_no_window(cx));
+                runtime,
+                _subscription,
             }
         })
-        .detach();
     }
 
-    fn force_refresh_no_window(&mut self, cx: &mut Context<Self>) {
-        self.start_poll(cx);
-    }
-
-    /// Toggle mute on a specific agent state. Adds a `MuteKey` targeting the
-    /// exact device+session+sub_agent combo if not present; removes it if already
-    /// muted. Persists config + updates auto_prompt's runtime filter immediately.
-    fn toggle_mute(&mut self, key: crate::types::MuteKey, cx: &mut Context<Self>) {
-        if let Some(pos) = self.config.muted.iter().position(|m| *m == key) {
-            self.config.muted.remove(pos);
-        } else {
-            self.config.muted.push(key);
-        }
-        if let Err(error) = self.config.save() {
-            log::warn!("[agent_board] could not persist muted set: {error:#}");
-        }
-        // Sync the runtime filter so auto_prompt stops injecting muted states.
-        let muted: Vec<auto_prompt::peer_states::PeerStateMute> = self
-            .config
-            .muted
-            .iter()
-            .map(|m| auto_prompt::peer_states::PeerStateMute {
-                device_id: m.device_id.clone(),
-                session_id: m.session_id.clone(),
-                sub_agent_id: m.sub_agent_id.clone(),
-            })
-            .collect();
-        auto_prompt::peer_states::set_muted(muted);
-        cx.notify();
+    fn runtime(&self) -> &Entity<BoardRuntime> {
+        &self.runtime
     }
 }
 
 impl Focusable for AgentBoardPanel {
-    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+    fn focus_handle(&self, _cx: &gpui::App) -> gpui::FocusHandle {
         self.focus_handle.clone()
     }
 }
 
 impl Render for AgentBoardPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let colors = theme.colors();
-        let muted = colors.text_muted;
+        let muted_color = colors.text_muted;
         let fg = colors.text;
         let accent = colors.text_accent;
 
-        let connected = self.client.is_some();
-        let room = self
-            .resolved_room
-            .clone()
-            .unwrap_or_else(|| self.config.room.clone());
+        let runtime = self.runtime().read(cx);
+        let connected = runtime.connected();
+        let room = runtime.room();
+        let realtime_enabled = runtime.realtime_enabled();
+        let muted_set = runtime.config().muted.clone();
+        let snapshot = runtime.snapshot().cloned();
 
         let mut children: Vec<gpui::AnyElement> = Vec::new();
 
         // Statuses (other agents' work — the "don't touch" signals).
-        if let Some(snapshot) = &self.snapshot {
+        if let Some(snapshot) = &snapshot {
             for status in &snapshot.statuses {
                 let label = format!(
                     "{} · {} scope(s){}",
@@ -533,7 +247,7 @@ impl Render for AgentBoardPanel {
                     div()
                         .px_2()
                         .py_1()
-                        .text_color(muted)
+                        .text_color(muted_color)
                         .text_xs()
                         .child(SharedString::from(label))
                         .into_any_element(),
@@ -564,15 +278,15 @@ impl Render for AgentBoardPanel {
             }
         }
 
-        // Last 10 messages.
-        if let Some(snapshot) = &self.snapshot {
+        // Last messages.
+        if let Some(snapshot) = &snapshot {
             if !snapshot.messages.is_empty() {
                 children.push(
                     div()
                         .px_2()
                         .pt_2()
                         .pb_1()
-                        .text_color(muted)
+                        .text_color(muted_color)
                         .text_xs()
                         .child(SharedString::from("— messages —"))
                         .into_any_element(),
@@ -595,14 +309,14 @@ impl Render for AgentBoardPanel {
         // Agent states (Phase 2): what each agent is doing right now, with a
         // per-row mute toggle. Muted rows are dimmed; clicking the toggle adds/
         // removes a MuteKey targeting this exact device+session+sub_agent.
-        if let Some(snapshot) = &self.snapshot {
+        if let Some(snapshot) = &snapshot {
             if !snapshot.states.is_empty() {
                 children.push(
                     div()
                         .px_2()
                         .pt_2()
                         .pb_1()
-                        .text_color(muted)
+                        .text_color(muted_color)
                         .text_xs()
                         .child(SharedString::from("— agent states —"))
                         .into_any_element(),
@@ -613,9 +327,9 @@ impl Render for AgentBoardPanel {
                         session_id: Some(state.session_id.clone()),
                         sub_agent_id: state.sub_agent_id.clone(),
                     };
-                    let is_muted = self.config.muted.contains(&key);
+                    let is_muted = muted_set.contains(&key);
                     let sub_label = state.sub_agent_id.as_deref().unwrap_or("(main)");
-                    let text_color = if is_muted { muted } else { fg };
+                    let text_color = if is_muted { muted_color } else { fg };
                     let toggle_label = if is_muted { "🔇" } else { "🔊" };
                     let line = format!(
                         "{} · {}: {}",
@@ -646,8 +360,11 @@ impl Render for AgentBoardPanel {
                                     .child(SharedString::from(toggle_label))
                                     .on_click(cx.listener({
                                         let key = key.clone();
-                                        move |this, _event, _window, cx| {
-                                            this.toggle_mute(key.clone(), cx);
+                                        let runtime = self.runtime().clone();
+                                        move |_this, _event, _window, cx| {
+                                            runtime.update(cx, |runtime, cx| {
+                                                runtime.toggle_mute(key.clone(), cx)
+                                            });
                                         }
                                     }))
                                     .into_any_element(),
@@ -692,22 +409,27 @@ impl Render for AgentBoardPanel {
                             )
                             .child(
                                 div()
-                                    .id("realtime-toggle")
+                                    .id("agent-board-realtime-toggle")
                                     .cursor_pointer()
                                     .text_xs()
-                                    .text_color(if self.realtime_enabled {
+                                    .text_color(if realtime_enabled {
                                         accent
                                     } else {
-                                        muted
+                                        muted_color
                                     })
                                     .hover(|style| style.text_color(accent))
-                                    .child(SharedString::from(if self.realtime_enabled {
+                                    .child(SharedString::from(if realtime_enabled {
                                         "📡 ON"
                                     } else {
                                         "📡"
                                     }))
-                                    .on_click(cx.listener(|this, _event, _window, cx| {
-                                        this.toggle_realtime(cx);
+                                    .on_click(cx.listener({
+                                        let runtime = self.runtime().clone();
+                                        move |_this, _event, _window, cx| {
+                                            runtime.update(cx, |runtime, cx| {
+                                                runtime.toggle_realtime(cx)
+                                            });
+                                        }
                                     }))
                                     .into_any_element(),
                             ),
@@ -715,7 +437,7 @@ impl Render for AgentBoardPanel {
                     .child(
                         div()
                             .text_xs()
-                            .text_color(muted)
+                            .text_color(muted_color)
                             .child(SharedString::from(connection_line)),
                     ),
             )
@@ -733,7 +455,7 @@ impl Panel for AgentBoardPanel {
         AGENT_BOARD_KEY
     }
 
-    fn position(&self, _window: &Window, _cx: &App) -> DockPosition {
+    fn position(&self, _window: &gpui::Window, _cx: &gpui::App) -> DockPosition {
         DockPosition::Left
     }
 
@@ -744,21 +466,21 @@ impl Panel for AgentBoardPanel {
     fn set_position(
         &mut self,
         _position: DockPosition,
-        _window: &mut Window,
+        _window: &mut gpui::Window,
         _cx: &mut Context<Self>,
     ) {
         // Left/right only; no persistence for simplicity.
     }
 
-    fn default_size(&self, _window: &Window, _cx: &App) -> gpui::Pixels {
+    fn default_size(&self, _window: &gpui::Window, _cx: &gpui::App) -> gpui::Pixels {
         px(320.)
     }
 
-    fn icon(&self, _window: &Window, _cx: &App) -> Option<ui::IconName> {
+    fn icon(&self, _window: &gpui::Window, _cx: &gpui::App) -> Option<ui::IconName> {
         Some(ui::IconName::QueueMessage)
     }
 
-    fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
+    fn icon_tooltip(&self, _window: &gpui::Window, _cx: &gpui::App) -> Option<&'static str> {
         Some("Agent Board")
     }
 
@@ -772,56 +494,52 @@ impl Panel for AgentBoardPanel {
 }
 
 // ---------------------------------------------------------------------------
-// init — register actions on every workspace, and add the panel when toggled.
+// init — create the runtime singleton, register actions on every workspace.
 // ---------------------------------------------------------------------------
 
-/// Register agent-board actions with all workspaces. `http` is the app-wide
-/// HTTP client so the panel can talk to the worker without depending on the
-/// `client` crate.
+/// Create the process-global [`BoardRuntime`] (starts the poll loop when the
+/// worker is configured) and register board + war-room actions with all
+/// workspaces. `http` is the app-wide HTTP client.
 pub fn init(http: Arc<dyn HttpClient>, cx: &mut App) {
+    BoardRuntime::init_global(http, cx);
+    war_room::init(cx);
+
     cx.observe_new(move |workspace: &mut Workspace, _window, _cx: &mut Context<Workspace>| {
-        workspace.register_action({
-            let http = http.clone();
-            move |workspace, _: &Toggle, window, cx| {
-                if !workspace.toggle_panel_focus::<AgentBoardPanel>(window, cx) {
-                    close_or_open(workspace, http.clone(), window, cx);
-                }
+        workspace.register_action(|workspace, _: &Toggle, window, cx| {
+            if !workspace.toggle_panel_focus::<AgentBoardPanel>(window, cx) {
+                close_or_open(workspace, window, cx);
             }
         });
         workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
             workspace.toggle_panel_focus::<AgentBoardPanel>(window, cx);
         });
-        workspace.register_action({
-            let http = http.clone();
-            move |workspace, _: &SetRoom, window, cx| {
-                open_or_focus(workspace, http.clone(), window, cx, |panel, window, cx| {
-                    panel.set_room(window, cx)
-                });
-            }
+        workspace.register_action(|workspace, _: &SetRoom, window, cx| {
+            open_or_focus(workspace, window, cx, |runtime, cx| {
+                let current = runtime.config().room.clone();
+                if let Some(room) = prompt_string("Set agent board room name", &current) {
+                    runtime.set_room(room, cx);
+                }
+            });
         });
-        workspace.register_action({
-            let http = http.clone();
-            move |workspace, _: &JoinRoom, window, cx| {
-                open_or_focus(workspace, http.clone(), window, cx, |panel, window, cx| {
-                    panel.join_room(window, cx)
-                });
-            }
+        workspace.register_action(|workspace, _: &JoinRoom, window, cx| {
+            open_or_focus(workspace, window, cx, |runtime, cx| {
+                let current = runtime.config().room.clone();
+                if let Some(room) = prompt_string("Join agent board room", &current) {
+                    runtime.set_room(room, cx);
+                }
+            });
         });
-        workspace.register_action({
-            let http = http.clone();
-            move |workspace, _: &Refresh, window, cx| {
-                open_or_focus(workspace, http.clone(), window, cx, |panel, window, cx| {
-                    panel.force_refresh(window, cx)
-                });
-            }
+        workspace.register_action(|workspace, _: &Refresh, window, cx| {
+            open_or_focus(workspace, window, cx, |runtime, cx| {
+                runtime.force_refresh(cx);
+            });
         });
-        workspace.register_action({
-            let http = http.clone();
-            move |workspace, _: &PostMessage, window, cx| {
-                open_or_focus(workspace, http.clone(), window, cx, |panel, window, cx| {
-                    panel.post_message(window, cx)
-                });
-            }
+        workspace.register_action(|workspace, _: &PostMessage, window, cx| {
+            open_or_focus(workspace, window, cx, |runtime, cx| {
+                if let Some(text) = prompt_string("Post a short message to the board", "") {
+                    runtime.post_message(text, cx);
+                }
+            });
         });
     })
     .detach();
@@ -829,12 +547,11 @@ pub fn init(http: Arc<dyn HttpClient>, cx: &mut App) {
 
 fn close_or_open(
     workspace: &mut Workspace,
-    http: Arc<dyn HttpClient>,
-    window: &mut Window,
+    window: &mut gpui::Window,
     cx: &mut Context<Workspace>,
 ) {
     if workspace.panel::<AgentBoardPanel>(cx).is_none() {
-        let panel = AgentBoardPanel::new(http, workspace, window, cx);
+        let panel = AgentBoardPanel::new(workspace, window, cx);
         workspace.add_panel(panel, window, cx);
     } else {
         workspace.close_panel::<AgentBoardPanel>(window, cx);
@@ -843,39 +560,36 @@ fn close_or_open(
 
 fn open_or_focus(
     workspace: &mut Workspace,
-    http: Arc<dyn HttpClient>,
-    window: &mut Window,
+    window: &mut gpui::Window,
     cx: &mut Context<Workspace>,
-    then: impl FnOnce(&mut AgentBoardPanel, &mut Window, &mut Context<AgentBoardPanel>),
+    then: impl FnOnce(&mut BoardRuntime, &mut Context<BoardRuntime>),
 ) {
     let panel = match workspace.panel::<AgentBoardPanel>(cx) {
         Some(panel) => panel,
         None => {
-            let panel = AgentBoardPanel::new(http, workspace, window, cx);
+            let panel = AgentBoardPanel::new(workspace, window, cx);
             workspace.add_panel(panel.clone(), window, cx);
             panel
         }
     };
-    panel.update(cx, |panel, cx| then(panel, window, cx));
+    let runtime = panel.read(cx).runtime().clone();
+    runtime.update(cx, |runtime, cx| then(runtime, cx));
 }
-
-// `client_http` removed: every action handler carries the captured `http` from
-// `init`, so no global lookup is needed.
 
 // ---------------------------------------------------------------------------
 // small helpers
 // ---------------------------------------------------------------------------
-
-fn hostname() -> String {
-    sysinfo::System::host_name().unwrap_or_else(|| "unknown".to_string())
-}
 
 fn format_message(message: &BoardMessage) -> String {
     let secs = message.ts / 1000;
     let when = chrono::DateTime::from_timestamp(secs, 0)
         .map(|dt| dt.format("%H:%M:%S").to_string())
         .unwrap_or_else(|| "?".to_string());
-    format!("[{when}] {}: {}", message.device_name, message.text)
+    format!(
+        "[{when}] {}: {}",
+        mentions::sender_label(message),
+        message.text
+    )
 }
 
 /// Minimal prompt for a string via the OS. For a single-user tool this is a

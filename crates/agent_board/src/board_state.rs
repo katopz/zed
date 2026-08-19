@@ -8,7 +8,9 @@ use std::sync::{Arc, RwLock};
 
 use auto_prompt::peer_states::AgentStateBroadcaster;
 use crate::client::BoardClient;
-use crate::types::{truncate_to_byte_budget, RoomSnapshot, MAX_STATE_TEXT_BYTES};
+use crate::types::{
+    truncate_to_byte_budget, PostMessageBody, RoomSnapshot, MAX_STATE_TEXT_BYTES,
+};
 
 /// Global: writer handle (client + room) set by the panel after `try_start`.
 static WRITER: RwLock<Option<WriterHandle>> = RwLock::new(None);
@@ -123,6 +125,49 @@ pub fn set_room_snapshot(snapshot: RoomSnapshot) {
 /// poll has succeeded yet.
 pub fn current_room_snapshot() -> Option<Arc<RoomSnapshot>> {
     ROOM_SNAPSHOT.read().ok()?.as_ref().cloned()
+}
+
+/// This device's name, when the board is configured. Used to label local
+/// claims in the work-board projection and to accent own messages in feeds.
+pub fn device_name() -> Option<String> {
+    WRITER
+        .read()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(|handle| handle.device_name.clone()))
+}
+
+/// Post a message to the room feed without holding a GPUI entity handle
+/// (Plan 024 P4). Fire-and-forget: clones the writer, spawns the POST on the
+/// background executor, logs failures at debug. `sender` labels the composer
+/// (`"operator"`, `"web"`, or a posting agent's `device:sess4`).
+pub fn post_message(text: &str, sender: &str) {
+    let handle = match WRITER.read() {
+        Ok(guard) => guard.as_ref().map(|handle| {
+            (
+                handle.client.clone(),
+                handle.room.clone(),
+                handle.device_name.clone(),
+                handle.executor.clone(),
+            )
+        }),
+        Err(_) => None,
+    };
+    let Some((client, room, device_name, executor)) = handle else {
+        log::debug!("[agent_board] board not configured; dropping post_message");
+        return;
+    };
+    let body = PostMessageBody {
+        device_name,
+        sender: truncate_to_byte_budget(sender, 64),
+        text: truncate_to_byte_budget(text, 1024),
+    };
+    executor
+        .spawn(async move {
+            if let Err(error) = client.post_message(&room, body).await {
+                log::debug!("[agent_board] post_message failed: {error:#}");
+            }
+        })
+        .detach();
 }
 
 /// Clear the writer handle. Test-only.

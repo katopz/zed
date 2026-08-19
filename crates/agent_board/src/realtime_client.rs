@@ -119,28 +119,63 @@ async fn connect_and_drain(
             continue;
         };
 
-        // Try to parse as a reply push. The worker broadcasts the raw reply
-        // JSON. If it targets this device, inject it.
-        if let Ok(reply) = serde_json::from_str::<serde_json::Value>(payload) {
-            if let Some(target_device) = reply.get("target_device").and_then(|v| v.as_str()) {
-                if target_device == device_name {
-                    let prefix = reply
+        // Try to parse the event as a board object. Two shapes matter here:
+        // (a) a reply push targeting this device (worker broadcasts the raw
+        //     reply JSON), and (b) a feed message (Plan 024) — scanned for
+        // `@device:sess4` mentions so delivery is instant when 📡 is on,
+        // instead of waiting out the 15s poll.
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) {
+            if value.get("target_device").is_some() {
+                // Reply push: inject only when it targets this device.
+                if value.get("target_device").and_then(|v| v.as_str()) == Some(device_name) {
+                    let prefix = value
                         .get("target_session_prefix")
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
-                    let text = reply
+                    let text = value
                         .get("text")
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
                     auto_prompt::peer_states::inject_web_reply(prefix, text);
                 }
+            } else if let Some(message) = parse_board_message(&value) {
+                crate::mentions::handle_board_message(&message, device_name);
             }
         }
     }
 
     Ok(())
+}
+
+/// Best-effort `BoardMessage` extraction from an SSE payload: has `text` +
+/// `ts` + `device_name`, and is not a status (no `scopes`) or state (no
+/// `state_text`) broadcast.
+fn parse_board_message(value: &serde_json::Value) -> Option<crate::types::BoardMessage> {
+    if value.get("scopes").is_some() || value.get("state_text").is_some() {
+        return None;
+    }
+    Some(crate::types::BoardMessage {
+        v: 1,
+        device_id: value
+            .get("device_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        device_name: value
+            .get("device_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        sender: value
+            .get("sender")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        text: value.get("text")?.as_str()?.to_string(),
+        ts: value.get("ts")?.as_i64()?,
+    })
 }
 
 /// Minimal percent-encoding for URL path/query segments. Reuses the same
