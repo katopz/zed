@@ -123,8 +123,13 @@ pub fn release(plan_file: &str, session_id: &str) {
 ///
 /// Called when a session/thread is closed or the auto_prompt chain stops.
 pub fn release_all_for_session(session_id: &str) {
-    with_registry(|registry| {
+    let released_files = with_registry(|registry| {
         let before = registry.len();
+        let released_files: Vec<String> = registry
+            .iter()
+            .filter(|(_, ownership)| ownership.session_id == session_id)
+            .map(|(plan_file, _)| plan_file.clone())
+            .collect();
         registry.retain(|_, ownership| ownership.session_id != session_id);
         let released = before - registry.len();
         if released > 0 {
@@ -132,7 +137,18 @@ pub fn release_all_for_session(session_id: &str) {
                 "[auto_prompt::plan_registry] Released {released} plan claim(s) for session {session_id}"
             );
         }
+        released_files
     });
+    // Broadcast after the registry lock is released; no-op without a broadcaster.
+    for plan_file in released_files {
+        let plan_name = plan_file.rsplit('/').next().unwrap_or(plan_file.as_str());
+        crate::peer_states::broadcast_state(
+            session_id,
+            None,
+            &format!("released: {plan_name}"),
+            &plan_file,
+        );
+    }
 }
 
 /// Update the heartbeat for a plan claim.
@@ -355,6 +371,24 @@ mod tests {
         let claims = active_claims();
         assert_eq!(claims.len(), 1);
         assert_eq!(claims[0].session_id, "sess_b");
+    }
+
+    #[test]
+    fn test_release_all_for_session_idempotent_and_others_kept() {
+        let _lock = setup();
+        try_claim(".plans/01_a.md", "sess_a", "a").ok();
+        try_claim(".plans/02_b.md", "sess_a", "b").ok();
+        try_claim(".plans/03_c.md", "sess_b", "c").ok();
+
+        release_all_for_session("sess_a");
+        // Second call with no remaining claims must not panic and must not
+        // touch other sessions' claims.
+        release_all_for_session("sess_a");
+
+        let claims = active_claims();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].session_id, "sess_b");
+        assert_eq!(claims[0].plan_file, ".plans/03_c.md");
     }
 
     #[test]
