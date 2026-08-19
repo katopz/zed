@@ -21,6 +21,11 @@ war room feed (Zed panel + web UI, same data):
 
 - New activity-bar icon **directly behind Collab Panel** (`UserGroup` icon,
   activation_priority 6).
+- **Pinned work board (todolist)** at the top of the panel: what agent is
+  doing what, per-item state (`doing` / `stale` / `done`), race conflicts
+  flagged — capped to the **last 5 hours** of work. Pure projection over
+  existing claims + states (see "Pinned work board" section); zero new
+  sources of truth.
 - Plan 015 web UI stays the optional mobility client — it needs no changes to
   the worker contract, only a chat input that emits the same @mention syntax.
 - Lean: no new crates, no new worker endpoints, no new polling loops. One
@@ -134,6 +139,60 @@ REPLY:[<device>:<sess4>] <text>                → private steering (Plan 015, u
   `#[serde(default)] sender: String` (`"operator"`, `"web"`, or the posting
   agent's `device:sess4`). Old snapshots deserialize unchanged (serde default).
 
+## Pinned work board (todolist, 5h window)
+
+Reduce race tasks by making ownership visible at a glance. Pinned above the
+war room feed. **Derived, never duplicated**: the projection merges two
+existing streams — no new write path, no new wire type.
+
+### Data sources (both already shipped)
+
+| Source | Carries | Location |
+|---|---|---|
+| Local claims | `ActivePlanClaim { plan_file, session_id, task_summary, claimed_ago_secs }` | `auto_prompt::plan_registry` (300s heartbeat GC) |
+| Remote scopes | `DeviceStatus.scopes[] { plan_file, task_summary, session_id }` + `stale` + `updated_at` | `RoomSnapshot.statuses` (15s feeder refresh) |
+| Terminal signal | NEW one-liner: on claim release, `broadcast_state(sess, None, "released: {plan_name}", plan_path)` at the existing chain-stop release hook | rides the `/state` ring buffer |
+
+Cross-device race *prevention* already exists: `inject_remote_claims`
+re-claims remote scopes locally (`remote:{device}:{session}`), and
+`format_claims_for_context(session)` feeds peers' claims into every agent's
+LLM context; `is_claimed_by_other`/`filter_unclaimed` make agents skip taken
+plans. The work board adds the **operator-visible** layer (and the honest
+"released" terminal state that is currently missing).
+
+### Projection (pure fn, `war_room.rs`)
+
+```
+build_work_board(snapshot, local_claims, now) -> Vec<WorkItem>
+WorkItem { plan_name, plan_path, owner_labels: Vec<device:sess4>,
+           task_summary, state, last_activity_ts }
+
+state: Doing   — heartbeat/status fresh (<300s)
+       Stale   — status.stale or heartbeat older than 300s, no release seen
+       Released— a `released: {plan}` state matched by meta==plan_path
+```
+
+- Merge key: normalized plan path (claims and scopes use the same path form).
+- **5h window**: drop items whose `last_activity_ts` (max of claim heartbeat,
+  scope `updated_at`, latest matching state `ts`) is older than 5h. Time-boxed
+  ring buffer — the ledger self-prunes; KV keeps 7d for forensics, UI stays lean.
+- **Race flag**: `Doing` item with ≥2 distinct owner devices → render warning
+  color + ⚠. The claim system narrows the window to ~15s of feeder lag; the
+  flag catches manual/same-file collisions it can't prevent.
+- Render order: `Doing` first (race-flagged top), then `Stale`, then
+  `Released`; cap at ~20 rows with scroll (bounded by 5h window anyway).
+- Done-honesty: v1 broadcasts `released:` (not `done:`) — the chain-stop hook
+  fires on both success and abort, and we don't distinguish them yet. A
+  `done:` state fires only from the explicit completion path if one is
+  trivially available; otherwise `Released` is the honest terminal. Don't lie
+  to the operator.
+
+### Agent visibility
+
+`get_agent_room` MCP output gains the merged work board (scopes + states
+projection, same shape as the panel) so an agent can ask "what's safe to
+grab" explicitly — complementing the automatic context injection.
+
 ## Loop guard (agent ↔ agent commands)
 
 Two agents commanding each other can ping-pong forever (token burn). Guards,
@@ -163,6 +222,10 @@ operator sees the storm even when injection is suppressed.
 - Layout (Collab-Panel-shaped):
   - Header: room name, connection state, 📡 toggle (binds the shared runtime,
     replaces the per-panel one), refresh.
+  - **Work board (pinned, top)**: the 5h todolist projection — `Doing`
+    (race-flagged first) / `Stale` / `Released`, owner `device:sess4` +
+    task_summary per item; ~20-row cap with scroll. Collapsible to a single
+    summary row (`3 doing · 1 stale · 2 released`).
   - Roster (contacts-like): devices → agents (`device:sess4` + state_text).
     Click an agent → input pre-filled with `@device:sess4 `.
   - Feed (channel-like): last N messages (N = worker cap, 100), own messages
@@ -223,14 +286,18 @@ Collab but not adjacent) — zero upstream-file churn, but not the requested
 
 ### P2 — Worker + wire (small, backward compatible)
 
-- [ ] `MAX_MESSAGES` 10 → 100 (`index.js` const + `wrangler.toml` var).
+- [ ] `MAX_MESSAGES` 10 → 100, `MAX_ROOM_STATES` 10 → 50 (`index.js` consts +
+      `wrangler.toml` vars; states cap raised so `released:` terminal markers
+      survive chatty rooms within the 5h window).
 - [ ] `BoardMessage`/`PostMessageBody` gain `#[serde(default)] sender`;
       worker passes it through on `/msg`; old payloads default `""`.
 
 ### P3 — WarRoomPanel
 
-- [ ] `war_room.rs`: panel entity + render (header / roster / feed / input)
-      per the design above; local-only state; 📡 toggle bound to runtime.
+- [ ] `war_room.rs`: panel entity + render (header / **work board** / roster /
+      feed / input) per the design above; local-only state; 📡 toggle bound to
+      runtime. Work board is a pure child render of the projection — no
+      separate entity, no extra notifications.
 - [ ] `actions!(war_room, [Toggle, ToggleFocus, Refresh])` +
       `workspace.register_action` wiring in `agent_board::init`.
 - [ ] `zed.rs initialize_panels`: eager add (`WarRoomPanel::new` is cheap —
@@ -247,6 +314,9 @@ Collab but not adjacent) — zero upstream-file churn, but not the requested
 - [ ] MCP tool `post_agent_board_message { text }` (`mcp_tools.rs`, default
       annotations: not read-only, not destructive); agents compose
       `@target:sess4 …` using `get_agent_room` output.
+- [ ] `get_agent_room` output gains the work board (merged scopes + states,
+      same `WorkItem` shape as the panel) so agents can query "what's safe
+      to grab" explicitly.
 - [ ] Self-mention drop + prompt guidance embedded in the tool description
       ("mention cooldowns apply; do not spam peers").
 
@@ -267,9 +337,34 @@ Collab but not adjacent) — zero upstream-file churn, but not the requested
       skips others, honors watermark, `@all` deferred).
 - [ ] `mention_guard`: cooldown window, hourly cap, self-mention drop.
 - [ ] `types.rs`: sender-field round-trip + old-snapshot default.
+- [ ] `war_room.rs`: `build_work_board` projection tests — fresh/stale/
+      released states, 5h cutoff boundary, race flag on two devices doing
+      the same plan, merge of local claims + remote scopes by path.
 - [ ] Panel smoke test (gpui test): render with empty runtime (local-only),
       roster click fills input, send posts via mocked client.
 - [ ] `./script/clippy` clean; `cargo test -p agent_board -p agent_ui` green.
+
+### P7 — Pinned work board (todolist)
+
+- [ ] Pure projection `build_work_board(snapshot, local_claims, now) ->
+      Vec<WorkItem>` in `war_room.rs` (merge key: normalized plan path;
+      states per the spec; 5h `last_activity_ts` cutoff; race flag when ≥2
+      devices `Doing` the same plan).
+- [ ] Release broadcast: at the existing chain-stop release hook
+      (`auto_prompt`, where `release_all_for_session` is called), emit
+      `broadcast_state(sess, None, "released: {plan_name}", plan_path)` per
+      released claim — rides `/state`; no new endpoint. Honest terminal only
+      (`released`, not `done`) unless a trivially-true completion signal
+      exists at the same call site.
+- [ ] Panel: pinned section render (order: race-flagged `Doing` → `Doing` →
+      `Stale` → `Released`; ~20-row cap; collapsible summary row);
+      recompute only on runtime notify (15s poll / SSE push), never on a
+      timer of its own.
+- [ ] `get_agent_room` MCP output extension (see P4).
+- [ ] Clock note: local claims use `time_monotonic_secs` (no wall clock) —
+      `claimed_ago_secs` converts via `now - claimed_ago`; remote items use
+      wall-clock `updated_at`/`ts`. The projection must not mix the two
+      epochs — normalize to wall-clock `now` at the call site.
 
 ## Perf/sec considerations
 
@@ -277,6 +372,12 @@ Collab but not adjacent) — zero upstream-file churn, but not the requested
   ≤ today's steady state once the board panel has been opened (its entity
   outlives dock close). Runtime extraction removes the would-be 2×/N×
   duplication.
+- **Work board projection is O(claims + states)** per runtime notify
+  (≤50 states + ≤ dozens of claims), recompute only on notify — no timer, no
+  allocation in render beyond the projection vec (reused via `Vec::clear` +
+  re-push if it ever shows up in profiles; it won't at this scale).
+- **5h window bounds the projection** — time-boxed, not unbounded history;
+  render capped ~20 rows regardless.
 - **Mention scan is O(new messages)** per round (≤ cap), pure string prefix
   check — nanoseconds.
 - **Panel render only when open**; feed bounded at 100 rows; roster bounded
@@ -294,6 +395,16 @@ Collab but not adjacent) — zero upstream-file churn, but not the requested
 - **Agent loop storms**: guards mitigate, mute backstops; a determined agent
   can still rotate sessions — operator-visible in feed (visibility is the
   control).
+- **"Released" ≠ "done"**: the chain-stop hook fires on success AND abort;
+  v1 renders the honest neutral terminal. If operators need true done-state,
+  wire the completion-specific path later (deferred).
+- **Chatty-room eviction**: a `released:` marker can be pushed out of the
+  states ring buffer before 5h in a very chatty room — mitigated by
+  `MAX_ROOM_STATES` 10→50; worst case the item drops off the board early
+  (it's a projection, the claims/KV truth is unaffected).
+- **Clock epochs**: local claims are monotonic-clock, remote are wall-clock —
+  the projection normalizes at the call site (P7 task); mixing them naively
+  would produce garbage 5h cutoffs.
 - **At-most-once delivery** (inherited from 015): a mention missed while a
   device is offline is still in the feed (7d TTL) — operator re-posts. No
   ack in v1.
@@ -329,6 +440,10 @@ No new crates. `agent_ui` is NOT touched except tests. `workspace`, `outline_pan
 - [ ] Agent → agent mention via `post_agent_board_message` → routed + injected.
 - [ ] Self-mention dropped; cooldown + hourly cap log-and-suppress (forced
       storm test).
+- [ ] Work board: two devices `Doing` the same plan → race flag renders
+      (warning color + ⚠) within one sync round; single-owner items don't.
+- [ ] Work board: item older than 5h disappears on next notify; `released:`
+      state pins a `Released` item within the window.
 - [ ] Both panels open → exactly one poll loop (verified by log count over
       60s).
 - [ ] Panel closed → zero render/notify work from the war room (profiler or
@@ -345,4 +460,7 @@ No new crates. `agent_ui` is NOT touched except tests. `workspace`, `outline_pan
   agent names (meta-carried); `!`-prefix native steering
   (`set_end_turn_at_next_boundary` — still blocked on the same
   ConversationView→agent::Thread access noted in 015 W9); delivery acks;
-  per-agent threads as separate tabs (feed filter is enough at this scale).
+  per-agent threads as separate tabs (feed filter is enough at this scale);
+  task-level (checkbox) granularity inside plan files — the work board is
+  plan-file-level v1, matching the claim substrate's granularity; true
+  `done` terminal state (requires completion-specific hook).
