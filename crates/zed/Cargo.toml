@@ -62,6 +62,11 @@ name = "zed_visual_test_runner"
 path = "src/visual_test_runner.rs"
 required-features = ["visual-tests"]
 
+[[bin]]
+name = "zed_war_room_activity_bar"
+path = "src/war_room_activity_bar.rs"
+required-features = ["visual-tests"]
+
 [dependencies]
 acp_thread.workspace = true
 acp_tools.workspace = true

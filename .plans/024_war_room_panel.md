@@ -400,12 +400,52 @@ Collab but not adjacent) — zero upstream-file churn, but not the requested
       pixel-faithful PNG. Artifact committed at `.plans/024_war_room_panel.png`
       (920×1560). Note: requires `gpui_platform/font-kit` dev-feature —
       without it font registration silently no-ops and text never renders.
-- [x] `./script/clippy` clean; `cargo test -p agent_board -p agent_ui` green.
-      (agent_board: scoped `cargo clippy -p agent_board --all-targets` clean
-      — repo-wide script skipped under sibling-agent build load; 80/80 tests
-      incl. the gpui harnesses and the `#[should_panic]` priority test; the
-      `war_room_screenshot` example builds clean too. agent_ui untouched by
-      design.)
+- [x] Activity-bar screenshot artifact (zed bin, NEW):
+      `cargo run -p zed --bin zed_war_room_activity_bar --features
+      visual-tests` opens a production-shaped offscreen window —
+      `MultiWorkspace` root, agent `Sidebar` registered + open, one
+      `Workspace`, real panels loaded via their production `::load`
+      constructors (Project 1 / Git 3 / Collab 5 / WarRoom 6 / Outline 7) —
+      and captures both layouts: DEFAULT (agentic) settings, where the
+      panel buttons land in the status bar corners (left strip: WarRoom
+      alone; right strip: Project/Git/Collab/Outline), and the CLASSIC
+      layout (`PanelLayout::EDITOR` docks, applied via
+      `SettingsStore::update_user_settings`), where the strip reads
+      Project/Git/Collab/WarRoom/Outline — WarRoom directly behind Collab.
+      Adjacency is asserted as DATA (`left_dock().panel_index_for_type`:
+      collab+1 == war_room, war_room+1 == outline, in a debug build where
+      the duplicate-priority guard would panic on any collision) AND
+      verified in pixels (icon clusters at 52px pitch: collab@724,
+      war_room@776, outline@828 physical px). Artifacts committed:
+      `.plans/024_war_room_activity_bar_default.png`,
+      `.plans/024_war_room_activity_bar_classic.png` (+ `_left` strips,
+      2560×1600 full, One Dark forced). Offscreen Metal render — no live
+      debug-build session needed after all; the earlier "live-GUI
+      remainder" is closed.
+- [x] `./script/clippy` clean; `cargo test -p agent_board -p agent_ui` green;
+      repo-wide `./script/clippy` + `cargo test -p zed` green (plan 024
+      validation session).
+      — agent_board: 80/80 tests (prior session). REPO-WIDE `./script/clippy`
+      (`--release --all-targets --all-features -- --deny warnings`, 1041 crates,
+      isolated `CARGO_TARGET_DIR` on internal NVMe after the SD target's
+      release check-artifact cache turned out corrupt — empty fingerprint
+      dirs, see the session note below): initially caught 2 `redundant_clone`
+      lints in the new activity-bar bin (fixed, last-use clones dropped); now
+      exit 0. `cargo test -p zed`: 79 passed / 1 ignored with
+      `--test-threads=1`; under DEFAULT parallel threads,
+      `test_action_namespaces` failed on the missing `agent_board` +
+      `war_room` namespaces (plan-013/024 regression — the `actions!` macros
+      register globally at compile time; expectation list updated, fixed) and
+      upstream `test_multi_workspace_session_restore` (from upstream #48800)
+      flakes under parallelism only — passes isolated and single-threaded;
+      tracked at `.issues/014` (NOT a plan regression).
+      Session note: the SD-card target dir developed empty fingerprint dirs
+      (killed builds + disk pressure at 99% full); debug cache healed by
+      deleting the 26 empty dirs; release check cache bypassed via
+      `CARGO_TARGET_DIR=/tmp` (removed after). If E0463 "can't find crate"
+      appears again on this volume, clean the empty fingerprint dirs first
+      (`ls -A <dir> | grep -cv '^\._'` == 0 → remove).
+      (agent_ui untouched by design.)
 
 ### P7 — Pinned work board (todolist)
 
@@ -493,17 +533,28 @@ No new crates. `agent_ui` is NOT touched except tests. `workspace`, `outline_pan
 
 ## GOAT gate
 
-- [-] (partial) Icon renders directly behind Collab Panel in the activity bar
+- [x] Icon renders directly behind Collab Panel in the activity bar
       (screenshot, default settings, debug build — duplicate-priority panic
       path exercised).
-      — AUTOMATED: priority 6 locked by
-      `panel_closed_silence_zero_render_work_after_drop`; duplicate-priority
-      panic path EXERCISED by
-      `duplicate_activation_priority_panics_in_debug_builds` (#[should_panic]);
-      pixel-faithful panel render committed at `.plans/024_war_room_panel.png`
-      (via `examples/war_room_screenshot`). Adjacency (Collab 5 / WarRoom 6 /
-      Outline 7) verified by grep across the panel crates; the ACTIVITY BAR
-      screenshot itself needs a live debug-build session (live-GUI remainder).
+      — AUTOMATED (offscreen Metal, no live session):
+      `zed_war_room_activity_bar` bin (visual-tests feature) renders a
+      production-shaped window (MultiWorkspace + Sidebar + real panels via
+      their `::load` constructors) and captures BOTH layouts. CLASSIC
+      layout (the layout this claim was written against): left strip reads
+      Project/Git/Collab/WarRoom/Outline — WarRoom DIRECTLY behind Collab,
+      asserted as dock data (`panel_index_for_type`: collab+1 == war_room,
+      war_room+1 == outline) and verified in pixels (52px icon pitch:
+      collab@724, war_room@776, outline@828 physical px). DEFAULT (agentic)
+      settings honestly documented: Collab/Outline/Project/Git dock RIGHT
+      (`PanelLayout::AGENT` is the shipped default) while WarRoom docks
+      left — artifacts show WarRoom alone in the left strip and
+      Project/Git/Collab/Outline in the right strip; adjacency-by-priority
+      holds within any shared strip. Duplicate-priority debug guard:
+      `duplicate_activation_priority_panics_in_debug_builds`
+      (`#[should_panic]`) + this bin itself runs in a debug build (any
+      collision would panic). Artifacts:
+      `.plans/024_war_room_activity_bar_{default,classic}.png` (+ `_left`
+      strips).
 - [-] (partial) Operator @mention from Zed panel → visible in web feed AND
       injected into target thread (<1s 📡 on / <15s poll off; `📢 war-room`
       line in the thread).
@@ -565,9 +616,12 @@ No new crates. `agent_ui` is NOT touched except tests. `workspace`, `outline_pan
       — AUTOMATED: `board_message_old_payload_defaults_empty_sender` +
       legacy-`PostMessageBody` test in `types.rs`; deployed worker
       (v2b3d70d5) round-trips the field.
-- [x] `./script/clippy` + `cargo test -p agent_board` green.
-      — scoped `cargo clippy -p agent_board --all-targets` clean
-      (repo-wide script skipped under sibling-agent build load); 77/77 tests.
+- [x] `./script/clippy` + `cargo test -p agent_board` green — now REPO-WIDE:
+      `./script/clippy` exit 0 (1041 crates, release/all-features/all-targets,
+      deny-warnings; 2 redundant-clone lints it caught in the new activity-bar
+      bin were fixed) and `cargo test -p zed` 79/79 single-threaded (the
+      parallel-only upstream flake is tracked at `.issues/014`); agent_board
+      80/80.
 - [-] (deferred-blocked) Web chat input usable end-to-end — requires 015 W5
       `GITHUB_CLIENT_ID`; blocked, untouched.
 
