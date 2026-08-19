@@ -1,7 +1,8 @@
 # 008: Unified context-overflow flow (native + Claude agents)
 
 - **Plan**: `.plans/023_unified_context_overflow_flow.md`
-- **Status**: implemented; see commit referenced in the plan header after close-out
+- **Commit**: `e6cf667182` (develop)
+- **Status**: implemented and closed
 - **Date**: 2026-08-19
 
 ## What changed
