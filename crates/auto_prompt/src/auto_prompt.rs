@@ -105,6 +105,31 @@ fn clear_summary_for_session(session_id: &str) {
     })
 }
 
+// Plan 023 D: clarification loop guard — the pros/cons clarify prompt fires at
+// most once per chain. Deliberately sticky (not cleared on stop/reset): a
+// stop→clarify→stop cycle must not re-ask; the next chain hop gets a fresh
+// session id and a fresh budget.
+static CLARIFY_REGISTRY: std::sync::RwLock<Option<std::collections::HashMap<String, bool>>> =
+    std::sync::RwLock::new(None);
+
+fn clarify_fired_for(session_id: &str) -> bool {
+    let guard = CLARIFY_REGISTRY
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard
+        .as_ref()
+        .is_some_and(|map| map.get(session_id).copied().unwrap_or(false))
+}
+
+fn mark_clarify_fired(session_id: &str) {
+    let mut guard = CLARIFY_REGISTRY
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard
+        .get_or_insert_with(std::collections::HashMap::new)
+        .insert(session_id.to_string(), true);
+}
+
 use std::sync::RwLock;
 use std::time::SystemTime;
 
@@ -217,10 +242,23 @@ pub enum AutoPromptOutcome {
     /// failure. The caller should wait `delay_ms`, then re-run `decide_with_llm`
     /// (the rate limit may have cleared). See issue 007.
     RetryAfterBackoff { delay_ms: u64, reason: String },
+    /// The orchestration LLM is not confident how to proceed, and the worker's
+    /// last message presents options/decision points without a pros/cons
+    /// layout. The caller should send the clarification prompt to the SAME
+    /// thread so the worker lays out the trade-offs and recommends before any
+    /// stop/continue decision is made (plan 023 D, req 5). Fires at most once
+    /// per chain via `CLARIFY_REGISTRY`.
+    ClarificationRequest(AutoPromptAction),
 }
+
+/// Marker introducing the addition-request section appended to new-thread
+/// prompts (plan 023 B1).
+const ADDITION_REQUEST_MARKER: &str = "## 4. Addition request";
 
 /// Extract the decision text from a `with_first_prompt_context`-formatted string.
 /// Returns the content after the last `## N. Decision` header, or None if not found.
+/// The extraction is cut at the `## 4. Addition request` boundary so the
+/// carried draft never pollutes the decision text (plan 023 B2).
 pub fn extract_decision_prompt(prompt: &str) -> Option<String> {
     let marker = "## 3. Decision";
     let alt_marker = "## 2. Decision";
@@ -229,8 +267,27 @@ pub fn extract_decision_prompt(prompt: &str) -> Option<String> {
         .map(|i| i + marker.len())
         .or_else(|| prompt.find(alt_marker).map(|i| i + alt_marker.len()));
     start
-        .map(|i| prompt[i..].trim().to_string())
+        .map(|i| {
+            let decision = &prompt[i..];
+            match decision.find(ADDITION_REQUEST_MARKER) {
+                Some(boundary) => decision[..boundary].trim().to_string(),
+                None => decision.trim().to_string(),
+            }
+        })
         .filter(|s| !s.is_empty())
+}
+
+/// Append the stashed input-box draft as a `## 4. Addition request` section to
+/// a `with_first_prompt_context` payload (plan 023 B1, req 2.1). No-op when the
+/// draft is absent/empty or the section is already present.
+pub fn append_addition_request(prompt: &str, addition_request: Option<&str>) -> String {
+    let Some(draft) = addition_request.map(str::trim).filter(|d| !d.is_empty()) else {
+        return prompt.to_string();
+    };
+    if prompt.contains(ADDITION_REQUEST_MARKER) {
+        return prompt.to_string();
+    }
+    format!("{prompt}\n\n{ADDITION_REQUEST_MARKER}\n\n{draft}")
 }
 
 pub fn with_first_prompt_context(
@@ -1229,6 +1286,269 @@ pub fn decide(
 /// Async LLM call to determine the next prompt.
 ///
 /// Returns `Some(action)` if the chain should continue, `None` to stop.
+/// Phase 1/2 context-overflow state machine, shared by the native path and
+/// the Claude >320k parity path (plan 023 A2/A3).
+///
+/// - Phase 1 (`summary_state == 0`, last message not already a summary):
+///   returns `ContextOverflow` so the UI sends a "summarize" prompt to the
+///   SAME thread, then sets `summary_state = 1`.
+/// - Phase 2 (`summary_state == 1`, or a voluntary summary skipped Phase 1):
+///   the last assistant message IS the summary — builds the continuation
+///   prompt and returns `Continue` with `force_new_thread = true` and reset
+///   token counts.
+///
+/// Never calls the LLM itself; deterministic state machine only.
+pub(crate) fn context_overflow_outcome(data: &LlmCallData) -> AutoPromptOutcome {
+    let session_id_str = data.session_id.to_string();
+
+    // ── Issue 007 guard: API exhaustion + context overflow ────────────
+    //
+    // If the source thread's completion request itself failed
+    // (`had_api_error=true`: rate limit, network, 5xx, etc.) AND its
+    // context has overflowed, Phase 2 would create a new continuation
+    // thread whose first turn immediately hits the same exhausted API
+    // and fails — a death spiral of doomed threads that burns quota
+    // without making progress. Defer instead: `RetryAfterBackoff` makes
+    // the caller sleep and re-run the decision.
+    //
+    // Deliberately checks `had_api_error`, NOT the broader `had_error`.
+    // `had_error` is also set by a single failed tool call anywhere in
+    // the turn — extremely common in normal agentic work and unrelated
+    // to API availability.
+    if data.had_api_error {
+        let config = load_config_cached().unwrap_or_default();
+        // failure count is incremented by the caller's retry loop on
+        // receipt of this outcome; use the current value to size the
+        // initial delay so we don't pile up retries faster than the
+        // upstream API can recover.
+        let current_failures = AUTO_PROMPT_LLM_FAILURE_COUNT.load(Ordering::Relaxed);
+        let delay_ms = config.backoff_delay_ms(current_failures.saturating_add(1));
+        log::warn!(
+            "[auto_prompt::context_overflow] overflow + had_api_error — deferring Phase 1/2 by {delay_ms}ms (current_failures={current_failures}, session={session_id_str})"
+        );
+        return AutoPromptOutcome::RetryAfterBackoff {
+            delay_ms,
+            reason: "context overflow with source thread error (likely rate limit)".to_string(),
+        };
+    }
+
+    let summary_state = summary_state_for(&session_id_str);
+
+    // If the last assistant message is already a voluntary summary (e.g. the
+    // agent followed an "Always end with TL;DR" instruction and self-summarized
+    // before context overflowed), skip Phase 1's redundant "Stop and summarize"
+    // request and go straight to Phase 2 — reuse the existing summary as the
+    // thread handoff. Saves a full assistant response of tokens.
+    //
+    // Only applies at summary_state==0 (Phase 1 has not fired yet). Once
+    // Phase 1 has fired (state==1) the response is already a Phase 1 summary
+    // and the normal Phase 2 path handles it.
+    let skip_phase_1 = summary_state == 0
+        && data
+            .last_assistant_message
+            .as_deref()
+            .map_or(false, looks_like_voluntary_summary);
+    if skip_phase_1 {
+        log::warn!(
+            "[auto_prompt::context_overflow] Last message is already a voluntary summary — skipping Phase 1, going straight to Phase 2 (session={session_id_str})"
+        );
+        // Keep summary_state==0 in the registry: we never asked for a summary,
+        // so there's nothing to clear. The Phase 2 branch below handles the
+        // handoff directly when `skip_phase_1` is set.
+    }
+
+    log::info!(
+        "[auto_prompt::context_overflow] session={session_id_str} summary_state={summary_state} skip_phase_1={skip_phase_1}"
+    );
+
+    if summary_state == 0 && !skip_phase_1 {
+        // Phase 1: Request summarization. Return ContextOverflow so the
+        // UI sends a "summarize" message to the current thread.
+        //
+        // Always goes to the SAME thread — no need for ## 1/## 2/## 3 headers
+        // since the AI already has full conversation context. Raw instruction only.
+        let next_prompt = "Stop what you are doing and provide a concise summary of your progress. Include: (1) what was the original task, (2) what was accomplished, (3) what remains to be done, (4) the current state of any active plans (reference by filename). Be thorough — this summary will be used to continue in a fresh context.".to_string();
+        set_summary_state(&session_id_str, 1);
+        log::info!(
+            "[auto_prompt::context_overflow] Returning ContextOverflow — requesting summary from AI (session={session_id_str})"
+        );
+        return AutoPromptOutcome::ContextOverflow(AutoPromptAction {
+            from_session_id: data.session_id.clone(),
+            from_title: data.title.clone(),
+            next_prompt,
+            work_dirs: data.work_dirs.clone(),
+            original_user_message: data.original_user_message.clone(),
+            profile_id: data.profile_id.clone(),
+            actual_input_tokens: data.actual_input_tokens,
+            approximate_token_count: data.approximate_token_count,
+            last_assistant_message: data.last_assistant_message.clone(),
+            force_new_thread: false,
+            focus_new_thread: false,
+        });
+    } else if summary_state == 1 || skip_phase_1 {
+        // Phase 2: AI has responded with summary (or already had a voluntary
+        // summary, via `skip_phase_1`). The last_assistant_message IS the
+        // summary. Create a new thread with the inlined summary.
+        clear_summary_for_session(&session_id_str);
+
+        // Phase 2 (P2.2 native summary hook): broadcast the summary to the
+        // agent board so peer agents can see what this agent just concluded.
+        // Mirrors the claude_agent path's `maybe_broadcast_summary_to_board`.
+        // We already know this is a summary (summary_state==1 or voluntary),
+        // so no contains_summary check needed.
+        if let Some(summary) = data.last_assistant_message.as_deref() {
+            peer_states::broadcast_state(&session_id_str, None, summary, "summary");
+        }
+        log::info!(
+            "[auto_prompt::context_overflow] Summary received — creating new thread with inlined summary (session={session_id_str})"
+        );
+
+        let prompt_summary = build_prompt_summary(
+            None,
+            data.title.as_deref(),
+            Some("context overflow: continuing in new thread with summary"),
+            data.last_assistant_message.as_deref(),
+            data.original_user_message.as_deref(),
+            data.first_user_message.as_deref(),
+        );
+
+        // Build the continuation prompt in priority order:
+        //   1. Summary's own Recommended Next Steps (the AI just wrote them —
+        //      they're the most authoritative source of what to do next).
+        //   2. Unchecked tasks in current-repo plan files (the session's
+        //      actual target project, not a noisy neighbour repo).
+        //   3. Unchecked tasks in other-repo plan files (last-resort).
+        //   4. Generic "continue" fallback.
+        //
+        // `detect_remaining_work` is intentionally NOT consulted here: it
+        // skips auto_prompt summary responses (see its guard) to avoid
+        // re-summarization loops in the safety-net path. Phase 2 wants the
+        // summary's guidance, so we use `extract_summary_next_steps` instead.
+        let continuation = if llm_acknowledged_all_tasks_blocked(
+            data.last_assistant_message.as_deref(),
+        ) {
+            log::info!(
+                "auto_prompt: ContextOverflow — LLM acknowledged blocked tasks, using generic continuation"
+            );
+            "Continue from where we left off.".to_string()
+        } else if let Some(steps) = data
+            .last_assistant_message
+            .as_deref()
+            .and_then(extract_summary_next_steps)
+        {
+            log::warn!(
+                "auto_prompt: ContextOverflow Phase 2 — using summary's Recommended Next Steps as continuation"
+            );
+            steps
+        } else if let Some(plan_prompt) = detect_remaining_plan_tasks(
+            &data.context_json,
+            PlanRepoFilter::CurrentRepo,
+            data.work_dirs.as_deref(),
+        ) {
+            log::warn!(
+                "auto_prompt: ContextOverflow Phase 2 — no summary next steps, falling back to current-repo plan tasks"
+            );
+            plan_prompt
+        } else if let Some(plan_prompt) = detect_remaining_plan_tasks(
+            &data.context_json,
+            PlanRepoFilter::OtherRepos,
+            data.work_dirs.as_deref(),
+        ) {
+            log::warn!(
+                "auto_prompt: ContextOverflow Phase 2 — no current-repo tasks, falling back to other-repo plan tasks"
+            );
+            plan_prompt
+        } else {
+            log::info!(
+                "auto_prompt: ContextOverflow Phase 2 — no detectors matched, generic continuation"
+            );
+            "Continue from where we left off.".to_string()
+        };
+
+        // Preserve slash commands (e.g. /optimize) through context overflow
+        // so the new thread re-activates the skill and continues the loop.
+        let continuation = match data.original_user_message.as_deref() {
+            Some(msg) if msg.trim().starts_with('/') => {
+                let cmd = msg.trim();
+                log::info!(
+                    "auto_prompt: ContextOverflow — original message is slash command '{cmd}', preserving it"
+                );
+                format!(
+                    "{cmd}\n\nContext overflowed mid-task. Pick up where the summary left off. \
+                         Do NOT summarize again — continue working immediately."
+                )
+            }
+            _ => continuation,
+        };
+
+        let next_prompt = with_first_prompt_context(
+            continuation,
+            prompt_summary.as_deref(),
+            data.title.as_deref(),
+            data.last_assistant_message.as_deref(),
+        );
+
+        auto_claim_plan(
+            &next_prompt,
+            &data.context_json,
+            &data.session_id,
+            data.title.as_deref(),
+        );
+        // Reset token counts — the new thread starts from a summary, not the
+        // bloated old context. Carrying the old token counts forward causes
+        // dispatch_action to always choose new-thread AND can re-trigger
+        // ContextOverflow on the fresh thread.
+        // Force new-thread creation regardless of token counts — after Phase 2
+        // the old thread's context is full and the summary must go to a fresh thread.
+        let mut action = data.make_continue_action(next_prompt);
+        action.actual_input_tokens = None;
+        action.approximate_token_count = 0;
+        action.force_new_thread = true;
+        return AutoPromptOutcome::Continue(action);
+    }
+
+    // Unexpected state — reset and stop
+    clear_summary_for_session(&session_id_str);
+    let stop_reason = "context overflow: unexpected summary state".to_string();
+    reset_iteration_with_session(&data.session_id.to_string());
+    AutoPromptOutcome::Stopped {
+        reason: stop_reason,
+    }
+}
+
+/// Build a one-shot pros/cons clarification request (plan 023 D, req 5).
+///
+/// Fires only when ALL hold:
+/// - the clarify prompt has not already fired for this chain (`CLARIFY_REGISTRY`),
+/// - the worker's last message presents an options/decision point it could
+///   resolve itself (`pending_question::mentions_decision_point`),
+/// - the worker has not already laid out pros/cons (`has_pros_cons_layout`).
+///
+/// Genuine user-input requests (credentials, explicit deferral) are excluded
+/// upstream by `is_waiting_for_user_decision`, which runs before this check.
+fn maybe_clarification_request(data: &LlmCallData) -> Option<AutoPromptOutcome> {
+    let session_id_str = data.session_id.to_string();
+    if clarify_fired_for(&session_id_str) {
+        return None;
+    }
+    let last = data
+        .last_assistant_message
+        .as_deref()
+        .map(str::trim)
+        .filter(|msg| !msg.is_empty())?;
+    if pending_question::has_pros_cons_layout(Some(last)) {
+        return None;
+    }
+    if !pending_question::mentions_decision_point(Some(last)) {
+        return None;
+    }
+    mark_clarify_fired(&session_id_str);
+    let prompt = "Before deciding, list the pros and cons of each option you mentioned, then recommend one and proceed with it.".to_string();
+    let mut action = data.make_continue_action(prompt);
+    action.force_new_thread = false;
+    Some(AutoPromptOutcome::ClarificationRequest(action))
+}
+
 pub async fn decide_with_llm(
     data: LlmCallData,
     cx: &gpui::AsyncApp,
@@ -1267,245 +1587,27 @@ pub async fn decide_with_llm(
         return Ok(outcome);
     }
 
-    let result = if data.context_exceeds_limit {
-        // ── Issue 007 guard: API exhaustion + context overflow ────────────
-        //
-        // If the source thread's completion request itself failed
-        // (`had_api_error=true`: rate limit, network, 5xx, etc.) AND its
-        // context has overflowed, Phase 2 would create a new continuation
-        // thread whose first turn immediately hits the same exhausted API
-        // and fails — a death spiral of doomed threads that burns quota
-        // without making progress.
-        //
-        // Instead, defer the Phase 1/2 decision: return `RetryAfterBackoff`
-        // so the caller sleeps and re-runs `decide_with_llm`. If retries are
-        // exhausted, the caller surfaces a `Stopped` to the user.
-        //
-        // Deliberately checks `had_api_error`, NOT the broader `had_error`.
-        // `had_error` is also set by a single failed tool call anywhere in
-        // the turn (see `AcpThread::had_error` doc) — extremely common in
-        // normal agentic work and unrelated to API availability. Gating this
-        // guard on the broad signal previously misfired constantly: a long
-        // session with context overflow plus any one incidental tool-call
-        // failure (a grep with no matches, a bad `old_string` in an edit,
-        // etc.) would defer, exhaust `max_llm_retries`, and permanently stop
-        // with a misleading "likely rate limit" reason — even though the API
-        // was healthy and Phase 2 would have worked fine immediately.
-        if data.had_api_error {
-            let config = load_config_cached().unwrap_or_default();
-            // failure count is incremented by the caller's retry loop on
-            // receipt of this outcome; use the current value to size the
-            // initial delay so we don't pile up retries faster than the
-            // upstream API can recover.
-            let current_failures = AUTO_PROMPT_LLM_FAILURE_COUNT.load(Ordering::Relaxed);
-            let delay_ms = config.backoff_delay_ms(current_failures.saturating_add(1));
-            log::warn!(
-                "[auto_prompt::decide_with_llm] Context overflow + had_error — deferring Phase 1/2 by {delay_ms}ms (current_failures={current_failures}, session={session_id_str})"
-            );
-            return Ok(AutoPromptOutcome::RetryAfterBackoff {
-                delay_ms,
-                reason: "context overflow with source thread error (likely rate limit)".to_string(),
-            });
-        }
+    if data.context_exceeds_limit {
+        // Shared Phase 1/2 state machine (plan 023 A2) — also reused by the
+        // Claude >320k parity path (plan 023 A3).
+        return Ok(context_overflow_outcome(&data));
+    }
 
-        let summary_state = summary_state_for(&session_id_str);
-
-        // If the last assistant message is already a voluntary summary (e.g. the
-        // agent followed an "Always end with TL;DR" instruction and self-summarized
-        // before context overflowed), skip Phase 1's redundant "Stop and summarize"
-        // request and go straight to Phase 2 — reuse the existing summary as the
-        // thread handoff. Saves a full assistant response of tokens.
-        //
-        // Only applies at summary_state==0 (Phase 1 has not fired yet). Once
-        // Phase 1 has fired (state==1) the response is already a Phase 1 summary
-        // and the normal Phase 2 path handles it.
-        let skip_phase_1 = summary_state == 0
-            && data
-                .last_assistant_message
-                .as_deref()
-                .map_or(false, looks_like_voluntary_summary);
-        if skip_phase_1 {
-            log::warn!(
-                "[auto_prompt::decide_with_llm] Last message is already a voluntary summary — skipping Phase 1, going straight to Phase 2 (session={session_id_str})"
-            );
-            // Keep summary_state==0 in the registry: we never asked for a summary,
-            // so there's nothing to clear. The Phase 2 branch below handles the
-            // handoff directly when `skip_phase_1` is set.
-        }
-
-        log::info!(
-            "[auto_prompt::decide_with_llm] Context exceeds token limit — session={session_id_str} summary_state={summary_state} skip_phase_1={skip_phase_1}"
-        );
-
-        if summary_state == 0 && !skip_phase_1 {
-            // Phase 1: Request summarization. Return ContextOverflow so the
-            // UI sends a "summarize" message to the current thread.
-            //
-            // Always goes to the SAME thread — no need for ## 1/## 2/## 3 headers
-            // since the AI already has full conversation context. Raw instruction only.
-            let next_prompt = "Stop what you are doing and provide a concise summary of your progress. Include: (1) what was the original task, (2) what was accomplished, (3) what remains to be done, (4) the current state of any active plans (reference by filename). Be thorough — this summary will be used to continue in a fresh context.".to_string();
-            set_summary_state(&session_id_str, 1);
-            log::info!(
-                "[auto_prompt::decide_with_llm] Returning ContextOverflow — requesting summary from AI (session={session_id_str})"
-            );
-            return Ok(AutoPromptOutcome::ContextOverflow(AutoPromptAction {
-                from_session_id: data.session_id,
-                from_title: data.title,
-                next_prompt,
-                work_dirs: data.work_dirs,
-                original_user_message: data.original_user_message,
-                profile_id: data.profile_id.clone(),
-                actual_input_tokens: data.actual_input_tokens,
-                approximate_token_count: data.approximate_token_count,
-                last_assistant_message: data.last_assistant_message.clone(),
-                force_new_thread: false,
-                focus_new_thread: false,
-            }));
-        } else if summary_state == 1 || skip_phase_1 {
-            // Phase 2: AI has responded with summary (or already had a voluntary
-            // summary, via `skip_phase_1`). The last_assistant_message IS the
-            // summary. Create a new thread with ThreadSummary flow.
-            clear_summary_for_session(&session_id_str);
-
-            // Phase 2 (P2.2 native summary hook): broadcast the summary to the
-            // agent board so peer agents can see what this agent just concluded.
-            // Mirrors the claude_agent path's `maybe_broadcast_summary_to_board`.
-            // We already know this is a summary (summary_state==1 or voluntary),
-            // so no contains_summary check needed.
-            if let Some(summary) = data.last_assistant_message.as_deref() {
-                peer_states::broadcast_state(&session_id_str, None, summary, "summary");
-            }
-            log::info!(
-                "[auto_prompt::decide_with_llm] Summary received — creating new thread with ThreadSummary flow (session={session_id_str})"
-            );
-
-            let prompt_summary = build_prompt_summary(
-                None,
-                data.title.as_deref(),
-                Some("context overflow: continuing in new thread with summary"),
-                data.last_assistant_message.as_deref(),
-                data.original_user_message.as_deref(),
-                data.first_user_message.as_deref(),
-            );
-
-            // Build the continuation prompt in priority order:
-            //   1. Summary's own Recommended Next Steps (the AI just wrote them —
-            //      they're the most authoritative source of what to do next).
-            //   2. Unchecked tasks in current-repo plan files (the session's
-            //      actual target project, not a noisy neighbour repo).
-            //   3. Unchecked tasks in other-repo plan files (last-resort).
-            //   4. Generic "continue" fallback.
-            //
-            // `detect_remaining_work` is intentionally NOT consulted here: it
-            // skips auto_prompt summary responses (see its guard) to avoid
-            // re-summarization loops in the safety-net path. Phase 2 wants the
-            // summary's guidance, so we use `extract_summary_next_steps` instead.
-            let continuation = if llm_acknowledged_all_tasks_blocked(
-                data.last_assistant_message.as_deref(),
-            ) {
-                log::info!(
-                    "auto_prompt: ContextOverflow — LLM acknowledged blocked tasks, using generic continuation"
-                );
-                "Continue from where we left off.".to_string()
-            } else if let Some(steps) = data
-                .last_assistant_message
-                .as_deref()
-                .and_then(extract_summary_next_steps)
-            {
-                log::warn!(
-                    "auto_prompt: ContextOverflow Phase 2 — using summary's Recommended Next Steps as continuation"
-                );
-                steps
-            } else if let Some(plan_prompt) = detect_remaining_plan_tasks(
-                &data.context_json,
-                PlanRepoFilter::CurrentRepo,
-                data.work_dirs.as_deref(),
-            ) {
-                log::warn!(
-                    "auto_prompt: ContextOverflow Phase 2 — no summary next steps, falling back to current-repo plan tasks"
-                );
-                plan_prompt
-            } else if let Some(plan_prompt) = detect_remaining_plan_tasks(
-                &data.context_json,
-                PlanRepoFilter::OtherRepos,
-                data.work_dirs.as_deref(),
-            ) {
-                log::warn!(
-                    "auto_prompt: ContextOverflow Phase 2 — no current-repo tasks, falling back to other-repo plan tasks"
-                );
-                plan_prompt
-            } else {
-                log::info!(
-                    "auto_prompt: ContextOverflow Phase 2 — no detectors matched, generic continuation"
-                );
-                "Continue from where we left off.".to_string()
-            };
-
-            // Preserve slash commands (e.g. /optimize) through context overflow
-            // so the new thread re-activates the skill and continues the loop.
-            let continuation = match data.original_user_message.as_deref() {
-                Some(msg) if msg.trim().starts_with('/') => {
-                    let cmd = msg.trim();
-                    log::info!(
-                        "auto_prompt: ContextOverflow — original message is slash command '{cmd}', preserving it"
-                    );
-                    format!(
-                        "{cmd}\n\nContext overflowed mid-task. Pick up where the summary left off. \
-                         Do NOT summarize again — continue working immediately."
-                    )
-                }
-                _ => continuation,
-            };
-
-            let next_prompt = with_first_prompt_context(
-                continuation,
-                prompt_summary.as_deref(),
-                data.title.as_deref(),
-                data.last_assistant_message.as_deref(),
-            );
-
-            auto_claim_plan(
-                &next_prompt,
-                &data.context_json,
-                &data.session_id,
-                data.title.as_deref(),
-            );
-            // Reset token counts — the new thread starts from a summary, not the
-            // bloated old context. Carrying the old token counts forward causes
-            // dispatch_action to always choose new-thread AND can re-trigger
-            // ContextOverflow on the fresh thread.
-            // Force new-thread creation regardless of token counts — after Phase 2
-            // the old thread's context is full and the summary must go to a fresh thread.
-            let mut action = data.make_continue_action(next_prompt);
-            action.actual_input_tokens = None;
-            action.approximate_token_count = 0;
-            action.force_new_thread = true;
-            return Ok(AutoPromptOutcome::Continue(action));
-        } else {
-            // Unexpected state — reset and stop
-            clear_summary_for_session(&session_id_str);
-            let stop_reason = "context overflow: unexpected summary state".to_string();
-            reset_iteration_with_session(&data.session_id.to_string());
-            return Ok(AutoPromptOutcome::Stopped {
-                reason: stop_reason,
-            });
-        }
-    } else {
-        // Use lightweight context: last assistant message + plan summaries only.
-        // Reduces token usage from ~80K to ~500 tokens.
-        let lightweight_context = lightweight_context::build_lightweight_orchestration_context(
-            &data.context_json,
-            &data.stop_phase,
-            data.iteration_count,
-            data.had_error,
-        );
-        log::info!(
-            "[auto_prompt::decide_with_llm] Using lightweight context ({} chars) instead of full context ({} chars)",
-            lightweight_context.len(),
-            data.context_json.len(),
-        );
-        call_language_model(&data.model, &data.system_prompt, &lightweight_context, cx).await
-    };
+    // Use lightweight context: last assistant message + plan summaries only.
+    // Reduces token usage from ~80K to ~500 tokens.
+    let lightweight_context = lightweight_context::build_lightweight_orchestration_context(
+        &data.context_json,
+        &data.stop_phase,
+        data.iteration_count,
+        data.had_error,
+    );
+    log::info!(
+        "[auto_prompt::decide_with_llm] Using lightweight context ({} chars) instead of full context ({} chars)",
+        lightweight_context.len(),
+        data.context_json.len(),
+    );
+    let result = call_language_model(&data.model, &data.system_prompt, &lightweight_context, cx)
+        .await;
 
     log::info!(
         "[auto_prompt::decide_with_llm] LLM call completed with result: {:?}",
@@ -1982,6 +2084,17 @@ pub async fn decide_with_llm(
                         );
                         reset_iteration_with_session(&data.session_id.to_string());
                         return Ok(AutoPromptOutcome::Stopped { reason });
+                    } else if let Some(clarification) = maybe_clarification_request(&data) {
+                        // Plan 023 D (req 5): low confidence + the worker's last
+                        // message presents options without a pros/cons layout —
+                        // ask for the trade-off analysis once instead of stopping
+                        // ambiguously. (User-deferral / genuine user-input cases
+                        // were already handled by `is_waiting_for_user_decision`
+                        // above.)
+                        log::warn!(
+                            "auto_prompt: low confidence + unresolved decision point — requesting pros/cons clarification (once per chain)"
+                        );
+                        return Ok(clarification);
                     } else {
                         // Before accepting stop, check plan files for unchecked tasks.
                         // If the LLM explicitly declared ALL tasks blocked (not just some),
@@ -3819,6 +3932,158 @@ fn build_checkbox_verification_prompt(context_json: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Minimal LlmCallData for pure state-machine tests (plan 023 F1). The
+    /// overflow and clarify machines never call the model; the slot just
+    /// satisfies the struct shape.
+    fn overflow_test_data(session: &str, last_assistant_message: Option<&str>) -> LlmCallData {
+        LlmCallData {
+            model: std::sync::Arc::new(
+                language_model::fake_provider::FakeLanguageModel::default(),
+            ),
+            system_prompt: String::new(),
+            context_json: serde_json::json!({"session_id": session}).to_string(),
+            project_root: None,
+            session_id: acp::SessionId::new(session),
+            title: Some("test".to_string()),
+            iteration_count: 1,
+            max_verification_attempts: 0,
+            work_dirs: None,
+            first_user_message: None,
+            original_user_message: None,
+            last_assistant_message: last_assistant_message.map(str::to_string),
+            profile_id: None,
+            actual_input_tokens: Some(300_000),
+            had_error: false,
+            had_api_error: false,
+            stop_phase: context::StopPhase::Working,
+            context_exceeds_limit: true,
+            approximate_token_count: 0,
+            connection: None,
+            project: None,
+            peer_agent_states: None,
+        }
+    }
+
+    #[test]
+    fn context_overflow_phase1_requests_summary() {
+        let session = "overflow-phase1-test";
+        clear_summary_for_session(session);
+        let data = overflow_test_data(session, Some("Working on the parser fix still."));
+        match context_overflow_outcome(&data) {
+            AutoPromptOutcome::ContextOverflow(action) => {
+                assert!(!action.force_new_thread);
+                assert!(action.next_prompt.contains("concise summary"));
+                assert_eq!(summary_state_for(session), 1);
+            }
+            other => panic!("expected ContextOverflow, got {other:?}"),
+        }
+        clear_summary_for_session(session);
+    }
+
+    #[test]
+    fn context_overflow_phase2_forks_new_thread() {
+        let session = "overflow-phase2-test";
+        set_summary_state(session, 1);
+        let data = overflow_test_data(
+            session,
+            Some("## Summary\n\nDid the refactor. Remaining: run clippy."),
+        );
+        match context_overflow_outcome(&data) {
+            AutoPromptOutcome::Continue(action) => {
+                assert!(action.force_new_thread, "Phase 2 must force a new thread");
+                assert_eq!(action.actual_input_tokens, None);
+                assert_eq!(action.approximate_token_count, 0);
+                assert_eq!(summary_state_for(session), 0, "state cleared after Phase 2");
+            }
+            other => panic!("expected Continue, got {other:?}"),
+        }
+        clear_summary_for_session(session);
+    }
+
+    #[test]
+    fn context_overflow_voluntary_summary_skips_phase1() {
+        let session = "overflow-voluntary-test";
+        clear_summary_for_session(session);
+        let data = overflow_test_data(session, Some("## Summary\n\nDone with the task."));
+        match context_overflow_outcome(&data) {
+            AutoPromptOutcome::Continue(action) => {
+                assert!(
+                    action.force_new_thread,
+                    "voluntary summary goes straight to Phase 2"
+                );
+            }
+            other => panic!("expected Continue, got {other:?}"),
+        }
+        clear_summary_for_session(session);
+    }
+
+    #[test]
+    fn append_addition_request_adds_section() {
+        let base = "## 1. Thread Summary\n\nsummary\n\n## 3. Decision\n\ndo work";
+        let result = append_addition_request(base, Some("  also fix the tests  "));
+        assert!(result.contains("## 4. Addition request\n\nalso fix the tests"),
+            "draft should be trimmed and appended: {result}");
+        assert!(result.ends_with("also fix the tests"));
+    }
+
+    #[test]
+    fn append_addition_request_noop_for_empty_or_missing() {
+        let base = "## 3. Decision\n\ndo work";
+        assert_eq!(append_addition_request(base, None), base);
+        assert_eq!(append_addition_request(base, Some("   ")), base);
+    }
+
+    #[test]
+    fn append_addition_request_never_duplicates() {
+        let base = "## 3. Decision\n\ndo work\n\n## 4. Addition request\n\nfirst draft";
+        assert_eq!(append_addition_request(base, Some("second draft")), base);
+    }
+
+    #[test]
+    fn extract_decision_prompt_cuts_at_addition_request() {
+        let prompt = "## 1. Thread Summary\n\nsummary\n\n## 3. Decision\n\ncontinue the work\n\n## 4. Addition request\n\nuser's draft";
+        assert_eq!(
+            extract_decision_prompt(prompt).as_deref(),
+            Some("continue the work")
+        );
+    }
+
+    #[test]
+    fn maybe_clarification_request_fires_once() {
+        let session = "clarify-once-test";
+        let data = overflow_test_data(
+            session,
+            Some("I could take approach 1 or approach 2.\n\nWhich one?"),
+        );
+        let first = maybe_clarification_request(&data);
+        assert!(
+            matches!(&first, Some(AutoPromptOutcome::ClarificationRequest(action)) if !action.force_new_thread
+                && action.next_prompt.contains("pros and cons")),
+            "expected a same-thread clarify prompt, got {first:?}"
+        );
+        assert!(
+            maybe_clarification_request(&data).is_none(),
+            "CLARIFY_REGISTRY must fire at most once per chain"
+        );
+    }
+
+    #[test]
+    fn maybe_clarification_request_skips_existing_pros_cons() {
+        let session = "clarify-proscons-test";
+        let data = overflow_test_data(
+            session,
+            Some("Two options:\n\nPros of A: fast. Cons of A: fragile. Pros of B: safe."),
+        );
+        assert!(maybe_clarification_request(&data).is_none());
+    }
+
+    #[test]
+    fn maybe_clarification_request_skips_without_options() {
+        let session = "clarify-nooptions-test";
+        let data = overflow_test_data(session, Some("Implemented the feature and tests pass."));
+        assert!(maybe_clarification_request(&data).is_none());
+    }
 
     #[test]
     fn test_with_first_prompt_context_multiline() {

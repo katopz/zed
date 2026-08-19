@@ -237,6 +237,71 @@ fn is_list_item_line(line: &str) -> bool {
     }
 }
 
+/// Detect whether the worker's recent paragraphs present an options/decision
+/// point it could resolve itself with a pros/cons layout (plan 023 D, req 5).
+/// Scans the same last-3-paragraph window as the pending-question detector and
+/// deliberately excludes auto_prompt's own summary responses.
+pub(crate) fn mentions_decision_point(last_assistant_message: Option<&str>) -> bool {
+    let Some(msg) = last_assistant_message else {
+        return false;
+    };
+    let msg = msg.trim();
+    if msg.is_empty() || is_auto_prompt_summary_response(msg) {
+        return false;
+    }
+
+    let paragraphs: Vec<&str> = msg
+        .split("\n\n")
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .collect();
+    if paragraphs.is_empty() {
+        return false;
+    }
+    let scan_count = ANSWERER_CONTEXT_PARAGRAPHS.min(paragraphs.len());
+    let window = paragraphs[paragraphs.len() - scan_count..].join("\n\n").to_lowercase();
+
+    const DECISION_PATTERNS: &[&str] = &[
+        "option a",
+        "option b",
+        "option 1",
+        "option 2",
+        "path a",
+        "path b",
+        "approach 1",
+        "approach 2",
+        "two options",
+        "two approaches",
+        "two ways",
+        "alternatives",
+        "pros and cons",
+        "pros/cons",
+        "trade-off",
+        "tradeoffs",
+        "trade-offs",
+        "or should we",
+        "or would you rather",
+    ];
+    if DECISION_PATTERNS.iter().any(|needle| window.contains(needle)) {
+        return true;
+    }
+    // "should i X or Y" deliberation the worker could settle itself.
+    window.contains("should i") && window.contains(" or ")
+}
+
+/// Detect an existing pros/cons layout — the worker already did the
+/// trade-off analysis, so asking for it again would loop (plan 023 D).
+pub(crate) fn has_pros_cons_layout(last_assistant_message: Option<&str>) -> bool {
+    let Some(msg) = last_assistant_message.map(str::trim) else {
+        return false;
+    };
+    if msg.is_empty() {
+        return false;
+    }
+    let lower = msg.to_lowercase();
+    lower.contains("pros") && (lower.contains("cons") || lower.contains("drawbacks"))
+}
+
 /// System prompt for the targeted answerer call. Instructs the model to reason
 /// over the agent's question + preceding paragraphs and emit a JSON answer
 /// reusing the standard `AutoPromptResponse` shape (`next_prompt` carries the
@@ -767,6 +832,55 @@ All done now, committed on develop.";
     }
 
     // ── extract_json_local / parse_answer ─────────────────────────────────
+
+    #[test]
+    fn mentions_decision_point_detects_option_deliberation() {
+        assert!(mentions_decision_point(Some(
+            "I could take approach 1 or approach 2.\n\nWhich one?",
+        )));
+        assert!(mentions_decision_point(Some(
+            "Here are two options:\n\nOption A reuses the cache, Option B is simpler.",
+        )));
+        assert!(mentions_decision_point(Some(
+            "There are trade-offs between the two approaches.",
+        )));
+        assert!(mentions_decision_point(Some(
+            "Should I keep the raw path or should we go latent?",
+        )));
+    }
+
+    #[test]
+    fn mentions_decision_point_skips_plain_and_summary_messages() {
+        assert!(!mentions_decision_point(Some(
+            "Implemented the feature and tests pass.",
+        )));
+        assert!(!mentions_decision_point(Some("")));
+        assert!(!mentions_decision_point(None));
+        // Our own Phase 1 summary responses must never look like a decision point.
+        assert!(!mentions_decision_point(Some(
+            "## 1. Original task\n\nfix parser\n\n## 2. What was accomplished\n\nlots\n\n## 3. What remains to be done\n\noption a or b check",
+        )));
+    }
+
+    #[test]
+    fn mentions_decision_point_only_scans_recent_paragraphs() {
+        let old = "way back in paragraph zero we discussed option a vs option b";
+        let recent = "The implementation is finished.";
+        let msg = format!("{old}\n\nfiller one\n\nfiller two\n\nfiller three\n\n{recent}");
+        assert!(!mentions_decision_point(Some(&msg)));
+    }
+
+    #[test]
+    fn has_pros_cons_layout_detection() {
+        assert!(has_pros_cons_layout(Some(
+            "Pros of A: fast.\n\nCons of A: fragile.",
+        )));
+        assert!(has_pros_cons_layout(Some("pros: speed, drawbacks: latency")));
+        // "drawbacks" without "pros" is not a completed pros/cons layout.
+        assert!(!has_pros_cons_layout(Some("drawbacks include latency")));
+        assert!(!has_pros_cons_layout(Some("no analysis here")));
+        assert!(!has_pros_cons_layout(None));
+    }
 
     #[test]
     fn parse_answer_fenced_json() {

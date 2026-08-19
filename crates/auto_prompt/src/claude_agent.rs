@@ -1,20 +1,26 @@
 //! Claude (ACP) agent auto-prompt decision logic.
 //!
-//! Intentionally simple and isolated from the native-agent path. Claude Code
-//! manages its own context window, compaction, and tool loop internally —
-//! Zed's auto_prompt layer must never stop, compact, or fork a new thread
-//! for it. The only job here is to look at the agent's last 2-3 paragraphs
-//! of output, ask the orchestration LLM whether the task is done, and if not,
-//! produce the next prompt to nudge the same thread forward.
+//! Intentionally simple and isolated from the native-agent path. Below the
+//! context-overflow threshold Claude Code manages its own context window,
+//! compaction, and tool loop internally — Zed's auto_prompt layer must not
+//! stop, compact, or fork a new thread for it. The only job here is to look
+//! at the agent's last 2-3 paragraphs of output, ask the orchestration LLM
+//! whether the task is done, and if not, produce the next prompt to nudge
+//! the same thread forward.
 //!
 //! Contract (do not change without explicit owner sign-off):
-//!   1. Never return `ContextOverflow` — no token-limit triggers.
-//!   2. Never set `force_new_thread = true` — always continue in the same thread.
-//!   3. No pre-stop verification, no max-iterations gate, no rules-based stop
+//!   1. Never return `ContextOverflow` and never set `force_new_thread = true`
+//!      — EXCEPT above `claude_context_overflow_tokens` (default 320k, plan
+//!      023 A3): the thread is near the model ceiling, so `decide_claude`
+//!      routes it through the shared native Phase 1/2 summarize→fork flow
+//!      (`context_overflow_outcome`) via a `NeedsLlmCall` carrying
+//!      `context_exceeds_limit = true`. Below the threshold: always
+//!      same-thread.
+//!   2. No pre-stop verification, no max-iterations gate, no rules-based stop
 //!      — except the session-limit rule (`decide_claude`), which schedules a
 //!      same-thread continuation at the provider's embedded reset time
 //!      instead of consulting the (equally rate-limited) orchestrator.
-//!   4. The only hard stops are: user cancel, no model configured, or the
+//!   3. The only hard stops are: user cancel, no model configured, or the
 //!      configured default model is not Anthropic (see `decide_claude`).
 
 use agent_client_protocol::schema::v1 as acp;
@@ -184,7 +190,10 @@ You receive:
 /// Returns `DispatchAfterDelay` only when a session-limit reset time was
 /// parsed from the worker's turn error or synthetic message (scheduled at
 /// reset + margin; see `session_limit`). Otherwise never returns
-/// `DispatchNow` / `DispatchAfterDelay` / `ContextOverflow`.
+/// `DispatchNow` / `DispatchAfterDelay` / `ContextOverflow` — except above
+/// `claude_context_overflow_tokens` (plan 023 A3), where it returns a
+/// `NeedsLlmCall` with `context_exceeds_limit = true` that the caller routes
+/// through the native shared overflow flow.
 pub fn decide_claude(
     thread: &gpui::Entity<acp_thread::AcpThread>,
     _used_tools: bool,
@@ -252,6 +261,17 @@ pub fn decide_claude(
     // Need a configured model to reason about the next step.
     let registry = language_model::LanguageModelRegistry::read_global(cx);
     let configured_model = registry.default_model();
+
+    // Plan 023 A3 (req 1): context-overflow parity. Above
+    // `claude_context_overflow_tokens` (default 320k) the thread is close to
+    // the model ceiling — route it through the shared native Phase 1/2
+    // summarize→fork flow instead of same-thread continuation. Below the
+    // threshold: unchanged same-thread behavior.
+    if let Some(decision) =
+        claude_context_overflow_decision(thread, configured_model.as_ref(), cx)
+    {
+        return decision;
+    }
 
     // Two orchestrator backends, selected at compile time:
     //
@@ -321,6 +341,92 @@ fn extract_worker_signal(
     maybe_broadcast_summary_to_board(&session_id, full_last_message.as_deref());
 
     Some((session_id, title, work_dirs, last_assistant_message))
+}
+
+/// Pure threshold check for the Claude overflow gate, isolated so the
+/// "no usage data → stay same-thread" policy is unit-testable without a
+/// live thread (plan 023 A3).
+fn claude_tokens_exceed_overflow(effective_tokens: Option<u64>, threshold: usize) -> bool {
+    // Without API-reported usage we cannot distinguish 10k from 400k tokens;
+    // stay on the same-thread path rather than fork on a guess.
+    effective_tokens.is_some_and(|tokens| tokens as usize > threshold)
+}
+
+/// Claude >320k parity gate (plan 023 A3, req 1).
+///
+/// Returns `Some(NeedsLlmCall { context_exceeds_limit: true })` when the
+/// thread's API-reported input tokens exceed `claude_context_overflow_tokens`
+/// — the caller (agent_ui) then routes the decision through the native
+/// `decide_with_llm`, whose shared `context_overflow_outcome` runs Phase 1
+/// (same-thread summarize) → Phase 2 (new thread with inlined summary).
+/// Returns `None` below the threshold, without usage data, or with no
+/// configured model (the normal backends then handle the NoAction).
+fn claude_context_overflow_decision(
+    thread: &gpui::Entity<acp_thread::AcpThread>,
+    configured_model: Option<&language_model::ConfiguredModel>,
+    cx: &App,
+) -> Option<AutoPromptDecision> {
+    let threshold = crate::load_config_cached()
+        .map(|config| config.claude_context_overflow_tokens)
+        .unwrap_or(320_000);
+
+    let thread_ref = thread.read(cx);
+    let effective_tokens = thread_ref.token_usage().map(|usage| usage.input_tokens);
+    if !claude_tokens_exceed_overflow(effective_tokens, threshold) {
+        return None;
+    }
+
+    // The overflow state machine never calls the LLM with `data.model`, but
+    // `LlmCallData` requires the slot — bail like the normal paths when
+    // nothing is configured.
+    let configured = configured_model?;
+
+    let session_id = thread_ref.session_id().clone();
+    log::warn!(
+        "[auto_prompt::claude] effective tokens {:?} > {threshold} — routing to shared context-overflow flow (session={session_id})",
+        effective_tokens
+    );
+
+    let title = thread_ref.title().map(|t| t.to_string());
+    let work_dirs = thread_ref.work_dirs().map(|pl| pl.paths().to_vec());
+    let last_assistant_message = thread_ref.last_assistant_message_text(cx);
+    let plan_files = crate::read_plan_files(thread_ref, None);
+
+    // Shape matches what `detect_remaining_plan_tasks` parses, so Phase 2's
+    // plan-task fallback works on this path too.
+    let context_json = serde_json::json!({
+        "session_id": session_id.to_string(),
+        "last_assistant_message": last_assistant_message,
+        "plan_files": plan_files,
+    })
+    .to_string();
+
+    Some(AutoPromptDecision::NeedsLlmCall(LlmCallData {
+        model: configured.model.clone(),
+        // Unused by the overflow path (Phase 1/2 are deterministic and the
+        // pending-question fast path has its own prompt).
+        system_prompt: String::new(),
+        context_json,
+        project_root: work_dirs.as_ref().and_then(|d| d.first().cloned()),
+        session_id,
+        title,
+        iteration_count: get_iteration(),
+        max_verification_attempts: 0,
+        work_dirs,
+        first_user_message: None,
+        original_user_message: None,
+        last_assistant_message,
+        profile_id: None,
+        actual_input_tokens: effective_tokens,
+        had_error: false,
+        had_api_error: false,
+        stop_phase: crate::context::StopPhase::Working,
+        context_exceeds_limit: true,
+        approximate_token_count: 0,
+        connection: None,
+        project: None,
+        peer_agent_states: crate::peer_states::unmuted_states_for_context(),
+    }))
 }
 
 /// LLM-call backend (default build): package a `NeedsLlmCall` decision carrying
@@ -1089,6 +1195,26 @@ fn truncate_last_paragraphs(text: &str) -> String {
     }
     taken.reverse();
     taken.join("\n\n")
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::claude_tokens_exceed_overflow;
+
+    // Plan 023 A3 (req 1): the gate fires only above the threshold, and never
+    // without API-reported usage.
+    #[test]
+    fn claude_overflow_gate_fires_above_threshold() {
+        assert!(claude_tokens_exceed_overflow(Some(320_001), 320_000));
+        assert!(claude_tokens_exceed_overflow(Some(1_000_000), 320_000));
+    }
+
+    #[test]
+    fn claude_overflow_gate_silent_at_or_below_threshold() {
+        assert!(!claude_tokens_exceed_overflow(Some(320_000), 320_000));
+        assert!(!claude_tokens_exceed_overflow(Some(80_000), 320_000));
+        assert!(!claude_tokens_exceed_overflow(None, 320_000));
+    }
 }
 
 #[cfg(test)]

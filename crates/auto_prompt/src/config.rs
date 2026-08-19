@@ -20,10 +20,19 @@ pub struct AutoPromptConfig {
     #[serde(default = "default_max_iterations")]
     pub max_iterations: u32,
 
-    /// Token count threshold (approximate) at which context is considered too large
-    /// and the system forces a "continue" prompt instead of asking the LLM.
+    /// Token count threshold (approximate) at which the summarize→new-thread
+    /// flow takes over (plan 023). Below it the chain always answers in the
+    /// same thread (req 4); above it Phase 1 asks for a summary on the same
+    /// thread and Phase 2 forks a continuation thread.
     #[serde(default = "default_max_context_tokens")]
     pub max_context_tokens: usize,
+
+    /// Claude (ACP) threads above this many input tokens join the native
+    /// Phase 1/2 summarize→fork flow instead of relying on Claude Code's
+    /// internal compaction alone (plan 023 A3, req 1). Below it, Claude
+    /// always continues in the same thread.
+    #[serde(default = "default_claude_context_overflow_tokens")]
+    pub claude_context_overflow_tokens: usize,
 
     /// Base delay in milliseconds for exponential backoff on errors.
     /// Actual delay = backoff_base_ms * 2^retry_count (capped at 60s).
@@ -43,12 +52,13 @@ pub struct AutoPromptConfig {
     pub max_llm_retries: u32,
 
     /// Token count threshold below which auto-prompt continues in the same thread
-    /// instead of creating a new thread with summary. Only applies to native Zed agent;
-    /// ACP agents (e.g. Claude) always use same-thread /compact regardless of token count.
+    /// instead of creating a new thread with summary. Only applies to native Zed agent.
     /// When the actual input token count exceeds this value, a new thread is created.
     ///
-    /// `0` (the default) = "auto": the threshold is 50% of the active model's max input
-    /// tokens, capped at 100_000. Any positive value overrides this with a fixed threshold.
+    /// `0` (the default) = "auto": since plan 023 the auto value resolves to
+    /// `max_context_tokens` (256k default) — below the overflow gate the chain
+    /// always continues same-thread, and the Phase 1/2 machinery owns forking
+    /// above it. Any positive value overrides this with a fixed threshold.
     #[serde(default = "default_same_thread_token_threshold")]
     pub same_thread_token_threshold: usize,
 
@@ -77,6 +87,15 @@ pub struct AutoPromptConfig {
     /// pre-watchdog behaviour (a hung worker stream stalls forever).
     #[serde(default = "default_watchdog_enabled")]
     pub watchdog_enabled: bool,
+
+    /// Slash command / skill dispatched once when an automatic chain stops
+    /// with no remaining tasks (plan 023 E, req 6) — e.g. a housekeeping
+    /// skill that syncs docs. Availability-checked against the thread's
+    /// agent commands/skills before sending; an unresolvable command logs
+    /// and stops normally, never failing the chain. `None` (or an empty
+    /// string in config/env) disables the hook.
+    #[serde(default = "default_housekeeping_command")]
+    pub housekeeping_command: Option<String>,
 }
 
 fn default_max_iterations() -> u32 {
@@ -84,7 +103,13 @@ fn default_max_iterations() -> u32 {
 }
 
 fn default_max_context_tokens() -> usize {
-    80_000
+    // Plan 023 A1: 256k gate — below it same-thread (req 4), above it the
+    // summarize→fork dance (req 3).
+    256_000
+}
+
+fn default_claude_context_overflow_tokens() -> usize {
+    320_000
 }
 
 fn default_backoff_base_ms() -> u64 {
@@ -116,6 +141,10 @@ fn default_watchdog_enabled() -> bool {
     true
 }
 
+fn default_housekeeping_command() -> Option<String> {
+    Some("housekeeping".to_string())
+}
+
 impl Default for AutoPromptConfig {
     fn default() -> Self {
         Self {
@@ -129,6 +158,8 @@ impl Default for AutoPromptConfig {
             session_limit_margin_secs: default_session_limit_margin_secs(),
             watchdog_timeout_secs: default_watchdog_timeout_secs(),
             watchdog_enabled: default_watchdog_enabled(),
+            claude_context_overflow_tokens: default_claude_context_overflow_tokens(),
+            housekeeping_command: default_housekeeping_command(),
         }
     }
 }
@@ -182,6 +213,12 @@ impl AutoPromptConfig {
             .and_then(|v| v.parse().ok())
             .unwrap_or_else(default_max_context_tokens);
 
+        let claude_context_overflow_tokens =
+            std::env::var("ZED_AUTO_PROMPT_CLAUDE_CONTEXT_OVERFLOW_TOKENS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(default_claude_context_overflow_tokens);
+
         let backoff_base_ms = std::env::var("ZED_AUTO_PROMPT_BACKOFF_BASE_MS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -218,6 +255,14 @@ impl AutoPromptConfig {
             .map(|v| !matches!(v.as_str(), "0" | "false"))
             .unwrap_or_else(default_watchdog_enabled);
 
+        // Set + non-empty → that command; set + empty → explicitly disabled;
+        // unset → default ("housekeeping").
+        let housekeeping_command = match std::env::var("ZED_AUTO_PROMPT_HOUSEKEEPING_COMMAND") {
+            Ok(v) if !v.trim().is_empty() => Some(v.trim().to_string()),
+            Ok(_) => None,
+            Err(_) => default_housekeeping_command(),
+        };
+
         Self {
             system_prompt,
             max_iterations,
@@ -229,6 +274,8 @@ impl AutoPromptConfig {
             session_limit_margin_secs,
             watchdog_timeout_secs,
             watchdog_enabled,
+            claude_context_overflow_tokens,
+            housekeeping_command,
         }
     }
 
@@ -253,5 +300,59 @@ impl AutoPromptConfig {
         crate::invalidate_config_cache();
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn max_context_tokens_defaults_to_256k() {
+        // Plan 023 A1 (req 3/4): 256k gate — below it same-thread, above it
+        // the summarize→fork flow.
+        assert_eq!(default_max_context_tokens(), 256_000);
+        assert_eq!(AutoPromptConfig::default().max_context_tokens, 256_000);
+    }
+
+    #[test]
+    fn claude_context_overflow_tokens_defaults_to_320k() {
+        // Plan 023 A3 (req 1): Claude joins the native overflow flow above 320k.
+        assert_eq!(default_claude_context_overflow_tokens(), 320_000);
+        assert_eq!(
+            AutoPromptConfig::default().claude_context_overflow_tokens,
+            320_000
+        );
+    }
+
+    #[test]
+    fn housekeeping_command_defaults_to_housekeeping() {
+        // Plan 023 E (req 6): default command name, overridable/disablable.
+        assert_eq!(
+            default_housekeeping_command(),
+            Some("housekeeping".to_string())
+        );
+        assert_eq!(
+            AutoPromptConfig::default().housekeeping_command,
+            Some("housekeeping".to_string())
+        );
+    }
+
+    #[test]
+    fn serde_missing_fields_fall_back_to_defaults() {
+        let config: AutoPromptConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.max_context_tokens, 256_000);
+        assert_eq!(config.claude_context_overflow_tokens, 320_000);
+        assert_eq!(
+            config.housekeeping_command,
+            Some("housekeeping".to_string())
+        );
+    }
+
+    #[test]
+    fn serde_null_housekeeping_command_disables() {
+        let config: AutoPromptConfig =
+            serde_json::from_str(r#"{"housekeeping_command": null}"#).unwrap();
+        assert_eq!(config.housekeeping_command, None);
     }
 }

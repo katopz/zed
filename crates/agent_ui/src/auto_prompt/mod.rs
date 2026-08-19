@@ -1,4 +1,4 @@
-use acp_thread::{AgentThreadEntry, MentionUri, ThreadStatus, ToolCallStatus};
+use acp_thread::{AgentThreadEntry, ThreadStatus, ToolCallStatus};
 use agent::ZED_AGENT_ID;
 use agent_client_protocol::schema::v1 as acp;
 use agent_servers::CLAUDE_AGENT_ID;
@@ -12,6 +12,92 @@ use ui::prelude::*;
 use workspace::PathList;
 
 use crate::thread_metadata_store::ThreadMetadataStore;
+
+// ── Plan 023 registries ───────────────────────────────────────────────────
+//
+// B3: input-box drafts stashed at Phase-1/clarify time. Phase 1's `set_message`
+// overwrites the editor and `send()` clears it, so without the stash the draft
+// is destroyed before the new-thread dispatch could carry it. Keyed by the
+// source thread's session id; taken (removed) by `dispatch_action` when the
+// continuation thread is created.
+static DRAFT_STASH: std::sync::RwLock<Option<std::collections::HashMap<String, String>>> =
+    std::sync::RwLock::new(None);
+
+fn stash_draft(session_id: &str, draft: String) {
+    if draft.trim().is_empty() {
+        return;
+    }
+    let mut guard = DRAFT_STASH
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard
+        .get_or_insert_with(std::collections::HashMap::new)
+        .insert(session_id.to_string(), draft);
+}
+
+fn take_stashed_draft(session_id: &str) -> Option<String> {
+    let mut guard = DRAFT_STASH
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard
+        .as_mut()
+        .and_then(|map| map.remove(session_id))
+}
+
+/// Stash the user's current input-box draft for `active_tv`'s thread, if any.
+/// Call BEFORE any `set_message` on the same editor — the editor overwrite is
+/// exactly what destroys the draft otherwise.
+fn stash_live_draft(
+    active_tv: &gpui::Entity<crate::conversation_view::ThreadView>,
+    cx: &gpui::App,
+) {
+    let text = active_tv
+        .read(cx)
+        .message_editor
+        .read(cx)
+        .text(cx)
+        .trim()
+        .to_string();
+    if text.is_empty() {
+        return;
+    }
+    let session_key = active_tv
+        .read(cx)
+        .thread
+        .read(cx)
+        .session_id()
+        .to_string();
+    log::info!(
+        "[auto_prompt] Stashing input-box draft ({} chars) for session {session_key}",
+        text.len()
+    );
+    stash_draft(&session_key, text);
+}
+
+// E: housekeeping runs at most once per thread session when an automatic
+// chain stops with no remaining tasks (plan 023 E, req 6). Sticky by design —
+// cleared never; a stop→housekeeping→stop cycle must not re-fire. The next
+// chain hop gets a fresh session id and a fresh budget.
+static HOUSEKEEPING_REGISTRY: std::sync::RwLock<Option<std::collections::HashMap<String, bool>>> =
+    std::sync::RwLock::new(None);
+
+fn housekeeping_already_run(session_id: &str) -> bool {
+    let guard = HOUSEKEEPING_REGISTRY
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard
+        .as_ref()
+        .is_some_and(|map| map.get(session_id).copied().unwrap_or(false))
+}
+
+fn mark_housekeeping_run(session_id: &str) {
+    let mut guard = HOUSEKEEPING_REGISTRY
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard
+        .get_or_insert_with(std::collections::HashMap::new)
+        .insert(session_id.to_string(), true);
+}
 
 /// Strip the context wrapper produced by `with_first_prompt_context`.
 /// For same-thread continuation (ACP agents) the AI already has full
@@ -287,32 +373,22 @@ pub(crate) fn dispatch_action(
         .active_thread()
         .is_some_and(|tv| tv.read(cx).thread.read(cx).connection().agent_id() == *ZED_AGENT_ID);
 
+    let max_context_tokens = auto_prompt::load_config_cached()
+        .map(|config| config.max_context_tokens)
+        .unwrap_or(256_000);
+
     let same_thread_threshold = match auto_prompt::load_config_cached()
         .map(|config| config.same_thread_token_threshold)
         .unwrap_or(0)
     {
         // Explicit positive override from config/env.
         threshold if threshold > 0 => threshold,
-        // Auto: 50% of the active model's max input tokens, capped at 100k.
-        // 60k fallback applies only before the first usage report populates token_usage.
-        _ => {
-            let max_input: usize = conversation_view
-                .active_thread()
-                .and_then(|tv| {
-                    tv.read(cx)
-                        .thread
-                        .read(cx)
-                        .token_usage()
-                        .and_then(|usage| {
-                            let max_input = usage
-                                .max_tokens
-                                .saturating_sub(usage.max_output_tokens.unwrap_or_default());
-                            (max_input > 0).then(|| max_input as usize)
-                        })
-                })
-                .unwrap_or(60_000);
-            (max_input / 2).clamp(1, 100_000)
-        }
+        // Plan 023 C1: auto mode resolves to the overflow gate
+        // (`max_context_tokens`, 256k default). Below it the chain always
+        // continues same-thread (req 4); above it the Phase 1/2 machinery
+        // owns forking. The old 50%-of-max-input heuristic forked native
+        // threads at ~100k even when the context was fine.
+        _ => max_context_tokens,
     };
 
     // Use actual API-reported tokens when available; fall back to the
@@ -323,7 +399,7 @@ pub(crate) fn dispatch_action(
         .actual_input_tokens
         .map(|t| t as usize)
         .unwrap_or(action.approximate_token_count);
-    let exceeds_same_thread = effective_tokens >= same_thread_threshold;
+    let exceeds_same_thread = effective_tokens > same_thread_threshold;
 
     let use_new_thread = action.force_new_thread || (is_native_agent && exceeds_same_thread);
 
@@ -378,9 +454,12 @@ pub(crate) fn dispatch_action(
             );
             return;
         }
-        // ACP agents (Claude, etc.) must NEVER create new threads — they rely on
-        // conversation history in the same thread. If the active thread is gone,
-        // stop instead of falling through to the new-thread path.
+        // ACP agents (Claude, etc.) must never create new threads on their own
+        // — they rely on conversation history in the same thread. Exception
+        // (plan 023 A3/C1): `force_new_thread` (Claude Phase 2 above 320k)
+        // routes through the new-thread branch before this guard. If the
+        // active thread is gone on an ordinary same-thread continuation, stop
+        // instead of falling through to the new-thread path.
         if !is_native_agent {
             log::warn!(
                 "[auto_prompt] dispatch_action: no active thread for ACP agent continuation, stopping (ACP agents cannot use new threads)"
@@ -399,6 +478,42 @@ pub(crate) fn dispatch_action(
     );
 
     let decision_prompt = auto_prompt::extract_decision_prompt(&action.next_prompt);
+
+    // Plan 023 B3 (req 2.1): carry the user's input-box draft into the new
+    // thread as `## 4. Addition request`. Prefer the draft stashed at
+    // Phase-1/clarify time (set_message + send destroy it); fall back to a
+    // live read for the voluntary-summary path, which skips Phase 1.
+    let session_key = action.from_session_id.to_string();
+    let live_draft = conversation_view.active_thread().and_then(|active_tv| {
+        let text = active_tv
+            .read(cx)
+            .message_editor
+            .read(cx)
+            .text(cx)
+            .trim()
+            .to_string();
+        (!text.is_empty()).then_some(text)
+    });
+    let (draft, clear_live_editor) = match take_stashed_draft(&session_key) {
+        Some(stashed) => (Some(stashed), false),
+        None => (live_draft.clone(), live_draft.is_some()),
+    };
+    if clear_live_editor {
+        // The live draft rides in the new thread; clear it here so it is
+        // neither lost nor duplicated.
+        if let Some(active_tv) = conversation_view.active_thread() {
+            active_tv.update(cx, |tv, cx| {
+                tv.message_editor
+                    .update(cx, |editor, cx| editor.set_message(vec![], window, cx));
+            });
+        }
+    }
+    if let Some(draft) = draft.as_deref() {
+        log::info!(
+            "[auto_prompt] dispatch_action: carrying input-box draft ({} chars) as ## 4. Addition request",
+            draft.len()
+        );
+    }
 
     // Continuation threads must inherit the agent of the thread they're
     // continuing, not whatever agent happens to be the panel's stale
@@ -450,49 +565,41 @@ pub(crate) fn dispatch_action(
             let from_session_id = action.from_session_id.clone();
             let from_title = action.from_title.clone();
 
-            let initial_content = if action.last_assistant_message.is_some()
-                || decision_prompt.is_some()
-            {
-                let follow_up = crate::AgentPanel::build_auto_prompt_follow_up(
+            // Plan 023 B4 (req 2.2): always inline the summary as a
+            // ContentBlock. The previous ThreadSummary path inserted an
+            // `@thread` mention that made the new thread re-summarize the old
+            // one with a full LLM call (the "blinking" loading indicator) —
+            // redundant because the summary is already the last assistant
+            // message. `set_continued_from` below preserves the sidebar link.
+            let initial_content = {
+                let decision = decision_prompt
+                    .clone()
+                    .unwrap_or_else(|| action.next_prompt.clone());
+                let prompt_summary = auto_prompt::build_prompt_summary(
+                    None,
+                    from_title.as_deref(),
+                    Some("context overflow: continuing in new thread with summary"),
                     action.last_assistant_message.as_deref(),
-                    decision_prompt.as_deref(),
+                    action.original_user_message.as_deref(),
+                    None,
                 );
-
+                let mut full_prompt = auto_prompt::with_first_prompt_context(
+                    decision,
+                    prompt_summary.as_deref(),
+                    from_title.as_deref(),
+                    action.last_assistant_message.as_deref(),
+                );
+                if let Some(draft) = draft.as_deref() {
+                    full_prompt =
+                        auto_prompt::append_addition_request(&full_prompt, Some(draft));
+                }
                 log::info!(
-                    "[auto_prompt] dispatch_action: using ThreadSummary with follow_up ({} chars)",
-                    follow_up.as_ref().map_or(0, |s| s.len())
+                    "[auto_prompt] dispatch_action: new thread via ContentBlock ({} chars, draft={})",
+                    full_prompt.len(),
+                    draft.is_some()
                 );
-
-                crate::AgentInitialContent::ThreadSummary {
-                    session_id: from_session_id,
-                    title: from_title.map(gpui::SharedString::from),
-                    follow_up,
-                    auto_submit: true,
-                }
-            } else {
-                let next_prompt = action.next_prompt.clone();
-
-                let raw_title = from_title.as_deref().unwrap_or("Thread");
-                let mut clean_title = raw_title.to_string();
-                while let Some(rest) = clean_title.strip_prefix("[@") {
-                    if let Some(end) = rest.find("](zed:///agent/thread/") {
-                        clean_title = rest[..end].to_string();
-                    } else {
-                        break;
-                    }
-                }
-
-                let mention_uri = MentionUri::Thread {
-                    id: from_session_id,
-                    name: clean_title,
-                };
-                let summary_link = format!("{}\n\n", mention_uri.as_link());
-                let full_prompt = format!("{summary_link}{next_prompt}");
-
-                let blocks = vec![acp::ContentBlock::Text(acp::TextContent::new(full_prompt))];
-
                 crate::AgentInitialContent::ContentBlock {
-                    blocks,
+                    blocks: vec![acp::ContentBlock::Text(acp::TextContent::new(full_prompt))],
                     auto_submit: true,
                     auto_prompt_enabled: true,
                     profile_id: action.profile_id.clone(),
@@ -500,12 +607,9 @@ pub(crate) fn dispatch_action(
             };
 
             panel.update(cx, |panel, cx| {
-                let continued_from = match &initial_content {
-                    crate::AgentInitialContent::ThreadSummary { session_id, .. } => {
-                        Some(session_id.clone())
-                    }
-                    _ => None,
-                };
+                // Plan 023 B4: continued-from metadata no longer derives from
+                // the ThreadSummary variant — track it from the action directly.
+                let continued_from = Some(from_session_id.clone());
                 // When the user has not opted into auto-focus, create the
                 // continuation thread in the background (retained_threads)
                 // instead of replacing the active base_view. This avoids
@@ -814,10 +918,15 @@ fn run_auto_prompt(
 
                 let mut data = data;
 
-                // Claude path keeps its own minimal system prompt and skips the
-                // native path's plan/summary/verification prompt overrides.
-                // The native path may still apply AUTO_PROMPT.md / store prompt.
-                if !is_claude_agent_for_task {
+                // Plan 023 A3: Claude threads above the overflow threshold
+                // arrive as NeedsLlmCall with context_exceeds_limit=true —
+                // route them through the native decide_with_llm so the shared
+                // Phase 1/2 machine handles them. Everything else on the
+                // Claude path keeps its own minimal system prompt and skips
+                // the native prompt overrides.
+                let use_native_flow = !is_claude_agent_for_task || data.context_exceeds_limit;
+
+                if use_native_flow {
                     let store_prompt_result = load_auto_prompt_system_prompt(cx).await;
                     match config.system_prompt.as_ref() {
                         Some(prompt) => data.system_prompt = prompt.clone(),
@@ -883,10 +992,10 @@ fn run_auto_prompt(
                     }
                 }
 
-                let mut result = if is_claude_agent_for_task {
-                    auto_prompt::claude_agent::decide_claude_async(data.clone(), cx).await
-                } else {
+                let mut result = if use_native_flow {
                     auto_prompt::decide_with_llm(data.clone(), cx).await
+                } else {
+                    auto_prompt::claude_agent::decide_claude_async(data.clone(), cx).await
                 };
 
                 // Unified retry loop with exponential backoff. Handles two retry triggers:
@@ -955,10 +1064,10 @@ fn run_auto_prompt(
                     }
 
                     log::info!("[auto_prompt] Retrying LLM call ({retry_label})");
-                    result = if is_claude_agent_for_task {
-                        auto_prompt::claude_agent::decide_claude_async(data.clone(), cx).await
-                    } else {
+                    result = if use_native_flow {
                         auto_prompt::decide_with_llm(data.clone(), cx).await
+                    } else {
+                        auto_prompt::claude_agent::decide_claude_async(data.clone(), cx).await
                     };
                 }
 
@@ -1025,6 +1134,10 @@ fn run_auto_prompt(
                         );
                         match _view.update_in(cx, |_view, window, cx| {
                             if let Some(active_tv) = _view.active_thread() {
+                                // Plan 023 B3: stash the user's draft BEFORE
+                                // set_message overwrites it — Phase 2 will carry
+                                // it into the new thread as ## 4.
+                                stash_live_draft(&active_tv, cx);
                                 let prompt = action.next_prompt.clone();
                                 active_tv.update(cx, |tv, cx| {
                                     tv.message_editor.update(cx, |editor, cx| {
@@ -1049,6 +1162,57 @@ fn run_auto_prompt(
                             Err(err) => {
                                 log::warn!(
                                     "[auto_prompt] FAILED to dispatch context overflow (view may have been dropped): {err}"
+                                );
+                            }
+                        }
+                    }
+                    Ok(auto_prompt::AutoPromptOutcome::ClarificationRequest(action)) => {
+                        auto_prompt::reset_llm_failure_count();
+                        if let Some(ref tv) = thread_weak {
+                            if let Err(err) = tv.update(cx, |tv, cx| {
+                                tv._auto_prompt_task = None;
+                                tv.auto_prompt_state = AutoPromptState::Idle;
+                                cx.notify();
+                            }) {
+                                log::warn!(
+                                    "[auto_prompt] failed to reset state before clarification dispatch: {err}"
+                                );
+                            }
+                        }
+
+                        // Plan 023 D (req 5): same-thread pros/cons clarification.
+                        // Stash the draft first — set_message would destroy it
+                        // (B3), and the eventual new-thread fork carries it.
+                        log::info!(
+                            "[auto_prompt] ClarificationRequest — sending pros/cons prompt to same thread"
+                        );
+                        match _view.update_in(cx, |_view, window, cx| {
+                            if let Some(active_tv) = _view.active_thread() {
+                                stash_live_draft(&active_tv, cx);
+                                let prompt = action.next_prompt.clone();
+                                active_tv.update(cx, |tv, cx| {
+                                    tv.message_editor.update(cx, |editor, cx| {
+                                        editor.set_message(
+                                            vec![acp::ContentBlock::Text(acp::TextContent::new(prompt))],
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                    tv.send(window, cx);
+                                });
+                                log::info!(
+                                    "[auto_prompt] ClarificationRequest sent to same thread"
+                                );
+                            } else {
+                                log::warn!(
+                                    "[auto_prompt] ClarificationRequest: no active thread, dropping"
+                                );
+                            }
+                        }) {
+                            Ok(()) => {}
+                            Err(err) => {
+                                log::warn!(
+                                    "[auto_prompt] FAILED to dispatch clarification (view may have been dropped): {err}"
                                 );
                             }
                         }
@@ -1081,6 +1245,73 @@ fn run_auto_prompt(
                                 ),
                             }
                             return;
+                        }
+
+                        // Plan 023 E (req 6): when an automatic chain stops with
+                        // nothing left to do, run the configured housekeeping
+                        // skill once (e.g. doc-sync). Availability-checked
+                        // against the thread's agent commands/skills — an
+                        // unresolvable command logs and stops normally, never
+                        // failing the chain. The next stop sees the registry
+                        // entry and truly stops.
+                        let housekeeping_command = auto_prompt::load_config_cached()
+                            .ok()
+                            .and_then(|config| config.housekeeping_command)
+                            .map(|command| command.trim().to_string())
+                            .filter(|command| !command.is_empty());
+                        let housekeeping_session_key = data.session_id.to_string();
+                        if let Some(command) = housekeeping_command
+                            .filter(|_| !housekeeping_already_run(&housekeeping_session_key))
+                        {
+                            let dispatched = _view
+                                .update_in(cx, |_view, window, cx| {
+                                    let Some(active_tv) = _view.active_thread() else {
+                                        return false;
+                                    };
+                                    // The command must resolve as a slash command
+                                    // or skill for this thread's agent, else the
+                                    // send would fail validation.
+                                    let capabilities =
+                                        active_tv.read(cx).session_capabilities.clone();
+                                    let available = {
+                                        let caps = capabilities.read();
+                                        caps.available_commands()
+                                            .iter()
+                                            .any(|c| c.name == command)
+                                            || caps
+                                                .available_skills()
+                                                .iter()
+                                                .any(|s| s.name.as_ref() == command)
+                                    };
+                                    if !available {
+                                        log::info!(
+                                            "[auto_prompt] Housekeeping command '{command}' not available for this agent — skipping"
+                                        );
+                                        return false;
+                                    }
+                                    mark_housekeeping_run(&housekeeping_session_key);
+                                    let prompt = format!("/{command}");
+                                    active_tv.update(cx, |tv, cx| {
+                                        tv.message_editor.update(cx, |editor, cx| {
+                                            editor.set_message(
+                                                vec![acp::ContentBlock::Text(
+                                                    acp::TextContent::new(prompt),
+                                                )],
+                                                window,
+                                                cx,
+                                            );
+                                        });
+                                        tv.send(window, cx);
+                                    });
+                                    true
+                                })
+                                .unwrap_or(false);
+                            if dispatched {
+                                log::warn!(
+                                    "[auto_prompt] Housekeeping skill '{command}' dispatched (session={housekeeping_session_key}) — chain will stop on next halt"
+                                );
+                                return;
+                            }
                         }
 
                         if let Some(ref workspace) = workspace_weak {
@@ -1524,5 +1755,36 @@ pub fn cancel_watchdog_for_thread(
         view.update(cx, |view, _cx| {
             view.cancel_watchdog();
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Plan 023 B3: drafts are keyed by session id, stash skips empties, take
+    // removes (once).
+    #[test]
+    fn draft_stash_roundtrip() {
+        stash_draft("draft-test-session", "fix the flaky test".to_string());
+        assert_eq!(
+            take_stashed_draft("draft-test-session").as_deref(),
+            Some("fix the flaky test")
+        );
+        assert_eq!(take_stashed_draft("draft-test-session"), None);
+    }
+
+    #[test]
+    fn draft_stash_ignores_empty_drafts() {
+        stash_draft("draft-empty-test", "   ".to_string());
+        assert_eq!(take_stashed_draft("draft-empty-test"), None);
+    }
+
+    // Plan 023 E: housekeeping fires at most once per session.
+    #[test]
+    fn housekeeping_registry_once_per_session() {
+        assert!(!housekeeping_already_run("housekeeping-test-session"));
+        mark_housekeeping_run("housekeeping-test-session");
+        assert!(housekeeping_already_run("housekeeping-test-session"));
     }
 }

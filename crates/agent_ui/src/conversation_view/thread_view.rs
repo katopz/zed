@@ -6429,6 +6429,32 @@ impl ThreadView {
                                 "[auto_prompt] Retry returned RetryAfterBackoff — waiting {delay_ms}ms suggested; reason: {reason}"
                             );
                         }
+                        Ok(auto_prompt::AutoPromptOutcome::ClarificationRequest(action)) => {
+                            // Plan 023 D: manual retry got a clarify verdict —
+                            // dispatch_action sends it to the same thread
+                            // (force_new_thread=false, tokens below threshold).
+                            auto_prompt::reset_llm_failure_count();
+                            if let Some(ref tv) = thread_weak {
+                                if let Err(err) = tv.update(cx, |tv, cx| {
+                                    tv.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;
+                                    tv._auto_prompt_retry_data = None;
+                                    cx.notify();
+                                }) {
+                                    log::warn!("[auto_prompt] failed to reset state on retry clarify: {err}");
+                                }
+                            }
+                            log::info!("[auto_prompt] Retry clarification — dispatching pros/cons prompt");
+                            match conversation_view.update_in(cx, |_cv, window, cx| {
+                                crate::auto_prompt::dispatch_action(action, _cv, window, cx);
+                            }) {
+                                Ok(()) => {
+                                    log::info!("[auto_prompt] Retry clarification dispatch submitted");
+                                }
+                                Err(err) => {
+                                    log::warn!("[auto_prompt] FAILED to dispatch retry clarification: {err}");
+                                }
+                            }
+                        }
                         Err(err) => {
                             // Retry failed again - set back to Failed state and restore retry data
                             if let Some(ref tv) = thread_weak {

@@ -129,23 +129,23 @@ substrate.
 
 ## Tasks
 
-- [ ] A1. `config.rs`: `max_context_tokens` default 256_000; add `claude_context_overflow_tokens` (320_000) + env var; serde/default/tests
-- [ ] A2. `auto_prompt.rs`: extract Phase 1/2 into `context_overflow_outcome`; native path calls it (no behavior change)
-- [ ] A3. `claude_agent.rs`: effective-token gate → route >320k through `context_overflow_outcome`; below unchanged; module doc rewrite
-- [ ] B1. `with_first_prompt_context`: `addition_request` param → `## 4. Addition request` section
-- [ ] B2. `extract_decision_prompt` + `strip_first_prompt_wrapper`: stop at `## 4.` boundary
-- [ ] B3. `agent_ui/auto_prompt/mod.rs`: `DRAFT_STASH`; stash in ContextOverflow arm pre-`set_message`; take + append `## 4.` + clear editor in `dispatch_action` new-thread branch
-- [ ] B4. `dispatch_action` + `agent_panel.rs` `AutoPromptNewThread`: `ThreadSummary` → `ContentBlock` (summary inlined, keep `set_continued_from`, keep focus behavior)
-- [ ] C1. `dispatch_action`: `use_new_thread = force_new_thread || (native && tokens > max_context_tokens)`; `same_thread_token_threshold` auto = overflow threshold; ACP guard allows `force_new_thread`
-- [ ] D1. `AutoPromptOutcome::ClarificationRequest` + `CLARIFY_REGISTRY` (once per chain)
-- [ ] D2. Options/pros-cons detector (extend `pending_question`); low-confidence branch in `decide_with_llm` returns it
-- [ ] D3. UI arm: same-thread clarify dispatch in `run_auto_prompt`
-- [ ] E1. `config.rs`: `housekeeping_command` (default `housekeeping`, empty = off)
-- [ ] E2. `run_auto_prompt` Stopped arm: skill-resolve check + `HOUSEKEEPING_REGISTRY` once-guard + same-thread dispatch
-- [ ] F1. Tests: config defaults; claude >320k ContextOverflow / <320k unchanged; #4 section + decision-boundary cut; draft stash carry; voluntary-summary still skips Phase 1; clarify fires once + skips existing pros/cons; housekeeping fires once + skips missing skill
-- [ ] F2. `./script/clippy` clean on touched crates (`auto_prompt`, `agent_ui`)
-- [ ] F3. Update user's `~/.config/zed/auto_prompt.json` if it pins `max_context_tokens` (stale 80k override would defeat A1)
-- [ ] F4. `.docs/` note + close out
+- [x] A1. `config.rs`: `max_context_tokens` default 256_000; add `claude_context_overflow_tokens` (320_000) + env var; serde/default/tests
+- [x] A2. `auto_prompt.rs`: extract Phase 1/2 into `context_overflow_outcome`; native path calls it (no behavior change)
+- [x] A3. `claude_agent.rs`: effective-token gate → route >320k through `context_overflow_outcome`; below unchanged; module doc rewrite
+- [x] B1. `with_first_prompt_context`: addition carried as `## 4. Addition request` — implemented as `auto_prompt::append_addition_request` applied at dispatch time (avoids touching all 13 `with_first_prompt_context` call sites; same payload)
+- [x] B2. `extract_decision_prompt` cuts at `## 4. Addition request` boundary (`strip_first_prompt_wrapper` untouched — same-thread prompts never carry `## 4`)
+- [x] B3. `agent_ui/auto_prompt/mod.rs`: `DRAFT_STASH`; stash in ContextOverflow + ClarificationRequest arms pre-`set_message`; take + append `## 4.` + clear editor in `dispatch_action` new-thread branch (live-read fallback covers the voluntary-summary path)
+- [x] B4. `dispatch_action` + `agent_panel.rs` `AutoPromptNewThread`: `ThreadSummary` → `ContentBlock` (summary inlined, keep `set_continued_from` via `action.from_session_id`, keep focus behavior; orphaned `build_auto_prompt_follow_up` removed)
+- [x] C1. `dispatch_action`: `use_new_thread = force_new_thread || (native && tokens > max_context_tokens)`; `same_thread_token_threshold` auto = overflow threshold (explicit overrides honored); ACP guard allows `force_new_thread`
+- [x] D1. `AutoPromptOutcome::ClarificationRequest` + `CLARIFY_REGISTRY` (once per chain, sticky — deliberately NOT cleared on stop so stop→clarify→stop cannot loop)
+- [x] D2. `pending_question`: `mentions_decision_point` + `has_pros_cons_layout`; low-confidence WantsStop branch returns it (after `is_waiting_for_user_decision`, before plan fallback; also added arm to thread_view.rs manual-retry match)
+- [x] D3. UI arm: same-thread clarify dispatch in `run_auto_prompt` (with draft stash)
+- [x] E1. `config.rs`: `housekeeping_command` (default `housekeeping`, empty/null = off)
+- [x] E2. `run_auto_prompt` Stopped arm: session-capabilities resolve check (commands + skills) + `HOUSEKEEPING_REGISTRY` once-guard + same-thread dispatch
+- [x] F1. Tests: 21 new in auto_prompt + 3 in agent_ui — config defaults/serde-null, overflow Phase 1/Phase 2/voluntary-skip, #4 append + decision-boundary cut, clarify once/skip detectors, Claude gate pure check, draft stash roundtrip, housekeeping once-guard
+- [x] F2. `./script/clippy`-equivalent clean on touched crates (`cargo clippy -p auto_prompt -p agent_ui --release --all-targets --all-features -- --deny warnings` → exit 0)
+- [x] F3. Updated `~/.config/zed/auto_prompt.json` `max_context_tokens` 80000 → 256000 (stale override would defeat A1)
+- [x] F4. `.docs/008_unified_context_overflow_flow.md` + this close-out
 
 ## Gate / perf notes
 

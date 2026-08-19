@@ -501,65 +501,49 @@ pub fn init(cx: &mut App) {
                         let from_session_id = action.from_session_id.clone();
                         let from_title = action.from_title.clone();
 
-                        let initial_content =
-                            if action.last_assistant_message.is_some()
-                                || action.decision_prompt.is_some()
-                            {
-                                let follow_up = AgentPanel::build_auto_prompt_follow_up(
-                                    action.last_assistant_message.as_deref(),
-                                    action.decision_prompt.as_deref(),
-                                );
-
-                                log::info!(
-                                    "[auto_prompt] AutoPromptNewThread action: using ThreadSummary with follow_up ({} chars)",
-                                    follow_up.as_ref().map_or(0, |s| s.len())
-                                );
-
-                                AgentInitialContent::ThreadSummary {
-                                    session_id: from_session_id,
-                                    title: from_title.map(SharedString::from),
-                                    follow_up,
-                                    auto_submit: true,
-                                }
-                            } else {
-                                let next_prompt = action.next_prompt.clone();
-
-                                let raw_title = from_title.as_deref().unwrap_or("Thread");
-                                let mut clean_title = raw_title.to_string();
-                                while let Some(rest) = clean_title.strip_prefix("[@") {
-                                    if let Some(end) = rest.find("](zed:///agent/thread/") {
-                                        clean_title = rest[..end].to_string();
-                                    } else {
-                                        break;
-                                    }
-                                }
-
-                                let mention_uri = MentionUri::Thread {
-                                    id: from_session_id,
-                                    name: clean_title,
-                                };
-                                let summary_link = format!("{}\n\n", mention_uri.as_link());
-                                let full_prompt = format!("{summary_link}{next_prompt}");
-
-                                let blocks = vec![acp::ContentBlock::Text(acp::TextContent::new(
+                        // Plan 023 B4: inline the summary as a ContentBlock
+                        // instead of ThreadSummary — the @thread mention made
+                        // the new thread re-summarize the old one with a full
+                        // LLM call even though the summary is already the last
+                        // assistant message. `set_continued_from` below
+                        // preserves the sidebar link.
+                        let initial_content = {
+                            let decision = action
+                                .decision_prompt
+                                .clone()
+                                .unwrap_or_else(|| action.next_prompt.clone());
+                            let prompt_summary = auto_prompt::build_prompt_summary(
+                                None,
+                                from_title.as_deref(),
+                                Some("context overflow: continuing in new thread with summary"),
+                                action.last_assistant_message.as_deref(),
+                                action.original_user_message.as_deref(),
+                                None,
+                            );
+                            let full_prompt = auto_prompt::with_first_prompt_context(
+                                decision,
+                                prompt_summary.as_deref(),
+                                from_title.as_deref(),
+                                action.last_assistant_message.as_deref(),
+                            );
+                            log::info!(
+                                "[auto_prompt] AutoPromptNewThread action: new thread via ContentBlock ({} chars)",
+                                full_prompt.len()
+                            );
+                            AgentInitialContent::ContentBlock {
+                                blocks: vec![acp::ContentBlock::Text(acp::TextContent::new(
                                     full_prompt,
-                                ))];
-
-                                AgentInitialContent::ContentBlock {
-                                    blocks,
-                                    auto_submit: true,
-                                    auto_prompt_enabled: true,
-                                    profile_id: action.profile_id.clone(),
-                                }
-                            };
+                                ))],
+                                auto_submit: true,
+                                auto_prompt_enabled: true,
+                                profile_id: action.profile_id.clone(),
+                            }
+                        };
 
                         panel.update(cx, |panel, cx| {
-                            let continued_from = match &initial_content {
-                                AgentInitialContent::ThreadSummary { session_id, .. } => {
-                                    Some(session_id.clone())
-                                }
-                                _ => None,
-                            };
+                            // Plan 023 B4: track continued-from from the action
+                            // directly (no longer derived from ThreadSummary).
+                            let continued_from = Some(from_session_id.clone());
                             let new_thread_id = panel.external_thread(
                                 None,
                                 None,
@@ -3765,34 +3749,6 @@ impl AgentPanel {
             })
         })
         .detach_and_log_err(cx);
-    }
-
-    pub(crate) fn build_auto_prompt_follow_up(
-        last_assistant_message: Option<&str>,
-        decision_prompt: Option<&str>,
-    ) -> Option<String> {
-        let mut parts = Vec::new();
-
-        if let Some(last) = last_assistant_message.filter(|s| !s.trim().is_empty()) {
-            parts.push("## 2. Last Assistant Message".to_string());
-            parts.push(String::new());
-            parts.push(last.trim().to_string());
-            parts.push(String::new());
-            parts.push("---".to_string());
-        }
-
-        if let Some(decision) = decision_prompt.filter(|s| !s.trim().is_empty()) {
-            parts.push(String::new());
-            parts.push("## 3. Decision".to_string());
-            parts.push(String::new());
-            parts.push(decision.trim().to_string());
-        }
-
-        if parts.is_empty() {
-            None
-        } else {
-            Some(parts.join("\n"))
-        }
     }
 
     fn initial_content_for_thread_summary(
