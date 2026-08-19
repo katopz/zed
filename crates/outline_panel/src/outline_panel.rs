@@ -5042,7 +5042,7 @@ impl Panel for OutlinePanel {
     }
 
     fn activation_priority(&self) -> u32 {
-        6
+        7
     }
 
     fn hide_button_setting(&self, _: &App) -> Option<workspace::HideStatusItem> {

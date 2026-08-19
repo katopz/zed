@@ -1537,7 +1537,7 @@ impl Panel for DebugPanel {
     }
 
     fn activation_priority(&self) -> u32 {
-        7
+        8
     }
 
     fn hide_button_setting(&self, _: &App) -> Option<workspace::HideStatusItem> {
