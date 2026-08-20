@@ -262,8 +262,8 @@ async function main() {
   }
 
   // T8b — WS positive with a real GitHub token (optional: only when
-  // AGENT_BOARD_GITHUB_PAT is provided). Verifies the allowlist: a PAT for
-  // ALLOWED_LOGIN passes, anything else closes 4001.
+  // AGENT_BOARD_GITHUB_PAT is provided). The operator's PAT authenticates;
+  // the login allowlist is only enforced when ALLOWED_LOGIN is set.
   if (process.env.AGENT_BOARD_GITHUB_PAT) {
     const c = await wsConnect(ROOM);
     const outcome = await new Promise((resolve) => {

@@ -28,6 +28,8 @@ STALE_STATUS_SECS = "300"
 # device flow needs no client secret. Create an OAuth App (any callback URL,
 # e.g. the worker URL) and ENABLE the Device Flow checkbox in its advanced
 # settings, then paste its client id here.
-GITHUB_CLIENT_ID = ""
+GITHUB_CLIENT_ID = "Iv23li2pZ9Pmv79Y77Fh"
 # Login allowlist for the web dashboard (GitHub login, not email).
-ALLOWED_LOGIN = "katopz"
+# Blank = any GitHub account that completes the device flow may sign in
+# (the client_id alone does not restrict who can authorize the app).
+ALLOWED_LOGIN = ""

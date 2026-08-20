@@ -130,15 +130,20 @@ async function sha256Hex(text) {
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-// Verify a GitHub user token: ask GitHub whose it is, then check the login
-// against the allowlist. Returns { ok: true, login } or { ok: false, error }.
+// Verify a GitHub user token by asking GitHub whose it is. When ALLOWED_LOGIN
+// is set (non-blank) the login must match it (case-insensitive); when blank or
+// unset, any GitHub account that completed the device flow is accepted — the
+// client_id alone does NOT restrict who can authorize the app.
+// Returns { ok: true, login } or { ok: false, error }.
 async function verifyGithubToken(env, token) {
   if (!token) return { ok: false, error: "missing token" };
-  const allowedLogin = (env.ALLOWED_LOGIN || "katopz").toLowerCase();
+  const allowedLogin = String(env.ALLOWED_LOGIN ?? "").trim().toLowerCase();
+  const isLoginAllowed = (login) =>
+    allowedLogin === "" || login.toLowerCase() === allowedLogin;
   const key = await sha256Hex(token);
   const cached = githubTokenCache.get(key);
   if (cached && cached.expiresAt > Date.now()) {
-    return cached.login.toLowerCase() === allowedLogin
+    return isLoginAllowed(cached.login)
       ? { ok: true, login: cached.login }
       : { ok: false, error: `login ${cached.login} not allowlisted` };
   }
@@ -156,7 +161,7 @@ async function verifyGithubToken(env, token) {
     const user = await res.json();
     const login = String(user.login ?? "");
     if (!login) return { ok: false, error: "token has no login" };
-    if (login.toLowerCase() !== allowedLogin) {
+    if (!isLoginAllowed(login)) {
       return { ok: false, error: `login ${login} not allowlisted` };
     }
     githubTokenCache.set(key, { login, expiresAt: Date.now() + GITHUB_VERIFY_TTL_MS });
