@@ -63,5 +63,5 @@ auto-answer with the **least-privileged allow** option after a countdown.
 - [x] Tests: auto-allow fires after timeout; no auto-allow by default
 - [x] Update user settings.json with 30s
 - [x] Clippy + targeted tests green
-- [ ] Commit `feat:` on develop
+- [x] Commit `feat:` on develop (3ffef69ab4, pushed)
 - [-] Settings-UI page row (deferred; JSON-only is fine for now)
