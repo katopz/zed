@@ -1417,13 +1417,19 @@ pub(crate) fn context_overflow_outcome(data: &LlmCallData) -> AutoPromptOutcome 
         //      they're the most authoritative source of what to do next).
         //   2. Unchecked tasks in current-repo plan files (the session's
         //      actual target project, not a noisy neighbour repo).
-        //   3. Unchecked tasks in other-repo plan files (last-resort).
-        //   4. Generic "continue" fallback.
+        //   3. Unchecked tasks in other-repo plan files.
+        //   4. Summary declares nothing left → housekeeping prompt
+        //      (skills, mining, re-bench, other repos, stop).
+        //   5. Generic "continue" fallback.
         //
         // `detect_remaining_work` is intentionally NOT consulted here: it
         // skips auto_prompt summary responses (see its guard) to avoid
         // re-summarization loops in the safety-net path. Phase 2 wants the
         // summary's guidance, so we use `extract_summary_next_steps` instead.
+        let summary_continuation = data
+            .last_assistant_message
+            .as_deref()
+            .and_then(extract_summary_next_steps);
         let continuation = if llm_acknowledged_all_tasks_blocked(
             data.last_assistant_message.as_deref(),
         ) {
@@ -1431,38 +1437,50 @@ pub(crate) fn context_overflow_outcome(data: &LlmCallData) -> AutoPromptOutcome 
                 "auto_prompt: ContextOverflow — LLM acknowledged blocked tasks, using generic continuation"
             );
             "Continue from where we left off.".to_string()
-        } else if let Some(steps) = data
-            .last_assistant_message
-            .as_deref()
-            .and_then(extract_summary_next_steps)
-        {
+        } else if let Some(SummaryContinuation::Steps(steps)) = &summary_continuation {
             log::warn!(
                 "auto_prompt: ContextOverflow Phase 2 — using summary's Recommended Next Steps as continuation"
             );
-            steps
-        } else if let Some(plan_prompt) = detect_remaining_plan_tasks(
-            &data.context_json,
-            PlanRepoFilter::CurrentRepo,
-            data.work_dirs.as_deref(),
-        ) {
-            log::warn!(
-                "auto_prompt: ContextOverflow Phase 2 — no summary next steps, falling back to current-repo plan tasks"
-            );
-            plan_prompt
-        } else if let Some(plan_prompt) = detect_remaining_plan_tasks(
-            &data.context_json,
-            PlanRepoFilter::OtherRepos,
-            data.work_dirs.as_deref(),
-        ) {
-            log::warn!(
-                "auto_prompt: ContextOverflow Phase 2 — no current-repo tasks, falling back to other-repo plan tasks"
-            );
-            plan_prompt
+            steps.clone()
         } else {
-            log::info!(
-                "auto_prompt: ContextOverflow Phase 2 — no detectors matched, generic continuation"
-            );
-            "Continue from where we left off.".to_string()
+            // No actionable steps in the summary (none found, or the summary
+            // explicitly declares nothing left). Fall back to unclaimed plan
+            // tasks: current repo first, then other repos. Only when no plan
+            // tasks remain does a nothing-left summary switch to housekeeping.
+            let plan_prompt = detect_remaining_plan_tasks(
+                &data.context_json,
+                PlanRepoFilter::CurrentRepo,
+                data.work_dirs.as_deref(),
+            )
+            .or_else(|| {
+                detect_remaining_plan_tasks(
+                    &data.context_json,
+                    PlanRepoFilter::OtherRepos,
+                    data.work_dirs.as_deref(),
+                )
+            });
+            match plan_prompt {
+                Some(plan_prompt) => {
+                    log::warn!(
+                        "auto_prompt: ContextOverflow Phase 2 — no summary next steps, falling back to plan tasks"
+                    );
+                    plan_prompt
+                }
+                None => match &summary_continuation {
+                    Some(SummaryContinuation::NothingLeft) => {
+                        log::warn!(
+                            "auto_prompt: ContextOverflow Phase 2 — summary declares nothing left and no plan tasks remain, switching to housekeeping"
+                        );
+                        housekeeping_continuation()
+                    }
+                    _ => {
+                        log::info!(
+                            "auto_prompt: ContextOverflow Phase 2 — no detectors matched, generic continuation"
+                        );
+                        "Continue from where we left off.".to_string()
+                    }
+                },
+            }
         };
 
         // Preserve slash commands (e.g. /optimize) through context overflow
@@ -3276,6 +3294,91 @@ fn extract_remaining_section(text: &str) -> Option<String> {
     Some(paragraphs[fallback_start..].join("\n\n"))
 }
 
+/// Phase 2 continuation derived from the summary's own next-steps guidance.
+#[derive(Debug, Clone, PartialEq)]
+enum SummaryContinuation {
+    /// The summary lists actionable next steps — continue with them.
+    Steps(String),
+    /// The summary explicitly declares no remaining work — the continuation
+    /// should fall through to plan files / housekeeping instead of ordering
+    /// the agent to "start working immediately" on nothing.
+    NothingLeft,
+}
+
+/// Nothing-left cues: phrases a summary uses to declare that no work remains.
+const NOTHING_LEFT_CUES: &[&str] = &[
+    "nothing left",
+    "nothing to do",
+    "nothing remains",
+    "nothing remaining",
+    "nothing outstanding",
+    "nothing actionable",
+    "no remaining work",
+    "no remaining tasks",
+    "no remaining items",
+    "no outstanding",
+    "no open items",
+    "no pending",
+    "no further work",
+    "no further action",
+    "all tasks complete",
+    "all complete",
+    "all done",
+    "fully complete",
+    "none left",
+];
+
+/// Text of a numbered list item (`"1. foo"` / `"1) foo"`), or None.
+fn numbered_item_text(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start();
+    let digits_len = trimmed.chars().take_while(|c| c.is_ascii_digit()).count();
+    if digits_len == 0 {
+        return None;
+    }
+    // ASCII digits are 1-byte, so this index is a char boundary.
+    let rest = &trimmed[digits_len..];
+    rest.strip_prefix(". ").or_else(|| rest.strip_prefix(") "))
+}
+
+/// True when a next-steps section declares there is no work left.
+///
+/// Requires an explicit nothing-left cue, and lets real work override the
+/// negation: an actionable unchecked checkbox or a numbered step that is not
+/// itself a nothing-left statement means tasks still remain (mixed sections
+/// like "Nothing critical, but T2 still needs verification" keep working).
+fn section_indicates_no_remaining_work(section: &str) -> bool {
+    let lower = section.to_lowercase();
+    if !NOTHING_LEFT_CUES.iter().any(|cue| lower.contains(cue)) {
+        return false;
+    }
+    !section.lines().any(|line| {
+        if is_actionable_checkbox(line) {
+            return true;
+        }
+        match numbered_item_text(line) {
+            Some(text) => {
+                let text_lower = text.to_lowercase();
+                !NOTHING_LEFT_CUES.iter().any(|cue| text_lower.contains(cue))
+            }
+            None => false,
+        }
+    })
+}
+
+/// Continuation for summaries that declare no remaining work: switch to
+/// housekeeping instead of ordering work on an empty queue.
+fn housekeeping_continuation() -> String {
+    "The previous session's summary reports no remaining work. Do NOT summarize again — \
+     switch to housekeeping, in this order:\n\
+     1. Run the boundary-guard and doc-sync skills for this repo.\n\
+     2. Mine the next riir-clippy batch; search online to unblock any blocked task.\n\
+     3. Re-run benchmarks if the working tree is dirty.\n\
+     4. If no issues, plans, or proposals remain in this repo, look for unclaimed work \
+     in the other workspace repos — only where no other agent is active.\n\
+     5. If nothing actionable remains, stop cleanly; do not invent work."
+        .to_string()
+}
+
 /// Extract the "what to do next" section from a ContextOverflow Phase 1 summary.
 ///
 /// Unlike `detect_remaining_work`, which deliberately skips auto_prompt
@@ -3290,7 +3393,11 @@ fn extract_remaining_section(text: &str) -> Option<String> {
 /// heading or end of message), so the continuation prompt keeps full context.
 /// Falls back to the last 3 paragraphs (matching `extract_remaining_section` semantics)
 /// when no explicit section is found, then to None when nothing actionable remains.
-fn extract_summary_next_steps(summary: &str) -> Option<String> {
+///
+/// A section that explicitly declares no remaining work ("Nothing left",
+/// "all tasks complete") returns `NothingLeft` instead of a continuation that
+/// would order the agent to start working on an empty queue.
+fn extract_summary_next_steps(summary: &str) -> Option<SummaryContinuation> {
     let trimmed = summary.trim();
     if trimmed.is_empty() {
         return None;
@@ -3387,11 +3494,20 @@ fn extract_summary_next_steps(summary: &str) -> Option<String> {
         return None;
     }
 
-    Some(format!(
+    if section_indicates_no_remaining_work(&section) {
+        log::info!(
+            "[auto_prompt::extract_summary_next_steps] Summary declares no remaining work"
+        );
+        return Some(SummaryContinuation::NothingLeft);
+    }
+
+    Some(SummaryContinuation::Steps(format!(
         "Continuing from the previous session's summary. Recommended next steps:\n\n\
          {section}\n\n\
-         Pick up from here. Do NOT summarize again — start working immediately."
-    ))
+         Pick up from here. Do NOT summarize again — start working immediately: \
+         execute the highest-priority item above, and where a decision is needed, \
+         make the call yourself and proceed."
+    )))
 }
 
 fn detect_remaining_work(last_assistant_message: Option<&str>) -> Option<String> {
@@ -5861,6 +5977,9 @@ mod tests {
                        ## Active Plan Files\n\n\n- .plans/302_*";
         let result =
             extract_summary_next_steps(summary).expect("recommended next steps should be found");
+        let SummaryContinuation::Steps(result) = result else {
+            panic!("actionable next steps must produce Steps, got {result:?}");
+        };
         assert!(
             result.contains("Fix the riir-gpu build break"),
             "should contain the first recommended step"
@@ -5882,9 +6001,16 @@ mod tests {
                        - [ ] T3: commit\n";
         let result =
             extract_summary_next_steps(summary).expect("What Remains section should be found");
+        let SummaryContinuation::Steps(result) = result else {
+            panic!("unchecked checkboxes must produce Steps, got {result:?}");
+        };
         assert!(
             result.contains("T2: verify build"),
             "should contain the unchecked task"
+        );
+        assert!(
+            result.contains("make the call yourself"),
+            "tail should tell the agent to resolve decisions itself"
         );
     }
 
@@ -5904,6 +6030,9 @@ mod tests {
         let summary = "# Summary\n\nDid A.\n\nDid B.\n\nStill need to run the benchmark and commit the results.";
         let result =
             extract_summary_next_steps(summary).expect("prose trigger 'need to' should match");
+        let SummaryContinuation::Steps(result) = result else {
+            panic!("prose next steps must produce Steps, got {result:?}");
+        };
         assert!(
             result.contains("run the benchmark"),
             "fallback should pick up the prose next-step"
@@ -5932,6 +6061,9 @@ mod tests {
                        ## Active Plan / Issue Files\n\n- .plans/302_* complete";
         let result = extract_summary_next_steps(summary)
             .expect("recommended next steps must be extracted for Phase 2");
+        let SummaryContinuation::Steps(result) = result else {
+            panic!("numbered steps must produce Steps, got {result:?}");
+        };
         assert!(
             result.contains("Decide on the riir-gpu build break"),
             "must contain step 1"
@@ -5944,6 +6076,75 @@ mod tests {
             result.contains("Pick up from here"),
             "continuation framing should be present"
         );
+        assert!(
+            result.contains("where a decision is needed"),
+            "tail should instruct the agent to resolve the decision itself"
+        );
+    }
+
+    #[test]
+    fn test_extract_summary_next_steps_nothing_left_returns_housekeeping_path() {
+        // The reported bug: a "What Remains" section that declares nothing
+        // left still counted as actionable ("- " bullet marker) and produced
+        // "start working immediately" on an empty queue.
+        let summary = "# Session Summary\n\n## Original Task\n\nRefactor.\n\n\
+                       ## What Was Accomplished\n\nAll done.\n\n\
+                       ## What Remains\n\n- Nothing — all tasks complete.";
+        let result = extract_summary_next_steps(summary)
+            .expect("nothing-left section must still be detected");
+        assert_eq!(
+            result,
+            SummaryContinuation::NothingLeft,
+            "a remains section declaring nothing left must NOT produce Steps"
+        );
+    }
+
+    #[test]
+    fn test_extract_summary_next_steps_nothing_left_prose() {
+        // No heading — the prose fallback picks up "Nothing left to do" and
+        // must classify it as NothingLeft rather than actionable steps.
+        let summary = "# Session Summary\n\nDid A.\n\nDid B.\n\nNothing left to do.";
+        let result = extract_summary_next_steps(summary)
+            .expect("prose nothing-left must be detected");
+        assert_eq!(result, SummaryContinuation::NothingLeft);
+    }
+
+    #[test]
+    fn test_extract_summary_next_steps_mixed_negation_with_real_work_stays_steps() {
+        // Negation cue + real unchecked work → Steps, not NothingLeft.
+        let summary = "# Summary\n\n## What Remains\n\n\
+                       T1 is all done.\n\
+                       - [ ] T2: verify build\n";
+        let result = extract_summary_next_steps(summary).expect("section should be found");
+        let SummaryContinuation::Steps(result) = result else {
+            panic!("an actionable checkbox must override the negation cue, got {result:?}");
+        };
+        assert!(result.contains("T2: verify build"));
+    }
+
+    #[test]
+    fn test_extract_summary_next_steps_negated_numbered_item_is_nothing_left() {
+        // A numbered item whose text is itself a nothing-left statement must
+        // not count as real work.
+        let summary = "# Summary\n\n## Next Steps\n\n1. Nothing left to do — all complete.";
+        let result = extract_summary_next_steps(summary)
+            .expect("numbered negation must be detected");
+        assert_eq!(result, SummaryContinuation::NothingLeft);
+    }
+
+    #[test]
+    fn test_housekeeping_continuation_lists_skills_and_stop() {
+        let prompt = housekeeping_continuation();
+        assert!(prompt.contains("boundary-guard"));
+        assert!(prompt.contains("doc-sync"));
+        assert!(prompt.contains("riir-clippy"));
+        assert!(prompt.contains("Re-run benchmarks"));
+        assert!(prompt.contains("no other agent is active"));
+        assert!(
+            prompt.contains("stop cleanly"),
+            "must end with a stop instruction so the loop terminates"
+        );
+        assert!(prompt.contains("Do NOT summarize again"));
     }
 
     #[test]
