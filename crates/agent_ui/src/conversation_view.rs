@@ -1,9 +1,9 @@
 use acp_thread::{
     AcpThread, AcpThreadEvent, AgentThreadEntry, AssistantMessage, AssistantMessageChunk,
-    AuthRequired, ClientUserMessageId, ElicitationEntryId, ElicitationStatus, ElicitationStore,
-    LoadError, MaxOutputTokensError, MentionUri, PermissionOptionChoice, PermissionOptions,
-    PermissionPattern, RetryStatus, SelectedPermissionOutcome, ThreadStatus, ToolCall,
-    ToolCallContent, ToolCallStatus,
+    AuthRequired, AuthorizationKind, ClientUserMessageId, ElicitationEntryId, ElicitationStatus,
+    ElicitationStore, LoadError, MaxOutputTokensError, MentionUri, PermissionOptionChoice,
+    PermissionOptions, PermissionPattern, RetryStatus, SANDBOX_FALLBACK_RETRY_OPTION_ID,
+    SelectedPermissionOutcome, ThreadStatus, ToolCall, ToolCallContent, ToolCallStatus,
 };
 use acp_thread::{AgentConnection, Plan};
 use action_log::{ActionLog, ActionLogTelemetry, DiffStats};
@@ -267,6 +267,10 @@ pub(crate) struct Conversation {
     threads: HashMap<acp::SessionId, Entity<AcpThread>>,
     permission_requests: IndexMap<acp::SessionId, Vec<acp::ToolCallId>>,
     elicitation_requests: IndexMap<acp::SessionId, Vec<ElicitationEntryId>>,
+    /// Seconds left before each pending permission request is auto-allowed
+    /// (see `agent.auto_allow_permissions_after_seconds`). Entries only exist
+    /// while that setting is enabled and the request is unanswered.
+    auto_allow_remaining: HashMap<(acp::SessionId, acp::ToolCallId), u64>,
     subscriptions: Vec<Subscription>,
     updated_at: Option<Instant>,
 }
@@ -276,7 +280,7 @@ impl Conversation {
         let session_id = thread.read(cx).session_id().clone();
         let subscription = cx.subscribe(&thread, {
             let session_id = session_id.clone();
-            move |this, _thread, event, _cx| {
+            move |this, _thread, event, cx| {
                 this.updated_at = Some(Instant::now());
                 match event {
                     AcpThreadEvent::ToolAuthorizationRequested(id) => {
@@ -284,8 +288,11 @@ impl Conversation {
                             .entry(session_id.clone())
                             .or_default()
                             .push(id.clone());
+                        this.schedule_auto_allow(session_id.clone(), id.clone(), cx);
                     }
                     AcpThreadEvent::ToolAuthorizationReceived(id) => {
+                        this.auto_allow_remaining
+                            .remove(&(session_id.clone(), id.clone()));
                         if let Some(tool_calls) = this.permission_requests.get_mut(&session_id) {
                             tool_calls.retain(|tool_call_id| tool_call_id != id);
                             if tool_calls.is_empty() {
@@ -482,6 +489,120 @@ impl Conversation {
             thread.authorize_tool_call(tool_call_id, outcome, cx);
         });
         cx.notify();
+    }
+
+    /// Starts a per-request countdown that auto-allows this tool call once
+    /// `agent.auto_allow_permissions_after_seconds` elapses. No-op when the
+    /// setting is disabled (the default) or the setting type isn't registered
+    /// (e.g. in tests that never configure it).
+    fn schedule_auto_allow(
+        &mut self,
+        session_id: acp::SessionId,
+        tool_call_id: acp::ToolCallId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(seconds) = AgentSettings::try_get(cx)
+            .and_then(|settings| settings.auto_allow_permissions_after_seconds)
+        else {
+            return;
+        };
+        let key = (session_id, tool_call_id);
+        // A duplicate request event for an id that's already counting down
+        // must not reset it or spawn a second ticking task.
+        if self.auto_allow_remaining.contains_key(&key) {
+            return;
+        }
+        self.auto_allow_remaining.insert(key.clone(), seconds.max(1));
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                let Some(remaining) = this
+                    .update(cx, |this, cx| {
+                        // Answered or canceled meanwhile: stop counting down.
+                        let Some(remaining) = this.auto_allow_remaining.get_mut(&key) else {
+                            return None;
+                        };
+                        *remaining = remaining.saturating_sub(1);
+                        cx.notify();
+                        Some(*remaining)
+                    })
+                    .ok()
+                    .flatten()
+                else {
+                    break;
+                };
+                if remaining == 0 {
+                    this.update(cx, |this, cx| {
+                        this.fire_auto_allow(&key.0, &key.1, cx);
+                    })
+                    .ok();
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Auto-answers a pending permission request with the least-privileged
+    /// allow option. Anything that isn't a plain allow/deny permission grant
+    /// (action choices, the sandbox-fallback retry decision) is left for the
+    /// user, as are prompts that offer no allow option at all.
+    fn fire_auto_allow(
+        &mut self,
+        session_id: &acp::SessionId,
+        tool_call_id: &acp::ToolCallId,
+        cx: &mut Context<Self>,
+    ) {
+        self.auto_allow_remaining
+            .remove(&(session_id.clone(), tool_call_id.clone()));
+        let Some(thread) = self.threads.get(session_id) else {
+            return;
+        };
+        let Some((_, tool_call)) = thread.read(cx).tool_call(tool_call_id) else {
+            return;
+        };
+        let ToolCallStatus::WaitingForConfirmation { options, kind, .. } = &tool_call.status
+        else {
+            return;
+        };
+        if *kind != AuthorizationKind::PermissionGrant {
+            return;
+        }
+        if let PermissionOptions::Flat(flat_options) = options
+            && flat_options.iter().any(|option| {
+                option.option_id.0.as_ref() == SANDBOX_FALLBACK_RETRY_OPTION_ID
+            })
+        {
+            return;
+        }
+        // Prefer the one-shot allow ("Only this time" / "Allow once"); only
+        // fall back to a persistent allow when nothing weaker is offered.
+        let outcome = resolve_outcome_from_selection(options, None, true).or_else(|| {
+            options
+                .first_option_of_kind(acp::PermissionOptionKind::AllowAlways)
+                .map(|option| {
+                    SelectedPermissionOutcome::new(option.option_id.clone(), option.kind)
+                })
+        });
+        let Some(outcome) = outcome else {
+            return;
+        };
+        log::info!(
+            "Auto-allowing tool call {tool_call_id} after `auto_allow_permissions_after_seconds`"
+        );
+        self.authorize_tool_call(session_id.clone(), tool_call_id.clone(), outcome, cx);
+    }
+
+    /// Seconds until this pending request is auto-allowed, if a countdown is
+    /// running for it.
+    pub fn auto_allow_remaining_seconds(
+        &self,
+        session_id: &acp::SessionId,
+        tool_call_id: &acp::ToolCallId,
+    ) -> Option<u64> {
+        self.auto_allow_remaining
+            .get(&(session_id.clone(), tool_call_id.clone()))
+            .copied()
     }
 
     fn set_work_dirs(&mut self, work_dirs: PathList, cx: &mut Context<Self>) {
@@ -10676,6 +10797,125 @@ pub(crate) mod tests {
                 "Expected no pending tool calls after both were authorized"
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_conversation_auto_allows_pending_tool_call_after_timeout(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            project::DisableAiSettings::register(cx);
+            AgentSettings::register(cx);
+            let mut settings = AgentSettings::get_global(cx).clone();
+            settings.auto_allow_permissions_after_seconds = Some(2);
+            AgentSettings::override_global(settings, cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection: Rc<dyn AgentConnection> = Rc::new(StubAgentConnection::new());
+
+        let session_id = acp::SessionId::new("session-auto");
+        let (thread, conversation) = cx.update(|cx| {
+            let thread =
+                create_test_acp_thread(None, "session-auto", connection.clone(), project.clone(), cx);
+            let conversation = cx.new(|cx| {
+                let mut conversation = Conversation::default();
+                conversation.register_thread(thread.clone(), cx);
+                conversation
+            });
+            (thread, conversation)
+        });
+
+        let request = request_test_tool_authorization(&thread, "tc-auto", "allow-auto", cx);
+        cx.run_until_parked();
+
+        let countdown_started = cx.read(|cx| {
+            conversation
+                .read(cx)
+                .auto_allow_remaining_seconds(&session_id, &acp::ToolCallId::new("tc-auto"))
+        });
+        assert_eq!(countdown_started, Some(2));
+
+        cx.executor().advance_clock(Duration::from_secs(3));
+        cx.run_until_parked();
+
+        let outcome = request.await;
+        match outcome {
+            acp_thread::RequestPermissionOutcome::Selected(outcome) => {
+                assert_eq!(outcome.option_id.0.as_ref(), "allow-auto");
+                assert_eq!(outcome.option_kind, acp::PermissionOptionKind::AllowOnce);
+            }
+            other => panic!("expected auto-allow, got {other:?}"),
+        }
+
+        cx.read(|cx| {
+            assert!(
+                conversation
+                    .read(cx)
+                    .pending_tool_call(&session_id, cx)
+                    .is_none(),
+                "Expected no pending tool call after auto-allow fired"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_conversation_does_not_auto_allow_by_default(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            project::DisableAiSettings::register(cx);
+            AgentSettings::register(cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection: Rc<dyn AgentConnection> = Rc::new(StubAgentConnection::new());
+
+        let session_id = acp::SessionId::new("session-manual");
+        let (thread, conversation) = cx.update(|cx| {
+            let thread = create_test_acp_thread(
+                None,
+                "session-manual",
+                connection.clone(),
+                project.clone(),
+                cx,
+            );
+            let conversation = cx.new(|cx| {
+                let mut conversation = Conversation::default();
+                conversation.register_thread(thread.clone(), cx);
+                conversation
+            });
+            (thread, conversation)
+        });
+
+        let _request = request_test_tool_authorization(&thread, "tc-manual", "allow-manual", cx);
+        cx.run_until_parked();
+
+        cx.executor().advance_clock(Duration::from_secs(60));
+        cx.run_until_parked();
+
+        let still_waiting = cx.read(|cx| {
+            thread
+                .read(cx)
+                .tool_call(&acp::ToolCallId::new("tc-manual"))
+                .is_some_and(|(_, tool_call)| {
+                    matches!(
+                        tool_call.status,
+                        ToolCallStatus::WaitingForConfirmation { .. }
+                    )
+                })
+        });
+        assert!(
+            still_waiting,
+            "expected prompt to wait indefinitely when the setting is unset"
+        );
+        assert_eq!(
+            conversation.read_with(cx, |conversation, _| {
+                conversation
+                    .auto_allow_remaining_seconds(&session_id, &acp::ToolCallId::new("tc-manual"))
+            }),
+            None
+        );
     }
 
     #[gpui::test]

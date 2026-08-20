@@ -921,6 +921,10 @@ impl ThreadView {
             subscriptions.push(cx.observe(&usage_store, |_, _, cx| cx.notify()));
         }
 
+        // Repaint when the conversation changes, e.g. when an auto-allow
+        // countdown ticks down on a pending permission prompt.
+        subscriptions.push(cx.observe(&conversation, |_, _, cx| cx.notify()));
+
         if let Some(project) = project.upgrade() {
             subscriptions.push(cx.subscribe(&project, {
                 let resolver = code_span_resolver.clone();
@@ -3837,6 +3841,8 @@ impl ThreadView {
         let conversation = self.conversation.read(cx);
         let tool_call_id = conversation.pending_tool_call_for_session(&active_session_id, cx)?;
         let pending_count = conversation.pending_tool_call_count_for_session(&active_session_id);
+        let auto_allow_remaining =
+            conversation.auto_allow_remaining_seconds(&active_session_id, &tool_call_id);
 
         let thread = self.thread.read(cx);
         let (entry_ix, tool_call) = thread.tool_call(&tool_call_id)?;
@@ -3865,6 +3871,10 @@ impl ThreadView {
             format!("Awaiting Confirmation ({pending_count})").into()
         } else {
             "Awaiting Confirmation".into()
+        };
+        let label: SharedString = match auto_allow_remaining {
+            Some(seconds) => format!("{label} · auto-allow in {seconds}s").into(),
+            None => label,
         };
 
         let header = h_flex()
@@ -10967,13 +10977,13 @@ impl ThreadView {
         allow_disabled: bool,
         cx: &Context<Self>,
     ) -> Div {
-        match options {
+        let buttons = match options {
             PermissionOptions::Flat(options) => self.render_permission_buttons_flat(
-                session_id,
+                session_id.clone(),
                 is_first,
                 options,
                 entry_ix,
-                tool_call_id,
+                tool_call_id.clone(),
                 focus_handle,
                 allow_disabled,
                 cx,
@@ -10983,8 +10993,8 @@ impl ThreadView {
                 choices,
                 None,
                 entry_ix,
-                session_id,
-                tool_call_id,
+                session_id.clone(),
+                tool_call_id.clone(),
                 focus_handle,
                 allow_disabled,
                 cx,
@@ -10998,12 +11008,34 @@ impl ThreadView {
                 choices,
                 Some((patterns, tool_name)),
                 entry_ix,
-                session_id,
-                tool_call_id,
+                session_id.clone(),
+                tool_call_id.clone(),
                 focus_handle,
                 allow_disabled,
                 cx,
             ),
+        };
+        if let Some(seconds) = self
+            .conversation
+            .read(cx)
+            .auto_allow_remaining_seconds(&session_id, &tool_call_id)
+        {
+            v_flex()
+                .w_full()
+                .child(buttons)
+                .child(
+                    h_flex()
+                        .w_full()
+                        .px_1()
+                        .justify_end()
+                        .child(
+                            Label::new(format!("Auto-allow in {seconds}s"))
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        ),
+                )
+        } else {
+            buttons
         }
     }
 

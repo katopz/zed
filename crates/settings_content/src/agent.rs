@@ -369,6 +369,16 @@ pub struct AgentSettingsContent {
     ///
     /// Default: false
     pub auto_focus_new_thread: Option<bool>,
+    /// When set, tool permission prompts are automatically answered with the
+    /// least-privileged "allow" option after this many seconds, so unattended
+    /// agent runs don't stall waiting for confirmation. The prompt shows a
+    /// countdown while it is pending. Answering manually cancels the countdown.
+    /// Applies to the native agent and to external agents (ACP). Prompts that
+    /// are decisions rather than allow/deny grants (e.g. the sandbox-fallback
+    /// retry choice) are never auto-answered.
+    ///
+    /// Default: null (prompts wait indefinitely)
+    pub auto_allow_permissions_after_seconds: Option<u64>,
     /// Per-tool permission rules for granular control over which tool actions
     /// require confirmation.
     ///

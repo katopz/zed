@@ -246,6 +246,10 @@ pub struct AgentSettings {
     /// Whether auto_prompt should steal keyboard focus when it creates a new
     /// background continuation thread. Default: false (don't steal focus).
     pub auto_focus_new_thread: bool,
+    /// When set, tool permission prompts are automatically answered with the
+    /// least-privileged "allow" option after this many seconds. Default:
+    /// None (prompts wait indefinitely).
+    pub auto_allow_permissions_after_seconds: Option<u64>,
     pub tool_permissions: ToolPermissions,
     pub sandbox_permissions: SandboxPermissions,
 }
@@ -825,6 +829,7 @@ impl Settings for AgentSettings {
             show_turn_stats: agent.show_turn_stats.unwrap(),
             show_merge_conflict_indicator: agent.show_merge_conflict_indicator.unwrap(),
             auto_focus_new_thread: agent.auto_focus_new_thread.unwrap_or(false),
+            auto_allow_permissions_after_seconds: agent.auto_allow_permissions_after_seconds,
             tool_permissions: compile_tool_permissions(agent.tool_permissions),
             sandbox_permissions: compile_sandbox_permissions(agent.sandbox_permissions),
         }
@@ -1119,6 +1124,18 @@ mod tests {
                 .terminal_init_command
                 .is_none()
         );
+    }
+
+    #[test]
+    fn test_auto_allow_permissions_after_seconds_parsing() {
+        let json = json!({
+            "auto_allow_permissions_after_seconds": 30
+        });
+        let content: settings::AgentSettingsContent = serde_json::from_value(json).unwrap();
+        assert_eq!(content.auto_allow_permissions_after_seconds, Some(30));
+
+        let empty: settings::AgentSettingsContent = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(empty.auto_allow_permissions_after_seconds, None);
     }
 
     #[test]

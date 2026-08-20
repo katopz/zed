@@ -1028,6 +1028,7 @@ mod tests {
             show_turn_stats: false,
             show_merge_conflict_indicator: true,
             auto_focus_new_thread: false,
+            auto_allow_permissions_after_seconds: None,
             sidebar_side: Default::default(),
             thinking_display: Default::default(),
         };
