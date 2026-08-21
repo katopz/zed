@@ -3505,8 +3505,10 @@ fn extract_summary_next_steps(summary: &str) -> Option<SummaryContinuation> {
         "Continuing from the previous session's summary. Recommended next steps:\n\n\
          {section}\n\n\
          Pick up from here. Do NOT summarize again — start working immediately: \
-         execute the highest-priority item above, and where a decision is needed, \
-         make the call yourself and proceed."
+         execute the highest-priority item above; where a decision is needed, \
+         make the call yourself and proceed — unless the item is explicitly \
+         owner-gated ('owner go', 'gated on'), in which case skip it, say why, \
+         and take the next ungated item."
     )))
 }
 
@@ -6264,6 +6266,43 @@ mod tests {
             result.contains("where a decision is needed"),
             "tail should instruct the agent to resolve the decision itself"
         );
+    }
+
+    #[test]
+    fn test_extract_summary_next_steps_gated_remains_stay_steps() {
+        // Reproduces the user-reported confusion: a boundary-session summary
+        // whose remains are ALL owner-gated or deliberately deferred. The
+        // remains must still be extracted as Steps (NOT skipped, NOT nothing-
+        // left) — a different session's plan-file fallback must never silently
+        // replace them — and the tail must tell the agent to respect the gates
+        // instead of deciding on the owner's behalf.
+        let summary = "## Summary\n\n\
+                       **(1) Original task** — Fix and remove `.issues/724` and `.issues/737` in riir-ai.\n\n\
+                       **(2) Accomplished**\n\
+                       - Workspace gate script landed, 15 repos clean\n\n\
+                       **(3) What remains**\n\
+                       - `.issues/739` — engram trait seam relocation (CODE, owner go; T1–T5 with GOAT gate)\n\
+                       - T-AGENTS prose extraction from the 5 long AGENTS.md files — deliberately not done\n\
+                       - riir-chain shows 2 transient gate findings until the pin branch merges\n\n\
+                       **(4) Active plan state**\n\
+                       - `.issues/739` — OPEN, gated on owner go\n\
+                       - `.proposals/025` — DEFER by decision record, not a task";
+        let result = extract_summary_next_steps(summary)
+            .expect("gated remains must still be extracted as Steps");
+        let SummaryContinuation::Steps(result) = result else {
+            panic!("gated remains are real remains, got {result:?}");
+        };
+        assert!(
+            result.contains(".issues/739"),
+            "the remains section must be embedded so the next thread sees it: {result}"
+        );
+        assert!(
+            result.contains("owner-gated"),
+            "tail must instruct the agent to respect explicit owner gates: {result}"
+        );
+        // All-gated remains are NOT nothing-left: there is still work the
+        // owner can ungat, so the housekeeping path must not fire.
+        assert!(!result.contains("boundary-guard"));
     }
 
     #[test]
