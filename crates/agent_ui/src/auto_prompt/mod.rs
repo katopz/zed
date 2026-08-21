@@ -13,6 +13,8 @@ use workspace::PathList;
 
 use crate::thread_metadata_store::ThreadMetadataStore;
 
+pub(crate) mod elicitation_auto_answer;
+
 // ── Plan 023 registries ───────────────────────────────────────────────────
 //
 // B3: input-box drafts stashed at Phase-1/clarify time. Phase 1's `set_message`

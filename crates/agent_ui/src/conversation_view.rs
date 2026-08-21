@@ -1792,8 +1792,15 @@ impl ConversationView {
                 self.notify_with_sound("Waiting for tool confirmation", IconName::Info, window, cx);
             }
             AcpThreadEvent::ToolAuthorizationReceived(_) => {}
-            AcpThreadEvent::ElicitationRequested(_) => {
+            AcpThreadEvent::ElicitationRequested(id) => {
                 self.notify_with_sound("Waiting for input", IconName::Info, window, cx);
+                // A thread awaiting a decision form never stops, so every
+                // other auto-prompt recovery path is unreachable — arm the
+                // auto-answer (reasoned pick, countdown backstop) when this
+                // thread's auto-prompt loop is running.
+                crate::auto_prompt::elicitation_auto_answer::arm_if_enabled(
+                    self, thread, &id, cx,
+                );
             }
             AcpThreadEvent::ElicitationResponded(_) => {}
             AcpThreadEvent::Retry(retry) => {

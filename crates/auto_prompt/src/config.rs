@@ -96,6 +96,21 @@ pub struct AutoPromptConfig {
     #[serde(default = "default_reasoned_phase2_enabled")]
     pub reasoned_phase2_enabled: bool,
 
+    /// Whether decision-form elicitations (`ask_user` / ACP session
+    /// elicitation) are auto-answered on threads whose auto-prompt is
+    /// enabled: an LLM reasoning pass picks the option (with a one-line
+    /// rationale in the free-text field) and a countdown backstop selects
+    /// the first option when reasoning fails or is slow. Without this, a
+    /// worker blocked on a decision form stalls the whole chain until a
+    /// human answers.
+    #[serde(default = "default_elicitation_auto_answer_enabled")]
+    pub elicitation_auto_answer_enabled: bool,
+
+    /// Countdown before the first-option backstop fires on an unanswered
+    /// decision form. Reasoned answers arriving earlier win.
+    #[serde(default = "default_elicitation_countdown_secs")]
+    pub elicitation_countdown_secs: u64,
+
     /// Slash command / skill dispatched once when an automatic chain stops
     /// with no remaining tasks (plan 023 E, req 6) — e.g. a housekeeping
     /// skill that syncs docs. Availability-checked against the thread's
@@ -157,6 +172,14 @@ fn default_reasoned_phase2_enabled() -> bool {
     true
 }
 
+fn default_elicitation_auto_answer_enabled() -> bool {
+    true
+}
+
+fn default_elicitation_countdown_secs() -> u64 {
+    60
+}
+
 impl Default for AutoPromptConfig {
     fn default() -> Self {
         Self {
@@ -173,6 +196,8 @@ impl Default for AutoPromptConfig {
             claude_context_overflow_tokens: default_claude_context_overflow_tokens(),
             housekeeping_command: default_housekeeping_command(),
             reasoned_phase2_enabled: default_reasoned_phase2_enabled(),
+            elicitation_auto_answer_enabled: default_elicitation_auto_answer_enabled(),
+            elicitation_countdown_secs: default_elicitation_countdown_secs(),
         }
     }
 }
@@ -281,6 +306,18 @@ impl AutoPromptConfig {
             .map(|v| !matches!(v.as_str(), "0" | "false"))
             .unwrap_or_else(default_reasoned_phase2_enabled);
 
+        let elicitation_auto_answer_enabled =
+            std::env::var("ZED_AUTO_PROMPT_ELICITATION_AUTO_ANSWER_ENABLED")
+                .ok()
+                .map(|v| !matches!(v.as_str(), "0" | "false"))
+                .unwrap_or_else(default_elicitation_auto_answer_enabled);
+
+        let elicitation_countdown_secs =
+            std::env::var("ZED_AUTO_PROMPT_ELICITATION_COUNTDOWN_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(default_elicitation_countdown_secs);
+
         Self {
             system_prompt,
             max_iterations,
@@ -295,6 +332,8 @@ impl AutoPromptConfig {
             claude_context_overflow_tokens,
             housekeeping_command,
             reasoned_phase2_enabled,
+            elicitation_auto_answer_enabled,
+            elicitation_countdown_secs,
         }
     }
 
@@ -350,6 +389,17 @@ mod tests {
         // rule-based chain is the fallback (and the flag-off mode).
         assert!(default_reasoned_phase2_enabled());
         assert!(AutoPromptConfig::default().reasoned_phase2_enabled);
+    }
+
+    #[test]
+    fn elicitation_auto_answer_defaults() {
+        assert!(default_elicitation_auto_answer_enabled());
+        assert_eq!(default_elicitation_countdown_secs(), 60);
+        assert!(AutoPromptConfig::default().elicitation_auto_answer_enabled);
+        assert_eq!(
+            AutoPromptConfig::default().elicitation_countdown_secs,
+            60
+        );
     }
 
     #[test]
