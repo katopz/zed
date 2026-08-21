@@ -1802,7 +1802,11 @@ impl ConversationView {
                     self, thread, &id, cx,
                 );
             }
-            AcpThreadEvent::ElicitationResponded(_) => {}
+            AcpThreadEvent::ElicitationResponded(id) => {
+                // The auto-answer countdown is moot once the form is answered
+                // (by the user, the auto-answer itself, or a cancel).
+                crate::auto_prompt::elicitation_auto_answer::clear_deadline(&id);
+            }
             AcpThreadEvent::Retry(retry) => {
                 if let Some(active) = self.thread_view(&session_id) {
                     active.update(cx, |active, _cx| {

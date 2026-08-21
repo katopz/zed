@@ -4,9 +4,12 @@ use collections::{HashMap, HashSet};
 use component::{Component, ComponentScope, example_group_with_title, single_example};
 use editor::Editor;
 use futures::channel::oneshot;
-use gpui::{AnyElement, App, Div, Empty, Entity, Hsla, SharedString, Window, div};
+use gpui::{
+    Animation, AnimationExt, AnyElement, App, Div, Empty, Entity, Hsla, SharedString, Window, div,
+};
 use std::collections::BTreeMap;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 use ui::{
     Button, Checkbox, Color, Icon, IconName, IconSize, Indicator, Label, LabelSize, ToggleState,
     prelude::*,
@@ -1519,9 +1522,49 @@ impl<'a> ElicitationCard<'a> {
                             ),
                     )
                     .child(
-                        Label::new(status_label)
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
+                        h_flex()
+                            .gap_2()
+                            .when(is_pending, |this| {
+                                // Auto-answer countdown (only when armed by
+                                // auto_prompt's elicitation auto-answer). The
+                                // repeating animation re-runs the closure each
+                                // frame so the seconds tick down from the real
+                                // deadline.
+                                let elicitation_id = self.elicitation.id.clone();
+                                let countdown =
+                                    crate::auto_prompt::elicitation_auto_answer::countdown_text(
+                                        &elicitation_id,
+                                        Instant::now(),
+                                    );
+                                match countdown {
+                                    Some(initial_text) => this.child(
+                                        Label::new(initial_text)
+                                            .size(LabelSize::Small)
+                                            .color(Color::Warning)
+                                            .with_animation(
+                                                "elicitation-auto-answer-countdown",
+                                                Animation::new(Duration::from_secs(1)).repeat(),
+                                                move |_label, _delta| {
+                                                    let text = crate::auto_prompt::
+                                                        elicitation_auto_answer::countdown_text(
+                                                            &elicitation_id,
+                                                            Instant::now(),
+                                                        )
+                                                        .unwrap_or_default();
+                                                    Label::new(text)
+                                                        .size(LabelSize::Small)
+                                                        .color(Color::Warning)
+                                                },
+                                            ),
+                                    ),
+                                    None => this,
+                                }
+                            })
+                            .child(
+                                Label::new(status_label)
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            ),
                     ),
             )
             .child(body)

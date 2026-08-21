@@ -29,13 +29,62 @@ use language_model::{
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::ConversationView;
 
 /// Field key the `ask_user` tool uses for free-text answers. Used to prefer
 /// the canonical free-text field when parsing generic form schemas.
 const OTHER_FIELD: &str = "other";
+
+/// Deadline registry for the visible countdown. Keyed by elicitation entry
+/// id (string); armed in `arm_if_enabled`, cleared on
+/// `AcpThreadEvent::ElicitationResponded`. The card reads it on every frame
+/// (the countdown label is animation-driven) so lookups must be cheap.
+static AUTO_ANSWER_DEADLINES: std::sync::RwLock<Option<std::collections::HashMap<String, Instant>>> =
+    std::sync::RwLock::new(None);
+
+pub(crate) fn set_deadline(elicitation_id: &ElicitationEntryId, deadline: Instant) {
+    let mut guard = AUTO_ANSWER_DEADLINES
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard
+        .get_or_insert_with(Default::default)
+        .insert(elicitation_id.0.to_string(), deadline);
+}
+
+pub(crate) fn clear_deadline(elicitation_id: &ElicitationEntryId) {
+    if let Ok(mut guard) = AUTO_ANSWER_DEADLINES.write() {
+        if let Some(map) = guard.as_mut() {
+            map.remove(elicitation_id.0.as_ref());
+        }
+    }
+}
+
+pub(crate) fn deadline_for(elicitation_id: &ElicitationEntryId) -> Option<Instant> {
+    let guard = AUTO_ANSWER_DEADLINES
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard
+        .as_ref()
+        .and_then(|map| map.get(elicitation_id.0.as_ref()).copied())
+}
+
+/// The visible countdown text for an armed elicitation. Pure (takes `now`)
+/// so the card can recompute it every animation frame without hidden state.
+/// `None` when no auto-answer is armed for this elicitation.
+pub(crate) fn countdown_text(
+    elicitation_id: &ElicitationEntryId,
+    now: Instant,
+) -> Option<String> {
+    let deadline = deadline_for(elicitation_id)?;
+    let remaining = deadline.saturating_duration_since(now);
+    Some(if remaining.is_zero() {
+        "auto-answering…".to_string()
+    } else {
+        format!("auto-answer in {}s", remaining.as_secs().max(1))
+    })
+}
 
 /// The parsed, answerable shape of a form elicitation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -278,6 +327,9 @@ pub fn arm_if_enabled(
         .map(|configured| configured.model);
     let context = last_assistant_text(thread.read(cx));
     let countdown = Duration::from_secs(config.elicitation_countdown_secs.max(1));
+    // Register the deadline BEFORE spawning so the countdown label renders
+    // on the card's very next frame, not one countdown late.
+    set_deadline(elicitation_id, Instant::now() + countdown);
     let elicitation_id = elicitation_id.clone();
     let thread = thread.clone();
 
@@ -507,5 +559,32 @@ mod tests {
     #[test]
     fn test_parse_reasoned_answer_garbage_is_none() {
         assert!(parse_reasoned_answer("I think Approach A").is_none());
+    }
+
+    #[test]
+    fn test_countdown_text_formats_remaining_seconds() {
+        let id = ElicitationEntryId("countdown-test".into());
+        let now = Instant::now();
+        // Not armed → no label.
+        assert_eq!(countdown_text(&id, now), None);
+
+        set_deadline(&id, now + Duration::from_secs(42));
+        assert_eq!(
+            countdown_text(&id, now),
+            Some("auto-answer in 42s".to_string())
+        );
+        // Sub-second remaining clamps up to 1s (never shows 0s).
+        assert_eq!(
+            countdown_text(&id, now + Duration::from_millis(41_500)),
+            Some("auto-answer in 1s".to_string())
+        );
+        // Past the deadline → answering.
+        assert_eq!(
+            countdown_text(&id, now + Duration::from_secs(43)),
+            Some("auto-answering…".to_string())
+        );
+
+        clear_deadline(&id);
+        assert_eq!(countdown_text(&id, now), None);
     }
 }
