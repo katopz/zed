@@ -4053,18 +4053,36 @@ mod tests {
     /// overflow and clarify machines never call the model; the slot just
     /// satisfies the struct shape.
     fn overflow_test_data(session: &str, last_assistant_message: Option<&str>) -> LlmCallData {
+        overflow_test_data_with(
+            session,
+            last_assistant_message,
+            serde_json::json!({"session_id": session}).to_string(),
+            None,
+        )
+    }
+
+    /// `overflow_test_data` with a caller-supplied `context_json` (e.g. plan
+    /// files for the Phase 2 fallback chain) and `work_dirs` (current-repo
+    /// classification). Plan paths must be unique per test — the plan claim
+    /// registry is global and keyed by path.
+    fn overflow_test_data_with(
+        session: &str,
+        last_assistant_message: Option<&str>,
+        context_json: String,
+        work_dirs: Option<Vec<PathBuf>>,
+    ) -> LlmCallData {
         LlmCallData {
             model: std::sync::Arc::new(
                 language_model::fake_provider::FakeLanguageModel::default(),
             ),
             system_prompt: String::new(),
-            context_json: serde_json::json!({"session_id": session}).to_string(),
+            context_json,
             project_root: None,
             session_id: acp::SessionId::new(session),
             title: Some("test".to_string()),
             iteration_count: 1,
             max_verification_attempts: 0,
-            work_dirs: None,
+            work_dirs,
             first_user_message: None,
             original_user_message: None,
             last_assistant_message: last_assistant_message.map(str::to_string),
@@ -4111,6 +4129,172 @@ mod tests {
                 assert_eq!(action.actual_input_tokens, None);
                 assert_eq!(action.approximate_token_count, 0);
                 assert_eq!(summary_state_for(session), 0, "state cleared after Phase 2");
+            }
+            other => panic!("expected Continue, got {other:?}"),
+        }
+        clear_summary_for_session(session);
+    }
+
+    #[test]
+    fn context_overflow_phase2_actionable_steps_continuation() {
+        // Phase 2 end-to-end: a summary with actionable numbered steps must
+        // become a continuation that embeds the steps and the decision-aware
+        // tail — not a generic "continue" nor the housekeeping prompt.
+        let session = "overflow-phase2-steps-test";
+        set_summary_state(session, 1);
+        let summary = "# Session Summary\n\n## Original Task\n\nRefactor.\n\n\
+                       ## What Remains\n\n\
+                       1. Decide on the serializer format\n\
+                       2. Finish the port\n\
+                       3. Commit";
+        let data = overflow_test_data(session, Some(summary));
+        match context_overflow_outcome(&data) {
+            AutoPromptOutcome::Continue(action) => {
+                assert!(action.force_new_thread, "Phase 2 must force a new thread");
+                assert!(
+                    action.next_prompt.contains("Decide on the serializer format"),
+                    "continuation must embed the summary's first step: {}",
+                    action.next_prompt
+                );
+                assert!(
+                    action.next_prompt.contains("Pick up from here"),
+                    "continuation framing must be present: {}",
+                    action.next_prompt
+                );
+                assert!(
+                    action.next_prompt.contains("where a decision is needed"),
+                    "decision-aware tail must instruct the agent to resolve the \
+                     decision itself: {}",
+                    action.next_prompt
+                );
+                assert!(
+                    !action.next_prompt.contains("boundary-guard"),
+                    "actionable steps must not route to housekeeping: {}",
+                    action.next_prompt
+                );
+                assert_eq!(action.actual_input_tokens, None);
+                assert_eq!(action.approximate_token_count, 0);
+                assert_eq!(summary_state_for(session), 0, "state cleared after Phase 2");
+            }
+            other => panic!("expected Continue, got {other:?}"),
+        }
+        clear_summary_for_session(session);
+    }
+
+    #[test]
+    fn context_overflow_phase2_nothing_left_routes_to_housekeeping() {
+        // Phase 2 end-to-end: a summary that declares nothing left, with no
+        // plan tasks anywhere, must switch to the housekeeping prompt instead
+        // of ordering "start working immediately" on an empty queue.
+        let session = "overflow-phase2-idle-test";
+        set_summary_state(session, 1);
+        let summary = "# Session Summary\n\n## What Was Accomplished\n\nEverything landed.\n\n\
+                       ## What Remains\n\n- Nothing left — all tasks complete.";
+        let data = overflow_test_data(session, Some(summary));
+        match context_overflow_outcome(&data) {
+            AutoPromptOutcome::Continue(action) => {
+                assert!(action.force_new_thread, "Phase 2 must force a new thread");
+                for marker in [
+                    "no remaining work",
+                    "boundary-guard",
+                    "doc-sync",
+                    "riir-clippy",
+                    "stop cleanly",
+                ] {
+                    assert!(
+                        action.next_prompt.contains(marker),
+                        "housekeeping prompt must mention '{marker}': {}",
+                        action.next_prompt
+                    );
+                }
+                assert!(
+                    !action.next_prompt.contains("Pick up from here"),
+                    "nothing-left must not order immediate work: {}",
+                    action.next_prompt
+                );
+            }
+            other => panic!("expected Continue, got {other:?}"),
+        }
+        clear_summary_for_session(session);
+    }
+
+    #[test]
+    fn context_overflow_phase2_plan_tasks_beat_nothing_left() {
+        // Priority chain: unclaimed current-repo plan tasks must win over a
+        // nothing-left summary — housekeeping only fires when no plans remain.
+        let session = "overflow-phase2-plan-wins-test";
+        set_summary_state(session, 1);
+        let summary = "# Session Summary\n\n## What Remains\n\n- Nothing left — all tasks complete.";
+        let context_json = serde_json::json!({
+            "session_id": session,
+            "plan_files": [{
+                "path": "/tmp/zed-phase2-it/current/.plans/9902_plan_wins.md",
+                "content": "- [x] Step 1: done\n- [ ] Step 2: pending"
+            }]
+        })
+        .to_string();
+        let data = overflow_test_data_with(
+            session,
+            Some(summary),
+            context_json,
+            Some(vec![PathBuf::from("/tmp/zed-phase2-it/current")]),
+        );
+        match context_overflow_outcome(&data) {
+            AutoPromptOutcome::Continue(action) => {
+                assert!(
+                    action.next_prompt.contains("Plan files have remaining unchecked tasks"),
+                    "current-repo plan tasks must win over a nothing-left summary: {}",
+                    action.next_prompt
+                );
+                assert!(
+                    action.next_prompt.contains("9902_plan_wins.md"),
+                    "plan prompt must name the file: {}",
+                    action.next_prompt
+                );
+                assert!(
+                    !action.next_prompt.contains("boundary-guard"),
+                    "housekeeping must not fire while plan tasks remain: {}",
+                    action.next_prompt
+                );
+            }
+            other => panic!("expected Continue, got {other:?}"),
+        }
+        clear_summary_for_session(session);
+    }
+
+    #[test]
+    fn context_overflow_phase2_nothing_left_other_repo_plan_fallback() {
+        // Priority chain tail: when no current-repo plans remain, other-repo
+        // plan tasks are consulted before housekeeping.
+        let session = "overflow-phase2-other-repo-test";
+        set_summary_state(session, 1);
+        let summary = "# Session Summary\n\n## What Remains\n\n- Nothing left — all tasks complete.";
+        let context_json = serde_json::json!({
+            "session_id": session,
+            "plan_files": [{
+                "path": "/tmp/zed-phase2-it/other/.plans/9903_other_repo.md",
+                "content": "- [ ] Step 1: pending"
+            }]
+        })
+        .to_string();
+        let data = overflow_test_data_with(
+            session,
+            Some(summary),
+            context_json,
+            Some(vec![PathBuf::from("/tmp/zed-phase2-it/current")]),
+        );
+        match context_overflow_outcome(&data) {
+            AutoPromptOutcome::Continue(action) => {
+                assert!(
+                    action.next_prompt.contains("9903_other_repo.md"),
+                    "other-repo plan tasks must be picked up before housekeeping: {}",
+                    action.next_prompt
+                );
+                assert!(
+                    !action.next_prompt.contains("boundary-guard"),
+                    "housekeeping must not fire while other-repo plan tasks remain: {}",
+                    action.next_prompt
+                );
             }
             other => panic!("expected Continue, got {other:?}"),
         }
