@@ -12,10 +12,11 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use futures::{AsyncBufReadExt, StreamExt};
-use gpui::{BackgroundExecutor, Task};
+use gpui::{AsyncApp, Task, WeakEntity};
 use http_client::{AsyncBody, HttpClient};
 
 use crate::identity::DeviceIdentity;
+use crate::runtime::BoardRuntime;
 
 /// SSE connection state for the agent board. Held alive by the panel when
 /// the 📡 toggle is on. Dropping this struct cancels the background task.
@@ -24,29 +25,26 @@ pub struct RealtimeClient {
 }
 
 impl RealtimeClient {
-    /// Start a background SSE connection to the worker. The task runs for
-    /// the lifetime of the returned `RealtimeClient`. Auto-reconnects with
-    /// exponential backoff on disconnection.
+    /// Start a foreground-owned SSE connection to the worker. The task runs
+    /// for the lifetime of the returned `RealtimeClient`. Auto-reconnects
+    /// with exponential backoff on disconnection. Feed-relevant events also
+    /// nudge the runtime for an immediate (throttled) refresh so panels stay
+    /// live instead of waiting out the poll interval.
     pub fn start(
         http: Arc<dyn HttpClient>,
         base_url: String,
         room: String,
         identity: Arc<DeviceIdentity>,
-        executor: BackgroundExecutor,
+        cx: &mut gpui::Context<BoardRuntime>,
     ) -> Self {
         let device_name = identity.device_name().to_string();
-        let timer_executor = executor.clone();
-        let task = executor.spawn(async move {
+        let executor = cx.background_executor().clone();
+        let task = cx.spawn(async move |this, cx| {
             let mut backoff = Duration::from_secs(1);
             let max_backoff = Duration::from_secs(30);
             loop {
-                match connect_and_drain(
-                    &http,
-                    &base_url,
-                    &room,
-                    &device_name,
-                )
-                .await
+                match connect_and_drain(&http, &base_url, &room, &device_name, this.clone(), cx)
+                    .await
                 {
                     Ok(()) => {
                         log::info!(
@@ -59,7 +57,7 @@ impl RealtimeClient {
                             "[agent_board] SSE stream error: {error:#}; reconnecting in {:?}",
                             backoff
                         );
-                        timer_executor.timer(backoff).await;
+                        executor.timer(backoff).await;
                         backoff = (backoff * 2).min(max_backoff);
                     }
                 }
@@ -77,6 +75,8 @@ async fn connect_and_drain(
     base_url: &str,
     room: &str,
     device_name: &str,
+    runtime: WeakEntity<BoardRuntime>,
+    cx: &mut AsyncApp,
 ) -> Result<()> {
     let uri = format!(
         "{}/v1/rooms/{}/events?device={}",
@@ -119,11 +119,12 @@ async fn connect_and_drain(
             continue;
         };
 
-        // Try to parse the event as a board object. Two shapes matter here:
+        // Try to parse the event as a board object. Three shapes matter:
         // (a) a reply push targeting this device (worker broadcasts the raw
-        //     reply JSON), and (b) a feed message (Plan 024) — scanned for
-        // `@device:sess4` mentions so delivery is instant when 📡 is on,
-        // instead of waiting out the 15s poll.
+        //     reply JSON), (b) a feed message (Plan 024) — scanned for
+        //     `@device:sess4` mentions so delivery is instant when 📡 is on,
+        //     and (c) state/status broadcasts — no side effect, but they still
+        //     nudge a refresh so the panels reflect them immediately.
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) {
             if value.get("target_device").is_some() {
                 // Reply push: inject only when it targets this device.
@@ -140,8 +141,18 @@ async fn connect_and_drain(
                         .to_string();
                     auto_prompt::peer_states::inject_web_reply(prefix, text);
                 }
-            } else if let Some(message) = parse_board_message(&value) {
-                crate::mentions::handle_board_message(&message, device_name);
+            } else {
+                let is_feed_event = parse_board_message(&value).is_some()
+                    || value.get("state_text").is_some()
+                    || value.get("scopes").is_some();
+                if let Some(message) = parse_board_message(&value) {
+                    crate::mentions::handle_board_message(&message, device_name);
+                }
+                if is_feed_event {
+                    runtime
+                        .update(cx, |runtime, cx| runtime.realtime_nudge(cx))
+                        .ok();
+                }
             }
         }
     }

@@ -222,6 +222,7 @@ pub enum IconName {
     ReplaceNext,
     ReplyArrowRight,
     Rerun,
+    Robot,
     Return,
     RotateCcw,
     RotateCw,
@@ -346,6 +347,11 @@ mod tests {
                 .file_stem()
                 .and_then(|file_stem| file_stem.to_str())
                 .expect("icon file name is not valid UTF-8");
+            // Skip macOS AppleDouble sidecar files (`._foo.svg`) that appear
+            // on non-Apple filesystem mounts; they are not real assets.
+            if file_stem.starts_with('.') {
+                continue;
+            }
 
             file_stem.parse::<IconName>()?;
         }

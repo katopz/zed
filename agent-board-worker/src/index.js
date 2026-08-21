@@ -411,6 +411,14 @@ h1{font-size:15px;margin:0;font-weight:600}
 #replybar button:hover{background:#4a7dc8}
 #replybar button:disabled{background:#333;color:#666;cursor:not-allowed}
 .empty{color:#777;font-style:italic;padding:20px;text-align:center}
+#feed{background:#262626;border-radius:5px;margin-bottom:10px;border:1px solid #2e2e2e;padding:8px 11px;max-height:38vh;overflow-y:auto}
+#feed .fh{font-weight:600;margin-bottom:4px;user-select:none}
+#feed .msg{padding:3px 0;border-bottom:1px solid #232323;font-size:12px;word-break:break-word}
+#feed .msg:last-child{border:0}
+#feed .msg .s{color:#9c9c9c;font-size:10px;margin-right:6px}
+#feed .msg .who{color:#6ea8e0;margin-right:4px}
+#feed .msg.mention .who{color:#e2b23c}
+#ronote{display:none;font-size:11px;color:#999;margin-left:8px}
 #ghbtn{display:none;padding:5px 12px;background:#24292f;color:#fff;border:1px solid #444;border-radius:3px;cursor:pointer;font:600 12px/1.4 -apple-system,sans-serif}
 #ghbtn:hover{background:#32383f}
 #modal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:10;align-items:center;justify-content:center}
@@ -429,11 +437,13 @@ h1{font-size:15px;margin:0;font-weight:600}
     <button id="ghbtn">Sign in with GitHub</button>
   </div>
 </header>
+<div id="feed"><div class="fh">🗣 War room feed</div><div id="feedrows"><div class="empty" style="padding:8px">No messages yet.</div></div></div>
 <div id="dash"><div class="empty">Sign in to load the room.</div></div>
 <div id="replybar">
   <input id="reply" placeholder="REPLY:[device:sess4] message" autocomplete="off">
   <button id="send" disabled>Send</button>
 </div>
+<span id="ronote">read-only — posting needs GitHub sign-in (GITHUB_CLIENT_ID unset on worker)</span>
 <div id="modal"><div id="modalbox">
   <div>Enter this code on GitHub:</div>
   <div id="ucode"></div>
@@ -447,8 +457,10 @@ document.getElementById("room").textContent = ROOM;
 
 let token = sessionStorage.getItem("ab_gh_token") || null, login = null, ws = null, backoff = 1000;
 let devices = {};                 // name -> { agents: { sess4 -> {session_id, states:[]} } }
+let messages = [];                // war room feed messages, ts ascending
+let sse = null, pollTimer = null; // read-only mode: SSE + 15s poll fallback
 let expandedDev = new Set();      // device names whose body is open
-let expandedAg = new Set();       // "name:sess4" keys whose body is open
+let expandedAg = new Set();      // "name:sess4" keys whose body is open
 
 function setStatus(ok) {
   const el = document.getElementById("status");
@@ -571,7 +583,52 @@ function routeMsg(m) {
   if (m.session_id !== undefined && (m.state_text !== undefined || m.device_name)) {
     ingestState(m); render(); return;
   }
-  // Other shapes (status, msg) — not rendered in v1 dashboard.
+  // Feed message (Plan 024 war room): text + ts, no scopes/state/target.
+  if (m.text !== undefined && m.ts !== undefined && m.scopes === undefined && m.target_device === undefined) {
+    ingestMessage(m); render(); return;
+  }
+  // Status broadcast (scopes): surface each scope as a pseudo state so the
+  // device accordion reflects plan-claimed agents too.
+  if (m.scopes !== undefined && m.device_name) {
+    for (const sc of m.scopes || []) {
+      ingestState({
+        device_name: m.device_name,
+        session_id: sc.session_id || "",
+        state_text: sc.task_summary || "(plan scope)",
+        meta: sc.plan_file || "",
+        ts: m.updated_at || Date.now(),
+      });
+    }
+    render(); return;
+  }
+}
+
+function ingestMessage(m) {
+  if (!m || m.text === undefined) return;
+  messages.push({
+    who: m.sender || m.device_name || "?",
+    text: String(m.text),
+    ts: m.ts || Date.now(),
+  });
+  messages.sort(function (a, b) { return a.ts - b.ts; });
+  if (messages.length > 50) messages.splice(0, messages.length - 50);
+}
+
+function renderFeed() {
+  const root = document.getElementById("feedrows");
+  if (!root) return;
+  if (messages.length === 0) {
+    root.innerHTML = '<div class="empty" style="padding:8px">No messages yet.</div>';
+    return;
+  }
+  let h = "";
+  for (const m of messages) {
+    const cls = String(m.text).startsWith("@") ? " msg mention" : " msg";
+    h += '<div class="' + cls.trim() + '"><span class="s">' + fmtTime(m.ts) + '</span>'
+      + '<span class="who">' + esc(m.who) + ':</span>' + esc(m.text) + '</div>';
+  }
+  root.innerHTML = h;
+  root.scrollTop = root.scrollHeight;
 }
 
 function ingestState(s) {
@@ -596,6 +653,20 @@ async function fetchRoom() {
     const data = await r.json();
     devices = {};
     for (const st of data.states || []) ingestState(st);
+    // Status scopes → pseudo states (plan-claimed agents show in the roster).
+    for (const s of data.statuses || []) {
+      for (const sc of s.scopes || []) {
+        ingestState({
+          device_name: s.device_name,
+          session_id: sc.session_id || "",
+          state_text: sc.task_summary || "(plan scope)",
+          meta: sc.plan_file || "",
+          ts: s.updated_at || Date.now(),
+        });
+      }
+    }
+    messages = [];
+    for (const m of data.messages || []) ingestMessage(m);
     render();
   } catch (e) {
     console.error("fetchRoom failed", e);
@@ -603,6 +674,7 @@ async function fetchRoom() {
 }
 
 function render() {
+  renderFeed();
   const root = document.getElementById("dash");
   const names = Object.keys(devices);
   if (names.length === 0) {
@@ -705,9 +777,35 @@ document.getElementById("modal").addEventListener("click", function (e) {
   if (e.target.id === "modal") e.target.classList.remove("open"); // cancel
 });
 
-// Boot: restore a stored token (auto-connect), otherwise show sign-in.
+// Boot: restore a stored token (auto-connect), otherwise show sign-in when
+// GitHub auth is available, or fall into read-only mode (SSE + poll, no
+// posting) when it isn't — a usable dashboard instead of a dead end.
 if (token) onAuthed(token);
-else showSignIn();
+else if (GH_ENABLED) showSignIn();
+else startReadOnly();
+
+function startReadOnly() {
+  document.getElementById("ronote").style.display = "inline";
+  const reply = document.getElementById("reply");
+  reply.value = "";
+  reply.disabled = true;
+  reply.placeholder = "read-only — posting requires GitHub sign-in";
+  fetchRoom();
+  // SSE (read-only, no auth) for instant updates, 15s poll as reconnect
+  // fallback / safety net.
+  try {
+    sse = new EventSource("/v1/rooms/" + encodeURIComponent(ROOM) + "/events?device=web-readonly");
+    sse.onmessage = function (ev) {
+      let m;
+      try { m = JSON.parse(ev.data); } catch (e) { return; }
+      routeMsg(m);
+    };
+    setStatus(true);
+  } catch (e) {
+    console.error("SSE failed", e);
+  }
+  pollTimer = setInterval(fetchRoom, 15000);
+}
 </script>
 </body>
 </html>`;

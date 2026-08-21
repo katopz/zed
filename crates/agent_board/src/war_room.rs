@@ -15,12 +15,13 @@ use auto_prompt::plan_registry::ActivePlanClaim;
 use editor::Editor;
 use gpui::{
     Action, App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, ParentElement, Render, SharedString,
+    InteractiveElement, IntoElement, ParentElement, Render, ScrollHandle, SharedString,
     StatefulInteractiveElement, Styled, Subscription, Window, actions, div, px,
 };
+use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use ui::ActiveTheme;
+use ui::{ActiveTheme, CopyButton, FluentBuilder, IconSize};
 use workspace::dock::{DockPosition, Panel, PanelEvent};
 use workspace::Workspace;
 
@@ -218,6 +219,44 @@ pub fn build_work_board(
         );
     }
 
+    // Ad-hoc presence (v1.1): agents broadcasting fresh states without a plan
+    // claim are still active work — derive a `(no plan)` Doing row per
+    // uncovered device:session so the board never reads "0 doing" while
+    // agents run. Sessions already owning a plan row (scope/claim/released)
+    // are covered by their owner labels and skipped here.
+    let covered: std::collections::HashSet<String> = items
+        .values()
+        .flat_map(|acc| acc.owner_labels.iter().cloned())
+        .collect();
+    let mut latest_state_by_label: std::collections::HashMap<String, &AgentStateMessage> =
+        std::collections::HashMap::new();
+    for state in &snapshot.states {
+        if state.session_id.is_empty() {
+            continue;
+        }
+        let label = format!(
+            "{}:{}",
+            state.device_name,
+            session_prefix4(&state.session_id)
+        );
+        let latest = latest_state_by_label.entry(label).or_insert(state);
+        if state.ts > latest.ts {
+            *latest = state;
+        }
+    }
+    for (label, state) in latest_state_by_label {
+        if covered.contains(&label) || now_ms.saturating_sub(state.ts) > STALE_AFTER_MS {
+            continue;
+        }
+        let acc = items.entry(format!("adhoc:{label}")).or_default();
+        acc.add_owner(&state.device_name, label);
+        if !state.state_text.is_empty() {
+            acc.task_summary = state.state_text.clone();
+        }
+        acc.last_activity_ts = acc.last_activity_ts.max(state.ts);
+        acc.doing = true;
+    }
+
     let mut board: Vec<WorkItem> = items
         .into_iter()
         .filter(|(_, acc)| now_ms.saturating_sub(acc.last_activity_ts) <= WORK_BOARD_WINDOW_MS)
@@ -230,8 +269,13 @@ pub fn build_work_board(
                 WorkState::Stale
             };
             let race = acc.doing && acc.owner_devices.len() >= 2;
+            let plan_name = if plan_path.starts_with("adhoc:") {
+                "(no plan)".to_string()
+            } else {
+                basename(&plan_path).to_string()
+            };
             WorkItem {
-                plan_name: basename(&plan_path).to_string(),
+                plan_name,
                 plan_path,
                 owner_labels: acc.owner_labels,
                 task_summary: acc.task_summary,
@@ -272,6 +316,46 @@ fn state_rank(item: &WorkItem) -> u8 {
 // Panel
 // ---------------------------------------------------------------------------
 
+/// Cached `Entity<Markdown>` per rendered feed message, keyed by a blake3
+/// hash of (ts, device_id, sender, text). Creating a markdown entity per
+/// render would re-parse every message on every notify; the cache keeps
+/// parsing one-time and evicts entries for messages no longer in the feed.
+#[derive(Default)]
+struct MarkdownCache(std::collections::HashMap<u64, Entity<Markdown>>);
+
+impl MarkdownCache {
+    fn key(message: &BoardMessage) -> u64 {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&message.ts.to_le_bytes());
+        hasher.update(message.device_id.as_bytes());
+        hasher.update(message.sender.as_bytes());
+        hasher.update(message.text.as_bytes());
+        let hash = hasher.finalize();
+        u64::from_le_bytes(hash.as_bytes()[..8].try_into().expect("blake3 gives ≥8 bytes"))
+    }
+
+    fn get_or_create(
+        &mut self,
+        message: &BoardMessage,
+        cx: &mut Context<WarRoomPanel>,
+    ) -> Entity<Markdown> {
+        let key = Self::key(message);
+        if let Some(entity) = self.0.get(&key) {
+            return entity.clone();
+        }
+        let entity = cx.new(|cx| {
+            Markdown::new(SharedString::from(message.text.clone()), None, None, cx)
+        });
+        self.0.insert(key, entity.clone());
+        entity
+    }
+
+    fn retain_current(&mut self, keys: &[u64]) {
+        let keep: std::collections::HashSet<u64> = keys.iter().copied().collect();
+        self.0.retain(|key, _| keep.contains(key));
+    }
+}
+
 /// The war room: roster + pinned work board + shared feed + @mention input.
 /// A pure view over [`BoardRuntime`].
 pub struct WarRoomPanel {
@@ -279,6 +363,10 @@ pub struct WarRoomPanel {
     runtime: Entity<BoardRuntime>,
     input: Entity<Editor>,
     board_collapsed: bool,
+    feed_scroll_handle: ScrollHandle,
+    markdown_cache: MarkdownCache,
+    /// Max message ts seen by the last render — drives autoscroll-on-new.
+    last_feed_ts: i64,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -301,6 +389,9 @@ impl WarRoomPanel {
                 runtime,
                 input,
                 board_collapsed: false,
+                feed_scroll_handle: ScrollHandle::new(),
+                markdown_cache: MarkdownCache::default(),
+                last_feed_ts: i64::MIN,
                 _subscriptions: vec![subscription],
             }
         })
@@ -340,61 +431,79 @@ impl WarRoomPanel {
         let colors = theme.colors();
         let muted = colors.text_muted;
         let accent = colors.text_accent;
+        let error_color = theme.status().error;
         let runtime = self.runtime.read(cx);
         let connected = runtime.connected();
         let room = runtime.room();
         let realtime_enabled = runtime.realtime_enabled();
 
-        let connection_line = if connected {
+        let room_line = if connected {
             format!("connected to {room}")
         } else {
             "not connected (local-only)".to_string()
         };
+        let (sync_line, sync_color) = if !connected {
+            ("never synced".to_string(), muted)
+        } else if let Some(error) = runtime.last_sync_error() {
+            (format!("sync failed: {error}"), error_color)
+        } else if let Some(ts) = runtime.last_synced_at() {
+            (
+                format!(
+                    "synced {}",
+                    chrono::DateTime::from_timestamp(ts / 1000, 0)
+                        .map(|dt| dt.format("%H:%M:%S").to_string())
+                        .unwrap_or_else(|| "?".to_string())
+                ),
+                muted,
+            )
+        } else {
+            ("waiting for first sync…".to_string(), muted)
+        };
 
         div()
             .flex()
-            .items_center()
-            .justify_between()
+            .flex_col()
+            .gap_0p5()
             .pb_1()
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .gap_2()
+                    .justify_between()
                     .child(
                         div()
-                            .text_sm()
-                            .text_color(accent)
-                            .child(SharedString::from("War Room".to_string())),
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(accent)
+                                    .child(SharedString::from("War Room".to_string())),
+                            )
+                            .child(
+                                div()
+                                    .id("war-room-realtime-toggle")
+                                    .cursor_pointer()
+                                    .text_xs()
+                                    .text_color(if realtime_enabled { accent } else { muted })
+                                    .hover(|style| style.text_color(accent))
+                                    .child(SharedString::from(if realtime_enabled {
+                                        "📡 ON"
+                                    } else {
+                                        "📡"
+                                    }))
+                                    .on_click(cx.listener({
+                                        let runtime = self.runtime.clone();
+                                        move |_this, _event, _window, cx| {
+                                            runtime.update(cx, |runtime, cx| {
+                                                runtime.toggle_realtime(cx)
+                                            });
+                                        }
+                                    }))
+                                    .into_any_element(),
+                            ),
                     )
-                    .child(
-                        div()
-                            .id("war-room-realtime-toggle")
-                            .cursor_pointer()
-                            .text_xs()
-                            .text_color(if realtime_enabled { accent } else { muted })
-                            .hover(|style| style.text_color(accent))
-                            .child(SharedString::from(if realtime_enabled {
-                                "📡 ON"
-                            } else {
-                                "📡"
-                            }))
-                            .on_click(cx.listener({
-                                let runtime = self.runtime.clone();
-                                move |_this, _event, _window, cx| {
-                                    runtime.update(cx, |runtime, cx| {
-                                        runtime.toggle_realtime(cx)
-                                    });
-                                }
-                            }))
-                            .into_any_element(),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
                     .child(
                         div()
                             .id("war-room-refresh")
@@ -412,12 +521,19 @@ impl WarRoomPanel {
                                 }
                             }))
                             .into_any_element(),
-                    )
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_xs()
+                    .child(div().text_color(muted).child(SharedString::from(room_line)))
                     .child(
                         div()
-                            .text_xs()
-                            .text_color(muted)
-                            .child(SharedString::from(connection_line)),
+                            .text_color(sync_color)
+                            .child(SharedString::from(sync_line)),
                     ),
             )
             .into_any_element()
@@ -452,17 +568,7 @@ impl WarRoomPanel {
         let summary = format!("{doing} doing · {stale} stale · {released} released");
 
         let mut rows: Vec<gpui::AnyElement> = Vec::new();
-        if self.board_collapsed {
-            rows.push(
-                div()
-                    .px_2()
-                    .py_1()
-                    .text_xs()
-                    .text_color(muted)
-                    .child(SharedString::from(summary.clone()))
-                    .into_any_element(),
-            );
-        } else {
+        if !self.board_collapsed {
             if board.is_empty() {
                 rows.push(
                     div()
@@ -515,6 +621,7 @@ impl WarRoomPanel {
         div()
             .flex()
             .flex_col()
+            .flex_shrink_0()
             .pb_1()
             .child(
                 div()
@@ -534,7 +641,18 @@ impl WarRoomPanel {
                     }))
                     .into_any_element(),
             )
-            .children(rows)
+            .when(!self.board_collapsed, |section| {
+                section.child(
+                    div()
+                        .id("war-room-board-rows")
+                        .max_h(px(160.))
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .flex()
+                        .flex_col()
+                        .children(rows),
+                )
+            })
             .into_any_element()
     }
 
@@ -572,6 +690,19 @@ impl WarRoomPanel {
         }
 
         let mut rows: Vec<gpui::AnyElement> = Vec::new();
+        if entries.is_empty() {
+            rows.push(
+                div()
+                    .px_2()
+                    .pb_0p5()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(SharedString::from(
+                        "no agents reporting yet — connect a worker to sync",
+                    ))
+                    .into_any_element(),
+            );
+        }
         for (index, (label, state_text)) in entries.iter().enumerate() {
             let line = format!("{label} · {state_text}");
             rows.push(
@@ -597,6 +728,7 @@ impl WarRoomPanel {
         div()
             .flex()
             .flex_col()
+            .flex_shrink_0()
             .child(
                 div()
                     .px_2()
@@ -607,16 +739,27 @@ impl WarRoomPanel {
                     .child(SharedString::from("— roster (click to @mention) —"))
                     .into_any_element(),
             )
-            .children(rows)
+            .child(
+                div()
+                    .id("war-room-roster-rows")
+                    .max_h(px(120.))
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .children(rows),
+            )
             .into_any_element()
     }
 
-    fn render_feed(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_feed(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = cx.theme();
         let colors = theme.colors();
         let muted = colors.text_muted;
         let fg = colors.text;
         let accent = colors.text_accent;
+        let border = colors.border;
+        let warning = theme.status().warning;
 
         let snapshot = self.runtime.read(cx).snapshot().cloned();
         let local_device = crate::board_state::device_name().unwrap_or_default();
@@ -627,8 +770,10 @@ impl WarRoomPanel {
             State(AgentStateMessage),
         }
         let mut entries: Vec<(i64, FeedEntry)> = Vec::new();
+        let mut latest_message_ts = i64::MIN;
         if let Some(snapshot) = &snapshot {
             for message in &snapshot.messages {
+                latest_message_ts = latest_message_ts.max(message.ts);
                 entries.push((message.ts, FeedEntry::Message(message.clone())));
             }
             for state in &snapshot.states {
@@ -637,60 +782,103 @@ impl WarRoomPanel {
         }
         entries.sort_by_key(|(ts, _)| *ts);
 
+        // Autoscroll: a message newer than the last render's newest flags a
+        // scroll-to-bottom for the next layout pass.
+        if latest_message_ts > self.last_feed_ts {
+            self.last_feed_ts = latest_message_ts;
+            self.feed_scroll_handle.scroll_to_bottom();
+        }
+
+        let mut current_keys: Vec<u64> = Vec::new();
         let mut rows: Vec<gpui::AnyElement> = Vec::new();
-        for (ts, entry) in entries.iter().rev().take(100).rev() {
-            let line = match entry {
+        let markdown_style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
+        for (index, (ts, entry)) in entries.iter().rev().take(100).rev().enumerate() {
+            match entry {
                 FeedEntry::Message(message) => {
-                    let secs = ts / 1000;
-                    let when = chrono::DateTime::from_timestamp(secs, 0)
+                    let sender = mentions::sender_label(message);
+                    let when = chrono::DateTime::from_timestamp(ts / 1000, 0)
                         .map(|dt| dt.format("%H:%M:%S").to_string())
                         .unwrap_or_else(|| "?".to_string());
-                    format!(
-                        "[{when}] {}: {}",
-                        mentions::sender_label(message),
-                        message.text
-                    )
+                    let is_mention = message.text.starts_with('@');
+                    let own = !local_device.is_empty() && message.device_name == local_device;
+                    let sender_color = if own || is_mention {
+                        accent
+                    } else {
+                        fg
+                    };
+                    let markdown = self.markdown_cache.get_or_create(message, cx);
+                    current_keys.push(MarkdownCache::key(message));
+                    rows.push(
+                        div()
+                            .id(("war-room-message", index as u64))
+                            .flex()
+                            .flex_col()
+                            .gap_0p5()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(if is_mention { warning } else { border })
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_baseline()
+                                            .gap_1()
+                                            .min_w_0()
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                                    .text_color(sender_color)
+                                                    .child(SharedString::from(sender)),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(muted)
+                                                    .child(SharedString::from(when)),
+                                            ),
+                                    )
+                                    .child(
+                                        CopyButton::new(
+                                            ("war-room-message-copy", index as u64),
+                                            message.text.clone(),
+                                        )
+                                        .icon_size(IconSize::Indicator),
+                                    ),
+                            )
+                            .child(MarkdownElement::new(markdown, markdown_style.clone()))
+                            .into_any_element(),
+                    );
                 }
                 FeedEntry::State(state) => {
                     let sub = state.sub_agent_id.as_deref().unwrap_or("main");
-                    format!(
+                    let line = format!(
                         "· {} [{}:{sub}] {}",
                         state.device_name,
                         session_prefix4(&state.session_id),
                         state.state_text
-                    )
+                    );
+                    rows.push(
+                        div()
+                            .id(("war-room-state", index as u64))
+                            .px_2()
+                            .py_0p5()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(SharedString::from(line))
+                            .into_any_element(),
+                    );
                 }
-            };
-            let is_state = matches!(entry, FeedEntry::State(_));
-            let is_mention = match entry {
-                FeedEntry::Message(message) => message.text.starts_with('@'),
-                _ => false,
-            };
-            let own = match entry {
-                FeedEntry::Message(message) => {
-                    !local_device.is_empty() && message.device_name == local_device
-                }
-                _ => false,
-            };
-            let color = if is_state {
-                muted
-            } else if is_mention {
-                accent
-            } else if own {
-                accent
-            } else {
-                fg
-            };
-            rows.push(
-                div()
-                    .px_2()
-                    .py_0p5()
-                    .text_xs()
-                    .text_color(color)
-                    .child(SharedString::from(line))
-                    .into_any_element(),
-            );
+            }
         }
+        self.markdown_cache.retain_current(&current_keys);
 
         div()
             .flex()
@@ -699,6 +887,8 @@ impl WarRoomPanel {
             .min_h_0()
             .id("war-room-feed")
             .overflow_y_scroll()
+            .track_scroll(&self.feed_scroll_handle)
+            .gap_1()
             .child(
                 div()
                     .px_2()
@@ -719,6 +909,7 @@ impl WarRoomPanel {
         let muted = colors.text_muted;
         div()
             .flex()
+            .flex_shrink_0()
             .items_center()
             .gap_1()
             .pt_1()
@@ -759,7 +950,7 @@ impl Focusable for WarRoomPanel {
 }
 
 impl Render for WarRoomPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         #[cfg(test)]
         PANEL_RENDER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let theme = cx.theme();
@@ -773,11 +964,12 @@ impl Render for WarRoomPanel {
             .flex_col()
             .gap_0p5()
             .p_2()
+            .overflow_hidden()
             .text_color(fg)
             .child(self.render_header(cx))
             .child(self.render_work_board(cx))
             .child(self.render_roster(cx))
-            .child(self.render_feed(cx))
+            .child(self.render_feed(window, cx))
             .child(self.render_input(cx))
             .into_any_element()
     }
@@ -814,7 +1006,7 @@ impl Panel for WarRoomPanel {
     }
 
     fn icon(&self, _window: &Window, _cx: &App) -> Option<ui::IconName> {
-        Some(ui::IconName::UserGroup)
+        Some(ui::IconName::Robot)
     }
 
     fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
@@ -1211,6 +1403,81 @@ mod tests {
         let snap = snapshot(vec![status("SHIKUWA", false, NOW, scopes)], vec![]);
         let board = build_work_board(&snap, &[], "m3", NOW);
         assert_eq!(board.len(), WORK_BOARD_ROW_CAP);
+    }
+
+    fn agent_state(device_name: &str, session_id: &str, state_text: &str, ts: i64) -> AgentStateMessage {
+        AgentStateMessage {
+            v: 1,
+            device_id: format!("id-{device_name}"),
+            device_name: device_name.to_string(),
+            session_id: session_id.to_string(),
+            sub_agent_id: None,
+            state_text: state_text.to_string(),
+            meta: String::new(),
+            ts,
+        }
+    }
+
+    #[test]
+    fn fresh_state_without_plan_yields_adhoc_doing_row() {
+        let snap = snapshot(
+            vec![],
+            vec![agent_state("m3", "f3a2ffff", "editing auth bridge", NOW - 10_000)],
+        );
+        let board = build_work_board(&snap, &[], "m3", NOW);
+        assert_eq!(board.len(), 1);
+        let item = &board[0];
+        assert_eq!(item.state, WorkState::Doing);
+        assert_eq!(item.plan_name, "(no plan)");
+        assert_eq!(item.owner_labels, vec!["m3:f3a2".to_string()]);
+        assert_eq!(item.task_summary, "editing auth bridge");
+    }
+
+    #[test]
+    fn state_for_covered_session_is_not_duplicated() {
+        // The session owns a plan scope — the ad-hoc projection must skip it.
+        let snap = snapshot(
+            vec![status(
+                "m3",
+                false,
+                NOW - 10_000,
+                vec![scope("f3a2ffff", "/repo/.plans/010_x.md", "plan work")],
+            )],
+            vec![agent_state("m3", "f3a2ffff", "same session", NOW - 5_000)],
+        );
+        let board = build_work_board(&snap, &[], "m3", NOW);
+        assert_eq!(board.len(), 1);
+        assert_eq!(board[0].plan_name, "010_x.md");
+        assert_eq!(board[0].task_summary, "plan work");
+    }
+
+    #[test]
+    fn stale_state_yields_no_adhoc_row() {
+        let snap = snapshot(
+            vec![],
+            vec![agent_state(
+                "m3",
+                "f3a2ffff",
+                "old",
+                NOW - STALE_AFTER_MS - 1,
+            )],
+        );
+        let board = build_work_board(&snap, &[], "m3", NOW);
+        assert!(board.is_empty());
+    }
+
+    #[test]
+    fn adhoc_rows_use_latest_state_per_session() {
+        let snap = snapshot(
+            vec![],
+            vec![
+                agent_state("m3", "f3a2ffff", "older state", NOW - 60_000),
+                agent_state("m3", "f3a2ffff", "newest state", NOW - 5_000),
+            ],
+        );
+        let board = build_work_board(&snap, &[], "m3", NOW);
+        assert_eq!(board.len(), 1);
+        assert_eq!(board[0].task_summary, "newest state");
     }
 
     // -----------------------------------------------------------------------

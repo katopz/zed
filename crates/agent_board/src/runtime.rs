@@ -48,6 +48,11 @@ pub struct BoardRuntime {
     realtime_client: Option<crate::realtime_client::RealtimeClient>,
     /// Completed poll rounds — the single-poll-loop GOAT check counts these.
     poll_rounds: u64,
+    /// Unix ms of the last successful sync round (None before the first).
+    last_synced_at: Option<i64>,
+    /// Last sync-round failure, surfaced in the war room header so a dead
+    /// worker is visible instead of silently stale.
+    last_sync_error: Option<String>,
 }
 
 impl BoardRuntime {
@@ -83,6 +88,8 @@ impl BoardRuntime {
                 mcp_server: None,
                 realtime_client: None,
                 poll_rounds: 0,
+                last_synced_at: None,
+                last_sync_error: None,
             };
             runtime.try_start(cx);
             runtime
@@ -128,6 +135,16 @@ impl BoardRuntime {
 
     pub fn poll_rounds(&self) -> u64 {
         self.poll_rounds
+    }
+
+    /// Unix ms of the last successful sync round, if any.
+    pub fn last_synced_at(&self) -> Option<i64> {
+        self.last_synced_at
+    }
+
+    /// Last sync-round error (cleared on the next success).
+    pub fn last_sync_error(&self) -> Option<&str> {
+        self.last_sync_error.as_deref()
     }
 
     /// Whether the poll task exists. Local-only runtimes (empty `worker_url`)
@@ -264,7 +281,7 @@ impl BoardRuntime {
             base_url,
             room,
             identity,
-            cx.background_executor().clone(),
+            cx,
         ));
         log::info!("[agent_board] real-time SSE client started (📡 toggle ON)");
     }
@@ -326,6 +343,11 @@ impl BoardRuntime {
                     }
                     Err(error) => {
                         log::debug!("[agent_board] sync round failed: {error:#}");
+                        this.update(cx, |this, cx| {
+                            this.last_sync_error = Some(format!("{error:#}"));
+                            cx.notify();
+                        })
+                        .ok();
                     }
                 }
                 cx.background_executor().timer(interval).await;
@@ -339,6 +361,8 @@ impl BoardRuntime {
     /// embedders) can drive rounds without a worker.
     pub fn on_snapshot(&mut self, snapshot: RoomSnapshot, cx: &mut Context<Self>) {
         self.poll_rounds += 1;
+        self.last_synced_at = Some(now_unix_ms());
+        self.last_sync_error = None;
         log::debug!(
             "[agent_board] sync round #{} complete (room={})",
             self.poll_rounds,
@@ -361,6 +385,18 @@ impl BoardRuntime {
     /// the panel reflects them without waiting out the interval).
     pub fn force_refresh(&mut self, cx: &mut Context<Self>) {
         self.start_poll(cx);
+    }
+
+    /// SSE-event nudge: refresh immediately, but throttled to one round per
+    /// ~2s so a chatty room doesn't turn the realtime stream into a GET flood.
+    pub fn realtime_nudge(&mut self, cx: &mut Context<Self>) {
+        let due = self
+            .last_synced_at
+            .map(|ts| now_unix_ms().saturating_sub(ts) >= 2_000)
+            .unwrap_or(true);
+        if due {
+            self.force_refresh(cx);
+        }
     }
 
     /// Set the room name and restart everything bound to it.
@@ -441,6 +477,13 @@ fn hostname() -> String {
     sysinfo::System::host_name().unwrap_or_else(|| "unknown".to_string())
 }
 
+fn now_unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 // ---------------------------------------------------------------------------
 // Tests — the single-poll-loop invariant (Plan 024 P0 / GOAT gate), verified
 // hermetically: a default config keeps the runtime inert, `init_global` is
@@ -508,12 +551,21 @@ mod tests {
         let runtime = cx.update(|cx| {
             BoardRuntime::init_global_with_config(inert_http(), AgentBoardConfig::default(), cx)
         });
+        // Sync metadata starts empty (local-only: never synced, no error).
+        runtime.read_with(cx, |runtime, _| {
+            assert!(runtime.last_synced_at().is_none());
+            assert!(runtime.last_sync_error().is_none());
+        });
         // Two rounds arrive (as the single poll loop would deliver them)…
         runtime.update(cx, |runtime, cx| runtime.on_snapshot(empty_snapshot(), cx));
         runtime.update(cx, |runtime, cx| runtime.on_snapshot(empty_snapshot(), cx));
-        // …and every view of the shared runtime sees the same single counter.
+        // …and every view of the shared runtime sees the same single counter,
+        // plus the successful-sync metadata.
         cx.update(|cx| {
-            assert_eq!(BoardRuntime::global(cx).read(cx).poll_rounds(), 2);
+            let runtime = BoardRuntime::global(cx).read(cx);
+            assert_eq!(runtime.poll_rounds(), 2);
+            assert!(runtime.last_synced_at().is_some());
+            assert!(runtime.last_sync_error().is_none());
         });
         runtime.read_with(cx, |runtime, _| assert_eq!(runtime.poll_rounds(), 2));
     }

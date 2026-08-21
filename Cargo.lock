@@ -391,6 +391,7 @@ dependencies = [
  "hex",
  "http_client",
  "log",
+ "markdown",
  "project",
  "rand 0.8.6",
  "schemars 1.0.4",
