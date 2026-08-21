@@ -88,6 +88,14 @@ pub struct AutoPromptConfig {
     #[serde(default = "default_watchdog_enabled")]
     pub watchdog_enabled: bool,
 
+    /// Whether Phase 2 (context-overflow continuation) prompts are authored
+    /// by an LLM reasoning pass over the summary (default) instead of the
+    /// deterministic rule-based chain. The rule-based chain always remains
+    /// as the fallback when the reasoning call fails, times out, or is
+    /// disabled here — overflow must never get more stuck than without it.
+    #[serde(default = "default_reasoned_phase2_enabled")]
+    pub reasoned_phase2_enabled: bool,
+
     /// Slash command / skill dispatched once when an automatic chain stops
     /// with no remaining tasks (plan 023 E, req 6) — e.g. a housekeeping
     /// skill that syncs docs. Availability-checked against the thread's
@@ -145,6 +153,10 @@ fn default_housekeeping_command() -> Option<String> {
     Some("housekeeping".to_string())
 }
 
+fn default_reasoned_phase2_enabled() -> bool {
+    true
+}
+
 impl Default for AutoPromptConfig {
     fn default() -> Self {
         Self {
@@ -160,6 +172,7 @@ impl Default for AutoPromptConfig {
             watchdog_enabled: default_watchdog_enabled(),
             claude_context_overflow_tokens: default_claude_context_overflow_tokens(),
             housekeeping_command: default_housekeeping_command(),
+            reasoned_phase2_enabled: default_reasoned_phase2_enabled(),
         }
     }
 }
@@ -263,6 +276,11 @@ impl AutoPromptConfig {
             Err(_) => default_housekeeping_command(),
         };
 
+        let reasoned_phase2_enabled = std::env::var("ZED_AUTO_PROMPT_REASONED_PHASE2_ENABLED")
+            .ok()
+            .map(|v| !matches!(v.as_str(), "0" | "false"))
+            .unwrap_or_else(default_reasoned_phase2_enabled);
+
         Self {
             system_prompt,
             max_iterations,
@@ -276,6 +294,7 @@ impl AutoPromptConfig {
             watchdog_enabled,
             claude_context_overflow_tokens,
             housekeeping_command,
+            reasoned_phase2_enabled,
         }
     }
 
@@ -323,6 +342,14 @@ mod tests {
             AutoPromptConfig::default().claude_context_overflow_tokens,
             320_000
         );
+    }
+
+    #[test]
+    fn reasoned_phase2_defaults_to_enabled() {
+        // The LLM reasoning pass is the default Phase 2 author; the
+        // rule-based chain is the fallback (and the flag-off mode).
+        assert!(default_reasoned_phase2_enabled());
+        assert!(AutoPromptConfig::default().reasoned_phase2_enabled);
     }
 
     #[test]
