@@ -157,7 +157,7 @@ fn default_session_limit_margin_secs() -> u64 {
 }
 
 fn default_watchdog_timeout_secs() -> u64 {
-    600
+    1800
 }
 
 fn default_watchdog_enabled() -> bool {

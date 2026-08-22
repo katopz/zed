@@ -12361,7 +12361,7 @@ pub(crate) mod tests {
     #[gpui::test]
     async fn test_watchdog_resets_across_generations(cx: &mut TestAppContext) {
         // This test does NOT set the watchdog env vars. The watchdog is enabled
-        // by default with a 600s window — long enough that the timer never
+        // by default with a 1800s window — long enough that the timer never
         // fires during this test (we never advance the clock that far). This
         // deliberately avoids any global env-var race with
         // `test_watchdog_halts_stuck_thread`, which sets a 1s window.

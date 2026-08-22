@@ -36,7 +36,7 @@ Stuck-thread watchdog in the `agent_ui` layer that runs independently of
 ## Key files
 
 - `crates/auto_prompt/src/watchdog.rs` — reasoning LLM call + prompt.
-- `crates/auto_prompt/src/config.rs` — `watchdog_timeout_secs` (default 600),
+- `crates/auto_prompt/src/config.rs` — `watchdog_timeout_secs` (default 1800),
   `watchdog_enabled` (default true).
 - `crates/agent_ui/src/auto_prompt/mod.rs` — `start_watchdog`,
   `cancel_watchdog_for_thread`.

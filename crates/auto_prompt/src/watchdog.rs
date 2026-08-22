@@ -17,9 +17,9 @@
 //!     can recover — retry, try another approach, or stop).
 //!
 //! The decision is intentionally LLM-based rather than rule-based: a fixed
-//! rule ("any spinner for >10 min = halt") would fire on every legitimately
+//! rule ("any spinner for >30 min = halt") would fire on every legitimately
 //! long `cargo build` or test run. The LLM can tell the difference between
-//! "a `git log` returned 3 lines 10 minutes ago and nothing happened since"
+//! "a `git log` returned 3 lines 30 minutes ago and nothing happened since"
 //! (halt) and "a `cargo test` is still streaming output" (continue).
 
 use std::sync::Arc;
@@ -95,7 +95,7 @@ a test suite, a large file read) and the timeout was premature. We will wait \
 another full window and ask you again with a higher timeout number.
 
 - \"halt\": The agent is truly stuck (e.g. a quick command like `git log` \
-returned 3 lines 10 minutes ago and nothing happened since). We will cancel \
+returned 3 lines 30 minutes ago and nothing happened since). We will cancel \
 the worker and tell it about the timeout so it can retry, change approach, \
 or explicitly stop.
 

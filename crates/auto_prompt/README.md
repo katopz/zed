@@ -274,7 +274,7 @@ If more than 300 seconds (`CHAIN_TIMEOUT_SECS`) pass between iterations, the cha
 
 **Problem**: All other timeouts in auto_prompt run *after* `on_thread_stopped` fires. If the worker LLM stream hangs (provider stall, rate-limit with empty body, ACP protocol dead-end), the thread stays in `Generating` forever and `on_thread_stopped` never fires. None of the existing timeouts can recover from this.
 
-**Solution**: A watchdog task (`auto_prompt/src/watchdog.rs`) is armed when auto_prompt dispatches a continuation. It sleeps for `watchdog_timeout_secs` (default 600 = 10 minutes), then:
+**Solution**: A watchdog task (`auto_prompt/src/watchdog.rs`) is armed when auto_prompt dispatches a continuation. It sleeps for `watchdog_timeout_secs` (default 1800 = 30 minutes), then:
 
 1. Checks if the thread is still `Generating`. If not, the thread recovered — exit.
 2. Gathers context: last tool call (input + output), last assistant message, cumulative elapsed time, timeout number.
@@ -285,7 +285,7 @@ If more than 300 seconds (`CHAIN_TIMEOUT_SECS`) pass between iterations, the cha
 
 **Key safety properties**:
 - On any reasoning LLM failure (unreachable, unparseable, timeout), defaults to `Continue` — never kills a possibly-fine worker on a flaky reasoning call.
-- The reasoning LLM can distinguish "`git log` returned 3 lines 10 min ago" (halt) from "`cargo test` still running" (continue).
+- The reasoning LLM can distinguish "`git log` returned 3 lines 30 min ago" (halt) from "`cargo test` still running" (continue).
 - Config: `watchdog_timeout_secs` (env: `ZED_AUTO_PROMPT_WATCHDOG_TIMEOUT_SECS`), `watchdog_enabled` (env: `ZED_AUTO_PROMPT_WATCHDOG_ENABLED`). Disable with `watchdog_enabled: false`.
 - Decisions logged to `/tmp/zed_auto_prompt/{ms}_{seq}_watchdog_decision.json`.
 
@@ -705,7 +705,7 @@ Config file: `~/.config/zed/auto_prompt.json`
   "max_verification_attempts": 2,
   "max_llm_retries": 3,
   "same_thread_token_threshold": 60000,
-  "watchdog_timeout_secs": 600,
+  "watchdog_timeout_secs": 1800,
   "watchdog_enabled": true
 }
 ```
@@ -719,7 +719,7 @@ Config file: `~/.config/zed/auto_prompt.json`
 | `max_llm_retries` | `3` | Max automatic retry attempts for LLM calls before showing "Retry" button |
 | `max_verification_attempts` | `2` | Max verification prompts in PreStop phase before accepting stop |
 | `same_thread_token_threshold` | `60000` | Token count below which auto-prompt continues in the same thread instead of creating a new thread |
-| `watchdog_timeout_secs` | `600` | Seconds the worker may stay in `Generating` before a reasoning LLM decides continue/halt |
+| `watchdog_timeout_secs` | `1800` | Seconds the worker may stay in `Generating` before a reasoning LLM decides continue/halt |
 | `watchdog_enabled` | `true` | Whether the stuck-thread watchdog is active |
 
 Note: Enable/disable is controlled by the UI toggle (sparkle button) per thread, not by the config file.

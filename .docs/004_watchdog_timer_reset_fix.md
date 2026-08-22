@@ -48,7 +48,7 @@ other threads.
   cancelled → timeout-notice injected → new generation.
 - `test_watchdog_resets_across_generations` — regression for this issue:
   two sequential generations, asserts lifecycle armed → None (cancelled) →
-  Some (re-armed). Uses default 600s window (no env var) to avoid global
+  Some (re-armed). Uses the default 1800s window (no env var) to avoid global
   state races with the HALT test.
 
 Stable at 30 iterations × 2 tests (60/60 pass).
