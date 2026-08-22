@@ -1796,11 +1796,14 @@ impl ConversationView {
                 self.notify_with_sound("Waiting for input", IconName::Info, window, cx);
                 // A thread awaiting a decision form never stops, so every
                 // other auto-prompt recovery path is unreachable — arm the
-                // auto-answer (reasoned pick, countdown backstop) when this
-                // thread's auto-prompt loop is running.
-                crate::auto_prompt::elicitation_auto_answer::arm_if_enabled(
-                    self, thread, &id, cx,
-                );
+                // auto-answer (reasoned pick, countdown backstop). Resolve the
+                // view by the elicitation's own session: the form may belong
+                // to a background thread while another is active.
+                if let Some(thread_view) = self.thread_view(&session_id) {
+                    crate::auto_prompt::elicitation_auto_answer::arm_if_enabled(
+                        thread_view, thread, &id, cx,
+                    );
+                }
             }
             AcpThreadEvent::ElicitationResponded(id) => {
                 // The auto-answer countdown is moot once the form is answered

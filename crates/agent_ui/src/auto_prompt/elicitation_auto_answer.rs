@@ -295,21 +295,29 @@ async fn call_answerer(
 /// Arm the auto-answer for a pending elicitation on a thread whose
 /// auto-prompt is enabled. No-op when the feature is disabled in config, the
 /// elicitation is not an answerable form, or there is nothing to answer.
+///
+/// `thread_view` is the view for THIS elicitation's session (resolved by
+/// session id, NOT the conversation's active view — the elicitation may land
+/// on a background thread while the user is looking at another).
 pub fn arm_if_enabled(
-    conversation_view: &ConversationView,
+    thread_view: gpui::Entity<crate::conversation_view::ThreadView>,
     thread: &gpui::Entity<AcpThread>,
     elicitation_id: &ElicitationEntryId,
     cx: &mut gpui::Context<ConversationView>,
 ) {
     let config = auto_prompt::load_config_cached().unwrap_or_default();
     if !config.elicitation_auto_answer_enabled {
+        log::debug!(
+            "[auto_prompt::elicitation_auto_answer] skipping — disabled in config"
+        );
         return;
     }
 
-    let auto_prompt_enabled = conversation_view
-        .active_thread()
-        .is_some_and(|thread_view| thread_view.read(cx).auto_prompt_enabled);
+    let auto_prompt_enabled = thread_view.read(cx).auto_prompt_enabled;
     if !auto_prompt_enabled {
+        log::debug!(
+            "[auto_prompt::elicitation_auto_answer] skipping — auto-prompt disabled for this thread"
+        );
         return;
     }
 
@@ -319,6 +327,9 @@ pub fn arm_if_enabled(
         .map(|(_, elicitation)| elicitation)
         .and_then(|elicitation| extract_question(&elicitation.request));
     let Some(question) = question else {
+        log::debug!(
+            "[auto_prompt::elicitation_auto_answer] skipping — not an answerable form elicitation"
+        );
         return;
     };
 
@@ -327,6 +338,13 @@ pub fn arm_if_enabled(
         .map(|configured| configured.model);
     let context = last_assistant_text(thread.read(cx));
     let countdown = Duration::from_secs(config.elicitation_countdown_secs.max(1));
+    log::info!(
+        "[auto_prompt::elicitation_auto_answer] armed for '{}' ({} option(s), countdown {}s, reasoning {})",
+        question.message,
+        question.options.len(),
+        countdown.as_secs(),
+        if model.is_some() { "on" } else { "OFF — backstop only" }
+    );
     // Register the deadline BEFORE spawning so the countdown label renders
     // on the card's very next frame, not one countdown late.
     set_deadline(elicitation_id, Instant::now() + countdown);
