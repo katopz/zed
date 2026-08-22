@@ -5264,6 +5264,125 @@ pub mod tests {
     }
 
     #[gpui::test]
+    async fn test_buffer_search_persists_when_opening_next_file_as_preview(
+        cx: &mut TestAppContext,
+    ) {
+        // Clicking successive files in the project panel opens each of them as
+        // a preview tab, replacing the previous preview in the same pane. The
+        // deployed buffer search bar must stay visible with its query and
+        // re-run the query in the newly opened file.
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/dir"),
+            json!({
+                "one.rs": "dog\ncat\n",
+                "two.rs": "dog\ndog\n",
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+        let worktree_id = project.update(cx, |this, cx| {
+            this.worktrees(cx).next().unwrap().read(cx).id()
+        });
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+
+        let editor_one = workspace
+            .update_in(&mut cx, |workspace, window, cx| {
+                workspace.open_path_preview(
+                    (worktree_id, rel_path("one.rs")),
+                    None,
+                    true,
+                    true,
+                    true,
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .unwrap()
+            .downcast::<Editor>()
+            .unwrap();
+        cx.run_until_parked();
+
+        let panes: Vec<_> = workspace.update_in(&mut cx, |this, _, _| this.panes().to_owned());
+        assert_eq!(panes.len(), 1);
+        let pane = panes.first().cloned().unwrap();
+
+        let buffer_search_bar = cx.new_window_entity(|window, cx| {
+            let mut search_bar =
+                BufferSearchBar::new(Some(project.read(cx).languages().clone()), window, cx);
+            search_bar.set_active_pane_item(Some(&editor_one), window, cx);
+            search_bar.show(window, cx);
+            search_bar
+        });
+        pane.update_in(&mut cx, |pane, window, cx| {
+            pane.toolbar().update(cx, |toolbar, cx| {
+                toolbar.add_item(buffer_search_bar.clone(), window, cx);
+            })
+        });
+
+        buffer_search_bar
+            .update_in(&mut cx, |buffer_search_bar, window, cx| {
+                buffer_search_bar.focus_handle(cx).focus(window, cx);
+                buffer_search_bar.search("dog", None, true, window, cx)
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        buffer_search_bar.read_with(&cx, |buffer_search_bar, cx| {
+            assert!(!buffer_search_bar.is_dismissed());
+            assert_eq!(buffer_search_bar.query(cx), "dog");
+        });
+
+        // Click the next file in the project panel: opens as a preview tab,
+        // replacing the previous preview item in the same pane.
+        let editor_two = workspace
+            .update_in(&mut cx, |workspace, window, cx| {
+                workspace.open_path_preview(
+                    (worktree_id, rel_path("two.rs")),
+                    None,
+                    true,
+                    true,
+                    true,
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .unwrap()
+            .downcast::<Editor>()
+            .unwrap();
+        cx.run_until_parked();
+
+        buffer_search_bar.read_with(&cx, |buffer_search_bar, cx| {
+            assert!(
+                !buffer_search_bar.is_dismissed(),
+                "Opening the next file as a preview tab must not dismiss the search bar"
+            );
+            assert_eq!(
+                buffer_search_bar.query(cx),
+                "dog",
+                "The query must be preserved when the next file opens"
+            );
+        });
+        editor_two.update_in(&mut cx, |editor, window, cx| {
+            assert_eq!(
+                editor.all_text_background_highlights(window, cx).len(),
+                2,
+                "The preserved query should re-run against the newly opened file"
+            );
+        });
+    }
+
+    #[gpui::test]
     async fn test_search_dismisses_modal(cx: &mut TestAppContext) {
         init_test(cx);
 

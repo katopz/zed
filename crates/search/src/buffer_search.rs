@@ -3269,6 +3269,127 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[gpui::test]
+    async fn test_search_persists_when_pane_activates_another_item(cx: &mut TestAppContext) {
+        // Opening/activating another file in the same pane (e.g. clicking a
+        // file in the project panel) goes through Pane's toolbar update and
+        // must keep the deployed search bar with its query, re-running it in
+        // the newly active editor.
+        init_globals(cx);
+        let app_state = cx.update(AppState::test);
+        let project = Project::test(app_state.fs.clone(), [], cx).await;
+        let buffer_a = cx.new(|cx| {
+            Buffer::local(
+                r#"
+                dog
+                cat
+                "#
+                .unindent(),
+                cx,
+            )
+        });
+        let buffer_b = cx.new(|cx| {
+            Buffer::local(
+                r#"
+                dog
+                dog
+                "#
+                .unindent(),
+                cx,
+            )
+        });
+        let multibuffer_a = cx.update(|cx| MultiBuffer::build_from_buffer(buffer_a, cx));
+        let multibuffer_b = cx.update(|cx| MultiBuffer::build_from_buffer(buffer_b, cx));
+        let mut editor_a = None;
+        let mut editor_b = None;
+        let mut search_bar = None;
+        let mut workspace_handle = None;
+
+        let window = cx.add_window(|window, cx| {
+            let default_key_bindings = settings::KeymapFile::load_asset_allow_partial_failure(
+                "keymaps/default-macos.json",
+                cx,
+            )
+            .unwrap();
+            cx.bind_keys(default_key_bindings);
+            let workspace = cx.new(|cx| Workspace::test_new(project.clone(), window, cx));
+            let multi_workspace = MultiWorkspace::new(workspace.clone(), window, cx);
+            let buffer_search_bar = cx.new(|cx| BufferSearchBar::new(None, window, cx));
+            workspace.update(cx, |workspace, cx| {
+                workspace.active_pane().update(cx, |pane, cx| {
+                    pane.toolbar().update(cx, |toolbar, cx| {
+                        toolbar.add_item(buffer_search_bar.clone(), window, cx);
+                    });
+                });
+            });
+            let editor_handle_a = cx.new(|cx| {
+                Editor::new(
+                    editor::EditorMode::full(),
+                    multibuffer_a.clone(),
+                    Some(project.clone()),
+                    window,
+                    cx,
+                )
+            });
+            let editor_handle_b = cx.new(|cx| {
+                Editor::new(
+                    editor::EditorMode::full(),
+                    multibuffer_b.clone(),
+                    Some(project.clone()),
+                    window,
+                    cx,
+                )
+            });
+            workspace.update(cx, |workspace, cx| {
+                workspace.add_item_to_center(Box::new(editor_handle_a.clone()), window, cx);
+            });
+            editor_a = Some(editor_handle_a);
+            editor_b = Some(editor_handle_b);
+            search_bar = Some(buffer_search_bar);
+            workspace_handle = Some(workspace);
+            multi_workspace
+        });
+        let cx = VisualTestContext::from_window(*window, cx).into_mut();
+        let editor_a = editor_a.unwrap();
+        let editor_b = editor_b.unwrap();
+        let search_bar = search_bar.unwrap();
+        let workspace_handle = workspace_handle.unwrap();
+
+        search_bar
+            .update_in(cx, |search_bar, window, cx| {
+                search_bar.deploy(&Deploy::find(), None, window, cx);
+                search_bar.search("dog", None, true, window, cx)
+            })
+            .await
+            .unwrap();
+
+        editor_a.update_in(cx, |editor, window, cx| {
+            assert_eq!(editor.all_text_background_highlights(window, cx).len(), 1);
+        });
+
+        // Activate the other editor in the pane, like opening another file.
+        workspace_handle.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_center(Box::new(editor_b.clone()), window, cx);
+        });
+        cx.run_until_parked();
+
+        search_bar.read_with(cx, |search_bar, cx| {
+            assert!(
+                !search_bar.is_dismissed(),
+                "Activating another item must not dismiss the search bar"
+            );
+            assert_eq!(search_bar.query(cx), "dog");
+        });
+        editor_b.update_in(cx, |editor, window, cx| {
+            assert_eq!(
+                editor.all_text_background_highlights(window, cx).len(),
+                2,
+                "The query should re-run against the newly active item"
+            );
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
     async fn test_cmd_e_then_cmd_g_uses_selection_for_find(cx: &mut TestAppContext) {
         init_globals(cx);
         let app_state = cx.update(AppState::test);
@@ -3742,6 +3863,92 @@ mod tests {
             assert!(
                 !search_bar.needs_expand_collapse_option(cx),
                 "Items reporting ItemBufferKind::None must not get the expand/collapse button"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_search_persists_when_switching_active_items(cx: &mut TestAppContext) {
+        // Switching the active pane item (e.g. clicking another file in the
+        // project panel or another tab) must keep the search bar deployed
+        // with its query and re-run that query in the newly active item.
+        init_globals(cx);
+        let mut editors = None;
+        let window = cx.add_window(|window, cx| {
+            let default_key_bindings = settings::KeymapFile::load_asset_allow_partial_failure(
+                "keymaps/default-macos.json",
+                cx,
+            )
+            .unwrap();
+            cx.bind_keys(default_key_bindings);
+            let buffer_a = cx.new(|cx| {
+                Buffer::local(
+                    r#"
+                    dog
+                    cat
+                    "#
+                    .unindent(),
+                    cx,
+                )
+            });
+            let buffer_b = cx.new(|cx| {
+                Buffer::local(
+                    r#"
+                    dog
+                    dog
+                    "#
+                    .unindent(),
+                    cx,
+                )
+            });
+            let editor_a = cx.new(|cx| Editor::for_buffer(buffer_a, None, window, cx));
+            let editor_b = cx.new(|cx| Editor::for_buffer(buffer_b, None, window, cx));
+            let mut search_bar = BufferSearchBar::new(None, window, cx);
+            search_bar.set_active_pane_item(Some(&editor_a), window, cx);
+            search_bar.show(window, cx);
+            editors = Some((editor_a, editor_b));
+            search_bar
+        });
+        let search_bar = window.root(cx).unwrap();
+        let cx = VisualTestContext::from_window(*window, cx).into_mut();
+        let (editor_a, editor_b) = editors.unwrap();
+
+        search_bar
+            .update_in(cx, |search_bar, window, cx| {
+                search_bar.search("dog", None, true, window, cx)
+            })
+            .await
+            .unwrap();
+
+        editor_a.update_in(cx, |editor, window, cx| {
+            assert_eq!(
+                editor.all_text_background_highlights(window, cx).len(),
+                1,
+                "The initial item should have its matches highlighted"
+            );
+        });
+
+        let new_location = search_bar.update_in(cx, |search_bar, window, cx| {
+            search_bar.set_active_pane_item(Some(&editor_b), window, cx)
+        });
+
+        assert_eq!(
+            new_location,
+            ToolbarItemLocation::Secondary,
+            "A deployed search bar must stay visible when switching to another singleton item"
+        );
+        search_bar.read_with(cx, |search_bar, cx| {
+            assert!(!search_bar.is_dismissed());
+            assert_eq!(search_bar.query(cx), "dog");
+        });
+
+        cx.run_until_parked();
+
+        editor_b.update_in(cx, |editor, window, cx| {
+            assert_eq!(
+                editor.all_text_background_highlights(window, cx).len(),
+                2,
+                "The query should re-run against the newly active item"
             );
         });
     }
