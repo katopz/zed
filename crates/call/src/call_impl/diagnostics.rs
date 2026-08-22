@@ -235,7 +235,18 @@ impl Serialize for ConnectionQualityDTO {
     }
 }
 
-#[cfg_attr(any(test, feature = "test-support"), allow(dead_code))]
+#[cfg_attr(
+    all(
+        not(rust_analyzer),
+        any(
+            test,
+            feature = "test-support",
+            target_os = "windows",
+            target_os = "freebsd"
+        )
+    ),
+    allow(dead_code)
+)]
 struct TrackContext {
     participant_id: String,
     participant_name: String,
@@ -250,7 +261,18 @@ struct PollResult {
 }
 
 #[derive(Clone, Copy)]
-#[cfg_attr(any(test, feature = "test-support"), allow(dead_code))]
+#[cfg_attr(
+    all(
+        not(rust_analyzer),
+        any(
+            test,
+            feature = "test-support",
+            target_os = "windows",
+            target_os = "freebsd"
+        )
+    ),
+    allow(dead_code)
+)]
 struct InboundCounters {
     packets_received: u64,
     packets_lost: i64,
@@ -329,7 +351,7 @@ fn compute_remote_audio_stats(
     not(any(
         test,
         feature = "test-support",
-        all(target_os = "windows", target_env = "gnu"),
+        target_os = "windows",
         target_os = "freebsd"
     ))
 ))]
@@ -462,7 +484,7 @@ fn compute_remote_audio_stats(
     any(
         test,
         feature = "test-support",
-        all(target_os = "windows", target_env = "gnu"),
+        target_os = "windows",
         target_os = "freebsd"
     )
 ))]
