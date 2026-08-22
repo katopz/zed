@@ -5,13 +5,13 @@
 //! This crate contains the decision logic only. The caller (agent_ui)
 //! handles the actual GPUI action dispatch.
 
-mod config;
 pub mod claude_agent;
+mod config;
 pub mod context;
 pub(crate) mod debug_log;
 pub mod lightweight_context;
-mod pending_question;
 pub mod peer_states;
+mod pending_question;
 pub mod plan_registry;
 pub mod session_limit;
 pub mod watchdog;
@@ -851,17 +851,33 @@ pub fn is_waiting_for_user_decision(last_assistant_message: Option<&str>) -> boo
     explicit_deferral
 }
 
-/// Synchronous pre-check and decision.
-///
-/// Returns `NoAction` if auto-prompt should not fire (disabled, no tools,
-/// cancelled, max iterations, no model configured).
-/// Returns `NeedsLlmCall` for all non-trivial cases (LLM decides).
-pub fn decide(
+/// Outcome of the cheap pre-decide checks: either an immediate decision
+/// (auto-prompt declines before touching the filesystem) or the context
+/// needed to finish the decision once plan/doc files have been read.
+enum DecidePrecheck {
+    Decision(AutoPromptDecision),
+    Proceed(Box<DecidePrecheckContext>),
+}
+
+struct DecidePrecheckContext {
+    project_root: Option<std::path::PathBuf>,
+    iteration_count: u32,
+    config: AutoPromptConfig,
+    stop_phase: StopPhase,
+    verification_count: u32,
+    model: Arc<dyn LanguageModel>,
+}
+
+/// Cheap pre-checks that run on the main thread before any context file is
+/// read. Mirrors the original `decide` prefix: config load, cancel/max-iteration
+/// gates, model lookup. Everything here is in-memory (config is mtime-cached),
+/// so it never blocks the UI thread meaningfully.
+fn decide_precheck(
     thread: &gpui::Entity<acp_thread::AcpThread>,
     used_tools: bool,
     stop_reason: &acp::StopReason,
-    cx: &App,
-) -> AutoPromptDecision {
+    cx: &gpui::App,
+) -> DecidePrecheck {
     log::info!("[auto_prompt::decide] Starting decision process");
 
     let project_root = thread
@@ -890,7 +906,7 @@ pub fn decide(
                 "no_action",
                 serde_json::json!({"reason": "config_load_failed", "error": format!("{err}")}),
             );
-            return AutoPromptDecision::NoAction;
+            return DecidePrecheck::Decision(AutoPromptDecision::NoAction);
         }
     };
 
@@ -918,11 +934,8 @@ pub fn decide(
         log::info!("[auto_prompt::decide] Thread was cancelled, skipping auto-prompt");
         let session_id_str = thread.read(cx).session_id().to_string();
         reset_iteration_with_session(&session_id_str);
-        debug_log::write_log(
-            "no_action",
-            serde_json::json!({"reason": "cancelled"}),
-        );
-        return AutoPromptDecision::NoAction;
+        debug_log::write_log("no_action", serde_json::json!({"reason": "cancelled"}));
+        return DecidePrecheck::Decision(AutoPromptDecision::NoAction);
     }
 
     log::info!("[auto_prompt::decide] Stop reason: {:?}", stop_reason);
@@ -935,7 +948,7 @@ pub fn decide(
             "no_action",
             serde_json::json!({"reason": "interactive_tool_pending"}),
         );
-        return AutoPromptDecision::NoAction;
+        return DecidePrecheck::Decision(AutoPromptDecision::NoAction);
     }
 
     log::info!(
@@ -959,7 +972,7 @@ pub fn decide(
                 "max_iterations": config.max_iterations,
             }),
         );
-        return AutoPromptDecision::NoAction;
+        return DecidePrecheck::Decision(AutoPromptDecision::NoAction);
     }
 
     let registry = language_model::LanguageModelRegistry::read_global(cx);
@@ -969,7 +982,7 @@ pub fn decide(
             "no_action",
             serde_json::json!({"reason": "no_model_configured"}),
         );
-        return AutoPromptDecision::NoAction;
+        return DecidePrecheck::Decision(AutoPromptDecision::NoAction);
     };
     let model = configured_model.model;
     log::info!("[auto_prompt::decide] Using model: {:?}", model.id());
@@ -983,21 +996,103 @@ pub fn decide(
         StopPhase::PreStop
     };
 
+    DecidePrecheck::Proceed(Box::new(DecidePrecheckContext {
+        project_root,
+        iteration_count,
+        config,
+        stop_phase,
+        verification_count,
+        model,
+    }))
+}
+
+/// Synchronous pre-check and decision.
+///
+/// Returns `NoAction` if auto-prompt should not fire (disabled, no tools,
+/// cancelled, max iterations, no model configured).
+/// Returns `NeedsLlmCall` for all non-trivial cases (LLM decides).
+///
+/// Prefer [`decide_async`], which runs the plan/doc file reads on a background
+/// thread; this sync form exists for callers that cannot await.
+pub fn decide(
+    thread: &gpui::Entity<acp_thread::AcpThread>,
+    used_tools: bool,
+    stop_reason: &acp::StopReason,
+    cx: &gpui::App,
+) -> AutoPromptDecision {
+    let pre = match decide_precheck(thread, used_tools, stop_reason, cx) {
+        DecidePrecheck::Decision(decision) => return decision,
+        DecidePrecheck::Proceed(pre) => pre,
+    };
+    let inputs = context_file_inputs(&thread.read(cx), cx);
+    let plan_files = read_plan_files(&inputs);
+    let doc_files = read_doc_files(inputs.work_dirs.as_deref().unwrap_or_default());
+    decide_finish(thread, stop_reason, *pre, inputs, plan_files, doc_files, cx)
+}
+
+/// Non-blocking variant of [`decide`]: the `.plans/`/`.docs/` reads (up to 10
+/// × 100KB files plus directory scans) run on a background executor so the UI
+/// thread stays responsive; everything needing `&App` still runs on the main
+/// thread. Behavior is identical to the sync path.
+pub async fn decide_async(
+    thread: gpui::Entity<acp_thread::AcpThread>,
+    used_tools: bool,
+    stop_reason: acp::StopReason,
+    cx: &gpui::AsyncApp,
+) -> AutoPromptDecision {
+    let pre = match cx.update(|cx| decide_precheck(&thread, used_tools, &stop_reason, cx)) {
+        DecidePrecheck::Decision(decision) => return decision,
+        DecidePrecheck::Proceed(pre) => pre,
+    };
+    let inputs = cx.update(|cx| context_file_inputs(&thread.read(cx), cx));
+    let bg_inputs = inputs.clone();
+    let (plan_files, doc_files) = cx
+        .background_executor()
+        .spawn(async move {
+            let work_dirs = bg_inputs.work_dirs.as_deref().unwrap_or_default();
+            let doc_files = read_doc_files(work_dirs);
+            let plan_files = read_plan_files(&bg_inputs);
+            (plan_files, doc_files)
+        })
+        .await;
+    cx.update(|cx| {
+        decide_finish(
+            &thread,
+            &stop_reason,
+            *pre,
+            inputs,
+            plan_files,
+            doc_files,
+            cx,
+        )
+    })
+}
+
+/// Second half of the decide pipeline: builds the full [`AutoPromptContext`]
+/// from the (pre-read) plan/doc files and runs the decision logic. Runs on the
+/// main thread (entity reads); the callers own how the file reads happen.
+fn decide_finish(
+    thread: &gpui::Entity<acp_thread::AcpThread>,
+    stop_reason: &acp::StopReason,
+    pre: DecidePrecheckContext,
+    inputs: ContextFileInputs,
+    plan_files: Vec<PlanFileContent>,
+    doc_files: Vec<String>,
+    cx: &gpui::App,
+) -> AutoPromptDecision {
+    let DecidePrecheckContext {
+        project_root,
+        iteration_count,
+        config,
+        stop_phase,
+        verification_count,
+        model,
+    } = pre;
+
     let (auto_prompt_ctx, session_id, thread_title, work_dirs) = {
         let thread_ref = thread.read(cx);
         let stop_reason_str = format!("{stop_reason:?}").to_lowercase();
-        let first_user_msg = thread_ref.entries().iter().find_map(|entry| {
-            if let acp_thread::AgentThreadEntry::UserMessage(msg) = entry {
-                let content = msg.content.to_markdown(cx).to_string();
-                if !content.is_empty() {
-                    return Some(content);
-                }
-            }
-            None
-        });
-        let plan_files = read_plan_files(thread_ref, first_user_msg.as_deref());
-        let doc_files = read_doc_files(thread_ref);
-        let sid = thread_ref.session_id().clone();
+        let sid = inputs.session_id;
         let sid_str = sid.to_string();
         for plan in &plan_files {
             plan_registry::heartbeat(&plan.path, &sid_str);
@@ -1013,8 +1108,7 @@ pub fn decide(
         ctx.stop_phase = stop_phase.clone();
         ctx.verification_count = verification_count;
         let title = thread_ref.title().map(|t| t.to_string());
-        let dirs = thread_ref.work_dirs().map(|pl| pl.paths().to_vec());
-        (ctx, sid, title, dirs)
+        (ctx, sid, title, inputs.work_dirs)
     };
 
     // Extract the raw original user message, unwrapping any auto-generated chain wrapper.
@@ -1156,7 +1250,8 @@ pub fn decide(
         let last_assistant_message = _last_assistant_msg
             .filter(|message| !crate::session_limit::looks_like_usage_limit(message));
         let next_prompt = with_first_prompt_context(
-            "The provider session limit window has reset. Continue from where we left off.".to_string(),
+            "The provider session limit window has reset. Continue from where we left off."
+                .to_string(),
             build_prompt_summary(
                 None,
                 thread_title.as_deref(),
@@ -1411,10 +1506,7 @@ async fn phase2_reasoning_attempt_with(
 /// Returns None on ANY failure (stream error, empty output, timeout) so the
 /// caller falls back to the deterministic rule-based chain — overflow must
 /// never get more stuck than without reasoning.
-async fn reason_phase2_continuation(
-    data: &LlmCallData,
-    cx: &gpui::AsyncApp,
-) -> Option<String> {
+async fn reason_phase2_continuation(data: &LlmCallData, cx: &gpui::AsyncApp) -> Option<String> {
     let summary = data.last_assistant_message.as_deref()?.trim().to_string();
     if summary.is_empty() {
         return None;
@@ -1631,13 +1723,9 @@ pub(crate) fn context_overflow_outcome_with(
             .as_deref()
             .and_then(extract_summary_next_steps);
         let continuation = if let Some(reasoned) = reasoned_continuation {
-            log::warn!(
-                "auto_prompt: ContextOverflow Phase 2 — using LLM-reasoned continuation"
-            );
+            log::warn!("auto_prompt: ContextOverflow Phase 2 — using LLM-reasoned continuation");
             reasoned
-        } else if llm_acknowledged_all_tasks_blocked(
-            data.last_assistant_message.as_deref(),
-        ) {
+        } else if llm_acknowledged_all_tasks_blocked(data.last_assistant_message.as_deref()) {
             log::info!(
                 "auto_prompt: ContextOverflow — LLM acknowledged blocked tasks, using generic continuation"
             );
@@ -1837,8 +1925,8 @@ pub async fn decide_with_llm(
         lightweight_context.len(),
         data.context_json.len(),
     );
-    let result = call_language_model(&data.model, &data.system_prompt, &lightweight_context, cx)
-        .await;
+    let result =
+        call_language_model(&data.model, &data.system_prompt, &lightweight_context, cx).await;
 
     log::info!(
         "[auto_prompt::decide_with_llm] LLM call completed with result: {:?}",
@@ -2203,13 +2291,11 @@ pub async fn decide_with_llm(
                                         data.title.as_deref(),
                                     );
                                     Ok(data.make_continue(next_prompt))
-                                } else if let Some(plan_prompt) =
-                                    detect_remaining_plan_tasks(
-                                        &data.context_json,
-                                        PlanRepoFilter::All,
-                                        data.work_dirs.as_deref(),
-                                    )
-                                {
+                                } else if let Some(plan_prompt) = detect_remaining_plan_tasks(
+                                    &data.context_json,
+                                    PlanRepoFilter::All,
+                                    data.work_dirs.as_deref(),
+                                ) {
                                     log::warn!(
                                         "auto_prompt: PLAN TASK FALLBACK — detect_remaining_work found nothing but plan files have unchecked tasks"
                                     );
@@ -2260,13 +2346,11 @@ pub async fn decide_with_llm(
                                         data.title.as_deref(),
                                     );
                                     Ok(data.make_continue(next_prompt))
-                                } else if let Some(plan_prompt) =
-                                    detect_remaining_plan_tasks(
-                                        &data.context_json,
-                                        PlanRepoFilter::All,
-                                        data.work_dirs.as_deref(),
-                                    )
-                                {
+                                } else if let Some(plan_prompt) = detect_remaining_plan_tasks(
+                                    &data.context_json,
+                                    PlanRepoFilter::All,
+                                    data.work_dirs.as_deref(),
+                                ) {
                                     log::warn!(
                                         "auto_prompt: PLAN TASK FALLBACK — all retries failed but plan files have unchecked tasks"
                                     );
@@ -2571,32 +2655,60 @@ pub(crate) fn get_iteration() -> u32 {
     iteration
 }
 
-fn read_plan_files(
+/// Cheap inputs needed to read the `.plans/`/`.docs/` context files off the
+/// main thread. Gathered on the main thread (needs `&App`); consumed by the
+/// pure-fs readers below, which are safe to run on a background executor.
+#[derive(Clone)]
+pub(crate) struct ContextFileInputs {
+    session_id: acp::SessionId,
+    work_dirs: Option<Vec<std::path::PathBuf>>,
+    first_user_message: Option<String>,
+}
+
+pub(crate) fn context_file_inputs(
     thread: &acp_thread::AcpThread,
-    first_user_message: Option<&str>,
-) -> Vec<PlanFileContent> {
+    cx: &gpui::App,
+) -> ContextFileInputs {
+    let work_dirs = thread.work_dirs().map(|pl| pl.paths().to_vec());
+    let first_user_message = thread.entries().iter().find_map(|entry| {
+        if let acp_thread::AgentThreadEntry::UserMessage(msg) = entry {
+            let content = msg.content.to_markdown(cx).to_string();
+            if !content.is_empty() {
+                return Some(content);
+            }
+        }
+        None
+    });
+    ContextFileInputs {
+        session_id: thread.session_id().clone(),
+        work_dirs,
+        first_user_message,
+    }
+}
+
+/// Plan-file inputs without the first-user-message project hint — the shape
+/// the Claude parity paths historically used.
+pub(crate) fn plan_inputs_without_message(thread: &acp_thread::AcpThread) -> ContextFileInputs {
+    ContextFileInputs {
+        session_id: thread.session_id().clone(),
+        work_dirs: thread.work_dirs().map(|pl| pl.paths().to_vec()),
+        first_user_message: None,
+    }
+}
+
+pub(crate) fn read_plan_files(inputs: &ContextFileInputs) -> Vec<PlanFileContent> {
     log::info!("[auto_prompt::read_plan_files] Starting to read plan files");
 
-    let session_id = thread.session_id().to_string();
-
-    let work_dirs = match thread.work_dirs() {
-        Some(dirs) => {
-            let paths = dirs.paths().to_vec();
-            log::info!(
-                "[auto_prompt::read_plan_files] Found {} work directory/ies",
-                paths.len()
-            );
-            paths
-        }
-        None => {
-            log::info!("[auto_prompt::read_plan_files] No work directories configured");
-            return Vec::new();
-        }
+    let Some(work_dirs) = inputs.work_dirs.as_deref() else {
+        log::info!("[auto_prompt::read_plan_files] No work directories configured");
+        return Vec::new();
     };
+    let session_id = inputs.session_id.to_string();
+    let first_user_message = inputs.first_user_message.as_deref();
 
     let mut plan_files = Vec::new();
 
-    for work_dir in &work_dirs {
+    for work_dir in work_dirs {
         let plan_dir_candidates = [work_dir.join(".plan"), work_dir.join(".plans")];
         let Some(plan_dir) = plan_dir_candidates.iter().find(|d| d.is_dir()) else {
             log::info!(
@@ -2720,15 +2832,10 @@ fn read_plan_files(
     plan_files
 }
 
-fn read_doc_files(thread: &acp_thread::AcpThread) -> Vec<String> {
-    let work_dirs = match thread.work_dirs() {
-        Some(dirs) => dirs.paths().to_vec(),
-        None => return Vec::new(),
-    };
-
+fn read_doc_files(work_dirs: &[std::path::PathBuf]) -> Vec<String> {
     let mut doc_files = Vec::new();
 
-    for work_dir in &work_dirs {
+    for work_dir in work_dirs {
         let doc_dir_candidates = [work_dir.join(".docs")];
         let Some(doc_dir) = doc_dir_candidates.iter().find(|d| d.is_dir()) else {
             continue;
@@ -3708,9 +3815,7 @@ fn extract_summary_next_steps(summary: &str) -> Option<SummaryContinuation> {
     }
 
     if section_indicates_no_remaining_work(&section) {
-        log::info!(
-            "[auto_prompt::extract_summary_next_steps] Summary declares no remaining work"
-        );
+        log::info!("[auto_prompt::extract_summary_next_steps] Summary declares no remaining work");
         return Some(SummaryContinuation::NothingLeft);
     }
 
@@ -3755,11 +3860,7 @@ fn detect_remaining_work(last_assistant_message: Option<&str>) -> Option<String>
     // We also require the phrase to appear in a *list/heading context*: the
     // line must start with a markdown list/heading marker. This prevents
     // free-form mentions like "consider the action items above" from firing.
-    const PATTERNS: &[&str] = &[
-        "todo:",
-        "action items",
-        "left to do",
-    ];
+    const PATTERNS: &[&str] = &["todo:", "action items", "left to do"];
 
     // Negation cues: if any appear within ~40 chars before the matched phrase
     // on the same line, treat the mention as referring to work that does NOT
@@ -3803,7 +3904,9 @@ fn detect_remaining_work(last_assistant_message: Option<&str>) -> Option<String>
                 break;
             }
         }
-        let Some(pattern) = matched_pattern else { continue };
+        let Some(pattern) = matched_pattern else {
+            continue;
+        };
         log::warn!(
             "[auto_prompt::detect_remaining_work] Pattern found: {pattern} in a list/heading line of last_assistant_message — overriding stop"
         );
@@ -4071,9 +4174,7 @@ fn detect_remaining_plan_tasks(
     // knowing which repos the session is targeting.
     let dirs: Vec<PathBuf> = match (filter, work_dirs) {
         (PlanRepoFilter::All, _) | (_, None | Some(&[])) => Vec::new(),
-        (PlanRepoFilter::CurrentRepo | PlanRepoFilter::OtherRepos, Some(dirs)) => {
-            dirs.to_vec()
-        }
+        (PlanRepoFilter::CurrentRepo | PlanRepoFilter::OtherRepos, Some(dirs)) => dirs.to_vec(),
     };
     let can_classify = !dirs.is_empty();
 
@@ -4287,9 +4388,7 @@ mod tests {
         work_dirs: Option<Vec<PathBuf>>,
     ) -> LlmCallData {
         LlmCallData {
-            model: std::sync::Arc::new(
-                language_model::fake_provider::FakeLanguageModel::default(),
-            ),
+            model: std::sync::Arc::new(language_model::fake_provider::FakeLanguageModel::default()),
             system_prompt: String::new(),
             context_json,
             project_root: None,
@@ -4367,7 +4466,9 @@ mod tests {
             AutoPromptOutcome::Continue(action) => {
                 assert!(action.force_new_thread, "Phase 2 must force a new thread");
                 assert!(
-                    action.next_prompt.contains("Decide on the serializer format"),
+                    action
+                        .next_prompt
+                        .contains("Decide on the serializer format"),
                     "continuation must embed the summary's first step: {}",
                     action.next_prompt
                 );
@@ -4453,7 +4554,10 @@ mod tests {
         let input = build_phase2_reasoning_input(&data);
         assert!(input.contains("previous thread's final summary"));
         assert!(input.contains("T2: verify build"));
-        assert!(input.contains("9905_input.md"), "plan landscape must be included");
+        assert!(
+            input.contains("9905_input.md"),
+            "plan landscape must be included"
+        );
         assert!(input.contains("Session work dirs: /tmp/w"));
     }
 
@@ -4470,9 +4574,8 @@ mod tests {
 
     #[gpui::test]
     async fn test_reason_phase2_continuation_model_success(cx: &mut gpui::TestAppContext) {
-        let model = std::sync::Arc::new(
-            language_model::fake_provider::FakeLanguageModel::default(),
-        );
+        let model =
+            std::sync::Arc::new(language_model::fake_provider::FakeLanguageModel::default());
         let mut data = overflow_test_data(
             "phase2-reason-model-test",
             Some("## Summary\n\n## What Remains\n\n- [ ] T2: verify build"),
@@ -4481,7 +4584,8 @@ mod tests {
         let task = cx.spawn(async move |cx| reason_phase2_continuation(&data, &cx).await);
         cx.run_until_parked();
         assert_eq!(model.completion_count(), 1, "one reasoning call expected");
-        model.send_last_completion_stream_text_chunk("Continue with T2: verify build, then commit.");
+        model
+            .send_last_completion_stream_text_chunk("Continue with T2: verify build, then commit.");
         model.end_last_completion_stream();
         let result = task
             .await
@@ -4491,9 +4595,8 @@ mod tests {
 
     #[gpui::test]
     async fn test_reason_phase2_continuation_model_error_falls_back(cx: &mut gpui::TestAppContext) {
-        let model = std::sync::Arc::new(
-            language_model::fake_provider::FakeLanguageModel::default(),
-        );
+        let model =
+            std::sync::Arc::new(language_model::fake_provider::FakeLanguageModel::default());
         let mut data = overflow_test_data(
             "phase2-reason-model-err-test",
             Some("## Summary\n\n## What Remains\n\n- [ ] T2: verify build"),
@@ -4502,9 +4605,7 @@ mod tests {
         let task = cx.spawn(async move |cx| reason_phase2_continuation(&data, &cx).await);
         cx.run_until_parked();
         model.send_last_completion_stream_error(
-            language_model::LanguageModelCompletionError::Other(anyhow::anyhow!(
-                "rate limited",
-            )),
+            language_model::LanguageModelCompletionError::Other(anyhow::anyhow!("rate limited",)),
         );
         model.end_last_completion_stream();
         assert!(
@@ -4515,9 +4616,8 @@ mod tests {
 
     #[gpui::test]
     async fn test_phase2_reasoning_attempt_gating(cx: &mut gpui::TestAppContext) {
-        let model = std::sync::Arc::new(
-            language_model::fake_provider::FakeLanguageModel::default(),
-        );
+        let model =
+            std::sync::Arc::new(language_model::fake_provider::FakeLanguageModel::default());
         let config = crate::config::AutoPromptConfig::default();
 
         // Phase 1 (state 0, no voluntary summary) — no reasoning call at all.
@@ -4525,9 +4625,8 @@ mod tests {
         clear_summary_for_session(session);
         let mut data = overflow_test_data(session, Some("Working on the parser fix still."));
         data.model = model.clone();
-        let task = cx.spawn(async move |cx| {
-            phase2_reasoning_attempt_with(&data, &config, &cx).await
-        });
+        let task =
+            cx.spawn(async move |cx| phase2_reasoning_attempt_with(&data, &config, &cx).await);
         assert!(task.await.is_none(), "Phase 1 must not reason");
         assert_eq!(model.completion_count(), 0, "no model call during Phase 1");
 
@@ -4591,7 +4690,8 @@ mod tests {
         // nothing-left summary — housekeeping only fires when no plans remain.
         let session = "overflow-phase2-plan-wins-test";
         set_summary_state(session, 1);
-        let summary = "# Session Summary\n\n## What Remains\n\n- Nothing left — all tasks complete.";
+        let summary =
+            "# Session Summary\n\n## What Remains\n\n- Nothing left — all tasks complete.";
         let context_json = serde_json::json!({
             "session_id": session,
             "plan_files": [{
@@ -4609,7 +4709,9 @@ mod tests {
         match context_overflow_outcome(&data) {
             AutoPromptOutcome::Continue(action) => {
                 assert!(
-                    action.next_prompt.contains("Plan files have remaining unchecked tasks"),
+                    action
+                        .next_prompt
+                        .contains("Plan files have remaining unchecked tasks"),
                     "current-repo plan tasks must win over a nothing-left summary: {}",
                     action.next_prompt
                 );
@@ -4635,7 +4737,8 @@ mod tests {
         // plan tasks are consulted before housekeeping.
         let session = "overflow-phase2-other-repo-test";
         set_summary_state(session, 1);
-        let summary = "# Session Summary\n\n## What Remains\n\n- Nothing left — all tasks complete.";
+        let summary =
+            "# Session Summary\n\n## What Remains\n\n- Nothing left — all tasks complete.";
         let context_json = serde_json::json!({
             "session_id": session,
             "plan_files": [{
@@ -4689,8 +4792,10 @@ mod tests {
     fn append_addition_request_adds_section() {
         let base = "## 1. Thread Summary\n\nsummary\n\n## 3. Decision\n\ndo work";
         let result = append_addition_request(base, Some("  also fix the tests  "));
-        assert!(result.contains("## 4. Addition request\n\nalso fix the tests"),
-            "draft should be trimmed and appended: {result}");
+        assert!(
+            result.contains("## 4. Addition request\n\nalso fix the tests"),
+            "draft should be trimmed and appended: {result}"
+        );
         assert!(result.ends_with("also fix the tests"));
     }
 
@@ -5318,8 +5423,7 @@ mod tests {
         let input = EvaluationInput {
             confidence: Some(0.1),
             last_assistant_message: Some(
-                "Done with part 1.\n\n### Action items\n\n- Fix the bug\n- Add tests"
-                    .to_string(),
+                "Done with part 1.\n\n### Action items\n\n- Fix the bug\n- Add tests".to_string(),
             ),
             ..make_input()
         };
@@ -6453,9 +6557,12 @@ mod tests {
             {"path":"/Users/me/proj-b/.plans/002_other.md","content":"- [ ] T2"}
         ]}"##;
         let work_dirs = vec![PathBuf::from("/Users/me/proj-a")];
-        let current =
-            detect_remaining_plan_tasks(context_json, PlanRepoFilter::CurrentRepo, Some(&work_dirs))
-                .expect("current-repo plan should be found");
+        let current = detect_remaining_plan_tasks(
+            context_json,
+            PlanRepoFilter::CurrentRepo,
+            Some(&work_dirs),
+        )
+        .expect("current-repo plan should be found");
         assert!(
             current.contains("001_current.md"),
             "current-repo plan should be listed"
@@ -6494,8 +6601,12 @@ mod tests {
         ]}"##;
         let work_dirs = vec![PathBuf::from("/Users/me/proj-a")];
         assert!(
-            detect_remaining_plan_tasks(context_json, PlanRepoFilter::CurrentRepo, Some(&work_dirs))
-                .is_none(),
+            detect_remaining_plan_tasks(
+                context_json,
+                PlanRepoFilter::CurrentRepo,
+                Some(&work_dirs)
+            )
+            .is_none(),
             "no current-repo plans => None"
         );
         assert!(
@@ -6567,7 +6678,8 @@ mod tests {
 
     #[test]
     fn test_extract_summary_next_steps_ignores_heading_without_actionable_body() {
-        let summary = "# Summary\n\n## Next Steps\n\nSee the plan file for details.\n\n## Done\n\nAll good.";
+        let summary =
+            "# Summary\n\n## Next Steps\n\nSee the plan file for details.\n\n## Done\n\nAll good.";
         let result = extract_summary_next_steps(summary);
         assert!(
             result.is_none(),
@@ -6692,8 +6804,8 @@ mod tests {
         // No heading — the prose fallback picks up "Nothing left to do" and
         // must classify it as NothingLeft rather than actionable steps.
         let summary = "# Session Summary\n\nDid A.\n\nDid B.\n\nNothing left to do.";
-        let result = extract_summary_next_steps(summary)
-            .expect("prose nothing-left must be detected");
+        let result =
+            extract_summary_next_steps(summary).expect("prose nothing-left must be detected");
         assert_eq!(result, SummaryContinuation::NothingLeft);
     }
 
@@ -6715,8 +6827,8 @@ mod tests {
         // A numbered item whose text is itself a nothing-left statement must
         // not count as real work.
         let summary = "# Summary\n\n## Next Steps\n\n1. Nothing left to do — all complete.";
-        let result = extract_summary_next_steps(summary)
-            .expect("numbered negation must be detected");
+        let result =
+            extract_summary_next_steps(summary).expect("numbered negation must be detected");
         assert_eq!(result, SummaryContinuation::NothingLeft);
     }
 
@@ -6868,7 +6980,9 @@ Ready to execute Issue 024 (Hero → Avatar rename)?";
 
     #[test]
     fn looks_like_voluntary_summary_tldr_heading() {
-        assert!(looks_like_voluntary_summary("## TL;DR\n\nDid X, Y, Z. Next: do W."));
+        assert!(looks_like_voluntary_summary(
+            "## TL;DR\n\nDid X, Y, Z. Next: do W."
+        ));
         assert!(looks_like_voluntary_summary("### TL;DR\n\nDid the thing."));
     }
 
@@ -7530,8 +7644,14 @@ Ready to execute Issue 024 (Hero → Avatar rename)?";
             reason: "test".to_string(),
         };
         let debug = format!("{outcome:?}");
-        assert!(debug.contains("RetryAfterBackoff"), "debug repr missing variant name: {debug}");
-        assert!(debug.contains("1000"), "debug repr missing delay_ms: {debug}");
+        assert!(
+            debug.contains("RetryAfterBackoff"),
+            "debug repr missing variant name: {debug}"
+        );
+        assert!(
+            debug.contains("1000"),
+            "debug repr missing delay_ms: {debug}"
+        );
     }
 
     #[test]

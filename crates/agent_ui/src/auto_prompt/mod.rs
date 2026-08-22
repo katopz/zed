@@ -41,9 +41,7 @@ fn take_stashed_draft(session_id: &str) -> Option<String> {
     let mut guard = DRAFT_STASH
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    guard
-        .as_mut()
-        .and_then(|map| map.remove(session_id))
+    guard.as_mut().and_then(|map| map.remove(session_id))
 }
 
 /// Stash the user's current input-box draft for `active_tv`'s thread, if any.
@@ -63,12 +61,7 @@ fn stash_live_draft(
     if text.is_empty() {
         return;
     }
-    let session_key = active_tv
-        .read(cx)
-        .thread
-        .read(cx)
-        .session_id()
-        .to_string();
+    let session_key = active_tv.read(cx).thread.read(cx).session_id().to_string();
     log::info!(
         "[auto_prompt] Stashing input-box draft ({} chars) for session {session_key}",
         text.len()
@@ -260,20 +253,14 @@ async fn load_auto_prompt_system_prompt(
 fn persist_upgraded_prompt(path: &std::path::Path, content: &str) {
     if let Some(parent) = path.parent() {
         if let Err(err) = std::fs::create_dir_all(parent) {
-            log::warn!(
-                "[auto_prompt] Failed to create parent dir for {path:?}: {err}"
-            );
+            log::warn!("[auto_prompt] Failed to create parent dir for {path:?}: {err}");
             return;
         }
     }
     if let Err(err) = std::fs::write(path, content) {
-        log::warn!(
-            "[auto_prompt] Failed to persist upgraded AUTO_PROMPT.md to {path:?}: {err}"
-        );
+        log::warn!("[auto_prompt] Failed to persist upgraded AUTO_PROMPT.md to {path:?}: {err}");
     } else {
-        log::info!(
-            "[auto_prompt] Persisted upgraded AUTO_PROMPT.md to {path:?}"
-        );
+        log::info!("[auto_prompt] Persisted upgraded AUTO_PROMPT.md to {path:?}");
     }
 }
 
@@ -346,10 +333,7 @@ pub struct AutoPromptNewThread {
 /// "Continue from where we left off." (e.g. from manual_auto_prompt). Bolting a
 /// generic preamble onto a substantive decision produced absurd two-paragraph
 /// messages (e.g. preamble + "Yes, I love you" in reply to "Do you love me?").
-fn build_continuation_prompt(
-    _last_assistant_message: Option<&str>,
-    decision: &str,
-) -> String {
+fn build_continuation_prompt(_last_assistant_message: Option<&str>, decision: &str) -> String {
     let trimmed = decision.trim();
 
     // Bare generic continuation (manual_auto_prompt, overflow fallbacks) — no
@@ -424,7 +408,8 @@ pub(crate) fn dispatch_action(
             // Check if the user is mid-composition in the active thread's editor.
             // The same-thread path overwrites the editor via set_message, which
             // would destroy the user's draft. We log the state for diagnosis.
-            let editor_has_text = active_tv.read(cx)
+            let editor_has_text = active_tv
+                .read(cx)
                 .message_editor
                 .read(cx)
                 .text(cx)
@@ -436,10 +421,8 @@ pub(crate) fn dispatch_action(
                 action.actual_input_tokens
             );
             let decision = strip_first_prompt_wrapper(&action.next_prompt);
-            let prompt = build_continuation_prompt(
-                action.last_assistant_message.as_deref(),
-                &decision,
-            );
+            let prompt =
+                build_continuation_prompt(action.last_assistant_message.as_deref(), &decision);
             active_tv.update(cx, |tv, cx| {
                 tv.message_editor.update(cx, |editor, cx| {
                     editor.set_message(
@@ -728,6 +711,12 @@ pub fn on_manual_auto_prompt(
 ///
 /// `manual_fallback` is `Some` only for the manual path; it marks the run as
 /// user-initiated (focus the continuation, always send something).
+///
+/// The decide phase (config load, `.plans/`/`.docs/` reads, context build)
+/// runs inside the returned task — never on the caller's stack — so a click
+/// cannot stall a frame. A manual click additionally marks the active thread
+/// `Processing` synchronously below, so the very next paint shows feedback
+/// while the decision is being computed.
 fn run_auto_prompt(
     conversation_view: &crate::ConversationView,
     thread: &gpui::Entity<acp_thread::AcpThread>,
@@ -755,20 +744,7 @@ fn run_auto_prompt(
     // Route to the isolated Claude path for ACP Claude agents. Claude Code
     // manages its own context/compaction — it must never hit the native
     // ContextOverflow / summarize / new-thread flow (see claude_agent.rs).
-    let is_claude_agent = thread
-        .read(cx)
-        .connection()
-        .agent_id()
-        .as_ref()
-        == CLAUDE_AGENT_ID;
-
-    let decision = if is_claude_agent {
-        log::info!("[auto_prompt] Claude agent detected — using claude_agent::decide_claude");
-        auto_prompt::claude_agent::decide_claude(thread, used_tools, stop_reason, cx)
-    } else {
-        auto_prompt::decide(thread, used_tools, stop_reason, cx)
-    };
-    log::info!("[auto_prompt] decision result: {:?}", decision);
+    let is_claude_agent = thread.read(cx).connection().agent_id().as_ref() == CLAUDE_AGENT_ID;
     let is_claude_agent_for_task = is_claude_agent;
 
     let mut profile_id = conversation_view
@@ -777,32 +753,70 @@ fn run_auto_prompt(
         .map(|id| id.to_string());
     log::info!("[auto_prompt] captured profile_id: {:?}", profile_id);
 
-    match decision {
-        auto_prompt::AutoPromptDecision::NoAction => match manual_fallback {
-            // The user asked for a continuation, so send the generic one rather
-            // than silently doing nothing.
-            Some(mut fallback) => {
-                log::info!("[auto_prompt] NoAction on manual run - dispatching generic fallback");
-                fallback.profile_id = profile_id.take().or(fallback.profile_id);
-                dispatch_action(fallback, conversation_view, window, cx);
-                None
-            }
-            None => {
-                log::info!("[auto_prompt] NoAction - taking no action");
-                None
-            }
-        },
-
-        auto_prompt::AutoPromptDecision::DispatchNow(mut action) => {
-            action.profile_id = profile_id.take();
-            action.focus_new_thread |= is_manual;
-            log::info!(
-                "[auto_prompt] DispatchNow - dispatching action with prompt: {}",
-                action.next_prompt
-            );
-            dispatch_action(action, conversation_view, window, cx);
-            None
+    // Instant feedback for the manual click: the decision now happens in the
+    // spawned task below, so set the marker here while the handler is still
+    // on the stack — the next frame paints "Processing…" instead of freezing.
+    // Every terminal arm below resets it (or hands it to the inner delay/LLM
+    // tasks, which already manage the state themselves).
+    if is_manual {
+        if let Some(active) = conversation_view.active_thread() {
+            active.update(cx, |tv, cx| {
+                tv.auto_prompt_state = AutoPromptState::Processing;
+                cx.notify();
+            });
         }
+    }
+
+    let thread = thread.clone();
+    let stop_reason = *stop_reason;
+
+    Some(cx.spawn_in(window, async move |_view, cx| {
+        let decision = if is_claude_agent_for_task {
+            log::info!("[auto_prompt] Claude agent detected — using claude_agent::decide_claude");
+            cx.update(|_window, cx| {
+                auto_prompt::claude_agent::decide_claude(&thread, used_tools, &stop_reason, cx)
+            })
+            .unwrap_or(auto_prompt::AutoPromptDecision::NoAction)
+        } else {
+            auto_prompt::decide_async(thread.clone(), used_tools, stop_reason, cx).await
+        };
+        log::info!("[auto_prompt] decision result: {:?}", decision);
+
+        match decision {
+            auto_prompt::AutoPromptDecision::NoAction => match manual_fallback {
+                // The user asked for a continuation, so send the generic one rather
+                // than silently doing nothing.
+                Some(mut fallback) => {
+                    log::info!("[auto_prompt] NoAction on manual run - dispatching generic fallback");
+                    fallback.profile_id = profile_id.take().or(fallback.profile_id);
+                    let _ = _view.update_in(cx, |_view, window, cx| {
+                        reset_auto_prompt_state(_view, cx);
+                        dispatch_action(fallback, _view, window, cx);
+                    });
+                }
+                None => {
+                    log::info!("[auto_prompt] NoAction - taking no action");
+                    // The caller stored this (now finished) task in
+                    // `_auto_prompt_task`; clear it so a later user message
+                    // doesn't mistake the completed decision for a live one.
+                    let _ = _view.update_in(cx, |cv, _window, cx| {
+                        reset_auto_prompt_state(cv, cx);
+                    });
+                }
+            },
+
+            auto_prompt::AutoPromptDecision::DispatchNow(mut action) => {
+                action.profile_id = profile_id.take();
+                action.focus_new_thread |= is_manual;
+                log::info!(
+                    "[auto_prompt] DispatchNow - dispatching action with prompt: {}",
+                    action.next_prompt
+                );
+                let _ = _view.update_in(cx, |_view, window, cx| {
+                    reset_auto_prompt_state(_view, cx);
+                    dispatch_action(action, _view, window, cx);
+                });
+            }
 
         auto_prompt::AutoPromptDecision::DispatchAfterDelay {
             mut action,
@@ -818,7 +832,11 @@ fn run_auto_prompt(
                 action.next_prompt
             );
 
-            let task = cx.spawn_in(window, async move |_view, cx| {
+            // Spawn the delay task off the live view (it owns `window`), then
+            // stay alive until it finishes so dropping the outer task cancels
+            // the delayed dispatch too.
+            let inner = _view.update_in(cx, |_view, window, cx| {
+                cx.spawn_in(window, async move |_view, cx| {
                 let thread_weak = _view
                     .update_in(cx, |cv, _window, cx| {
                         cv.active_thread().map(|tv| {
@@ -854,32 +872,34 @@ fn run_auto_prompt(
                     }
                 }
 
-                match _view.update_in(cx, |_view, window, cx| {
-                    // Mirror the "limit reached — auto-continue scheduled at …"
-                    // notification: when the scheduled retry finally fires, tell
-                    // the user the chain is resuming.
-                    if reason == auto_prompt::AutoPromptDelayReason::UsageLimitReset {
-                        _view.notify_with_sound(
-                            "Usage limit window reset — auto-continue resuming",
-                            IconName::Info,
-                            window,
-                            cx,
-                        );
+                    match _view.update_in(cx, |_view, window, cx| {
+                        // Mirror the "limit reached — auto-continue scheduled at …"
+                        // notification: when the scheduled retry finally fires, tell
+                        // the user the chain is resuming.
+                        if reason == auto_prompt::AutoPromptDelayReason::UsageLimitReset {
+                            _view.notify_with_sound(
+                                "Usage limit window reset — auto-continue resuming",
+                                IconName::Info,
+                                window,
+                                cx,
+                            );
+                        }
+                        dispatch_action(action, _view, window, cx);
+                    }) {
+                        Ok(()) => {
+                            log::info!("[auto_prompt] DispatchAfterDelay dispatch submitted");
+                        }
+                        Err(err) => {
+                            log::warn!(
+                                "[auto_prompt] FAILED to dispatch after delay (view may have been dropped): {err}"
+                            );
+                        }
                     }
-                    dispatch_action(action, _view, window, cx);
-                }) {
-                    Ok(()) => {
-                        log::info!("[auto_prompt] DispatchAfterDelay dispatch submitted");
-                    }
-                    Err(err) => {
-                        log::warn!(
-                            "[auto_prompt] FAILED to dispatch after delay (view may have been dropped): {err}"
-                        );
-                    }
-                }
+                })
             });
-
-            Some(task)
+            if let Ok(task) = inner {
+                task.await;
+            }
         }
 
         auto_prompt::AutoPromptDecision::NeedsLlmCall(mut data) => {
@@ -889,7 +909,11 @@ fn run_auto_prompt(
                 data.model.id()
             );
 
-            let task = cx.spawn_in(window, async move |_view, cx| {
+            // Same attach pattern as the delay arm: the LLM task is spawned
+            // off the live view and awaited here, so cancelling the outer
+            // task cancels the in-flight orchestration call.
+            let inner = _view.update_in(cx, |_view, window, cx| {
+                cx.spawn_in(window, async move |_view, cx| {
                 log::info!("[auto_prompt] ASYNC TASK: starting LLM call");
 
                 let thread_weak = _view
@@ -1428,10 +1452,27 @@ fn run_auto_prompt(
                         }
                     }
                 }
+                })
             });
-
-            Some(task)
+            if let Ok(task) = inner {
+                task.await;
+            }
         }
+    }
+    }))
+}
+
+/// Reset the active thread's auto-prompt marker after an immediate (non-LLM)
+/// decision: clears the `Processing` state set synchronously on a manual click
+/// and the stored task handle, so a completed decision never looks live to
+/// `send_content`'s cancel-on-user-message check.
+fn reset_auto_prompt_state(conversation_view: &crate::ConversationView, cx: &mut gpui::App) {
+    if let Some(tv) = conversation_view.active_thread() {
+        tv.update(cx, |tv, cx| {
+            tv.auto_prompt_state = AutoPromptState::Idle;
+            tv._auto_prompt_task = None;
+            cx.notify();
+        });
     }
 }
 
@@ -1607,20 +1648,17 @@ pub fn start_watchdog(
                     return;
                 }
                 Err(err) => {
-                    log::warn!(
-                        "[auto_prompt::watchdog] Thread entity dropped, exiting: {err}"
-                    );
+                    log::warn!("[auto_prompt::watchdog] Thread entity dropped, exiting: {err}");
                     return;
                 }
             };
 
             // Ask the reasoning LLM whether to continue or halt.
-            let decision =
-                auto_prompt::watchdog::reason_about_stuck_thread(&model, &context, cx)
-                    .await
-                    .unwrap_or(auto_prompt::watchdog::WatchdogDecision::Continue {
-                        reason: "reasoning call errored".to_string(),
-                    });
+            let decision = auto_prompt::watchdog::reason_about_stuck_thread(&model, &context, cx)
+                .await
+                .unwrap_or(auto_prompt::watchdog::WatchdogDecision::Continue {
+                    reason: "reasoning call errored".to_string(),
+                });
 
             match decision {
                 auto_prompt::watchdog::WatchdogDecision::Continue { reason } => {
@@ -1644,9 +1682,7 @@ pub fn start_watchdog(
                     // which on_thread_stopped treats as NoAction (resets iteration).
                     // We then dispatch a timeout prompt to the SAME thread so the
                     // worker can recover with full context.
-                    let cancel_task = match thread_weak.update(cx, |thread, cx| {
-                        thread.cancel(cx)
-                    }) {
+                    let cancel_task = match thread_weak.update(cx, |thread, cx| thread.cancel(cx)) {
                         Ok(task) => task,
                         Err(err) => {
                             log::warn!(
@@ -1679,9 +1715,7 @@ pub fn start_watchdog(
                             from_session_id: thread.session_id().clone(),
                             from_title: thread.title().map(|t| t.to_string()),
                             next_prompt: timeout_prompt,
-                            work_dirs: thread
-                                .work_dirs()
-                                .map(|pl| pl.paths().to_vec()),
+                            work_dirs: thread.work_dirs().map(|pl| pl.paths().to_vec()),
                             original_user_message: None,
                             profile_id: None,
                             actual_input_tokens: None,

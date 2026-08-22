@@ -239,8 +239,9 @@ pub fn decide_claude(
             let action = AutoPromptAction {
                 from_session_id: thread_ref.session_id().clone(),
                 from_title: thread_ref.title().map(|title| title.to_string()),
-                next_prompt: "The Claude session limit window has reset. Continue from where you left off."
-                    .to_string(),
+                next_prompt:
+                    "The Claude session limit window has reset. Continue from where you left off."
+                        .to_string(),
                 work_dirs: thread_ref.work_dirs().map(|pl| pl.paths().to_vec()),
                 original_user_message: None,
                 profile_id: None,
@@ -267,8 +268,7 @@ pub fn decide_claude(
     // the model ceiling — route it through the shared native Phase 1/2
     // summarize→fork flow instead of same-thread continuation. Below the
     // threshold: unchanged same-thread behavior.
-    if let Some(decision) =
-        claude_context_overflow_decision(thread, configured_model.as_ref(), cx)
+    if let Some(decision) = claude_context_overflow_decision(thread, configured_model.as_ref(), cx)
     {
         return decision;
     }
@@ -390,7 +390,7 @@ fn claude_context_overflow_decision(
     let title = thread_ref.title().map(|t| t.to_string());
     let work_dirs = thread_ref.work_dirs().map(|pl| pl.paths().to_vec());
     let last_assistant_message = thread_ref.last_assistant_message_text(cx);
-    let plan_files = crate::read_plan_files(thread_ref, None);
+    let plan_files = crate::read_plan_files(&crate::plan_inputs_without_message(thread_ref));
 
     // Shape matches what `detect_remaining_plan_tasks` parses, so Phase 2's
     // plan-task fallback works on this path too.
@@ -442,17 +442,13 @@ fn claude_decision_needs_llm(
     let Some((session_id, title, work_dirs, last_assistant_message)) =
         extract_worker_signal(thread, cx)
     else {
-        log::info!(
-            "[auto_prompt::claude] No assistant message to reason about — stopping chain"
-        );
+        log::info!("[auto_prompt::claude] No assistant message to reason about — stopping chain");
         crate::reset_iteration_with_session(&thread.read(cx).session_id().to_string());
         return AutoPromptDecision::NoAction;
     };
 
     let iteration_count = get_iteration();
-    log::info!(
-        "[auto_prompt::claude] iteration {iteration_count}, handing to orchestration LLM"
-    );
+    log::info!("[auto_prompt::claude] iteration {iteration_count}, handing to orchestration LLM");
 
     let context_json = serde_json::json!({
         "session_id": session_id.to_string(),
@@ -531,9 +527,7 @@ fn claude_decision_hidden(
     let Some((session_id, title, work_dirs, last_assistant_message)) =
         extract_worker_signal(thread, cx)
     else {
-        log::info!(
-            "[auto_prompt::claude] No assistant message to reason about — stopping chain"
-        );
+        log::info!("[auto_prompt::claude] No assistant message to reason about — stopping chain");
         crate::reset_iteration_with_session(&thread.read(cx).session_id().to_string());
         return AutoPromptDecision::NoAction;
     };
@@ -564,7 +558,7 @@ fn claude_decision_hidden(
     // that emits a completion summary with `[ ]` items still in the plan
     // looks "done" — the orchestrator has no signal that work remains.
     // See .plans/014_claude_offscreen_orchestrator.md (context-parity fix).
-    let plan_files = crate::read_plan_files(&thread.read(cx), None);
+    let plan_files = crate::read_plan_files(&crate::plan_inputs_without_message(&thread.read(cx)));
     let stop_phase = compute_claude_stop_phase();
 
     let context_json = serde_json::json!({
@@ -656,9 +650,7 @@ pub async fn decide_claude_with_llm(
         let session_id_str = data.session_id.to_string();
         crate::reset_iteration_with_session(&session_id_str);
         return Ok(AutoPromptOutcome::Stopped {
-            reason: format!(
-                "orchestrator: low confidence ({confidence:.2}) continue verdict"
-            ),
+            reason: format!("orchestrator: low confidence ({confidence:.2}) continue verdict"),
         });
     }
 
@@ -782,9 +774,7 @@ pub async fn decide_claude_with_hidden_thread(
             .update(|cx| connection.clone().close_session(&hidden_session_id, cx))
             .await;
         if let Err(err) = close_result {
-            log::warn!(
-                "[auto_prompt::claude] hidden session close failed: {err:#}"
-            );
+            log::warn!("[auto_prompt::claude] hidden session close failed: {err:#}");
         }
     }
     drop(hidden_thread);
@@ -826,17 +816,16 @@ async fn judge_with_hidden_session(
         data.had_error,
     );
 
-    let message = vec![acp::ContentBlock::Text(acp::TextContent::new(
-        format!(
-            "{}\n\n--- CONTEXT + WORKER OUTPUT BELOW ---\n\nContext JSON:\n{}\n\nWorker's last output:\n{}",
-            data.system_prompt, lightweight_context, worker_output,
-        ),
-    ))];
+    let message = vec![acp::ContentBlock::Text(acp::TextContent::new(format!(
+        "{}\n\n--- CONTEXT + WORKER OUTPUT BELOW ---\n\nContext JSON:\n{}\n\nWorker's last output:\n{}",
+        data.system_prompt, lightweight_context, worker_output,
+    )))];
 
     // send() runs a full turn and resolves on stop. Bound it with a timeout so
     // a runaway hidden session can't wedge the chain. 180s is generous for a
     // single judgment turn including Claude Code session startup.
-    let send_future = cx.update(|cx| hidden_thread.update(cx, |thread, cx| thread.send(message, cx)));
+    let send_future =
+        cx.update(|cx| hidden_thread.update(cx, |thread, cx| thread.send(message, cx)));
     let timeout_future = cx.background_executor().timer(Duration::from_secs(180));
     pin_mut!(send_future, timeout_future);
 
@@ -855,9 +844,11 @@ async fn judge_with_hidden_session(
         futures::future::Either::Right(_) => {
             log::warn!("[auto_prompt::claude] hidden session timed out after 180s");
             // Cancel the hidden turn so we don't leak a running session.
-            let _ = cx.update(|cx| hidden_thread.update(cx, |t, cx| {
-                t.cancel(cx).detach();
-            }));
+            let _ = cx.update(|cx| {
+                hidden_thread.update(cx, |t, cx| {
+                    t.cancel(cx).detach();
+                })
+            });
             let session_id_str = data.session_id.to_string();
             crate::reset_iteration_with_session(&session_id_str);
             return Ok(AutoPromptOutcome::Stopped {
@@ -873,8 +864,7 @@ async fn judge_with_hidden_session(
     // catches that by inspecting the hidden session's entry history directly:
     // any ToolCall since the last user message means the orchestrator did work
     // instead of judging, so we stop regardless of what the JSON says.
-    let used_tools = cx
-        .update(|cx| hidden_thread.read(cx).used_tools_since_last_user_message());
+    let used_tools = cx.update(|cx| hidden_thread.read(cx).used_tools_since_last_user_message());
     if used_tools {
         log::warn!(
             "[auto_prompt::claude] hidden orchestrator used tools despite the no-tools constraint — stopping"
@@ -882,8 +872,9 @@ async fn judge_with_hidden_session(
         let session_id_str = data.session_id.to_string();
         crate::reset_iteration_with_session(&session_id_str);
         return Ok(AutoPromptOutcome::Stopped {
-            reason: "hidden orchestrator: tool-leak detected (used tools despite no-tools constraint)"
-                .to_string(),
+            reason:
+                "hidden orchestrator: tool-leak detected (used tools despite no-tools constraint)"
+                    .to_string(),
         });
     }
 
@@ -1029,23 +1020,21 @@ async fn call_claude_orchestrator(
 /// Parse the orchestrator's JSON response into a verdict.
 fn parse_claude_response(raw: &str) -> anyhow::Result<ClaudeVerdict> {
     let json_str = extract_json_object(raw);
-    let value: serde_json::Value = serde_json::from_str(json_str)
-        .with_context(|| format!("invalid JSON: {json_str}"))?;
+    let value: serde_json::Value =
+        serde_json::from_str(json_str).with_context(|| format!("invalid JSON: {json_str}"))?;
 
     let continue_work = value
         .get("continue")
         .and_then(|v| v.as_bool())
         .ok_or_else(|| anyhow::anyhow!("missing or non-boolean 'continue' field"))?;
 
-    let next_prompt = value
-        .get("next_prompt")
-        .and_then(|v| {
-            if v.is_null() {
-                None
-            } else {
-                v.as_str().map(|s| s.to_string())
-            }
-        });
+    let next_prompt = value.get("next_prompt").and_then(|v| {
+        if v.is_null() {
+            None
+        } else {
+            v.as_str().map(|s| s.to_string())
+        }
+    });
     let reason = value
         .get("reason")
         .and_then(|v| v.as_str())
@@ -1122,7 +1111,9 @@ const SUMMARY_SEARCH_WINDOW: usize = 6;
 
 fn is_summary_heading(paragraph: &str) -> bool {
     let lower = paragraph.trim_start().to_ascii_lowercase();
-    SUMMARY_MARKERS.iter().any(|marker| lower.starts_with(marker))
+    SUMMARY_MARKERS
+        .iter()
+        .any(|marker| lower.starts_with(marker))
 }
 
 /// Check if any paragraph in the text starts with a summary marker. Used to
@@ -1136,10 +1127,7 @@ fn contains_summary(text: &str) -> bool {
 /// (`SUMMARY_MARKERS`), broadcast it to the agent board so peer agents on other
 /// devices can see what this agent concluded. Fire-and-forget — no-op when no
 /// board is configured (the broadcaster is a silent skip).
-fn maybe_broadcast_summary_to_board(
-    session_id: &acp::SessionId,
-    full_last_message: Option<&str>,
-) {
+fn maybe_broadcast_summary_to_board(session_id: &acp::SessionId, full_last_message: Option<&str>) {
     let Some(message) = full_last_message else {
         return;
     };
@@ -1148,12 +1136,7 @@ fn maybe_broadcast_summary_to_board(
     }
     // Broadcast the summary text. The board truncates to 256 chars. The meta
     // field carries the session id for display.
-    crate::peer_states::broadcast_state(
-        &session_id.to_string(),
-        None,
-        message,
-        "summary",
-    );
+    crate::peer_states::broadcast_state(&session_id.to_string(), None, message, "summary");
 }
 
 /// Truncate to the last N paragraphs within a char budget.
@@ -1471,7 +1454,11 @@ mod tests {
         maybe_broadcast_summary_to_board(&session_id, Some(message));
 
         let calls = mock.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1, "summary should trigger exactly one broadcast");
+        assert_eq!(
+            calls.len(),
+            1,
+            "summary should trigger exactly one broadcast"
+        );
         assert_eq!(calls[0].0, "test-session");
         assert_eq!(calls[0].3, "summary", "meta should be 'summary'");
         assert!(calls[0].2.contains("Fixed the bug"));
@@ -1613,7 +1600,10 @@ mod tests {
         let verdict = parse_claude_response(raw).expect("parse ok");
         assert!(verdict.continue_work);
         assert!(verdict.confidence.unwrap() >= CONTINUE_CONFIDENCE_THRESHOLD);
-        assert_eq!(verdict.next_prompt.as_deref(), Some("Run the failing test."));
+        assert_eq!(
+            verdict.next_prompt.as_deref(),
+            Some("Run the failing test.")
+        );
     }
 
     #[cfg(feature = "claude-hidden-orchestrator")]
@@ -1622,7 +1612,8 @@ mod tests {
         // If the hidden session tool-leaks (runs a tool instead of replying
         // JSON), the reply won't parse → the async path must map that to Stopped,
         // never loop. Pin that parse_claude_response errors on non-JSON.
-        let tool_leak_reply = "I read the file and found the bug is on line 42. You should fix it there.";
+        let tool_leak_reply =
+            "I read the file and found the bug is on line 42. You should fix it there.";
         assert!(parse_claude_response(tool_leak_reply).is_err());
     }
 
@@ -1687,16 +1678,13 @@ mod tests {
         fn init_test(cx: &mut gpui::TestAppContext) {
             cx.update(|cx| {
                 let mut settings_store = settings::SettingsStore::test(cx);
-                settings_store
-                    .register_setting::<feature_flags::FeatureFlagsSettings>();
+                settings_store.register_setting::<feature_flags::FeatureFlagsSettings>();
                 cx.set_global(settings_store);
             });
         }
 
         #[gpui::test]
-        async fn test_hidden_thread_continue_verdict_roundtrips(
-            cx: &mut gpui::TestAppContext,
-        ) {
+        async fn test_hidden_thread_continue_verdict_roundtrips(cx: &mut gpui::TestAppContext) {
             init_test(cx);
 
             let fs = fs::FakeFs::new(cx.executor());
@@ -1717,9 +1705,7 @@ mod tests {
 
             let outcome = cx
                 .update(|cx| {
-                    cx.spawn(async move |cx| {
-                        decide_claude_with_hidden_thread(data, cx).await
-                    })
+                    cx.spawn(async move |cx| decide_claude_with_hidden_thread(data, cx).await)
                 })
                 .await
                 .expect("hidden-thread decision succeeded");
@@ -1753,9 +1739,7 @@ mod tests {
 
             let outcome = cx
                 .update(|cx| {
-                    cx.spawn(async move |cx| {
-                        decide_claude_with_hidden_thread(data, cx).await
-                    })
+                    cx.spawn(async move |cx| decide_claude_with_hidden_thread(data, cx).await)
                 })
                 .await
                 .expect("hidden-thread decision succeeded");
@@ -1779,19 +1763,14 @@ mod tests {
             // Simulate a tool-leak: the hidden session returned prose instead
             // of JSON. The async path must map this to Stopped, never loop.
             connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
-                acp::ContentChunk::new(
-                    "I read the file and the bug is on line 42.".into(),
-                ),
+                acp::ContentChunk::new("I read the file and the bug is on line 42.".into()),
             )]);
 
-            let data =
-                build_test_data(connection, project, "Investigating the bug in file.rs.");
+            let data = build_test_data(connection, project, "Investigating the bug in file.rs.");
 
             let outcome = cx
                 .update(|cx| {
-                    cx.spawn(async move |cx| {
-                        decide_claude_with_hidden_thread(data, cx).await
-                    })
+                    cx.spawn(async move |cx| decide_claude_with_hidden_thread(data, cx).await)
                 })
                 .await
                 .expect("hidden-thread decision succeeded");
@@ -1838,14 +1817,11 @@ mod tests {
                 )),
             ]);
 
-            let data =
-                build_test_data(connection, project, "Investigating the bug in file.rs.");
+            let data = build_test_data(connection, project, "Investigating the bug in file.rs.");
 
             let outcome = cx
                 .update(|cx| {
-                    cx.spawn(async move |cx| {
-                        decide_claude_with_hidden_thread(data, cx).await
-                    })
+                    cx.spawn(async move |cx| decide_claude_with_hidden_thread(data, cx).await)
                 })
                 .await
                 .expect("hidden-thread decision succeeded");
@@ -1857,9 +1833,7 @@ mod tests {
                         "tool-using hidden session should stop with tool-leak reason, got: {reason}"
                     );
                 }
-                other => panic!(
-                    "expected Stopped for tool-leak with valid JSON, got {other:?}"
-                ),
+                other => panic!("expected Stopped for tool-leak with valid JSON, got {other:?}"),
             }
         }
 
@@ -1883,9 +1857,7 @@ mod tests {
 
             let outcome = cx
                 .update(|cx| {
-                    cx.spawn(async move |cx| {
-                        decide_claude_with_hidden_thread(data, cx).await
-                    })
+                    cx.spawn(async move |cx| decide_claude_with_hidden_thread(data, cx).await)
                 })
                 .await
                 .expect("hidden-thread decision succeeded");
@@ -1924,9 +1896,7 @@ mod tests {
 
             let outcome = cx
                 .update(|cx| {
-                    cx.spawn(async move |cx| {
-                        decide_claude_with_hidden_thread(data, cx).await
-                    })
+                    cx.spawn(async move |cx| decide_claude_with_hidden_thread(data, cx).await)
                 })
                 .await
                 .expect("hidden-thread decision succeeded");
@@ -1964,9 +1934,7 @@ mod tests {
 
             let outcome = cx
                 .update(|cx| {
-                    cx.spawn(async move |cx| {
-                        decide_claude_with_hidden_thread(data, cx).await
-                    })
+                    cx.spawn(async move |cx| decide_claude_with_hidden_thread(data, cx).await)
                 })
                 .await
                 .expect("hidden-thread decision succeeded");
@@ -1983,9 +1951,7 @@ mod tests {
         }
 
         #[gpui::test]
-        async fn test_hidden_thread_closes_session_when_supported(
-            cx: &mut gpui::TestAppContext,
-        ) {
+        async fn test_hidden_thread_closes_session_when_supported(cx: &mut gpui::TestAppContext) {
             // Regression: the hidden session must be closed via
             // connection.close_session() after the judgment turn, so the
             // underlying ACP process is killed and the session is removed
@@ -1997,9 +1963,7 @@ mod tests {
             let fs = fs::FakeFs::new(cx.executor());
             let project = project::Project::test(fs, [], cx).await;
 
-            let connection = Rc::new(
-                StubAgentConnection::new().with_supports_close_session(true),
-            );
+            let connection = Rc::new(StubAgentConnection::new().with_supports_close_session(true));
             connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
                 acp::ContentChunk::new(
                     r#"{"continue": false, "confidence": 0.9, "next_prompt": null, "reason": "done"}"#
@@ -2011,9 +1975,7 @@ mod tests {
 
             let outcome = cx
                 .update(|cx| {
-                    cx.spawn(async move |cx| {
-                        decide_claude_with_hidden_thread(data, cx).await
-                    })
+                    cx.spawn(async move |cx| decide_claude_with_hidden_thread(data, cx).await)
                 })
                 .await
                 .expect("hidden-thread decision succeeded");
@@ -2030,9 +1992,7 @@ mod tests {
         }
 
         #[gpui::test]
-        async fn test_hidden_thread_skips_close_when_not_supported(
-            cx: &mut gpui::TestAppContext,
-        ) {
+        async fn test_hidden_thread_skips_close_when_not_supported(cx: &mut gpui::TestAppContext) {
             // When the connection doesn't support close_session (the default
             // for StubAgentConnection), the orchestrator must not try to call
             // it — otherwise it would get an error every time.
@@ -2053,9 +2013,7 @@ mod tests {
 
             let outcome = cx
                 .update(|cx| {
-                    cx.spawn(async move |cx| {
-                        decide_claude_with_hidden_thread(data, cx).await
-                    })
+                    cx.spawn(async move |cx| decide_claude_with_hidden_thread(data, cx).await)
                 })
                 .await
                 .expect("hidden-thread decision succeeded");
@@ -2079,9 +2037,7 @@ mod tests {
         /// ever regressed to calling the model (e.g. by accidentally routing to
         /// decide_claude_with_llm), this count would be 1.
         #[gpui::test]
-        async fn test_hidden_thread_never_calls_language_model(
-            cx: &mut gpui::TestAppContext,
-        ) {
+        async fn test_hidden_thread_never_calls_language_model(cx: &mut gpui::TestAppContext) {
             init_test(cx);
 
             let fs = fs::FakeFs::new(cx.executor());
@@ -2095,18 +2051,14 @@ mod tests {
                 ),
             )]);
 
-            let model = Arc::new(
-                language_model::fake_provider::FakeLanguageModel::default(),
-            );
+            let model = Arc::new(language_model::fake_provider::FakeLanguageModel::default());
             let mut data =
                 build_test_data(connection, project, "Investigating the bug in file.rs.");
             data.model = model.clone();
 
             let outcome = cx
                 .update(|cx| {
-                    cx.spawn(async move |cx| {
-                        decide_claude_with_hidden_thread(data, cx).await
-                    })
+                    cx.spawn(async move |cx| decide_claude_with_hidden_thread(data, cx).await)
                 })
                 .await
                 .expect("hidden-thread decision succeeded");
@@ -2135,9 +2087,7 @@ mod tests {
         /// this test confirms no deadlock or state leakage in the orchestration
         /// layer itself.
         #[gpui::test]
-        async fn test_hidden_thread_concurrent_decisions_isolate(
-            cx: &mut gpui::TestAppContext,
-        ) {
+        async fn test_hidden_thread_concurrent_decisions_isolate(cx: &mut gpui::TestAppContext) {
             init_test(cx);
 
             let fs = fs::FakeFs::new(cx.executor());
@@ -2150,12 +2100,10 @@ mod tests {
             // caller drains the updates, second caller waits forever). Separate
             // connections avoid that stub limitation while still testing the
             // orchestration layer's concurrency safety.
-            let connection_a = Rc::new(
-                StubAgentConnection::new().with_supports_close_session(true),
-            );
-            let connection_b = Rc::new(
-                StubAgentConnection::new().with_supports_close_session(true),
-            );
+            let connection_a =
+                Rc::new(StubAgentConnection::new().with_supports_close_session(true));
+            let connection_b =
+                Rc::new(StubAgentConnection::new().with_supports_close_session(true));
 
             // Decision A: continue, run the failing test.
             connection_a.set_next_prompt_updates(vec![
@@ -2186,22 +2134,14 @@ mod tests {
             // state or a lock ordering issue, one or both would deadlock or
             // produce the wrong verdict.
             let task_a = cx.update(|cx| {
-                cx.spawn(async move |cx| {
-                    decide_claude_with_hidden_thread(data_a, cx).await
-                })
+                cx.spawn(async move |cx| decide_claude_with_hidden_thread(data_a, cx).await)
             });
             let task_b = cx.update(|cx| {
-                cx.spawn(async move |cx| {
-                    decide_claude_with_hidden_thread(data_b, cx).await
-                })
+                cx.spawn(async move |cx| decide_claude_with_hidden_thread(data_b, cx).await)
             });
 
-            let outcome_a = task_a
-                .await
-                .expect("concurrent decision A succeeded");
-            let outcome_b = task_b
-                .await
-                .expect("concurrent decision B succeeded");
+            let outcome_a = task_a.await.expect("concurrent decision A succeeded");
+            let outcome_b = task_b.await.expect("concurrent decision B succeeded");
 
             // Verify no cross-contamination: A continues, B stops.
             match outcome_a {
@@ -2225,11 +2165,13 @@ mod tests {
 
             // Both hidden sessions must be closed (no leak under concurrency).
             assert_eq!(
-                connection_a.close_count(), 1,
+                connection_a.close_count(),
+                1,
                 "decision A's hidden session must be closed exactly once"
             );
             assert_eq!(
-                connection_b.close_count(), 1,
+                connection_b.close_count(),
+                1,
                 "decision B's hidden session must be closed exactly once"
             );
         }
@@ -2249,9 +2191,7 @@ mod tests {
             let fs = fs::FakeFs::new(cx.executor());
             let project = project::Project::test(fs, [], cx).await;
 
-            let connection = Rc::new(
-                StubAgentConnection::new().with_supports_close_session(true),
-            );
+            let connection = Rc::new(StubAgentConnection::new().with_supports_close_session(true));
             // The hidden session sees plan_summary with unchecked tasks and
             // returns continue (the new prompt rule fires). The worker's own
             // output says "all done" — plan_summary must win.
@@ -2280,9 +2220,7 @@ mod tests {
 
             let outcome = cx
                 .update(|cx| {
-                    cx.spawn(async move |cx| {
-                        decide_claude_with_hidden_thread(data, cx).await
-                    })
+                    cx.spawn(async move |cx| decide_claude_with_hidden_thread(data, cx).await)
                 })
                 .await
                 .expect("hidden-thread decision succeeded");
@@ -2295,9 +2233,7 @@ mod tests {
                         action.next_prompt
                     );
                 }
-                other => panic!(
-                    "expected Continue when plan has unchecked tasks, got {other:?}"
-                ),
+                other => panic!("expected Continue when plan has unchecked tasks, got {other:?}"),
             }
         }
     }

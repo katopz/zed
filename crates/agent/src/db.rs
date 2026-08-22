@@ -119,6 +119,10 @@ pub struct DbSandboxGrants {
     /// could not be created (the fallback prompt's "for this thread" option).
     #[serde(default)]
     pub sandbox_fallback: bool,
+    /// Whether the user acknowledged the Windows-drive (DrvFs) sandbox
+    /// integrity warning for this thread; later commands skip the re-prompt.
+    #[serde(default)]
+    pub windows_fs_warning_ack: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -966,6 +970,7 @@ mod tests {
             allow_fs_write_all: false,
             unsandboxed: true,
             sandbox_fallback: true,
+            windows_fs_warning_ack: true,
         };
         thread.sandbox_grants = grants.clone();
 

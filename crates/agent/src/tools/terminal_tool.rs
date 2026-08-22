@@ -635,9 +635,12 @@ async fn run_terminal_tool(
     // path on a Windows drive (DrvFs) — from an explicit grant, a standing
     // grant, or the default project directory — its integrity guarantees are
     // weaker. When the warning is enabled, confirm with the user first. This
-    // gate is transient (never persisted): on "Continue" the normal flow
-    // (including any escalation prompt) proceeds; on "Abort" the command is
-    // cancelled. It recurs until the warning is disabled in settings.
+    // gate is transient: on "Continue" the acknowledgment is recorded for the
+    // thread (later commands here skip the re-prompt — on a native-Windows
+    // project the worktree is always on a Windows drive, so a per-command
+    // prompt would fire on every `git status`); on "Abort" the command is
+    // cancelled. New threads warn again until the warning is disabled in
+    // settings.
     //
     // The warning only makes sense when a WSL sandbox will actually wrap the
     // command, so it is skipped when the command is guaranteed to run without
@@ -649,6 +652,7 @@ async fn run_terminal_tool(
         && !want_unsandboxed
         && !unsandboxed_floor
         && persistent.warn_ntfs_grants
+        && !event_stream.windows_fs_warning_acknowledged()
         && sandbox::wsl_distro_registered()
     {
         let effective = event_stream.effective_sandbox_request(&request, &persistent);

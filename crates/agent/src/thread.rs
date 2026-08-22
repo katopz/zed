@@ -6006,10 +6006,14 @@ impl ToolCallEventStream {
     /// Confirm, before running a command whose sandbox will contain a Windows
     /// drive (DrvFs) path, that the user accepts the weaker integrity
     /// guarantees. This is a transient gate *in front of* the normal sandbox
-    /// flow — it is never persisted or recorded as a grant; the only way to
-    /// stop it recurring is to disable `warn_ntfs_grants` in settings (offered
-    /// via the banner's gear). Returns `Ok(())` on "Continue" (after which the
-    /// caller proceeds to any escalation prompt) and `Err` on "Abort".
+    /// flow — it is never persisted as a grant; acknowledging it records a
+    /// thread-scoped flag so the rest of the thread skips the re-prompt (on a
+    /// native-Windows project the worktree is always on a Windows drive, so
+    /// without that flag every command would re-prompt). The only way to stop
+    /// it appearing for NEW threads is to disable `warn_ntfs_grants` in
+    /// settings (offered via the banner's gear). Returns `Ok(())` on
+    /// "Continue" (after which the caller proceeds to any escalation prompt)
+    /// and `Err` on "Abort".
     pub(crate) fn authorize_windows_fs_warning(&self, cx: &mut App) -> Task<Result<()>> {
         // If the warning is already disabled, don't prompt.
         if !AgentSettings::get_global(cx)
@@ -6049,7 +6053,13 @@ impl ToolCallEventStream {
         // which tears down the stream and turns the prompt into a phantom
         // decline.
         let tool_call_id = self.tool_call_id.clone();
-        cx.spawn(async move |_cx| {
+        // Acknowledging records the thread-scoped flag so later commands in
+        // this thread skip the re-prompt.
+        let sandbox_grants = self.sandbox_grants.clone();
+        // For persisting the thread-scoped acknowledgment so it survives a
+        // reopen (same pattern as the other "for this thread" grants).
+        let thread = self.thread.clone();
+        cx.spawn(async move |cx| {
             let (response_tx, response_rx) = oneshot::channel();
             if let Err(error) = stream
                 .0
@@ -6081,7 +6091,13 @@ impl ToolCallEventStream {
                 .map_err(|_| anyhow!("authorization channel closed"))?;
             ensure_tool_call_authorization_not_interrupted(&outcome)?;
             match acp_thread::SandboxPermission::from_id(outcome.option_id.0.as_ref()) {
-                Some(acp_thread::SandboxPermission::AllowOnce) => Ok(()),
+                Some(acp_thread::SandboxPermission::AllowOnce) => {
+                    sandbox_grants
+                        .borrow_mut()
+                        .record_windows_fs_warning_ack();
+                    Self::persist_thread_grants(&thread, cx);
+                    Ok(())
+                }
                 _ => Err(anyhow!("Windows-drive write aborted by user")),
             }
         })
@@ -6220,6 +6236,15 @@ impl ToolCallEventStream {
     /// the thread (distinct from the persistent `allow_unsandboxed` setting).
     pub(crate) fn sandbox_fallback_granted_for_thread(&self) -> bool {
         self.sandbox_grants.borrow().fallback_granted_for_thread()
+    }
+
+    /// Whether the user already acknowledged the Windows-drive (DrvFs)
+    /// sandbox-integrity warning for this thread; when true the terminal tool
+    /// skips the re-prompt for later commands in the thread.
+    pub(crate) fn windows_fs_warning_acknowledged(&self) -> bool {
+        self.sandbox_grants
+            .borrow()
+            .windows_fs_warning_acknowledged()
     }
 
     /// Whether the user approved a model-requested `unsandboxed: true` escape

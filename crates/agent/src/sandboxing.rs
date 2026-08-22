@@ -317,6 +317,13 @@ pub(crate) struct ThreadSandboxGrants {
     /// `unsandboxed`, which records a model-requested escape; this is a
     /// user-acknowledged degradation because the sandbox is unavailable.
     sandbox_fallback: bool,
+    /// Whether the user acknowledged the weaker DrvFs sandbox-integrity
+    /// warning for this thread. On a native-Windows project every sandboxed
+    /// command's writable surface includes the `C:\…` worktree, so without
+    /// this flag the warning would re-prompt on every single command (even
+    /// read-only ones like `git status`). Acknowledged once per thread;
+    /// the persistent `warn_ntfs_grants` setting remains the total off-switch.
+    windows_fs_warning_ack: bool,
     /// Paths granted write access for the thread, each paired with the canonical
     /// target resolved at approval time. Each covers its whole subtree; redundant
     /// children are pruned on insert (by canonical target).
@@ -408,13 +415,26 @@ impl ThreadSandboxGrants {
         self.unsandboxed
     }
 
-    /// Record that the user approved running commands unsandboxed for the rest
+    /// Whether the user approved running commands unsandboxed for the rest
     /// of the thread when the sandbox can't be created. Only the Bubblewrap
     /// sandboxes (Linux directly, Windows via WSL) can fail to create a
     /// sandbox, so this is gated to those platforms.
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     pub fn record_fallback(&mut self) {
         self.sandbox_fallback = true;
+    }
+
+    /// Whether the user acknowledged the Windows-drive (DrvFs) sandbox
+    /// integrity warning for this thread — later commands in the thread skip
+    /// the re-prompt.
+    pub fn windows_fs_warning_acknowledged(&self) -> bool {
+        self.windows_fs_warning_ack
+    }
+
+    /// Record that the user acknowledged the Windows-drive (DrvFs) sandbox
+    /// integrity warning, suppressing it for the rest of the thread.
+    pub fn record_windows_fs_warning_ack(&mut self) {
+        self.windows_fs_warning_ack = true;
     }
 
     /// The sandbox this thread's grants establish on top of the settings, as a
@@ -487,6 +507,7 @@ impl ThreadSandboxGrants {
             allow_fs_write_all: self.allow_fs_write_all,
             unsandboxed: self.unsandboxed,
             sandbox_fallback: self.sandbox_fallback,
+            windows_fs_warning_ack: self.windows_fs_warning_ack,
         }
     }
 
@@ -509,6 +530,7 @@ impl ThreadSandboxGrants {
             allow_fs_write_all: db.allow_fs_write_all,
             unsandboxed: db.unsandboxed,
             sandbox_fallback: db.sandbox_fallback,
+            windows_fs_warning_ack: db.windows_fs_warning_ack,
             write_paths: db.write_paths.clone(),
         }
     }
@@ -922,6 +944,23 @@ mod tests {
         grants.record_fallback();
         assert!(grants.fallback_granted_for_thread());
         assert!(!covers(&grants, &unsandboxed_request()));
+    }
+
+    #[test]
+    fn windows_fs_warning_ack_round_trips_through_db() {
+        let mut grants = ThreadSandboxGrants::default();
+        assert!(!grants.windows_fs_warning_acknowledged());
+
+        grants.record_windows_fs_warning_ack();
+        assert!(grants.windows_fs_warning_acknowledged());
+
+        let restored = ThreadSandboxGrants::from_db(&grants.to_db());
+        assert!(restored.windows_fs_warning_acknowledged());
+
+        // Rows persisted before the field existed deserialize with the
+        // warning unacknowledged, so old threads warn once again at most.
+        let legacy = ThreadSandboxGrants::from_db(&crate::db::DbSandboxGrants::default());
+        assert!(!legacy.windows_fs_warning_acknowledged());
     }
 
     #[test]
