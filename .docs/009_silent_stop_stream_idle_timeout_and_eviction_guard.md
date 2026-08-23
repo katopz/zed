@@ -90,18 +90,38 @@ The idle-timeout test drives the deterministic GPUI scheduler
 (`advance_clock`), so the full retry cascade (~375s virtual time) runs in
 0.29s wall time.
 
-## Remaining known gaps (deliberate, for follow-up)
+## Remaining known gaps (updated 2026-08-23, second pass)
 
-- `stream_compaction`'s event loop has the same no-timeout shape as the main
-  loop had — a hung compaction stream still wedges until the watchdog.
-  Smaller blast radius (compaction requests are rarer); same fix pattern
-  applies if it shows up in logs.
-- Watchdog coverage hole: Claude-agent threads are skipped entirely when the
-  default provider isn't Anthropic ("Claude agent thread but default model
-  provider is GLM — skipping watchdog" appears in the logs).
-- `[agent_board] runtime poll loop starting` logged every 1–2s despite
-  claiming "single instance per process" — unrelated spam, worth its own
-  issue.
-- Premature "normal" stops where auto_prompt's decide LLM concludes NoAction
-  at 350k+ token contexts are a decision-quality problem, not a wiring bug —
-  lowering the overflow threshold (256k → ~200k) would shrink those contexts.
+- [x] `stream_compaction`'s event loop had the same no-timeout shape — FIXED:
+  both the request-establishment `select!` and the event loop now race the
+  same `agent.stream_idle_timeout_secs` timer (shared
+  `stream_idle_timeout_future` helper); a hung compaction stream retries
+  twice via the existing compaction-retry path, then the turn ends with a
+  visible `stream idle timeout` error. Regression test:
+  `test_compaction_stream_idle_timeout_recovers_hung_stream`.
+- [x] Watchdog Claude coverage hole — FIXED: a Claude-agent thread with a
+  non-Anthropic default model no longer skips the watchdog (the old
+  `return None` would leave hung Claude threads with NO recovery path).
+  It logs INFO and reasons with the configured default model; on provider
+  failure the decision degrades to `Continue` (re-sleep), so there is no
+  call-burn during healthy operation.
+- [x] auto_prompt overflow gate 256k → 200k — DONE: `default_max_context_tokens()`
+  is now 200_000 (threads were ballooning to 343–413k before the gate could
+  fire at turn end); the hardcoded 256k fallback in `dispatch_action` now
+  uses the shared default. Override remains
+  `ZED_AUTO_PROMPT_MAX_CONTEXT_TOKENS`.
+- [x] `[agent_board]` poll-loop log spam — root-caused as stale binary: the
+  running build (Aug 23 07:42) predates the unlogged-restart guard that
+  already sits uncommitted in the tree (sibling agent, Aug 23 22:01). The
+  spam was `realtime_nudge` → `force_refresh` → `start_poll` logging INFO
+  unconditionally every ~2s. No action taken here — the sibling's fix in
+  `crates/agent_board/src/runtime.rs` covers it; rebuilding/restarting picks
+  it up.
+- [ ] `tools::edit_file_tool::tests::test_streaming_authorize` fails
+  deterministically — PRE-EXISTING from the Aug 19 upstream merge
+  (`8823d2bcea`), verified failing at `HEAD~2` in an isolated worktree
+  before any of the 003 fixes. Unrelated to this workstream; needs its own
+  issue (agent-skills permission prompt offering "Always allow").
+- [ ] Premature "normal" stops where auto_prompt's decide LLM concludes
+  NoAction at 350k+ token contexts are a decision-quality problem, not a
+  wiring bug — the 200k gate above shrinks those contexts going forward.

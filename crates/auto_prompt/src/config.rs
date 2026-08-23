@@ -125,10 +125,14 @@ fn default_max_iterations() -> u32 {
     20
 }
 
-fn default_max_context_tokens() -> usize {
-    // Plan 023 A1: 256k gate — below it same-thread (req 4), above it the
-    // summarize→fork dance (req 3).
-    256_000
+pub fn default_max_context_tokens() -> usize {
+    // Plan 023 A1 gate, retuned 2026-08-23: below it same-thread (req 4),
+    // above it the summarize→fork dance (req 3). The 256k value let worker
+    // threads balloon to 343–413k actual input tokens before the gate could
+    // fire (it only runs at turn end), and GLM requests at those sizes are
+    // exactly the ones that stall (see .docs/009). 200k forks earlier and
+    // keeps decide calls small; override with ZED_AUTO_PROMPT_MAX_CONTEXT_TOKENS.
+    200_000
 }
 
 fn default_claude_context_overflow_tokens() -> usize {
@@ -366,11 +370,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn max_context_tokens_defaults_to_256k() {
-        // Plan 023 A1 (req 3/4): 256k gate — below it same-thread, above it
-        // the summarize→fork flow.
-        assert_eq!(default_max_context_tokens(), 256_000);
-        assert_eq!(AutoPromptConfig::default().max_context_tokens, 256_000);
+    fn max_context_tokens_defaults_to_200k() {
+        // Plan 023 A1 (req 3/4): the gate — below it same-thread, above it
+        // the summarize→fork flow. 200k per .docs/009 (256k let threads
+        // balloon to 343–413k before forking).
+        assert_eq!(default_max_context_tokens(), 200_000);
+        assert_eq!(AutoPromptConfig::default().max_context_tokens, 200_000);
     }
 
     #[test]
@@ -418,7 +423,7 @@ mod tests {
     #[test]
     fn serde_missing_fields_fall_back_to_defaults() {
         let config: AutoPromptConfig = serde_json::from_str("{}").unwrap();
-        assert_eq!(config.max_context_tokens, 256_000);
+        assert_eq!(config.max_context_tokens, 200_000);
         assert_eq!(config.claude_context_overflow_tokens, 320_000);
         assert_eq!(
             config.housekeeping_command,

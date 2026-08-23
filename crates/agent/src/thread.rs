@@ -2754,6 +2754,25 @@ impl Thread {
         Ok(events_rx)
     }
 
+    /// Build the idle-timeout future raced against stream events. Returns a
+    /// never-firing future when the timeout is disabled (`0`), so callers can
+    /// always include the arm in their `select!`.
+    fn stream_idle_timeout_future(
+        stream_idle_timeout_secs: u64,
+        cx: &mut AsyncApp,
+    ) -> futures::future::Fuse<
+        std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>,
+    > {
+        if stream_idle_timeout_secs > 0 {
+            cx.background_executor()
+                .timer(Duration::from_secs(stream_idle_timeout_secs))
+                .boxed()
+                .fuse()
+        } else {
+            futures::future::pending::<()>().boxed().fuse()
+        }
+    }
+
     async fn run_turn_internal(
         this: &WeakEntity<Self>,
         event_stream: &ThreadEventStream,
@@ -2888,14 +2907,8 @@ impl Thread {
                 // connection but then never deliver SSE events: without it,
                 // `events.next()` blocks forever and the thread wedges in
                 // `Generating` until the auto-prompt watchdog intervenes.
-                let mut stream_idle_timeout = if stream_idle_timeout_secs > 0 {
-                    cx.background_executor()
-                        .timer(Duration::from_secs(stream_idle_timeout_secs))
-                        .boxed()
-                        .fuse()
-                } else {
-                    futures::future::pending::<()>().boxed().fuse()
-                };
+                let mut stream_idle_timeout =
+                    Self::stream_idle_timeout_future(stream_idle_timeout_secs, cx);
                 // Snapshot before the select: its tool branch mutably borrows
                 // `tool_results`, so the idle arm cannot read it directly.
                 let has_pending_tool_results = !tool_results.is_empty();
@@ -3217,11 +3230,18 @@ impl Thread {
         cx: &mut AsyncApp,
     ) -> Result<ControlFlow<()>> {
         log::debug!("Running compaction");
+        let stream_idle_timeout_secs =
+            this.read_with(cx, |_, cx| AgentSettings::get_global(cx).stream_idle_timeout_secs)?;
         let compaction_id = acp_thread::ContextCompactionId(Uuid::new_v4().to_string().into());
         event_stream.send_context_compaction(
             compaction_id.clone(),
             acp_thread::ContextCompactionStatus::InProgress,
         );
+        // Created before the select because its first branch borrows `cx` for
+        // the request itself; the timer guards the same provider failure mode
+        // as the main loop (connection accepted, then no events ever).
+        let mut request_idle_timeout =
+            Self::stream_idle_timeout_future(stream_idle_timeout_secs, cx);
         let stream = futures::select! {
             result = model.stream_completion(request, cx).fuse() => result,
             _ = cancellation_rx.changed().fuse() => {
@@ -3231,11 +3251,23 @@ impl Thread {
                 }
                 return Ok(ControlFlow::Continue(()));
             }
+            _ = request_idle_timeout => {
+                log::warn!(
+                    "Compaction stream request idle for {stream_idle_timeout_secs}s; \
+                     treating the stream as dead"
+                );
+                return Err(LanguageModelCompletionError::Other(anyhow!(
+                    "stream idle timeout: no response in {stream_idle_timeout_secs}s"
+                ))
+                .into());
+            }
         };
         let mut stream = stream?;
 
         let mut summary = String::new();
         loop {
+            let mut event_idle_timeout =
+                Self::stream_idle_timeout_future(stream_idle_timeout_secs, cx);
             let event = futures::select! {
                 event = stream.next().fuse() => event,
                 _ = cancellation_rx.changed().fuse() => {
@@ -3244,6 +3276,16 @@ impl Thread {
                         return Ok(ControlFlow::Break(()));
                     }
                     continue;
+                }
+                _ = event_idle_timeout => {
+                    log::warn!(
+                        "Compaction stream idle for {stream_idle_timeout_secs}s; \
+                         treating the stream as dead"
+                    );
+                    return Err(LanguageModelCompletionError::Other(anyhow!(
+                        "stream idle timeout: no events in {stream_idle_timeout_secs}s"
+                    ))
+                    .into());
                 }
             };
 
@@ -7972,6 +8014,94 @@ mod tests {
         assert!(
             saw_idle_timeout_error,
             "the turn must end with the idle-timeout error instead of wedging"
+        );
+
+        thread.read_with(cx, |thread, _| {
+            assert!(
+                thread.running_turn.is_none(),
+                "the turn must have finished, not stayed Generating forever"
+            );
+        });
+    }
+
+    /// A compaction stream that accepts the request but never delivers
+    /// events must not wedge the turn: the idle timeout in `stream_compaction`
+    /// turns it into a retryable error (initial + 2 retries against the
+    /// compaction model), then the turn ends with a visible error instead of
+    /// hanging forever (`.docs/009` follow-up to issue 003).
+    #[gpui::test]
+    async fn test_compaction_stream_idle_timeout_recovers_hung_stream(cx: &mut TestAppContext) {
+        let (thread, _event_stream) = setup_thread_for_test(cx).await;
+        let thread_model = Arc::new(FakeLanguageModel::default());
+        let compaction_model = Arc::new(FakeLanguageModel::default());
+        let old_user_message_id = ClientUserMessageId::new();
+
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.set_model(thread_model.clone(), cx);
+                thread
+                    .messages
+                    .push(user_text_message(old_user_message_id.clone(), "old user"));
+                thread.messages.push(agent_text_message("old assistant"));
+                thread.request_token_usage.insert(
+                    old_user_message_id.clone(),
+                    TokenUsage {
+                        input_tokens: u64::MAX,
+                        ..Default::default()
+                    },
+                );
+            });
+            set_auto_compact_settings(
+                cx,
+                agent_settings::AutoCompactSettings {
+                    enabled: true,
+                    threshold: agent_settings::AutoCompactThreshold::Percentage(0.5),
+                },
+            );
+            set_registry_compaction_model(cx, Some(compaction_model.clone()));
+        });
+
+        // The compaction model's stream stays open but never yields events.
+        let mut events = cx
+            .update(|cx| {
+                thread.update(cx, |thread, cx| {
+                    thread.send(ClientUserMessageId::new(), vec!["new prompt"], cx)
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        // Three compaction attempts (initial + 2 retries) at ~125s virtual
+        // time each; advance in chunks so each due timer's task runs first.
+        for _ in 0..8 {
+            cx.executor().advance_clock(Duration::from_secs(60));
+            cx.run_until_parked();
+        }
+
+        assert_eq!(
+            compaction_model.pending_completions().len(),
+            3,
+            "initial compaction attempt plus two retries should have opened three streams"
+        );
+        assert_eq!(
+            thread_model.pending_completions().len(),
+            0,
+            "the main model must never be hit while compaction cannot complete"
+        );
+
+        let mut saw_idle_timeout_error = false;
+        while let Some(event) = events.next().await {
+            if let Err(error) = event {
+                assert!(
+                    error.to_string().contains("stream idle timeout"),
+                    "unexpected turn error: {error:#}"
+                );
+                saw_idle_timeout_error = true;
+            }
+        }
+        assert!(
+            saw_idle_timeout_error,
+            "the turn must end with the compaction idle-timeout error instead of wedging"
         );
 
         thread.read_with(cx, |thread, _| {

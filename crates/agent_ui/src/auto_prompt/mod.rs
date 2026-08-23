@@ -361,7 +361,7 @@ pub(crate) fn dispatch_action(
 
     let max_context_tokens = auto_prompt::load_config_cached()
         .map(|config| config.max_context_tokens)
-        .unwrap_or(256_000);
+        .unwrap_or_else(|_| auto_prompt::default_max_context_tokens());
 
     let same_thread_threshold = match auto_prompt::load_config_cached()
         .map(|config| config.same_thread_token_threshold)
@@ -1581,21 +1581,22 @@ pub fn start_watchdog(
     let model = configured_model.model.clone();
 
     // Claude Code authenticates itself outside Zed's LanguageModelRegistry, so
-    // the watchdog's reasoning call only makes sense when Zed's default model
-    // is a real Anthropic model. Otherwise it would silently burn calls
-    // against whatever other provider is configured (possibly the same one
-    // that's rate-limited, if Claude is being used as a fallback for it).
+    // for a Claude-agent thread the watchdog's reasoning call necessarily uses
+    // Zed's default model — which may not be Anthropic. That's still better
+    // than skipping the watchdog entirely (a hung Claude thread would have NO
+    // recovery path): the reasoning call only fires after a stuck-timeout, and
+    // if the provider is down the decision degrades to `Continue` (re-sleep),
+    // so there is no call-burn during healthy operation. Log for visibility.
     let is_claude_agent = thread
         .upgrade()
         .map(|t| t.read(cx).connection().agent_id().as_ref() == CLAUDE_AGENT_ID)
         .unwrap_or(false);
     if is_claude_agent && model.provider_id() != language_model::ANTHROPIC_PROVIDER_ID {
         log::info!(
-            "[auto_prompt::watchdog] Claude agent thread but default model provider is {:?}, \
-             not Anthropic — skipping watchdog",
+            "[auto_prompt::watchdog] Claude agent thread with non-Anthropic default model \
+             ({:?}) — watchdog will use it for stuck-thread reasoning",
             model.provider_id()
         );
-        return None;
     }
 
     let timeout_secs = config.watchdog_timeout_secs;

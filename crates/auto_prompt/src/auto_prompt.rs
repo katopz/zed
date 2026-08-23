@@ -16,7 +16,7 @@ pub mod plan_registry;
 pub mod session_limit;
 pub mod watchdog;
 
-pub use config::AutoPromptConfig;
+pub use config::{AutoPromptConfig, default_max_context_tokens};
 pub use context::{
     AutoPromptContext, AutoPromptResponse, PlanFileContent, StopPhase, truncate_to_paragraph_budget,
 };
