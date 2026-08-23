@@ -379,6 +379,16 @@ pub struct AgentSettingsContent {
     ///
     /// Default: null (prompts wait indefinitely)
     pub auto_allow_permissions_after_seconds: Option<u64>,
+    /// Maximum time to wait for a streamed completion event from the language
+    /// model before treating the stream as dead and retrying the request.
+    /// Guards against providers that accept the HTTP connection but then
+    /// never deliver SSE events, which would otherwise wedge the thread in
+    /// `Generating` until the auto-prompt watchdog intervenes. The timeout
+    /// only fires when no tool results are pending; while tools run, a silent
+    /// stream is legitimate. Set to 0 to disable.
+    ///
+    /// Default: 120
+    pub stream_idle_timeout_secs: Option<u64>,
     /// Per-tool permission rules for granular control over which tool actions
     /// require confirmation.
     ///

@@ -2869,6 +2869,10 @@ impl Thread {
 
             log::debug!("Calling model.stream_completion, attempt {}", attempt);
 
+            let stream_idle_timeout_secs = this.read_with(cx, |_, cx| {
+                AgentSettings::get_global(cx).stream_idle_timeout_secs
+            })?;
+
             let (mut events, mut error) = match model.stream_completion(request, cx).await {
                 Ok(events) => (events.fuse(), None),
                 Err(err) => (stream::empty().boxed().fuse(), Some(err)),
@@ -2880,8 +2884,41 @@ impl Thread {
             let mut had_refusal = false;
             loop {
                 // Race between getting the first event, tool completion, and cancellation.
+                // The idle timer guards against providers that accept the HTTP
+                // connection but then never deliver SSE events: without it,
+                // `events.next()` blocks forever and the thread wedges in
+                // `Generating` until the auto-prompt watchdog intervenes.
+                let mut stream_idle_timeout = if stream_idle_timeout_secs > 0 {
+                    cx.background_executor()
+                        .timer(Duration::from_secs(stream_idle_timeout_secs))
+                        .boxed()
+                        .fuse()
+                } else {
+                    futures::future::pending::<()>().boxed().fuse()
+                };
+                // Snapshot before the select: its tool branch mutably borrows
+                // `tool_results`, so the idle arm cannot read it directly.
+                let has_pending_tool_results = !tool_results.is_empty();
                 let first_event = futures::select! {
                     event = events.next().fuse() => event,
+                    _ = stream_idle_timeout => {
+                        // A silent stream is legitimate while tool results are
+                        // still pending (the tool branch of this select fires
+                        // when they complete). Only treat the stream as dead
+                        // when there is nothing left to wait for.
+                        if !has_pending_tool_results {
+                            log::warn!(
+                                "No completion events for {}s with no pending tool results; \
+                                 treating the stream as dead and retrying (attempt {attempt})",
+                                stream_idle_timeout_secs
+                            );
+                            error = Some(LanguageModelCompletionError::Other(anyhow!(
+                                "stream idle timeout: no events in {stream_idle_timeout_secs}s"
+                            )));
+                            break;
+                        }
+                        continue;
+                    }
                     tool_result = futures::StreamExt::select_next_some(&mut tool_results) => {
                         let (owning_message_ix, tool_result) = tool_result;
                         let is_error = tool_result.is_error;
@@ -7878,6 +7915,71 @@ mod tests {
         compaction_model.send_completion_stream_text_chunk(&request, "summary");
         compaction_model.end_completion_stream(&request);
         cx.run_until_parked();
+    }
+
+    /// A provider that accepts the request but never delivers SSE events must
+    /// not wedge the thread in `Generating` forever: the idle timeout in
+    /// `run_turn_internal` turns the dead stream into a retryable error, the
+    /// retry re-opens the stream, and once retries are exhausted the turn ends
+    /// with the error instead of hanging (issue 003).
+    #[gpui::test]
+    async fn test_stream_idle_timeout_recovers_hung_stream(cx: &mut TestAppContext) {
+        let (thread, _event_stream) = setup_thread_for_test(cx).await;
+        let model = Arc::new(FakeLanguageModel::default());
+
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.set_model(model.clone(), cx);
+            });
+        });
+
+        // The fake model's stream stays open but never yields events — the
+        // exact failure mode from issue 003.
+        let mut events = cx
+            .update(|cx| {
+                thread.update(cx, |thread, cx| {
+                    thread.send(ClientUserMessageId::new(), vec!["hello"], cx)
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        // Default `stream_idle_timeout_secs` is 120; `Other` errors retry
+        // twice with a 5s fixed delay, so the full cascade (3 attempts) needs
+        // ~370s of virtual time. Advance in chunks so each due timer's task
+        // runs before the next clock jump.
+        for _ in 0..8 {
+            cx.executor().advance_clock(Duration::from_secs(60));
+            cx.run_until_parked();
+        }
+
+        assert_eq!(
+            model.pending_completions().len(),
+            3,
+            "initial attempt plus two retries should have opened three streams"
+        );
+
+        let mut saw_idle_timeout_error = false;
+        while let Some(event) = events.next().await {
+            if let Err(error) = event {
+                assert!(
+                    error.to_string().contains("stream idle timeout"),
+                    "unexpected turn error: {error:#}"
+                );
+                saw_idle_timeout_error = true;
+            }
+        }
+        assert!(
+            saw_idle_timeout_error,
+            "the turn must end with the idle-timeout error instead of wedging"
+        );
+
+        thread.read_with(cx, |thread, _| {
+            assert!(
+                thread.running_turn.is_none(),
+                "the turn must have finished, not stayed Generating forever"
+            );
+        });
     }
 
     #[gpui::test]

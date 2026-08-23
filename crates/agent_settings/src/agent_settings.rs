@@ -32,6 +32,9 @@ pub const SUMMARIZE_THREAD_DETAILED_PROMPT: &str =
     include_str!("prompts/summarize_thread_detailed_prompt.txt");
 pub const COMPACTION_PROMPT: &str = include_str!("prompts/compaction_prompt.txt");
 
+/// Default for `AgentSettings::stream_idle_timeout_secs`.
+pub const DEFAULT_STREAM_IDLE_TIMEOUT_SECS: u64 = 120;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PanelLayout {
     pub(crate) agent_dock: Option<DockPosition>,
@@ -250,6 +253,11 @@ pub struct AgentSettings {
     /// least-privileged "allow" option after this many seconds. Default:
     /// None (prompts wait indefinitely).
     pub auto_allow_permissions_after_seconds: Option<u64>,
+    /// Maximum time to wait for a streamed completion event before treating
+    /// the stream as dead and retrying. 0 disables the timeout. Default: 120
+    /// seconds — long enough for time-to-first-token on very large contexts,
+    /// short enough that a wedged stream recovers without the watchdog.
+    pub stream_idle_timeout_secs: u64,
     pub tool_permissions: ToolPermissions,
     pub sandbox_permissions: SandboxPermissions,
 }
@@ -830,6 +838,9 @@ impl Settings for AgentSettings {
             show_merge_conflict_indicator: agent.show_merge_conflict_indicator.unwrap(),
             auto_focus_new_thread: agent.auto_focus_new_thread.unwrap_or(false),
             auto_allow_permissions_after_seconds: agent.auto_allow_permissions_after_seconds,
+            stream_idle_timeout_secs: agent
+                .stream_idle_timeout_secs
+                .unwrap_or(DEFAULT_STREAM_IDLE_TIMEOUT_SECS),
             tool_permissions: compile_tool_permissions(agent.tool_permissions),
             sandbox_permissions: compile_sandbox_permissions(agent.sandbox_permissions),
         }
@@ -1136,6 +1147,22 @@ mod tests {
 
         let empty: settings::AgentSettingsContent = serde_json::from_value(json!({})).unwrap();
         assert_eq!(empty.auto_allow_permissions_after_seconds, None);
+    }
+
+    #[test]
+    fn test_stream_idle_timeout_secs_parsing() {
+        let json = json!({
+            "stream_idle_timeout_secs": 45
+        });
+        let content: settings::AgentSettingsContent = serde_json::from_value(json).unwrap();
+        assert_eq!(content.stream_idle_timeout_secs, Some(45));
+
+        let disabled: settings::AgentSettingsContent =
+            serde_json::from_value(json!({ "stream_idle_timeout_secs": 0 })).unwrap();
+        assert_eq!(disabled.stream_idle_timeout_secs, Some(0));
+
+        let empty: settings::AgentSettingsContent = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(empty.stream_idle_timeout_secs, None);
     }
 
     #[test]

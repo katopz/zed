@@ -3856,7 +3856,10 @@ impl AgentPanel {
     /// producing a title/summary, or has a queued message. As a backstop for
     /// the runaway case where every retained thread is generating (so cleanup
     /// would be a no-op), we still enforce a hard cap of
-    /// [`MAX_RETAINED_THREADS`] by evicting the single oldest retained thread.
+    /// [`MAX_RETAINED_THREADS`] by evicting the oldest evictable thread — and
+    /// deliberately exceeding the cap when every thread is busy, since killing
+    /// active work is worse than a temporarily larger map (see
+    /// [`Self::is_thread_evictable`]).
     fn insert_retained_thread(
         &mut self,
         thread_id: ThreadId,
@@ -3871,18 +3874,34 @@ impl AgentPanel {
 
         // Hard cap backstop: if every retained thread was mid-generation,
         // `cleanup_retained_threads` could not evict any of them. Respect the
-        // invariant by evicting the single oldest (FIFO order from IndexMap).
+        // invariant by evicting the single oldest EVICTABLE retained thread —
+        // never a busy one: evicting a Generating thread drops its
+        // ConversationView, which cancels the watchdog and auto_prompt tasks
+        // that are the only recovery paths for a wedged stream (issue 003).
+        // When no thread is evictable we deliberately exceed the cap — the cap
+        // exists to bound idle-thread memory (issue 006), not to kill work.
         // The underlying agent-server thread keeps running and its metadata
         // stays in `ThreadMetadataStore`, so the user can reopen it from the
         // sidebar.
         while self.retained_threads.len() > MAX_RETAINED_THREADS {
-            let Some(oldest_id) = self.retained_threads.keys().next().copied() else {
+            let Some(oldest_id) = self
+                .retained_threads
+                .iter()
+                .find(|(_id, view)| self.is_thread_evictable(view, cx))
+                .map(|(id, _)| *id)
+            else {
+                log::warn!(
+                    "[agent_panel] retained_threads ({}) all busy; exceeding hard cap of {} \
+                     instead of evicting active work",
+                    self.retained_threads.len(),
+                    MAX_RETAINED_THREADS
+                );
                 break;
             };
             self.retained_threads.shift_remove(&oldest_id);
             log::info!(
                 "[agent_panel] retained_threads exceeded hard cap of {MAX_RETAINED_THREADS} \
-                 (all threads busy); evicted oldest thread {oldest_id:?} \
+                 (all idle slots taken); evicted oldest idle thread {oldest_id:?} \
                  (metadata preserved in ThreadMetadataStore)"
             );
         }
@@ -4596,57 +4615,60 @@ impl AgentPanel {
         self.insert_retained_thread(thread_id, conversation_view, cx);
     }
 
+    /// Whether a retained thread may be dropped from `retained_threads`
+    /// without losing in-flight work. Busy threads (Generating, loading,
+    /// generating a title or summary, or with queued messages) and threads
+    /// that cannot be reloaded from their agent server must be kept —
+    /// evicting them cancels their recovery chains (watchdog, auto_prompt
+    /// tasks) and, for unloadable threads, loses the thread entirely.
+    fn is_thread_evictable(&self, conversation_view: &Entity<ConversationView>, cx: &App) -> bool {
+        let view = conversation_view.read(cx);
+        let Some(thread_view) = view.root_thread_view() else {
+            return false;
+        };
+        let thread_view = thread_view.read(cx);
+        let acp_thread = thread_view.thread.read(cx);
+        // Only consider truly-idle, loadable threads for cleanup.
+        if !acp_thread.connection().supports_load_session()
+            || acp_thread.status() != ThreadStatus::Idle
+        {
+            return false;
+        }
+        // `is_loading_contents` covers the window between `send()` and
+        // the turn actually starting: the editor's message (including
+        // mention resolutions such as the ThreadSummary follow-up) is
+        // being resolved into content blocks. The thread reports Idle
+        // during this window, so without this guard the thread can be
+        // evicted while its summary/content is still loading — which is the
+        // "new thread disappears while summary is loading" bug.
+        //
+        // Note: we intentionally do NOT guard on `_auto_prompt_task` —
+        // that task is the orchestration LLM call, and cancelling it on
+        // eviction merely stops the auto_prompt chain for an otherwise
+        // idle thread; it does not lose user data. Guarding it would
+        // prevent legitimate cleanup of idle threads (the stub-thread
+        // regression tests create threads whose `on_thread_stopped`
+        // plants a pending auto_prompt task).
+        if thread_view.is_loading_contents {
+            return false;
+        }
+        if let Some(native_thread) = thread_view.as_native_thread(cx) {
+            let native = native_thread.read(cx);
+            if native.is_generating_title() || native.is_generating_summary() {
+                return false;
+            }
+        }
+        if thread_view.has_queued_messages() {
+            return false;
+        }
+        true
+    }
+
     fn cleanup_retained_threads(&mut self, cx: &App) {
         let mut potential_removals = self
             .retained_threads
             .iter()
-            .filter(|(_id, view)| {
-                let view = view.read(cx);
-                let Some(thread_view) = view.root_thread_view() else {
-                    return false;
-                };
-                let thread_view = thread_view.read(cx);
-                let acp_thread = thread_view.thread.read(cx);
-                // Only consider truly-idle, loadable threads for cleanup.
-                // Threads that are Generating, Loading, generating a title or
-                // summary in the background, or have a queued message must not
-                // be evicted — evicting them cancels in-flight work and loses
-                // the thread entirely (the user-facing regression where a new
-                // thread vanishes while waiting for summary/title processing).
-                if !acp_thread.connection().supports_load_session()
-                    || acp_thread.status() != ThreadStatus::Idle
-                {
-                    return false;
-                }
-                // `is_loading_contents` covers the window between `send()` and
-                // the turn actually starting: the editor's message (including
-                // mention resolutions such as the ThreadSummary follow-up) is
-                // being resolved into content blocks. The thread reports Idle
-                // during this window, so without this guard the thread can be
-                // evicted while its summary/content is still loading — which is
-                // the "new thread disappears while summary is loading" bug.
-                //
-                // Note: we intentionally do NOT guard on `_auto_prompt_task` —
-                // that task is the orchestration LLM call, and cancelling it on
-                // eviction merely stops the auto_prompt chain for an otherwise
-                // idle thread; it does not lose user data. Guarding it would
-                // prevent legitimate cleanup of idle threads (the stub-thread
-                // regression tests create threads whose `on_thread_stopped`
-                // plants a pending auto_prompt task).
-                if thread_view.is_loading_contents {
-                    return false;
-                }
-                if let Some(native_thread) = thread_view.as_native_thread(cx) {
-                    let native = native_thread.read(cx);
-                    if native.is_generating_title() || native.is_generating_summary() {
-                        return false;
-                    }
-                }
-                if thread_view.has_queued_messages() {
-                    return false;
-                }
-                true
-            })
+            .filter(|(_id, view)| self.is_thread_evictable(view, cx))
             .collect::<Vec<_>>();
 
         let max_idle = MaxIdleRetainedThreads::global(cx);
@@ -11710,6 +11732,124 @@ mod tests {
                 !panel.retained_threads.contains_key(&thread_id_b),
                 "idle thread with only an in-flight auto_prompt_task should still be cleaned up"
             );
+        });
+    }
+
+    /// End the active stub thread's turn and clear its loading flag so it
+    /// becomes fully evictable (Idle + loadable + not loading contents).
+    fn park_idle_thread(
+        panel: &Entity<AgentPanel>,
+        connection: &StubAgentConnection,
+        session_id: &acp::SessionId,
+        cx: &mut VisualTestContext,
+    ) {
+        cx.update(|_, _cx| {
+            connection.end_turn(session_id.clone(), acp::StopReason::EndTurn);
+        });
+        cx.run_until_parked();
+        panel.update(cx, |panel, cx| {
+            let view = panel
+                .active_conversation_view()
+                .expect("thread still active when parking");
+            let thread_view = view
+                .read(cx)
+                .root_thread_view()
+                .expect("thread connected");
+            thread_view.update(cx, |tv, _cx| {
+                tv.is_loading_contents = false;
+            });
+        });
+    }
+
+    /// Regression test: when the retained-thread hard cap is exceeded, the
+    /// backstop must evict the oldest EVICTABLE (idle) thread — never a
+    /// Generating one. Evicting a generating thread drops its
+    /// ConversationView, which cancels the watchdog and auto_prompt tasks
+    /// that are the only recovery paths for a wedged stream (issue 003).
+    #[gpui::test]
+    async fn test_hard_cap_evicts_idle_thread_not_generating(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let connection = StubAgentConnection::new()
+            .with_supports_load_session(true)
+            .with_agent_id("loadable-stub".into())
+            .with_telemetry_id("loadable-stub".into());
+
+        // Threads 1-5: opened, ended, parked idle in the background.
+        let mut idle_thread_ids = Vec::new();
+        for _ in 0..5 {
+            let (session_id, thread_id) =
+                open_generating_thread_with_loadable_connection(&panel, &connection, &mut cx);
+            park_idle_thread(&panel, &connection, &session_id, &mut cx);
+            idle_thread_ids.push(thread_id);
+        }
+
+        // Threads 6-9: opened and left Generating in the background.
+        let mut generating_thread_ids = Vec::new();
+        for _ in 0..4 {
+            let (_session_id, thread_id) =
+                open_generating_thread_with_loadable_connection(&panel, &connection, &mut cx);
+            generating_thread_ids.push(thread_id);
+        }
+
+        // Retained = 5 idle + 4 generating = 9 threads (cap is 8); opening
+        // the 10th moves thread 9 into retained and trips the hard cap.
+        let (_session_id_10, _thread_id_10) =
+            open_generating_thread_with_loadable_connection(&panel, &connection, &mut cx);
+
+        panel.read_with(&cx, |panel, _cx| {
+            assert_eq!(
+                panel.retained_threads.len(),
+                MAX_RETAINED_THREADS,
+                "the oldest idle thread should have been evicted to satisfy the cap"
+            );
+            assert!(
+                !panel.retained_threads.contains_key(&idle_thread_ids[0]),
+                "the oldest idle thread is the eviction victim"
+            );
+            for thread_id in &idle_thread_ids[1..] {
+                assert!(
+                    panel.retained_threads.contains_key(thread_id),
+                    "remaining idle threads stay retained"
+                );
+            }
+            for thread_id in &generating_thread_ids {
+                assert!(
+                    panel.retained_threads.contains_key(thread_id),
+                    "generating threads must never be evicted by the hard cap"
+                );
+            }
+        });
+    }
+
+    /// When every retained thread is busy, the hard-cap backstop must exceed
+    /// the cap rather than kill active work.
+    #[gpui::test]
+    async fn test_hard_cap_exceeds_cap_when_all_threads_busy(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let connection = StubAgentConnection::new()
+            .with_supports_load_session(true)
+            .with_agent_id("loadable-stub".into())
+            .with_telemetry_id("loadable-stub".into());
+
+        let mut thread_ids = Vec::new();
+        for _ in 0..10 {
+            let (_session_id, thread_id) =
+                open_generating_thread_with_loadable_connection(&panel, &connection, &mut cx);
+            thread_ids.push(thread_id);
+        }
+
+        panel.read_with(&cx, |panel, _cx| {
+            assert_eq!(
+                panel.retained_threads.len(),
+                MAX_RETAINED_THREADS + 1,
+                "with no evictable thread the cap is exceeded, not enforced by killing work"
+            );
+            for thread_id in &thread_ids[..MAX_RETAINED_THREADS] {
+                assert!(
+                    panel.retained_threads.contains_key(thread_id),
+                    "generating threads must survive the hard-cap backstop"
+                );
+            }
         });
     }
 

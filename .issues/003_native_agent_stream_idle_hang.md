@@ -2,9 +2,27 @@
 
 ## Status
 - [x] Root cause identified (evidence: 19 watchdog incidents, 10/11 halts correlate with completed-tool-call + dead stream)
-- [ ] Fix proposed (add idle timeout to stream event loop)
-- [ ] Tested
-- [ ] GOAT verified
+- [x] Fix implemented: idle timeout in `run_turn_internal` (`agent.stream_idle_timeout_secs`, default 120s, 0 = disabled)
+- [x] Busy-thread eviction guard added to the retained-threads hard cap (the amplifier that killed recovery)
+- [x] Tested (`test_stream_idle_timeout_recovers_hung_stream`, `test_hard_cap_*`)
+- [x] Resolution note: `.docs/009_silent_stop_stream_idle_timeout_and_eviction_guard.md`
+
+## 2026-08-23 regression addendum (resolved the same day)
+
+User report: 20+ silent stops "recently". Log forensics across
+`Zed.log`/`Zed.log.old` reframe the failure — the watchdog NEVER fired
+(zero decision lines in either log) because it is cancelled when the
+thread stops "normally" or dies silently with an evicted view:
+
+- 32 hard-cap evictions in the heavy window; 23 watchdogs started, only
+  13 got a cancel line — the other ~10 died with their evicted
+  ConversationView (dropped `_watchdog_task` logs nothing).
+- 2 thread stops had NO `on_thread_stopped` entry point at all.
+- Not every incident follows a tool call: stalls also hit first-event
+  waits (TTFT) at 350-413k-token contexts; the missing-idle-timeout
+  applies to every wait point in the event loop, not just post-tool.
+- The `72883e1538` watchdog 10→30min raise was NOT the cause — the
+  watchdog was already architecturally unreachable for these stops.
 
 ## Symptom
 

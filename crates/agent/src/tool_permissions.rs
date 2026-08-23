@@ -611,6 +611,7 @@ mod tests {
             show_merge_conflict_indicator: true,
             auto_focus_new_thread: false,
             auto_allow_permissions_after_seconds: None,
+            stream_idle_timeout_secs: agent_settings::DEFAULT_STREAM_IDLE_TIMEOUT_SECS,
             sidebar_side: Default::default(),
             thinking_display: Default::default(),
         }
