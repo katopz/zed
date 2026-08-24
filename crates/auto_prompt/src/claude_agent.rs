@@ -10,8 +10,9 @@
 //!
 //! Contract (do not change without explicit owner sign-off):
 //!   1. Never return `ContextOverflow` and never set `force_new_thread = true`
-//!      — EXCEPT above `claude_context_overflow_tokens` (default 320k, plan
-//!      023 A3): the thread is near the model ceiling, so `decide_claude`
+//!      — EXCEPT above the Claude overflow gate (`claude_context_overflow_tokens`,
+//!      which defaults to following the native `max_context_tokens` gate;
+//!      plan 023 A3): the thread is near the model ceiling, so `decide_claude`
 //!      routes it through the shared native Phase 1/2 summarize→fork flow
 //!      (`context_overflow_outcome`) via a `NeedsLlmCall` carrying
 //!      `context_exceeds_limit = true`. Below the threshold: always
@@ -263,11 +264,11 @@ pub fn decide_claude(
     let registry = language_model::LanguageModelRegistry::read_global(cx);
     let configured_model = registry.default_model();
 
-    // Plan 023 A3 (req 1): context-overflow parity. Above
-    // `claude_context_overflow_tokens` (default 320k) the thread is close to
-    // the model ceiling — route it through the shared native Phase 1/2
-    // summarize→fork flow instead of same-thread continuation. Below the
-    // threshold: unchanged same-thread behavior.
+    // Plan 023 A3 (req 1): context-overflow parity. Above the Claude
+    // overflow gate (defaults to the native `max_context_tokens` gate) the
+    // thread is close to the model ceiling — route it through the shared
+    // native Phase 1/2 summarize→fork flow instead of same-thread
+    // continuation. Below the threshold: unchanged same-thread behavior.
     if let Some(decision) = claude_context_overflow_decision(thread, configured_model.as_ref(), cx)
     {
         return decision;
@@ -352,11 +353,21 @@ fn claude_tokens_exceed_overflow(effective_tokens: Option<u64>, threshold: usize
     effective_tokens.is_some_and(|tokens| tokens as usize > threshold)
 }
 
-/// Claude >320k parity gate (plan 023 A3, req 1).
+/// Effective context tokens for the Claude overflow gate.
+///
+/// ACP `UsageUpdate` populates `used_tokens` ("tokens currently in context"
+/// — what Claude Code reports), while `input_tokens` is only set from
+/// stop-response usage behind the `acp-beta` feature flag. Take the max of
+/// the two so the gate fires no matter which field the agent populates.
+fn claude_effective_context_tokens(usage: &acp_thread::TokenUsage) -> u64 {
+    usage.input_tokens.max(usage.used_tokens)
+}
+
+/// Claude context-overflow parity gate (plan 023 A3, req 1).
 ///
 /// Returns `Some(NeedsLlmCall { context_exceeds_limit: true })` when the
-/// thread's API-reported input tokens exceed `claude_context_overflow_tokens`
-/// — the caller (agent_ui) then routes the decision through the native
+/// thread's effective context tokens exceed the Claude overflow gate — the
+/// caller (agent_ui) then routes the decision through the native
 /// `decide_with_llm`, whose shared `context_overflow_outcome` runs Phase 1
 /// (same-thread summarize) → Phase 2 (new thread with inlined summary).
 /// Returns `None` below the threshold, without usage data, or with no
@@ -367,11 +378,11 @@ fn claude_context_overflow_decision(
     cx: &App,
 ) -> Option<AutoPromptDecision> {
     let threshold = crate::load_config_cached()
-        .map(|config| config.claude_context_overflow_tokens)
-        .unwrap_or(320_000);
+        .map(|config| config.effective_claude_context_overflow_tokens())
+        .unwrap_or_else(|_| crate::default_max_context_tokens());
 
     let thread_ref = thread.read(cx);
-    let effective_tokens = thread_ref.token_usage().map(|usage| usage.input_tokens);
+    let effective_tokens = thread_ref.token_usage().map(claude_effective_context_tokens);
     if !claude_tokens_exceed_overflow(effective_tokens, threshold) {
         return None;
     }
@@ -1182,7 +1193,7 @@ fn truncate_last_paragraphs(text: &str) -> String {
 
 #[cfg(test)]
 mod gate_tests {
-    use super::claude_tokens_exceed_overflow;
+    use super::{claude_effective_context_tokens, claude_tokens_exceed_overflow};
 
     // Plan 023 A3 (req 1): the gate fires only above the threshold, and never
     // without API-reported usage.
@@ -1197,6 +1208,42 @@ mod gate_tests {
         assert!(!claude_tokens_exceed_overflow(Some(320_000), 320_000));
         assert!(!claude_tokens_exceed_overflow(Some(80_000), 320_000));
         assert!(!claude_tokens_exceed_overflow(None, 320_000));
+    }
+
+    fn usage(input_tokens: u64, used_tokens: u64) -> acp_thread::TokenUsage {
+        acp_thread::TokenUsage {
+            input_tokens,
+            used_tokens,
+            ..Default::default()
+        }
+    }
+
+    // .docs/010: Claude Code populates `used_tokens` (ACP UsageUpdate)
+    // while `input_tokens` stays 0 without the acp-beta flag — the gate
+    // must read the populated field.
+    #[test]
+    fn claude_effective_tokens_reads_used_tokens_when_input_is_zero() {
+        assert_eq!(
+            claude_effective_context_tokens(&usage(0, 210_000)),
+            210_000
+        );
+    }
+
+    #[test]
+    fn claude_effective_tokens_reads_input_tokens_when_larger() {
+        assert_eq!(
+            claude_effective_context_tokens(&usage(230_000, 50_000)),
+            230_000
+        );
+    }
+
+    #[test]
+    fn claude_effective_tokens_gate_fires_from_used_tokens() {
+        // The exact reported bug: 200k+ context, input_tokens never set.
+        assert!(claude_tokens_exceed_overflow(
+            Some(claude_effective_context_tokens(&usage(0, 200_001))),
+            200_000
+        ));
     }
 }
 

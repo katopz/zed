@@ -27,10 +27,15 @@ pub struct AutoPromptConfig {
     #[serde(default = "default_max_context_tokens")]
     pub max_context_tokens: usize,
 
-    /// Claude (ACP) threads above this many input tokens join the native
+    /// Claude (ACP) threads above this many context tokens join the native
     /// Phase 1/2 summarize→fork flow instead of relying on Claude Code's
     /// internal compaction alone (plan 023 A3, req 1). Below it, Claude
     /// always continues in the same thread.
+    ///
+    /// `0` (the default) = "follow `max_context_tokens`" — the same gate as
+    /// the native agent, so both flows fork at the same threshold. Any
+    /// positive value overrides with a Claude-specific threshold (set a
+    /// huge value to effectively disable the gate).
     #[serde(default = "default_claude_context_overflow_tokens")]
     pub claude_context_overflow_tokens: usize,
 
@@ -56,7 +61,7 @@ pub struct AutoPromptConfig {
     /// When the actual input token count exceeds this value, a new thread is created.
     ///
     /// `0` (the default) = "auto": since plan 023 the auto value resolves to
-    /// `max_context_tokens` (256k default) — below the overflow gate the chain
+    /// `max_context_tokens` (200k default) — below the overflow gate the chain
     /// always continues same-thread, and the Phase 1/2 machinery owns forking
     /// above it. Any positive value overrides this with a fixed threshold.
     #[serde(default = "default_same_thread_token_threshold")]
@@ -136,7 +141,10 @@ pub fn default_max_context_tokens() -> usize {
 }
 
 fn default_claude_context_overflow_tokens() -> usize {
-    320_000
+    // 0 = "follow `max_context_tokens`" (same gate as the native agent).
+    // The old fixed 320k default forked Claude threads 120k tokens later
+    // than native ones and let requests stall near the model ceiling.
+    0
 }
 
 fn default_backoff_base_ms() -> u64 {
@@ -152,7 +160,7 @@ fn default_max_llm_retries() -> u32 {
 }
 
 fn default_same_thread_token_threshold() -> usize {
-    // 0 means "auto" (50% of model max input tokens, capped at 100k); see dispatch_action.
+    // 0 means "auto": resolves to `max_context_tokens` (see dispatch_action).
     0
 }
 
@@ -207,6 +215,16 @@ impl Default for AutoPromptConfig {
 }
 
 impl AutoPromptConfig {
+    /// Effective Claude overflow gate: `claude_context_overflow_tokens`
+    /// when explicitly set (positive), otherwise `max_context_tokens` —
+    /// identical to the native-agent gate by default.
+    pub fn effective_claude_context_overflow_tokens(&self) -> usize {
+        match self.claude_context_overflow_tokens {
+            0 => self.max_context_tokens,
+            explicit => explicit,
+        }
+    }
+
     /// Returns the path to the config file: `~/.config/zed/auto_prompt.json`
     pub fn config_path() -> Result<PathBuf> {
         let config_dir = paths::config_dir();
@@ -379,12 +397,33 @@ mod tests {
     }
 
     #[test]
-    fn claude_context_overflow_tokens_defaults_to_320k() {
-        // Plan 023 A3 (req 1): Claude joins the native overflow flow above 320k.
-        assert_eq!(default_claude_context_overflow_tokens(), 320_000);
+    fn claude_context_overflow_tokens_default_follows_native_gate() {
+        // 0 = "follow `max_context_tokens`": Claude and native agents fork at
+        // the same threshold by default (parity fix, .docs/010).
+        assert_eq!(default_claude_context_overflow_tokens(), 0);
         assert_eq!(
             AutoPromptConfig::default().claude_context_overflow_tokens,
-            320_000
+            0
+        );
+        assert_eq!(
+            AutoPromptConfig::default().effective_claude_context_overflow_tokens(),
+            default_max_context_tokens()
+        );
+    }
+
+    #[test]
+    fn claude_context_overflow_explicit_override_wins() {
+        let config: AutoPromptConfig = serde_json::from_str(
+            r#"{"claude_context_overflow_tokens": 320000}"#,
+        )
+        .unwrap();
+        assert_eq!(config.effective_claude_context_overflow_tokens(), 320_000);
+
+        let zeroed: AutoPromptConfig =
+            serde_json::from_str(r#"{"claude_context_overflow_tokens": 0}"#).unwrap();
+        assert_eq!(
+            zeroed.effective_claude_context_overflow_tokens(),
+            zeroed.max_context_tokens
         );
     }
 
@@ -424,7 +463,11 @@ mod tests {
     fn serde_missing_fields_fall_back_to_defaults() {
         let config: AutoPromptConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(config.max_context_tokens, 200_000);
-        assert_eq!(config.claude_context_overflow_tokens, 320_000);
+        assert_eq!(config.claude_context_overflow_tokens, 0);
+        assert_eq!(
+            config.effective_claude_context_overflow_tokens(),
+            200_000
+        );
         assert_eq!(
             config.housekeeping_command,
             Some("housekeeping".to_string())

@@ -1382,7 +1382,7 @@ fn decide_finish(
 ///
 /// Returns `Some(action)` if the chain should continue, `None` to stop.
 /// Phase 1/2 context-overflow state machine, shared by the native path and
-/// the Claude >320k parity path (plan 023 A2/A3).
+/// the Claude overflow parity path (plan 023 A2/A3).
 ///
 /// - Phase 1 (`summary_state == 0`, last message not already a summary):
 ///   returns `ContextOverflow` so the UI sends a "summarize" prompt to the
@@ -1900,7 +1900,7 @@ pub async fn decide_with_llm(
 
     if data.context_exceeds_limit {
         // Shared Phase 1/2 state machine (plan 023 A2) — also reused by the
-        // Claude >320k parity path (plan 023 A3). When Phase 2 is imminent
+        // Claude overflow parity path (plan 023 A3). When Phase 2 is imminent
         // (the summary already exists) and reasoned Phase 2 is enabled, an
         // LLM reasoning pass authors the continuation; every failure falls
         // back to the deterministic chain inside the state machine.

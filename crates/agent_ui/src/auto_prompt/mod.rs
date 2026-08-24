@@ -370,7 +370,7 @@ pub(crate) fn dispatch_action(
         // Explicit positive override from config/env.
         threshold if threshold > 0 => threshold,
         // Plan 023 C1: auto mode resolves to the overflow gate
-        // (`max_context_tokens`, 256k default). Below it the chain always
+        // (`max_context_tokens`, 200k default). Below it the chain always
         // continues same-thread (req 4); above it the Phase 1/2 machinery
         // owns forking. The old 50%-of-max-input heuristic forked native
         // threads at ~100k even when the context was fine.
@@ -441,10 +441,11 @@ pub(crate) fn dispatch_action(
         }
         // ACP agents (Claude, etc.) must never create new threads on their own
         // — they rely on conversation history in the same thread. Exception
-        // (plan 023 A3/C1): `force_new_thread` (Claude Phase 2 above 320k)
-        // routes through the new-thread branch before this guard. If the
-        // active thread is gone on an ordinary same-thread continuation, stop
-        // instead of falling through to the new-thread path.
+        // (plan 023 A3/C1): `force_new_thread` (Claude Phase 2 above the
+        // overflow gate) routes through the new-thread branch before this
+        // guard. If the active thread is gone on an ordinary same-thread
+        // continuation, stop instead of falling through to the new-thread
+        // path.
         if !is_native_agent {
             log::warn!(
                 "[auto_prompt] dispatch_action: no active thread for ACP agent continuation, stopping (ACP agents cannot use new threads)"
