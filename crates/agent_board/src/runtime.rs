@@ -142,6 +142,18 @@ impl BoardRuntime {
         self.last_synced_at
     }
 
+    /// Web dashboard URL for the current room (`{worker}/?room={room}`),
+    /// present only when connected — the panel links here so the operator
+    /// never has to reconstruct (or hardcode) the URL by hand.
+    pub fn dashboard_url(&self) -> Option<String> {
+        if !self.connected() {
+            return None;
+        }
+        let base = self.config.worker_url.trim_end_matches('/');
+        let room = crate::client::urlencoding(&self.room());
+        Some(format!("{base}/?room={room}"))
+    }
+
     /// Last sync-round error (cleared on the next success).
     pub fn last_sync_error(&self) -> Option<&str> {
         self.last_sync_error.as_deref()
@@ -313,9 +325,16 @@ impl BoardRuntime {
             return;
         };
         let interval = Duration::from_secs(self.config.poll_interval_secs.max(5));
-        log::info!(
-            "[agent_board] runtime poll loop starting (single instance per process, interval {interval:?})"
-        );
+        // Replacing `poll_task` cancels the previous loop, so only one ever
+        // runs — but `force_refresh` restarts it on every nudge, so the banner
+        // logs once per process and restarts stay at debug.
+        if self.poll_task.is_none() {
+            log::info!(
+                "[agent_board] runtime poll loop starting (single instance per process, interval {interval:?})"
+            );
+        } else {
+            log::debug!("[agent_board] poll loop restarted for an immediate refresh");
+        }
 
         let task = cx.spawn(async move |this, cx: &mut AsyncApp| {
             loop {
@@ -543,6 +562,8 @@ mod tests {
             assert!(runtime.mcp_server.is_none());
             assert!(runtime.realtime_client.is_none());
             assert_eq!(runtime.poll_rounds(), 0);
+            // No worker → no dashboard link either (the 🌐 button hides).
+            assert!(runtime.dashboard_url().is_none());
         });
     }
 

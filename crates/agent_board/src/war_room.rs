@@ -442,6 +442,7 @@ impl WarRoomPanel {
         } else {
             "not connected (local-only)".to_string()
         };
+        let dashboard_url = runtime.dashboard_url();
         let (sync_line, sync_color) = if !connected {
             ("never synced".to_string(), muted)
         } else if let Some(error) = runtime.last_sync_error() {
@@ -506,21 +507,42 @@ impl WarRoomPanel {
                     )
                     .child(
                         div()
-                            .id("war-room-refresh")
-                            .cursor_pointer()
-                            .text_xs()
-                            .text_color(muted)
-                            .hover(|style| style.text_color(accent))
-                            .child(SharedString::from("⟳"))
-                            .on_click(cx.listener({
-                                let runtime = self.runtime.clone();
-                                move |_this, _event, _window, cx| {
-                                    runtime.update(cx, |runtime, cx| {
-                                        runtime.force_refresh(cx)
-                                    });
-                                }
-                            }))
-                            .into_any_element(),
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .when_some(dashboard_url, |row, url| {
+                                row.child(
+                                    div()
+                                        .id("war-room-open-web")
+                                        .cursor_pointer()
+                                        .text_xs()
+                                        .text_color(muted)
+                                        .hover(|style| style.text_color(accent))
+                                        .child(SharedString::from("🌐 web"))
+                                        .on_click(move |_event, _window, cx| {
+                                            cx.open_url(&url);
+                                        })
+                                        .into_any_element(),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .id("war-room-refresh")
+                                    .cursor_pointer()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .hover(|style| style.text_color(accent))
+                                    .child(SharedString::from("⟳"))
+                                    .on_click(cx.listener({
+                                        let runtime = self.runtime.clone();
+                                        move |_this, _event, _window, cx| {
+                                            runtime.update(cx, |runtime, cx| {
+                                                runtime.force_refresh(cx)
+                                            });
+                                        }
+                                    }))
+                                    .into_any_element(),
+                            ),
                     ),
             )
             .child(

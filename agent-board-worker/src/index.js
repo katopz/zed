@@ -28,6 +28,9 @@ import * as ed from "@noble/ed25519";
 const MAX_MESSAGES = 100;
 const MAX_ROOM_STATES = 50;
 const MAX_STATE_TEXT_BYTES = 256;
+// Plan 026 — web Threads tab.
+const MAX_THREAD_ENTRIES = 100;
+const MAX_THREAD_ENTRY_BYTES = 4096;
 const STALE_STATUS_SECS = 300;
 const TTL_SECS = 60 * 60 * 24 * 7; // 1 week
 
@@ -327,6 +330,51 @@ async function handlePostReply(env, room, body, authorLogin) {
   return json(reply, 201);
 }
 
+async function handlePostThread(env, room, body, verified) {
+  // Plan 026: upsert thread-timeline entries for a session. Entries carry
+  // their local `seq`; re-sends (streaming growth) replace by seq.
+  const sessionId = String(body.session_id ?? "").slice(0, 128);
+  if (!sessionId) return json({ error: "session_id required" }, 400);
+  const key = `room:${room}:thread:${sessionId}`;
+  const raw = await env.AGENT_BOARD.get(key);
+  let doc = raw
+    ? JSON.parse(raw)
+    : { v: 1, device_name: "", session_id: sessionId, title: null, updated_at: 0, entries: [] };
+  doc.device_name = String(body.device_name ?? "") || doc.device_name;
+  doc.title = body.title ?? doc.title;
+  const incoming = Array.isArray(body.entries) ? body.entries.slice(0, 32) : [];
+  for (const e of incoming) {
+    const entry = {
+      seq: Number(e.seq ?? 0) | 0,
+      role: String(e.role ?? "").slice(0, 16),
+      text: truncateToByteBudget(String(e.text ?? ""), MAX_THREAD_ENTRY_BYTES),
+      ts: Number(e.ts) > 0 ? Number(e.ts) : Date.now(),
+    };
+    const existing = doc.entries.findIndex((x) => x.seq === entry.seq);
+    if (existing >= 0) doc.entries[existing] = entry;
+    else doc.entries.push(entry);
+  }
+  doc.entries.sort((a, b) => a.seq - b.seq);
+  if (doc.entries.length > MAX_THREAD_ENTRIES) {
+    doc.entries.splice(0, doc.entries.length - MAX_THREAD_ENTRIES);
+  }
+  doc.updated_at = Date.now();
+  await env.AGENT_BOARD.put(key, JSON.stringify(doc), { expirationTtl: TTL_SECS });
+  await relayToRoom(env, room, JSON.stringify({ type: "thread", ...doc }));
+  return json(doc, 200);
+}
+
+async function handleGetThreads(env, room) {
+  const list = await env.AGENT_BOARD.list({ prefix: `room:${room}:thread:`, limit: 64 });
+  const threads = [];
+  for (const k of list.keys) {
+    const raw = await env.AGENT_BOARD.get(k.name);
+    if (raw !== null) threads.push(JSON.parse(raw));
+  }
+  threads.sort((a, b) => (b.updated_at ?? 0) - (a.updated_at ?? 0));
+  return json({ v: 1, room, threads }, 200);
+}
+
 async function handleGetRoom(env, room) {
   const [deviceList, msgList, stateList, replyList] = await Promise.all([
     env.AGENT_BOARD.list({ prefix: `room:${room}:device:`, limit: 64 }),
@@ -370,6 +418,26 @@ async function handleGetRoom(env, room) {
 // ───────────────────────────────────────────────────────────────────────────
 // W1 — Worker HTML dashboard (inline, ~15KB budget, no framework)
 // ───────────────────────────────────────────────────────────────────────────
+
+function noRoomHtml() {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>Agent Board — room required</title>
+<style>body{font:14px/1.5 -apple-system,sans-serif;background:#1b1b1b;color:#e4e4e4;margin:0;padding:40px;max-width:640px;margin-inline:auto}code{background:#262626;padding:2px 6px;border-radius:3px;font-size:12px}h1{font-size:16px}</style>
+</head>
+<body>
+<h1>📡 Agent Board — room required</h1>
+<p>This dashboard shows one room. Open it with a room id:</p>
+<p><code>/?room=&lt;room-id&gt;</code></p>
+<p>Where the room id comes from:</p>
+<ul>
+<li><b>Zed war room panel</b> — click the <code>🌐 web</code> button in the panel header; it opens this page with the room already filled in.</li>
+<li><b>Config</b> — an explicit <code>room</code> in <code>~/.config/zed/agent_board.json</code> is used verbatim.</li>
+<li><b>Default</b> — with no <code>room</code> set, every device derives the same id from its SSH key: <code>blake3(raw_ed25519_pubkey)</code> hex (64 chars). Two devices sharing a key auto-join the same room.</li>
+</ul>
+</body>
+</html>`;
+}
 
 function dashboardHtml(roomId, githubEnabled) {
   return `<!DOCTYPE html>
@@ -419,6 +487,32 @@ h1{font-size:15px;margin:0;font-weight:600}
 #feed .msg .who{color:#6ea8e0;margin-right:4px}
 #feed .msg.mention .who{color:#e2b23c}
 #ronote{display:none;font-size:11px;color:#999;margin-left:8px}
+#tabs{display:flex;gap:6px;margin-bottom:10px}
+#tabs button{padding:5px 14px;background:#262626;color:#bbb;border:1px solid #2e2e2e;border-radius:4px 4px 0 0;cursor:pointer;font:600 12px/1.4 -apple-system,sans-serif}
+#tabs button.on{background:#313131;color:#fff;border-color:#3a6db8}
+#threads{display:none}
+#threads.wrap{display:flex;gap:10px;align-items:stretch;min-height:60vh}
+#tsessions{flex:0 0 170px;background:#262626;border:1px solid #2e2e2e;border-radius:5px;overflow-y:auto;max-height:70vh}
+#tsessions .ts{padding:8px 10px;cursor:pointer;border-bottom:1px solid #232323;font-size:12px}
+#tsessions .ts:hover{background:#2e2e2e}
+#tsessions .ts.on{background:#313131}
+#tsessions .ts .who{font-weight:600}
+#tsessions .ts .prev{color:#888;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#ttimeline{flex:1;display:flex;flex-direction:column;background:#262626;border:1px solid #2e2e2e;border-radius:5px;min-width:0}
+#tentries{flex:1;overflow-y:auto;padding:10px;max-height:56vh}
+#tentries .te{margin-bottom:8px;padding:7px 10px;border-radius:6px;font-size:12px;line-height:1.5;white-space:pre-wrap;word-break:break-word}
+#tentries .te.user{background:#243447;color:#dbe7f3}
+#tentries .te.assistant{background:#1e2a1e;color:#d9e8d9}
+#tentries .te.tool{background:#222;color:#9a9a9a;font-family:ui-monospace,Menlo,monospace;font-size:11px}
+#tentries .te .r{font-size:10px;opacity:.6;margin-bottom:3px;font-family:-apple-system,sans-serif}
+#tbar{display:flex;gap:6px;padding:8px;border-top:1px solid #2c2c2c;align-items:center}
+#tbar input{flex:1;padding:7px 9px;background:#1a1a1a;border:1px solid #444;color:#eee;border-radius:3px;font:13px/1.4 -apple-system,sans-serif;min-width:0}
+#tbar button{padding:7px 12px;border:0;border-radius:3px;cursor:pointer;font-weight:600;font:600 12px/1.4 -apple-system,sans-serif}
+#tbar .send{background:#3a6db8;color:#fff}
+#tbar .stop{background:#8c3a3a;color:#fff}
+#tbar .retry{background:#8c7a3a;color:#fff}
+#tbar button:hover{filter:brightness(1.15)}
+#tbar button:disabled{background:#333;color:#666;cursor:not-allowed}
 #ghbtn{display:none;padding:5px 12px;background:#24292f;color:#fff;border:1px solid #444;border-radius:3px;cursor:pointer;font:600 12px/1.4 -apple-system,sans-serif}
 #ghbtn:hover{background:#32383f}
 #modal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:10;align-items:center;justify-content:center}
@@ -437,8 +531,25 @@ h1{font-size:15px;margin:0;font-weight:600}
     <button id="ghbtn">Sign in with GitHub</button>
   </div>
 </header>
+<div id="tabs"><button id="tab-board" class="on">Board</button><button id="tab-threads">Threads</button></div>
+<div id="board">
 <div id="feed"><div class="fh">🗣 War room feed</div><div id="feedrows"><div class="empty" style="padding:8px">No messages yet.</div></div></div>
 <div id="dash"><div class="empty">Sign in to load the room.</div></div>
+</div>
+<div id="threads">
+  <div class="wrap" id="threads-wrap">
+    <div id="tsessions"><div class="empty" style="padding:12px">No threads yet.</div></div>
+    <div id="ttimeline">
+      <div id="tentries"><div class="empty" style="padding:12px">Pick a session.</div></div>
+      <div id="tbar">
+        <input id="tprompt" placeholder="prompt / steer the selected session" autocomplete="off" disabled>
+        <button id="tsend" class="send" disabled>Send</button>
+        <button id="tstop" class="stop" disabled>Stop</button>
+        <button id="tretry" class="retry" disabled>Retry</button>
+      </div>
+    </div>
+  </div>
+</div>
 <div id="replybar">
   <input id="reply" placeholder="REPLY:[device:sess4] message" autocomplete="off">
   <button id="send" disabled>Send</button>
@@ -486,6 +597,7 @@ function onAuthed(t) {
   document.getElementById("send").disabled = false;
   connect();
   fetchRoom();
+  fetchThreads();
 }
 
 function showSignIn() {
@@ -579,6 +691,12 @@ function routeMsg(m) {
   if (!m) return;
   // Reply echo — ignore (we sent it). Future: render as confirmation.
   if (m.type === "reply" && m.target_device !== undefined) return;
+  // Thread mirror (Plan 026): typed wrapper around the per-session doc.
+  // Checked BEFORE the state branch — thread docs also carry session_id +
+  // device_name and would otherwise be mis-ingested as states.
+  if (m.type === "thread" && m.session_id !== undefined) {
+    upsertThread(m); renderThreads(); return;
+  }
   // State broadcast: device_name + session_id + state_text
   if (m.session_id !== undefined && (m.state_text !== undefined || m.device_name)) {
     ingestState(m); render(); return;
@@ -784,6 +902,152 @@ if (token) onAuthed(token);
 else if (GH_ENABLED) showSignIn();
 else startReadOnly();
 
+// ── Threads tab (Plan 026) ──
+let threads = {};            // session_id -> thread doc {device_name, title, entries}
+let selectedSession = null;  // full session_id
+
+function sess4(id) { return String(id || "").slice(0, 4); }
+
+function upsertThread(doc) {
+  if (!doc || !doc.session_id) return;
+  const existing = threads[doc.session_id];
+  if (existing) {
+    if (doc.title !== undefined && doc.title !== null) existing.title = doc.title;
+    if (doc.device_name) existing.device_name = doc.device_name;
+    if (Array.isArray(doc.entries)) {
+      for (const e of doc.entries) {
+        const ix = existing.entries.findIndex((x) => x.seq === e.seq);
+        if (ix >= 0) existing.entries[ix] = e;
+        else existing.entries.push(e);
+      }
+      existing.entries.sort((a, b) => a.seq - b.seq);
+    }
+  } else {
+    threads[doc.session_id] = {
+      device_name: doc.device_name || "",
+      title: doc.title || null,
+      entries: Array.isArray(doc.entries) ? doc.entries.slice() : [],
+    };
+  }
+}
+
+async function fetchThreads() {
+  try {
+    const r = await fetch("/v1/rooms/" + encodeURIComponent(ROOM) + "/threads");
+    if (!r.ok) return;
+    const data = await r.json();
+    for (const doc of data.threads || []) upsertThread(doc);
+    renderThreads();
+  } catch (e) {
+    console.error("fetchThreads failed", e);
+  }
+}
+
+function threadLabel(sessionId) {
+  const t = threads[sessionId];
+  const dev = t && t.device_name ? t.device_name : "?";
+  return dev + ":" + sess4(sessionId);
+}
+
+function renderThreads() {
+  const list = document.getElementById("tsessions");
+  const ids = Object.keys(threads);
+  if (ids.length === 0) {
+    list.innerHTML = '<div class="empty" style="padding:12px">No threads yet.</div>';
+    return;
+  }
+  let h = "";
+  for (const id of ids) {
+    const t = threads[id];
+    const last = t.entries[t.entries.length - 1];
+    const prev = last ? String(last.text || "").replace(/\s+/g, " ").slice(0, 40) : (t.title || "");
+    h += '<div class="ts' + (id === selectedSession ? " on" : "") + '" onclick="selectSession(' + esc(JSON.stringify(id)) + ')">'
+      + '<div class="who">' + esc(threadLabel(id)) + '</div>'
+      + '<div class="prev">' + esc(prev) + '</div></div>';
+  }
+  list.innerHTML = h;
+  renderTimeline();
+}
+
+function renderTimeline() {
+  const root = document.getElementById("tentries");
+  const bar = document.getElementById("tbar");
+  if (!selectedSession || !threads[selectedSession]) {
+    root.innerHTML = '<div class="empty" style="padding:12px">Pick a session.</div>';
+    return;
+  }
+  const t = threads[selectedSession];
+  let h = "";
+  for (const e of t.entries) {
+    h += '<div class="te ' + esc(e.role || "assistant") + '"><div class="r">' + esc(e.role || "") + " · " + fmtTime(e.ts) + '</div>' + esc(e.text || "") + "</div>";
+  }
+  root.innerHTML = h || '<div class="empty" style="padding:12px">Empty thread.</div>';
+  root.scrollTop = root.scrollHeight;
+}
+
+window.selectSession = function (id) {
+  selectedSession = id;
+  const authed = !!token;
+  for (const el of ["tprompt", "tsend", "tstop", "tretry"]) {
+    document.getElementById(el).disabled = !authed;
+  }
+  renderThreads();
+};
+
+function sendThreadCommand(kind) {
+  if (!selectedSession) return;
+  const t = threads[selectedSession];
+  const target_device = t.device_name;
+  const target_session_prefix = sess4(selectedSession);
+  let text;
+  if (kind === "send") {
+    const input = document.getElementById("tprompt");
+    text = input.value.trim();
+    if (!text) return;
+    input.value = "";
+  } else {
+    text = kind === "stop" ? "!stop" : "!retry";
+  }
+  const payload = {
+    type: "reply",
+    target_device,
+    target_session_prefix,
+    text,
+  };
+  if (ws && ws.readyState === 1) {
+    ws.send(JSON.stringify(payload));
+  } else {
+    fetch("/v1/rooms/" + encodeURIComponent(ROOM) + "/reply", {
+      method: "POST",
+      headers: { "Authorization": "Bearer " + token, "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }).catch(function (e) { console.error("thread command POST failed", e); });
+  }
+}
+document.getElementById("tsend").addEventListener("click", function () { sendThreadCommand("send"); });
+document.getElementById("tstop").addEventListener("click", function () { sendThreadCommand("stop"); });
+document.getElementById("tretry").addEventListener("click", function () { sendThreadCommand("retry"); });
+document.getElementById("tprompt").addEventListener("keydown", function (e) {
+  if (e.key === "Enter") sendThreadCommand("send");
+});
+
+// Tabs.
+function setTab(which) {
+  const boardTab = document.getElementById("tab-board");
+  const threadsTab = document.getElementById("tab-threads");
+  const board = document.getElementById("board");
+  const threadsView = document.getElementById("threads");
+  const on = which === "threads";
+  boardTab.classList.toggle("on", !on);
+  threadsTab.classList.toggle("on", on);
+  board.style.display = on ? "none" : "block";
+  threadsView.classList.toggle("wrap", on);
+  threadsView.style.display = on ? "block" : "none";
+  if (on) fetchThreads();
+}
+document.getElementById("tab-board").addEventListener("click", function () { setTab("board"); });
+document.getElementById("tab-threads").addEventListener("click", function () { setTab("threads"); });
+
 function startReadOnly() {
   document.getElementById("ronote").style.display = "inline";
   const reply = document.getElementById("reply");
@@ -804,7 +1068,10 @@ function startReadOnly() {
   } catch (e) {
     console.error("SSE failed", e);
   }
-  pollTimer = setInterval(fetchRoom, 15000);
+  pollTimer = setInterval(function () {
+    fetchRoom();
+    fetchThreads();
+  }, 15000);
 }
 </script>
 </body>
@@ -826,10 +1093,19 @@ export default {
 
     if (path === "/healthz") return json({ ok: true }, 200);
 
-    // W1 — Dashboard HTML. Static, no auth.
+    // W1 — Dashboard HTML. No auth. Requires an explicit `?room=` — devices
+    // derive the room from their SSH key (blake3 hex) or config, and the
+    // panel's 🌐 button links here with it already filled in. Without the
+    // param there is no sensible default (any fallback would silently show
+    // an empty, wrong room), so explain instead.
     if (path === "/") {
-      const roomId = url.searchParams.get("room") ?? "zed-agent-board";
-      return new Response(dashboardHtml(roomId, Boolean(env.GITHUB_CLIENT_ID)), {
+      const roomParam = url.searchParams.get("room");
+      if (!roomParam) {
+        return new Response(noRoomHtml(), {
+          headers: { "content-type": "text/html; charset=utf-8" },
+        });
+      }
+      return new Response(dashboardHtml(roomParam, Boolean(env.GITHUB_CLIENT_ID)), {
         headers: { "content-type": "text/html; charset=utf-8" },
       });
     }
@@ -860,6 +1136,25 @@ export default {
     const roomMatch = path.match(/^\/v1\/rooms\/([^/]+)$/);
     if (roomMatch && request.method === "GET") {
       return handleGetRoom(env, decodeURIComponent(roomMatch[1]));
+    }
+
+    // Plan 026 — thread mirroring for the web Threads tab.
+    const threadsMatch = path.match(/^\/v1\/rooms\/([^/]+)\/threads$/);
+    if (threadsMatch && request.method === "GET") {
+      return handleGetThreads(env, decodeURIComponent(threadsMatch[1]));
+    }
+    const threadMatch = path.match(/^\/v1\/rooms\/([^/]+)\/thread$/);
+    if (threadMatch && request.method === "POST") {
+      const bodyText = await request.text();
+      const verified = await verifySignature(env, request.headers, bodyText);
+      if (!verified.ok) return json({ error: verified.error }, verified.status);
+      let body;
+      try {
+        body = JSON.parse(bodyText);
+      } catch {
+        return json({ error: "invalid json" }, 400);
+      }
+      return handlePostThread(env, decodeURIComponent(threadMatch[1]), body, verified);
     }
 
     // W4 — SSE stream. Forwarded to the DO, which holds the connection open

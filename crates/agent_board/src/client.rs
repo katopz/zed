@@ -29,6 +29,11 @@ pub struct BoardClient {
 
 impl BoardClient {
     pub fn new(http: Arc<dyn HttpClient>, mut base_url: String, identity: Arc<DeviceIdentity>) -> Self {
+        // Accept the short form (`name.account.workers.dev`) and normalize to
+        // https — one less thing to get wrong in agent_board.json.
+        if !base_url.contains("://") {
+            base_url = format!("https://{base_url}");
+        }
         while base_url.ends_with('/') {
             base_url.pop();
         }
@@ -109,6 +114,20 @@ impl BoardClient {
         Ok(())
     }
 
+    /// `POST /v1/rooms/{room}/thread` — append thread-timeline entries for a
+    /// session (Plan 026 web Threads tab). The worker keeps a per-session ring
+    /// and relays the payload to SSE listeners.
+    pub async fn post_thread(
+        &self,
+        room: &str,
+        body: crate::types::PostThreadBody,
+    ) -> Result<()> {
+        let body_text = serde_json::to_string(&body).context("serializing thread body")?;
+        let uri = format!("{}/v1/rooms/{}/thread", self.base_url, urlencoding(room));
+        self.send_signed(&uri, body_text.into_bytes()).await?;
+        Ok(())
+    }
+
     async fn send_signed(
         &self,
         uri: &str,
@@ -149,7 +168,7 @@ impl BoardClient {
 
 /// Minimal percent-encoding for the room path segment. Only reserved/space
 /// chars that would break the path are escaped; alphanumerics pass through.
-fn urlencoding(room: &str) -> String {
+pub(crate) fn urlencoding(room: &str) -> String {
     let mut out = String::with_capacity(room.len());
     for byte in room.bytes() {
         match byte {

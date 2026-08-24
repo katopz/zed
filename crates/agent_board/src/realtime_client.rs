@@ -81,8 +81,8 @@ async fn connect_and_drain(
     let uri = format!(
         "{}/v1/rooms/{}/events?device={}",
         base_url,
-        urlencoding(room),
-        urlencoding(device_name),
+        crate::client::urlencoding(room),
+        crate::client::urlencoding(device_name),
     );
 
     let response = http
@@ -187,22 +187,4 @@ fn parse_board_message(value: &serde_json::Value) -> Option<crate::types::BoardM
         text: value.get("text")?.as_str()?.to_string(),
         ts: value.get("ts")?.as_i64()?,
     })
-}
-
-/// Minimal percent-encoding for URL path/query segments. Reuses the same
-/// logic as `client::urlencoding`.
-fn urlencoding(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for byte in s.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(byte as char);
-            }
-            _ => {
-                out.push('%');
-                out.push_str(&format!("{byte:02X}"));
-            }
-        }
-    }
-    out
 }

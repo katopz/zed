@@ -1397,6 +1397,13 @@ pub struct AgentPanel {
     /// thread as `AgentBoardNotification` entries. Held to keep the task alive.
     _notification_drain_task: Option<Task<()>>,
 
+    /// Plan 026: per-session tail fingerprint (entry count + hash of the last
+    /// entry's markdown) already mirrored to the web Threads tab. Streaming
+    /// entries update in place, so a plain count is not enough — the tail hash
+    /// catches in-place growth and re-sends the entry (the worker upserts by
+    /// `seq`, making re-sends idempotent).
+    thread_broadcast_tails: HashMap<acp::SessionId, (usize, u64)>,
+
     is_active: bool,
 }
 
@@ -1812,6 +1819,7 @@ impl AgentPanel {
             _thread_metadata_store_subscription,
             last_context_source: None,
             _notification_drain_task: None,
+            thread_broadcast_tails: HashMap::default(),
             is_active: false,
         };
 
@@ -1829,6 +1837,10 @@ impl AgentPanel {
     ///
     /// Plan 015: also drains web steering replies, resolving them by session-id
     /// prefix to the correct thread and injecting via `send` + steering flag.
+    ///
+    /// Plan 026: (a) mirrors new thread entries to the board so the web
+    /// Threads tab can render them, and (b) honors `!stop` / `!retry` reply
+    /// commands by driving `AcpThread::cancel` / `retry` directly.
     fn start_notification_drain(&mut self, cx: &mut Context<Self>) {
         let timer = cx.spawn(async move |this, cx| {
             loop {
@@ -1851,35 +1863,73 @@ impl AgentPanel {
                     .ok();
                 }
 
-                // 2. Web steering replies → inject into target threads.
+                // 2. Mirror new thread entries to the board (web Threads tab).
+                this.update(cx, |panel, cx| {
+                    panel.broadcast_new_thread_entries(cx);
+                })
+                .ok();
+
+                // 3. Web steering replies → inject into target threads; `!stop`
+                //    / `!retry` are control commands instead of prompts.
                 let replies = auto_prompt::peer_states::drain_web_replies();
                 if !replies.is_empty() {
                     this.update(cx, |panel, cx| {
                         for (session_prefix, text) in &replies {
-                            if let Some(thread) =
+                            let Some(thread) =
                                 panel.thread_for_session_prefix(session_prefix, cx)
-                            {
-                                let text = text.clone();
-                                thread.update(cx, |thread, cx| {
-                                    let reply_text = format!("🌐 REPLY:[{session_prefix}] {text}");
-                                    let future = thread.send(vec![reply_text.into()], cx);
-                                    cx.background_executor()
-                                        .spawn(async move {
-                                            if let Err(error) = future.await {
-                                                log::warn!(
-                                                    "[agent_board] web reply send failed: {error:#}"
-                                                );
-                                            }
-                                        })
-                                        .detach();
-                                });
-                                log::info!(
-                                    "[agent_board] injected web reply for session prefix {session_prefix}"
-                                );
-                            } else {
+                            else {
                                 log::warn!(
                                     "[agent_board] web reply for session prefix {session_prefix} has no matching thread — skipping"
                                 );
+                                continue;
+                            };
+                            let trimmed = text.trim();
+                            match trimmed {
+                                "!stop" => {
+                                    thread.update(cx, |thread, cx| {
+                                        thread.cancel(cx).detach();
+                                    });
+                                    log::info!(
+                                        "[agent_board] web !stop → cancelled session {session_prefix}"
+                                    );
+                                }
+                                "!retry" => {
+                                    thread.update(cx, |thread, cx| {
+                                        let future = thread.retry(cx);
+                                        cx.background_executor()
+                                            .spawn(async move {
+                                                if let Err(error) = future.await {
+                                                    log::warn!(
+                                                        "[agent_board] web !retry failed: {error:#}"
+                                                    );
+                                                }
+                                            })
+                                            .detach();
+                                    });
+                                    log::info!(
+                                        "[agent_board] web !retry → retrying session {session_prefix}"
+                                    );
+                                }
+                                _ => {
+                                    let text = text.clone();
+                                    thread.update(cx, |thread, cx| {
+                                        let reply_text =
+                                            format!("🌐 REPLY:[{session_prefix}] {text}");
+                                        let future = thread.send(vec![reply_text.into()], cx);
+                                        cx.background_executor()
+                                            .spawn(async move {
+                                                if let Err(error) = future.await {
+                                                    log::warn!(
+                                                        "[agent_board] web reply send failed: {error:#}"
+                                                    );
+                                                }
+                                            })
+                                            .detach();
+                                    });
+                                    log::info!(
+                                        "[agent_board] injected web reply for session prefix {session_prefix}"
+                                    );
+                                }
                             }
                         }
                     })
@@ -1888,6 +1938,82 @@ impl AgentPanel {
             }
         });
         self._notification_drain_task = Some(timer);
+    }
+
+    /// Plan 026: mirror the tail of every conversation view's root thread to
+    /// the board for the web Threads tab. Sends the last few entries every time
+    /// the tail changes (new entry OR in-place growth of the last one); the
+    /// worker upserts by `seq`, so re-sends replace rather than duplicate.
+    /// Board-injected notifications are skipped — the mirror must never echo
+    /// board content back to the board.
+    fn broadcast_new_thread_entries(&mut self, cx: &mut Context<Self>) {
+        const TAIL: usize = 3;
+        let views = self.conversation_views();
+        for view in views {
+            let Some(thread) = view.read(cx).root_thread(cx) else {
+                continue;
+            };
+            let (session_id, title) = thread.read_with(cx, |thread, _| {
+                (
+                    thread.session_id().clone(),
+                    thread.title().map(|t| t.to_string()),
+                )
+            });
+            // Fingerprint = (entry count, hash of the last mirrored entry's
+            // text). Equal fingerprints mean nothing new to send.
+            let (len, fingerprint) = thread.read_with(cx, |thread, cx| {
+                let len = thread.entries().len();
+                let hash = thread
+                    .entries()
+                    .last()
+                    .map(|entry| {
+                        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                        std::hash::Hash::hash(&entry.to_markdown(cx), &mut hasher);
+                        std::hash::Hasher::finish(&hasher)
+                    })
+                    .unwrap_or(0);
+                (len, hash)
+            });
+            if Some((len, fingerprint)) == self.thread_broadcast_tails.get(&session_id).copied() {
+                continue;
+            }
+            self.thread_broadcast_tails
+                .insert(session_id.clone(), (len, fingerprint));
+
+            let start = len.saturating_sub(TAIL);
+            let new_entries: Vec<auto_prompt::peer_states::ThreadEntry> = thread
+                .read_with(cx, |thread, cx| {
+                    thread
+                        .entries()
+                        .iter()
+                        .enumerate()
+                        .skip(start)
+                        .filter_map(|(index, entry)| {
+                            let role = match entry {
+                                acp_thread::AgentThreadEntry::UserMessage(_) => "user",
+                                acp_thread::AgentThreadEntry::AssistantMessage(_) => "assistant",
+                                acp_thread::AgentThreadEntry::ToolCall(_) => "tool",
+                                // Board-injected notifications would echo back
+                                // to the board; elicitation/plan/compaction
+                                // entries are local UI chrome.
+                                _ => return None,
+                            };
+                            Some(auto_prompt::peer_states::ThreadEntry {
+                                seq: index as u64,
+                                role: role.to_string(),
+                                text: entry.to_markdown(cx),
+                            })
+                        })
+                        .collect()
+                });
+            if !new_entries.is_empty() {
+                auto_prompt::peer_states::broadcast_thread_update(
+                    &session_id.to_string(),
+                    title.as_deref(),
+                    &new_entries,
+                );
+            }
+        }
     }
 
     pub fn toggle_focus(

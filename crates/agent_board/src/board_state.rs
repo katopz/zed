@@ -6,10 +6,11 @@
 
 use std::sync::{Arc, RwLock};
 
-use auto_prompt::peer_states::AgentStateBroadcaster;
+use auto_prompt::peer_states::{AgentStateBroadcaster, ThreadEntry};
 use crate::client::BoardClient;
 use crate::types::{
-    truncate_to_byte_budget, PostMessageBody, RoomSnapshot, MAX_STATE_TEXT_BYTES,
+    truncate_to_byte_budget, PostMessageBody, PostThreadBody, RoomSnapshot, ThreadEntryWire,
+    MAX_STATE_TEXT_BYTES, MAX_THREAD_ENTRY_BYTES,
 };
 
 /// Global: writer handle (client + room) set by the panel after `try_start`.
@@ -77,6 +78,54 @@ impl AgentStateBroadcaster for BoardBroadcaster {
             .spawn(async move {
                 if let Err(error) = client.post_state(&room, body).await {
                     log::debug!("[agent_board] post_state failed: {error:#}");
+                }
+            })
+            .detach();
+    }
+
+    fn broadcast_thread_update(
+        &self,
+        session_id: &str,
+        title: Option<&str>,
+        entries: &[ThreadEntry],
+    ) {
+        if entries.is_empty() {
+            return;
+        }
+        let handle = match WRITER.read() {
+            Ok(guard) => guard.as_ref().map(|h| {
+                (
+                    h.client.clone(),
+                    h.room.clone(),
+                    h.device_name.clone(),
+                    h.executor.clone(),
+                )
+            }),
+            Err(_) => None,
+        };
+        let Some((client, room, device_name, executor)) = handle else {
+            return;
+        };
+
+        let body = PostThreadBody {
+            device_name,
+            session_id: session_id.to_string(),
+            title: title.map(|t| truncate_to_byte_budget(t, MAX_STATE_TEXT_BYTES)),
+            entries: entries
+                .iter()
+                .map(|entry| ThreadEntryWire {
+                    seq: entry.seq,
+                    role: truncate_to_byte_budget(&entry.role, 16),
+                    text: truncate_to_byte_budget(&entry.text, MAX_THREAD_ENTRY_BYTES),
+                    ts: 0,
+                })
+                .collect(),
+        };
+
+        executor
+            .spawn(async move {
+                if let Err(error) = client.post_thread(&room, body).await {
+                    log::debug!("[agent_board] post_thread failed: {error:#}");
                 }
             })
             .detach();

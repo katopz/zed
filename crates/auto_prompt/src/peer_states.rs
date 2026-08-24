@@ -26,6 +26,29 @@ pub trait AgentStateBroadcaster: Send + Sync {
     /// Fire-and-forget: spawn a background post of the agent state. The
     /// implementation handles truncation + the actual HTTP call.
     fn broadcast(&self, session_id: &str, sub_agent_id: Option<&str>, state_text: &str, meta: &str);
+
+    /// Fire-and-forget batch of thread-timeline entries (Plan 026 web Threads
+    /// tab). Default no-op so existing implementations (tests, boards without
+    /// the endpoint) are unaffected.
+    fn broadcast_thread_update(
+        &self,
+        _session_id: &str,
+        _title: Option<&str>,
+        _entries: &[ThreadEntry],
+    ) {
+    }
+}
+
+/// One thread-timeline entry mirrored to the web Threads tab: a user /
+/// assistant / tool turn rendered to markdown by the producer (agent_ui),
+/// capped before it reaches the broadcaster. `seq` is the entry's index in
+/// the local thread — consumers upsert by it so re-sends (streaming growth)
+/// replace instead of duplicate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadEntry {
+    pub seq: u64,
+    pub role: String,
+    pub text: String,
 }
 
 /// A mute filter: any `None` field is a wildcard. Mirrors
@@ -93,6 +116,22 @@ pub fn broadcast_state(
     };
     if let Some(broadcaster) = broadcaster {
         broadcaster.broadcast(session_id, sub_agent_id, state_text, meta);
+    }
+}
+
+/// Broadcast new thread-timeline entries for a session (fire-and-forget,
+/// Plan 026). Same no-op semantics as [`broadcast_state`].
+pub fn broadcast_thread_update(
+    session_id: &str,
+    title: Option<&str>,
+    entries: &[ThreadEntry],
+) {
+    let broadcaster = match BROADCASTER.read() {
+        Ok(guard) => guard.clone(),
+        Err(_) => None,
+    };
+    if let Some(broadcaster) = broadcaster {
+        broadcaster.broadcast_thread_update(session_id, title, entries);
     }
 }
 
@@ -646,6 +685,54 @@ mod tests {
         // No broadcaster registered — should be a silent no-op, not a panic.
         broadcast_state("sess-1", None, "working", "test");
         // If we get here without panicking, the test passes.
+    }
+
+    #[test]
+    fn broadcast_thread_update_forwards_and_defaults_noop() {
+        let _lock = setup();
+        // Default (no override) implementations must tolerate the call.
+        struct Bare;
+        impl AgentStateBroadcaster for Bare {
+            fn broadcast(&self, _: &str, _: Option<&str>, _: &str, _: &str) {}
+        }
+        register_broadcaster(Some(Arc::new(Bare {})));
+        broadcast_thread_update("sess-1", None, &[]);
+        broadcast_thread_update(
+            "sess-1",
+            Some("t"),
+            &[ThreadEntry { seq: 0, role: "user".into(), text: "hi".into() }],
+        );
+
+        // And a recording override receives the batch verbatim.
+        #[derive(Default)]
+        struct Rec(std::sync::Mutex<Vec<(String, Option<String>, Vec<ThreadEntry>)>>);
+        impl AgentStateBroadcaster for Rec {
+            fn broadcast(&self, _: &str, _: Option<&str>, _: &str, _: &str) {}
+            fn broadcast_thread_update(
+                &self,
+                session_id: &str,
+                title: Option<&str>,
+                entries: &[ThreadEntry],
+            ) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((session_id.to_string(), title.map(str::to_string), entries.to_vec()));
+            }
+        }
+        let rec = Arc::new(Rec::default());
+        register_broadcaster(Some(rec.clone()));
+        broadcast_thread_update(
+            "sess-2",
+            Some("title"),
+            &[ThreadEntry { seq: 7, role: "assistant".into(), text: "done".into() }],
+        );
+        let calls = rec.0.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "sess-2");
+        assert_eq!(calls[0].1.as_deref(), Some("title"));
+        assert_eq!(calls[0].2.len(), 1);
+        assert_eq!(calls[0].2[0].seq, 7);
     }
 
     // ── Web reply tests (Plan 015) ──

@@ -1,0 +1,12 @@
+# wrangler's .env-style file for LOCAL dev (`wrangler dev`). NOT deployed and
+# NOT committed with real values — copy to `.dev.vars` and fill in.
+# Deployed config lives in wrangler.toml [vars] (public values) or
+# `wrangler secret put <NAME>` (secrets). wrangler does not read `.env`.
+
+# GitHub OAuth app client id (public by design; device flow needs no secret).
+# Blank/unset = the dashboard boots read-only (SSE + poll, no posting).
+GITHUB_CLIENT_ID=""
+
+# GitHub login allowlist for the web dashboard. Blank = ANY GitHub account
+# that completes the device flow may sign in — set this before deploying!
+ALLOWED_LOGIN="katopz"
