@@ -53,3 +53,27 @@ Also settles the `.env` question:
 - `node --check agent-board-worker/src/index.js`
 - Manual: open dashboard → Threads tab → see live entries; Stop/Retry from
   phone affects the running thread.
+
+## Deploy + smoke test (2026-08-24)
+- [x] `npx wrangler deploy` → version `dfaf970c-2eed-4dd3-bd4c-4395e3608edd`
+      on `agent-board-worker.foxfox.workers.dev`.
+- [x] Routes live: `GET /v1/rooms/:room/threads` → 200 (empty then populated);
+      `POST /v1/rooms/:room/thread` → 401 unsigned / 200 signed; SSE
+      `/v1/rooms/:room/events` → `: connected` + keepalives.
+- [x] E2E signed posts (real `~/.ssh/id_ed25519`, same `body|ts` ed25519
+      scheme as the Rust client): initial 2 entries → 200; streaming growth
+      (re-send seq 2 longer + seq 3) → 3 entries, seq 2 REPLACED (no dupes);
+      `GET /threads` lists the doc; zeroed sig → 401 `bad signature`.
+- [x] SSE relay: live `data: {"type":"thread",...}` frame observed during a
+      signed POST.
+- [x] Dashboard HTML: `tab-board`/`tab-threads` buttons, `#tsessions`, thread
+      JS (`upsertThread`/`threadLabel`) all present.
+- [x] New bundle (Aug 24 build) launched side-by-side via
+      `--user-data-dir /tmp/zed-smoke-data`: process stable, ESTABLISHED
+      Cloudflare connections (SSE + poll), room heartbeat fresh (age ~2s).
+- [-] In-app drain E2E + browser write path (Send/`!stop`/`!retry`) —
+      owner-gated: needs a human-typed agent prompt in the new build + GitHub
+      sign-in in the browser. Smoke thread `smoke-e2e` (4 entries) left in KV
+      as a live demo artifact; expires via 7d TTL.
+- Note: Cloudflare bot mode 403s `Python-urllib` UAs on this domain — use a
+  custom `User-Agent` when scripting against the worker.
