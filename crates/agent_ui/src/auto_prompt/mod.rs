@@ -1566,6 +1566,20 @@ fn gather_watchdog_context(
     })
 }
 
+/// Per-app watchdog configuration override.
+///
+/// Tests set this instead of the `ZED_AUTO_PROMPT_WATCHDOG_*` env vars:
+/// env mutation is process-global, so tests running in parallel threads of
+/// one binary race their config loads against a sibling's `set_var` and arm
+/// the wrong timeout. A GPUI global is per-`App` (per test) and race-free.
+#[derive(Clone, Copy)]
+pub struct WatchdogConfigOverride {
+    pub enabled: bool,
+    pub timeout_secs: u64,
+}
+
+impl gpui::Global for WatchdogConfigOverride {}
+
 /// Start the stuck-thread watchdog for a thread.
 ///
 /// Call this when the thread enters `Generating` and auto-prompt is enabled.
@@ -1586,8 +1600,14 @@ pub fn start_watchdog(
     window: &Window,
     cx: &gpui::App,
 ) -> Option<gpui::Task<()>> {
-    let config = auto_prompt::load_config_cached().ok()?;
-    if !config.watchdog_enabled || config.watchdog_timeout_secs == 0 {
+    let (watchdog_enabled, timeout_secs) = match cx.try_global::<WatchdogConfigOverride>() {
+        Some(override_config) => (override_config.enabled, override_config.timeout_secs),
+        None => {
+            let config = auto_prompt::load_config_cached().ok()?;
+            (config.watchdog_enabled, config.watchdog_timeout_secs)
+        }
+    };
+    if !watchdog_enabled || timeout_secs == 0 {
         return None;
     }
 
@@ -1614,7 +1634,6 @@ pub fn start_watchdog(
         );
     }
 
-    let timeout_secs = config.watchdog_timeout_secs;
     let thread_weak = thread;
 
     log::info!(

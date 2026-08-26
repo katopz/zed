@@ -12408,30 +12408,18 @@ pub(crate) mod tests {
         );
     }
 
-    // Guard that restores the watchdog env vars and invalidates the config
-    // cache on drop, so a panic mid-test doesn't leak a 1s watchdog timeout
-    // into sibling tests running in the same process.
-    struct WatchdogEnvGuard;
-    impl Drop for WatchdogEnvGuard {
-        fn drop(&mut self) {
-            // `set_var`/`remove_var` are `unsafe` as of Rust 2024 (mutating
-            // global state). The test process is single-threaded for env vars.
-            unsafe {
-                std::env::remove_var("ZED_AUTO_PROMPT_WATCHDOG_TIMEOUT_SECS");
-                std::env::remove_var("ZED_AUTO_PROMPT_WATCHDOG_ENABLED");
-            }
-            auto_prompt::invalidate_config_cache();
-        }
-    }
-
-    /// Set the watchdog env vars and invalidate the cached config so the next
-    /// `load_config_cached()` picks up the test values.
-    fn set_watchdog_env(timeout_secs: &str, enabled: &str) {
-        unsafe {
-            std::env::set_var("ZED_AUTO_PROMPT_WATCHDOG_TIMEOUT_SECS", timeout_secs);
-            std::env::set_var("ZED_AUTO_PROMPT_WATCHDOG_ENABLED", enabled);
-        }
-        auto_prompt::invalidate_config_cache();
+    /// Override the watchdog config for THIS test's app only. The env-var
+    /// route is process-global: tests running in parallel threads of one
+    /// binary race their config loads against a sibling's `set_var` and arm
+    /// the wrong timeout (reproduced as flakes in both directions), so tests
+    /// use the per-app override instead.
+    fn set_watchdog_override(cx: &mut TestAppContext, timeout_secs: u64) {
+        cx.update(|cx| {
+            cx.set_global(crate::auto_prompt::WatchdogConfigOverride {
+                enabled: true,
+                timeout_secs,
+            });
+        });
     }
 
     /// End-to-end test for the stuck-thread watchdog HALT flow.
@@ -12446,8 +12434,7 @@ pub(crate) mod tests {
     #[gpui::test]
     async fn test_watchdog_halts_stuck_thread(cx: &mut TestAppContext) {
         // 1s watchdog window so the test advances the clock only a little.
-        set_watchdog_env("1", "1");
-        let _guard = WatchdogEnvGuard;
+        set_watchdog_override(cx, 1);
 
         init_test(cx);
 
@@ -12545,11 +12532,9 @@ pub(crate) mod tests {
     /// re-armed (Some, a fresh task) on the next send.
     #[gpui::test]
     async fn test_watchdog_resets_across_generations(cx: &mut TestAppContext) {
-        // This test does NOT set the watchdog env vars. The watchdog is enabled
-        // by default with a 1800s window — long enough that the timer never
-        // fires during this test (we never advance the clock that far). This
-        // deliberately avoids any global env-var race with
-        // `test_watchdog_halts_stuck_thread`, which sets a 1s window.
+        // This test does NOT override the watchdog config. The watchdog is
+        // enabled by default with a 1800s window — long enough that the timer
+        // never fires during this test (we never advance the clock that far).
         //
         // We only assert the arm/cancel lifecycle, not the timeout itself.
 
@@ -12635,8 +12620,7 @@ pub(crate) mod tests {
     async fn test_watchdog_does_not_fire_during_active_stream(cx: &mut TestAppContext) {
         // 2s watchdog window — short enough for the test, long enough that we
         // can advance the clock in steps and inject streaming chunks between.
-        set_watchdog_env("2", "1");
-        let _guard = WatchdogEnvGuard;
+        set_watchdog_override(cx, 2);
 
         init_test(cx);
 

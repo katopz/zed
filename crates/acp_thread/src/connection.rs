@@ -962,6 +962,11 @@ mod test_support {
             _session_id: &acp::SessionId,
             _cx: &mut gpui::App,
         ) -> Task<Result<()>> {
+            if !self.supports_close_session {
+                return Task::ready(Err(anyhow::Error::msg(
+                    "Closing sessions is not supported",
+                )));
+            }
             self.close_count.fetch_add(1, Ordering::SeqCst);
             Task::ready(Ok(()))
         }
