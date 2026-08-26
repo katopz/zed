@@ -26,6 +26,8 @@
       }
   });
   ```
+* `auto_prompt::truncate_at_char_boundary` is `pub` and canonical for byte-limited truncation — reuse it instead of hand-rolling char-boundary truncation per crate.
+* Multi-key language-model providers must honor `LanguageModel::reset_key_session()` on new-thread creation so stale per-key backoff is re-probed (see `open_ai_compatible.rs`).
 
 # Timers in tests
 
