@@ -40,7 +40,7 @@ pub use health::format_backoff_remaining;
 mod health;
 use health::{
     KeyHealthTracker, KeySlot, SlotHealthStatus,
-    key_health_path_for, reload_persisted_health, retry_stream,
+    key_health_path_for, record_key_success, reload_persisted_health, retry_stream,
     schedule_persist_key_health_inner, snapshot_health,
 };
 
@@ -402,6 +402,23 @@ impl State {
             extra_headers: self.settings.custom_headers.clone(),
             provider_name: Arc::<str>::from(self.id.as_ref()),
         })
+    }
+
+    /// Probe inputs for every slot that has a key configured, in fixed
+    /// `[Primary, Secondary, Tertiary, Quaternary]` order. Used by
+    /// `reset_key_session` to re-verify all keys (including backed-off ones)
+    /// when a new agent thread starts. Slots without a key (or with no model
+    /// configured) are skipped — there is nothing to probe.
+    fn all_probe_inputs(&self) -> Vec<(KeySlot, KeyProbeInputs)> {
+        [
+            KeySlot::Primary,
+            KeySlot::Secondary,
+            KeySlot::Tertiary,
+            KeySlot::Quaternary,
+        ]
+        .into_iter()
+        .filter_map(|slot| self.probe_inputs(slot).map(|inputs| (slot, inputs)))
+        .collect()
     }
 
     /// Returns `[Primary, Secondary, Tertiary, Quaternary]` slot status for the UI. Clones
@@ -1014,6 +1031,63 @@ impl LanguageModel for OpenAiCompatibleLanguageModel {
         let _ = self.state.update(cx, |_, cx| cx.notify());
     }
 
+    fn reset_key_session(&self, cx: &App) {
+        // Clear the session-sticky pick so the new thread re-randomizes its
+        // key (plan 027). The probe below then re-verifies reality.
+        self.state.read_with(cx, |state, _| {
+            state.key_health.lock().reset_session();
+        });
+
+        let (probe_inputs, key_health, key_health_dirty, key_health_path) = self
+            .state
+            .read_with(cx, |state, _| {
+                (
+                    state.all_probe_inputs(),
+                    state.key_health.clone(),
+                    state.key_health_dirty.clone(),
+                    state.key_health_path.clone(),
+                )
+            });
+        if probe_inputs.is_empty() {
+            return;
+        }
+        let http_client = self.http_client.clone();
+        let persist_executor = cx.background_executor().clone();
+        let fs = <dyn Fs>::global(cx);
+        // Detached: the new thread's first request must not wait for the
+        // probes — they only *clear* stale backoffs when they arrive; the
+        // in-memory health is already usable as-is.
+        cx.background_spawn(async move {
+            let health_before = snapshot_health(&key_health);
+            for (slot, inputs) in probe_inputs {
+                // Sequential on purpose: probes are 1-token pings, and a burst
+                // of parallel pings right at thread start would compete with
+                // the thread's own first request for the rate limiter.
+                let result = run_key_probe(http_client.clone(), inputs).await;
+                // Same semantics as the settings-page Check button: a healthy
+                // probe clears stale backoff (the key is NOT really limited);
+                // rate-limit confirms the backoff is warranted; any other
+                // error is ambiguous and changes nothing.
+                if result == KeyProbeResult::Ok {
+                    record_key_success(&key_health, slot);
+                }
+                log::info!(
+                    "reset_key_session probe: slot={slot:?} result={result:?}"
+                );
+            }
+            if snapshot_health(&key_health) != health_before {
+                schedule_persist_key_health_inner(
+                    &key_health,
+                    &key_health_dirty,
+                    key_health_path,
+                    persist_executor,
+                    fs,
+                );
+            }
+        })
+        .detach();
+    }
+
     fn max_token_count(&self) -> u64 {
         self.model.max_tokens
     }
@@ -1438,7 +1512,7 @@ impl ConfigurationView {
     ///
     /// On `Ok` the slot's backoff is also cleared: a successful probe is direct
     /// evidence the key works right now, so any stale backoff (e.g. the upstream
-    /// quota reset) shouldn't keep the key rotated out until the 5h window
+    /// quota reset) shouldn't keep the key rotated out until the 1h window
     /// elapses. This mirrors the per-key success path in `retry_stream`, which
     /// clears health on the first successful request.
     fn probe_key(&mut self, slot: KeySlot, window: &mut Window, cx: &mut Context<Self>) {
@@ -1458,7 +1532,7 @@ impl ConfigurationView {
                 let idx = slot_index(slot);
                 // A successful probe means the key is healthy right now — clear
                 // any backoff so the slot re-enters rotation immediately instead
-                // of waiting out the 5h window. Non-ok results leave backoff
+                // of waiting out the 1h window. Non-ok results leave backoff
                 // untouched (a rate-limit probe confirms the backoff is still
                 // warranted; an error probe is ambiguous and shouldn't quietly
                 // clear a backoff earned by real request failures).
@@ -1479,7 +1553,7 @@ impl ConfigurationView {
     ///
     /// - `Clear backoff` only appears when `status.is_backed_off` (no point
     ///   clearing a healthy slot). Escape hatch for when the upstream quota
-    ///   resets before the 5h window elapses.
+    ///   resets before the 1h window elapses.
     /// - `Check` probes the key and reflects the latest result on its face:
     ///   `Check…` (in flight, disabled), `check(ok)` (green), `check(hit)`
     ///   (warning, rate-limited), `check(err)` (error, other) with the message

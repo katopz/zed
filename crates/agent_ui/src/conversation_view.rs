@@ -1,9 +1,9 @@
 use acp_thread::{
     AcpThread, AcpThreadEvent, AgentThreadEntry, AssistantMessage, AssistantMessageChunk,
-    AuthRequired, AuthorizationKind, ClientUserMessageId, ElicitationEntryId, ElicitationStatus,
-    ElicitationStore, LoadError, MaxOutputTokensError, MentionUri, PermissionOptionChoice,
-    PermissionOptions, PermissionPattern, RetryStatus, SANDBOX_FALLBACK_RETRY_OPTION_ID,
-    SelectedPermissionOutcome, ThreadStatus, ToolCall, ToolCallContent, ToolCallStatus,
+    AuthRequired, ClientUserMessageId, ElicitationEntryId, ElicitationStatus, ElicitationStore,
+    LoadError, MaxOutputTokensError, MentionUri, PermissionOptionChoice, PermissionOptions,
+    PermissionPattern, RetryStatus, SelectedPermissionOutcome, ThreadStatus, ToolCall,
+    ToolCallContent, ToolCallStatus,
 };
 use acp_thread::{AgentConnection, Plan};
 use action_log::{ActionLog, ActionLogTelemetry, DiffStats};
@@ -543,10 +543,15 @@ impl Conversation {
         .detach();
     }
 
-    /// Auto-answers a pending permission request with the least-privileged
-    /// allow option. Anything that isn't a plain allow/deny permission grant
-    /// (action choices, the sandbox-fallback retry decision) is left for the
-    /// user, as are prompts that offer no allow option at all.
+    /// Auto-answers a pending tool-authorization request with the
+    /// least-privileged allow option after the countdown (plan 025; extended
+    /// in plan 027 to EVERY prompt that offers an allow option):
+    /// - plain permission grants (terminal/edit/sandbox, windows fs warning),
+    /// - action-choice prompts with an allow option (e.g. save vs discard),
+    /// - the sandbox-fallback prompt ("Run without sandbox once" — retry and
+    ///   deny are never picked; unattended chains previously stalled here
+    /// forever).
+    /// Prompts that offer no allow option at all stay with the user.
     fn fire_auto_allow(
         &mut self,
         session_id: &acp::SessionId,
@@ -561,22 +566,15 @@ impl Conversation {
         let Some((_, tool_call)) = thread.read(cx).tool_call(tool_call_id) else {
             return;
         };
-        let ToolCallStatus::WaitingForConfirmation { options, kind, .. } = &tool_call.status
-        else {
+        let ToolCallStatus::WaitingForConfirmation { options, .. } = &tool_call.status else {
             return;
         };
-        if *kind != AuthorizationKind::PermissionGrant {
-            return;
-        }
-        if let PermissionOptions::Flat(flat_options) = options
-            && flat_options.iter().any(|option| {
-                option.option_id.0.as_ref() == SANDBOX_FALLBACK_RETRY_OPTION_ID
-            })
-        {
-            return;
-        }
-        // Prefer the one-shot allow ("Only this time" / "Allow once"); only
-        // fall back to a persistent allow when nothing weaker is offered.
+        // Prefer the one-shot allow ("Only this time" / "Allow once" /
+        // "Run without sandbox once"); only fall back to a persistent allow
+        // when nothing weaker is offered. `resolve_outcome_from_selection`
+        // handles both flat and dropdown option shapes and returns None when
+        // no allow option exists — those prompts are genuine decisions the
+        // user must make.
         let outcome = resolve_outcome_from_selection(options, None, true).or_else(|| {
             options
                 .first_option_of_kind(acp::PermissionOptionKind::AllowAlways)
@@ -10871,6 +10869,193 @@ pub(crate) mod tests {
                 "Expected no pending tool call after auto-allow fired"
             );
         });
+    }
+
+    /// Like [`Self::request_test_tool_authorization`] but with caller-supplied
+    /// options and authorization kind — used by the plan-027 auto-allow tests
+    /// (ActionChoice prompts, sandbox-fallback option sets).
+    fn request_test_tool_authorization_with(
+        thread: &Entity<AcpThread>,
+        tool_call_id: &str,
+        options: PermissionOptions,
+        kind: acp_thread::AuthorizationKind,
+        cx: &mut TestAppContext,
+    ) -> Task<acp_thread::RequestPermissionOutcome> {
+        let tool_call_id = acp::ToolCallId::new(tool_call_id);
+        let label = format!("Tool {tool_call_id}");
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread
+                    .request_tool_call_authorization(
+                        acp::ToolCall::new(tool_call_id, label)
+                            .kind(acp::ToolKind::Edit)
+                            .into(),
+                        options,
+                        kind,
+                        cx,
+                    )
+                    .unwrap()
+            })
+        })
+    }
+
+    /// Plan 027: ActionChoice prompts that offer an allow option are
+    /// auto-answered too — the carve-out only remains for prompts with no
+    /// allow option at all.
+    #[gpui::test]
+    async fn test_conversation_auto_allows_action_choice_with_allow_option(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        cx.update(|cx| {
+            project::DisableAiSettings::register(cx);
+            AgentSettings::register(cx);
+            let mut settings = AgentSettings::get_global(cx).clone();
+            settings.auto_allow_permissions_after_seconds = Some(2);
+            AgentSettings::override_global(settings, cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection: Rc<dyn AgentConnection> = Rc::new(StubAgentConnection::new());
+
+        // (No session_id binding needed — assertions go through the request.)
+        let (thread, _conversation) = cx.update(|cx| {
+            let thread = create_test_acp_thread(
+                None,
+                "session-action-choice",
+                connection.clone(),
+                project.clone(),
+                cx,
+            );
+            let conversation = cx.new(|cx| {
+                let mut conversation = Conversation::default();
+                conversation.register_thread(thread.clone(), cx);
+                conversation
+            });
+            (thread, conversation)
+        });
+
+        let request = request_test_tool_authorization_with(
+            &thread,
+            "tc-action-choice",
+            PermissionOptions::Flat(vec![
+                acp::PermissionOption::new(
+                    acp::PermissionOptionId::new("discard"),
+                    "Discard",
+                    acp::PermissionOptionKind::RejectOnce,
+                ),
+                acp::PermissionOption::new(
+                    acp::PermissionOptionId::new("save"),
+                    "Save",
+                    acp::PermissionOptionKind::AllowOnce,
+                ),
+            ]),
+            acp_thread::AuthorizationKind::ActionChoice,
+            cx,
+        );
+        cx.run_until_parked();
+
+        cx.executor().advance_clock(Duration::from_secs(3));
+        cx.run_until_parked();
+
+        match request.await {
+            acp_thread::RequestPermissionOutcome::Selected(outcome) => {
+                assert_eq!(outcome.option_id.0.as_ref(), "save");
+                assert_eq!(outcome.option_kind, acp::PermissionOptionKind::AllowOnce);
+            }
+            other => panic!("expected auto-allow of the allow option, got {other:?}"),
+        }
+    }
+
+    /// Plan 027: the sandbox-fallback prompt auto-picks the least-privileged
+    /// allow ("Run without sandbox once") — never Retry and never a persistent
+    /// allow.
+    #[gpui::test]
+    async fn test_conversation_auto_allows_sandbox_fallback_with_once_allow(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        cx.update(|cx| {
+            project::DisableAiSettings::register(cx);
+            AgentSettings::register(cx);
+            let mut settings = AgentSettings::get_global(cx).clone();
+            settings.auto_allow_permissions_after_seconds = Some(2);
+            AgentSettings::override_global(settings, cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection: Rc<dyn AgentConnection> = Rc::new(StubAgentConnection::new());
+
+        // (No session_id binding needed — assertions go through the request.)
+        let (thread, _conversation) = cx.update(|cx| {
+            let thread = create_test_acp_thread(
+                None,
+                "session-sandbox-fallback",
+                connection.clone(),
+                project.clone(),
+                cx,
+            );
+            let conversation = cx.new(|cx| {
+                let mut conversation = Conversation::default();
+                conversation.register_thread(thread.clone(), cx);
+                conversation
+            });
+            (thread, conversation)
+        });
+
+        let request = request_test_tool_authorization_with(
+            &thread,
+            "tc-sandbox-fallback",
+            PermissionOptions::Flat(vec![
+                acp::PermissionOption::new(
+                    acp::PermissionOptionId::new(
+                        acp_thread::SANDBOX_FALLBACK_RETRY_OPTION_ID,
+                    ),
+                    "Retry",
+                    acp::PermissionOptionKind::RejectAlways,
+                ),
+                acp::PermissionOption::new(
+                    acp::PermissionOptionId::new(
+                        acp_thread::SandboxPermission::AllowOnce.as_id(),
+                    ),
+                    "Run without sandbox once",
+                    acp::PermissionOptionKind::AllowOnce,
+                ),
+                acp::PermissionOption::new(
+                    acp::PermissionOptionId::new(
+                        acp_thread::SandboxPermission::AllowAlways.as_id(),
+                    ),
+                    "Always run without sandbox",
+                    acp::PermissionOptionKind::AllowAlways,
+                ),
+                acp::PermissionOption::new(
+                    acp::PermissionOptionId::new("deny"),
+                    "Deny",
+                    acp::PermissionOptionKind::RejectOnce,
+                ),
+            ]),
+            acp_thread::AuthorizationKind::ActionChoice,
+            cx,
+        );
+        cx.run_until_parked();
+
+        cx.executor().advance_clock(Duration::from_secs(3));
+        cx.run_until_parked();
+
+        match request.await {
+            acp_thread::RequestPermissionOutcome::Selected(outcome) => {
+                assert_eq!(
+                    outcome.option_id.0.as_ref(),
+                    acp_thread::SandboxPermission::AllowOnce.as_id(),
+                    "must pick 'Run without sandbox once', got {:?}",
+                    outcome.option_id
+                );
+                assert_eq!(outcome.option_kind, acp::PermissionOptionKind::AllowOnce);
+            }
+            other => panic!("expected auto-allow of the once-allow option, got {other:?}"),
+        }
     }
 
     #[gpui::test]

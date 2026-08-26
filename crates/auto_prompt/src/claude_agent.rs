@@ -700,6 +700,19 @@ pub async fn decide_claude_async(
     data: LlmCallData,
     cx: &gpui::AsyncApp,
 ) -> anyhow::Result<AutoPromptOutcome> {
+    // Summary-first fast path (plan 027, parity with the native flow): a
+    // voluntary summary at the last paragraph carries its own "what
+    // remains" — skip the orchestrator and continue same-thread with the
+    // fixed decision directive. Overflow/nothing-left cases fall through to
+    // the flows that own them (overflow routes through the shared native
+    // Phase 1/2 machine before reaching here).
+    if let Some(outcome) = crate::summary_continuation_fast_path(&data) {
+        log::warn!(
+            "[auto_prompt::claude] summary fast path — continuing same-thread with fixed decision (no orchestrator call)"
+        );
+        return Ok(outcome);
+    }
+
     #[cfg(feature = "claude-hidden-orchestrator")]
     {
         decide_claude_with_hidden_thread(data, cx).await

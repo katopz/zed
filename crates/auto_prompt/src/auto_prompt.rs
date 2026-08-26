@@ -781,6 +781,14 @@ pub fn evaluate_response(input: &EvaluationInput) -> EvaluationResult {
 /// the LLM is certain the chain should stop — verification is pointless.
 const DECISIVE_STOP_THRESHOLD: f64 = 0.15;
 
+/// Fixed decision directive used by the summary-first fast path (plan 027).
+/// When the worker's last message already ends with a summary (the mandated
+/// `## Summary` handoff format), auto_prompt does NOT re-process it with an
+/// orchestrator/reasoning LLM call — the new/same thread is continued with
+/// this instruction and the summary itself carries "what remains".
+pub const CONTINUE_REMAINS_DECISION: &str =
+    "Continue remains and make decisions for best perf/sec prod grade";
+
 /// Returns true when the orchestration LLM is decisively stopping.
 /// A decisive stop has very low confidence and no prompt — the LLM is
 /// certain, so verification would just create wasted work.
@@ -849,6 +857,48 @@ pub fn is_waiting_for_user_decision(last_assistant_message: Option<&str>) -> boo
         || lower.contains("let me know how you'd like");
 
     explicit_deferral
+}
+
+/// Summary-first fast path (plan 027, shared by native + Claude flows).
+///
+/// When the worker's last message is already a voluntary summary (the mandated
+/// `## Summary` handoff) AND it does not declare "nothing left", skip the
+/// orchestrator LLM call entirely and continue in the SAME thread with the
+/// fixed [`CONTINUE_REMAINS_DECISION`] directive — the summary already says
+/// what remains, so a full decide pass is wasted latency/tokens.
+///
+/// Returns `None` when the fast path does not apply:
+/// - no summary at the last paragraph → the normal flow runs (overflow asks
+///   Phase 1 for a summary first; same-thread consults the orchestrator);
+/// - the summary declares nothing left → the normal flow owns stopping /
+///   housekeeping (otherwise the chain would never terminate);
+/// - the thread overflowed → the caller routes through the shared Phase 1/2
+///   machine (`context_overflow_outcome`), which forks with the summary.
+///
+/// The returned action always has `force_new_thread = false`: below the
+/// overflow gate the chain continues same-thread (plan 023 req 4).
+pub fn summary_continuation_fast_path(data: &LlmCallData) -> Option<AutoPromptOutcome> {
+    if data.context_exceeds_limit {
+        return None;
+    }
+    let last = data.last_assistant_message.as_deref()?;
+    if !looks_like_voluntary_summary(last) {
+        return None;
+    }
+    if matches!(
+        extract_summary_next_steps(last),
+        Some(SummaryContinuation::NothingLeft)
+    ) {
+        log::info!(
+            "[auto_prompt] summary fast path: summary declares nothing left — deferring to normal stop/housekeeping flow"
+        );
+        return None;
+    }
+    log::warn!(
+        "[auto_prompt] summary fast path: last message is a voluntary summary — continuing same-thread with fixed decision (no orchestrator call)"
+    );
+    let action = data.make_continue_action(CONTINUE_REMAINS_DECISION.to_string());
+    Some(AutoPromptOutcome::Continue(action))
 }
 
 /// Outcome of the cheap pre-decide checks: either an immediate decision
@@ -1392,205 +1442,20 @@ fn decide_finish(
 ///   prompt and returns `Continue` with `force_new_thread = true` and reset
 ///   token counts.
 ///
-/// System prompt for the Phase 2 continuation author (reasoned mode).
-///
-/// The model receives the previous thread's final summary and the plan
-/// landscape, and writes the first prompt for the fresh continuation thread.
-const PHASE2_REASONER_SYSTEM_PROMPT: &str = r#"You write the first prompt for a fresh continuation thread that takes over
-from a previous thread whose context overflowed. You are given the previous
-thread's final summary (including its remaining-work items) and the landscape
-of unclaimed plan files with unchecked tasks.
-
-Rules:
-1. Reason about the summary's remaining tasks. Skip items that are explicitly
-   owner-gated ("owner go", "gated on", "awaiting owner") or deliberately
-   deferred, saying why in one line each.
-2. Pick the single highest-priority actionable item and write a concrete,
-   imperative instruction for it. Reference plan/issue file paths verbatim.
-   Where the item needs a technical decision, make the call yourself and say
-   which option you chose and why in one line.
-3. If nothing actionable remains in the summary, pick from the unclaimed plan
-   files (lowest number first) and write the instruction for its next task.
-4. If nothing is actionable anywhere, write a housekeeping instruction:
-   run the boundary-guard and doc-sync skills, mine the next riir-clippy
-   batch (research online to unblock blocked tasks), re-run benchmarks if
-   the working tree is dirty, check other workspace repos only where no
-   other agent is active, and stop cleanly if nothing remains.
-5. Never ask a question, never summarize, never restate these rules. The
-   reader is a fresh agent with no context besides what you write and the
-   summary sections already inlined above your text.
-
-Output ONLY the continuation prompt text. Max ~150 words."#;
-
-/// Cap for the summary excerpt fed to the Phase 2 reasoner. The summary is
-/// already the distilled handoff; this only guards against pathological
-/// multi-screen "summaries".
-const PHASE2_REASONER_SUMMARY_CHAR_CAP: usize = 12_000;
-
 /// Char-boundary-safe truncation (project rule: never slice a `&str` by byte
 /// index without a boundary check — summaries routinely contain em-dashes
-/// and CJK).
-fn truncate_at_char_boundary(text: &str, max_chars: usize) -> String {
+/// and CJK). This is the canonical truncation helper referenced by the repo
+/// `.rules` for log/preview truncation.
+pub fn truncate_at_char_boundary(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
         return text.to_string();
     }
     text.chars().take(max_chars).collect()
 }
 
-/// Build the user-turn input for the Phase 2 reasoner: summary excerpt +
-/// plan landscape + work dirs. Pure — unit-testable without a model.
-fn build_phase2_reasoning_input(data: &LlmCallData) -> String {
-    let summary = data
-        .last_assistant_message
-        .as_deref()
-        .map(|s| truncate_at_char_boundary(s.trim(), PHASE2_REASONER_SUMMARY_CHAR_CAP))
-        .unwrap_or_default();
-    let plans = build_plan_landscape(&data.context_json)
-        .unwrap_or_else(|| "(no unclaimed plans with unchecked tasks)".to_string());
-    let work_dirs = data
-        .work_dirs
-        .as_ref()
-        .map(|dirs| {
-            dirs.iter()
-                .map(|d| d.to_string_lossy().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        })
-        .unwrap_or_else(|| "(none)".to_string());
-
-    format!(
-        "--- previous thread's final summary ---\n{summary}\n--- end summary ---\n\n\
-         --- unclaimed plans with unchecked tasks ---\n{plans}\n--- end plans ---\n\n\
-         Session work dirs: {work_dirs}"
-    )
-}
-
-/// Decide whether to attempt the LLM-reasoned Phase 2 continuation, and run it.
-///
-/// Only fires when Phase 2 is imminent (summary state == 1, or a voluntary
-/// summary will skip Phase 1) — never during Phase 1 (no summary exists
-/// yet), never after an API error (the RetryAfterBackoff guard owns that
-/// case), and never when disabled in config (rule-based mode).
-async fn phase2_reasoning_attempt(data: &LlmCallData, cx: &gpui::AsyncApp) -> Option<String> {
-    if data.had_api_error {
-        return None;
-    }
-    let config = load_config_cached().unwrap_or_default();
-    phase2_reasoning_attempt_with(data, &config, cx).await
-}
-
-/// Config-injected core of `phase2_reasoning_attempt` (hermetic for tests).
-async fn phase2_reasoning_attempt_with(
-    data: &LlmCallData,
-    config: &crate::config::AutoPromptConfig,
-    cx: &gpui::AsyncApp,
-) -> Option<String> {
-    if !config.reasoned_phase2_enabled {
-        return None;
-    }
-    let session_id_str = data.session_id.to_string();
-    let summary_state = summary_state_for(&session_id_str);
-    let skip_phase_1 = summary_state == 0
-        && data
-            .last_assistant_message
-            .as_deref()
-            .map_or(false, looks_like_voluntary_summary);
-    if summary_state != 1 && !skip_phase_1 {
-        return None;
-    }
-    reason_phase2_continuation(data, cx).await
-}
-
-/// Ask the thread's model to reason the Phase 2 continuation from the summary.
-///
-/// Returns None on ANY failure (stream error, empty output, timeout) so the
-/// caller falls back to the deterministic rule-based chain — overflow must
-/// never get more stuck than without reasoning.
-async fn reason_phase2_continuation(data: &LlmCallData, cx: &gpui::AsyncApp) -> Option<String> {
-    let summary = data.last_assistant_message.as_deref()?.trim().to_string();
-    if summary.is_empty() {
-        return None;
-    }
-
-    let user_turn = build_phase2_reasoning_input(data);
-    let request = LanguageModelRequest {
-        messages: vec![
-            LanguageModelRequestMessage {
-                role: Role::System,
-                content: vec![PHASE2_REASONER_SYSTEM_PROMPT.into()],
-                cache: false,
-                reasoning_details: None,
-            },
-            LanguageModelRequestMessage {
-                role: Role::User,
-                content: vec![user_turn.into()],
-                cache: false,
-                reasoning_details: None,
-            },
-        ],
-        ..Default::default()
-    };
-
-    let completion_future = async {
-        let mut stream = data
-            .model
-            .stream_completion(request, cx)
-            .await
-            .context("phase2 reasoner: failed to start completion stream")?;
-        let mut text_parts: Vec<String> = Vec::new();
-        while let Some(event) = stream.next().await {
-            match event {
-                Ok(LanguageModelCompletionEvent::Text(text)) => text_parts.push(text),
-                Ok(_) => {}
-                Err(err) => {
-                    log::warn!("[auto_prompt::phase2_reasoner] stream error: {err:#}");
-                    return Err(anyhow::anyhow!(err.to_string()));
-                }
-            }
-        }
-        let text = text_parts.concat();
-        if text.trim().is_empty() {
-            anyhow::bail!("phase2 reasoner: model returned no text events");
-        }
-        anyhow::Ok(text.trim().to_string())
-    };
-
-    let timeout_future = cx.background_executor().timer(Duration::from_secs(45));
-    pin_mut!(completion_future, timeout_future);
-
-    match future::select(completion_future, timeout_future).await {
-        future::Either::Left((Ok(text), _)) => Some(text),
-        future::Either::Left((Err(err), _)) => {
-            log::warn!(
-                "[auto_prompt::phase2_reasoner] reasoning failed: {err:#} — falling back to rule-based continuation"
-            );
-            None
-        }
-        future::Either::Right(_) => {
-            log::warn!(
-                "[auto_prompt::phase2_reasoner] reasoning timed out after 45s — falling back to rule-based continuation"
-            );
-            None
-        }
-    }
-}
-
 /// Deterministic Phase 1/2 state machine for context overflow.
 /// Never calls the LLM itself; deterministic state machine only.
 pub(crate) fn context_overflow_outcome(data: &LlmCallData) -> AutoPromptOutcome {
-    context_overflow_outcome_with(data, None)
-}
-
-/// `context_overflow_outcome` with an optional LLM-reasoned continuation.
-///
-/// When `reasoned_continuation` is Some it is used verbatim as the Phase 2
-/// continuation (the deterministic chain is skipped); None runs the chain.
-/// All other behaviour (Phase 1, state registry, action fields, plan claim)
-/// is identical.
-pub(crate) fn context_overflow_outcome_with(
-    data: &LlmCallData,
-    reasoned_continuation: Option<String>,
-) -> AutoPromptOutcome {
     let session_id_str = data.session_id.to_string();
 
     // ── Issue 007 guard: API exhaustion + context overflow ────────────
@@ -1704,43 +1569,22 @@ pub(crate) fn context_overflow_outcome_with(
             data.first_user_message.as_deref(),
         );
 
-        // Build the continuation prompt in priority order:
-        //   1. Summary's own Recommended Next Steps (the AI just wrote them —
-        //      they're the most authoritative source of what to do next).
-        //   2. Unchecked tasks in current-repo plan files (the session's
-        //      actual target project, not a noisy neighbour repo).
-        //   3. Unchecked tasks in other-repo plan files.
-        //   4. Summary declares nothing left → housekeeping prompt
-        //      (skills, mining, re-bench, other repos, stop).
-        //   5. Generic "continue" fallback.
-        //
-        // `detect_remaining_work` is intentionally NOT consulted here: it
-        // skips auto_prompt summary responses (see its guard) to avoid
-        // re-summarization loops in the safety-net path. Phase 2 wants the
-        // summary's guidance, so we use `extract_summary_next_steps` instead.
+        // Plan 027 ("do not process"): the summary already says what remains,
+        // so no orchestrator/reasoning pass and no detector chain — the new
+        // thread's decision slot is the fixed directive. The ONE piece of
+        // processing kept is the termination guard: a summary that declares
+        // nothing left only switches to housekeeping when no unclaimed plan
+        // tasks remain (plan tasks beat nothing-left); otherwise the fixed
+        // directive is used and the worker picks the tasks up itself.
         let summary_continuation = data
             .last_assistant_message
             .as_deref()
             .and_then(extract_summary_next_steps);
-        let continuation = if let Some(reasoned) = reasoned_continuation {
-            log::warn!("auto_prompt: ContextOverflow Phase 2 — using LLM-reasoned continuation");
-            reasoned
-        } else if llm_acknowledged_all_tasks_blocked(data.last_assistant_message.as_deref()) {
-            log::info!(
-                "auto_prompt: ContextOverflow — LLM acknowledged blocked tasks, using generic continuation"
-            );
-            "Continue from where we left off.".to_string()
-        } else if let Some(SummaryContinuation::Steps(steps)) = &summary_continuation {
-            log::warn!(
-                "auto_prompt: ContextOverflow Phase 2 — using summary's Recommended Next Steps as continuation"
-            );
-            steps.clone()
-        } else {
-            // No actionable steps in the summary (none found, or the summary
-            // explicitly declares nothing left). Fall back to unclaimed plan
-            // tasks: current repo first, then other repos. Only when no plan
-            // tasks remain does a nothing-left summary switch to housekeeping.
-            let plan_prompt = detect_remaining_plan_tasks(
+        let continuation = if matches!(
+            summary_continuation,
+            Some(SummaryContinuation::NothingLeft)
+        ) {
+            let plan_tasks_remain = detect_remaining_plan_tasks(
                 &data.context_json,
                 PlanRepoFilter::CurrentRepo,
                 data.work_dirs.as_deref(),
@@ -1751,29 +1595,24 @@ pub(crate) fn context_overflow_outcome_with(
                     PlanRepoFilter::OtherRepos,
                     data.work_dirs.as_deref(),
                 )
-            });
-            match plan_prompt {
-                Some(plan_prompt) => {
-                    log::warn!(
-                        "auto_prompt: ContextOverflow Phase 2 — no summary next steps, falling back to plan tasks"
-                    );
-                    plan_prompt
-                }
-                None => match &summary_continuation {
-                    Some(SummaryContinuation::NothingLeft) => {
-                        log::warn!(
-                            "auto_prompt: ContextOverflow Phase 2 — summary declares nothing left and no plan tasks remain, switching to housekeeping"
-                        );
-                        housekeeping_continuation()
-                    }
-                    _ => {
-                        log::info!(
-                            "auto_prompt: ContextOverflow Phase 2 — no detectors matched, generic continuation"
-                        );
-                        "Continue from where we left off.".to_string()
-                    }
-                },
+            })
+            .is_some();
+            if plan_tasks_remain {
+                log::warn!(
+                    "auto_prompt: ContextOverflow Phase 2 — summary says nothing left but plan tasks remain, continuing with fixed decision"
+                );
+                CONTINUE_REMAINS_DECISION.to_string()
+            } else {
+                log::warn!(
+                    "auto_prompt: ContextOverflow Phase 2 — summary declares nothing left and no plan tasks remain, switching to housekeeping"
+                );
+                housekeeping_continuation()
             }
+        } else {
+            log::warn!(
+                "auto_prompt: ContextOverflow Phase 2 — using summary + fixed decision directive (no processing)"
+            );
+            CONTINUE_REMAINS_DECISION.to_string()
         };
 
         // Preserve slash commands (e.g. /optimize) through context overflow
@@ -1898,17 +1737,22 @@ pub async fn decide_with_llm(
         return Ok(outcome);
     }
 
+    // ── Summary-first fast path (plan 027) ──────────────────────────────
+    //
+    // A voluntary summary at the last paragraph carries its own "what
+    // remains" — no orchestrator call needed. Same-thread continuation with
+    // the fixed decision directive. Overflow / nothing-left cases return None
+    // here and fall through to the flows that own them.
+    if let Some(outcome) = summary_continuation_fast_path(&data) {
+        return Ok(outcome);
+    }
+
     if data.context_exceeds_limit {
         // Shared Phase 1/2 state machine (plan 023 A2) — also reused by the
-        // Claude overflow parity path (plan 023 A3). When Phase 2 is imminent
-        // (the summary already exists) and reasoned Phase 2 is enabled, an
-        // LLM reasoning pass authors the continuation; every failure falls
-        // back to the deterministic chain inside the state machine.
-        let reasoned = phase2_reasoning_attempt(&data, cx).await;
-        let outcome = match reasoned {
-            Some(reasoned) => context_overflow_outcome_with(&data, Some(reasoned)),
-            None => context_overflow_outcome(&data),
-        };
+        // Claude overflow parity path (plan 023 A3). No reasoning pass: when a
+        // summary exists it is used verbatim with the fixed decision directive
+        // (plan 027 "do not process"); when it doesn't, Phase 1 asks for one.
+        let outcome = context_overflow_outcome(&data);
         return Ok(outcome);
     }
 
@@ -4451,9 +4295,9 @@ mod tests {
 
     #[test]
     fn context_overflow_phase2_actionable_steps_continuation() {
-        // Phase 2 end-to-end: a summary with actionable numbered steps must
-        // become a continuation that embeds the steps and the decision-aware
-        // tail — not a generic "continue" nor the housekeeping prompt.
+        // Plan 027: actionable steps in the summary ride along in the inlined
+        // Last Assistant Message section; the Decision slot is the fixed
+        // directive. No housekeeping, forced new thread.
         let session = "overflow-phase2-steps-test";
         set_summary_state(session, 1);
         let summary = "# Session Summary\n\n## Original Task\n\nRefactor.\n\n\
@@ -4466,21 +4310,15 @@ mod tests {
             AutoPromptOutcome::Continue(action) => {
                 assert!(action.force_new_thread, "Phase 2 must force a new thread");
                 assert!(
+                    action.next_prompt.contains(CONTINUE_REMAINS_DECISION),
+                    "fixed decision directive must be the decision: {}",
+                    action.next_prompt
+                );
+                assert!(
                     action
                         .next_prompt
                         .contains("Decide on the serializer format"),
-                    "continuation must embed the summary's first step: {}",
-                    action.next_prompt
-                );
-                assert!(
-                    action.next_prompt.contains("Pick up from here"),
-                    "continuation framing must be present: {}",
-                    action.next_prompt
-                );
-                assert!(
-                    action.next_prompt.contains("where a decision is needed"),
-                    "decision-aware tail must instruct the agent to resolve the \
-                     decision itself: {}",
+                    "summary steps must be inlined for context: {}",
                     action.next_prompt
                 );
                 assert!(
@@ -4498,31 +4336,31 @@ mod tests {
     }
 
     #[test]
-    fn context_overflow_phase2_reasoned_continuation_used_verbatim() {
-        // Phase 2 with an LLM-reasoned continuation: used verbatim in the
-        // Decision slot, same action guarantees as the deterministic path.
-        let session = "overflow-phase2-reasoned-test";
+    fn context_overflow_phase2_uses_fixed_decision_directive() {
+        // Plan 027 ("do not process"): with a summary in hand, Phase 2's
+        // Decision slot is the fixed directive — no reasoned pass, no
+        // next-step extraction, no plan-task prompt. Same action guarantees
+        // (forced new thread, reset token counts) as before.
+        let session = "overflow-phase2-fixed-decision-test";
         set_summary_state(session, 1);
         let summary = "# Session Summary\n\n## What Remains\n\n- `.issues/739` — owner go\n- [ ] T2: verify build\n";
         let data = overflow_test_data(session, Some(summary));
-        let reasoned = "Skip .issues/739 (owner-gated). Continue with T2 from \
-                       .plans/341: run the verification build, then commit.";
-        match context_overflow_outcome_with(&data, Some(reasoned.to_string())) {
+        match context_overflow_outcome(&data) {
             AutoPromptOutcome::Continue(action) => {
                 assert!(action.force_new_thread, "Phase 2 must force a new thread");
                 assert!(
-                    action.next_prompt.contains(reasoned),
-                    "reasoned continuation must appear verbatim: {}",
+                    action.next_prompt.contains(CONTINUE_REMAINS_DECISION),
+                    "fixed decision directive must appear in the prompt: {}",
                     action.next_prompt
                 );
                 assert!(
                     action.next_prompt.contains("## 3. Decision"),
-                    "reasoned continuation rides in the Decision section: {}",
+                    "directive rides in the Decision section: {}",
                     action.next_prompt
                 );
                 assert!(
-                    !action.next_prompt.contains("Pick up from here"),
-                    "rule-based tail must not bleed into the reasoned path: {}",
+                    action.next_prompt.contains("T2: verify build"),
+                    "summary is inlined for context: {}",
                     action.next_prompt
                 );
                 assert_eq!(action.actual_input_tokens, None);
@@ -4534,31 +4372,65 @@ mod tests {
     }
 
     #[test]
-    fn test_build_phase2_reasoning_input_sections() {
-        let session = "phase2-input-test";
+    fn summary_fast_path_continues_same_thread_with_fixed_decision() {
+        // Plan 027: a voluntary summary with remaining work short-circuits the
+        // orchestrator — same-thread Continue carrying the fixed directive.
+        let session = "summary-fast-path-test";
         clear_summary_for_session(session);
-        let context_json = serde_json::json!({
-            "session_id": session,
-            "plan_files": [{
-                "path": "/tmp/w/.plans/9905_input.md",
-                "content": "- [ ] T1: pending"
-            }]
-        })
-        .to_string();
-        let data = overflow_test_data_with(
+        let mut data = overflow_test_data(
             session,
-            Some("## What Remains\n\n- [ ] T2: verify build"),
-            context_json,
-            Some(vec![PathBuf::from("/tmp/w")]),
+            Some("## Summary\n\nDid the refactor.\n\n## What Remains\n\n- [ ] T2: verify build"),
         );
-        let input = build_phase2_reasoning_input(&data);
-        assert!(input.contains("previous thread's final summary"));
-        assert!(input.contains("T2: verify build"));
-        assert!(
-            input.contains("9905_input.md"),
-            "plan landscape must be included"
+        data.context_exceeds_limit = false;
+        match summary_continuation_fast_path(&data) {
+            Some(AutoPromptOutcome::Continue(action)) => {
+                assert!(
+                    !action.force_new_thread,
+                    "fast path continues in the same thread below the overflow gate"
+                );
+                assert_eq!(action.next_prompt, CONTINUE_REMAINS_DECISION);
+            }
+            other => panic!("expected Continue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn summary_fast_path_skipped_without_summary() {
+        // No summary at the last paragraph → fast path does not apply; the
+        // normal flow (orchestrator / Phase 1) owns the decision.
+        let session = "summary-fast-path-none-test";
+        clear_summary_for_session(session);
+        let mut data = overflow_test_data(session, Some("Working on the parser fix still."));
+        data.context_exceeds_limit = false;
+        assert!(summary_continuation_fast_path(&data).is_none());
+    }
+
+    #[test]
+    fn summary_fast_path_skipped_on_nothing_left() {
+        // Nothing-left summaries must NOT continue via the fast path — the
+        // normal flow owns stopping / housekeeping so chains terminate.
+        let session = "summary-fast-path-idle-test";
+        clear_summary_for_session(session);
+        let mut data = overflow_test_data(
+            session,
+            Some("## Summary\n\nAll done.\n\n## What Remains\n\nNothing left to do."),
         );
-        assert!(input.contains("Session work dirs: /tmp/w"));
+        data.context_exceeds_limit = false;
+        assert!(summary_continuation_fast_path(&data).is_none());
+    }
+
+    #[test]
+    fn summary_fast_path_skipped_on_overflow() {
+        // Overflowed threads route through the shared Phase 1/2 machine (fork
+        // with summary), never the same-thread fast path.
+        let session = "summary-fast-path-overflow-test";
+        clear_summary_for_session(session);
+        let mut data = overflow_test_data(
+            session,
+            Some("## Summary\n\nDid the refactor.\n\n## What Remains\n\n- [ ] T2: verify build"),
+        );
+        data.context_exceeds_limit = true;
+        assert!(summary_continuation_fast_path(&data).is_none());
     }
 
     #[test]
@@ -4570,81 +4442,6 @@ mod tests {
         assert_eq!(truncated.chars().count(), 3);
         assert!(text.starts_with(&truncated));
         assert!(truncated.is_char_boundary(truncated.len()));
-    }
-
-    #[gpui::test]
-    async fn test_reason_phase2_continuation_model_success(cx: &mut gpui::TestAppContext) {
-        let model =
-            std::sync::Arc::new(language_model::fake_provider::FakeLanguageModel::default());
-        let mut data = overflow_test_data(
-            "phase2-reason-model-test",
-            Some("## Summary\n\n## What Remains\n\n- [ ] T2: verify build"),
-        );
-        data.model = model.clone();
-        let task = cx.spawn(async move |cx| reason_phase2_continuation(&data, &cx).await);
-        cx.run_until_parked();
-        assert_eq!(model.completion_count(), 1, "one reasoning call expected");
-        model
-            .send_last_completion_stream_text_chunk("Continue with T2: verify build, then commit.");
-        model.end_last_completion_stream();
-        let result = task
-            .await
-            .expect("reasoning must produce a continuation on success");
-        assert_eq!(result, "Continue with T2: verify build, then commit.");
-    }
-
-    #[gpui::test]
-    async fn test_reason_phase2_continuation_model_error_falls_back(cx: &mut gpui::TestAppContext) {
-        let model =
-            std::sync::Arc::new(language_model::fake_provider::FakeLanguageModel::default());
-        let mut data = overflow_test_data(
-            "phase2-reason-model-err-test",
-            Some("## Summary\n\n## What Remains\n\n- [ ] T2: verify build"),
-        );
-        data.model = model.clone();
-        let task = cx.spawn(async move |cx| reason_phase2_continuation(&data, &cx).await);
-        cx.run_until_parked();
-        model.send_last_completion_stream_error(
-            language_model::LanguageModelCompletionError::Other(anyhow::anyhow!("rate limited",)),
-        );
-        model.end_last_completion_stream();
-        assert!(
-            task.await.is_none(),
-            "stream error must fall back to None (rule-based chain)"
-        );
-    }
-
-    #[gpui::test]
-    async fn test_phase2_reasoning_attempt_gating(cx: &mut gpui::TestAppContext) {
-        let model =
-            std::sync::Arc::new(language_model::fake_provider::FakeLanguageModel::default());
-        let config = crate::config::AutoPromptConfig::default();
-
-        // Phase 1 (state 0, no voluntary summary) — no reasoning call at all.
-        let session = "phase2-gate-phase1-test";
-        clear_summary_for_session(session);
-        let mut data = overflow_test_data(session, Some("Working on the parser fix still."));
-        data.model = model.clone();
-        let task =
-            cx.spawn(async move |cx| phase2_reasoning_attempt_with(&data, &config, &cx).await);
-        assert!(task.await.is_none(), "Phase 1 must not reason");
-        assert_eq!(model.completion_count(), 0, "no model call during Phase 1");
-
-        // Disabled in config — no call even when Phase 2 is imminent.
-        let session = "phase2-gate-off-test";
-        set_summary_state(session, 1);
-        let mut data = overflow_test_data(session, Some("## Summary\n\nDid the refactor."));
-        data.model = model.clone();
-        let disabled_config = crate::config::AutoPromptConfig {
-            reasoned_phase2_enabled: false,
-            ..Default::default()
-        };
-        let task = cx.spawn(async move |cx| {
-            phase2_reasoning_attempt_with(&data, &disabled_config, &cx).await
-        });
-        assert!(task.await.is_none(), "disabled flag must skip reasoning");
-        assert_eq!(model.completion_count(), 0, "no model call when disabled");
-        clear_summary_for_session(session);
     }
 
     #[test]
@@ -4686,8 +4483,9 @@ mod tests {
 
     #[test]
     fn context_overflow_phase2_plan_tasks_beat_nothing_left() {
-        // Priority chain: unclaimed current-repo plan tasks must win over a
-        // nothing-left summary — housekeeping only fires when no plans remain.
+        // Termination guard: unclaimed plan tasks must keep the chain on the
+        // fixed decision directive — housekeeping only fires when no plans
+        // remain anywhere (plan 027 keeps plan-tasks-beat-nothing-left).
         let session = "overflow-phase2-plan-wins-test";
         set_summary_state(session, 1);
         let summary =
@@ -4709,15 +4507,8 @@ mod tests {
         match context_overflow_outcome(&data) {
             AutoPromptOutcome::Continue(action) => {
                 assert!(
-                    action
-                        .next_prompt
-                        .contains("Plan files have remaining unchecked tasks"),
-                    "current-repo plan tasks must win over a nothing-left summary: {}",
-                    action.next_prompt
-                );
-                assert!(
-                    action.next_prompt.contains("9902_plan_wins.md"),
-                    "plan prompt must name the file: {}",
+                    action.next_prompt.contains(CONTINUE_REMAINS_DECISION),
+                    "remaining plan tasks must keep the chain on the fixed decision: {}",
                     action.next_prompt
                 );
                 assert!(
@@ -4733,8 +4524,9 @@ mod tests {
 
     #[test]
     fn context_overflow_phase2_nothing_left_other_repo_plan_fallback() {
-        // Priority chain tail: when no current-repo plans remain, other-repo
-        // plan tasks are consulted before housekeeping.
+        // Termination guard tail: when no current-repo plans remain, other-repo
+        // plan tasks still prevent housekeeping (chain continues on the fixed
+        // decision directive).
         let session = "overflow-phase2-other-repo-test";
         set_summary_state(session, 1);
         let summary =
@@ -4756,8 +4548,8 @@ mod tests {
         match context_overflow_outcome(&data) {
             AutoPromptOutcome::Continue(action) => {
                 assert!(
-                    action.next_prompt.contains("9903_other_repo.md"),
-                    "other-repo plan tasks must be picked up before housekeeping: {}",
+                    action.next_prompt.contains(CONTINUE_REMAINS_DECISION),
+                    "other-repo plan tasks must keep the chain on the fixed decision: {}",
                     action.next_prompt
                 );
                 assert!(

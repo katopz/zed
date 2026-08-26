@@ -135,8 +135,18 @@ impl KeyHealthTracker {
     /// Marks `slot` as the one currently being attempted, so the UI can show
     /// which key an in-flight turn is using. Called from `retry_stream` right
     /// after `select_from_candidates` picks a key — before the attempt resolves.
+    /// Also serves as the session-sticky pick for `select_from_candidates`
+    /// (same-thread cache affinity).
     pub fn record_attempt(&mut self, slot: KeySlot) {
         self.last_used_slot = Some(slot);
+    }
+
+    /// Clears the session-sticky pick so the next `select_from_candidates`
+    /// re-randomizes among the healthy spares. Called when a new agent thread
+    /// starts (`LanguageModel::reset_key_session`) — a new thread re-rolls its
+    /// key instead of inheriting the previous thread's pick.
+    pub fn reset_session(&mut self) {
+        self.last_used_slot = None;
     }
 
     /// Toggles the user-controlled `enabled` flag on a slot. Does not touch the
@@ -449,14 +459,16 @@ pub fn schedule_persist_key_health_inner(
 
 /// Soft cap on backoff. After this duration since the last failure the key is
 /// automatically selectable again — no explicit "clear" path is needed.
-pub const BACKOFF_MAX: Duration = Duration::from_secs(5 * 60 * 60);
+/// 1h (plan 027): the 5h window kept recovered keys out of rotation for hours;
+/// new-thread probing (`reset_key_session`) now clears stale backoffs eagerly,
+/// so a long cap buys nothing.
+pub const BACKOFF_MAX: Duration = Duration::from_secs(60 * 60);
 
 /// Base unit for the exponential schedule.
 pub const BACKOFF_BASE: Duration = Duration::from_secs(30);
 
-/// Computes an exponential backoff with jitter. The 5-hour cap is the
-/// dominant constraint regardless of how large `failures` gets, matching the
-/// user requirement of "remove backoff after 5 hours for each key".
+/// Computes an exponential backoff with jitter. The 1-hour cap is the
+/// dominant constraint regardless of how large `failures` gets.
 ///
 /// Jitter factor is in `[0.5, 1.5)` to avoid the thundering-herd case where
 /// all keys fail at the same instant and would otherwise all unblock together.
@@ -546,27 +558,25 @@ pub fn is_backoff_worthy(err: &LanguageModelCompletionError) -> bool {
 /// in `stream_completion` / `stream_response`, which has already snapshot the
 /// candidate list and cannot go back through `&self`.
 ///
-/// Selection policy (**priority-first** with hourly fallback):
+/// Selection policy (**priority-first**, session-sticky, random spares):
 ///
 /// 1. Build `healthy` = present + `enabled` + not in backoff.
-/// 2. If `Primary` is healthy, return it. This makes Primary "sticky" — it
-///    gets used for the entire wall-clock hour (and across hours, days, …)
-///    *until it actually fails*, which keeps the upstream prompt cache keyed
-///    on Primary continuously hot. Other configured keys are spares, not
-///    load-balanced peers.
-/// 3. Otherwise (Primary is absent / disabled / backed off) pick among the
-///    remaining healthy candidates via `deterministic_hourly_pick` so the
-///    same spare key is used for the whole hour — again cache-friendly.
-/// 4. If no healthy candidate exists, fall back to the earliest-expiring
+/// 2. If `Primary` is healthy, return it. K1 is always used while available —
+///    its upstream prompt cache stays continuously hot. Other configured
+///    keys are spares, not load-balanced peers.
+/// 3. Otherwise, if the session-sticky pick (`last_used_slot`) is still
+///    healthy, reuse it — the same thread keeps hitting the same key so its
+///    prompt cache stays active. Cleared by `reset_session()` when a new
+///    agent thread starts.
+/// 4. Otherwise pick a **random** healthy candidate (plan 027: replaces the
+///    old wall-clock hourly rotation). Random-per-session instead of
+///    time-bound. Inside `retry_stream` the just-failed slot is no longer
+///    healthy, so a retry naturally re-randomizes over the available keys.
+/// 5. If no healthy candidate exists, fall back to the earliest-expiring
 ///    backoff among **enabled** slots. Disabled slots are never picked even
 ///    in fail-open (a disabled slot is a hard user opt-out, distinct from a
 ///    transient backoff). Failing open on backoff is strictly better than
 ///    `NoApiKey` when at least one enabled key exists.
-///
-/// `deterministic_hourly_pick` rotates by `floor(now_unix_secs / 3600) %
-/// healthy.len()` so the same key is used for the whole wall-clock hour. This
-/// is cache-friendly: most upstream providers key their prompt cache on the
-/// API key, and random per-request rotation would thrash the cache.
 pub fn select_from_candidates(
     candidates: &[(Arc<str>, KeySlot)],
     health: &KeyHealthTracker,
@@ -584,8 +594,8 @@ pub fn select_from_candidates(
         .cloned()
         .collect();
 
-    // Sticky Primary: while Primary is healthy, always use it so its upstream
-    // prompt cache stays hot. Other slots are spares.
+    // Sticky Primary: while K1 is healthy it always wins (req: "K1 is always
+    // used if available").
     if let Some(pick) = healthy
         .iter()
         .find(|(_, slot)| *slot == KeySlot::Primary)
@@ -594,8 +604,20 @@ pub fn select_from_candidates(
         return Some(pick);
     }
 
-    // Primary unavailable — hourly-rotate across whatever else is healthy.
-    if let Some(pick) = deterministic_hourly_pick(&healthy) {
+    // Session affinity: keep the key this thread-chain already used while it
+    // stays healthy — same thread, same key, hot prompt cache.
+    if let Some(last_used) = health.last_used_slot
+        && let Some(pick) = healthy
+            .iter()
+            .find(|(_, slot)| *slot == last_used)
+            .cloned()
+    {
+        return Some(pick);
+    }
+
+    // Fresh session (or the sticky pick went unhealthy): random among the
+    // remaining healthy spares.
+    if let Some(pick) = random_pick(&healthy) {
         return Some(pick);
     }
 
@@ -614,23 +636,15 @@ pub fn select_from_candidates(
         .map(|((key, slot), _)| (key, slot))
 }
 
-/// Picks a candidate by the current wall-clock hour so the same key is used
-/// for the whole hour (cache-friendly). Returns `None` for an empty list.
-fn deterministic_hourly_pick(
-    healthy: &[(Arc<str>, KeySlot)],
-) -> Option<(Arc<str>, KeySlot)> {
+/// Picks a uniformly random candidate. Returns `None` for an empty list.
+/// Random (not wall-clock hourly) per plan 027: a new thread re-rolls its
+/// spare key instead of inheriting a time-slot, while same-thread stickiness
+/// is provided by `last_used_slot` affinity in `select_from_candidates`.
+fn random_pick(healthy: &[(Arc<str>, KeySlot)]) -> Option<(Arc<str>, KeySlot)> {
     if healthy.is_empty() {
         return None;
     }
-    // Wall-clock hour since UNIX_EPOCH. `SystemTime` (not `Instant`) because
-    // the rotation must align across process boundaries and restarts — a
-    // process-local monotonic clock would desync the schedule.
-    let unix_secs = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let hour = (unix_secs / 3600) as usize;
-    let idx = hour % healthy.len();
+    let idx = rand::rng().random_range(0..healthy.len());
     Some(healthy[idx].clone())
 }
 
@@ -1005,9 +1019,12 @@ mod tests {
     }
 
     #[test]
-    fn select_from_candidates_falls_through_to_hourly_when_primary_backed_off() {
-        // When Primary is in backoff, the remaining healthy slots should be
-        // hourly-rotated (deterministic within an hour).
+    fn select_from_candidates_random_among_healthy_when_primary_backed_off() {
+        // When Primary is in backoff and no session pick exists, selection is a
+        // RANDOM healthy spare (plan 027) — not a fixed time-slot. Every pick
+        // must belong to the healthy set; over many rolls at least two distinct
+        // spares should appear (probability of a single distinct pick over 40
+        // rolls with 2 healthy spares is 2·(1/2)^40 ≈ 0).
         let candidates: Vec<(Arc<str>, KeySlot)> = vec![
             (Arc::<str>::from("key-a"), KeySlot::Primary),
             (Arc::<str>::from("key-b"), KeySlot::Secondary),
@@ -1016,23 +1033,93 @@ mod tests {
         let mut health = KeyHealthTracker::default();
         health.record_failure(KeySlot::Primary, Instant::now());
         let now = Instant::now();
-        // Many calls within the same wall-clock hour must all resolve to the
-        // SAME spare slot (deterministic_hourly_pick picks one index for the hour).
-        let mut seen_slots: Vec<KeySlot> = Vec::new();
-        for _ in 0..20 {
+        let mut saw_secondary = false;
+        let mut saw_tertiary = false;
+        for _ in 0..40 {
             let (_, slot) = select_from_candidates(&candidates, &health, now).unwrap();
             assert_ne!(slot, KeySlot::Primary, "backed-off Primary must never be picked");
-            seen_slots.push(slot);
+            match slot {
+                KeySlot::Secondary => saw_secondary = true,
+                KeySlot::Tertiary => saw_tertiary = true,
+                other => panic!("pick must be a healthy spare, got {other:?}"),
+            }
         }
-        // Deterministic hourly pick selects the SAME index for the whole hour,
-        // so 20 calls in a row must all have resolved to one slot.
-        let distinct = {
-            let mut dedup = seen_slots.clone();
-            dedup.dedup();
-            dedup.len()
-        };
-        assert_eq!(distinct, 1,
-            "hourly rotation should be deterministic within one hour, got {seen_slots:?}");
+        assert!(
+            saw_secondary && saw_tertiary,
+            "random pick should vary across rolls (secondary={saw_secondary}, tertiary={saw_tertiary})"
+        );
+    }
+
+    #[test]
+    fn select_from_candidates_sticks_to_session_pick_while_healthy() {
+        // Same-thread cache affinity: once a spare has been used
+        // (`record_attempt`), subsequent selections keep returning it while it
+        // stays healthy — the prompt cache on that key stays hot.
+        let candidates: Vec<(Arc<str>, KeySlot)> = vec![
+            (Arc::<str>::from("key-a"), KeySlot::Primary),
+            (Arc::<str>::from("key-b"), KeySlot::Secondary),
+            (Arc::<str>::from("key-c"), KeySlot::Tertiary),
+        ];
+        let mut health = KeyHealthTracker::default();
+        health.record_failure(KeySlot::Primary, Instant::now());
+        health.record_attempt(KeySlot::Tertiary);
+        let now = Instant::now();
+        for _ in 0..20 {
+            let (key, slot) = select_from_candidates(&candidates, &health, now).unwrap();
+            assert_eq!(slot, KeySlot::Tertiary, "session pick must be sticky while healthy");
+            assert_eq!(&*key, "key-c");
+        }
+    }
+
+    #[test]
+    fn select_from_candidates_re_randomizes_after_session_reset() {
+        // New thread: `reset_session` clears the sticky pick, so selection
+        // re-rolls across the healthy spares instead of inheriting the old key.
+        let candidates: Vec<(Arc<str>, KeySlot)> = vec![
+            (Arc::<str>::from("key-a"), KeySlot::Primary),
+            (Arc::<str>::from("key-b"), KeySlot::Secondary),
+            (Arc::<str>::from("key-c"), KeySlot::Tertiary),
+            (Arc::<str>::from("key-d"), KeySlot::Quaternary),
+        ];
+        let mut health = KeyHealthTracker::default();
+        health.record_failure(KeySlot::Primary, Instant::now());
+        health.record_attempt(KeySlot::Secondary);
+        health.reset_session();
+        assert_eq!(health.last_used_slot, None);
+        let now = Instant::now();
+        let mut distinct: Vec<KeySlot> = Vec::new();
+        for _ in 0..60 {
+            let (_, slot) = select_from_candidates(&candidates, &health, now).unwrap();
+            if !distinct.contains(&slot) {
+                distinct.push(slot);
+            }
+        }
+        assert!(
+            distinct.len() >= 2,
+            "after reset the pick should re-roll across spares, got {distinct:?}"
+        );
+    }
+
+    #[test]
+    fn select_from_candidates_drops_session_pick_that_goes_unhealthy() {
+        // The sticky pick only applies while healthy: once it enters backoff
+        // (e.g. it failed and retry_stream rotates), selection moves on to
+        // another healthy spare.
+        let candidates: Vec<(Arc<str>, KeySlot)> = vec![
+            (Arc::<str>::from("key-a"), KeySlot::Primary),
+            (Arc::<str>::from("key-b"), KeySlot::Secondary),
+            (Arc::<str>::from("key-c"), KeySlot::Tertiary),
+        ];
+        let mut health = KeyHealthTracker::default();
+        health.record_failure(KeySlot::Primary, Instant::now());
+        health.record_failure(KeySlot::Secondary, Instant::now());
+        // last_used_slot points at the now-backed-off Secondary.
+        health.record_attempt(KeySlot::Secondary);
+        let now = Instant::now();
+        for _ in 0..10 {
+            let (_, slot) = select_from_candidates(&candidates, &health, now).unwrap();
+            assert_eq!(slot, KeySlot::Tertiary, "unhealthy session pick must be skipped");
+        }
     }
 
     #[test]
@@ -1392,8 +1479,10 @@ mod tests {
         assert_eq!(format_backoff_remaining(Duration::from_secs(3900)), "1h 5m");
         // Exactly one hour
         assert_eq!(format_backoff_remaining(Duration::from_secs(3600)), "1h 0m");
-        // The 5h cap
-        assert_eq!(format_backoff_remaining(BACKOFF_MAX), "5h 0m");
+        // The 1h cap (plan 027)
+        assert_eq!(format_backoff_remaining(BACKOFF_MAX), "1h 0m");
+        // Durations past the cap still format correctly if ever displayed.
+        assert_eq!(format_backoff_remaining(Duration::from_secs(5 * 3600)), "5h 0m");
     }
 
     // ------------------------------------------------------------------

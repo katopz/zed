@@ -171,6 +171,18 @@ pub trait LanguageModel: Send + Sync {
     /// for providers that don't rotate keys.
     fn set_key_slot_enabled(&self, _slot_index: usize, _enabled: bool, _cx: &mut App) {}
 
+    /// Starts a new key-selection session for multi-key providers: clears the
+    /// session-sticky pick (so the next request re-randomizes among the healthy
+    /// keys instead of inheriting the previous thread's key) and probes every
+    /// configured key — including backed-off ones — in the background, clearing
+    /// stale backoffs when the upstream reports the key healthy again.
+    ///
+    /// Called when a new agent thread starts, so prompt-cache affinity resets
+    /// per thread and backoff state is re-verified against reality before the
+    /// first turn picks a key. Default no-op for providers that don't rotate
+    /// keys.
+    fn reset_key_session(&self, _cx: &App) {}
+
     /// Information about the cost of using this model, if available.
     fn model_cost_info(&self) -> Option<LanguageModelCostInfo> {
         None

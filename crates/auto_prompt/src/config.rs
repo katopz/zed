@@ -93,14 +93,6 @@ pub struct AutoPromptConfig {
     #[serde(default = "default_watchdog_enabled")]
     pub watchdog_enabled: bool,
 
-    /// Whether Phase 2 (context-overflow continuation) prompts are authored
-    /// by an LLM reasoning pass over the summary (default) instead of the
-    /// deterministic rule-based chain. The rule-based chain always remains
-    /// as the fallback when the reasoning call fails, times out, or is
-    /// disabled here — overflow must never get more stuck than without it.
-    #[serde(default = "default_reasoned_phase2_enabled")]
-    pub reasoned_phase2_enabled: bool,
-
     /// Whether decision-form elicitations (`ask_user` / ACP session
     /// elicitation) are auto-answered on threads whose auto-prompt is
     /// enabled: an LLM reasoning pass picks the option (with a one-line
@@ -180,10 +172,6 @@ fn default_housekeeping_command() -> Option<String> {
     Some("housekeeping".to_string())
 }
 
-fn default_reasoned_phase2_enabled() -> bool {
-    true
-}
-
 fn default_elicitation_auto_answer_enabled() -> bool {
     true
 }
@@ -207,7 +195,6 @@ impl Default for AutoPromptConfig {
             watchdog_enabled: default_watchdog_enabled(),
             claude_context_overflow_tokens: default_claude_context_overflow_tokens(),
             housekeeping_command: default_housekeeping_command(),
-            reasoned_phase2_enabled: default_reasoned_phase2_enabled(),
             elicitation_auto_answer_enabled: default_elicitation_auto_answer_enabled(),
             elicitation_countdown_secs: default_elicitation_countdown_secs(),
         }
@@ -323,11 +310,6 @@ impl AutoPromptConfig {
             Err(_) => default_housekeeping_command(),
         };
 
-        let reasoned_phase2_enabled = std::env::var("ZED_AUTO_PROMPT_REASONED_PHASE2_ENABLED")
-            .ok()
-            .map(|v| !matches!(v.as_str(), "0" | "false"))
-            .unwrap_or_else(default_reasoned_phase2_enabled);
-
         let elicitation_auto_answer_enabled =
             std::env::var("ZED_AUTO_PROMPT_ELICITATION_AUTO_ANSWER_ENABLED")
                 .ok()
@@ -353,7 +335,6 @@ impl AutoPromptConfig {
             watchdog_enabled,
             claude_context_overflow_tokens,
             housekeeping_command,
-            reasoned_phase2_enabled,
             elicitation_auto_answer_enabled,
             elicitation_countdown_secs,
         }
@@ -425,14 +406,6 @@ mod tests {
             zeroed.effective_claude_context_overflow_tokens(),
             zeroed.max_context_tokens
         );
-    }
-
-    #[test]
-    fn reasoned_phase2_defaults_to_enabled() {
-        // The LLM reasoning pass is the default Phase 2 author; the
-        // rule-based chain is the fallback (and the flag-off mode).
-        assert!(default_reasoned_phase2_enabled());
-        assert!(AutoPromptConfig::default().reasoned_phase2_enabled);
     }
 
     #[test]

@@ -463,6 +463,20 @@ pub(crate) fn dispatch_action(
         action.actual_input_tokens
     );
 
+    // Plan 027: a new thread starts a fresh key-selection session on
+    // multi-key providers — clear the session-sticky pick (the new thread
+    // re-randomizes among healthy keys instead of inheriting this thread's
+    // key) and re-probe every configured key (including backed-off ones) so
+    // stale backoffs clear before the first turn picks a key. No-op for
+    // single-key providers (Claude/ACP, cloud, local).
+    if let Some(model) = conversation_view
+        .active_thread()
+        .and_then(|tv| tv.read(cx).as_native_thread(cx))
+        .and_then(|native_thread| native_thread.read(cx).model().cloned())
+    {
+        model.reset_key_session(cx);
+    }
+
     let decision_prompt = auto_prompt::extract_decision_prompt(&action.next_prompt);
 
     // Plan 023 B3 (req 2.1): carry the user's input-box draft into the new
