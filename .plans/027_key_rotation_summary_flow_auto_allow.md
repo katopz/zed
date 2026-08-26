@@ -119,6 +119,28 @@
   `test_watchdog_does_not_fire_during_active_stream`) reproduce identically on
   clean HEAD (verified via temp worktree) — pre-existing, not from this plan.
 
+## Follow-up: pre-existing failures fixed (commit `61d9947e23`)
+
+Both failures flagged above (tracked as issue 015) are fixed and the issue
+removed:
+
+- `test_close_session_returns_error_when_unsupported` — the
+  `StubAgentConnection::close_session` stub returned `Ok` even when
+  `supports_close_session()` was false, violating the `AgentConnection`
+  contract (default impl returns `Err`). The stub now gates on the
+  capability flag, mirroring `load_session`.
+- `test_watchdog_does_not_fire_during_active_stream` (+
+  `test_watchdog_halts_stuck_thread`, which flaked in the opposite
+  direction) — root cause was NOT the fake clock: both tests mutated the
+  process-global `ZED_AUTO_PROMPT_WATCHDOG_*` env vars, and parallel test
+  threads in one binary race their config loads against a sibling's
+  `set_var` (via the shared `CACHED_CONFIG` static), arming the wrong
+  timeout (1s vs 2s). Reproduced 5/8 parallel runs pre-fix. Fix: per-app
+  `WatchdogConfigOverride` GPUI global consulted by `start_watchdog` —
+  per-test state, no process globals. Post-fix: 12/12 parallel watchdog
+  runs green, full `agent_ui` suite 465/465 twice, `acp_thread` 124/124,
+  `auto_prompt hidden_thread` 12/12.
+
 ## Notes / deviations
 
 - Same-thread no-summary case keeps the orchestrator flow instead of forcing a
