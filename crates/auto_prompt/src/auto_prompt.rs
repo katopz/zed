@@ -13,6 +13,7 @@ pub mod lightweight_context;
 pub mod peer_states;
 mod pending_question;
 pub mod plan_registry;
+mod plan_source;
 pub mod session_limit;
 pub mod watchdog;
 
@@ -1075,7 +1076,10 @@ pub fn decide(
         DecidePrecheck::Proceed(pre) => pre,
     };
     let inputs = context_file_inputs(&thread.read(cx), cx);
-    let plan_files = read_plan_files(&inputs);
+    // Main thread, no executor handle for an async read here: serve the
+    // last origin snapshot when fresh, otherwise the worktree fallback.
+    // The primary dispatch path (decide_async) keeps the cache warm.
+    let plan_files = read_plan_files_cached(&inputs);
     let doc_files = read_doc_files(inputs.work_dirs.as_deref().unwrap_or_default());
     decide_finish(thread, stop_reason, *pre, inputs, plan_files, doc_files, cx)
 }
@@ -1083,7 +1087,9 @@ pub fn decide(
 /// Non-blocking variant of [`decide`]: the `.plans/`/`.docs/` reads (up to 10
 /// × 100KB files plus directory scans) run on a background executor so the UI
 /// thread stays responsive; everything needing `&App` still runs on the main
-/// thread. Behavior is identical to the sync path.
+/// thread. Behavior is identical to the sync path, except plan files are
+/// sourced from origin's remote-tracking refs (with a gated `git fetch
+/// origin` first — see `plan_source`), never the possibly-dirty working tree.
 pub async fn decide_async(
     thread: gpui::Entity<acp_thread::AcpThread>,
     used_tools: bool,
@@ -1096,12 +1102,16 @@ pub async fn decide_async(
     };
     let inputs = cx.update(|cx| context_file_inputs(&thread.read(cx), cx));
     let bg_inputs = inputs.clone();
+    let executor = cx.background_executor().clone();
     let (plan_files, doc_files) = cx
         .background_executor()
         .spawn(async move {
             let work_dirs = bg_inputs.work_dirs.as_deref().unwrap_or_default();
             let doc_files = read_doc_files(work_dirs);
-            let plan_files = read_plan_files(&bg_inputs);
+            // Background thread: refresh remote-tracking refs via a gated
+            // `git fetch origin`, then read plans from them — never from the
+            // possibly-dirty working tree.
+            let plan_files = read_plan_files(&bg_inputs, Some(&executor)).await;
             (plan_files, doc_files)
         })
         .await;
@@ -2540,82 +2550,134 @@ pub(crate) fn plan_inputs_without_message(thread: &acp_thread::AcpThread) -> Con
     }
 }
 
-pub(crate) fn read_plan_files(inputs: &ContextFileInputs) -> Vec<PlanFileContent> {
-    log::info!("[auto_prompt::read_plan_files] Starting to read plan files");
+/// Read plan files for the dispatcher.
+///
+/// Canonical source is origin's remote-tracking refs (`plan_source`): a
+/// dirty sibling-branch checkout or untracked WIP must never feed the
+/// dispatcher stale plan contents. Per file, the ref where the file was last
+/// touched wins (`origin/develop` vs `origin/main` vs …), so a hotfix that
+/// only landed on one branch is seen even when another branch's tip is
+/// newer. The worktree is only a fallback for repos without origin-published
+/// plans (non-git dirs, no remote, nothing pushed yet).
+///
+/// `fetch_executor` supplies the timer bounding the gated `git fetch
+/// origin` — pass `Some` only from background-thread callers; `None` resolves
+/// against local remote-tracking refs without fetching.
+pub(crate) async fn read_plan_files(
+    inputs: &ContextFileInputs,
+    fetch_executor: Option<&gpui::BackgroundExecutor>,
+) -> Vec<PlanFileContent> {
+    log::info!(
+        "[auto_prompt::read_plan_files] Reading plan files (origin refs, fetch={})",
+        fetch_executor.is_some()
+    );
 
     let Some(work_dirs) = inputs.work_dirs.as_deref() else {
         log::info!("[auto_prompt::read_plan_files] No work directories configured");
         return Vec::new();
     };
     let session_id = inputs.session_id.to_string();
-    let first_user_message = inputs.first_user_message.as_deref();
 
     let mut plan_files = Vec::new();
 
     for work_dir in work_dirs {
-        let plan_dir_candidates = [work_dir.join(".plan"), work_dir.join(".plans")];
-        let Some(plan_dir) = plan_dir_candidates.iter().find(|d| d.is_dir()) else {
+        let origin_files = plan_source::origin_plan_files(work_dir, fetch_executor).await;
+        let candidates = origin_candidates(&origin_files, work_dir);
+        push_unclaimed(candidates, &session_id, &mut plan_files);
+    }
+
+    finalize_plan_files(&mut plan_files, inputs.first_user_message.as_deref())
+}
+
+/// Synchronous variant for main-thread callers (the Claude parity paths): a
+/// TTL-fresh origin snapshot when [`warm_plan_snapshots`] ran, otherwise the
+/// worktree fallback. Never spawns git.
+pub(crate) fn read_plan_files_cached(inputs: &ContextFileInputs) -> Vec<PlanFileContent> {
+    log::info!("[auto_prompt::read_plan_files] Reading plan files (cached origin refs)");
+
+    let Some(work_dirs) = inputs.work_dirs.as_deref() else {
+        log::info!("[auto_prompt::read_plan_files] No work directories configured");
+        return Vec::new();
+    };
+    let session_id = inputs.session_id.to_string();
+
+    let mut plan_files = Vec::new();
+
+    for work_dir in work_dirs {
+        let cached = plan_source::cached_origin_plan_files(work_dir);
+        let candidates = match cached {
+            Some(origin_files) if !origin_files.is_empty() => {
+                origin_candidates(&origin_files, work_dir)
+            }
+            _ => read_plan_dir_from_worktree(work_dir),
+        };
+        push_unclaimed(candidates, &session_id, &mut plan_files);
+    }
+
+    finalize_plan_files(&mut plan_files, inputs.first_user_message.as_deref())
+}
+
+/// Background-refresh the origin plan snapshots for these work dirs so the
+/// synchronous Claude parity reads see canonical origin contents. Bounded by
+/// the per-repo fetch gate (60s) and the 10s fetch timeout.
+pub fn warm_plan_snapshots(
+    work_dirs: Vec<std::path::PathBuf>,
+    executor: gpui::BackgroundExecutor,
+) -> gpui::Task<()> {
+    let inner = executor.clone();
+    executor.spawn(async move {
+        for work_dir in work_dirs {
+            plan_source::origin_plan_files(&work_dir, Some(&inner)).await;
+        }
+    })
+}
+
+/// Map origin files to (abs path, content) pairs, or fall back to the
+/// worktree when origin carries nothing for this dir.
+fn origin_candidates(
+    origin_files: &Arc<Vec<plan_source::OriginPlanFile>>,
+    work_dir: &std::path::Path,
+) -> Vec<(String, String)> {
+    if origin_files.is_empty() {
+        return read_plan_dir_from_worktree(work_dir);
+    }
+    for file in origin_files.iter() {
+        log::info!(
+            "[auto_prompt::read_plan_files] origin: {} @ {} (blob {})",
+            file.rel_path,
+            file.ref_name,
+            &file.blob[..file.blob.len().min(7)]
+        );
+    }
+    origin_files
+        .iter()
+        .map(|file| (file.abs_path.clone(), file.content.clone()))
+        .collect()
+}
+
+/// Claim-filtered merge into `plan_files`.
+fn push_unclaimed(
+    candidates: Vec<(String, String)>,
+    session_id: &str,
+    plan_files: &mut Vec<PlanFileContent>,
+) {
+    for (path_str, content) in candidates {
+        if plan_registry::is_claimed_by_other(&path_str, session_id) {
             log::info!(
-                "[auto_prompt::read_plan_files] Neither .plan/ nor .plans/ directory exists in {}",
-                work_dir.display()
+                "[auto_prompt::read_plan_files] Skipping plan claimed by another agent: {path_str}"
             );
             continue;
-        };
-        log::info!(
-            "[auto_prompt::read_plan_files] Found plan directory: {}",
-            plan_dir.display()
-        );
-
-        let entries = match std::fs::read_dir(plan_dir) {
-            Ok(entries) => entries,
-            Err(err) => {
-                log::warn!(
-                    "[auto_prompt::read_plan_files] Cannot read directory {}: {err}",
-                    plan_dir.display()
-                );
-                continue;
-            }
-        };
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-
-            let metadata = match std::fs::metadata(&path) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            if metadata.len() > 100_000 {
-                log::debug!(
-                    "auto_prompt: skipping large plan file ({} bytes): {}",
-                    metadata.len(),
-                    path.display()
-                );
-                continue;
-            }
-
-            let path_str = path.to_string_lossy().to_string();
-            if plan_registry::is_claimed_by_other(&path_str, &session_id) {
-                log::info!(
-                    "[auto_prompt::read_plan_files] Skipping plan claimed by another agent: {}",
-                    path_str
-                );
-                continue;
-            }
-
-            let content = match std::fs::read_to_string(&path) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-
-            plan_files.push(PlanFileContent {
-                path: path_str,
-                content,
-            });
         }
+        plan_files.push(PlanFileContent { path: path_str, content });
     }
+}
+
+/// Sort/filter/truncate rules shared by both readers: active-project first,
+/// incomplete plans from other projects, newest-first within groups, cap 10.
+fn finalize_plan_files(
+    plan_files: &mut Vec<PlanFileContent>,
+    first_user_message: Option<&str>,
+) -> Vec<PlanFileContent> {
 
     // Identify active project from first user message.
     // This prioritizes the session's target project over other workspace projects.
@@ -2673,7 +2735,62 @@ pub(crate) fn read_plan_files(inputs: &ContextFileInputs) -> Vec<PlanFileContent
         log::info!("[auto_prompt::read_plan_files] No plan files found in any .plan directory");
     }
 
-    plan_files
+    std::mem::take(plan_files)
+}
+
+/// Worktree fallback for one work dir — the historical read behavior, kept
+/// for repos whose origin carries no plan entries. Claim filtering happens
+/// in the caller so both sources share one code path.
+fn read_plan_dir_from_worktree(work_dir: &std::path::Path) -> Vec<(String, String)> {
+    let plan_dir_candidates = [work_dir.join(".plan"), work_dir.join(".plans")];
+    let Some(plan_dir) = plan_dir_candidates.iter().find(|d| d.is_dir()) else {
+        log::info!(
+            "[auto_prompt::read_plan_files] Neither .plan/ nor .plans/ directory exists in {}",
+            work_dir.display()
+        );
+        return Vec::new();
+    };
+    log::info!(
+        "[auto_prompt::read_plan_files] Found plan directory (worktree fallback): {}",
+        plan_dir.display()
+    );
+
+    let entries = match std::fs::read_dir(plan_dir) {
+        Ok(entries) => entries,
+        Err(err) => {
+            log::warn!(
+                "[auto_prompt::read_plan_files] Cannot read directory {}: {err}",
+                plan_dir.display()
+            );
+            return Vec::new();
+        }
+    };
+
+    let mut files = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+
+        let metadata = match std::fs::metadata(&path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if metadata.len() > 100_000 {
+            log::debug!(
+                "auto_prompt: skipping large plan file ({} bytes): {}",
+                metadata.len(),
+                path.display()
+            );
+            continue;
+        }
+
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            files.push((path.to_string_lossy().to_string(), content));
+        }
+    }
+    files
 }
 
 fn read_doc_files(work_dirs: &[std::path::PathBuf]) -> Vec<String> {

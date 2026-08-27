@@ -788,6 +788,20 @@ fn run_auto_prompt(
     Some(cx.spawn_in(window, async move |_view, cx| {
         let decision = if is_claude_agent_for_task {
             log::info!("[auto_prompt] Claude agent detected — using claude_agent::decide_claude");
+            // Warm the origin plan snapshots off-thread before the synchronous
+            // decide_claude read, so it never falls back to a possibly-dirty
+            // sibling worktree. Bounded by the per-repo fetch gate (60s) and
+            // the 10s fetch timeout; a warm cache makes this a no-op.
+            let work_dirs = cx
+                .update(|_window, cx| {
+                    thread.read(cx).work_dirs().map(|pl| pl.paths().to_vec())
+                })
+                .ok()
+                .flatten();
+            if let Some(work_dirs) = work_dirs {
+                auto_prompt::warm_plan_snapshots(work_dirs, cx.background_executor().clone())
+                    .await;
+            }
             cx.update(|_window, cx| {
                 auto_prompt::claude_agent::decide_claude(&thread, used_tools, &stop_reason, cx)
             })

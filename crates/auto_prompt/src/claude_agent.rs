@@ -401,7 +401,7 @@ fn claude_context_overflow_decision(
     let title = thread_ref.title().map(|t| t.to_string());
     let work_dirs = thread_ref.work_dirs().map(|pl| pl.paths().to_vec());
     let last_assistant_message = thread_ref.last_assistant_message_text(cx);
-    let plan_files = crate::read_plan_files(&crate::plan_inputs_without_message(thread_ref));
+    let plan_files = crate::read_plan_files_cached(&crate::plan_inputs_without_message(thread_ref));
 
     // Shape matches what `detect_remaining_plan_tasks` parses, so Phase 2's
     // plan-task fallback works on this path too.
@@ -564,12 +564,14 @@ fn claude_decision_hidden(
 
     let project = thread.read(cx).project().clone();
 
-    // Read plan files from disk (same as the native-agent path) so the
-    // hidden orchestrator can see unchecked tasks. Without this, a worker
+    // Read plan files (same as the native-agent path) so the hidden
+    // orchestrator can see unchecked tasks. Without this, a worker
     // that emits a completion summary with `[ ]` items still in the plan
     // looks "done" — the orchestrator has no signal that work remains.
     // See .plans/014_claude_offscreen_orchestrator.md (context-parity fix).
-    let plan_files = crate::read_plan_files(&crate::plan_inputs_without_message(&thread.read(cx)));
+    // Synchronous main-thread read: serves the prewarmed origin snapshot.
+    let plan_files =
+        crate::read_plan_files_cached(&crate::plan_inputs_without_message(&thread.read(cx)));
     let stop_phase = compute_claude_stop_phase();
 
     let context_json = serde_json::json!({
