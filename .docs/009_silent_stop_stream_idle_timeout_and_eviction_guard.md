@@ -53,6 +53,19 @@ GPUI timer, recreated each iteration:
   so nothing is lost. After retries exhaust: `send_error` → visible error
   entry in the thread + "Agent stopped due to an error" notification, and
   agent_ui's error arm can chain auto_prompt.
+  **Follow-up (2026-08-28):** user report showed the provider hang outlasting
+  that budget — the turn died with a visible `stream idle timeout` error while
+  a later *manual* Retry click (fresh turn, reset budget) succeeded. Idle
+  timeouts now carry a typed payload (`Thread::StreamIdleTimeout`, no string
+  matching) and `retry_strategy_for` grants them `Fixed { delay: 30s,
+  max_attempts: 4 }` (MAX_RETRY_ATTEMPTS) instead of the `Other(..)` fallback:
+  ~12 min of automatic recovery (5 attempts × 120s idle + 4 × 30s delays)
+  before the error surfaces, mirroring what the manual retry button did by
+  hand. Applies to the main turn loop and `stream_compaction` (shared retry
+  path). Regression tests:
+  `test_stream_idle_timeout_recovers_mid_retry_cascade` (hang, hang, recover →
+  turn completes with no error), plus the two exhaustion tests updated to the
+  5-attempt cascade.
 - Pending tool results + hung stream: the timer re-arms every iteration until
   tools finish, then the timeout applies. No false positives on long tools.
 

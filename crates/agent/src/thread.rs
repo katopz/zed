@@ -168,6 +168,28 @@ impl std::fmt::Display for PromptId {
 
 pub(crate) const MAX_RETRY_ATTEMPTS: u8 = 4;
 pub(crate) const BASE_RETRY_DELAY: Duration = Duration::from_secs(5);
+/// Delay between retries of a stream idle timeout. Longer than
+/// `BASE_RETRY_DELAY` because the provider hang that caused the silent
+/// stream typically outlasts a few seconds.
+const STREAM_IDLE_RETRY_DELAY: Duration = Duration::from_secs(30);
+
+/// Payload of the `LanguageModelCompletionError::Other` raised when a stream
+/// goes silent past `agent.stream_idle_timeout_secs`. Typed so the retry
+/// strategy can grant it a longer budget than other `Other(..)` errors
+/// without string matching.
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub(crate) struct StreamIdleTimeout {
+    message: String,
+}
+
+impl StreamIdleTimeout {
+    fn error(message: impl Into<String>) -> LanguageModelCompletionError {
+        LanguageModelCompletionError::Other(anyhow::Error::new(Self {
+            message: message.into(),
+        }))
+    }
+}
 
 #[derive(Debug, Clone)]
 enum RetryStrategy {
@@ -2925,7 +2947,7 @@ impl Thread {
                                  treating the stream as dead and retrying (attempt {attempt})",
                                 stream_idle_timeout_secs
                             );
-                            error = Some(LanguageModelCompletionError::Other(anyhow!(
+                            error = Some(StreamIdleTimeout::error(format!(
                                 "stream idle timeout: no events in {stream_idle_timeout_secs}s"
                             )));
                             break;
@@ -3256,7 +3278,7 @@ impl Thread {
                     "Compaction stream request idle for {stream_idle_timeout_secs}s; \
                      treating the stream as dead"
                 );
-                return Err(LanguageModelCompletionError::Other(anyhow!(
+                return Err(StreamIdleTimeout::error(format!(
                     "stream idle timeout: no response in {stream_idle_timeout_secs}s"
                 ))
                 .into());
@@ -3282,7 +3304,7 @@ impl Thread {
                         "Compaction stream idle for {stream_idle_timeout_secs}s; \
                          treating the stream as dead"
                     );
-                    return Err(LanguageModelCompletionError::Other(anyhow!(
+                    return Err(StreamIdleTimeout::error(format!(
                         "stream idle timeout: no events in {stream_idle_timeout_secs}s"
                     ))
                     .into());
@@ -4708,6 +4730,18 @@ impl Thread {
             // Retrying won't help until the user consents to data retention
             // or switches models.
             DataRetentionConsentRequired { .. } => None,
+            // A stream that goes silent past the idle timeout is a transient
+            // provider hang. The manual retry button reliably recovers these
+            // once the provider recovers, so keep the turn alive with a longer
+            // automatic budget (4 retries × 30s, on top of each attempt's own
+            // idle-timeout wait) instead of surfacing the error and waiting
+            // for the user to click retry.
+            Other(error) if error.downcast_ref::<StreamIdleTimeout>().is_some() => {
+                Some(RetryStrategy::Fixed {
+                    delay: STREAM_IDLE_RETRY_DELAY,
+                    max_attempts: MAX_RETRY_ATTEMPTS,
+                })
+            }
             // Conservatively assume that any other errors are non-retryable
             HttpResponseError { .. } | Other(..) => Some(RetryStrategy::Fixed {
                 delay: BASE_RETRY_DELAY,
@@ -7962,8 +7996,9 @@ mod tests {
     /// A provider that accepts the request but never delivers SSE events must
     /// not wedge the thread in `Generating` forever: the idle timeout in
     /// `run_turn_internal` turns the dead stream into a retryable error, the
-    /// retry re-opens the stream, and once retries are exhausted the turn ends
-    /// with the error instead of hanging (issue 003).
+    /// retry re-opens the stream, and once the extended idle-timeout retry
+    /// budget is exhausted the turn ends with the error instead of hanging
+    /// (issue 003).
     #[gpui::test]
     async fn test_stream_idle_timeout_recovers_hung_stream(cx: &mut TestAppContext) {
         let (thread, _event_stream) = setup_thread_for_test(cx).await;
@@ -7986,19 +8021,19 @@ mod tests {
             .unwrap();
         cx.run_until_parked();
 
-        // Default `stream_idle_timeout_secs` is 120; `Other` errors retry
-        // twice with a 5s fixed delay, so the full cascade (3 attempts) needs
-        // ~370s of virtual time. Advance in chunks so each due timer's task
+        // Default `stream_idle_timeout_secs` is 120; idle timeouts retry up to
+        // 4 times with a 30s fixed delay, so the full cascade (5 attempts) needs
+        // ~720s of virtual time. Advance in chunks so each due timer's task
         // runs before the next clock jump.
-        for _ in 0..8 {
+        for _ in 0..14 {
             cx.executor().advance_clock(Duration::from_secs(60));
             cx.run_until_parked();
         }
 
         assert_eq!(
             model.pending_completions().len(),
-            3,
-            "initial attempt plus two retries should have opened three streams"
+            5,
+            "initial attempt plus four retries should have opened five streams"
         );
 
         let mut saw_idle_timeout_error = false;
@@ -8024,9 +8059,91 @@ mod tests {
         });
     }
 
+    /// A provider hang that outlasts the first attempt must recover
+    /// automatically, without surfacing an error or waiting for the user to
+    /// click retry: the idle timeout turns the dead stream into a retryable
+    /// error, and when a later retry's stream delivers events the turn simply
+    /// continues to completion.
+    #[gpui::test]
+    async fn test_stream_idle_timeout_recovers_mid_retry_cascade(cx: &mut TestAppContext) {
+        let (thread, _event_stream) = setup_thread_for_test(cx).await;
+        let model = Arc::new(FakeLanguageModel::default());
+
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.set_model(model.clone(), cx);
+            });
+        });
+
+        let mut events = cx
+            .update(|cx| {
+                thread.update(cx, |thread, cx| {
+                    thread.send(ClientUserMessageId::new(), vec!["hello"], cx)
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        // Two attempts hang; each burns the 120s idle timeout plus a 30s
+        // retry delay. Advance in 60s chunks until the third stream opens.
+        for _ in 0..10 {
+            if model.completion_count() >= 3 {
+                break;
+            }
+            cx.executor().advance_clock(Duration::from_secs(60));
+            cx.run_until_parked();
+        }
+        assert_eq!(
+            model.completion_count(),
+            3,
+            "two hung attempts plus the retry should have opened three streams"
+        );
+
+        // The provider recovers on the third attempt. The abandoned attempts'
+        // senders are still queued with identical requests, so respond via
+        // the last-entry helper rather than equality-based lookup.
+        model.respond_to_last_pending_completion([LanguageModelCompletionEvent::Text(
+            "Recovered after retry.".into(),
+        )]);
+        cx.run_until_parked();
+
+        let mut saw_recovered_text = false;
+        let mut ended_normally = false;
+        let mut saw_error = false;
+        while let Some(event) = events.next().await {
+            match event {
+                Ok(ThreadEvent::AgentText(text)) => {
+                    saw_recovered_text |= text.contains("Recovered after retry.");
+                }
+                Ok(ThreadEvent::Stop(_)) => ended_normally = true,
+                Err(error) => {
+                    saw_error = true;
+                    log::error!("unexpected turn error: {error:#}");
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            saw_recovered_text,
+            "the recovered attempt's text must reach the event stream"
+        );
+        assert!(
+            ended_normally,
+            "the turn must end with a stop event instead of an error"
+        );
+        assert!(!saw_error, "no error may be surfaced when a retry recovers");
+
+        thread.read_with(cx, |thread, _| {
+            assert!(
+                thread.running_turn.is_none(),
+                "the turn must have finished cleanly"
+            );
+        });
+    }
+
     /// A compaction stream that accepts the request but never delivers
     /// events must not wedge the turn: the idle timeout in `stream_compaction`
-    /// turns it into a retryable error (initial + 2 retries against the
+    /// turns it into a retryable error (initial + 4 retries against the
     /// compaction model), then the turn ends with a visible error instead of
     /// hanging forever (`.docs/009` follow-up to issue 003).
     #[gpui::test]
@@ -8071,17 +8188,18 @@ mod tests {
             .unwrap();
         cx.run_until_parked();
 
-        // Three compaction attempts (initial + 2 retries) at ~125s virtual
-        // time each; advance in chunks so each due timer's task runs first.
-        for _ in 0..8 {
+        // Five compaction attempts (initial + 4 retries) at 120s idle + 30s
+        // delay each (~720s virtual time total); advance in chunks so each
+        // due timer's task runs first.
+        for _ in 0..14 {
             cx.executor().advance_clock(Duration::from_secs(60));
             cx.run_until_parked();
         }
 
         assert_eq!(
             compaction_model.pending_completions().len(),
-            3,
-            "initial compaction attempt plus two retries should have opened three streams"
+            5,
+            "initial compaction attempt plus four retries should have opened five streams"
         );
         assert_eq!(
             thread_model.pending_completions().len(),

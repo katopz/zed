@@ -274,6 +274,24 @@ impl FakeLanguageModel {
     pub fn end_last_completion_stream(&self) {
         self.end_completion_stream(self.pending_completions().last().unwrap());
     }
+
+    /// Send the given events to the most recent pending completion and end
+    /// its stream. Unlike the equality-based helpers above, this targets the
+    /// newest entry directly, so it also works when an earlier abandoned
+    /// completion carries an identical request (e.g. consecutive turn retries
+    /// against a hung stream, where equality lookup would hit the dead sender).
+    pub fn respond_to_last_pending_completion(
+        &self,
+        events: impl IntoIterator<Item = LanguageModelCompletionEvent>,
+    ) {
+        let mut current_completion_txs = self.current_completion_txs.lock();
+        let (_, tx) = current_completion_txs
+            .pop()
+            .expect("no pending completions to respond to");
+        for event in events {
+            tx.unbounded_send(Ok(event)).unwrap();
+        }
+    }
 }
 
 impl LanguageModel for FakeLanguageModel {
