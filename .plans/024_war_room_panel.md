@@ -1,5 +1,9 @@
 # 024 — War Room Panel (conversational agent board in Zed)
 
+> **OBSOLETE (2026-08-28, issue 030):** the war room + worker stack is
+> retired (`AgentBoardConfig.enabled` defaults to false; Cloudflare worker
+> and KV namespace deleted). Kept for historical context only.
+
 ## Goal
 
 Pivot the agent board from a **static status board** (Plan 013/015) to a

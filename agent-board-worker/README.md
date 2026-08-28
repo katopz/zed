@@ -1,5 +1,14 @@
 # agent-board-worker
 
+> **⚠️ OBSOLETE — DO NOT REDEPLOY (2026-08-28, issue 030).**
+> The war room stack is retired. The deployed worker and its KV namespace
+> (`AGENT_BOARD`, `d2cdb46dee30430b96dbf5b439ed318b`, ~3k keys) were DELETED
+> from the account. Root cause: KV read amplification (poll fan-out × per-GET
+> ring reads) hit 15.2M reads / 1.29M lists in one day. Zed's `agent_board`
+> crate now defaults to `enabled: false` — nothing calls this worker anymore.
+> This source is kept only as a historical reference; see
+> `../.issues/030_war_room_kv_read_amplification.md` before ever reviving it.
+
 Cloudflare Worker backing Zed's `agent_board` panel. A single-user,
 KV-backed notepad that mirrors `auto_prompt::plan_registry` claims across
 devices so two agents (e.g. the M3 laptop and the 4090 box) don't clobber each

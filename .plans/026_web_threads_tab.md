@@ -1,5 +1,11 @@
 # 026 — Web Threads tab (browser mirror of the agent thread panel)
 
+> **OBSOLETE (2026-08-28, issue 030):** the war room + worker stack is
+> retired (`AgentBoardConfig.enabled` defaults to false; Cloudflare worker
+> and KV namespace deleted). Note: this plan's streaming `POST /thread`
+> traffic was one of the read-amplification sources (deployed 2026-08-24,
+> the day before the 15.2M-read spike). Kept for historical context only.
+
 ## Goal
 A new "Threads" tab in the worker dashboard that mirrors the Zed agent thread
 panel: full timeline per session (user / assistant / tool entries as markdown),
