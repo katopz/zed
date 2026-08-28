@@ -153,3 +153,16 @@ removed:
   canonical truncation helper.
 - Auto-allow now also answers sandbox-fallback prompts with "Run without
   sandbox once" after the countdown (previously carved out by plan 025).
+
+## Addendum: issue 029 (fair distribution fix)
+
+The plan-027 "session-sticky" pick (`last_used_slot`) was process-global,
+ so with K1 unavailable all concurrent agents stuck to whichever spare one
+ random roll picked (user report: 6 agents, all on K4). Fixed in `cb99d024cd`:
+ selection is keyed by `LanguageModelRequest::thread_id` (per-thread sticky
+ map, TTL 30min) and fresh picks advance a round-robin cursor (random start)
+ over the healthy spares — 6 agents over K2..K4 now distribute exactly 2/2/2.
+ K1-priority, fail-open fallback, and `reset_key_session` probing unchanged;
+ `reset_session`/`record_attempt` removed as obsolete. Persist-if-changed now
+ compares persisted slot health only (manual `PartialEq`), so per-request
+ selection mutations no longer schedule backoff-file writes.
