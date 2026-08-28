@@ -20,6 +20,7 @@ use parking_lot::Mutex as ParkingMutex;
 use paths;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -80,7 +81,7 @@ impl KeyHealth {
     }
 }
 
-#[derive(Default, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct KeyHealthTracker {
     pub primary: KeyHealth,
     pub secondary: KeyHealth,
@@ -90,8 +91,61 @@ pub struct KeyHealthTracker {
     /// `select_from_candidates` inside `retry_stream`. Surfaced to the UI so the
     /// retry button can show which key the in-flight turn is actually using.
     /// Reset to `None` on load since a stale value across restarts is meaningless.
+    /// NOT a selection input — stickiness is per-thread (`thread_picks`).
     pub last_used_slot: Option<KeySlot>,
+    /// Ephemeral (never persisted): per-agent-thread sticky picks. The same
+    /// thread reuses its slot while the slot stays healthy, so its upstream
+    /// prompt cache stays hot. Keyed by `LanguageModelRequest::thread_id`.
+    thread_picks: HashMap<String, ThreadKeyPick>,
+    /// Ephemeral (never persisted): round-robin cursor for fresh picks.
+    /// Advances once per fresh selection so concurrent agents distribute
+    /// evenly across the healthy spares instead of clustering on one key.
+    /// Randomized start so the first fresh pick after launch isn't fixed.
+    rotation_cursor: u64,
 }
+
+/// A thread's sticky key assignment, plus when it was last refreshed (for
+/// TTL pruning — see `THREAD_PICK_TTL`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ThreadKeyPick {
+    slot: KeySlot,
+    last_used: Instant,
+}
+
+/// How long an idle thread's sticky pick survives. Purely a memory bound on
+/// `thread_picks`; re-picking after expiry is harmless (the old pick's prompt
+/// cache is long cold by then).
+const THREAD_PICK_TTL: Duration = Duration::from_secs(30 * 60);
+
+impl Default for KeyHealthTracker {
+    fn default() -> Self {
+        Self {
+            primary: KeyHealth::default(),
+            secondary: KeyHealth::default(),
+            tertiary: KeyHealth::default(),
+            quaternary: KeyHealth::default(),
+            last_used_slot: None,
+            thread_picks: HashMap::new(),
+            rotation_cursor: rand::rng().random::<u64>(),
+        }
+    }
+}
+
+impl PartialEq for KeyHealthTracker {
+    /// Equality of the *persisted* state only (the four slot-health entries).
+    /// The ephemeral selection state (`last_used_slot`, `thread_picks`,
+    /// `rotation_cursor`) mutates on every selection; including it would make
+    /// the persist-if-changed checks in `stream_completion` /
+    /// `stream_response` / `reset_key_session` fire on every request.
+    fn eq(&self, other: &Self) -> bool {
+        self.primary == other.primary
+            && self.secondary == other.secondary
+            && self.tertiary == other.tertiary
+            && self.quaternary == other.quaternary
+    }
+}
+
+impl Eq for KeyHealthTracker {}
 
 impl KeyHealthTracker {
     pub fn get(&self, slot: KeySlot) -> &KeyHealth {
@@ -130,23 +184,6 @@ impl KeyHealthTracker {
         health.consecutive_failures = health.consecutive_failures.saturating_add(1);
         let backoff = compute_backoff(health.consecutive_failures);
         health.backoff_until = Some(now + backoff);
-    }
-
-    /// Marks `slot` as the one currently being attempted, so the UI can show
-    /// which key an in-flight turn is using. Called from `retry_stream` right
-    /// after `select_from_candidates` picks a key — before the attempt resolves.
-    /// Also serves as the session-sticky pick for `select_from_candidates`
-    /// (same-thread cache affinity).
-    pub fn record_attempt(&mut self, slot: KeySlot) {
-        self.last_used_slot = Some(slot);
-    }
-
-    /// Clears the session-sticky pick so the next `select_from_candidates`
-    /// re-randomizes among the healthy spares. Called when a new agent thread
-    /// starts (`LanguageModel::reset_key_session`) — a new thread re-rolls its
-    /// key instead of inheriting the previous thread's pick.
-    pub fn reset_session(&mut self) {
-        self.last_used_slot = None;
     }
 
     /// Toggles the user-controlled `enabled` flag on a slot. Does not touch the
@@ -305,10 +342,12 @@ impl PersistedKeyHealthFile {
             secondary: self.secondary.to_health(now, elapsed_secs),
             tertiary: self.tertiary.to_health(now, elapsed_secs),
             quaternary: self.quaternary.to_health(now, elapsed_secs),
-            // `last_used_slot` is ephemeral runtime state — never restored
-            // from disk. A stale slot from a previous process would mislead
-            // the retry button label on the very first turn after launch.
+            // `last_used_slot` and the other ephemeral selection state are
+            // runtime-only — never restored from disk. A stale slot from a
+            // previous process would mislead the retry button label on the
+            // very first turn after launch.
             last_used_slot: None,
+            ..Default::default()
         }
     }
 }
@@ -554,24 +593,27 @@ pub fn is_backoff_worthy(err: &LanguageModelCompletionError) -> bool {
     }
 }
 
-/// Pure-function form of key selection. Used by the intra-request retry loop
-/// in `stream_completion` / `stream_response`, which has already snapshot the
-/// candidate list and cannot go back through `&self`.
+/// Key selection. Called once per attempt inside `retry_stream`'s loop,
+/// under the tracker lock, so it mutates ephemeral selection state (rotation
+/// cursor, per-thread sticky map, UI slot) atomically with the pick.
 ///
-/// Selection policy (**priority-first**, session-sticky, random spares):
+/// Selection policy (**priority-first**, per-thread sticky, fair rotation):
 ///
 /// 1. Build `healthy` = present + `enabled` + not in backoff.
 /// 2. If `Primary` is healthy, return it. K1 is always used while available —
 ///    its upstream prompt cache stays continuously hot. Other configured
 ///    keys are spares, not load-balanced peers.
-/// 3. Otherwise, if the session-sticky pick (`last_used_slot`) is still
-///    healthy, reuse it — the same thread keeps hitting the same key so its
-///    prompt cache stays active. Cleared by `reset_session()` when a new
-///    agent thread starts.
-/// 4. Otherwise pick a **random** healthy candidate (plan 027: replaces the
-///    old wall-clock hourly rotation). Random-per-session instead of
-///    time-bound. Inside `retry_stream` the just-failed slot is no longer
-///    healthy, so a retry naturally re-randomizes over the available keys.
+/// 3. Otherwise, if `thread_id` has a sticky pick that is still healthy,
+///    reuse it — the same thread keeps hitting the same key so its prompt
+///    cache stays active. Stickiness is keyed by the request's `thread_id`
+///    (populated by the agent layer), never by process-global state: a shared
+///    "last used" slot made every concurrent agent pile onto one key (issue 029).
+/// 4. Otherwise take the next slot from a round-robin cursor over the healthy
+///    spares (random start). Consecutive fresh picks — new threads, or sticky
+///    picks that went unhealthy — spread evenly across the healthy set instead
+///    of clustering: 6 agents over K2..K4 get exactly 2 each. Inside
+///    `retry_stream` the just-failed slot is no longer healthy, so a retry
+///    naturally advances to the next spare.
 /// 5. If no healthy candidate exists, fall back to the earliest-expiring
 ///    backoff among **enabled** slots. Disabled slots are never picked even
 ///    in fail-open (a disabled slot is a hard user opt-out, distinct from a
@@ -579,7 +621,8 @@ pub fn is_backoff_worthy(err: &LanguageModelCompletionError) -> bool {
 ///    `NoApiKey` when at least one enabled key exists.
 pub fn select_from_candidates(
     candidates: &[(Arc<str>, KeySlot)],
-    health: &KeyHealthTracker,
+    health: &mut KeyHealthTracker,
+    thread_id: Option<&str>,
     now: Instant,
 ) -> Option<(Arc<str>, KeySlot)> {
     // Healthy candidates: present, enabled, not in backoff. The `enabled`
@@ -595,37 +638,61 @@ pub fn select_from_candidates(
         .collect();
 
     // Sticky Primary: while K1 is healthy it always wins (req: "K1 is always
-    // used if available").
+    // used if available"). No thread-pick registration needed — while K1 is
+    // healthy no other branch is reachable, and once it backs off a stale K1
+    // entry would fail the sticky health check anyway.
     if let Some(pick) = healthy
         .iter()
         .find(|(_, slot)| *slot == KeySlot::Primary)
         .cloned()
     {
+        health.last_used_slot = Some(KeySlot::Primary);
         return Some(pick);
     }
 
-    // Session affinity: keep the key this thread-chain already used while it
+    // Per-thread affinity: keep the key this thread already used while it
     // stays healthy — same thread, same key, hot prompt cache.
-    if let Some(last_used) = health.last_used_slot
-        && let Some(pick) = healthy
-            .iter()
-            .find(|(_, slot)| *slot == last_used)
-            .cloned()
+    if let Some(thread_id) = thread_id
+        && let Some((key, slot)) = health
+            .thread_picks
+            .get(thread_id)
+            .and_then(|pick| healthy.iter().find(|(_, slot)| *slot == pick.slot).cloned())
     {
-        return Some(pick);
+        // Refresh so active threads don't expire out of the map.
+        if let Some(entry) = health.thread_picks.get_mut(thread_id) {
+            entry.last_used = now;
+        }
+        health.last_used_slot = Some(slot);
+        return Some((key, slot));
     }
 
-    // Fresh session (or the sticky pick went unhealthy): random among the
-    // remaining healthy spares.
-    if let Some(pick) = random_pick(&healthy) {
-        return Some(pick);
+    // Fresh pick (new thread, lost/unhealthy sticky pick, or no thread id):
+    // round-robin over the healthy spares so concurrent agents distribute
+    // fairly instead of clustering on one key.
+    if !healthy.is_empty() {
+        // Prune expired entries on the insert path only — the sticky path
+        // above refreshes `last_used`, so anything left here is idle.
+        health
+            .thread_picks
+            .retain(|_, pick| now.duration_since(pick.last_used) < THREAD_PICK_TTL);
+        let index = (health.rotation_cursor % healthy.len() as u64) as usize;
+        health.rotation_cursor = health.rotation_cursor.wrapping_add(1);
+        let (key, slot) = healthy[index].clone();
+        health.last_used_slot = Some(slot);
+        if let Some(thread_id) = thread_id {
+            health.thread_picks.insert(
+                thread_id.to_string(),
+                ThreadKeyPick { slot, last_used: now },
+            );
+        }
+        return Some((key, slot));
     }
 
     // Everything present+enabled is backed off — fall back to the
     // earliest-expiring backed-off enabled key. Disabled slots never qualify
     // (better to fail with `None` → `NoApiKey` than silently resurrect a key
     // the user explicitly turned off).
-    candidates
+    let fallback = candidates
         .iter()
         .filter(|(_, slot)| health.get(*slot).enabled)
         .filter_map(|(key, slot)| {
@@ -633,19 +700,11 @@ pub fn select_from_candidates(
             Some(((key.clone(), *slot), until))
         })
         .min_by_key(|(_, until)| *until)
-        .map(|((key, slot), _)| (key, slot))
-}
-
-/// Picks a uniformly random candidate. Returns `None` for an empty list.
-/// Random (not wall-clock hourly) per plan 027: a new thread re-rolls its
-/// spare key instead of inheriting a time-slot, while same-thread stickiness
-/// is provided by `last_used_slot` affinity in `select_from_candidates`.
-fn random_pick(healthy: &[(Arc<str>, KeySlot)]) -> Option<(Arc<str>, KeySlot)> {
-    if healthy.is_empty() {
-        return None;
+        .map(|((key, slot), _)| (key, slot));
+    if let Some((_, slot)) = &fallback {
+        health.last_used_slot = Some(*slot);
     }
-    let idx = rand::rng().random_range(0..healthy.len());
-    Some(healthy[idx].clone())
+    fallback
 }
 
 /// Updates per-key health after a successful request. Called from inside
@@ -660,14 +719,6 @@ fn random_pick(healthy: &[(Arc<str>, KeySlot)]) -> Option<(Arc<str>, KeySlot)> {
 pub fn record_key_success(key_health: &Arc<ParkingMutex<KeyHealthTracker>>, slot: KeySlot) {
     let mut health = key_health.lock();
     health.record_success(slot);
-}
-
-/// Marks `slot` as the one being attempted right now, so the UI can surface
-/// which key the in-flight turn picked. Called from `retry_stream` immediately
-/// after `select_from_candidates` resolves, before `do_attempt` is awaited.
-pub fn record_key_attempt(key_health: &Arc<ParkingMutex<KeyHealthTracker>>, slot: KeySlot) {
-    let mut health = key_health.lock();
-    health.record_attempt(slot);
 }
 
 /// Updates per-key health after a failed request. Only backoff-worthy errors
@@ -718,6 +769,7 @@ pub fn snapshot_health(key_health: &Arc<ParkingMutex<KeyHealthTracker>>) -> KeyH
 pub async fn retry_stream<S>(
     candidates: &[(Arc<str>, KeySlot)],
     key_health: &Arc<ParkingMutex<KeyHealthTracker>>,
+    thread_id: Option<&str>,
     provider: LanguageModelProviderName,
     mut do_attempt: impl FnMut(Arc<str>) -> BoxFuture<'static, Result<S, LanguageModelCompletionError>>,
 ) -> Result<S, LanguageModelCompletionError> {
@@ -728,14 +780,16 @@ pub async fn retry_stream<S>(
     // every failure was backoff-worthy, we've exhausted the pool.
     let max_attempts = remaining.len();
     for _ in 0..max_attempts {
-        let Some((api_key, slot)) =
-            select_from_candidates(&remaining, &snapshot_health(key_health), Instant::now())
-        else {
+        // Selection mutates ephemeral state (rotation cursor, per-thread
+        // sticky map, UI slot) and therefore runs under the tracker lock; the
+        // lock is released before the attempt future is awaited.
+        let picked = {
+            let mut health = key_health.lock();
+            select_from_candidates(&remaining, &mut health, thread_id, Instant::now())
+        };
+        let Some((api_key, slot)) = picked else {
             break;
         };
-        // Record which key this attempt is using before it resolves, so the UI
-        // can show which key the in-flight turn picked (retry button label).
-        record_key_attempt(key_health, slot);
 
         match do_attempt(api_key).await {
             Ok(stream) => {
@@ -942,8 +996,10 @@ mod tests {
     #[test]
     fn select_from_candidates_returns_none_when_no_keys_configured() {
         let candidates: Vec<(Arc<str>, KeySlot)> = Vec::new();
-        let health = KeyHealthTracker::default();
-        assert!(select_from_candidates(&candidates, &health, Instant::now()).is_none());
+        let mut health = KeyHealthTracker::default();
+        assert!(
+            select_from_candidates(&candidates, &mut health, None, Instant::now()).is_none()
+        );
     }
 
     #[test]
@@ -961,7 +1017,8 @@ mod tests {
         let now = Instant::now();
         // Secondary is the only healthy candidate, so it must be picked.
         for _ in 0..20 {
-            let (key, slot) = select_from_candidates(&candidates, &health, now).unwrap();
+            let (key, slot) =
+                select_from_candidates(&candidates, &mut health, None, now).unwrap();
             assert_eq!(slot, KeySlot::Secondary);
             assert_eq!(&*key, "key-b");
         }
@@ -991,7 +1048,7 @@ mod tests {
             ..Default::default()
         };
 
-        let pick = select_from_candidates(&candidates, &health, now);
+        let pick = select_from_candidates(&candidates, &mut health, None, now);
         assert!(pick.is_some(), "fail-open should return a key even when all backed off");
         // Secondary expires sooner, so it must be picked.
         let (_, slot) = pick.unwrap();
@@ -1009,22 +1066,21 @@ mod tests {
             (Arc::<str>::from("key-c"), KeySlot::Tertiary),
             (Arc::<str>::from("key-d"), KeySlot::Quaternary),
         ];
-        let health = KeyHealthTracker::default();
+        let mut health = KeyHealthTracker::default();
         let now = Instant::now();
         for _ in 0..20 {
-            let (key, slot) = select_from_candidates(&candidates, &health, now).unwrap();
+            let (key, slot) =
+                select_from_candidates(&candidates, &mut health, None, now).unwrap();
             assert_eq!(slot, KeySlot::Primary, "Primary must be sticky while healthy");
             assert_eq!(&*key, "key-a");
         }
     }
 
     #[test]
-    fn select_from_candidates_random_among_healthy_when_primary_backed_off() {
-        // When Primary is in backoff and no session pick exists, selection is a
-        // RANDOM healthy spare (plan 027) — not a fixed time-slot. Every pick
-        // must belong to the healthy set; over many rolls at least two distinct
-        // spares should appear (probability of a single distinct pick over 40
-        // rolls with 2 healthy spares is 2·(1/2)^40 ≈ 0).
+    fn select_from_candidates_rotates_through_spares_when_primary_backed_off() {
+        // When Primary is in backoff, fresh picks (no thread id) advance the
+        // round-robin cursor: consecutive requests land on different healthy
+        // spares instead of clustering on one key (issue 029).
         let candidates: Vec<(Arc<str>, KeySlot)> = vec![
             (Arc::<str>::from("key-a"), KeySlot::Primary),
             (Arc::<str>::from("key-b"), KeySlot::Secondary),
@@ -1033,28 +1089,22 @@ mod tests {
         let mut health = KeyHealthTracker::default();
         health.record_failure(KeySlot::Primary, Instant::now());
         let now = Instant::now();
-        let mut saw_secondary = false;
-        let mut saw_tertiary = false;
-        for _ in 0..40 {
-            let (_, slot) = select_from_candidates(&candidates, &health, now).unwrap();
-            assert_ne!(slot, KeySlot::Primary, "backed-off Primary must never be picked");
-            match slot {
-                KeySlot::Secondary => saw_secondary = true,
-                KeySlot::Tertiary => saw_tertiary = true,
-                other => panic!("pick must be a healthy spare, got {other:?}"),
-            }
-        }
-        assert!(
-            saw_secondary && saw_tertiary,
-            "random pick should vary across rolls (secondary={saw_secondary}, tertiary={saw_tertiary})"
-        );
+        let first = select_from_candidates(&candidates, &mut health, None, now)
+            .unwrap()
+            .1;
+        assert_ne!(first, KeySlot::Primary, "backed-off Primary must never be picked");
+        let second = select_from_candidates(&candidates, &mut health, None, now)
+            .unwrap()
+            .1;
+        assert_ne!(second, KeySlot::Primary);
+        assert_ne!(first, second, "consecutive fresh picks must rotate");
     }
 
     #[test]
-    fn select_from_candidates_sticks_to_session_pick_while_healthy() {
-        // Same-thread cache affinity: once a spare has been used
-        // (`record_attempt`), subsequent selections keep returning it while it
-        // stays healthy — the prompt cache on that key stays hot.
+    fn select_from_candidates_sticks_to_thread_pick_while_healthy() {
+        // Same-thread cache affinity: a thread's first pick is recorded in the
+        // per-thread sticky map, and subsequent selections for the same
+        // thread return it while it stays healthy — prompt cache stays hot.
         let candidates: Vec<(Arc<str>, KeySlot)> = vec![
             (Arc::<str>::from("key-a"), KeySlot::Primary),
             (Arc::<str>::from("key-b"), KeySlot::Secondary),
@@ -1062,19 +1112,22 @@ mod tests {
         ];
         let mut health = KeyHealthTracker::default();
         health.record_failure(KeySlot::Primary, Instant::now());
-        health.record_attempt(KeySlot::Tertiary);
         let now = Instant::now();
+        let (first_key, first_slot) =
+            select_from_candidates(&candidates, &mut health, Some("thread-1"), now).unwrap();
         for _ in 0..20 {
-            let (key, slot) = select_from_candidates(&candidates, &health, now).unwrap();
-            assert_eq!(slot, KeySlot::Tertiary, "session pick must be sticky while healthy");
-            assert_eq!(&*key, "key-c");
+            let (key, slot) =
+                select_from_candidates(&candidates, &mut health, Some("thread-1"), now).unwrap();
+            assert_eq!(slot, first_slot, "thread pick must be sticky while healthy");
+            assert_eq!(&*key, &*first_key);
         }
     }
 
     #[test]
-    fn select_from_candidates_re_randomizes_after_session_reset() {
-        // New thread: `reset_session` clears the sticky pick, so selection
-        // re-rolls across the healthy spares instead of inheriting the old key.
+    fn select_from_candidates_distributes_new_threads_fairly() {
+        // Issue 029: 6 concurrent agents (distinct thread ids) over 3 healthy
+        // spares must spread exactly 2/2/2 via the rotation cursor — not pile
+        // onto one key. Repeating a thread returns its own sticky slot.
         let candidates: Vec<(Arc<str>, KeySlot)> = vec![
             (Arc::<str>::from("key-a"), KeySlot::Primary),
             (Arc::<str>::from("key-b"), KeySlot::Secondary),
@@ -1083,28 +1136,37 @@ mod tests {
         ];
         let mut health = KeyHealthTracker::default();
         health.record_failure(KeySlot::Primary, Instant::now());
-        health.record_attempt(KeySlot::Secondary);
-        health.reset_session();
-        assert_eq!(health.last_used_slot, None);
         let now = Instant::now();
-        let mut distinct: Vec<KeySlot> = Vec::new();
-        for _ in 0..60 {
-            let (_, slot) = select_from_candidates(&candidates, &health, now).unwrap();
-            if !distinct.contains(&slot) {
-                distinct.push(slot);
+        let threads = ["t1", "t2", "t3", "t4", "t5", "t6"];
+        let mut secondary = 0;
+        let mut tertiary = 0;
+        let mut quaternary = 0;
+        let mut t1_pick = None;
+        for thread_id in threads {
+            let (_, slot) =
+                select_from_candidates(&candidates, &mut health, Some(thread_id), now).unwrap();
+            match slot {
+                KeySlot::Secondary => secondary += 1,
+                KeySlot::Tertiary => tertiary += 1,
+                KeySlot::Quaternary => quaternary += 1,
+                other => panic!("fresh pick must be a healthy spare, got {other:?}"),
+            }
+            if thread_id == "t1" {
+                t1_pick = Some(slot);
             }
         }
-        assert!(
-            distinct.len() >= 2,
-            "after reset the pick should re-roll across spares, got {distinct:?}"
-        );
+        assert_eq!((secondary, tertiary, quaternary), (2, 2, 2), "rotation must be even");
+        let again = select_from_candidates(&candidates, &mut health, Some("t1"), now)
+            .unwrap()
+            .1;
+        assert_eq!(Some(again), t1_pick, "same thread keeps its sticky slot");
     }
 
     #[test]
-    fn select_from_candidates_drops_session_pick_that_goes_unhealthy() {
+    fn select_from_candidates_drops_thread_pick_that_goes_unhealthy() {
         // The sticky pick only applies while healthy: once it enters backoff
-        // (e.g. it failed and retry_stream rotates), selection moves on to
-        // another healthy spare.
+        // (e.g. it failed and retry_stream rotates), that thread's selection
+        // moves on to another healthy spare.
         let candidates: Vec<(Arc<str>, KeySlot)> = vec![
             (Arc::<str>::from("key-a"), KeySlot::Primary),
             (Arc::<str>::from("key-b"), KeySlot::Secondary),
@@ -1113,13 +1175,67 @@ mod tests {
         let mut health = KeyHealthTracker::default();
         health.record_failure(KeySlot::Primary, Instant::now());
         health.record_failure(KeySlot::Secondary, Instant::now());
-        // last_used_slot points at the now-backed-off Secondary.
-        health.record_attempt(KeySlot::Secondary);
+        let now = Instant::now();
+        // thread-1's sticky pick points at the now-backed-off Secondary.
+        health.thread_picks.insert(
+            "thread-1".to_string(),
+            ThreadKeyPick {
+                slot: KeySlot::Secondary,
+                last_used: now,
+            },
+        );
+        let (_, slot) =
+            select_from_candidates(&candidates, &mut health, Some("thread-1"), now).unwrap();
+        assert_eq!(slot, KeySlot::Tertiary, "unhealthy thread pick must be skipped");
+        // The dropped pick is replaced by the fresh one.
+        assert_eq!(
+            health.thread_picks.get("thread-1").map(|pick| pick.slot),
+            Some(KeySlot::Tertiary)
+        );
+    }
+
+    #[test]
+    fn select_from_candidates_prunes_stale_thread_picks() {
+        // Idle threads' sticky picks expire after THREAD_PICK_TTL; a fresh
+        // selection prunes them, bounding the map's memory.
+        let candidates: Vec<(Arc<str>, KeySlot)> = vec![
+            (Arc::<str>::from("key-a"), KeySlot::Primary),
+            (Arc::<str>::from("key-b"), KeySlot::Secondary),
+        ];
+        let mut health = KeyHealthTracker::default();
+        // Back off Primary so selection reaches the fresh-pick path (the
+        // priority branch returns before pruning runs).
+        health.record_failure(KeySlot::Primary, Instant::now());
+        let now = Instant::now();
+        health.thread_picks.insert(
+            "stale".to_string(),
+            ThreadKeyPick {
+                slot: KeySlot::Secondary,
+                last_used: now - THREAD_PICK_TTL - Duration::from_secs(1),
+            },
+        );
+        let _ = select_from_candidates(&candidates, &mut health, Some("fresh"), now).unwrap();
+        assert!(!health.thread_picks.contains_key("stale"), "expired pick must be pruned");
+        assert!(health.thread_picks.contains_key("fresh"));
+        assert_eq!(health.thread_picks.len(), 1);
+    }
+
+    #[test]
+    fn select_from_candidates_without_thread_id_keeps_map_empty() {
+        // Requests without a thread id (edit prediction, other consumers) get
+        // rotation picks without sticky registration — there is nothing to
+        // stick to, and the map must not grow.
+        let candidates: Vec<(Arc<str>, KeySlot)> = vec![
+            (Arc::<str>::from("key-a"), KeySlot::Primary),
+            (Arc::<str>::from("key-b"), KeySlot::Secondary),
+        ];
+        let mut health = KeyHealthTracker::default();
+        health.record_failure(KeySlot::Primary, Instant::now());
         let now = Instant::now();
         for _ in 0..10 {
-            let (_, slot) = select_from_candidates(&candidates, &health, now).unwrap();
-            assert_eq!(slot, KeySlot::Tertiary, "unhealthy session pick must be skipped");
+            select_from_candidates(&candidates, &mut health, None, now).unwrap();
         }
+        assert!(health.thread_picks.is_empty());
     }
 
     #[test]
@@ -1134,7 +1250,8 @@ mod tests {
         health.set_enabled(KeySlot::Primary, false);
         let now = Instant::now();
         for _ in 0..20 {
-            let (_, slot) = select_from_candidates(&candidates, &health, now).unwrap();
+            let (_, slot) =
+                select_from_candidates(&candidates, &mut health, None, now).unwrap();
             assert_eq!(slot, KeySlot::Secondary, "disabled Primary must be skipped");
         }
     }
@@ -1153,7 +1270,7 @@ mod tests {
         health.record_failure(KeySlot::Secondary, Instant::now()); // backed off
         let now = Instant::now();
         // Secondary is backed off but enabled → fail-open should pick it.
-        let pick = select_from_candidates(&candidates, &health, now);
+        let pick = select_from_candidates(&candidates, &mut health, None, now);
         assert!(pick.is_some(), "enabled backed-off slot should fail-open");
         let (_, slot) = pick.unwrap();
         assert_eq!(slot, KeySlot::Secondary, "fail-open must skip disabled slots");
@@ -1171,7 +1288,7 @@ mod tests {
         health.set_enabled(KeySlot::Secondary, false);
         let now = Instant::now();
         assert!(
-            select_from_candidates(&candidates, &health, now).is_none(),
+            select_from_candidates(&candidates, &mut health, None, now).is_none(),
             "no enabled slot → None (disabled slots never picked)"
         );
     }
@@ -1239,6 +1356,7 @@ mod tests {
         let result: Result<i32, _> = smol::block_on(retry_stream(
             &candidates,
             &key_health,
+            None,
             provider_name(),
             move |api_key| {
                 let key = (*api_key).to_string();
@@ -1272,6 +1390,7 @@ mod tests {
         let result: Result<i32, _> = smol::block_on(retry_stream(
             &candidates,
             &key_health,
+            None,
             provider_name(),
             move |api_key| {
                 let key = (*api_key).to_string();
@@ -1333,6 +1452,7 @@ mod tests {
         let result: Result<i32, _> = smol::block_on(retry_stream(
             &candidates,
             &key_health,
+            None,
             provider_name(),
             move |api_key| {
                 let key = (*api_key).to_string();
@@ -1381,6 +1501,7 @@ mod tests {
         let result: Result<i32, _> = smol::block_on(retry_stream(
             &candidates,
             &key_health,
+            None,
             provider_name(),
             move |api_key| {
                 let key = (*api_key).to_string();
@@ -1415,6 +1536,7 @@ mod tests {
         let result: Result<i32, _> = smol::block_on(retry_stream(
             &candidates,
             &key_health,
+            None,
             provider_name(),
             move |api_key| {
                 let key = (*api_key).to_string();
@@ -1439,6 +1561,7 @@ mod tests {
         let result: Result<i32, _> = smol::block_on(retry_stream(
             &candidates,
             &key_health,
+            None,
             provider_name(),
             move |_api_key| Box::pin(async move { Ok(1_i32) }),
         ));

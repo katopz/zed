@@ -705,6 +705,7 @@ impl OpenAiCompatibleLanguageModel {
     fn stream_completion(
         &self,
         request: open_ai::Request,
+        thread_id: Option<String>,
         cx: &AsyncApp,
     ) -> BoxFuture<
         'static,
@@ -743,6 +744,7 @@ impl OpenAiCompatibleLanguageModel {
             let result = retry_stream(
                 &candidates,
                 &key_health,
+                thread_id.as_deref(),
                 provider,
                 move |api_key| {
                     let http_client = http_client.clone();
@@ -790,6 +792,7 @@ impl OpenAiCompatibleLanguageModel {
     fn stream_response(
         &self,
         request: ResponseRequest,
+        thread_id: Option<String>,
         cx: &AsyncApp,
     ) -> BoxFuture<'static, Result<futures::stream::BoxStream<'static, Result<ResponsesStreamEvent>>>>
     {
@@ -823,6 +826,7 @@ impl OpenAiCompatibleLanguageModel {
             let result = retry_stream(
                 &candidates,
                 &key_health,
+                thread_id.as_deref(),
                 provider,
                 move |api_key| {
                     let http_client = http_client.clone();
@@ -1032,12 +1036,11 @@ impl LanguageModel for OpenAiCompatibleLanguageModel {
     }
 
     fn reset_key_session(&self, cx: &App) {
-        // Clear the session-sticky pick so the new thread re-randomizes its
-        // key (plan 027). The probe below then re-verifies reality.
-        self.state.read_with(cx, |state, _| {
-            state.key_health.lock().reset_session();
-        });
-
+        // Issue 029: per-thread sticky picks make clearing selection state
+        // unnecessary — a new thread has a new id and picks fresh via the
+        // rotation cursor. The probes below remain: they re-verify every
+        // configured key (including backed-off ones) so stale backoffs clear
+        // before the new thread's first pick.
         let (probe_inputs, key_health, key_health_dirty, key_health_path) = self
             .state
             .read_with(cx, |state, _| {
@@ -1115,6 +1118,9 @@ impl LanguageModel for OpenAiCompatibleLanguageModel {
         if !self.supports_fast_mode() {
             request.speed = None;
         }
+        // Thread identity for per-thread key stickiness (issue 029), captured
+        // before the conversions below consume the request.
+        let thread_id = request.thread_id.clone();
 
         if self.model.capabilities.chat_completions {
             let reasoning_effort = chat_completion_reasoning_effort(&request, &self.model);
@@ -1131,7 +1137,7 @@ impl LanguageModel for OpenAiCompatibleLanguageModel {
                 Ok(request) => request,
                 Err(error) => return async move { Err(error.into()) }.boxed(),
             };
-            let completions = self.stream_completion(request, cx);
+            let completions = self.stream_completion(request, thread_id, cx);
             async move {
                 let mapper = OpenAiEventMapper::new();
                 Ok(mapper.map_stream(completions.await?).boxed())
@@ -1152,7 +1158,7 @@ impl LanguageModel for OpenAiCompatibleLanguageModel {
                 Ok(request) => request,
                 Err(error) => return async move { Err(error.into()) }.boxed(),
             };
-            let completions = self.stream_response(request, cx);
+            let completions = self.stream_response(request, thread_id, cx);
             let compaction_state_owner = self.provider_id.clone();
             async move {
                 let mapper = OpenAiResponseEventMapper::new(compaction_state_owner);

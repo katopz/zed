@@ -463,11 +463,10 @@ pub(crate) fn dispatch_action(
         action.actual_input_tokens
     );
 
-    // Plan 027: a new thread starts a fresh key-selection session on
-    // multi-key providers — clear the session-sticky pick (the new thread
-    // re-randomizes among healthy keys instead of inheriting this thread's
-    // key) and re-probe every configured key (including backed-off ones) so
-    // stale backoffs clear before the first turn picks a key. No-op for
+    // Plan 027 / issue 029: a new thread picks its spare key fresh via the
+    // per-thread sticky map + rotation cursor (no shared state to clear), and
+    // this hook re-probes every configured key (including backed-off ones)
+    // so stale backoffs clear before the first turn picks a key. No-op for
     // single-key providers (Claude/ACP, cloud, local).
     if let Some(model) = conversation_view
         .active_thread()
