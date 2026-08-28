@@ -1032,7 +1032,7 @@ impl Panel for WarRoomPanel {
     }
 
     fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
-        Some("War Room")
+        Some("War Room (obsolete)")
     }
 
     fn icon_label(&self, _window: &Window, _cx: &App) -> Option<String> {

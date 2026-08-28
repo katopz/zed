@@ -1,6 +1,14 @@
 //! agent_board — a multi-device, multi-agent notepad board that mirrors
 //! `auto_prompt::plan_registry` to/from a Cloudflare KV worker.
 //!
+//! **OBSOLETE (2026-08-28, issue 030).** The whole stack (board + war room +
+//! worker) is retired: polling fan-out plus per-GET ring reads hammered the
+//! KV namespace (15.2M reads / 1.29M lists in one day). The Cloudflare worker
+//! and its KV namespace have been DELETED. The board now defaults to
+//! `enabled: false` — no code path constructs a [`client::BoardClient`], so
+//! nothing can reach the network; panels run local-only. Keep this crate for
+//! the local-only `plan_registry` views; do not redeploy the worker.
+//!
 //! See `.plans/013_agent_board.md` for the full design. The short version:
 //! - `SetRoom` / `JoinRoom` (the user's "foo"/"bar") connect this device to a
 //!   room name, persisted to `~/.config/zed/agent_board.json`.
@@ -80,6 +88,14 @@ fn default_mention_max_per_hour() -> u32 {
 /// private key authorizes writes to the worker.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentBoardConfig {
+    /// Master kill switch for the whole board/war-room stack. Defaults to
+    /// false — the stack is OBSOLETE (issue 030: KV read amplification). When
+    /// false, [`crate::runtime::BoardRuntime::try_start`] returns early, so
+    /// no [`crate::client::BoardClient`] is ever built and no code path can
+    /// reach the network (no poll, no SSE, no status/thread POSTs). Panels
+    /// still render local-only state.
+    #[serde(default)]
+    pub enabled: bool,
     /// Absolute or `~/`-prefixed path to an ed25519 OpenSSH private key.
     #[serde(default = "default_ssh_key_path")]
     pub ssh_key_path: String,
@@ -123,6 +139,7 @@ fn default_poll_interval_secs() -> u64 {
 impl Default for AgentBoardConfig {
     fn default() -> Self {
         Self {
+            enabled: false,
             ssh_key_path: default_ssh_key_path(),
             worker_url: String::new(),
             room: String::new(),
@@ -481,7 +498,7 @@ impl Panel for AgentBoardPanel {
     }
 
     fn icon_tooltip(&self, _window: &gpui::Window, _cx: &gpui::App) -> Option<&'static str> {
-        Some("Agent Board")
+        Some("Agent Board (obsolete)")
     }
 
     fn toggle_action(&self) -> Box<dyn gpui::Action> {

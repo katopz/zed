@@ -183,6 +183,12 @@ impl BoardRuntime {
     /// so an unconfigured device simply falls back to local-only
     /// plan_registry.
     fn try_start(&mut self, cx: &mut Context<Self>) {
+        if !self.config.enabled {
+            log::info!(
+                "[agent_board] board disabled (enabled=false; stack obsolete, issue 030); running local-only (no remote sync)"
+            );
+            return;
+        }
         if self.config.worker_url.trim().is_empty() {
             log::info!(
                 "[agent_board] worker_url not set in config; running local-only (no remote sync)"
@@ -563,6 +569,32 @@ mod tests {
             assert!(runtime.realtime_client.is_none());
             assert_eq!(runtime.poll_rounds(), 0);
             // No worker → no dashboard link either (the 🌐 button hides).
+            assert!(runtime.dashboard_url().is_none());
+        });
+    }
+
+    /// Issue 030 kill switch: even with a worker_url fully configured, the
+    /// obsolete stack must stay completely inert unless `enabled` is true.
+    /// The 404 fake HTTP client fails the test run if any request escapes.
+    #[gpui::test]
+    async fn disabled_board_with_worker_url_stays_fully_inert(cx: &mut TestAppContext) {
+        let config = AgentBoardConfig {
+            worker_url: "https://agent-board.example.invalid".into(),
+            realtime_enabled: true,
+            ..AgentBoardConfig::default()
+        };
+        assert!(!config.enabled, "the obsolete stack must default to off");
+        let runtime = cx.update(|cx| {
+            BoardRuntime::init_global_with_config(inert_http(), config, cx)
+        });
+        cx.run_until_parked();
+        runtime.read_with(cx, |runtime, _| {
+            assert!(!runtime.connected());
+            assert!(runtime.client.is_none(), "disabled board must not build a client");
+            assert!(!runtime.has_poll_task(), "disabled board must not poll");
+            assert!(runtime.mcp_server.is_none());
+            assert!(runtime.realtime_client.is_none());
+            assert_eq!(runtime.poll_rounds(), 0);
             assert!(runtime.dashboard_url().is_none());
         });
     }
