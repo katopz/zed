@@ -631,6 +631,13 @@ pub fn init(
     thread_metadata_store::init(cx);
     terminal_thread_metadata_store::init(cx);
 
+    // Keeps the auto_prompt start-context machine line near-current (CPU/RAM
+    // are refresh deltas; the power probe shells out, so it must stay off the
+    // main thread). Test builds skip it: the deterministic test scheduler
+    // rejects the foreign async-process/async-io threads the probe creates.
+    #[cfg(not(any(test, feature = "test-support")))]
+    system_specs::spawn_periodic_sampler(cx.background_executor().clone());
+
     inline_assistant::init(fs.clone(), prompt_builder.clone(), cx);
     terminal_inline_assistant::init(fs.clone(), prompt_builder, cx);
     cx.observe_new(|workspace: &mut Workspace, _window, _cx| {

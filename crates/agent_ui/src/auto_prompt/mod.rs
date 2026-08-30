@@ -398,14 +398,11 @@ fn start_context_block(
     }
 
     // Machine line: read the latest background sample. GPU name comes from the
-    // active window's backend (e.g. "Apple M3 Max" on Metal). Schedule a fresh
-    // sample for the next prompt — CPU usage is a delta between refreshes, so
-    // sampling must be periodic and off the main thread.
+    // active window's backend (e.g. "Apple M3 Max" on Metal). The periodic
+    // sampler (spawned at init) keeps the cache near-current; prompt building
+    // only reads it and never blocks.
     let gpu_device_name = window.gpu_specs().map(|specs| specs.device_name);
     let machine_line = system_specs::machine_context_line(gpu_device_name.as_deref());
-    cx.background_executor()
-        .spawn(system_specs::sample_live_machine())
-        .detach();
 
     // Local sibling agents (this window) that are actively generating.
     let local_lines = conversation_view

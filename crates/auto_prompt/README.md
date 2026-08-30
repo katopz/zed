@@ -633,10 +633,10 @@ manual — is stamped with a `## Start context` block assembled by code at
 - **Machine line** (`system_specs::machine_context_line`): hostname/OS, CPU
   brand + cores + current usage, RAM used/total, GPU name (from
   `window.gpu_specs()`), and power state (`pmset` probe on macOS, sysfs on
-  Linux). CPU usage is a delta between refreshes, so samples are taken by a
-  background task (`system_specs::sample_live_machine`) that each dispatch
-  schedules for the *next* prompt — prompt building only reads the cache and
-  never blocks.
+  Linux). CPU usage is a delta between refreshes, so a once-per-process
+  periodic sampler (`system_specs::spawn_periodic_sampler`, spawned from
+  `agent_ui::init`, every 15s with the power probe throttled to ~1/min) keeps
+  the cache near-current — prompt building only reads it and never blocks.
 - **Local sibling agents**: threads in this window that are actively
   generating (`AgentPanel::active_thread_activity`), title + a snippet of the
   latest assistant message.

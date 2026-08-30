@@ -327,20 +327,64 @@ pub struct LiveMachine {
 static LIVE_MACHINE: RwLock<Option<Arc<LiveMachine>>> = RwLock::new(None);
 static SAMPLING: AtomicBool = AtomicBool::new(false);
 
+/// Interval between periodic machine samples. Continuation prompts read the
+/// latest sample, so this bounds how stale "CPU 42%" can be.
+const PERIODIC_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+/// The power probe shells out (`pmset` on macOS) — throttle it to once per
+/// minute; the battery/AC state changes slowly.
+const POWER_PROBE_EVERY_N_SAMPLES: u64 = 4;
+
+static PERIODIC_SAMPLER_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// Spawn the once-per-process periodic machine sampler on the background
+/// executor. Call from app init; later calls are no-ops. Keeps
+/// [`machine_context_line`] fed so every continuation prompt carries
+/// near-current CPU/RAM numbers without any prompt-time work.
+pub fn spawn_periodic_sampler(executor: gpui::BackgroundExecutor) {
+    if PERIODIC_SAMPLER_STARTED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let loop_executor = executor.clone();
+    executor
+        .spawn(async move {
+            let mut tick: u64 = 0;
+            loop {
+                sample_live_machine_inner(tick.is_multiple_of(POWER_PROBE_EVERY_N_SAMPLES)).await;
+                tick = tick.wrapping_add(1);
+                loop_executor.timer(PERIODIC_SAMPLE_INTERVAL).await;
+            }
+        })
+        .detach();
+}
+
 // Persistent sampler instance: `refresh_cpu_usage` computes usage as the delta
 // between consecutive refreshes, so a long-lived `System` yields a real average
 // without any sleeping. The first-ever sample reports 0%; every later one is
 // accurate.
 static SAMPLER_SYSTEM: std::sync::Mutex<Option<System>> = std::sync::Mutex::new(None);
 
-/// Take one machine sample and publish it. Must not run on the main thread
-/// (power probe + process refresh); callers spawn it on a background executor.
-/// Cheap no-op when a sample is already in flight; concurrent samples coalesce.
+/// Take one machine sample (with a fresh power probe) and publish it. Must not
+/// run on the main thread (power probe + process refresh); callers spawn it on
+/// a background executor. Cheap no-op when a sample is already in flight;
+/// concurrent samples coalesce.
 pub async fn sample_live_machine() {
+    sample_live_machine_inner(true).await;
+}
+
+async fn sample_live_machine_inner(probe_power: bool) {
     if SAMPLING.swap(true, Ordering::AcqRel) {
         return;
     }
-    let power = read_power_state().await;
+    let power = if probe_power {
+        read_power_state().await
+    } else {
+        // Between probes, carry the last known power state forward.
+        LIVE_MACHINE
+            .read()
+            .ok()
+            .and_then(|cache| cache.as_ref().map(|machine| machine.power.clone()))
+            .flatten()
+    };
     let snapshot = {
         let mut guard = SAMPLER_SYSTEM
             .lock()
