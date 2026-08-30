@@ -1,11 +1,15 @@
 //! Structured decision logging for debugging auto-prompt.
 //!
-//! Off by default (each decision performs a synchronous filesystem write on
-//! the foreground thread, which is unjustifiable as a default — see issue 006).
-//! Enable explicitly with `ZED_AUTO_PROMPT_LOG=1`; redirect the destination
-//! with `ZED_AUTO_PROMPT_LOG_DIR`. Writes one JSON file per decision event
-//! to `/tmp/zed_auto_prompt/` by default, named `{ms}_{seq}_{label}.json` so a
+//! Off by default (a filesystem write per decision on the foreground thread
+//! is unjustifiable as a default — see issue 006). Enable explicitly with
+//! `ZED_AUTO_PROMPT_LOG=1`; redirect the destination with
+//! `ZED_AUTO_PROMPT_LOG_DIR`. Writes one JSON file per decision event to
+//! `/tmp/zed_auto_prompt/` by default, named `{ms}_{seq}_{label}.json` so a
 //! full trace of a single stop/resume cycle is reconstructable by file order.
+//!
+//! The write runs on a detached background task (P2 follow-up); names still
+//! carry the ordering, so out-of-order completion is harmless. Tail entries
+//! may be lost on hard process exit — acceptable for a debug trace.
 //!
 //! All IO is best-effort: failures are surfaced via `log::warn!` and never
 //! propagated, so logging can never break the decision pipeline.
@@ -82,7 +86,46 @@ pub fn write_log(label: &str, payload: Value) {
         }
     };
     let path = dir.join(format!("{ms}_{seq}_{label}.json"));
-    if let Err(err) = std::fs::write(&path, json) {
-        log::warn!("[auto_prompt::debug_log] failed to write {path:?}: {err}");
+    spawn_write(path, json);
+}
+
+/// Hand the actual file write to a detached background task: even as an
+/// explicit opt-in, a synchronous filesystem write per decision on the
+/// foreground thread was a measurable stall source (issue 006). File names
+/// still carry `{ms}_{seq}` ordering, so out-of-order completion is harmless.
+fn spawn_write(path: PathBuf, json: String) {
+    smol::spawn(async move {
+        if let Err(err) = smol::fs::write(&path, json).await {
+            log::warn!("[auto_prompt::debug_log] failed to write {path:?}: {err}");
+        }
+    })
+    .detach();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spawn_write_lands_file_via_background_task() {
+        let dir = std::env::temp_dir().join(format!("zed_ap_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("1_0_smoke.json");
+        spawn_write(path.clone(), "{\"check\": true}".to_string());
+        // The write is detached on the global executor; poll briefly for it to
+        // land rather than sleeping a fixed amount.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !path.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "debug_log file never landed at {path:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{\"check\": true}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
