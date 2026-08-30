@@ -17,6 +17,14 @@ mod plan_source;
 pub mod session_limit;
 pub mod watchdog;
 
+/// Test-harness hook: disables `plan_source`'s real git process spawns so
+/// deterministic test executors are never woken by the foreign
+/// `async-io`/`async-process` driver threads that spawning creates. Set by
+/// agent_ui's test init; production never calls this.
+pub fn set_plan_source_git_spawns_disabled(disabled: bool) {
+    plan_source::set_git_spawns_disabled(disabled);
+}
+
 pub use config::{AutoPromptConfig, default_max_context_tokens};
 pub use context::{
     AutoPromptContext, AutoPromptResponse, PlanFileContent, StopPhase, truncate_to_paragraph_budget,

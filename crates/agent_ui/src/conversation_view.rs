@@ -6932,7 +6932,12 @@ pub(crate) mod tests {
             editor::init(cx);
             agent_panel::init(cx);
             release_channel::init(semver::Version::new(0, 0, 0), cx);
-            prompt_store::init(cx)
+            prompt_store::init(cx);
+            // Turn-completing tests fire the auto-prompt decide pipeline, whose
+            // plan reads shell out to git — those spawns create foreign driver
+            // threads that wake the deterministic scheduler from the wrong
+            // thread (rotating "Detected activity on thread async-io" failures).
+            auto_prompt::set_plan_source_git_spawns_disabled(true);
         });
     }
 

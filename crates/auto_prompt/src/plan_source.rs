@@ -21,6 +21,7 @@ use futures::future::{Either, select};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -80,6 +81,17 @@ struct Snapshot {
 }
 
 static SNAPSHOTS: Mutex<Option<HashMap<PathBuf, Snapshot>>> = Mutex::new(None);
+
+static GIT_SPAWNS_DISABLED: AtomicBool = AtomicBool::new(false);
+
+/// Deterministic test executors must never be woken by the foreign
+/// `async-io`/`async-process` driver threads that process spawning creates —
+/// the completion wake crosses threads and trips the test scheduler's
+/// `assert_correct_thread`. agent_ui's test harness sets this at init;
+/// production code never does.
+pub(crate) fn set_git_spawns_disabled(disabled: bool) {
+    GIT_SPAWNS_DISABLED.store(disabled, Ordering::Release);
+}
 static FETCH_ATTEMPTS: Mutex<Option<HashMap<PathBuf, f64>>> = Mutex::new(None);
 
 fn time_monotonic_secs() -> f64 {
@@ -359,6 +371,9 @@ async fn last_touch(
 }
 
 async fn git_toplevel(work_dir: &Path) -> Option<PathBuf> {
+    if GIT_SPAWNS_DISABLED.load(Ordering::Acquire) {
+        return None;
+    }
     let out = git_output(work_dir, &["rev-parse", "--show-toplevel"]).await?;
     Some(PathBuf::from(out.trim_end()))
 }

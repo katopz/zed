@@ -115,6 +115,11 @@ pub fn init_test(cx: &mut TestAppContext) {
         release_channel::init("0.0.0".parse().unwrap(), cx);
         agent_panel::init(cx);
         crate::terminal_thread_metadata_store::TerminalThreadMetadataStore::init_global(cx);
+        // Turn-completing tests fire the auto-prompt decide pipeline, whose
+        // plan reads shell out to git — those spawns create foreign driver
+        // threads that wake the deterministic scheduler from the wrong thread
+        // (rotating "Detected activity on thread async-io" failures).
+        auto_prompt::set_plan_source_git_spawns_disabled(true);
     });
 }
 
