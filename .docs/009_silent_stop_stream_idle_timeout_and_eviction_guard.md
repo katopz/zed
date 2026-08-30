@@ -53,7 +53,7 @@ GPUI timer, recreated each iteration:
   so nothing is lost. After retries exhaust: `send_error` → visible error
   entry in the thread + "Agent stopped due to an error" notification, and
   agent_ui's error arm can chain auto_prompt.
-  **Follow-up (2026-08-28):** user report showed the provider hang outlasting
+  **Follow-up (2026-08-28, `1bd6fb6383`):** user report showed the provider hang outlasting
   that budget — the turn died with a visible `stream idle timeout` error while
   a later *manual* Retry click (fresh turn, reset budget) succeeded. Idle
   timeouts now carry a typed payload (`Thread::StreamIdleTimeout`, no string
