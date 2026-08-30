@@ -99,6 +99,7 @@ serde_json.workspace = true
 serde_json_lenient.workspace = true
 settings.workspace = true
 streaming_diff.workspace = true
+system_specs.workspace = true
 task.workspace = true
 telemetry.workspace = true
 terminal.workspace = true

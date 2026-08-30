@@ -12289,12 +12289,14 @@ pub(crate) mod tests {
         );
     }
 
-    /// Clicking the manual auto-prompt button must run the same orchestration
-    /// path as the automatic trigger — reasoning about the agent's last
-    /// paragraphs — instead of immediately sending the static
-    /// "Continue from where we left off." nudge.
+    /// Clicking the manual auto-prompt button must NOT consult the
+    /// orchestration LLM — the static continue directive is dispatched
+    /// immediately (the orchestrator's verdict on a manual click was
+    /// effectively always this fixed decision anyway). The stub is left
+    /// unanswered after the click, so no `Stopped` event can fire the automatic
+    /// chain either: any orchestrator completion below would be a regression.
     #[gpui::test]
-    async fn test_manual_auto_prompt_consults_orchestrator(cx: &mut TestAppContext) {
+    async fn test_manual_auto_prompt_dispatches_static_continuation(cx: &mut TestAppContext) {
         init_test(cx);
 
         let fake_model = cx.read(|cx| {
@@ -12305,10 +12307,9 @@ pub(crate) mod tests {
                 .clone()
         });
 
-        // `default_response` completes each turn, so the thread ends up Idle
-        // with an assistant message for the orchestrator to reason about.
+        let connection = StubAgentConnection::new();
         let (conversation_view, cx) =
-            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
         add_to_workspace(conversation_view.clone(), cx);
 
         message_editor(&conversation_view, cx).update_in(cx, |editor, window, cx| {
@@ -12316,6 +12317,13 @@ pub(crate) mod tests {
         });
         active_thread(&conversation_view, cx)
             .update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+
+        let session_id = active_thread(&conversation_view, cx)
+            .read_with(cx, |thread, cx| thread.thread.read(cx).session_id().clone());
+        cx.update(|_, _cx| {
+            connection.end_turn(session_id, acp::StopReason::EndTurn);
+        });
         cx.run_until_parked();
 
         // auto_prompt is off, so the completed turn must not have consulted the
@@ -12326,16 +12334,17 @@ pub(crate) mod tests {
             .update_in(cx, |view, window, cx| view.manual_auto_prompt(window, cx));
         cx.run_until_parked();
 
-        assert!(
-            fake_model.as_fake().completion_count() > completions_before,
-            "manual auto-prompt should consult the orchestration LLM"
+        assert_eq!(
+            fake_model.as_fake().completion_count(),
+            completions_before,
+            "manual auto-prompt must not consult the orchestration LLM"
         );
 
         let markdown = active_thread(&conversation_view, cx)
             .read_with(cx, |view, cx| view.thread.read(cx).to_markdown(cx));
         assert!(
-            !markdown.contains("Continue from where we left off"),
-            "the static continuation must not be sent while the orchestrator is still deciding; got: {markdown}"
+            markdown.contains("Continue remaining work"),
+            "the static continuation directive must be sent immediately; got: {markdown}"
         );
     }
 

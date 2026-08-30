@@ -4617,6 +4617,34 @@ impl AgentPanel {
             .collect()
     }
 
+    /// One-line summaries of sibling threads that are actively generating, for
+    /// auto_prompt start-context. Idle/draft threads are skipped — a
+    /// continuation prompt cares about concurrent work, not parked threads.
+    pub(crate) fn active_thread_activity(&self, cx: &App) -> Vec<String> {
+        let mut actives = Vec::new();
+        for view in self.conversation_views() {
+            let Some(thread_view) = view.read(cx).active_thread() else {
+                continue;
+            };
+            let thread = thread_view.read(cx).thread.clone();
+            let thread = thread.read(cx);
+            if !matches!(thread.status(), acp_thread::ThreadStatus::Generating) {
+                continue;
+            }
+            let title = thread
+                .title()
+                .map(|title| title.to_string())
+                .unwrap_or_else(|| "untitled".to_string());
+            let line = match crate::auto_prompt::last_assistant_snippet(thread.entries(), 160, cx)
+            {
+                Some(snippet) => format!("{title}: {snippet}"),
+                None => title,
+            };
+            actives.push(line);
+        }
+        actives
+    }
+
     pub fn active_thread_view(&self, cx: &App) -> Option<Entity<ThreadView>> {
         let server_view = self.active_conversation_view()?;
         server_view.read(cx).root_thread_view()

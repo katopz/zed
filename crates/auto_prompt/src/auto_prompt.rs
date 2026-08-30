@@ -782,13 +782,14 @@ pub fn evaluate_response(input: &EvaluationInput) -> EvaluationResult {
 /// the LLM is certain the chain should stop — verification is pointless.
 const DECISIVE_STOP_THRESHOLD: f64 = 0.15;
 
-/// Fixed decision directive used by the summary-first fast path (plan 027).
-/// When the worker's last message already ends with a summary (the mandated
-/// `## Summary` handoff format), auto_prompt does NOT re-process it with an
-/// orchestrator/reasoning LLM call — the new/same thread is continued with
-/// this instruction and the summary itself carries "what remains".
-pub const CONTINUE_REMAINS_DECISION: &str =
-    "Continue remains and make decisions for best perf/sec prod grade";
+/// Fixed decision directive used by the manual sparkle click and the
+/// summary-first fast path (plan 027). When the worker's last message already
+/// ends with a summary (the mandated `## Summary` handoff format), auto_prompt
+/// does NOT re-process it with an orchestrator/reasoning LLM call — the
+/// new/same thread is continued with this instruction and the summary itself
+/// carries "what remains". The manual click dispatches this same directive
+/// directly, with no orchestrator call at all.
+pub const CONTINUE_REMAINS_DECISION: &str = "Continue remaining work with best perf/sec, prod-grade decisions (SOLID, DRY); file issues/plans as needed to ensure full coverage. If nothing remains, check other repos for unfinished tasks or do housekeeping (doc-sync, riir-clippy mining, code-smell hunt, online search to distill perf/sec or unblock deferred work).";
 
 /// Returns true when the orchestration LLM is decisively stopping.
 /// A decisive stop has very low confidence and no prompt — the LLM is

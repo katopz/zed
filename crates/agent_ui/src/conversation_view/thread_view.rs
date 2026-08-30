@@ -8720,7 +8720,13 @@ impl ThreadView {
             .and_then(auto_prompt::extract_original_user_message)
             .or_else(|| first_user_message.clone().filter(|s| !s.trim().is_empty()));
 
-        let raw_prompt = "Continue from where we left off.".to_string();
+        // Static continuation dispatched directly by the manual click —
+        // `on_manual_auto_prompt` sends this action immediately with no
+        // orchestrator call, and `dispatch_action` chooses same-thread vs
+        // new-thread from the token count. The first-prompt wrapper around the
+        // directive is stripped again before the send; it only matters for the
+        // new-thread path (decision extraction).
+        let raw_prompt = auto_prompt::CONTINUE_REMAINS_DECISION.to_string();
 
         let prompt_summary = auto_prompt::build_prompt_summary(
             None,
@@ -8738,11 +8744,9 @@ impl ThreadView {
             last_assistant_message.as_deref(),
         );
 
-        // Generic continuation used only if the orchestration LLM declines to
-        // produce one. The click itself routes through the same orchestrator as
-        // the automatic trigger (`on_manual_auto_prompt`), so the prompt the
-        // agent actually receives normally reasons about its last paragraphs
-        // rather than being this static nudge.
+        // Generic continuation kept only as a belt-and-braces default if the
+        // directive text is ever empty; the click itself now dispatches the
+        // static directive above.
         let fallback_action = auto_prompt::AutoPromptAction {
             from_session_id: session_id,
             from_title: title,

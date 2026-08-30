@@ -336,8 +336,8 @@ pub struct AutoPromptNewThread {
 fn build_continuation_prompt(_last_assistant_message: Option<&str>, decision: &str) -> String {
     let trimmed = decision.trim();
 
-    // Bare generic continuation (manual_auto_prompt, overflow fallbacks) — no
-    // substantive task to emit, so use a minimal continuation instruction.
+    // Bare generic continuation — no substantive task to emit, so use a minimal
+    // continuation instruction.
     let is_generic_continuation = trimmed
         .strip_prefix("Continue from where we left off")
         .map_or(false, |rest| rest.trim().trim_end_matches('.').is_empty());
@@ -349,6 +349,97 @@ fn build_continuation_prompt(_last_assistant_message: Option<&str>, decision: &s
     "Continue from where we left off.".to_string()
 }
 
+/// Char-boundary-safe snippet of the worker's latest assistant message, for
+/// "what other agents are doing right now" context lines.
+pub(crate) fn last_assistant_snippet(
+    entries: &[acp_thread::AgentThreadEntry],
+    max_chars: usize,
+    cx: &gpui::App,
+) -> Option<String> {
+    let message = entries.iter().rev().find_map(|entry| match entry {
+        AgentThreadEntry::AssistantMessage(message) => Some(message),
+        _ => None,
+    })?;
+    let text = message
+        .chunks
+        .iter()
+        .filter_map(|chunk| {
+            let block = match chunk {
+                acp_thread::AssistantMessageChunk::Message { block, .. } => block,
+                acp_thread::AssistantMessageChunk::Thought { block, .. } => block,
+            };
+            let text = block.to_markdown(cx);
+            (!text.is_empty()).then_some(text.to_string())
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    Some(text.chars().take(max_chars).collect::<String>())
+}
+
+/// Pre-gathered start context stamped onto every continuation prompt (both
+/// same-thread and new-thread): machine load (CPU/RAM/power/GPU) plus what the
+/// other agents — local siblings and remote board peers — are doing right now.
+/// The worker can then make resource- and fleet-aware decisions without
+/// spending tool calls probing the machine or the agent board.
+fn start_context_block(
+    conversation_view: &crate::ConversationView,
+    window: &Window,
+    cx: &gpui::App,
+) -> Option<String> {
+    // Test builds read no cache and spawn nothing (the deterministic test
+    // scheduler rejects foreign-thread activity), so the block would be empty
+    // noise — skip it entirely there.
+    if cfg!(any(test, feature = "test-support")) {
+        return None;
+    }
+
+    // Machine line: read the latest background sample. GPU name comes from the
+    // active window's backend (e.g. "Apple M3 Max" on Metal). Schedule a fresh
+    // sample for the next prompt — CPU usage is a delta between refreshes, so
+    // sampling must be periodic and off the main thread.
+    let gpu_device_name = window.gpu_specs().map(|specs| specs.device_name);
+    let machine_line = system_specs::machine_context_line(gpu_device_name.as_deref());
+    cx.background_executor()
+        .spawn(system_specs::sample_live_machine())
+        .detach();
+
+    // Local sibling agents (this window) that are actively generating.
+    let local_lines = conversation_view
+        .workspace()
+        .upgrade()
+        .and_then(|workspace| workspace.read(cx).panel::<crate::AgentPanel>(cx))
+        .map(|panel| panel.read(cx).active_thread_activity(cx))
+        .unwrap_or_default();
+
+    // Remote board peers (other devices), already formatted by auto_prompt.
+    let remote_block = auto_prompt::peer_states::unmuted_states_for_context();
+
+    if machine_line.is_none() && local_lines.is_empty() && remote_block.is_none() {
+        return None;
+    }
+
+    let mut block = String::from("## Start context (pre-gathered by Zed, no tool calls needed)");
+    if let Some(machine_line) = machine_line {
+        block.push('\n');
+        block.push_str(&machine_line);
+    }
+    if !local_lines.is_empty() {
+        block.push_str("\nLocal agents actively working right now:");
+        for line in local_lines {
+            block.push_str(&format!("\n- {line}"));
+        }
+    }
+    if let Some(remote_block) = remote_block {
+        block.push('\n');
+        block.push_str(remote_block.trim_end());
+    }
+    Some(block)
+}
+
 pub(crate) fn dispatch_action(
     action: auto_prompt::AutoPromptAction,
     conversation_view: &crate::ConversationView,
@@ -358,6 +449,10 @@ pub(crate) fn dispatch_action(
     let is_native_agent = conversation_view
         .active_thread()
         .is_some_and(|tv| tv.read(cx).thread.read(cx).connection().agent_id() == *ZED_AGENT_ID);
+
+    // Sample the machine in the background so the NEXT continuation prompt
+    // carries fresh CPU/RAM/power numbers (see start_context_block).
+    let start_context = start_context_block(conversation_view, window, cx);
 
     let max_context_tokens = auto_prompt::load_config_cached()
         .map(|config| config.max_context_tokens)
@@ -421,8 +516,12 @@ pub(crate) fn dispatch_action(
                 action.actual_input_tokens
             );
             let decision = strip_first_prompt_wrapper(&action.next_prompt);
-            let prompt =
+            let mut prompt =
                 build_continuation_prompt(action.last_assistant_message.as_deref(), &decision);
+            if let Some(start_context) = start_context.as_deref() {
+                prompt.push_str("\n\n---\n\n");
+                prompt.push_str(start_context);
+            }
             active_tv.update(cx, |tv, cx| {
                 tv.message_editor.update(cx, |editor, cx| {
                     editor.set_message(
@@ -592,6 +691,10 @@ pub(crate) fn dispatch_action(
                     full_prompt =
                         auto_prompt::append_addition_request(&full_prompt, Some(draft));
                 }
+                if let Some(start_context) = start_context.as_deref() {
+                    full_prompt.push_str("\n\n---\n\n");
+                    full_prompt.push_str(start_context);
+                }
                 log::info!(
                     "[auto_prompt] dispatch_action: new thread via ContentBlock ({} chars, draft={})",
                     full_prompt.len(),
@@ -694,15 +797,15 @@ pub fn on_thread_stopped(
 
 /// Entry point for the user-clicked (manual) auto-prompt button.
 ///
-/// Runs the *same* orchestration path as the automatic trigger so the
-/// continuation reasons about the agent's last paragraphs instead of sending a
-/// static "Continue from where we left off." — which is what a manual click
-/// used to do.
+/// A click is an explicit "keep working now", and the orchestrator's verdict
+/// was effectively always the fixed [`auto_prompt::CONTINUE_REMAINS_DECISION`]
+/// directive — so the static continuation carried by `fallback` is dispatched
+/// immediately, with no decide phase (no plan/doc reads, no LLM call).
+/// `dispatch_action` still chooses same-thread vs new-thread from the token
+/// count, and stamps the pre-gathered start context onto the prompt.
 ///
-/// `fallback` is dispatched verbatim only when the orchestrator declines to
-/// produce a continuation (`NoAction`, `Stopped`, or a failed orchestration
-/// call). A click is an explicit request to continue, so the thread must always
-/// receive something; the automatic path, by contrast, correctly sends nothing.
+/// Returns the short-lived task that performs the (LLM-free) dispatch, so the
+/// caller can store it for cancellation symmetry with the automatic path.
 pub fn on_manual_auto_prompt(
     conversation_view: &crate::ConversationView,
     thread: &gpui::Entity<acp_thread::AcpThread>,
@@ -724,7 +827,8 @@ pub fn on_manual_auto_prompt(
 /// Shared implementation of [`on_thread_stopped`] and [`on_manual_auto_prompt`].
 ///
 /// `manual_fallback` is `Some` only for the manual path; it marks the run as
-/// user-initiated (focus the continuation, always send something).
+/// user-initiated and short-circuits straight to a static dispatch (no decide
+/// phase) — the fallback action IS the continuation.
 ///
 /// The decide phase (config load, `.plans/`/`.docs/` reads, context build)
 /// runs inside the returned task — never on the caller's stack — so a click
@@ -785,6 +889,24 @@ fn run_auto_prompt(
     let stop_reason = *stop_reason;
 
     Some(cx.spawn_in(window, async move |_view, cx| {
+        // Manual click: static fast path. A click is an explicit "keep working
+        // now", and the orchestrator's verdict was effectively always the fixed
+        // continue directive anyway — so skip the whole decide pipeline (plan
+        // reads + LLM call) and dispatch the static continuation immediately.
+        // dispatch_action still chooses same-thread vs new-thread from the
+        // token count, so an overflowing thread forks instead of looping.
+        if let Some(mut fallback) = manual_fallback {
+            log::info!(
+                "[auto_prompt] manual click — dispatching static continuation (no orchestrator call)"
+            );
+            fallback.profile_id = profile_id.take().or(fallback.profile_id);
+            let _ = _view.update_in(cx, |_view, window, cx| {
+                reset_auto_prompt_state(_view, cx);
+                dispatch_action(fallback, _view, window, cx);
+            });
+            return;
+        }
+
         let decision = if is_claude_agent_for_task {
             log::info!("[auto_prompt] Claude agent detected — using claude_agent::decide_claude");
             // Warm the origin plan snapshots off-thread before the synchronous
@@ -811,27 +933,15 @@ fn run_auto_prompt(
         log::info!("[auto_prompt] decision result: {:?}", decision);
 
         match decision {
-            auto_prompt::AutoPromptDecision::NoAction => match manual_fallback {
-                // The user asked for a continuation, so send the generic one rather
-                // than silently doing nothing.
-                Some(mut fallback) => {
-                    log::info!("[auto_prompt] NoAction on manual run - dispatching generic fallback");
-                    fallback.profile_id = profile_id.take().or(fallback.profile_id);
-                    let _ = _view.update_in(cx, |_view, window, cx| {
-                        reset_auto_prompt_state(_view, cx);
-                        dispatch_action(fallback, _view, window, cx);
-                    });
-                }
-                None => {
-                    log::info!("[auto_prompt] NoAction - taking no action");
-                    // The caller stored this (now finished) task in
-                    // `_auto_prompt_task`; clear it so a later user message
-                    // doesn't mistake the completed decision for a live one.
-                    let _ = _view.update_in(cx, |cv, _window, cx| {
-                        reset_auto_prompt_state(cv, cx);
-                    });
-                }
-            },
+            auto_prompt::AutoPromptDecision::NoAction => {
+                log::info!("[auto_prompt] NoAction - taking no action");
+                // The caller stored this (now finished) task in
+                // `_auto_prompt_task`; clear it so a later user message
+                // doesn't mistake the completed decision for a live one.
+                let _ = _view.update_in(cx, |cv, _window, cx| {
+                    reset_auto_prompt_state(cv, cx);
+                });
+            }
 
             auto_prompt::AutoPromptDecision::DispatchNow(mut action) => {
                 action.profile_id = profile_id.take();

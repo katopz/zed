@@ -574,15 +574,17 @@ Messages like "5 remaining tasks require GPU hardware" or "Remaining Work (block
 
 2. **Manual sparkle button** (`thread_view.rs` `manual_auto_prompt()`):
    Always available in thread controls (bottom-right sparkle icon).
-   Bypasses the LLM decision pipeline — directly calls `dispatch_action()` with
-   `actual_input_tokens` from `thread.token_usage()`. This ensures the token
-   threshold check works correctly (no async LLM call that might lose the real
-   token count). Also enables `auto_prompt_enabled` so subsequent automatic
-   cycles can complete (e.g., ContextOverflow Phase 2).
+   Bypasses the LLM decision pipeline — dispatches the static
+   [`CONTINUE_REMAINS_DECISION`] continuation immediately (no orchestrator
+   call, no plan reads) while carrying `actual_input_tokens` from
+   `thread.token_usage()`, so `dispatch_action` still makes a correct
+   same-thread vs new-thread call. Also enables `auto_prompt_enabled` so
+   subsequent automatic cycles can complete (e.g., ContextOverflow Phase 2).
 
-   The manual sparkle button is for "kick the AI to keep working now" — it sends
-   a simple continuation prompt and lets `dispatch_action` decide same-thread
-   vs new-thread based on the token threshold.
+   The manual sparkle button is for "kick the AI to keep working now" — the
+   orchestrator's verdict on a click was effectively always the fixed continue
+   directive anyway, so the decide phase was pure latency (plan reads + LLM
+   round-trip) for a predetermined answer.
 
 ### New thread content (auto_prompt_new_thread)
 
@@ -617,34 +619,54 @@ When `AutoPromptNewThread` is dispatched, `AgentPanel::auto_prompt_new_thread()`
 
 ### Same-thread continuation
 
-When the token count is below the `same_thread_token_threshold` (default 60K), continuations are sent to the **same thread** instead of creating a new one:
+When the token count is below the overflow gate (`max_context_tokens`, 200k default), continuations are sent to the **same thread** instead of creating a new one:
 
 - **Native Zed agent**: the orchestration LLM's decision is emitted **as-is** (no static preamble prepended)
 - **ACP agents (Claude, etc.)**: a minimal orchestration LLM call reasons over the agent's last 2-3 paragraphs and returns `{continue, confidence, next_prompt, reason}`. The verdict drives continue-vs-stop; `next_prompt` (when continue) is sent as-is. See `claude_agent.rs`.
 
+### Start context (pre-gathered, both dispatch modes)
+
+Every continuation prompt — same-thread **and** new-thread, automatic **and**
+manual — is stamped with a `## Start context` block assembled by code at
+`dispatch_action` time (`start_context_block` in `agent_ui/src/auto_prompt/mod.rs`):
+
+- **Machine line** (`system_specs::machine_context_line`): hostname/OS, CPU
+  brand + cores + current usage, RAM used/total, GPU name (from
+  `window.gpu_specs()`), and power state (`pmset` probe on macOS, sysfs on
+  Linux). CPU usage is a delta between refreshes, so samples are taken by a
+  background task (`system_specs::sample_live_machine`) that each dispatch
+  schedules for the *next* prompt — prompt building only reads the cache and
+  never blocks.
+- **Local sibling agents**: threads in this window that are actively
+  generating (`AgentPanel::active_thread_activity`), title + a snippet of the
+  latest assistant message.
+- **Remote board peers**: `auto_prompt::peer_states::unmuted_states_for_context()`
+  (multi-device agent board, 15s feeder refresh).
+
+The worker agent can then make resource- and fleet-aware decisions without
+spending tool calls probing the machine (`nvidia-smi`, `powermetrics`, …) or
+polling the agent board. Test builds skip the block entirely (no cache, no
+process spawns under the deterministic test scheduler).
+
 ### Manual auto-prompt (sparkle button)
 
-Clicking the sparkle button in a thread runs the **same** orchestration path as the automatic `Stopped` trigger — `agent_ui::auto_prompt::on_manual_auto_prompt()` calls `run_auto_prompt()` with `stop_reason = EndTurn` and a fallback action. So a manual click reasons about the agent's last paragraphs (and, on the hidden-orchestrator path, the plan files) exactly like an automatic continuation.
+Clicking the sparkle button dispatches the static continuation immediately —
+`agent_ui::auto_prompt::on_manual_auto_prompt()` short-circuits past the whole
+decide phase (no plan/doc reads, no orchestrator call) and sends
+[`CONTINUE_REMAINS_DECISION`] (the same directive the summary fast path uses),
+stamped with the pre-gathered start context (see below). The orchestrator's
+verdict on a manual click was effectively always this fixed decision, so the
+LLM round-trip bought nothing but latency.
 
-The difference from the automatic path is only what happens when the orchestrator declines:
-
-| Orchestrator outcome | Automatic trigger | Manual click |
-|---|---|---|
-| `Continue` / `DispatchNow` | dispatch the decision | dispatch the decision (focused) |
-| `NoAction` | send nothing | dispatch the generic `"Continue from where we left off."` fallback |
-| `Stopped { reason }` | toast, send nothing | dispatch the generic fallback |
-| Orchestration call failed | `Failed` state + retry affordance | dispatch the generic fallback |
-
-A click is an explicit request to continue, so the thread must always receive something — but the static nudge is now the last resort, not the only behavior.
-
-The last assistant message is **not** repeated — it's already visible in the thread history. Only the orchestration LLM's decision is sent, keeping the continuation concise and avoiding the two-voice failure mode where a generic "Continue from where we left off…" preamble would be bolted onto a substantive task instruction.
+`dispatch_action` still chooses same-thread vs new-thread from the token count,
+and the click focuses the thread it just kicked.
 
 **`build_continuation_prompt(decision)` behavior** (`agent_ui/src/auto_prompt/mod.rs`):
 
 | Decision content | Emitted message |
 |------------------|-----------------|
 | Substantive task (e.g. "Scaffold the issue file at…", "Implement X. Production grade only.") | The decision, unchanged |
-| Bare generic "Continue from where we left off." (overflow fallback, orchestrator declined on a manual run) | `"Continue from where we left off."` (minimal fallback) |
+| Bare generic "Continue from where we left off." (empty/garbled orchestrator decision) | `"Continue from where we left off."` (minimal fallback) |
 | Empty | `"Continue from where we left off."` (minimal fallback) |
 
 The fallback is intentionally minimal. Behavioral meta-instructions ("commit when done", "review remaining work") belong in the agent's system prompt or the user's `AGENTS.md`, not bolted onto every same-thread continuation — otherwise a reply like "Yes, I love you" to "Do you love me?" would get prefixed with "Continue from where we left off. Summarize prior context internally…", producing an absurd two-paragraph message.
