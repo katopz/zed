@@ -1,5 +1,10 @@
 # 015 — Agent Board Web UI (browser dashboard + WebSocket steering)
 
+> **OBSOLETE (2026-08-28, issue 030):** the war room + worker stack this
+> WebUI served is retired — Cloudflare worker + KV namespace deleted
+> (commits `845972dfc2`, `38917190c3`). The acceptance criteria below are
+> unmeetable; kept for historical context only.
+
 ## Goal
 A minimal single-page HTML dashboard served by the Cloudflare Worker so the
 operator can see all agent threads across devices in a browser, click any

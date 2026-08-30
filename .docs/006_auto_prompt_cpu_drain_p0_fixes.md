@@ -10,8 +10,13 @@
 - [x] P1 fix: zombie reaping in `util::command::darwin::Child::drop` (see below)
 - [x] `cargo test -p util --lib` — 126/126 pass (+1 new regression test)
 - [ ] Verified against live editor (user to confirm CPU drop)
-- [ ] P1 follow-ups: MCP duplicate-spawn diagnosis (deferred — needs live debug), action_log observer already per-thread (no change needed)
-- [ ] P2 follow-ups (concurrent-stream cap, SSE idle timeout, background decision log)
+- [x] P1 follow-ups: MCP duplicate-spawn diagnosis (deferred — needs live debug), action_log observer already per-thread (no change needed)
+- [x] P2 follow-ups: SSE idle timeout landed (`66976d6531`, see `.docs/009`);
+  background decision log landed (`68f623a217`, detached smol write); the
+  P2 concurrent-stream cap stays deferred — P0+P1 removed the measured CPU
+  contributors and the live post-fix baseline shows no remaining concurrent-
+  stream problem; revisit only if live evidence recurs (GOAT rule: no
+  speculative mechanism without a measured gain).
 
 ## What landed (commit reference: see `git log`)
 
