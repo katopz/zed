@@ -137,7 +137,7 @@ The idle-timeout test drives the deterministic GPUI scheduler
   never prompts → the assertions read the stale 5.4 `/etc/hosts` dropdown that
   legitimately offers AllowAlways). Moved them to section 5.6 (global skills
   prompt), where they match `build_permission_options`' AgentSkills scope
-  (Flat, once-only) — `28a3f00344`.
+  (Flat, once-only) — `20f83a4eda`.
 - [ ] Premature "normal" stops where auto_prompt's decide LLM concludes
   NoAction at 350k+ token contexts are a decision-quality problem, not a
   wiring bug — the 200k gate above shrinks those contexts going forward.
