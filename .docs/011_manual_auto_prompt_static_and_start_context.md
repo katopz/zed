@@ -63,14 +63,19 @@ polling the agent board to learn what sibling agents were doing.
   `test_manual_auto_prompt_consults_orchestrator`).
 - clippy clean (deny warnings) for `system_specs`, `auto_prompt`, `agent_ui`;
   auto_prompt 394/394, system_specs 2/2 pass.
-- agent_ui has a machine-specific nondeterministic flake (foreign
-  `async-io`/`async-process` threads trip the deterministic test scheduler);
-  affects clean `develop` equally and the failing subset rotates between
-  runs — pre-existing, not caused by this work.
+- agent_ui flake (foreign `async-io`/`async-process` threads tripping the
+  deterministic test scheduler) root-caused and fixed in `f4f050d378`:
+  test-mode git spawns from auto_prompt `plan_source` were the foreign-thread
+  source; a test-only kill switch removes them. Full agent_ui suite passes
+  389/389 twice consecutively.
+- `d8c972fca8` syncs the Cargo.lock entry for the system_specs windows dep
+  (missed by `a186992528`; stale lockfile would fail CI `--locked` builds).
 
 ## Follow-ups
 
-- None open. Windows power probe landed in this doc's scope
-  (`GetSystemPowerStatus`, `Win32_System_Power`) — compile-unverified locally
-  (no Windows toolchain on the M3 build host; API usage verified against the
-  vendored windows-0.61 crate sources); zed's Windows CI build will confirm.
+- None open. Windows power probe (`GetSystemPowerStatus`,
+  `Win32_System_Power`) compile-verified locally: the FFI arm checked against
+  the real `windows 0.61.3` crate for `x86_64-pc-windows-msvc` in a minimal
+  proxy crate (full cross-check is blocked on macOS by the `stacker` C build
+  script needing Windows SDK headers; the remaining dep graph is
+  platform-agnostic Rust).
