@@ -130,11 +130,14 @@ The idle-timeout test drives the deterministic GPUI scheduler
   unconditionally every ~2s. No action taken here — the sibling's fix in
   `crates/agent_board/src/runtime.rs` covers it; rebuilding/restarting picks
   it up.
-- [ ] `tools::edit_file_tool::tests::test_streaming_authorize` fails
-  deterministically — PRE-EXISTING from the Aug 19 upstream merge
-  (`8823d2bcea`), verified failing at `HEAD~2` in an isolated worktree
-  before any of the 003 fixes. Unrelated to this workstream; needs its own
-  issue (agent-skills permission prompt offering "Always allow").
+- [x] `tools::edit_file_tool::tests::test_streaming_authorize` failed
+  deterministically (pre-existing from the Aug 19 upstream merge
+  `8823d2bcea`) — FIXED: the merge left the "no Always-allow / flat options"
+  assertions in section 5.5 (project-local skill, which under current behavior
+  never prompts → the assertions read the stale 5.4 `/etc/hosts` dropdown that
+  legitimately offers AllowAlways). Moved them to section 5.6 (global skills
+  prompt), where they match `build_permission_options`' AgentSkills scope
+  (Flat, once-only) — `28a3f00344`.
 - [ ] Premature "normal" stops where auto_prompt's decide LLM concludes
   NoAction at 350k+ token contexts are a decision-quality problem, not a
   wiring bug — the 200k gate above shrinks those contexts going forward.

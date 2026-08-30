@@ -1498,20 +1498,6 @@ mod tests {
             stream_rx.try_recv().is_err(),
             "project-local .agents/skills must NOT prompt"
         );
-        // Skills always prompt, so no "Always allow" option is offered.
-        assert!(
-            event
-                .options
-                .first_option_of_kind(acp::PermissionOptionKind::AllowAlways)
-                .is_none(),
-            "agent skills prompt must not offer an \"Always allow\" option: {:?}",
-            event.options,
-        );
-        assert!(
-            matches!(event.options, acp_thread::PermissionOptions::Flat(_)),
-            "agent skills prompt should use flat allow/deny options: {:?}",
-            event.options,
-        );
 
         // 5.6: The global .agents/skills directory is sensitive — still prompts
         let global_skill_path = agent_skills::global_skills_dir()
@@ -1527,6 +1513,20 @@ mod tests {
                 .title
                 .as_deref()
                 .is_some_and(|title| title.ends_with("(agent skills)"))
+        );
+        // Skills always prompt, so no "Always allow" option is offered.
+        assert!(
+            event
+                .options
+                .first_option_of_kind(acp::PermissionOptionKind::AllowAlways)
+                .is_none(),
+            "agent skills prompt must not offer an \"Always allow\" option: {:?}",
+            event.options,
+        );
+        assert!(
+            matches!(event.options, acp_thread::PermissionOptions::Flat(_)),
+            "agent skills prompt should use flat allow/deny options: {:?}",
+            event.options,
         );
     }
 
