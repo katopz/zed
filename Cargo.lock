@@ -18847,6 +18847,7 @@ dependencies = [
  "serde",
  "smol",
  "sysinfo 0.37.2",
+ "windows 0.61.3",
 ]
 
 [[package]]
