@@ -563,6 +563,35 @@ async fn read_power_state() -> Option<String> {
             None => "AC plugged (desktop)".to_string(),
         });
     }
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
+        let mut status = SYSTEM_POWER_STATUS::default();
+        if unsafe { GetSystemPowerStatus(&mut status) }.is_err() {
+            return None;
+        }
+        // ACLineStatus: 0 = on battery, 1 = on AC, 255 = unknown.
+        let ac = match status.ACLineStatus {
+            0 => false,
+            1 => true,
+            _ => return None,
+        };
+        // BatteryFlag bit 2 = charging. BatteryLifePercent 255 = unknown
+        // (desktop without a battery reports that, typically).
+        let charging = status.BatteryFlag & 4 != 0;
+        let detail = if status.BatteryLifePercent == 255 {
+            String::new()
+        } else {
+            let percent = status.BatteryLifePercent as u32;
+            let state = if charging { ", charging" } else { "" };
+            format!(" (battery {percent}%{state})")
+        };
+        return Some(if ac {
+            format!("AC plugged{detail}")
+        } else {
+            format!("On battery{detail}")
+        });
+    }
     #[allow(unreachable_code)]
     {
         None
