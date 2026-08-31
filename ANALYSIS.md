@@ -46,3 +46,10 @@ Alternative considered: pre-gather the start context in `run_auto_prompt` before
 
 - Chronic render-path stall: `ThreadView::refresh_sandbox_status` does `Thread::update` + pending-task bookkeeping during `AgentPanel` render (`agent_panel.rs:6778` → `thread_view.rs:5261`); it is the main-thread stack in every recent `.spin`/cpu-resource report. Should be moved off the render path.
 - Consider installing a panic hook in the app binary that logs to `Zed.log` before unwinding, so main-thread panics stop dying silently for GUI launches.
+
+## Update (same day)
+
+Both follow-ups landed:
+
+- Render-path stall fixed: refresh is event-driven off-render (`ThreadView::refresh_sandbox_status`), the toolbar renders the cached status read-only (`ThreadView::sandbox_status_element`) — see `.issues/015_sandbox_status_render_path_update_loop.md`.
+- Panic hook installed in `zed::reliability::init`: panics now log to `Zed.log` with a backtrace before unwinding.
