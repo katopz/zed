@@ -43,7 +43,7 @@ use language_model::{
     LanguageModelProvider, LanguageModelProviderId, LanguageModelRegistry, Speed,
 };
 use notifications::status_toast::StatusToast;
-use settings::{update_settings_file, update_settings_file_with_completion};
+use settings::{update_settings_file, update_settings_file_with_completion, SettingsStore};
 use ui::{
     ButtonLike, CalloutBorderPosition, Checkbox, SpinnerLabel, SpinnerVariant, SplitButton,
     SplitButtonStyle, Tab, ToggleState,
@@ -928,7 +928,7 @@ impl ThreadView {
         if let Some(project) = project.upgrade() {
             subscriptions.push(cx.subscribe(&project, {
                 let resolver = code_span_resolver.clone();
-                move |_this: &mut Self, _project, event: &project::Event, cx| {
+                move |this: &mut Self, _project, event: &project::Event, cx| {
                     if matches!(
                         event,
                         project::Event::WorktreeAdded(_)
@@ -937,6 +937,8 @@ impl ThreadView {
                     ) {
                         resolver.clear_cache();
                         cx.notify();
+                        // Worktree set changed → sandbox baseline paths changed.
+                        this.refresh_sandbox_status(cx);
                     }
                 }
             }));
@@ -1019,8 +1021,19 @@ impl ThreadView {
                         }
                     },
                 ));
+                // Grant changes notify the thread (see
+                // `persist_thread_grants`), so observe covers "allowed for this
+                // thread" sandbox changes without any render-path updates.
+                subscriptions.push(cx.observe(&native_thread, |this, _thread, cx| {
+                    this.refresh_sandbox_status(cx);
+                }));
             }
         }
+
+        // Sandbox scope changes when the user edits agent settings.
+        subscriptions.push(cx.observe_global::<SettingsStore>(|this, cx| {
+            this.refresh_sandbox_status(cx);
+        }));
 
         subscriptions.push(cx.observe(&message_editor, |this, editor, cx| {
             let is_empty = editor.read(cx).text(cx).is_empty();
@@ -1131,6 +1144,7 @@ impl ThreadView {
         this.sync_generating_indicator(cx);
         this.sync_editor_mode(cx);
         this.sync_existing_elicitation_states(window, cx);
+        this.refresh_sandbox_status(cx);
         let list_state_for_scroll = this.list_state.clone();
         let thread_view = cx.entity().downgrade();
 
@@ -5258,50 +5272,78 @@ impl ThreadView {
             .unwrap_or(false)
     }
 
-    fn refresh_sandbox_status(&mut self, cx: &mut Context<Self>) -> Option<VerifiedSandboxStatus> {
-        let thread = self.as_native_thread(cx)?;
-        let (key, refresh) =
-            thread.update(cx, |thread, cx| thread.refresh_verified_sandbox_status(cx))?;
-
-        if self.sandbox_status_key.as_ref() == Some(&key) {
-            return self.sandbox_status.clone();
+    /// Recompute the cached sandbox status off the render path.
+    ///
+    /// Triggered by events (thread notified on grant changes, project worktree
+    /// events, settings edits), never from a render pass: rendering used to
+    /// call this inline, which updated the ThreadView *and* the Thread entity
+    /// from `AgentPanel::render` on every frame — a self-sustaining redraw
+    /// loop and the main-thread stall captured in the chronic `.spin` reports.
+    /// Repeated triggers while a refresh is in flight coalesce.
+    fn refresh_sandbox_status(&mut self, cx: &mut Context<Self>) {
+        let Some(thread) = self.as_native_thread(cx) else {
+            return;
+        };
+        if self._sandbox_status_refresh_task.is_some() {
+            return;
         }
-
-        match refresh {
-            SandboxStatusRefresh::Ready(status) => {
-                self.sandbox_status = Some(status.clone());
-                self.sandbox_status_key = Some(key);
-                self.pending_sandbox_status_key = None;
-                Some(status)
-            }
-            SandboxStatusRefresh::Pending(task) => {
-                if self.pending_sandbox_status_key.as_ref() != Some(&key) {
-                    self.sandbox_status = None;
-                    self.sandbox_status_key = None;
-                    self.pending_sandbox_status_key = Some(key.clone());
-                    self._sandbox_status_refresh_task = Some(cx.spawn(async move |this, cx| {
-                        let status = task.await;
-                        this.update(cx, |this, cx| {
-                            if this.pending_sandbox_status_key.as_ref() == Some(&key) {
-                                this.sandbox_status = Some(status);
-                                this.sandbox_status_key = Some(key);
-                                this.pending_sandbox_status_key = None;
-                                cx.notify();
-                            }
-                        })
-                        .ok();
-                    }));
+        self._sandbox_status_refresh_task = Some(cx.spawn(async move |this, cx| {
+            let refreshed =
+                thread.update(cx, |thread, cx| thread.refresh_verified_sandbox_status(cx));
+            this.update(cx, |this, cx| {
+                this._sandbox_status_refresh_task = None;
+                match refreshed {
+                    // Sandboxing unavailable: drop any stale status so the
+                    // chip hides.
+                    None => {
+                        if this.sandbox_status.take().is_some()
+                            | this.sandbox_status_key.take().is_some()
+                        {
+                            this.pending_sandbox_status_key = None;
+                            cx.notify();
+                        }
+                    }
+                    Some((key, SandboxStatusRefresh::Ready(status))) => {
+                        this.pending_sandbox_status_key = None;
+                        if this.sandbox_status_key.as_ref() != Some(&key) {
+                            this.sandbox_status = Some(status);
+                            this.sandbox_status_key = Some(key);
+                            cx.notify();
+                        }
+                    }
+                    Some((key, SandboxStatusRefresh::Pending(task))) => {
+                        this.sandbox_status = None;
+                        this.sandbox_status_key = None;
+                        this.pending_sandbox_status_key = Some(key.clone());
+                        cx.notify();
+                        this._sandbox_status_refresh_task = Some(cx.spawn(async move |this, cx| {
+                            let status = task.await;
+                            this.update(cx, |this, cx| {
+                                if this.pending_sandbox_status_key.as_ref() == Some(&key) {
+                                    this.sandbox_status = Some(status);
+                                    this.sandbox_status_key = Some(key);
+                                    this.pending_sandbox_status_key = None;
+                                    cx.notify();
+                                }
+                            })
+                            .ok();
+                        }));
+                    }
                 }
-                None
-            }
-        }
+            })
+            .ok();
+        }));
     }
 
-    pub fn render_sandbox_status(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let status = self.refresh_sandbox_status(cx)?;
+    /// Read-only render of the cached sandbox status for the panel toolbar.
+    /// Takes `&self`/`&App` on purpose: the toolbar builds this during
+    /// `AgentPanel::render`, which must not update the ThreadView or Thread
+    /// entities (see [`Self::refresh_sandbox_status`]).
+    pub fn sandbox_status_element(&self, _cx: &App) -> Option<AnyElement> {
+        let status = self.sandbox_status.as_ref()?;
         let settings_sandbox = status.settings_sandbox.clone();
         let thread_sandbox = status.thread_sandbox.clone();
-        let baseline = status.baseline_writable_paths;
+        let baseline = status.baseline_writable_paths.clone();
 
         // The lock is struck only when the *merged* result is unsandboxed (the
         // agent runs with ambient permissions). A layer that is merely wide open

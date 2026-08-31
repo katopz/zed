@@ -6811,9 +6811,7 @@ impl AgentPanel {
             let sandbox_status = self
                 .active_conversation_view()
                 .and_then(|conversation_view| conversation_view.read(cx).root_thread_view())
-                .and_then(|thread_view| {
-                    thread_view.update(cx, |thread_view, cx| thread_view.render_sandbox_status(cx))
-                });
+                .and_then(|thread_view| thread_view.read(cx).sandbox_status_element(cx));
 
             base_container
                 .child(

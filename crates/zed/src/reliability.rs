@@ -26,6 +26,7 @@ use workspace::WorkspaceStore;
 mod hang_detection;
 
 pub fn init(client: Arc<Client>, workspace_store: Entity<WorkspaceStore>, cx: &mut App) {
+    install_panic_hook();
     hang_detection::start(client.clone(), cx);
     start_memory_usage_logging(workspace_store, cx);
 
@@ -93,6 +94,31 @@ pub fn init(client: Arc<Client>, workspace_store: Entity<WorkspaceStore>, cx: &m
 const MEMORY_USAGE_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const MEMORY_USAGE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const MEMORY_USAGE_MINIMUM_LOGGED_DELTA: u64 = 64 * 1024 * 1024;
+
+/// Log panics to the standard log (Zed.log / stderr) before unwinding, and
+/// print the backtrace once. Without this, a panic in a GUI launch dies at the
+/// runloop FFI boundary with the message on a stderr nobody sees — an app that
+/// "just crashed" with nothing in any log (see ANALYSIS.md).
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info
+            .location()
+            .map(|location| location.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let message = info
+            .payload()
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("Box<dyn Any>");
+        log::error!(
+            "panic at {location}: {message}\n{}",
+            std::backtrace::Backtrace::force_capture()
+        );
+        default_hook(info);
+    }));
+}
 
 /// Periodically logs this process' memory usage, so that gradual memory growth can be
 ///
