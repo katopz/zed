@@ -387,6 +387,7 @@ pub(crate) fn last_assistant_snippet(
 /// spending tool calls probing the machine or the agent board.
 fn start_context_block(
     conversation_view: &crate::ConversationView,
+    dispatching_view_id: gpui::EntityId,
     window: &Window,
     cx: &gpui::App,
 ) -> Option<String> {
@@ -404,12 +405,19 @@ fn start_context_block(
     let gpu_device_name = window.gpu_specs().map(|specs| specs.device_name);
     let machine_line = system_specs::machine_context_line(gpu_device_name.as_deref());
 
-    // Local sibling agents (this window) that are actively generating.
+    // Local sibling agents (this window) that are actively generating. The
+    // dispatching view itself is currently leased (we run inside its `update`),
+    // so reading it here would double-lease panic — it is also the continuation
+    // target, not a sibling — hence the skip.
     let local_lines = conversation_view
         .workspace()
         .upgrade()
         .and_then(|workspace| workspace.read(cx).panel::<crate::AgentPanel>(cx))
-        .map(|panel| panel.read(cx).active_thread_activity(cx))
+        .map(|panel| {
+            panel
+                .read(cx)
+                .active_thread_activity(cx, Some(dispatching_view_id))
+        })
         .unwrap_or_default();
 
     // Remote board peers (other devices), already formatted by auto_prompt.
@@ -449,7 +457,8 @@ pub(crate) fn dispatch_action(
 
     // Sample the machine in the background so the NEXT continuation prompt
     // carries fresh CPU/RAM/power numbers (see start_context_block).
-    let start_context = start_context_block(conversation_view, window, cx);
+    let dispatching_view_id = cx.entity().entity_id();
+    let start_context = start_context_block(conversation_view, dispatching_view_id, window, cx);
 
     let max_context_tokens = auto_prompt::load_config_cached()
         .map(|config| config.max_context_tokens)

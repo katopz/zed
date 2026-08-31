@@ -4620,9 +4620,17 @@ impl AgentPanel {
     /// One-line summaries of sibling threads that are actively generating, for
     /// auto_prompt start-context. Idle/draft threads are skipped — a
     /// continuation prompt cares about concurrent work, not parked threads.
-    pub(crate) fn active_thread_activity(&self, cx: &App) -> Vec<String> {
+    ///
+    /// `skip_view` must carry the entity id of any conversation view that is
+    /// currently leased (being updated) on the call stack — reading it here
+    /// would double-lease panic. In practice that is the dispatching view
+    /// itself, which is the continuation target, not a sibling.
+    pub(crate) fn active_thread_activity(&self, cx: &App, skip_view: Option<gpui::EntityId>) -> Vec<String> {
         let mut actives = Vec::new();
         for view in self.conversation_views() {
+            if skip_view.is_some_and(|id| id == view.entity_id()) {
+                continue;
+            }
             let Some(thread_view) = view.read(cx).active_thread() else {
                 continue;
             };
@@ -10018,6 +10026,56 @@ mod tests {
         // Lines are 1-based and inclusive; the path is presented as
         // `<rel-path>:<start>-<end>`, with a trailing space.
         assert_eq!(pasted, "file.rs:2-3 ");
+    }
+
+    // Regression: auto-prompt start-context gathering runs inside the
+    // dispatching ConversationView's `update`, so it must not read that view
+    // (the entity is leased while being updated — reading it panics with
+    // "cannot read ... while it is already being updated").
+    #[gpui::test]
+    async fn test_active_thread_activity_skips_leased_dispatching_view(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        cx.update(|cx| {
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
+        fs.insert_tree("/project", json!({ "file.txt": "" })).await;
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |mw, _cx| mw.workspace().clone())
+            .unwrap();
+        let mut cx = VisualTestContext::from_window(multi_workspace.into(), cx);
+        let panel = workspace.update_in(&mut cx, |workspace, window, cx| {
+            cx.new(|cx| AgentPanel::new(workspace, window, cx))
+        });
+
+        // Sibling thread: the stub holds the prompt response open, so this
+        // thread stays Generating and is retained when the next thread opens.
+        open_thread_with_connection(&panel, StubAgentConnection::new(), &mut cx);
+        send_message(&panel, &mut cx);
+
+        // Dispatching thread: now the displayed conversation view.
+        open_thread_with_connection(&panel, StubAgentConnection::new(), &mut cx);
+
+        let dispatching_view = panel.read_with(&cx, |panel, _cx| {
+            panel.active_conversation_view().unwrap().clone()
+        });
+        let dispatching_view_id = dispatching_view.entity_id();
+
+        let activity = dispatching_view.update(&mut cx, |_view, cx| {
+            panel
+                .read(cx)
+                .active_thread_activity(cx, Some(dispatching_view_id))
+        });
+        assert_eq!(activity.len(), 1, "only the generating sibling is reported");
     }
 
     async fn setup_panel(cx: &mut TestAppContext) -> (Entity<AgentPanel>, VisualTestContext) {
