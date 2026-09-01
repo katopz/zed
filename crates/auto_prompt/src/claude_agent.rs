@@ -206,6 +206,13 @@ pub fn decide_claude(
         stop_reason
     );
 
+    // Config kill switch (plan 031 silent stop): drop the automatic Claude
+    // chain with only a log line. Manual clicks bypass this function.
+    if crate::paused() {
+        log::warn!("[auto_prompt::claude] paused — silently stopping chain (stop_reason={stop_reason:?})");
+        return AutoPromptDecision::NoAction;
+    }
+
     // User/system cancel — never auto-continue.
     if matches!(stop_reason, acp::StopReason::Cancelled) {
         log::info!("[auto_prompt::claude] Cancelled — stopping chain");
@@ -705,12 +712,13 @@ pub async fn decide_claude_async(
     // Summary-first fast path (plan 027, parity with the native flow): a
     // voluntary summary at the last paragraph carries its own "what
     // remains" — skip the orchestrator and continue same-thread with the
-    // fixed decision directive. Overflow/nothing-left cases fall through to
+    // summary's steps + fixed decision directive (or stop on a terminal
+    // summary, plan 031). Overflow/nothing-left cases fall through to
     // the flows that own them (overflow routes through the shared native
     // Phase 1/2 machine before reaching here).
     if let Some(outcome) = crate::summary_continuation_fast_path(&data) {
         log::warn!(
-            "[auto_prompt::claude] summary fast path — continuing same-thread with fixed decision (no orchestrator call)"
+            "[auto_prompt::claude] summary fast path — dispatching fast-path outcome (no orchestrator call)"
         );
         return Ok(outcome);
     }

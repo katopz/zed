@@ -349,6 +349,12 @@ fn build_continuation_prompt(_last_assistant_message: Option<&str>, decision: &s
     "Continue from where we left off.".to_string()
 }
 
+/// Char budget for the sibling-activity snippet lines in the start-context
+/// block (plan 031 handoff fidelity): the old 160-char cut removed the
+/// operative tail of sibling updates mid-word (e.g. "…says 24 would-f"),
+/// so the worker saw the noise but not the signal. Ellipsis-marked when cut.
+pub(crate) const ACTIVITY_SNIPPET_MAX_CHARS: usize = 512;
+
 /// Char-boundary-safe snippet of the worker's latest assistant message, for
 /// "what other agents are doing right now" context lines.
 pub(crate) fn last_assistant_snippet(
@@ -377,7 +383,18 @@ pub(crate) fn last_assistant_snippet(
     if text.is_empty() {
         return None;
     }
-    Some(text.chars().take(max_chars).collect::<String>())
+    Some(snippet_with_ellipsis(text, max_chars))
+}
+
+/// Char-boundary-safe hard cut at `max_chars`, ellipsis-marked when trimmed,
+/// so a truncated line is never mistaken for a complete statement.
+fn snippet_with_ellipsis(text: &str, max_chars: usize) -> String {
+    let mut chars = text.chars();
+    let mut snippet: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        snippet.push('…');
+    }
+    snippet
 }
 
 /// Pre-gathered start context stamped onto every continuation prompt (both
@@ -1424,14 +1441,35 @@ fn run_auto_prompt(
                         // unresolvable command logs and stops normally, never
                         // failing the chain. The next stop sees the registry
                         // entry and truly stops.
+                        //
+                        // Plan 031 exceptions: a TERMINAL summary (all
+                        // remaining work armed/deferred/owner-gated) or the
+                        // `paused` kill switch both skip the hook — nothing
+                        // new may spin up on a stopped-quiet chain.
                         let housekeeping_command = auto_prompt::load_config_cached()
                             .ok()
                             .and_then(|config| config.housekeeping_command)
                             .map(|command| command.trim().to_string())
                             .filter(|command| !command.is_empty());
                         let housekeeping_session_key = data.session_id.to_string();
+                        let terminal_summary_stop = auto_prompt::summary_declares_terminal(
+                            data.last_assistant_message.as_deref(),
+                        );
+                        let paused_stop = auto_prompt::paused();
+                        if terminal_summary_stop {
+                            log::info!(
+                                "[auto_prompt] terminal summary — skipping housekeeping dispatch (all remaining work armed/deferred/owner-gated)"
+                            );
+                        }
+                        if paused_stop {
+                            log::info!(
+                                "[auto_prompt] paused — skipping housekeeping dispatch"
+                            );
+                        }
                         if let Some(command) = housekeeping_command
                             .filter(|_| !housekeeping_already_run(&housekeeping_session_key))
+                            .filter(|_| !terminal_summary_stop)
+                            .filter(|_| !paused_stop)
                         {
                             let dispatched = _view
                                 .update_in(cx, |_view, window, cx| {
@@ -1986,5 +2024,25 @@ mod tests {
         assert!(!housekeeping_already_run("housekeeping-test-session"));
         mark_housekeeping_run("housekeeping-test-session");
         assert!(housekeeping_already_run("housekeeping-test-session"));
+    }
+
+    // Plan 031: the activity snippet cut is ellipsis-marked and
+    // char-boundary-safe (the old silent 160-char cut ended mid-word, e.g.
+    // "…says 24 would-f").
+    #[test]
+    fn snippet_with_ellipsis_marks_truncation() {
+        assert_eq!(snippet_with_ellipsis("hello world", 16), "hello world");
+        assert_eq!(snippet_with_ellipsis("hello world", 5), "hello…");
+
+        let long = "x".repeat(600);
+        let cut = snippet_with_ellipsis(&long, ACTIVITY_SNIPPET_MAX_CHARS);
+        assert_eq!(cut.chars().count(), ACTIVITY_SNIPPET_MAX_CHARS + 1);
+        assert!(cut.ends_with('…'));
+
+        // Multibyte content never splits mid-character.
+        let emoji = "🙂".repeat(300);
+        let cut = snippet_with_ellipsis(&emoji, 7);
+        assert_eq!(cut.chars().count(), 8);
+        assert!(cut.ends_with('…'));
     }
 }

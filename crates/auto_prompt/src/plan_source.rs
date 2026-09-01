@@ -381,12 +381,18 @@ async fn git_toplevel(work_dir: &Path) -> Option<PathBuf> {
 /// Git pathspecs (with trailing `/`) for the plan directories under
 /// `work_dir`, expressed relative to the repo root so a work_dir that is a
 /// subdirectory resolves correctly.
+/// Directory names scanned for task/plan files, in both the origin scan and
+/// the worktree fallback. `.issues` is included so issue-file checkboxes
+/// count as remaining work — the fleet tracks tasks in `.plans` AND
+/// `.issues` (e.g. armed benchmark/POC levers live only in `.issues`).
+pub(crate) const PLAN_DIR_NAMES: &[&str] = &[".plan", ".plans", ".issues"];
+
 fn plan_prefixes(work_dir: &Path, repo_root: &Path) -> Option<Vec<String>> {
     let rel = work_dir.strip_prefix(repo_root).ok()?;
     let rel = rel.to_string_lossy();
     let rel = rel.trim_end_matches('/');
     Some(
-        [".plan", ".plans"]
+        PLAN_DIR_NAMES
             .iter()
             .map(|dir| match rel.is_empty() {
                 true => format!("{dir}/"),
@@ -928,6 +934,35 @@ mod tests {
         assert_eq!(s1.content, "sub one");
         // Top-level plans must not leak into a subdir work dir.
         assert!(!by_rel.contains_key(".plans/001_a.md"));
+    }
+
+    #[test]
+    fn issues_dir_files_are_visible_as_task_sources() {
+        // `.issues` carries fleet tasks too (e.g. armed benchmark levers in
+        // 771) — the origin scan must surface them like `.plans` files so
+        // detect_remaining_plan_tasks and the orchestrator see their
+        // checkboxes.
+        if !have_git() {
+            return;
+        }
+        let fixture = pushed_fixture();
+        smol::block_on(async {
+            git_ok(&fixture.work, &["checkout", "-q", "develop"], None).await;
+            let issues = fixture.work.join(".issues");
+            std::fs::create_dir(&issues).expect("mkdir issues");
+            std::fs::write(
+                issues.join("771_lever.md"),
+                "- [ ] 32K cooled-window cell\n- [x] 16K wash measured",
+            )
+            .expect("write issue");
+            commit_all(&fixture.work, "issue 771 lever", "2026-08-28T10:00:00+00:00").await;
+            git_ok(&fixture.work, &["push", "-q", "origin", "develop"], None).await;
+        });
+
+        let files = smol::block_on(origin_plan_files(&fixture.work, None));
+        let by_rel = by_rel(&files);
+        let issue = by_rel.get(".issues/771_lever.md").expect("issue visible");
+        assert!(issue.content.contains("32K cooled-window cell"));
     }
 
     #[test]

@@ -4643,8 +4643,11 @@ impl AgentPanel {
                 .title()
                 .map(|title| title.to_string())
                 .unwrap_or_else(|| "untitled".to_string());
-            let line = match crate::auto_prompt::last_assistant_snippet(thread.entries(), 160, cx)
-            {
+            let line = match crate::auto_prompt::last_assistant_snippet(
+                thread.entries(),
+                crate::auto_prompt::ACTIVITY_SNIPPET_MAX_CHARS,
+                cx,
+            ) {
                 Some(snippet) => format!("{title}: {snippet}"),
                 None => title,
             };

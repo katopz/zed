@@ -195,6 +195,17 @@ pub fn invalidate_config_cache() {
     log::info!("[auto_prompt::config] Config cache invalidated");
 }
 
+/// Kill-switch probe for the automatic chain (plan 031 silent stop): true
+/// when `paused` is set in auto_prompt.json or ZED_AUTO_PROMPT_PAUSED. The
+/// config cache re-validates on file mtime, so flipping the flag takes
+/// effect on the next chain event without a restart. Manual dispatch does
+/// not consult this — explicit human intent overrides the pause.
+pub fn paused() -> bool {
+    load_config_cached()
+        .map(|config| config.paused)
+        .unwrap_or(false)
+}
+
 /// Data needed to dispatch a follow-up prompt via GPUI action.
 ///
 /// The caller (agent_ui) wraps this in `AutoPromptNewThread` action.
@@ -872,18 +883,21 @@ pub fn is_waiting_for_user_decision(last_assistant_message: Option<&str>) -> boo
 /// Summary-first fast path (plan 027, shared by native + Claude flows).
 ///
 /// When the worker's last message is already a voluntary summary (the mandated
-/// `## Summary` handoff) AND it does not declare "nothing left", skip the
-/// orchestrator LLM call entirely and continue in the SAME thread with the
-/// fixed [`CONTINUE_REMAINS_DECISION`] directive — the summary already says
-/// what remains, so a full decide pass is wasted latency/tokens.
+/// `## Summary` handoff), skip the orchestrator LLM call entirely:
 ///
-/// Returns `None` when the fast path does not apply:
-/// - no summary at the last paragraph → the normal flow runs (overflow asks
-///   Phase 1 for a summary first; same-thread consults the orchestrator);
-/// - the summary declares nothing left → the normal flow owns stopping /
-///   housekeeping (otherwise the chain would never terminate);
-/// - the thread overflowed → the caller routes through the shared Phase 1/2
-///   machine (`context_overflow_outcome`), which forks with the summary.
+/// - summary names its remaining work → continue in the SAME thread with
+///   those steps AHEAD of the fixed [`CONTINUE_REMAINS_DECISION`] directive
+///   (plan 031 enrichment: the named task wins over re-derivation);
+/// - summary declares nothing left → `None` (the normal flow owns stopping /
+///   housekeeping, otherwise the chain would never terminate);
+/// - summary is TERMINAL (every remaining item armed/deferred/owner-gated) →
+///   `Stopped` — gated work is not picked up autonomously (plan 031);
+/// - no next-steps section → continue same-thread with the fixed directive.
+///
+/// Returns `None` also when there is no summary at the last paragraph (the
+/// normal flow runs: overflow asks Phase 1 for a summary first; same-thread
+/// consults the orchestrator) and when the thread overflowed (the caller
+/// routes through the shared Phase 1/2 machine, which forks with the summary).
 ///
 /// The returned action always has `force_new_thread = false`: below the
 /// overflow gate the chain continues same-thread (plan 023 req 4).
@@ -895,20 +909,58 @@ pub fn summary_continuation_fast_path(data: &LlmCallData) -> Option<AutoPromptOu
     if !looks_like_voluntary_summary(last) {
         return None;
     }
-    if matches!(
-        extract_summary_next_steps(last),
-        Some(SummaryContinuation::NothingLeft)
-    ) {
-        log::info!(
-            "[auto_prompt] summary fast path: summary declares nothing left — deferring to normal stop/housekeeping flow"
-        );
-        return None;
+    match extract_summary_next_steps(last) {
+        Some(SummaryContinuation::NothingLeft) => {
+            log::info!(
+                "[auto_prompt] summary fast path: summary declares nothing left — deferring to normal stop/housekeeping flow"
+            );
+            return None;
+        }
+        Some(SummaryContinuation::Terminal) => {
+            log::warn!(
+                "[auto_prompt] summary fast path: summary is terminal (all remaining work armed/deferred/owner-gated) — stopping the chain (housekeeping skipped)"
+            );
+            return Some(AutoPromptOutcome::Stopped {
+                reason: "summary is terminal — all remaining work is armed/deferred/owner-gated"
+                    .to_string(),
+            });
+        }
+        Some(SummaryContinuation::Steps(steps)) => {
+            log::warn!(
+                "[auto_prompt] summary fast path: voluntary summary — continuing same-thread with the summary's next steps + fixed decision fallback (no orchestrator call)"
+            );
+            let action =
+                data.make_continue_action(format!("{steps}\n\n{CONTINUE_REMAINS_DECISION}"));
+            return Some(AutoPromptOutcome::Continue(action));
+        }
+        None => {}
     }
     log::warn!(
         "[auto_prompt] summary fast path: last message is a voluntary summary — continuing same-thread with fixed decision (no orchestrator call)"
     );
     let action = data.make_continue_action(CONTINUE_REMAINS_DECISION.to_string());
     Some(AutoPromptOutcome::Continue(action))
+}
+
+/// True when the last assistant message is a voluntary summary whose
+/// remaining-work section is entirely non-executable now — every bullet
+/// armed / deferred / owner-gated / thermal-gated (plan 031 silent stop).
+/// Such a summary ends the chain: gated work is not picked up autonomously,
+/// and the stop-time housekeeping hook is skipped so nothing new spins up.
+pub fn summary_declares_terminal(last_assistant_message: Option<&str>) -> bool {
+    let Some(text) = last_assistant_message
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    else {
+        return false;
+    };
+    if !looks_like_voluntary_summary(text) {
+        return false;
+    }
+    matches!(
+        extract_summary_next_steps(text),
+        Some(SummaryContinuation::Terminal)
+    )
 }
 
 /// Outcome of the cheap pre-decide checks: either an immediate decision
@@ -969,6 +1021,17 @@ fn decide_precheck(
             return DecidePrecheck::Decision(AutoPromptDecision::NoAction);
         }
     };
+
+    // Config kill switch (plan 031 silent stop): stop the chain with only a
+    // log line — no orchestrator call, no fast path, no overflow Phase 1/2.
+    if config.paused {
+        log::warn!(
+            "[auto_prompt::decide] paused=true — silently stopping chain (session={:?})",
+            thread.read(cx).session_id()
+        );
+        debug_log::write_log("no_action", serde_json::json!({"reason": "paused"}));
+        return DecidePrecheck::Decision(AutoPromptDecision::NoAction);
+    }
 
     log::info!("[auto_prompt::decide] Auto-prompt evaluating");
 
@@ -1477,6 +1540,17 @@ pub fn truncate_at_char_boundary(text: &str, max_chars: usize) -> String {
 pub(crate) fn context_overflow_outcome(data: &LlmCallData) -> AutoPromptOutcome {
     let session_id_str = data.session_id.to_string();
 
+    // Config kill switch (plan 031 silent stop): drop all overflow handling
+    // with only a log line — no Phase 1 summarize request, no Phase 2 fork.
+    if paused() {
+        log::warn!(
+            "[auto_prompt::context_overflow] paused — silently stopping (session={session_id_str})"
+        );
+        return AutoPromptOutcome::Stopped {
+            reason: "auto-prompt paused (config)".to_string(),
+        };
+    }
+
     // ── Issue 007 guard: API exhaustion + context overflow ────────────
     //
     // If the source thread's completion request itself failed
@@ -1576,7 +1650,7 @@ pub(crate) fn context_overflow_outcome(data: &LlmCallData) -> AutoPromptOutcome 
             peer_states::broadcast_state(&session_id_str, None, summary, "summary");
         }
         log::info!(
-            "[auto_prompt::context_overflow] Summary received — creating new thread with inlined summary (session={session_id_str})"
+            "[auto_prompt::context_overflow] Summary received (session={session_id_str})"
         );
 
         let prompt_summary = build_prompt_summary(
@@ -1599,6 +1673,19 @@ pub(crate) fn context_overflow_outcome(data: &LlmCallData) -> AutoPromptOutcome 
             .last_assistant_message
             .as_deref()
             .and_then(extract_summary_next_steps);
+        if matches!(summary_continuation, Some(SummaryContinuation::Terminal)) {
+            // Plan 031 silent stop: a terminal summary (all remaining work
+            // armed/deferred/owner-gated) ends the chain — plan tasks do NOT
+            // resurrect it, and the stop-time housekeeping hook is skipped by
+            // the caller via summary_declares_terminal.
+            log::warn!(
+                "auto_prompt: ContextOverflow Phase 2 — summary is terminal (all remaining work armed/deferred/owner-gated) — stopping; plan tasks do not resurrect a terminal chain"
+            );
+            return AutoPromptOutcome::Stopped {
+                reason: "summary is terminal — all remaining work is armed/deferred/owner-gated"
+                    .to_string(),
+            };
+        }
         let continuation = if matches!(
             summary_continuation,
             Some(SummaryContinuation::NothingLeft)
@@ -1629,9 +1716,14 @@ pub(crate) fn context_overflow_outcome(data: &LlmCallData) -> AutoPromptOutcome 
             }
         } else {
             log::warn!(
-                "auto_prompt: ContextOverflow Phase 2 — using summary + fixed decision directive (no processing)"
+                "auto_prompt: ContextOverflow Phase 2 — using summary + fixed decision directive, enriched with the summary's next steps when present (no processing)"
             );
-            CONTINUE_REMAINS_DECISION.to_string()
+            match summary_continuation {
+                Some(SummaryContinuation::Steps(steps)) => {
+                    format!("{steps}\n\n{CONTINUE_REMAINS_DECISION}")
+                }
+                _ => CONTINUE_REMAINS_DECISION.to_string(),
+            }
         };
 
         // Preserve slash commands (e.g. /optimize) through context overflow
@@ -1760,8 +1852,10 @@ pub async fn decide_with_llm(
     //
     // A voluntary summary at the last paragraph carries its own "what
     // remains" — no orchestrator call needed. Same-thread continuation with
-    // the fixed decision directive. Overflow / nothing-left cases return None
-    // here and fall through to the flows that own them.
+    // the fixed decision directive (plan 031: or the summary's own next
+    // steps). Overflow / nothing-left cases return None
+    // here and fall through to the flows that own them; a TERMINAL summary
+    // returns Some(Stopped) and ends the chain right here (plan 031).
     if let Some(outcome) = summary_continuation_fast_path(&data) {
         return Ok(outcome);
     }
@@ -2751,10 +2845,14 @@ fn finalize_plan_files(
 /// for repos whose origin carries no plan entries. Claim filtering happens
 /// in the caller so both sources share one code path.
 fn read_plan_dir_from_worktree(work_dir: &std::path::Path) -> Vec<(String, String)> {
-    let plan_dir_candidates = [work_dir.join(".plan"), work_dir.join(".plans")];
+    let plan_dir_candidates: Vec<std::path::PathBuf> = crate::plan_source::PLAN_DIR_NAMES
+        .iter()
+        .map(|dir| work_dir.join(dir))
+        .collect();
     let Some(plan_dir) = plan_dir_candidates.iter().find(|d| d.is_dir()) else {
         log::info!(
-            "[auto_prompt::read_plan_files] Neither .plan/ nor .plans/ directory exists in {}",
+            "[auto_prompt::read_plan_files] None of {:?} directories exist in {}",
+            crate::plan_source::PLAN_DIR_NAMES,
             work_dir.display()
         );
         return Vec::new();
@@ -3593,6 +3691,12 @@ enum SummaryContinuation {
     /// should fall through to plan files / housekeeping instead of ordering
     /// the agent to "start working immediately" on nothing.
     NothingLeft,
+    /// Every remaining item is non-executable now: armed-but-not-built
+    /// levers, deferred items, owner-gated arms, thermal/cooldown-gated
+    /// benchmark cells. The chain must STOP — gated work is not picked up
+    /// autonomously and unrelated housekeeping would run uninvited (plan 031
+    /// silent stop). Beats remaining plan tasks by design.
+    Terminal,
 }
 
 /// Nothing-left cues: phrases a summary uses to declare that no work remains.
@@ -3652,6 +3756,54 @@ fn section_indicates_no_remaining_work(section: &str) -> bool {
             }
             None => false,
         }
+    })
+}
+
+/// Markers that make a remaining-work bullet non-executable now: armed
+/// levers, deferrals, owner gates, thermal/cooldown gates, work handed to
+/// another active session, unchanged backlog lanes.
+const DEFERRED_ITEM_MARKERS: &[&str] = &[
+    "armed",
+    "defer",
+    "owner-gated",
+    "gated on",
+    "owner go",
+    "cooldown",
+    "cooled",
+    "thermal",
+    "left to the",
+    "unchanged",
+    "awaiting",
+    "parked",
+    "on hold",
+    "[-]",
+];
+
+/// True when every bullet/numbered item in the section carries a deferral
+/// marker (an actionable unchecked checkbox immediately disqualifies). A
+/// prose-only section is conservatively NOT terminal — no bullets, no
+/// verdict.
+fn section_all_deferred(section: &str) -> bool {
+    let items: Vec<&str> = section
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            trimmed.starts_with("- ")
+                || trimmed.starts_with("* ")
+                || numbered_item_text(line).is_some()
+        })
+        .collect();
+    if items.is_empty() {
+        return false;
+    }
+    items.iter().all(|line| {
+        if is_actionable_checkbox(line) {
+            return false;
+        }
+        let lower = line.to_lowercase();
+        DEFERRED_ITEM_MARKERS
+            .iter()
+            .any(|marker| lower.contains(marker))
     })
 }
 
@@ -3787,6 +3939,13 @@ fn extract_summary_next_steps(summary: &str) -> Option<SummaryContinuation> {
     if section_indicates_no_remaining_work(&section) {
         log::info!("[auto_prompt::extract_summary_next_steps] Summary declares no remaining work");
         return Some(SummaryContinuation::NothingLeft);
+    }
+
+    if section_all_deferred(&section) {
+        log::info!(
+            "[auto_prompt::extract_summary_next_steps] Summary remaining items are all armed/deferred/owner-gated — terminal"
+        );
+        return Some(SummaryContinuation::Terminal);
     }
 
     Some(SummaryContinuation::Steps(format!(
@@ -4498,9 +4657,10 @@ mod tests {
     }
 
     #[test]
-    fn summary_fast_path_continues_same_thread_with_fixed_decision() {
-        // Plan 027: a voluntary summary with remaining work short-circuits the
-        // orchestrator — same-thread Continue carrying the fixed directive.
+    fn summary_fast_path_enriches_decision_with_summary_steps() {
+        // Plan 031: a voluntary summary with remaining work short-circuits the
+        // orchestrator — same-thread Continue carrying the summary's steps
+        // AHEAD of the fixed directive (the named task wins over re-derivation).
         let session = "summary-fast-path-test";
         clear_summary_for_session(session);
         let mut data = overflow_test_data(
@@ -4514,10 +4674,128 @@ mod tests {
                     !action.force_new_thread,
                     "fast path continues in the same thread below the overflow gate"
                 );
+                assert!(
+                    action
+                        .next_prompt
+                        .starts_with("Continuing from the previous session's summary"),
+                    "summary steps must lead the decision: {}",
+                    action.next_prompt
+                );
+                assert!(
+                    action.next_prompt.contains(CONTINUE_REMAINS_DECISION),
+                    "fixed decision directive must ride as the fallback: {}",
+                    action.next_prompt
+                );
+                assert!(
+                    action.next_prompt.contains("T2: verify build"),
+                    "summary steps must be inlined: {}",
+                    action.next_prompt
+                );
+            }
+            other => panic!("expected Continue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn summary_fast_path_fixed_decision_without_steps_section() {
+        // A summary with no next-steps section keeps the exact fixed directive.
+        let session = "summary-fast-path-plain-test";
+        clear_summary_for_session(session);
+        let mut data = overflow_test_data(
+            session,
+            Some("## Summary\n\nDid the refactor. Everything is verified."),
+        );
+        data.context_exceeds_limit = false;
+        match summary_continuation_fast_path(&data) {
+            Some(AutoPromptOutcome::Continue(action)) => {
                 assert_eq!(action.next_prompt, CONTINUE_REMAINS_DECISION);
             }
             other => panic!("expected Continue, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn summary_fast_path_stops_on_terminal_summary() {
+        // Plan 031: a summary whose remaining items are ALL armed/deferred/
+        // gated ends the chain — Stopped, not a continuation dispatch.
+        let session = "summary-fast-path-terminal-test";
+        clear_summary_for_session(session);
+        let mut data = overflow_test_data(
+            session,
+            Some(
+                "## Summary\n\nWash @16K measured.\n\n## What Remains\n\n\
+                 - 32K cooled-window cell (7-min-cooldown protocol).\n\
+                 - T2c-b — P3, deferred.\n\
+                 - League lanes unchanged.",
+            ),
+        );
+        data.context_exceeds_limit = false;
+        match summary_continuation_fast_path(&data) {
+            Some(AutoPromptOutcome::Stopped { reason }) => {
+                assert!(reason.contains("terminal"), "reason: {reason}");
+            }
+            other => panic!("expected Stopped, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn summary_declares_terminal_on_all_deferred_remaining() {
+        // Plan 031: the real-world wash handoff shape — bold section labels,
+        // every remaining bullet armed/deferred/thermal-gated/handed-off.
+        let summary = "\
+## Summary\n\n\
+**(1) Original task:** Build and measure the q8 prefill arm.\n\n\
+**(2) Accomplished:**\n\
+- All gates PASS; wash @16K (1.027x).\n\
+- Committed and pushed.\n\n\
+**(3) What remains:**\n\
+- **32K cooled-window cell** for the q8 arm (Issue 771 T2c; 7-min-cooldown protocol — the 16K run was heat-soaked).\n\
+- **T2c-b (half4 O accumulator)** — P3, deferred below the 32K cell.\n\
+- League lanes unchanged: 32K cells both sides, 4090 cudarc flash twin.\n\
+- The `round()` lowering hazard is recorded for the riir-clippy intake (append left to the active riir-clippy session).\n\n\
+**(4) Active plan state:** `.plans/562_x.md` — COMPLETE. `.issues/771.md` — T2c-a `[x]` (measured wash), T2c-b `[-]`.";
+        assert!(summary_declares_terminal(Some(summary)));
+        // One actionable bullet keeps the chain alive.
+        let actionable = "\
+## Summary\n\nBuilt the arm.\n\n\
+**(3) What remains:**\n\
+- **32K cooled-window cell** for the q8 arm (7-min-cooldown protocol).\n\
+- [ ] Run the league 32K cell now";
+        assert!(!summary_declares_terminal(Some(actionable)));
+        // Non-summaries are never terminal.
+        assert!(!summary_declares_terminal(Some("still working")));
+        assert!(!summary_declares_terminal(None));
+    }
+
+    #[test]
+    fn context_overflow_phase2_terminal_summary_stops_despite_plan_tasks() {
+        // Plan 031: a terminal summary ends the chain — plan tasks (even
+        // armed league cells in .issues) must NOT resurrect it, and no new
+        // thread is created.
+        let session = "overflow-phase2-terminal-test";
+        set_summary_state(session, 1);
+        let summary = "\
+## Summary\n\nBuilt the q8 arm; wash @16K.\n\n\
+**(3) What remains:**\n\
+- **32K cooled-window cell** (7-min-cooldown protocol — 16K was heat-soaked).\n\
+- **T2c-b** — P3, deferred.\n\
+- League lanes unchanged.";
+        let context_json = serde_json::json!({
+            "session_id": session,
+            "plan_files": [{
+                "path": "/tmp/zed-phase2-it/current/.issues/9904_league.md",
+                "content": "- [ ] 32K league cell"
+            }]
+        })
+        .to_string();
+        let data = overflow_test_data_with(session, Some(summary), context_json, None);
+        match context_overflow_outcome(&data) {
+            AutoPromptOutcome::Stopped { reason } => {
+                assert!(reason.contains("terminal"), "reason: {reason}");
+            }
+            other => panic!("expected Stopped, got {other:?}"),
+        }
+        clear_summary_for_session(session);
     }
 
     #[test]

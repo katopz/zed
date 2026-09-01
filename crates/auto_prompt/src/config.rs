@@ -116,6 +116,17 @@ pub struct AutoPromptConfig {
     /// string in config/env) disables the hook.
     #[serde(default = "default_housekeeping_command")]
     pub housekeeping_command: Option<String>,
+
+    /// Kill switch for the whole automatic chain: when true, every automatic
+    /// continuation — orchestrator decide (native + Claude), summary fast
+    /// path, overflow Phase 1/2, and the stop-time housekeeping hook — is
+    /// dropped with only a log line. Manual clicks still dispatch (explicit
+    /// human intent overrides the pause). Re-read live: the config cache
+    /// invalidates on file mtime, so flipping `"paused": true` in
+    /// `auto_prompt.json` takes effect on the next chain event without a
+    /// restart. Env equivalent: ZED_AUTO_PROMPT_PAUSED ("0"/"false" = off).
+    #[serde(default = "default_paused")]
+    pub paused: bool,
 }
 
 fn default_max_iterations() -> u32 {
@@ -172,6 +183,10 @@ fn default_housekeeping_command() -> Option<String> {
     Some("housekeeping".to_string())
 }
 
+fn default_paused() -> bool {
+    false
+}
+
 fn default_elicitation_auto_answer_enabled() -> bool {
     true
 }
@@ -197,6 +212,7 @@ impl Default for AutoPromptConfig {
             housekeeping_command: default_housekeeping_command(),
             elicitation_auto_answer_enabled: default_elicitation_auto_answer_enabled(),
             elicitation_countdown_secs: default_elicitation_countdown_secs(),
+            paused: default_paused(),
         }
     }
 }
@@ -322,6 +338,11 @@ impl AutoPromptConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or_else(default_elicitation_countdown_secs);
 
+        let paused = std::env::var("ZED_AUTO_PROMPT_PAUSED")
+            .ok()
+            .map(|v| !matches!(v.as_str(), "0" | "false"))
+            .unwrap_or_else(default_paused);
+
         Self {
             system_prompt,
             max_iterations,
@@ -337,6 +358,7 @@ impl AutoPromptConfig {
             housekeeping_command,
             elicitation_auto_answer_enabled,
             elicitation_countdown_secs,
+            paused,
         }
     }
 
@@ -452,5 +474,14 @@ mod tests {
         let config: AutoPromptConfig =
             serde_json::from_str(r#"{"housekeeping_command": null}"#).unwrap();
         assert_eq!(config.housekeeping_command, None);
+    }
+
+    #[test]
+    fn paused_defaults_false_and_explicit_true_roundtrips() {
+        let config: AutoPromptConfig = serde_json::from_str("{}").unwrap();
+        assert!(!config.paused);
+        assert!(!AutoPromptConfig::default().paused);
+        let config: AutoPromptConfig = serde_json::from_str(r#"{"paused": true}"#).unwrap();
+        assert!(config.paused);
     }
 }
