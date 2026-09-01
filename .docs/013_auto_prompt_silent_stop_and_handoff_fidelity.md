@@ -69,6 +69,28 @@ static `CONTINUE_REMAINS_DECISION` with a pre-written housekeeping fallback.
   with `…` (`snippet_with_ellipsis`, char-boundary-safe) — the receiving
   worker can tell a cut line from a complete statement.
 
+## Incident addendum (2026-09-01 22:39): auth-guard false positive
+
+The fleet repo-sync `for r in …` loop tripped `is_interactive_auth_command`'s
+substring matcher (`"auth "` matched inside the loop body) and
+`is_interactive_tool_pending` — which scanned EVERY terminal tool call since
+the last user message — silently returned `NoAction` at a thread stop
+(`Auth command detected: 'for r in katgpt-rs riir-ai …', pausing` in Zed.log).
+The chain died with no continuation; the owner saw "auto prompt not trigger
+at all". Fix:
+
+- Only the MOST RECENT terminal tool call (`latest_terminal_command`) can be
+  auth-pending — if the worker ran further commands after an auth-shaped one,
+  it was not blocked on it.
+- The matcher matches concrete auth invocations at shell-segment starts
+  (`INTERACTIVE_AUTH_INVOCATIONS`: `gh auth login`, `gcloud auth login`,
+  `az login`, `docker login`, …) instead of substring patterns —
+  `gh auth status`, `git -C riir-auth pull`, and sync for-loops never match.
+- Guard log upgraded INFO → WARN with resume semantics.
+- Missing an exotic auth flow is the safe direction: the chain continues and
+  the worker's next turn fails visibly; a false positive killed chains
+  silently.
+
 ## Tests
 
 - `auto_prompt`: paused config serde roundtrip; fast-path Steps enrichment /

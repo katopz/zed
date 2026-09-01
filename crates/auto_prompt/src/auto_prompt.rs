@@ -2508,58 +2508,106 @@ fn default_system_prompt() -> String {
         .to_string()
 }
 
-/// Checks if the last tool calls suggest the user is completing an
+/// Checks if the LAST terminal tool call suggests the worker is blocked on an
 /// interactive flow (browser-based auth, login) and auto_prompt should wait.
+/// Only the most recent terminal tool call counts: if the worker ran further
+/// commands after an auth-shaped one, it was not blocked on it. Scanning the
+/// whole turn killed chains on stale matches (2026-09-01: a fleet repo-sync
+/// `for r in …` loop tripped the substring matcher and silently stopped a
+/// chain whose worker had long moved on and posted its summary).
 fn is_interactive_tool_pending(thread: &gpui::Entity<acp_thread::AcpThread>, cx: &App) -> bool {
     let thread_ref = thread.read(cx);
+    let Some(command) = latest_terminal_command(thread_ref.entries()) else {
+        return false;
+    };
+    if is_interactive_auth_command(&command) {
+        log::warn!(
+            "[auto_prompt::decide] Latest terminal call is an interactive auth command: '{}' — pausing (chain resumes on next stop)",
+            command.chars().take(100).collect::<String>()
+        );
+        true
+    } else {
+        false
+    }
+}
 
-    for entry in thread_ref.entries().iter().rev() {
+/// The command of the MOST RECENT terminal tool call before the last user
+/// message. `None` when there is none (or it carries no command) — the
+/// caller treats that as "not pending" rather than scanning deeper into the
+/// turn for stale auth-shaped calls.
+fn latest_terminal_command(
+    entries: &[acp_thread::AgentThreadEntry],
+) -> Option<String> {
+    for entry in entries.iter().rev() {
         match entry {
-            acp_thread::AgentThreadEntry::UserMessage(_) => break,
+            acp_thread::AgentThreadEntry::UserMessage(_) => return None,
             acp_thread::AgentThreadEntry::ToolCall(tool) => {
-                let is_terminal = tool
-                    .tool_name
-                    .as_ref()
-                    .is_some_and(|name| name == "terminal");
-                if !is_terminal {
+                if tool.tool_name.as_deref() != Some("terminal") {
                     continue;
                 }
-
-                if let Some(input) = &tool.raw_input {
-                    if let Some(command) = input.get("command").and_then(|v| v.as_str()) {
-                        if is_interactive_auth_command(command) {
-                            log::info!(
-                                "[auto_prompt::decide] Auth command detected: '{}', pausing",
-                                command.chars().take(100).collect::<String>()
-                            );
-                            return true;
-                        }
-                    }
-                }
+                return tool
+                    .raw_input
+                    .as_ref()
+                    .and_then(|input| input.get("command"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
             }
             _ => continue,
         }
     }
-
-    false
+    None
 }
 
-/// Patterns indicating an interactive command that opens a browser or
-/// waits for external user action (auth flows, device login, etc.).
+/// Concrete invocations that open a browser or wait for external user action
+/// (auth flows, device login). Matched against the START of a shell segment
+/// (`&&` / `;` / `|` / `&` / newline / backtick separated) — never as a
+/// substring of the whole command, so compound scripts that merely MENTION
+/// auth words (repo-sync for-loops, `gh auth status` health checks, greps)
+/// do not trip the guard. Missing an exotic flow is safe: the chain just
+/// continues and the worker's next turn fails visibly; a false positive
+/// silently killed chains.
+const INTERACTIVE_AUTH_INVOCATIONS: &[&str] = &[
+    "login",
+    "gh auth login",
+    "gh auth refresh",
+    "gh auth switch",
+    "gcloud auth login",
+    "gcloud auth application-default login",
+    "aws sso login",
+    "az login",
+    "az devops login",
+    "vercel login",
+    "netlify login",
+    "wrangler login",
+    "supabase login",
+    "firebase login",
+    "docker login",
+    "oras login",
+    "crane auth login",
+    "npm login",
+    "npm adduser",
+    "pnpm login",
+    "yarn login",
+    "cargo login",
+    "huggingface-cli login",
+    "hf auth login",
+    "wandb login",
+    "claude login",
+    "codex login",
+    "gemini login",
+    "op login",
+];
+
 fn is_interactive_auth_command(command: &str) -> bool {
     let lower = command.to_lowercase();
-    const AUTH_COMMANDS: &[&str] = &[
-        "login",
-        "signin",
-        "sign-in",
-        "sign in",
-        "auth ",
-        " authenticate",
-        "oauth",
-        "sso login",
-    ];
-
-    AUTH_COMMANDS.iter().any(|pattern| lower.contains(pattern))
+    lower
+        .split(|c: char| matches!(c, '&' | ';' | '|' | '\n' | '(' | '`'))
+        .map(str::trim_start)
+        .any(|segment| {
+            INTERACTIVE_AUTH_INVOCATIONS
+                .iter()
+                .any(|invocation| segment.starts_with(invocation))
+        })
 }
 
 pub fn reset_iteration() {
@@ -4846,6 +4894,115 @@ mod tests {
         assert_eq!(truncated.chars().count(), 3);
         assert!(text.starts_with(&truncated));
         assert!(truncated.is_char_boundary(truncated.len()));
+    }
+
+    // 2026-09-01: the fleet repo-sync `for r in …` loop tripped the old
+    // substring matcher ("auth ") and silently killed chains via
+    // is_interactive_tool_pending. The matcher now matches concrete auth
+    // invocations at shell-segment starts only.
+    #[test]
+    fn interactive_auth_command_matches_invocations_not_mentions() {
+        // Genuine interactive flows — segment-start invocations.
+        for cmd in [
+            "gh auth login",
+            "gh auth login --web",
+            "echo hi && gh auth login",
+            "gcloud auth login; git fetch",
+            "cd repo | wrangler login",
+            "az login",
+            "docker login",
+            "login",
+        ] {
+            assert!(
+                is_interactive_auth_command(cmd),
+                "should match interactive auth: {cmd}"
+            );
+        }
+        // Scripts that merely mention auth words — must NOT match.
+        for cmd in [
+            "for r in katgpt-rs riir-ai riir-chain riir-neuron-db; do gh auth status; git -C $r fetch --all; done",
+            "for r in a b c; do echo == $r; git -C $r pull --ff-only; done",
+            "git config --get remote.origin.url | grep auth",
+            "echo 'sign in to continue' && git push",
+            "grep -rn oauth src/",
+            "gh auth status",
+            "git -C riir-auth pull",
+        ] {
+            assert!(
+                !is_interactive_auth_command(cmd),
+                "must not match auth mention: {cmd}"
+            );
+        }
+    }
+
+    // Only the most recent terminal tool call can be auth-"pending" — a stale
+    // auth-shaped call deeper in the turn must not stop the chain.
+    #[gpui::test]
+    async fn latest_terminal_command_scopes_to_most_recent_terminal_call(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            use gpui::AppContext as _;
+            let mut tool_call = |name: &str, command: Option<&str>| {
+                acp_thread::AgentThreadEntry::ToolCall(acp_thread::ToolCall {
+                    id: acp::ToolCallId::new("test"),
+                    label: cx.new(|cx| markdown::Markdown::new("label".into(), None, None, cx)),
+                    kind: acp::ToolKind::Execute,
+                    content: Vec::new(),
+                    status: acp_thread::ToolCallStatus::Completed,
+                    locations: Vec::new(),
+                    resolved_locations: Vec::new(),
+                    raw_input: command.map(|c| serde_json::json!({ "command": c })),
+                    raw_input_markdown: None,
+                    raw_output: None,
+                    tool_name: Some(name.to_string().into()),
+                    subagent_session_info: None,
+                    sandbox_authorization_details: None,
+                    sandbox_fallback_authorization_details: None,
+                    sandbox_not_applied: None,
+                })
+            };
+            let user = || {
+                acp_thread::AgentThreadEntry::UserMessage(acp_thread::UserMessage {
+                    protocol_id: None,
+                    client_id: None,
+                    is_optimistic: false,
+                    content: acp_thread::ContentBlock::Empty,
+                    chunks: Vec::new(),
+                    checkpoint: None,
+                    indented: false,
+                })
+            };
+
+            // Latest terminal call is a sync loop; an older auth-shaped call
+            // must not resurrect the guard.
+            let entries = vec![
+                user(),
+                tool_call("terminal", Some("gh auth login")),
+                tool_call("terminal", Some("for r in a b; do git -C $r fetch; done")),
+            ];
+            assert_eq!(
+                latest_terminal_command(&entries).as_deref(),
+                Some("for r in a b; do git -C $r fetch; done")
+            );
+            assert!(!is_interactive_auth_command(
+                &latest_terminal_command(&entries).unwrap()
+            ));
+
+            // Latest terminal call IS an auth flow → pending.
+            let entries = vec![
+                user(),
+                tool_call("terminal", Some("git push")),
+                tool_call("terminal", Some("gh auth login")),
+            ];
+            assert!(is_interactive_auth_command(
+                &latest_terminal_command(&entries).unwrap()
+            ));
+
+            // No terminal call since the last user message → None.
+            let entries = vec![tool_call("terminal", Some("gh auth login")), user()];
+            assert_eq!(latest_terminal_command(&entries), None);
+        });
     }
 
     #[test]
