@@ -1038,6 +1038,21 @@ fn decide_precheck(
         return DecidePrecheck::Decision(AutoPromptDecision::NoAction);
     }
 
+    // Verdict ping-pong (proposal 001): a stopped verdict thread between
+    // rounds is normal, not a thread that needs continuing. Manual dispatch
+    // never reaches this function, so explicit human intent still wins.
+    if acp_thread::verdict::is_active(thread.read(cx).session_id()) {
+        log::info!(
+            "[auto_prompt::decide] verdict negotiation active — skipping (session={:?})",
+            thread.read(cx).session_id()
+        );
+        debug_log::write_log(
+            "no_action",
+            serde_json::json!({"reason": "verdict_negotiation_active"}),
+        );
+        return DecidePrecheck::Decision(AutoPromptDecision::NoAction);
+    }
+
     log::info!("[auto_prompt::decide] Auto-prompt evaluating");
 
     let thread_has_tools = thread.read(cx).has_tool_calls();
@@ -1136,7 +1151,10 @@ fn decide_precheck(
     // limit cheaply, so fall through to the full pipeline (its chars/4
     // estimate keeps no-usage providers forking).
     let last_assistant_message = thread.read(cx).last_assistant_message_text(cx);
-    let usage = thread.read(cx).token_usage().map(|usage| usage.input_tokens);
+    let usage = thread
+        .read(cx)
+        .token_usage()
+        .map(|usage| usage.input_tokens);
     if let Some(last_assistant_message) = last_assistant_message {
         if usage.is_some() && looks_like_voluntary_summary(&last_assistant_message) {
             let actual_input_tokens = usage;
@@ -1728,9 +1746,7 @@ pub(crate) fn context_overflow_outcome(data: &LlmCallData) -> AutoPromptOutcome 
         if let Some(summary) = data.last_assistant_message.as_deref() {
             peer_states::broadcast_state(&session_id_str, None, summary, "summary");
         }
-        log::info!(
-            "[auto_prompt::context_overflow] Summary received (session={session_id_str})"
-        );
+        log::info!("[auto_prompt::context_overflow] Summary received (session={session_id_str})");
 
         let prompt_summary = build_prompt_summary(
             None,
@@ -1765,10 +1781,8 @@ pub(crate) fn context_overflow_outcome(data: &LlmCallData) -> AutoPromptOutcome 
                     .to_string(),
             };
         }
-        let continuation = if matches!(
-            summary_continuation,
-            Some(SummaryContinuation::NothingLeft)
-        ) {
+        let continuation = if matches!(summary_continuation, Some(SummaryContinuation::NothingLeft))
+        {
             let plan_tasks_remain = detect_remaining_plan_tasks(
                 &data.context_json,
                 PlanRepoFilter::CurrentRepo,
@@ -2618,9 +2632,7 @@ fn is_interactive_tool_pending(thread: &gpui::Entity<acp_thread::AcpThread>, cx:
 /// message. `None` when there is none (or it carries no command) — the
 /// caller treats that as "not pending" rather than scanning deeper into the
 /// turn for stale auth-shaped calls.
-fn latest_terminal_command(
-    entries: &[acp_thread::AgentThreadEntry],
-) -> Option<String> {
+fn latest_terminal_command(entries: &[acp_thread::AgentThreadEntry]) -> Option<String> {
     for entry in entries.iter().rev() {
         match entry {
             acp_thread::AgentThreadEntry::UserMessage(_) => return None,
@@ -2902,7 +2914,10 @@ fn push_unclaimed(
             );
             continue;
         }
-        plan_files.push(PlanFileContent { path: path_str, content });
+        plan_files.push(PlanFileContent {
+            path: path_str,
+            content,
+        });
     }
 }
 
@@ -2912,7 +2927,6 @@ fn finalize_plan_files(
     plan_files: &mut Vec<PlanFileContent>,
     first_user_message: Option<&str>,
 ) -> Vec<PlanFileContent> {
-
     // Identify active project from first user message.
     // This prioritizes the session's target project over other workspace projects.
     // Supports: file:///... URLs, zed:///... URLs, and plain absolute paths containing /.plans/ or /.plan/
@@ -4307,6 +4321,14 @@ pub(crate) fn is_auto_prompt_summary_response(text: &str) -> bool {
     .count();
     // Need at least 3 of 4 to avoid false positives on random text
     section_matches >= 3
+}
+
+/// Public probe for UI callers: does this message read as the structured
+/// summary format the auto-prompt pipeline expects? Used by the verdict
+/// button (proposal 001) to decide whether a thread is ready for a reviewer
+/// verdict.
+pub fn message_looks_like_summary(text: &str) -> bool {
+    is_auto_prompt_summary_response(text)
 }
 
 /// Check if the LLM explicitly declares that ALL remaining tasks are blocked,

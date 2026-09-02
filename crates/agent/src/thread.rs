@@ -3,9 +3,9 @@ use crate::{
     CreateDirectoryTool, CreateThreadTool, DbLanguageModel, DbThread, DeletePathTool,
     DiagnosticsTool, EditFileTool, FetchTool, FindPathTool, FindReferencesTool, GetCodeActionsTool,
     GoToDefinitionTool, GrepTool, ListAgentsAndModelsTool, ListDirectoryTool, MovePathTool,
-    ProjectSnapshot, ReadFileTool, RenameTool, SandboxedTerminalTool, SpawnAgentTool,
-    SystemPromptTemplate, Template, Templates, TerminalTool, ToolPermissionDecision, WebSearchTool,
-    WriteFileTool, decide_permission_from_settings,
+    ProjectSnapshot, ReadFileTool, RenameTool, RequestVerdictTool, SandboxedTerminalTool,
+    SpawnAgentTool, SystemPromptTemplate, Template, Templates, TerminalTool,
+    ToolPermissionDecision, WebSearchTool, WriteFileTool, decide_permission_from_settings,
 };
 use acp_thread::{ClientUserMessageId, MentionUri};
 use action_log::ActionLog;
@@ -792,6 +792,19 @@ pub trait ThreadEnvironment {
 
     fn create_subagent(&self, label: String, cx: &mut App) -> Result<Rc<dyn SubagentHandle>>;
 
+    /// Creates a subagent pinned to the configured `verdict_model` for the
+    /// `request_verdict` ping-pong (proposal 001). Environments that don't
+    /// support verdict negotiations reject the call.
+    fn create_verdict_subagent(
+        &self,
+        _label: String,
+        _cx: &mut App,
+    ) -> Result<Rc<dyn SubagentHandle>> {
+        Err(anyhow::anyhow!(
+            "Verdict subagents are not supported in this environment"
+        ))
+    }
+
     fn resume_subagent(
         &self,
         _session_id: acp::SessionId,
@@ -1501,6 +1514,19 @@ impl Thread {
             .send(Self::prompt_capabilities(Some(model.as_ref())))
             .log_err();
         self.model = ThreadModel::Ready(model);
+    }
+
+    /// Overrides the model after construction (e.g. the verdict subagent's
+    /// configured `verdict_model`). Mirrors `new_subagent`'s handling of
+    /// `subagent_model`: flag the thread as no longer inheriting parent model
+    /// settings so a later settings sync cannot clobber the override.
+    pub(crate) fn override_model_selection(
+        &mut self,
+        selection: &LanguageModelSelection,
+        cx: &mut Context<Self>,
+    ) {
+        self.inherits_parent_model_settings = false;
+        self.apply_model_selection(selection, cx);
     }
 
     pub fn id(&self) -> &acp::SessionId {
@@ -2228,6 +2254,9 @@ impl Thread {
 
         if self.depth() < MAX_SUBAGENT_DEPTH {
             self.add_tool(SpawnAgentTool::new(environment.clone()));
+            if AgentSettings::get_global(cx).verdict_ping_pong {
+                self.add_tool(RequestVerdictTool::new(environment.clone()));
+            }
         }
 
         // Sibling-thread tools are exposed at every depth: a subagent should
@@ -3252,8 +3281,9 @@ impl Thread {
         cx: &mut AsyncApp,
     ) -> Result<ControlFlow<()>> {
         log::debug!("Running compaction");
-        let stream_idle_timeout_secs =
-            this.read_with(cx, |_, cx| AgentSettings::get_global(cx).stream_idle_timeout_secs)?;
+        let stream_idle_timeout_secs = this.read_with(cx, |_, cx| {
+            AgentSettings::get_global(cx).stream_idle_timeout_secs
+        })?;
         let compaction_id = acp_thread::ContextCompactionId(Uuid::new_v4().to_string().into());
         event_stream.send_context_compaction(
             compaction_id.clone(),
@@ -5078,7 +5108,10 @@ async fn stream_completion_with_retry(
     request: &LanguageModelRequest,
     cx: &AsyncApp,
 ) -> std::result::Result<
-    BoxStream<'static, std::result::Result<LanguageModelCompletionEvent, LanguageModelCompletionError>>,
+    BoxStream<
+        'static,
+        std::result::Result<LanguageModelCompletionEvent, LanguageModelCompletionError>,
+    >,
     LanguageModelCompletionError,
 > {
     let mut attempt = 0;
@@ -6205,9 +6238,7 @@ impl ToolCallEventStream {
             ensure_tool_call_authorization_not_interrupted(&outcome)?;
             match acp_thread::SandboxPermission::from_id(outcome.option_id.0.as_ref()) {
                 Some(acp_thread::SandboxPermission::AllowOnce) => {
-                    sandbox_grants
-                        .borrow_mut()
-                        .record_windows_fs_warning_ack();
+                    sandbox_grants.borrow_mut().record_windows_fs_warning_ack();
                     Self::persist_thread_grants(&thread, cx);
                     Ok(())
                 }

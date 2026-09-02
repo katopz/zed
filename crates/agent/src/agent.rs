@@ -3203,6 +3203,27 @@ impl NativeThreadEnvironment {
         label: String,
         cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>> {
+        self.create_subagent_thread_inner(label, None, cx)
+    }
+
+    /// Creates a subagent pinned to the configured `verdict_model` (falls back
+    /// to the parent thread's model when unset). Used by the `request_verdict`
+    /// tool so the reviewer can be a different model than the worker.
+    pub(crate) fn create_verdict_subagent_thread(
+        &self,
+        label: String,
+        cx: &mut App,
+    ) -> Result<Rc<dyn SubagentHandle>> {
+        let model = AgentSettings::get_global(cx).verdict_model.clone();
+        self.create_subagent_thread_inner(label, model, cx)
+    }
+
+    fn create_subagent_thread_inner(
+        &self,
+        label: String,
+        model_override: Option<LanguageModelSelection>,
+        cx: &mut App,
+    ) -> Result<Rc<dyn SubagentHandle>> {
         let Some(parent_thread_entity) = self.thread.upgrade() else {
             anyhow::bail!("Parent thread no longer exists".to_string());
         };
@@ -3220,6 +3241,9 @@ impl NativeThreadEnvironment {
         let subagent_thread: Entity<Thread> = cx.new(|cx| {
             let mut thread = Thread::new_subagent(&parent_thread_entity, cx);
             thread.set_title(label.into(), cx);
+            if let Some(selection) = model_override {
+                thread.override_model_selection(&selection, cx);
+            }
             thread
         });
 
@@ -3402,6 +3426,14 @@ impl ThreadEnvironment for NativeThreadEnvironment {
 
     fn create_subagent(&self, label: String, cx: &mut App) -> Result<Rc<dyn SubagentHandle>> {
         self.create_subagent_thread(label, cx)
+    }
+
+    fn create_verdict_subagent(
+        &self,
+        label: String,
+        cx: &mut App,
+    ) -> Result<Rc<dyn SubagentHandle>> {
+        self.create_verdict_subagent_thread(label, cx)
     }
 
     fn resume_subagent(
@@ -3661,8 +3693,7 @@ impl NativeSubagentHandle {
 
         // If the turn already finished before we subscribed, we will not receive
         // a Stopped event. Check the status to decide whether to wait.
-        let is_generating =
-            acp_thread.read_with(cx, |t, _| t.status() == ThreadStatus::Generating);
+        let is_generating = acp_thread.read_with(cx, |t, _| t.status() == ThreadStatus::Generating);
 
         if !is_generating {
             // Turn already completed and we missed the event. Best-effort: treat
@@ -6741,8 +6772,7 @@ mod internal_tests {
             })
             .await
             .unwrap();
-        let session_a_id =
-            acp_thread_a.read_with(cx, |thread, _| thread.session_id().clone());
+        let session_a_id = acp_thread_a.read_with(cx, |thread, _| thread.session_id().clone());
         let thread_a = agent.read_with(cx, |agent, _| {
             agent.sessions.get(&session_a_id).unwrap().thread.clone()
         });
@@ -6777,8 +6807,7 @@ mod internal_tests {
             })
             .await
             .unwrap();
-        let session_b_id =
-            acp_thread_b.read_with(cx, |thread, _| thread.session_id().clone());
+        let session_b_id = acp_thread_b.read_with(cx, |thread, _| thread.session_id().clone());
         assert_eq!(
             acp_thread_b.read_with(cx, |thread, _| thread.entries().len()),
             0,
@@ -6786,9 +6815,7 @@ mod internal_tests {
         );
 
         // Fork A's history into B, then let the replayed events drain.
-        let seed = cx.update(|cx| {
-            connection.seed_history(&session_b_id, source_messages, cx)
-        });
+        let seed = cx.update(|cx| connection.seed_history(&session_b_id, source_messages, cx));
         seed.await.unwrap();
         cx.run_until_parked();
 
@@ -6980,9 +7007,7 @@ mod internal_tests {
     }
 
     #[gpui::test]
-    async fn test_thread_summary_falls_back_when_summary_unavailable(
-        cx: &mut TestAppContext,
-    ) {
+    async fn test_thread_summary_falls_back_when_summary_unavailable(cx: &mut TestAppContext) {
         init_test(cx);
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(

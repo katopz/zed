@@ -19,7 +19,7 @@ use agent::{
     SandboxStatusKey, SandboxStatusRefresh, SkillLoadingIssue, SkillLoadingIssueKind,
     SkillLoadingIssuesUpdated, ThreadSandbox, VerifiedSandboxStatus,
 };
-use agent_settings::UserAgentsMd;
+use agent_settings::{AgentSettings, UserAgentsMd};
 use agent_skills::MAX_SKILL_DESCRIPTION_LEN;
 use cloud_api_types::{SubmitAgentThreadFeedbackBody, SubmitAgentThreadFeedbackCommentsBody};
 use editor::actions::OpenExcerpts;
@@ -43,7 +43,7 @@ use language_model::{
     LanguageModelProvider, LanguageModelProviderId, LanguageModelRegistry, Speed,
 };
 use notifications::status_toast::StatusToast;
-use settings::{update_settings_file, update_settings_file_with_completion, SettingsStore};
+use settings::{SettingsStore, update_settings_file, update_settings_file_with_completion};
 use ui::{
     ButtonLike, CalloutBorderPosition, Checkbox, SpinnerLabel, SpinnerVariant, SplitButton,
     SplitButtonStyle, Tab, ToggleState,
@@ -4785,6 +4785,7 @@ impl ThreadView {
                                     .child(self.render_add_context_button(cx))
                                     .child(self.render_follow_toggle(cx))
                                     .child(self.render_auto_prompt_toggle(cx))
+                                    .child(self.render_verdict_button(cx))
                                     .children(self.render_key_status_buttons(cx))
                                     .children(self.render_fast_mode_control(cx))
                                     .children(self.render_thinking_control(cx)),
@@ -5316,18 +5317,19 @@ impl ThreadView {
                         this.sandbox_status_key = None;
                         this.pending_sandbox_status_key = Some(key.clone());
                         cx.notify();
-                        this._sandbox_status_refresh_task = Some(cx.spawn(async move |this, cx| {
-                            let status = task.await;
-                            this.update(cx, |this, cx| {
-                                if this.pending_sandbox_status_key.as_ref() == Some(&key) {
-                                    this.sandbox_status = Some(status);
-                                    this.sandbox_status_key = Some(key);
-                                    this.pending_sandbox_status_key = None;
-                                    cx.notify();
-                                }
-                            })
-                            .ok();
-                        }));
+                        this._sandbox_status_refresh_task =
+                            Some(cx.spawn(async move |this, cx| {
+                                let status = task.await;
+                                this.update(cx, |this, cx| {
+                                    if this.pending_sandbox_status_key.as_ref() == Some(&key) {
+                                        this.sandbox_status = Some(status);
+                                        this.sandbox_status_key = Some(key);
+                                        this.pending_sandbox_status_key = None;
+                                        cx.notify();
+                                    }
+                                })
+                                .ok();
+                            }));
                     }
                 }
             })
@@ -6331,6 +6333,78 @@ impl ThreadView {
                 }))
                 .into_any_element()
         }
+    }
+
+    fn verdict_request_prompt(max_rounds: usize) -> String {
+        format!(
+            "Request a second-opinion verdict on your latest `## Summary` from a fresh reviewer thread:\n\n\
+             1. Call the `request_verdict` tool with a message containing your complete `## Summary` \
+             plus this instruction: \"Reply with a verdict that MUST start with `#Verdict: AGREE` or \
+             `#Verdict: REVISE` followed by bullet-point reasons.\" Include any file paths or plan \
+             state the reviewer needs — it cannot see this conversation.\n\
+             2. If the reply starts with `#Verdict: REVISE`, address every reason with evidence, then \
+             call `request_verdict` again with the SAME `session_id` so the negotiation continues in \
+             the same thread. Never start a new session mid-negotiation.\n\
+             3. When the reviewer replies `#Verdict: AGREE` and you agree with it, reply \
+             `#Verdict: AGREE` yourself, restate the final agreed summary in the `## Summary` \
+             format, and stop.\n\
+             4. Hard cap: {max_rounds} rounds. If you reach the cap, stop calling the tool and \
+             present the remaining disagreement to the user."
+        )
+    }
+
+    fn handle_request_verdict_click(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_subagent() || self.thread.read(cx).status() != ThreadStatus::Idle {
+            return;
+        }
+
+        let max_rounds = AgentSettings::get_global(cx).verdict_max_rounds;
+        let prompt = Self::verdict_request_prompt(max_rounds);
+        let contents_task = Task::ready(anyhow::Ok(Some((
+            vec![acp::ContentBlock::Text(acp::TextContent::new(prompt))],
+            Vec::new(),
+        ))));
+        cx.emit(AcpThreadViewEvent::Interacted);
+        self.send_content(contents_task, false, window, cx);
+    }
+
+    fn render_verdict_button(&self, cx: &mut Context<Self>) -> AnyElement {
+        // GOAT gate (proposal 001): hidden until agent.verdict_ping_pong = true,
+        // and root views only — a subagent cannot spawn further subagents.
+        if !AgentSettings::get_global(cx).verdict_ping_pong || self.is_subagent() {
+            return div().into_any_element();
+        }
+
+        let thread_idle = self.thread.read(cx).status() == ThreadStatus::Idle;
+        let has_summary = thread_idle
+            && self
+                .thread
+                .read(cx)
+                .last_assistant_message_text(cx)
+                .is_some_and(|message| auto_prompt::message_looks_like_summary(&message));
+        let max_rounds = AgentSettings::get_global(cx).verdict_max_rounds;
+
+        let tooltip_text = if !thread_idle {
+            "Request verdict — wait for the agent to finish".to_string()
+        } else if has_summary {
+            format!("Request verdict ping-pong from a reviewer thread (max {max_rounds} rounds)")
+        } else {
+            "Request verdict — needs a `## Summary` in the last reply".to_string()
+        };
+
+        IconButton::new("request-verdict", IconName::Person)
+            .icon_size(IconSize::Small)
+            .icon_color(if has_summary {
+                Color::Accent
+            } else {
+                Color::Muted
+            })
+            .disabled(!has_summary)
+            .tooltip(move |_window, cx| Tooltip::simple(tooltip_text.clone(), cx))
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.handle_request_verdict_click(window, cx);
+            }))
+            .into_any_element()
     }
 
     fn handle_auto_prompt_toggle_click(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -9998,38 +10072,39 @@ impl ThreadView {
                 | ToolCallStatus::InProgress
                 | ToolCallStatus::Completed
                 | ToolCallStatus::Failed
-                | ToolCallStatus::Canceled => v_flex()
-                    .when(should_show_raw_input, |this| {
-                        this.mt_1p5().w_full().child(
-                            v_flex()
-                                .ml(rems(0.4))
-                                .px_3p5()
-                                .pb_1()
-                                .gap_1()
-                                .border_l_1()
-                                .border_color(self.tool_card_border_color(cx))
-                                .child(input_output_header("Raw Input:".into()))
-                                .children(tool_call.raw_input_markdown.clone().map(|input| {
-                                    div().id(("tool-call-raw-input-markdown", entry_ix)).child(
-                                        self.render_markdown(
-                                            input,
-                                            self.markdown_style_for_thread(
-                                                MarkdownStyle::themed(MarkdownFont::Agent, window, cx),
+                | ToolCallStatus::Canceled => {
+                    v_flex()
+                        .when(should_show_raw_input, |this| {
+                            this.mt_1p5().w_full().child(
+                                v_flex()
+                                    .ml(rems(0.4))
+                                    .px_3p5()
+                                    .pb_1()
+                                    .gap_1()
+                                    .border_l_1()
+                                    .border_color(self.tool_card_border_color(cx))
+                                    .child(input_output_header("Raw Input:".into()))
+                                    .children(tool_call.raw_input_markdown.clone().map(|input| {
+                                        div().id(("tool-call-raw-input-markdown", entry_ix)).child(
+                                            self.render_markdown(
+                                                input,
+                                                self.markdown_style_for_thread(
+                                                    MarkdownStyle::themed(
+                                                        MarkdownFont::Agent,
+                                                        window,
+                                                        cx,
+                                                    ),
+                                                    cx,
+                                                ),
                                                 cx,
                                             ),
-                                            cx,
-                                        ),
-                                    )
-                                }))
-                                .child(input_output_header("Output:".into())),
-                        )
-                    })
-                    .children(
-                        tool_call
-                            .content
-                            .iter()
-                            .enumerate()
-                            .map(|(content_ix, content)| {
+                                        )
+                                    }))
+                                    .child(input_output_header("Output:".into())),
+                            )
+                        })
+                        .children(tool_call.content.iter().enumerate().map(
+                            |(content_ix, content)| {
                                 let output_id = SharedString::from(format!(
                                     "tool-call-output-{entry_ix}-{content_ix}"
                                 ));
@@ -10048,27 +10123,29 @@ impl ThreadView {
                                         window,
                                         cx,
                                     ))
-                            }),
-                    )
-                    .when(!use_card_layout, |this| {
-                        let button_id =
-                            SharedString::from(format!("tool_output-collapse-{:?}", tool_call.id));
-                        let tool_call_id = tool_call.id.clone();
+                            },
+                        ))
+                        .when(!use_card_layout, |this| {
+                            let button_id = SharedString::from(format!(
+                                "tool_output-collapse-{:?}",
+                                tool_call.id
+                            ));
+                            let tool_call_id = tool_call.id.clone();
 
-                        this.child(
-                            div()
-                                .ml(rems(0.4))
-                                .px_3p5()
-                                .pt_2()
-                                .border_l_1()
-                                .border_color(self.tool_card_border_color(cx))
-                                .child(
-                                    IconButton::new(button_id, IconName::ChevronUp)
-                                        .full_width()
-                                        .style(ButtonStyle::Outlined)
-                                        .icon_color(Color::Muted)
-                                        .on_click(cx.listener({
-                                            move |this: &mut Self,
+                            this.child(
+                                div()
+                                    .ml(rems(0.4))
+                                    .px_3p5()
+                                    .pt_2()
+                                    .border_l_1()
+                                    .border_color(self.tool_card_border_color(cx))
+                                    .child(
+                                        IconButton::new(button_id, IconName::ChevronUp)
+                                            .full_width()
+                                            .style(ButtonStyle::Outlined)
+                                            .icon_color(Color::Muted)
+                                            .on_click(cx.listener({
+                                                move |this: &mut Self,
                                                   _,
                                                   window,
                                                   cx: &mut Context<Self>| {
@@ -10078,11 +10155,12 @@ impl ThreadView {
                                                 this.refresh_thread_search(window, cx);
                                                 cx.notify();
                                             }
-                                        })),
-                                ),
-                        )
-                    })
-                    .into_any(),
+                                            })),
+                                    ),
+                            )
+                        })
+                        .into_any()
+                }
                 ToolCallStatus::Rejected => Empty.into_any(),
             }
             .into()
@@ -11066,20 +11144,13 @@ impl ThreadView {
             .read(cx)
             .auto_allow_remaining_seconds(&session_id, &tool_call_id)
         {
-            v_flex()
-                .w_full()
-                .child(buttons)
-                .child(
-                    h_flex()
-                        .w_full()
-                        .px_1()
-                        .justify_end()
-                        .child(
-                            Label::new(format!("Auto-allow in {seconds}s"))
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                        ),
-                )
+            v_flex().w_full().child(buttons).child(
+                h_flex().w_full().px_1().justify_end().child(
+                    Label::new(format!("Auto-allow in {seconds}s"))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                ),
+            )
         } else {
             buttons
         }

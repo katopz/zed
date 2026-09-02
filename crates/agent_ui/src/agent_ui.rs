@@ -74,8 +74,8 @@ use workspace::{OpenOptions, Workspace};
 use crate::agent_configuration::ManageProfilesModal;
 pub use crate::agent_connection_store::{ActiveAcpConnection, AgentConnectionStore};
 pub use crate::agent_panel::{
-    AgentPanel, AgentPanelEvent, AgentPanelTerminalInfo, CreateThreadOptions, MaxIdleRetainedThreads,
-    TerminalId, ThreadTitleRegenerationResult,
+    AgentPanel, AgentPanelEvent, AgentPanelTerminalInfo, CreateThreadOptions,
+    MaxIdleRetainedThreads, TerminalId, ThreadTitleRegenerationResult,
 };
 use crate::agent_registry_ui::AgentRegistryPage;
 pub use crate::inline_assistant::InlineAssistant;
@@ -1002,6 +1002,9 @@ mod tests {
             max_content_width: Some(px(850.)),
             default_model: None,
             subagent_model: None,
+            verdict_ping_pong: false,
+            verdict_model: None,
+            verdict_max_rounds: 3,
             inline_assistant_model: None,
             inline_assistant_use_streaming_tools: false,
             commit_message_model: None,

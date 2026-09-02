@@ -46,7 +46,9 @@ pub struct SpawnAgentToolInput {
     pub session_id: Option<acp::SessionId>,
 }
 
-fn deserialize_session_id<'de, D>(deserializer: D) -> Result<Option<acp::SessionId>, D::Error>
+pub(super) fn deserialize_session_id<'de, D>(
+    deserializer: D,
+) -> Result<Option<acp::SessionId>, D::Error>
 where
     D: Deserializer<'de>,
 {

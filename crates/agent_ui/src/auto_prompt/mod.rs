@@ -875,6 +875,18 @@ fn run_auto_prompt(
         is_manual
     );
 
+    // Verdict ping-pong suppression (proposal 001): while a request_verdict
+    // negotiation is active, its thread's inter-round stops must never spawn
+    // an auto_prompt chain. Manual clicks keep bypassing this — explicit
+    // human intent overrides, matching the `paused()` kill-switch semantics.
+    if !is_manual && acp_thread::verdict::is_active(thread.read(cx).session_id()) {
+        log::info!(
+            "[auto_prompt] verdict negotiation active — suppressing auto chain (session={:?})",
+            thread.read(cx).session_id()
+        );
+        return None;
+    }
+
     if matches!(stop_reason, acp::StopReason::MaxTokens) {
         log::warn!(
             "[auto_prompt] Error/Rate Limit detected - stop_reason={:?}, will apply backoff retry",
@@ -1874,6 +1886,24 @@ pub fn start_watchdog(
                     continue;
                 }
                 auto_prompt::watchdog::WatchdogDecision::Halt { reason } => {
+                    // Verdict ping-pong (proposal 001): a reviewer thread that
+                    // takes a while between rounds is expected — never cancel
+                    // it and never inject the timeout-recovery prompt.
+                    let watched_is_verdict = thread_weak
+                        .read_with(cx, |thread, _cx| {
+                            acp_thread::verdict::is_active(thread.session_id())
+                        })
+                        .unwrap_or(false);
+                    if watched_is_verdict {
+                        log::warn!(
+                            "[auto_prompt::watchdog] HALT suppressed (timeout #{}) — thread is an \
+                             active verdict negotiation, reason: {}",
+                            timeout_number,
+                            reason
+                        );
+                        return;
+                    }
+
                     log::warn!(
                         "[auto_prompt::watchdog] Decision: HALT (timeout #{}, reason: {}) \
                          — cancelling worker and injecting timeout notice",

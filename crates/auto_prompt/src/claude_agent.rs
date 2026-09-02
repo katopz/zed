@@ -209,7 +209,16 @@ pub fn decide_claude(
     // Config kill switch (plan 031 silent stop): drop the automatic Claude
     // chain with only a log line. Manual clicks bypass this function.
     if crate::paused() {
-        log::warn!("[auto_prompt::claude] paused — silently stopping chain (stop_reason={stop_reason:?})");
+        log::warn!(
+            "[auto_prompt::claude] paused — silently stopping chain (stop_reason={stop_reason:?})"
+        );
+        return AutoPromptDecision::NoAction;
+    }
+
+    // Verdict ping-pong (proposal 001): never auto-continue a verdict thread
+    // mid-negotiation, whichever agent backs it.
+    if acp_thread::verdict::is_active(thread.read(cx).session_id()) {
+        log::info!("[auto_prompt::claude] verdict negotiation active — skipping");
         return AutoPromptDecision::NoAction;
     }
 
@@ -389,7 +398,9 @@ fn claude_context_overflow_decision(
         .unwrap_or_else(|_| crate::default_max_context_tokens());
 
     let thread_ref = thread.read(cx);
-    let effective_tokens = thread_ref.token_usage().map(claude_effective_context_tokens);
+    let effective_tokens = thread_ref
+        .token_usage()
+        .map(claude_effective_context_tokens);
     if !claude_tokens_exceed_overflow(effective_tokens, threshold) {
         return None;
     }
@@ -1246,10 +1257,7 @@ mod gate_tests {
     // must read the populated field.
     #[test]
     fn claude_effective_tokens_reads_used_tokens_when_input_is_zero() {
-        assert_eq!(
-            claude_effective_context_tokens(&usage(0, 210_000)),
-            210_000
-        );
+        assert_eq!(claude_effective_context_tokens(&usage(0, 210_000)), 210_000);
     }
 
     #[test]

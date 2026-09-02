@@ -1981,8 +1981,8 @@ impl AgentPanel {
                 .insert(session_id.clone(), (len, fingerprint));
 
             let start = len.saturating_sub(TAIL);
-            let new_entries: Vec<auto_prompt::peer_states::ThreadEntry> = thread
-                .read_with(cx, |thread, cx| {
+            let new_entries: Vec<auto_prompt::peer_states::ThreadEntry> =
+                thread.read_with(cx, |thread, cx| {
                     thread
                         .entries()
                         .iter()
@@ -4625,7 +4625,11 @@ impl AgentPanel {
     /// currently leased (being updated) on the call stack — reading it here
     /// would double-lease panic. In practice that is the dispatching view
     /// itself, which is the continuation target, not a sibling.
-    pub(crate) fn active_thread_activity(&self, cx: &App, skip_view: Option<gpui::EntityId>) -> Vec<String> {
+    pub(crate) fn active_thread_activity(
+        &self,
+        cx: &App,
+        skip_view: Option<gpui::EntityId>,
+    ) -> Vec<String> {
         let mut actives = Vec::new();
         for view in self.conversation_views() {
             if skip_view.is_some_and(|id| id == view.entity_id()) {
@@ -10034,9 +10038,7 @@ mod tests {
     // (the entity is leased while being updated — reading it panics with
     // "cannot read ... while it is already being updated").
     #[gpui::test]
-    async fn test_active_thread_activity_skips_leased_dispatching_view(
-        cx: &mut TestAppContext,
-    ) {
+    async fn test_active_thread_activity_skips_leased_dispatching_view(cx: &mut TestAppContext) {
         init_test(cx);
         cx.update(|cx| {
             agent::ThreadStore::init_global(cx);
@@ -11964,10 +11966,7 @@ mod tests {
             let view = panel
                 .active_conversation_view()
                 .expect("thread still active when parking");
-            let thread_view = view
-                .read(cx)
-                .root_thread_view()
-                .expect("thread connected");
+            let thread_view = view.read(cx).root_thread_view().expect("thread connected");
             thread_view.update(cx, |tv, _cx| {
                 tv.is_loading_contents = false;
             });

@@ -35,6 +35,9 @@ pub const COMPACTION_PROMPT: &str = include_str!("prompts/compaction_prompt.txt"
 /// Default for `AgentSettings::stream_idle_timeout_secs`.
 pub const DEFAULT_STREAM_IDLE_TIMEOUT_SECS: u64 = 120;
 
+/// Default for `AgentSettings::verdict_max_rounds` (proposal 001).
+pub const DEFAULT_VERDICT_MAX_ROUNDS: usize = 3;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PanelLayout {
     pub(crate) agent_dock: Option<DockPosition>,
@@ -217,6 +220,14 @@ pub struct AgentSettings {
     pub max_content_width: Option<Pixels>,
     pub default_model: Option<LanguageModelSelection>,
     pub subagent_model: Option<LanguageModelSelection>,
+    /// Whether the `request_verdict` tool is registered for native agent
+    /// threads (verdict ping-pong, proposal 001). GOAT gate — default off.
+    pub verdict_ping_pong: bool,
+    /// Model for the `request_verdict` reviewer subagent. `None` inherits the
+    /// parent thread's model.
+    pub verdict_model: Option<LanguageModelSelection>,
+    /// Hard cap on `request_verdict` rounds per negotiation.
+    pub verdict_max_rounds: usize,
     pub inline_assistant_model: Option<LanguageModelSelection>,
     pub inline_assistant_use_streaming_tools: bool,
     pub commit_message_model: Option<LanguageModelSelection>,
@@ -787,6 +798,11 @@ impl Settings for AgentSettings {
             flexible: agent.flexible.unwrap(),
             default_model: Some(agent.default_model.unwrap()),
             subagent_model: agent.subagent_model,
+            verdict_ping_pong: agent.verdict_ping_pong.unwrap_or(false),
+            verdict_model: agent.verdict_model,
+            verdict_max_rounds: agent
+                .verdict_max_rounds
+                .unwrap_or(DEFAULT_VERDICT_MAX_ROUNDS),
             inline_assistant_model: agent.inline_assistant_model,
             inline_assistant_use_streaming_tools: agent
                 .inline_assistant_use_streaming_tools

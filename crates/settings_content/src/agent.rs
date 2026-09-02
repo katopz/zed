@@ -237,6 +237,21 @@ pub struct AgentSettingsContent {
     pub default_model: Option<LanguageModelSelection>,
     /// The model to use for subagents spawned via the `spawn_agent` tool. Defaults to the parent agent's model when not specified.
     pub subagent_model: Option<LanguageModelSelection>,
+    /// Whether the `request_verdict` tool is registered for native agent
+    /// threads (verdict ping-pong, `.proposals/001_claude_sub_agent_verdict.md`).
+    /// Experimental — promote to default only if the GOAT benchmark shows
+    /// post-hoc rework dropping.
+    ///
+    /// Default: false
+    pub verdict_ping_pong: Option<bool>,
+    /// The model for the reviewer subagent spawned by the `request_verdict`
+    /// tool. Defaults to the parent agent's model when not specified.
+    pub verdict_model: Option<LanguageModelSelection>,
+    /// Maximum rounds per `request_verdict` negotiation before the tool
+    /// refuses further calls.
+    ///
+    /// Default: 3
+    pub verdict_max_rounds: Option<usize>,
     /// Favorite models to show at the top of the model selector.
     #[serde(default)]
     pub favorite_models: Vec<LanguageModelSelection>,

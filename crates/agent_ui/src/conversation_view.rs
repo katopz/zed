@@ -512,7 +512,8 @@ impl Conversation {
         if self.auto_allow_remaining.contains_key(&key) {
             return;
         }
-        self.auto_allow_remaining.insert(key.clone(), seconds.max(1));
+        self.auto_allow_remaining
+            .insert(key.clone(), seconds.max(1));
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
@@ -578,9 +579,7 @@ impl Conversation {
         let outcome = resolve_outcome_from_selection(options, None, true).or_else(|| {
             options
                 .first_option_of_kind(acp::PermissionOptionKind::AllowAlways)
-                .map(|option| {
-                    SelectedPermissionOutcome::new(option.option_id.clone(), option.kind)
-                })
+                .map(|option| SelectedPermissionOutcome::new(option.option_id.clone(), option.kind))
         });
         let Some(outcome) = outcome else {
             return;
@@ -1799,7 +1798,10 @@ impl ConversationView {
                 // to a background thread while another is active.
                 if let Some(thread_view) = self.thread_view(&session_id) {
                     crate::auto_prompt::elicitation_auto_answer::arm_if_enabled(
-                        thread_view, thread, &id, cx,
+                        thread_view,
+                        thread,
+                        &id,
+                        cx,
                     );
                 }
             }
@@ -1982,9 +1984,10 @@ impl ConversationView {
                             format!("Agent stopped: {limit_kind} limit reached"),
                             IconName::Warning,
                         ),
-                        (None, _) => {
-                            ("Agent stopped due to an error".to_string(), IconName::Warning)
-                        }
+                        (None, _) => (
+                            "Agent stopped due to an error".to_string(),
+                            IconName::Warning,
+                        ),
                     };
                     self.notify_with_sound(notification, icon, window, cx);
                     // Call auto-prompt for error events (e.g., rate limits)
@@ -10817,7 +10820,9 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
-    async fn test_conversation_auto_allows_pending_tool_call_after_timeout(cx: &mut TestAppContext) {
+    async fn test_conversation_auto_allows_pending_tool_call_after_timeout(
+        cx: &mut TestAppContext,
+    ) {
         init_test(cx);
         cx.update(|cx| {
             project::DisableAiSettings::register(cx);
@@ -10833,8 +10838,13 @@ pub(crate) mod tests {
 
         let session_id = acp::SessionId::new("session-auto");
         let (thread, conversation) = cx.update(|cx| {
-            let thread =
-                create_test_acp_thread(None, "session-auto", connection.clone(), project.clone(), cx);
+            let thread = create_test_acp_thread(
+                None,
+                "session-auto",
+                connection.clone(),
+                project.clone(),
+                cx,
+            );
             let conversation = cx.new(|cx| {
                 let mut conversation = Conversation::default();
                 conversation.register_thread(thread.clone(), cx);
@@ -11015,16 +11025,12 @@ pub(crate) mod tests {
             "tc-sandbox-fallback",
             PermissionOptions::Flat(vec![
                 acp::PermissionOption::new(
-                    acp::PermissionOptionId::new(
-                        acp_thread::SANDBOX_FALLBACK_RETRY_OPTION_ID,
-                    ),
+                    acp::PermissionOptionId::new(acp_thread::SANDBOX_FALLBACK_RETRY_OPTION_ID),
                     "Retry",
                     acp::PermissionOptionKind::RejectAlways,
                 ),
                 acp::PermissionOption::new(
-                    acp::PermissionOptionId::new(
-                        acp_thread::SandboxPermission::AllowOnce.as_id(),
-                    ),
+                    acp::PermissionOptionId::new(acp_thread::SandboxPermission::AllowOnce.as_id()),
                     "Run without sandbox once",
                     acp::PermissionOptionKind::AllowOnce,
                 ),

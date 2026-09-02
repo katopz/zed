@@ -2,6 +2,7 @@ mod connection;
 mod diff;
 mod mention;
 mod terminal;
+pub mod verdict;
 pub use ::terminal::HeadlessTerminal;
 use action_log::{ActionLog, ActionLogTelemetry};
 use agent_client_protocol::schema::{MaybeUndefined, v1 as acp};
@@ -3136,9 +3137,7 @@ impl AcpThread {
         cx: &mut Context<Self>,
     ) {
         self.push_entry(
-            AgentThreadEntry::AgentBoardNotification(AgentBoardNotification {
-                text: text.into(),
-            }),
+            AgentThreadEntry::AgentBoardNotification(AgentBoardNotification { text: text.into() }),
             cx,
         );
     }
@@ -3522,7 +3521,9 @@ impl AcpThread {
             if let Some(markdown) = markdown_for_raw_output(&raw_output, &language_registry, cx) {
                 tool_call
                     .content
-                    .push(ToolCallContent::ContentBlock(ContentBlock::Markdown { markdown }));
+                    .push(ToolCallContent::ContentBlock(ContentBlock::Markdown {
+                        markdown,
+                    }));
             }
         }
 
@@ -6604,11 +6605,9 @@ mod tests {
                                         .kind(acp::ToolKind::Other)
                                         .status(acp::ToolCallStatus::Completed)
                                         .meta(meta.clone())
-                                        .raw_output(
-                                            serde_json::Value::String(
-                                                "first output".into(),
-                                            ),
-                                        ),
+                                        .raw_output(serde_json::Value::String(
+                                            "first output".into(),
+                                        )),
                                 ),
                                 cx,
                             )
@@ -6628,9 +6627,7 @@ mod tests {
             .await
             .unwrap();
 
-        let request = thread.update(cx, |thread, cx| {
-            thread.send_raw("Run subagent", cx)
-        });
+        let request = thread.update(cx, |thread, cx| thread.send_raw("Run subagent", cx));
 
         run_until_first_tool_call(&thread, cx).await;
 
@@ -6660,10 +6657,7 @@ mod tests {
         thread.read_with(cx, |thread, _| {
             let tool_call = thread.tool_call_for_subagent(&subagent_session_id);
             assert!(
-                matches!(
-                    tool_call.unwrap().status,
-                    ToolCallStatus::InProgress
-                ),
+                matches!(tool_call.unwrap().status, ToolCallStatus::InProgress),
                 "tool_call should be InProgress after restart"
             );
         });

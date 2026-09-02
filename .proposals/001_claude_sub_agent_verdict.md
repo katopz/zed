@@ -1,6 +1,6 @@
 # Claude Sub-Agent Verdict (ping-pong second opinion)
 
-Status: PROPOSED — substrate verified in code, awaiting approval before implementation
+Status: IMPLEMENTED (phases 1-5) — GOAT gate off by default (`agent.verdict_ping_pong`), benchmark pending
 
 ## Goal
 
@@ -68,23 +68,36 @@ thread (and must not derail the parent), so the whole thing runs as a sub-agent 
 
 ## Plan
 
-- [ ] Phase 1: `auto_prompt::verdict_loop` module — suppression registry
-      (`register/complete/is_active`), protocol parse + agreement pure functions, tests
-- [ ] Phase 2: suppression hooks in `run_auto_prompt` entry + `decide_claude` +
-      watchdog HALT; teardown on thread close
-- [ ] Phase 3: `request_verdict` tool wrapping `ThreadEnvironment` (create + resume,
-      pinned `verdict_model` setting, verdict system prompt); FakeThreadEnvironment tests
-- [ ] Phase 4: button in message-editor toolbar (root views only; disabled without a
-      `## Summary`); click injects queued message that instructs the parent to call the
-      tool; config keys `verdict_model`, `verdict_max_rounds`
-- [ ] Phase 5 (GOAT gate): feature flag `verdict_ping_pong` (default off); benchmark —
-      threads-with-verdict vs without: post-hoc fix rate, rounds used, token cost;
-      promote to default only if rework measurably drops
-- [ ] Phase 6 (defer): Claude Code subscription path via ACP-connection verdict session
+- [x] Phase 1: `acp_thread::verdict` module — suppression registry
+      (`register/complete/is_active`/`rounds`, TTL 30min), `parse_verdict` +
+      `VerdictKind` protocol functions, 6 unit tests
+- [x] Phase 2: suppression hooks in `run_auto_prompt` entry (manual clicks
+      still bypass) + `decide_precheck` + `decide_claude` + watchdog HALT;
+      TTL expiry is the teardown (no leak path)
+- [x] Phase 3: `request_verdict` tool (`crates/agent/src/tools/request_verdict_tool.rs`)
+      via new `ThreadEnvironment::create_verdict_subagent` (model pinned to
+      `agent.verdict_model`, falls back to parent model); rounds budget
+      enforced pre-resume; output carries `round`/`max_rounds`
+- [x] Phase 4: button in message-editor toolbar (root views only; disabled
+      without a summary per `auto_prompt::message_looks_like_summary`); click
+      sends the ping-pong instruction; settings `agent.verdict_ping_pong`,
+      `agent.verdict_model`, `agent.verdict_max_rounds` (default 3)
+- [x] Phase 5 (GOAT gate): feature flag `verdict_ping_pong` default false —
+      tool unregistered and button hidden when off; benchmark
+      (threads-with-verdict vs without: post-hoc fix rate, rounds, token cost)
+      still pending before promoting to default
+- [-] Phase 6 (defer): Claude Code subscription path via ACP-connection verdict session
 
 ## Notes
 
 - Naming: `#Verdict` (user wrote "#Vedict", treated as typo).
 - Ping-pong stays visible in the parent thread as tool calls — user can watch and cancel.
-- Prefer option A (prompt-driven, tool-per-round) over one tool call that hides the whole
-  loop internally: visible, cancellable, and each parent reasoning step is a real LLM turn.
+- Implemented as option A (prompt-driven, tool-per-round): visible, cancellable, and each
+  parent reasoning step is a real LLM turn.
+- Deviation from the original plan: the registry lives in `acp_thread::verdict`, not
+  `auto_prompt::verdict_loop` — `auto_prompt` does not depend on `agent`, and `acp_thread`
+  is the one crate all consumers (agent tool, auto_prompt deciders, agent_ui watchdog)
+  already depend on.
+- Validation: `cargo test -p acp_thread verdict` (6), `cargo test -p agent request_verdict`
+  (2), full `cargo test -p agent` (735 passed), `cargo test -p agent_ui conversation_view::tests`
+  (116, incl. watchdog), `cargo test -p auto_prompt` (40), targeted clippy clean.
