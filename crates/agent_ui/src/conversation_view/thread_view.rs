@@ -6347,7 +6347,8 @@ impl ThreadView {
              the same thread. Never start a new session mid-negotiation.\n\
              3. When the reviewer replies `#Verdict: AGREE` and you agree with it, reply \
              `#Verdict: AGREE` yourself, restate the final agreed summary in the `## Summary` \
-             format, and stop.\n\
+             format, and stop — pass `final_round: true` on that closing call so the reviewer \
+             session is freed.\n\
              4. Hard cap: {max_rounds} rounds. If you reach the cap, stop calling the tool and \
              present the remaining disagreement to the user."
         )

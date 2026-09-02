@@ -580,6 +580,7 @@ mod tests {
             verdict_ping_pong: false,
             verdict_model: None,
             verdict_max_rounds: 3,
+            verdict_reviewer: settings::VerdictReviewerSetting::default(),
             inline_assistant_model: None,
             inline_assistant_use_streaming_tools: false,
             commit_message_model: None,

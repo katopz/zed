@@ -66,6 +66,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+use util::path_list::PathList;
 use util::{ResultExt, debug_panic, markdown::MarkdownCodeBlock, paths::PathStyle};
 use uuid::Uuid;
 
@@ -791,6 +792,19 @@ pub trait ThreadEnvironment {
     ) -> Task<Result<Rc<dyn TerminalHandle>>>;
 
     fn create_subagent(&self, label: String, cx: &mut App) -> Result<Rc<dyn SubagentHandle>>;
+
+    /// The project this thread works in, if the environment can provide it.
+    /// Used by the `request_verdict` tool to spawn external reviewer sessions
+    /// in the worker's project. Default: `None`.
+    fn project(&self, _cx: &App) -> Option<Entity<Project>> {
+        None
+    }
+
+    /// This thread's work directories, if the environment can provide them.
+    /// Passed to external reviewer sessions. Default: `None`.
+    fn work_dirs(&self, _cx: &App) -> Option<PathList> {
+        None
+    }
 
     /// Creates a subagent pinned to the configured `verdict_model` for the
     /// `request_verdict` ping-pong (proposal 001). Environments that don't

@@ -3436,6 +3436,16 @@ impl ThreadEnvironment for NativeThreadEnvironment {
         self.create_verdict_subagent_thread(label, cx)
     }
 
+    fn project(&self, cx: &App) -> Option<Entity<Project>> {
+        Some(self.thread.upgrade()?.read(cx).project().clone())
+    }
+
+    fn work_dirs(&self, cx: &App) -> Option<PathList> {
+        // The native Thread itself doesn't carry work dirs; the parent's ACP
+        // wrapper (held by this environment) does — set at register_session.
+        self.acp_thread.upgrade()?.read(cx).work_dirs().cloned()
+    }
+
     fn resume_subagent(
         &self,
         session_id: acp::SessionId,

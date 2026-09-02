@@ -252,6 +252,14 @@ pub struct AgentSettingsContent {
     ///
     /// Default: 3
     pub verdict_max_rounds: Option<usize>,
+    /// Which backend provides the reviewer thread for the `request_verdict`
+    /// tool. `native` spawns a subagent pinned to `verdict_model` (requires an
+    /// Anthropic API key for a Claude reviewer); `claude_code` spawns an
+    /// off-screen Claude Code session on its existing connection (subscription
+    /// auth, no API key).
+    ///
+    /// Default: native
+    pub verdict_reviewer: Option<VerdictReviewerSetting>,
     /// Favorite models to show at the top of the model selector.
     #[serde(default)]
     pub favorite_models: Vec<LanguageModelSelection>,
@@ -621,6 +629,18 @@ pub enum NotifyWhenAgentWaiting {
     PrimaryScreen,
     AllScreens,
     Never,
+}
+
+/// Which backend provides the reviewer thread for the `request_verdict` tool.
+#[derive(Clone, Default, Debug, Serialize, Deserialize, JsonSchema, MergeFrom, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum VerdictReviewerSetting {
+    /// Subagent pinned to `verdict_model` (inherits parent model when unset).
+    #[default]
+    Native,
+    /// Off-screen Claude Code session on its existing connection — uses
+    /// Claude Code's own subscription auth, no Anthropic API key required.
+    ClaudeCode,
 }
 
 #[derive(

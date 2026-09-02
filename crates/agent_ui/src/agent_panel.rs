@@ -1752,6 +1752,13 @@ impl AgentPanel {
         });
 
         let connection_store = cx.new(|cx| AgentConnectionStore::new(project.clone(), cx));
+
+        // Verdict ping-pong (proposal 001 phase 6): expose the panel's Claude
+        // Code connection to the `request_verdict` tool. Re-registered if a
+        // second panel spawns (last one wins); cleared when this panel drops.
+        acp_thread::verdict::set_reviewer(Some(crate::verdict_reviewer::ClaudeCodeReviewer::new(
+            connection_store.downgrade(),
+        )));
         let _project_subscription =
             cx.subscribe(&project, |this, _project, event, cx| match event {
                 project::Event::WorktreeAdded(_)

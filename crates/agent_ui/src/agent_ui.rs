@@ -39,6 +39,7 @@ pub mod thread_worktree_archive;
 pub mod threads_archive_view;
 mod ui;
 mod unicode_confusables;
+mod verdict_reviewer;
 
 use std::rc::Rc;
 use std::sync::Arc;
@@ -978,6 +979,7 @@ mod tests {
     use project::DisableAiSettings;
     use settings::{
         DockPosition, NotifyWhenAgentWaiting, PlaySoundWhenAgentDone, Settings, SettingsStore,
+        VerdictReviewerSetting,
     };
 
     #[gpui::test]
@@ -1005,6 +1007,7 @@ mod tests {
             verdict_ping_pong: false,
             verdict_model: None,
             verdict_max_rounds: 3,
+            verdict_reviewer: VerdictReviewerSetting::default(),
             inline_assistant_model: None,
             inline_assistant_use_streaming_tools: false,
             commit_message_model: None,

@@ -1,8 +1,8 @@
 # Claude Sub-Agent Verdict (ping-pong second opinion)
 
-Status: IMPLEMENTED (phases 1-5) — GOAT gate off by default (`agent.verdict_ping_pong`), benchmark pending
+Status: IMPLEMENTED (phases 1-6) — GOAT benchmark pending (`.issues/016`) before promoting to default
 
-Commit: e5b496bf46
+Commit: e5b496bf46 (phases 1-5), phase 6 commit (see plan 029)
 
 ## Goal
 
@@ -88,7 +88,9 @@ thread (and must not derail the parent), so the whole thing runs as a sub-agent 
       tool unregistered and button hidden when off; benchmark
       (threads-with-verdict vs without: post-hoc fix rate, rounds, token cost)
       still pending before promoting to default
-- [-] Phase 6 (defer): Claude Code subscription path via ACP-connection verdict session
+- [x] Phase 6: Claude Code subscription path via ACP-connection verdict session
+      (`.plans/029_claude_code_verdict_reviewer.md`; `agent.verdict_reviewer =
+      "claude_code"`; teardown limitation in `.issues/016`)
 
 ## Notes
 

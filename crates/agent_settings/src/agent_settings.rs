@@ -20,7 +20,7 @@ use settings::{
     DockPosition, DockSide, IntoGpui, LanguageModelParameters, LanguageModelSelection,
     NotifyWhenAgentWaiting, PlaySoundWhenAgentDone, RegisterSetting, Settings, SettingsContent,
     SettingsStore, SidebarDockPosition, SidebarSide, ThinkingBlockDisplay, ToolPermissionMode,
-    update_settings_file, update_settings_file_with_completion,
+    VerdictReviewerSetting, update_settings_file, update_settings_file_with_completion,
 };
 use util::ResultExt as _;
 
@@ -228,6 +228,8 @@ pub struct AgentSettings {
     pub verdict_model: Option<LanguageModelSelection>,
     /// Hard cap on `request_verdict` rounds per negotiation.
     pub verdict_max_rounds: usize,
+    /// Which backend provides the reviewer thread for `request_verdict`.
+    pub verdict_reviewer: VerdictReviewerSetting,
     pub inline_assistant_model: Option<LanguageModelSelection>,
     pub inline_assistant_use_streaming_tools: bool,
     pub commit_message_model: Option<LanguageModelSelection>,
@@ -803,6 +805,7 @@ impl Settings for AgentSettings {
             verdict_max_rounds: agent
                 .verdict_max_rounds
                 .unwrap_or(DEFAULT_VERDICT_MAX_ROUNDS),
+            verdict_reviewer: agent.verdict_reviewer.unwrap_or_default(),
             inline_assistant_model: agent.inline_assistant_model,
             inline_assistant_use_streaming_tools: agent
                 .inline_assistant_use_streaming_tools
