@@ -73,6 +73,12 @@ pub enum RequestVerdictToolOutput {
         output: String,
         round: usize,
         max_rounds: usize,
+        /// Reviewer backend label ("native" | provider label). Persisted with
+        /// the thread record so the GOAT scorer (`.issues/016`) can join
+        /// negotiations to threads without relying on log-only telemetry.
+        /// Defaulted so pre-field threads still deserialize on replay.
+        #[serde(default)]
+        reviewer: String,
         session_info: SubagentSessionInfo,
     },
     Error {
@@ -80,6 +86,10 @@ pub enum RequestVerdictToolOutput {
         #[serde(default)]
         session_id: Option<acp::SessionId>,
         error: String,
+        /// Same as the success variant's `reviewer`; empty when the failure
+        /// predates route resolution (tool-input transport errors).
+        #[serde(default)]
+        reviewer: String,
         session_info: Option<SubagentSessionInfo>,
     },
 }
@@ -92,22 +102,26 @@ impl From<RequestVerdictToolOutput> for LanguageModelToolResultContent {
                 output,
                 round,
                 max_rounds,
+                reviewer,
                 session_info: _, // Don't show this to the model
             } => serde_json::to_string(&serde_json::json!({
                 "session_id": session_id,
                 "output": output,
                 "round": round,
                 "max_rounds": max_rounds,
+                "reviewer": reviewer,
             }))
             .unwrap_or_else(|e| format!("Failed to serialize request_verdict output: {e}"))
             .into(),
             RequestVerdictToolOutput::Error {
                 session_id,
                 error,
+                reviewer,
                 session_info: _, // Don't show this to the model
             } => serde_json::to_string(&serde_json::json!({
                 "session_id": session_id,
                 "error": error,
+                "reviewer": reviewer,
             }))
             .unwrap_or_else(|e| format!("Failed to serialize request_verdict output: {e}"))
             .into(),
@@ -170,12 +184,32 @@ fn resolve_route(
 fn error_output(
     session_id: Option<acp::SessionId>,
     error: String,
+    reviewer: String,
     session_info: Option<SubagentSessionInfo>,
 ) -> RequestVerdictToolOutput {
     RequestVerdictToolOutput::Error {
         session_id,
         error,
+        reviewer,
         session_info,
+    }
+}
+
+/// Label for a resolved route — the same string the telemetry event and the
+/// persisted tool output carry.
+fn route_label(route: &ReviewerRoute) -> String {
+    match route {
+        ReviewerRoute::Native => "native".to_string(),
+        ReviewerRoute::External(label) => label.0.to_string(),
+    }
+}
+
+/// Label for a not-yet-resolved (or unresolvable) setting — keeps error
+/// outputs self-describing for the GOAT scorer.
+fn setting_label(setting: &VerdictReviewerSetting) -> String {
+    match setting {
+        VerdictReviewerSetting::Native => "native".to_string(),
+        VerdictReviewerSetting::ClaudeCode => "claude_code".to_string(),
     }
 }
 
@@ -217,6 +251,7 @@ impl AgentTool for RequestVerdictTool {
                 .map_err(|e| RequestVerdictToolOutput::Error {
                     session_id: None,
                     error: e.to_string(),
+                    reviewer: String::new(),
                     session_info: None,
                 })?;
 
@@ -236,13 +271,21 @@ impl AgentTool for RequestVerdictTool {
                     None,
                     "verdict ping-pong is disabled (set agent.verdict_ping_pong = true)"
                         .to_string(),
+                    setting_label(&reviewer_setting),
                     None,
                 ));
             }
 
             let route = match resolve_route(&reviewer_setting, verdict::reviewer()) {
                 Ok(route) => route,
-                Err(error) => return Err(error_output(None, error, None)),
+                Err(error) => {
+                    return Err(error_output(
+                        None,
+                        error,
+                        setting_label(&reviewer_setting),
+                        None,
+                    ))
+                }
             };
 
             // Budget check for resumed negotiations, before touching any
@@ -263,7 +306,7 @@ impl AgentTool for RequestVerdictTool {
                         cx.update(|cx| verdict::complete_reviewer(&session_id, cx));
                     }
                 }
-                return Err(error_output(Some(session_id), error, None));
+                return Err(error_output(Some(session_id), error, route_label(&route), None));
             }
 
             let mut route = route;
@@ -276,7 +319,7 @@ impl AgentTool for RequestVerdictTool {
                             self.environment
                                 .create_verdict_subagent(input.label.clone(), cx)
                         }
-                        .map_err(|err| error_output(None, err.to_string(), None))
+                        .map_err(|err| error_output(None, err.to_string(), "native".into(), None))
                     });
                     let subagent = match subagent {
                         Ok(subagent) => subagent,
@@ -295,6 +338,7 @@ impl AgentTool for RequestVerdictTool {
                             return Err(error_output(
                                 Some(session_id.clone()),
                                 error,
+                                "native".into(),
                                 Some(SubagentSessionInfo {
                                     session_id,
                                     message_start_index,
@@ -324,6 +368,7 @@ impl AgentTool for RequestVerdictTool {
                             None,
                             "external verdict reviewer was unregistered mid-negotiation"
                                 .to_string(),
+                            route_label(&route),
                             None,
                         ));
                     };
@@ -338,6 +383,7 @@ impl AgentTool for RequestVerdictTool {
                                     "verdict reviewer session expired — start a new negotiation \
                                      (call request_verdict without session_id)"
                                         .to_string(),
+                                    route_label(&route),
                                     None,
                                 ));
                             }
@@ -347,6 +393,7 @@ impl AgentTool for RequestVerdictTool {
                             return Err(error_output(
                                 None,
                                 "cannot spawn a claude_code reviewer without a project".to_string(),
+                                route_label(&route),
                                 None,
                             ));
                         };
@@ -358,7 +405,14 @@ impl AgentTool for RequestVerdictTool {
                             .await;
                         let thread = match spawn {
                             Ok(thread) => thread,
-                            Err(err) => return Err(error_output(None, err.to_string(), None)),
+                            Err(err) => {
+                                return Err(error_output(
+                                    None,
+                                    err.to_string(),
+                                    route_label(&route),
+                                    None,
+                                ))
+                            }
                         };
                         let session_id = cx.update(|cx| thread.read(cx).session_id().clone());
                         (thread, session_id)
@@ -384,7 +438,12 @@ impl AgentTool for RequestVerdictTool {
                         }
                         Err(err) => {
                             let error = err.to_string();
-                            return Err(error_output(Some(session_id), error, None));
+                            return Err(error_output(
+                                Some(session_id),
+                                error,
+                                route_label(&route),
+                                None,
+                            ));
                         }
                     }
                 }
@@ -392,16 +451,14 @@ impl AgentTool for RequestVerdictTool {
 
             let (session_id, output, round, message_start_index, message_end_index) = reply;
 
+            let reviewer = route_label(&route);
             let status = "completed";
             telemetry::event!(
                 "Verdict Subagent Completed",
                 subagent_session = session_id.to_string(),
                 round,
                 max_rounds,
-                reviewer = match &route {
-                    ReviewerRoute::Native => "native",
-                    ReviewerRoute::External(label) => label.0,
-                },
+                reviewer = reviewer.as_str(),
                 status,
             );
 
@@ -434,6 +491,7 @@ impl AgentTool for RequestVerdictTool {
                 round,
                 max_rounds,
                 output,
+                reviewer,
                 session_info,
             })
         })
@@ -571,6 +629,7 @@ mod tests {
             output: "#Verdict: AGREE".to_string(),
             round: 2,
             max_rounds: 3,
+            reviewer: "claude_code".to_string(),
             session_info: SubagentSessionInfo {
                 session_id: acp::SessionId::new("reviewer-1"),
                 message_start_index: 0,
@@ -586,7 +645,44 @@ mod tests {
         assert_eq!(parsed["session_id"], "reviewer-1");
         assert_eq!(parsed["round"], 2);
         assert_eq!(parsed["max_rounds"], 3);
+        assert_eq!(parsed["reviewer"], "claude_code");
         // session_info must not leak to the model
         assert!(parsed.get("session_info").is_none());
+    }
+
+    #[test]
+    fn output_deserializes_pre_reviewer_field_records() {
+        // Threads saved before the reviewer field existed replay unchanged.
+        let success: RequestVerdictToolOutput = serde_json::from_value(json!({
+            "session_id": "reviewer-1",
+            "output": "#Verdict: AGREE",
+            "round": 1,
+            "max_rounds": 3,
+            "session_info": {
+                "session_id": "reviewer-1",
+                "message_start_index": 0,
+                "message_end_index": null,
+            },
+        }))
+        .unwrap();
+        match success {
+            RequestVerdictToolOutput::Success { reviewer, .. } => {
+                assert_eq!(reviewer, "");
+            }
+            other => panic!("expected success, got {other:?}"),
+        }
+
+        let error: RequestVerdictToolOutput = serde_json::from_value(json!({
+            "session_id": "reviewer-1",
+            "error": "timed out",
+            "session_info": null,
+        }))
+        .unwrap();
+        match error {
+            RequestVerdictToolOutput::Error { reviewer, .. } => {
+                assert_eq!(reviewer, "");
+            }
+            other => panic!("expected error, got {other:?}"),
+        }
     }
 }

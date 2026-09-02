@@ -1,6 +1,6 @@
 # Claude Code Verdict Reviewer (phase 6 of proposal 001)
 
-Status: IMPLEMENTED — `agent.verdict_reviewer = "claude_code"` behind the ping-pong gate; teardown limitation tracked in `.issues/016`
+Status: IMPLEMENTED — `agent.verdict_reviewer = "claude_code"` behind the ping-pong gate; teardown limitation fixed via `.issues/016` part 2 (drain pattern)
 
 ## Goal
 
@@ -60,12 +60,12 @@ a provider trait + global in `acp_thread`, implemented and registered by
   the worker's project.
 - Settings: `agent.verdict_reviewer` (`settings_content` + `agent_settings`).
 
-## Known limitation (accepted, tracked in `.issues/016`)
+## Known limitation (fixed via `.issues/016` part 2)
 
 TTL-expired reviewer sessions (parent abandoned mid-negotiation without
-`final_round`) drop the registry handle but cannot close the ACP process —
-`verdict::prune` has no `cx`. The session idles until app exit. Bounded: at
-most one idle session per abandoned negotiation.
+`final_round`) used to idle until app exit because `verdict::prune` has no
+`cx`. FIXED: prune defers the thread to a pending-close list and the panel's
+10s drain loop pumps `drain_pending_closes(cx)` to close the ACP session.
 
 ## Validation
 

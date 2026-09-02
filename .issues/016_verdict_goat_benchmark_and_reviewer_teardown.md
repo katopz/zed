@@ -1,6 +1,6 @@
 # Verdict ping-pong GOAT benchmark + reviewer session teardown
 
-Status: OPEN — blocks promoting `agent.verdict_ping_pong` to default (proposal 001 phase 5)
+Status: PART 1 harness SHIPPED (persistence + scorer), Part 2 teardown FIXED (drain pattern); remaining: run the >= 20-task benchmark and record the GOAT verdict
 
 ## Context
 
@@ -40,24 +40,47 @@ corrections by enough to pay for the extra tokens.
 
 ### Harness work
 
-- [ ] Persist `reviewer` label + round counters alongside thread records so the
-      scorer can join telemetry to threads (telemetry is currently log-only).
-- [ ] Scorer script for post-hoc fix detection over thread history.
+- [x] Persist `reviewer` label + round counters alongside thread records so the
+      scorer can join telemetry to threads. Shipped as a `reviewer` field on
+      `RequestVerdictToolOutput` (both variants, `#[serde(default)]` so old
+      threads replay) — the structured output already persists into
+      `threads.db` via `LanguageModelToolResult.output`, so no schema change
+      was needed and the join is by construction (`tool_name ==
+      "request_verdict"`).
+- [x] Scorer script: `script/verdict_scorer.py` (uv + zstandard). Reads
+      `threads.db`, decompresses the zstd thread blobs, splits verdict-on/off
+      cohorts, and reports post-hoc fix rate / rounds distribution / aborts /
+      token averages. Validated against 1549 local threads (0 parse failures).
 
-## Part 2 — reviewer session teardown limitation (phase 6)
+### Finding from the local dry run
+
+0 of 878 summary-bearing threads had ANY user message after the final
+`## Summary` in the same session — corrections happen in follow-up threads.
+The same-session fix-rate metric may therefore read ~0 for BOTH cohorts and
+cannot discriminate. Before running the 20-task benchmark, extend the scorer
+(or the procedure) to link continuation threads (agent_ui's
+`ThreadMetadataStore.continued_from_session_id`) so post-hoc fixes in follow-up
+threads count against the originating thread.
+
+## Part 2 — reviewer session teardown limitation (phase 6) — FIXED
 
 `acp_thread::verdict::prune_expired` runs on lock without `cx`, so a
-TTL-expired external (claude_code) reviewer session drops the registry handle
-but cannot send `close_session` — the ACP process idles until app exit.
-Bounded: at most one idle session per abandoned negotiation (parent never sent
-`final_round` and never hit the round cap).
+TTL-expired external (claude_code) reviewer session dropped the registry handle
+but could not send `close_session` — the ACP process idles until app exit.
 
-Mitigation options, in preference order:
+Fixed with the drain pattern: `prune_expired` moves expired entries' reviewer
+threads into a pending-close list (`drain_pending_closes` pumps it with an
+`App` handle), and the agent panel's existing 10s notification drain loop
+invokes it — no new timer. Covered by
+`expired_reviewer_sessions_defer_close_and_drain_closes_them` (local
+close-counting connection asserted end-to-end).
 
-- [ ] Drain pattern: prune collects expired reviewer threads into a
+- [x] Drain pattern: prune collects expired reviewer threads into a
       pending-close list; `drain_pending_closes(cx)` invoked from the panel's
       existing 10s notification drain loop.
-- [ ] Pass an `App` handle into prune paths that have one and close inline.
+- [-] Pass an `App` handle into prune paths that have one and close inline.
+      (Superseded — the drain pattern covers the abandoned-negotiation case;
+      every path that already has `cx` closes inline via `complete_reviewer`.)
 
 ## Refs
 
