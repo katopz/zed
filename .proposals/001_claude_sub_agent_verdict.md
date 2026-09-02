@@ -2,6 +2,8 @@
 
 Status: IMPLEMENTED (phases 1-5) — GOAT gate off by default (`agent.verdict_ping_pong`), benchmark pending
 
+Commit: e5b496bf46
+
 ## Goal
 
 Add a native-agent button that throws the thread's `#Summary` to a **new Claude agent
