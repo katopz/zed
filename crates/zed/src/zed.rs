@@ -6210,6 +6210,14 @@ mod tests {
         cx.update(move |cx| {
             env_logger::builder().is_test(true).try_init().ok();
 
+            // Isolate this App's workspace/session DB from other tests: without
+            // this, every test App falls back to the process-global
+            // `TEST_APP_DATABASE`, where window/workspace id sequences collide
+            // across concurrently running tests and a slow serialization flush
+            // from one test can leak rows into another test's session restore
+            // (issue 014: rotating multi-workspace restore failures).
+            cx.set_global(db::AppDatabase::test_new());
+
             let state = Arc::get_mut(&mut app_state).unwrap();
             state.build_window_options = build_window_options;
             app_state.languages.add(markdown_lang());
