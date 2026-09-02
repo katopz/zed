@@ -888,8 +888,9 @@ pub fn is_waiting_for_user_decision(last_assistant_message: Option<&str>) -> boo
 /// - summary names its remaining work → continue in the SAME thread with
 ///   those steps AHEAD of the fixed [`CONTINUE_REMAINS_DECISION`] directive
 ///   (plan 031 enrichment: the named task wins over re-derivation);
-/// - summary declares nothing left → `None` (the normal flow owns stopping /
-///   housekeeping, otherwise the chain would never terminate);
+/// - summary declares nothing left → continue same-thread with the
+///   housekeeping directive (rules; the old deferral paid an orchestrator
+///   call only to stop into the same hook);
 /// - summary is TERMINAL (every remaining item armed/deferred/owner-gated) →
 ///   `Stopped` — gated work is not picked up autonomously (plan 031);
 /// - no next-steps section → continue same-thread with the fixed directive.
@@ -911,10 +912,14 @@ pub fn summary_continuation_fast_path(data: &LlmCallData) -> Option<AutoPromptOu
     }
     match extract_summary_next_steps(last) {
         Some(SummaryContinuation::NothingLeft) => {
+            // Rules-based (plan 031): nothing left → housekeeping directly.
+            // The old deferral to the orchestrator paid an LLM call only for
+            // it to stop into the same housekeeping hook.
             log::info!(
-                "[auto_prompt] summary fast path: summary declares nothing left — deferring to normal stop/housekeeping flow"
+                "[auto_prompt] summary fast path: summary declares nothing left — switching to housekeeping (rules, no orchestrator call)"
             );
-            return None;
+            let action = data.make_continue_action(housekeeping_continuation());
+            return Some(AutoPromptOutcome::Continue(action));
         }
         Some(SummaryContinuation::Terminal) => {
             log::warn!(
@@ -1118,6 +1123,80 @@ fn decide_precheck(
     } else {
         StopPhase::PreStop
     };
+
+    // Plan 031 rules-base short circuit: the last message is ALREADY a
+    // voluntary summary (the mandated `## Summary` handoff). The summary is
+    // the authority — no orchestrator reasoning and no plan-file scans are
+    // needed. Fork (over limit) or continue same-thread (under limit) via the
+    // deterministic summary machines in `decide_with_llm`, with a LIGHT
+    // LlmCallData: the full pipeline (origin git fetches across every work
+    // dir + whole-thread context serialization) took ~45s of silent latency
+    // before the fork, which read as "auto prompt not triggered".
+    // Requires reported token usage: without it we can't classify over/under
+    // limit cheaply, so fall through to the full pipeline (its chars/4
+    // estimate keeps no-usage providers forking).
+    let last_assistant_message = thread.read(cx).last_assistant_message_text(cx);
+    let usage = thread.read(cx).token_usage().map(|usage| usage.input_tokens);
+    if let Some(last_assistant_message) = last_assistant_message {
+        if usage.is_some() && looks_like_voluntary_summary(&last_assistant_message) {
+            let actual_input_tokens = usage;
+            let effective_token_count = actual_input_tokens.unwrap_or(0) as usize;
+            let context_exceeds_limit = effective_token_count > config.max_context_tokens;
+            let session_id = thread.read(cx).session_id().clone();
+            let light_data = LlmCallData {
+                model,
+                system_prompt: String::new(),
+                // Minimal: the summary machines never read plan files from
+                // context (a NothingLeft summary routes to housekeeping
+                // directly — endless housekeeping is the intended base state).
+                context_json: serde_json::json!({ "session_id": session_id }).to_string(),
+                project_root: None,
+                session_id,
+                title: thread.read(cx).title().map(|title| title.to_string()),
+                iteration_count,
+                max_verification_attempts: config.max_verification_attempts,
+                work_dirs: thread
+                    .read(cx)
+                    .work_dirs()
+                    .map(|plan| plan.paths().to_vec()),
+                first_user_message: thread
+                    .read(cx)
+                    .entries()
+                    .iter()
+                    .find_map(|entry| match entry {
+                        acp_thread::AgentThreadEntry::UserMessage(message) => {
+                            Some(message.content.to_markdown(cx).to_string())
+                        }
+                        _ => None,
+                    })
+                    .filter(|text| !text.trim().is_empty()),
+                original_user_message: None,
+                last_assistant_message: Some(last_assistant_message),
+                profile_id: None,
+                actual_input_tokens,
+                had_error: thread.read(cx).had_error(),
+                had_api_error: thread.read(cx).had_api_error(),
+                stop_phase,
+                context_exceeds_limit,
+                approximate_token_count: 0,
+                connection: None,
+                project: None,
+                peer_agent_states: peer_states::unmuted_states_for_context(),
+            };
+            log::info!(
+                "[auto_prompt::decide] voluntary summary — rules-based handoff, skipping plan scans + context serialization (over_limit={context_exceeds_limit}, session={:?})",
+                light_data.session_id
+            );
+            debug_log::write_log(
+                "summary_light_path",
+                serde_json::json!({
+                    "over_limit": context_exceeds_limit,
+                    "actual_input_tokens": actual_input_tokens,
+                }),
+            );
+            return DecidePrecheck::Decision(AutoPromptDecision::NeedsLlmCall(light_data));
+        }
+    }
 
     DecidePrecheck::Proceed(Box::new(DecidePrecheckContext {
         project_root,
@@ -1829,15 +1908,31 @@ pub async fn decide_with_llm(
 
     let session_id_str = data.session_id.to_string();
 
-    // ── Pending-question fast path ───────────────────────────────────────
+    // ── Summary-first fast path (plan 027, tightened plan 031) ──────────
+    //
+    // A voluntary summary at the last paragraph carries its own "what
+    // remains" — RULES ONLY, no orchestrator call and no pending-question
+    // LLM pass (a summary is not a question; the rules are authoritative):
+    //
+    // - over the context limit → None here; the Phase 1/2 machine below
+    //   forks a new thread whose Decision slot carries the rules decision
+    //   (summary steps + fixed directive / housekeeping / stop);
+    // - under the limit → continue SAME-THREAD with the summary's next
+    //   steps + fixed directive, or housekeeping when the summary declares
+    //   nothing left (endless housekeeping is the intended base state);
+    // - TERMINAL summary (all remaining work armed/deferred/owner-gated) →
+    //   Some(Stopped), chain ends right here (plan 031).
+    if let Some(outcome) = summary_continuation_fast_path(&data) {
+        return Ok(outcome);
+    }
+
+    // ── Pending-question fast path ─────────────────────────────────────
     //
     // If the worker stopped to ASK THE USER a question ("Which do you want?
     // Option A or Option B?", "Want me to do that?"), answer it directly via
     // a targeted LLM call on the last 2-3 paragraphs and dispatch that answer.
-    // This runs before the overflow / lightweight / verification paths because
-    // answering a short question is cheap and avoids the expensive summary
-    // dance that would otherwise drain tokens and throw away the question.
-    //
+    // Runs AFTER the summary fast path: a voluntary summary is never a
+    // question, and this pass is an LLM call the rules-base must not pay.
     // On any failure (no question, LLM unreachable, low confidence) the helper
     // returns Ok(None) and we fall through to the normal decision flow — the
     // user explicitly required that uncertain cases still reach stop/summary.
@@ -1845,18 +1940,6 @@ pub async fn decide_with_llm(
         log::warn!(
             "[auto_prompt::decide_with_llm] Pending-question fast path fired — dispatching answer (session={session_id_str})"
         );
-        return Ok(outcome);
-    }
-
-    // ── Summary-first fast path (plan 027) ──────────────────────────────
-    //
-    // A voluntary summary at the last paragraph carries its own "what
-    // remains" — no orchestrator call needed. Same-thread continuation with
-    // the fixed decision directive (plan 031: or the summary's own next
-    // steps). Overflow / nothing-left cases return None
-    // here and fall through to the flows that own them; a TERMINAL summary
-    // returns Some(Stopped) and ends the chain right here (plan 031).
-    if let Some(outcome) = summary_continuation_fast_path(&data) {
         return Ok(outcome);
     }
 
@@ -4858,9 +4941,9 @@ mod tests {
     }
 
     #[test]
-    fn summary_fast_path_skipped_on_nothing_left() {
-        // Nothing-left summaries must NOT continue via the fast path — the
-        // normal flow owns stopping / housekeeping so chains terminate.
+    fn summary_fast_path_nothing_left_routes_to_housekeeping_rules() {
+        // Plan 031: nothing-left summaries continue same-thread with the
+        // housekeeping directive — rules, no orchestrator call.
         let session = "summary-fast-path-idle-test";
         clear_summary_for_session(session);
         let mut data = overflow_test_data(
@@ -4868,7 +4951,19 @@ mod tests {
             Some("## Summary\n\nAll done.\n\n## What Remains\n\nNothing left to do."),
         );
         data.context_exceeds_limit = false;
-        assert!(summary_continuation_fast_path(&data).is_none());
+        match summary_continuation_fast_path(&data) {
+            Some(AutoPromptOutcome::Continue(action)) => {
+                assert!(!action.force_new_thread);
+                for marker in ["no remaining work", "boundary-guard", "stop cleanly"] {
+                    assert!(
+                        action.next_prompt.contains(marker),
+                        "housekeeping directive must mention '{marker}': {}",
+                        action.next_prompt
+                    );
+                }
+            }
+            other => panic!("expected Continue(housekeeping), got {other:?}"),
+        }
     }
 
     #[test]

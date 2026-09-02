@@ -894,18 +894,19 @@ fn run_auto_prompt(
         .map(|id| id.to_string());
     log::info!("[auto_prompt] captured profile_id: {:?}", profile_id);
 
-    // Instant feedback for the manual click: the decision now happens in the
-    // spawned task below, so set the marker here while the handler is still
-    // on the stack — the next frame paints "Processing…" instead of freezing.
-    // Every terminal arm below resets it (or hands it to the inner delay/LLM
-    // tasks, which already manage the state themselves).
-    if is_manual {
-        if let Some(active) = conversation_view.active_thread() {
-            active.update(cx, |tv, cx| {
-                tv.auto_prompt_state = AutoPromptState::Processing;
-                cx.notify();
-            });
-        }
+    // Instant feedback that the chain is deciding: the decision happens in
+    // the spawned task below, so set the marker here while the handler is
+    // still on the stack — the next frame paints "Processing…" instead of
+    // freezing. Set for AUTOMATIC continuations too: the decide pipeline
+    // (plan scans / context build, or the light summary handoff) previously
+    // ran with no indicator, which read as "auto prompt not triggered"
+    // (2026-09-01). Every terminal arm below resets it (or hands it to the
+    // inner delay/LLM tasks, which already manage the state themselves).
+    if let Some(active) = conversation_view.active_thread() {
+        active.update(cx, |tv, cx| {
+            tv.auto_prompt_state = AutoPromptState::Processing;
+            cx.notify();
+        });
     }
 
     let thread = thread.clone();

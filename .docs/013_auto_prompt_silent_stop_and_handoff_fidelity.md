@@ -91,6 +91,36 @@ at all". Fix:
   the worker's next turn fails visibly; a false positive killed chains
   silently.
 
+## Follow-up (same day): instant rules-based handoff + visible Processing
+
+Operator report: the fork from the 32K summary DID fire, but the decision
+phase ran with no "Processing…" indicator and ~45s of silent latency (origin
+git fetches across 13 work dirs + whole-thread context serialization) before
+the new thread appeared — which read as "not triggered".
+
+- **Processing… now shows for AUTOMATIC continuations too** — the state is
+  set at `run_auto_prompt` entry (was manual-only); every terminal arm
+  already resets it.
+- **Voluntary summaries never reach the orchestrator LLM now** (rules base;
+  reasoning was redundant):
+  - `decide_precheck` short-circuits to a LIGHT `LlmCallData` when the last
+    message is a voluntary summary AND token usage is reported — skipping the
+    plan-file scans and context serialization entirely (fork latency ~45s →
+    sub-second). Without reported usage the full pipeline keeps its chars/4
+    estimate so no-usage providers still fork.
+  - `decide_with_llm` order: summary fast path FIRST, then the
+    pending-question LLM pass (a summary is never a question).
+  - NothingLeft + under-limit now routes directly to the housekeeping
+    directive (the old deferral paid an orchestrator call only to stop into
+    the same housekeeping hook).
+- Decision matrix (rules base):
+  1. no summary (over or under limit) → orchestrator LLM judges last message
+     (continue / ask for summary / stop) — unchanged.
+  2. summary + over limit → new thread; the Decision slot carries the rules
+     decision (summary steps + fixed directive / housekeeping / terminal
+     stop) — the new thread decides from its next_prompt.
+  3. summary + under limit → continue SAME-THREAD on the rules decision.
+
 ## Tests
 
 - `auto_prompt`: paused config serde roundtrip; fast-path Steps enrichment /
