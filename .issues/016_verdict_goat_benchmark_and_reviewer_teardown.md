@@ -50,17 +50,23 @@ corrections by enough to pay for the extra tokens.
 - [x] Scorer script: `script/verdict_scorer.py` (uv + zstandard). Reads
       `threads.db`, decompresses the zstd thread blobs, splits verdict-on/off
       cohorts, and reports post-hoc fix rate / rounds distribution / aborts /
-      token averages. Validated against 1549 local threads (0 parse failures).
+      token averages. Also links continuation chains from agent_ui's
+      `sidebar_threads` (`continued_from_session_id`) so post-hoc fixes in
+      follow-up threads count against the originating thread. Validated
+      against 1550 local threads (0 parse failures, 486 continuation links).
 
-### Finding from the local dry run
+### Findings from the local dry run
 
-0 of 878 summary-bearing threads had ANY user message after the final
+0 of ~880 summary-bearing threads had ANY user message after the final
 `## Summary` in the same session — corrections happen in follow-up threads.
-The same-session fix-rate metric may therefore read ~0 for BOTH cohorts and
-cannot discriminate. Before running the 20-task benchmark, extend the scorer
-(or the procedure) to link continuation threads (agent_ui's
-`ThreadMetadataStore.continued_from_session_id`) so post-hoc fixes in follow-up
-threads count against the originating thread.
+Addressed in the scorer: threads are grouped into continuation chains, and a
+continuation whose FIRST user message matches the correction heuristics
+("fix diag error", "you missed", ...) counts as a post-hoc fix of the chain.
+
+Baseline on this machine (all verdict-off, feature never enabled locally):
+43/483 chains flagged = **8.9% post-hoc fix rate**. The verdict-on cohort is
+empty until the 20-task benchmark populates it; the GOAT gate stays
+">= ~30% relative reduction vs 8.9% baseline".
 
 ## Part 2 — reviewer session teardown limitation (phase 6) — FIXED
 

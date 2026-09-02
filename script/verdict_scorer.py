@@ -61,6 +61,50 @@ CORRECTION_RE = re.compile("|".join(CORRECTION_PATTERNS), re.IGNORECASE)
 SUMMARY_HEADING_RE = re.compile(r"^#{1,3}\s*summary\b", re.IGNORECASE | re.MULTILINE)
 
 
+def default_metadata_db_candidates() -> list[Path]:
+    """agent_ui's ThreadMetadataStore DB (sidebar_threads table)."""
+    home = Path.home()
+    if sys.platform == "win32":
+        root = home / "AppData" / "Local" / "Zed" / "db"
+    elif sys.platform == "darwin":
+        root = home / "Library" / "Application Support" / "Zed" / "db"
+    else:
+        root = home / ".local" / "share" / "zed" / "db"
+    return [root / "0-dev" / "db.sqlite", root / "0-global" / "db.sqlite"]
+
+
+def load_continuation_edges(db_path: Path | None) -> dict[str, str]:
+    """child session id -> continued-from session id."""
+    path = db_path
+    if path is None:
+        path = next((p for p in default_metadata_db_candidates() if p.exists()), None)
+        if path is None:
+            return {}
+    try:
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        edges = {
+            child: parent
+            for child, parent in connection.execute(
+                "SELECT session_id, continued_from_session_id FROM sidebar_threads "
+                "WHERE session_id IS NOT NULL AND continued_from_session_id IS NOT NULL"
+            )
+        }
+        connection.close()
+        return edges
+    except sqlite3.Error:
+        return {}
+
+
+def chain_root(session_id: str, edges: dict[str, str]) -> str:
+    """Follow continued-from links to the chain's originating thread."""
+    seen: set[str] = set()
+    current = session_id
+    while current in edges and current not in seen:
+        seen.add(current)
+        current = edges[current]
+    return current
+
+
 def default_db_candidates() -> list[Path]:
     home = Path.home()
     if sys.platform == "win32":
@@ -92,18 +136,13 @@ def decompress_data(data: bytes, data_type: str | None) -> bytes:
         return data
 
 
-def message_text_content(content: list) -> str:
-    """Concatenate the plain-text items of a content array.
+def content_text(content: list) -> str:
+    """Concatenate the plain-text items of a message content array.
 
-    Text variants serialize as bare JSON strings; structured variants
-    (Mention/Image) are objects and are skipped.
+    `Text` variants serialize as {"Text": "..."} (serde newtype variants);
+    bare strings are tolerated for forward compatibility. Structured variants
+    (Mention/Image/Thinking/ToolUse) are skipped.
     """
-    parts = [item for item in content if isinstance(item, str)]
-    return "\n".join(parts)
-
-
-def agent_message_text(msg: dict) -> str:
-    content = msg.get("content", [])
     parts = []
     for item in content:
         if isinstance(item, str):
@@ -111,6 +150,14 @@ def agent_message_text(msg: dict) -> str:
         elif isinstance(item, dict) and isinstance(item.get("Text"), str):
             parts.append(item["Text"])
     return "\n".join(parts)
+
+
+def agent_message_text(msg: dict) -> str:
+    return content_text(msg.get("content", []))
+
+
+def user_message_text(msg: dict) -> str:
+    return content_text(msg.get("content", []))
 
 
 @dataclass
@@ -134,6 +181,7 @@ class ThreadScore:
     corrections: list[str] = field(default_factory=list)
     input_tokens: int = 0
     output_tokens: int = 0
+    first_user_message: str = ""
 
     @property
     def verdict_on(self) -> bool:
@@ -223,7 +271,7 @@ def score_thread(thread_id: str, thread: dict) -> ThreadScore:
             user = message.get("User")
             if not isinstance(user, dict):
                 continue
-            text = message_text_content(user.get("content", []))
+            text = user_message_text(user)
             if not text.strip():
                 continue
             score.post_summary_user_messages += 1
@@ -231,28 +279,43 @@ def score_thread(thread_id: str, thread: dict) -> ThreadScore:
                 # Keep a short snippet for manual review of flagged threads.
                 snippet = " ".join(text.split())[:120]
                 score.corrections.append(snippet)
+
+    # First user message: a continuation whose opening message is corrective
+    # is a post-hoc fix in a follow-up thread (same-session continuations are
+    # rare - see the dry-run finding in .issues/016).
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        user = message.get("User")
+        if not isinstance(user, dict):
+            continue
+        text = user_message_text(user)
+        if text.strip():
+            score.first_user_message = " ".join(text.split())[:120]
+            break
     return score
 
 
-def cohort_stats(scores: list[ThreadScore]) -> dict:
-    with_summary = [s for s in scores if s.has_summary]
-    corrected = [s for s in with_summary if s.corrections]
-    rounds = [s.rounds_used for s in scores if s.verdict_on]
+def cohort_stats(chains: list[dict]) -> dict:
+    with_summary = [c for c in chains if c["has_summary"]]
+    corrected = [c for c in with_summary if c["corrections"]]
+    verdict_on = [c for c in chains if c["verdict_on"]]
+    rounds = [c["rounds_used"] for c in verdict_on]
     return {
-        "threads": len(scores),
-        "threads_with_summary": len(with_summary),
-        "threads_with_corrections": len(corrected),
+        "chains": len(chains),
+        "chains_with_summary": len(with_summary),
+        "chains_with_corrections": len(corrected),
         "post_hoc_fix_rate": (len(corrected) / len(with_summary)) if with_summary else None,
         "rounds_used_distribution": {
             str(n): rounds.count(n) for n in sorted(set(rounds))
         },
-        "negotiation_aborts": sum(1 for s in scores if s.aborted),
-        "reviewers": sorted({r for s in scores for r in s.reviewers}),
-        "avg_input_tokens": (
-            sum(s.input_tokens for s in scores) / len(scores) if scores else None
+        "negotiation_aborts": sum(1 for c in chains if c["aborted"]),
+        "reviewers": sorted({r for c in chains for r in c["reviewers"]}),
+        "avg_chain_input_tokens": (
+            sum(c["input_tokens"] for c in chains) / len(chains) if chains else None
         ),
-        "avg_output_tokens": (
-            sum(s.output_tokens for s in scores) / len(scores) if scores else None
+        "avg_chain_output_tokens": (
+            sum(c["output_tokens"] for c in chains) / len(chains) if chains else None
         ),
     }
 
@@ -268,6 +331,12 @@ def main() -> int:
         "--since",
         type=str,
         help="Only score threads updated on/after this ISO date (YYYY-MM-DD)",
+    )
+    parser.add_argument(
+        "--metadata-db",
+        type=Path,
+        help="Path to agent_ui's db.sqlite (sidebar_threads) for continuation "
+        "linking (default: auto-detect)",
     )
     parser.add_argument("--out", type=Path, help="Write JSON summary to this path")
     args = parser.parse_args()
@@ -315,43 +384,82 @@ def main() -> int:
 
     verdict_on = [s for s in scores if s.verdict_on]
     verdict_off = [s for s in scores if not s.verdict_on]
+
+    # Group threads into continuation chains: corrections in follow-up threads
+    # count against the originating thread, and a continuation whose FIRST
+    # user message is corrective is a post-hoc fix signal of its own.
+    edges = load_continuation_edges(args.metadata_db)
+    chains: dict[str, list[ThreadScore]] = {}
+    for score in scores:
+        root = chain_root(score.thread_id, edges)
+        chains.setdefault(root, []).append(score)
+
+    def chain_record(root: str, members: list[ThreadScore]) -> dict:
+        # Descendants other than the root are continuations by construction.
+        continuations = [m for m in members if m.thread_id != root]
+        corrective_continuations = [
+            m
+            for m in continuations
+            if m.first_user_message and CORRECTION_RE.search(m.first_user_message)
+        ]
+        corrections = [c for m in members for c in m.corrections]
+        corrections += [m.first_user_message for m in corrective_continuations]
+        return {
+            "root": root,
+            "members": [m.thread_id for m in members],
+            "verdict_on": any(m.verdict_on for m in members),
+            "has_summary": any(m.has_summary for m in members),
+            "corrections": corrections,
+            "rounds_used": max((m.rounds_used for m in members), default=0),
+            "aborted": any(m.aborted for m in members),
+            "reviewers": sorted({r for m in members for r in m.reviewers}),
+            "input_tokens": sum(m.input_tokens for m in members),
+            "output_tokens": sum(m.output_tokens for m in members),
+        }
+
+    chain_records = [chain_record(root, members) for root, members in chains.items()]
+    on_chains = [c for c in chain_records if c["verdict_on"]]
+    off_chains = [c for c in chain_records if not c["verdict_on"]]
     report = {
         "db": str(db_path),
+        "metadata_db_linked": bool(edges),
         "scored_threads": len(scores),
+        "chain_count": len(chain_records),
         "parse_failures": parse_failures,
-        "verdict_on": cohort_stats(verdict_on),
-        "verdict_off": cohort_stats(verdict_off),
-        "threads": [
+        "verdict_on": cohort_stats(on_chains),
+        "verdict_off": cohort_stats(off_chains),
+        "chains": [
             {
-                "id": s.thread_id,
-                "title": s.title,
-                "updated_at": s.updated_at,
-                "rounds_used": s.rounds_used,
-                "aborted": s.aborted,
-                "reviewers": sorted(s.reviewers),
-                "has_summary": s.has_summary,
-                "post_summary_user_messages": s.post_summary_user_messages,
-                "corrections": s.corrections,
+                "root": c["root"],
+                "members": c["members"],
+                "rounds_used": c["rounds_used"],
+                "aborted": c["aborted"],
+                "reviewers": c["reviewers"],
+                "has_summary": c["has_summary"],
+                "corrections": c["corrections"],
             }
-            for s in scores
+            for c in chain_records
         ],
     }
 
     # Human-readable table.
     print(f"threads.db: {db_path}")
-    print(f"scored: {report['scored_threads']} threads ({parse_failures} parse failures)\n")
+    print(
+        f"scored: {report['scored_threads']} threads in {len(chain_records)} chains "
+        f"({parse_failures} parse failures, continuation links: {len(edges)})\n"
+    )
     for label, cohort in (("verdict ON", report["verdict_on"]), ("verdict OFF", report["verdict_off"])):
         rate = cohort["post_hoc_fix_rate"]
         rate_str = f"{rate:.1%}" if rate is not None else "n/a"
         print(f"{label}:")
-        print(f"  threads={cohort['threads']} with_summary={cohort['threads_with_summary']}")
-        print(f"  post-hoc fix rate: {rate_str} ({cohort['threads_with_corrections']} corrected)")
+        print(f"  chains={cohort['chains']} with_summary={cohort['chains_with_summary']}")
+        print(f"  post-hoc fix rate: {rate_str} ({cohort['chains_with_corrections']} corrected)")
         print(f"  rounds: {cohort['rounds_used_distribution']}")
         print(f"  aborts: {cohort['negotiation_aborts']}  reviewers: {cohort['reviewers']}")
-        avg_in = cohort["avg_input_tokens"]
-        avg_out = cohort["avg_output_tokens"]
+        avg_in = cohort["avg_chain_input_tokens"]
+        avg_out = cohort["avg_chain_output_tokens"]
         print(
-            "  avg tokens: "
+            "  avg chain tokens: "
             + (f"in={avg_in:.0f} out={avg_out:.0f}" if avg_in is not None else "n/a")
         )
         print()
