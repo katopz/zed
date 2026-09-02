@@ -51,5 +51,5 @@ Alternative considered: pre-gather the start context in `run_auto_prompt` before
 
 Both follow-ups landed:
 
-- Render-path stall fixed: refresh is event-driven off-render (`ThreadView::refresh_sandbox_status`), the toolbar renders the cached status read-only (`ThreadView::sandbox_status_element`) — see `.issues/015_sandbox_status_render_path_update_loop.md`.
+- Render-path stall fixed: refresh is event-driven off-render (`ThreadView::refresh_sandbox_status`), the toolbar renders the cached status read-only (`ThreadView::sandbox_status_element`) — commit `8ed38b22f9` (issue 015, closed).
 - Panic hook installed in `zed::reliability::init`: panics now log to `Zed.log` with a backtrace before unwinding.
