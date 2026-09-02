@@ -99,6 +99,44 @@ fn registry() -> &'static Mutex<Option<HashMap<String, VerdictSession>>> {
     &REGISTRY
 }
 
+/// Reviewer threads orphaned by TTL expiry, awaiting an `App` handle to be
+/// closed (`.issues/016` part 2). `prune_expired` has no `cx`, so it defers
+/// the close here; the panel's 10s drain loop pumps the list via
+/// [`drain_pending_closes`]. Holding the `Entity` keeps the `AcpThread` alive
+/// until its session can be closed.
+fn pending_closes() -> &'static Mutex<Vec<Entity<AcpThread>>> {
+    static PENDING: Mutex<Vec<Entity<AcpThread>>> = Mutex::new(Vec::new());
+    &PENDING
+}
+
+fn lock_registry() -> std::sync::MutexGuard<'static, Option<HashMap<String, VerdictSession>>> {
+    registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn lock_pending_closes() -> std::sync::MutexGuard<'static, Vec<Entity<AcpThread>>> {
+    pending_closes()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn prune_expired(registry: &mut HashMap<String, VerdictSession>, now: Instant) {
+    // Lock order: registry → pending. The only other pending-lock site
+    // (`drain_pending_closes`) never takes the registry lock, so no cycle.
+    let mut pending = lock_pending_closes();
+    registry.retain(|_, entry| {
+        if now.duration_since(entry.last_activity) < SESSION_TTL {
+            true
+        } else {
+            if let Some(thread) = entry.reviewer_thread.take() {
+                pending.push(thread);
+            }
+            false
+        }
+    });
+}
+
 fn reviewer_slot() -> &'static Mutex<Option<Arc<dyn VerdictReviewer>>> {
     static REVIEWER: Mutex<Option<Arc<dyn VerdictReviewer>>> = Mutex::new(None);
     &REVIEWER
@@ -119,16 +157,6 @@ pub fn reviewer() -> Option<Arc<dyn VerdictReviewer>> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone()
-}
-
-fn lock_registry() -> std::sync::MutexGuard<'static, Option<HashMap<String, VerdictSession>>> {
-    registry()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-fn prune_expired(registry: &mut HashMap<String, VerdictSession>, now: Instant) {
-    registry.retain(|_, entry| now.duration_since(entry.last_activity) < SESSION_TTL);
 }
 
 /// Registers (or refreshes) a verdict negotiation session and returns the
@@ -208,11 +236,29 @@ fn close_thread_session(thread: &Entity<AcpThread>, cx: &mut App) {
         return;
     }
     // Best-effort: a failed close leaves the session idling in the connection
-    // until app exit (tracked in .issues/016), but must not fail the round.
+    // until app exit, but must not fail the round.
     connection
         .clone()
         .close_session(&session_id, cx)
         .detach_and_log_err(cx);
+}
+
+/// Closes reviewer sessions orphaned by TTL expiry (`.issues/016` part 2).
+/// Takes every deferred thread off the pending-close list and closes its
+/// session. Intended to be pumped from the agent panel's existing 10s
+/// notification drain loop, so no new timer is needed.
+pub fn drain_pending_closes(cx: &mut App) {
+    let pending = {
+        let mut guard = lock_pending_closes();
+        std::mem::take(&mut *guard)
+    };
+    if pending.is_empty() {
+        return;
+    }
+    log::debug!("[verdict] closing {} expired reviewer session(s)", pending.len());
+    for thread in pending {
+        close_thread_session(&thread, cx);
+    }
 }
 
 /// The live external reviewer thread for a session, if it is still tracked.
@@ -287,6 +333,14 @@ pub fn rounds(session_id: &acp::SessionId) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AgentConnection;
+    use action_log::ActionLog;
+    use gpui::AppContext as _;
+    use project::{AgentId, FakeFs};
+    use std::path::Path;
+    use std::rc::Rc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use util::path;
 
     fn session_id(id: &str) -> acp::SessionId {
         acp::SessionId::new(id)
@@ -409,5 +463,146 @@ mod tests {
         assert_eq!(rounds(&session), Some(1));
         complete(&session);
         assert!(reviewer_thread(&session).is_none());
+    }
+
+    /// Minimal connection that counts `close_session` calls, so the
+    /// pending-close drain can be asserted end-to-end.
+    #[derive(Default)]
+    struct CloseCountingConnection {
+        close_count: Arc<AtomicUsize>,
+    }
+
+    impl CloseCountingConnection {
+        fn close_count(&self) -> usize {
+            self.close_count.load(Ordering::SeqCst)
+        }
+    }
+
+    impl crate::AgentConnection for CloseCountingConnection {
+        fn agent_id(&self) -> AgentId {
+            AgentId::new("verdict-close-test")
+        }
+
+        fn telemetry_id(&self) -> gpui::SharedString {
+            "verdict-close-test".into()
+        }
+
+        fn auth_methods(&self) -> &[acp::AuthMethod] {
+            &[]
+        }
+
+        fn new_session(
+            self: Rc<Self>,
+            project: Entity<Project>,
+            work_dirs: PathList,
+            cx: &mut App,
+        ) -> Task<anyhow::Result<Entity<AcpThread>>> {
+            let session_id = acp::SessionId::new(uuid::Uuid::now_v7().to_string());
+            let action_log = cx.new(|_| ActionLog::new(project.clone()));
+            let thread = cx.new(|cx| {
+                AcpThread::new(
+                    None,
+                    None,
+                    Some(work_dirs),
+                    self.clone(),
+                    project,
+                    action_log,
+                    session_id,
+                    watch::Receiver::constant(acp::PromptCapabilities::new()),
+                    cx,
+                )
+            });
+            Task::ready(Ok(thread))
+        }
+
+        fn supports_close_session(&self) -> bool {
+            true
+        }
+
+        fn close_session(
+            self: Rc<Self>,
+            _session_id: &acp::SessionId,
+            _cx: &mut App,
+        ) -> Task<anyhow::Result<()>> {
+            self.close_count.fetch_add(1, Ordering::SeqCst);
+            Task::ready(Ok(()))
+        }
+
+        fn authenticate(
+            &self,
+            _method: acp::AuthMethodId,
+            _cx: &mut App,
+        ) -> Task<anyhow::Result<()>> {
+            Task::ready(Err(anyhow::anyhow!("not implemented in tests")))
+        }
+
+        fn prompt(
+            &self,
+            _params: acp::PromptRequest,
+            _cx: &mut App,
+        ) -> Task<anyhow::Result<acp::PromptResponse>> {
+            Task::ready(Err(anyhow::anyhow!("not implemented in tests")))
+        }
+
+        fn cancel(&self, _session_id: &acp::SessionId, _cx: &mut App) {}
+
+        fn into_any(self: Rc<Self>) -> Rc<dyn std::any::Any> {
+            self
+        }
+    }
+
+    fn init_verdict_test(cx: &mut gpui::TestAppContext) {
+        env_logger::try_init().ok();
+        cx.update(|cx| {
+            let mut settings_store = settings::SettingsStore::test(cx);
+            settings_store.register_setting::<feature_flags::FeatureFlagsSettings>();
+            cx.set_global(settings_store);
+        });
+    }
+
+    #[gpui::test]
+    async fn expired_reviewer_sessions_defer_close_and_drain_closes_them(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_verdict_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(CloseCountingConnection::default());
+        let thread = cx
+            .update(|cx| {
+                connection
+                    .clone()
+                    .new_session(project, PathList::new(&[Path::new(path!("/verdict-test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        // A reviewer session whose parent abandoned mid-negotiation: the entry
+        // ages past the TTL with the reviewer thread still attached.
+        let session = session_id("verdict-test-drain");
+        {
+            let mut guard = lock_registry();
+            let registry = guard.get_or_insert_with(HashMap::new);
+            registry.insert(
+                session.to_string(),
+                VerdictSession {
+                    last_activity: Instant::now() - SESSION_TTL - Duration::from_secs(1),
+                    rounds: 1,
+                    reviewer_thread: Some(thread),
+                },
+            );
+        }
+
+        // Pruning drops the expired entry and defers its reviewer thread for a
+        // later close instead of dropping the handle silently.
+        assert!(!is_active(&session));
+        assert_eq!(lock_pending_closes().len(), 1);
+
+        // Draining closes the session exactly once and empties the list.
+        cx.update(drain_pending_closes);
+        cx.run_until_parked();
+        assert_eq!(connection.close_count(), 1);
+        assert!(lock_pending_closes().is_empty());
     }
 }

@@ -1848,6 +1848,10 @@ impl AgentPanel {
     /// Plan 026: (a) mirrors new thread entries to the board so the web
     /// Threads tab can render them, and (b) honors `!stop` / `!retry` reply
     /// commands by driving `AcpThread::cancel` / `retry` directly.
+    ///
+    /// Issue 016 part 2: also pumps `acp_thread::verdict`'s pending-close list,
+    /// so TTL-expired external reviewer sessions are closed without needing
+    /// an `App` handle inside `prune_expired`.
     fn start_notification_drain(&mut self, cx: &mut Context<Self>) {
         let timer = cx.spawn(async move |this, cx| {
             loop {
@@ -1942,6 +1946,10 @@ impl AgentPanel {
                     })
                     .ok();
                 }
+
+                // 4. Verdict ping-pong: close TTL-expired external reviewer
+                //    sessions deferred by `verdict::prune_expired`.
+                cx.update(acp_thread::verdict::drain_pending_closes);
             }
         });
         self._notification_drain_task = Some(timer);
