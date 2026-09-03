@@ -4785,7 +4785,6 @@ impl ThreadView {
                                     .child(self.render_add_context_button(cx))
                                     .child(self.render_follow_toggle(cx))
                                     .child(self.render_auto_prompt_toggle(cx))
-                                    .child(self.render_verdict_button(cx))
                                     .children(self.render_key_status_buttons(cx))
                                     .children(self.render_fast_mode_control(cx))
                                     .children(self.render_thinking_control(cx)),
@@ -6335,77 +6334,67 @@ impl ThreadView {
         }
     }
 
-    fn verdict_request_prompt(max_rounds: usize) -> String {
-        format!(
+    fn verdict_request_prompt(max_rounds: usize, addition: Option<&str>) -> String {
+        let mut prompt = format!(
             "Request a second-opinion verdict on your latest `## Summary` from a fresh reviewer thread:\n\n\
              1. Call the `request_verdict` tool with a message containing your complete `## Summary` \
              plus this instruction: \"Reply with a verdict that MUST start with `#Verdict: AGREE` or \
              `#Verdict: REVISE` followed by bullet-point reasons.\" Include any file paths or plan \
-             state the reviewer needs — it cannot see this conversation.\n\
+             state the reviewer needs \u{2014} it cannot see this conversation.\n\
              2. If the reply starts with `#Verdict: REVISE`, address every reason with evidence, then \
              call `request_verdict` again with the SAME `session_id` so the negotiation continues in \
              the same thread. Never start a new session mid-negotiation.\n\
              3. When the reviewer replies `#Verdict: AGREE` and you agree with it, reply \
              `#Verdict: AGREE` yourself, restate the final agreed summary in the `## Summary` \
-             format, and stop — pass `final_round: true` on that closing call so the reviewer \
+             format, and stop \u{2014} pass `final_round: true` on that closing call so the reviewer \
              session is freed.\n\
              4. Hard cap: {max_rounds} rounds. If you reach the cap, stop calling the tool and \
              present the remaining disagreement to the user."
-        )
+        );
+        if let Some(addition) = addition.map(str::trim).filter(|text| !text.is_empty()) {
+            prompt.push_str("\n\n## User addition\n\n");
+            prompt.push_str(addition);
+            prompt.push_str(
+                "\n\nInclude the `## User addition` above verbatim in your `request_verdict` \
+                 message as extra context for the reviewer.",
+            );
+        }
+        prompt
     }
 
     fn handle_request_verdict_click(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Whatever the user typed in the chat input rides along as a user
+        // addition, and is consumed (cleared) like a normal send.
+        let addition = {
+            let text = self.message_editor.read(cx).text(cx);
+            let trimmed = text.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        };
+        if addition.is_some() {
+            self.message_editor
+                .update(cx, |editor, cx| editor.clear(window, cx));
+        }
+        self.request_verdict(addition, window, cx);
+    }
+
+    fn request_verdict(
+        &mut self,
+        addition: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.is_subagent() || self.thread.read(cx).status() != ThreadStatus::Idle {
             return;
         }
 
         let max_rounds = AgentSettings::get_global(cx).verdict_max_rounds;
-        let prompt = Self::verdict_request_prompt(max_rounds);
+        let prompt = Self::verdict_request_prompt(max_rounds, addition.as_deref());
         let contents_task = Task::ready(anyhow::Ok(Some((
             vec![acp::ContentBlock::Text(acp::TextContent::new(prompt))],
             Vec::new(),
         ))));
         cx.emit(AcpThreadViewEvent::Interacted);
         self.send_content(contents_task, false, window, cx);
-    }
-
-    fn render_verdict_button(&self, cx: &mut Context<Self>) -> AnyElement {
-        // GOAT gate (proposal 001): hidden until agent.verdict_ping_pong = true,
-        // and root views only — a subagent cannot spawn further subagents.
-        if !AgentSettings::get_global(cx).verdict_ping_pong || self.is_subagent() {
-            return div().into_any_element();
-        }
-
-        let thread_idle = self.thread.read(cx).status() == ThreadStatus::Idle;
-        let has_summary = thread_idle
-            && self
-                .thread
-                .read(cx)
-                .last_assistant_message_text(cx)
-                .is_some_and(|message| auto_prompt::message_looks_like_summary(&message));
-        let max_rounds = AgentSettings::get_global(cx).verdict_max_rounds;
-
-        let tooltip_text = if !thread_idle {
-            "Request verdict — wait for the agent to finish".to_string()
-        } else if has_summary {
-            format!("Request verdict ping-pong from a reviewer thread (max {max_rounds} rounds)")
-        } else {
-            "Request verdict — needs a `## Summary` in the last reply".to_string()
-        };
-
-        IconButton::new("request-verdict", IconName::Person)
-            .icon_size(IconSize::Small)
-            .icon_color(if has_summary {
-                Color::Accent
-            } else {
-                Color::Muted
-            })
-            .disabled(!has_summary)
-            .tooltip(move |_window, cx| Tooltip::simple(tooltip_text.clone(), cx))
-            .on_click(cx.listener(|this, _, window, cx| {
-                this.handle_request_verdict_click(window, cx);
-            }))
-            .into_any_element()
     }
 
     fn handle_auto_prompt_toggle_click(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -7846,6 +7835,29 @@ impl ThreadView {
                     }))
             });
 
+        // Verdict ping-pong (proposal 001): sits right behind "Copy Summary"
+        // and only when that button does — a summary to review must exist.
+        // GOAT-gated; root views only (subagents can't spawn reviewers).
+        let verdict_button = (AgentSettings::get_global(cx).verdict_ping_pong
+            && !self.is_subagent())
+        .then(|| {
+            copy_response_index.filter(|&response_index| {
+                Self::get_agent_summary_content(thread.read(cx).entries(), response_index, cx)
+                    .is_some()
+            })
+        })
+        .flatten()
+        .map(|_| {
+            IconButton::new(("request-verdict", entry_ix), IconName::Person)
+                .icon_size(IconSize::Small)
+                .icon_color(Color::Muted)
+                .disabled(is_generating)
+                .tooltip(Tooltip::text("Verdict with Claude"))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.handle_request_verdict_click(window, cx);
+                }))
+        });
+
         let scroll_to_recent_user_prompt = IconButton::new(
             ("scroll_to_recent_user_prompt", entry_ix),
             IconName::UserArrowUp,
@@ -7986,6 +7998,7 @@ impl ThreadView {
             )
             .when_some(feedback_buttons, |this, buttons| this.child(buttons))
             .when_some(copy_summary_button, |this, button| this.child(button))
+            .when_some(verdict_button, |this, button| this.child(button))
             .when_some(copy_response_button, |this, button| this.child(button))
             .child(manual_auto_prompt_button)
             .child(scroll_to_recent_user_prompt)
@@ -9303,6 +9316,38 @@ impl ThreadView {
                         })
                     });
 
+                    // Verdict ping-pong (proposal 001): right-click a native
+                    // agent thread's message to send it for a reviewer verdict.
+                    // Any selected text rides along as the user addition.
+                    let verdict_gate = AgentSettings::get_global(cx).verdict_ping_pong
+                        && !this.is_subagent()
+                        && this.thread.read(cx).connection().agent_id().as_ref()
+                            == agent::ZED_AGENT_ID.as_ref();
+                    let verdict_ready = verdict_gate
+                        && this.thread.read(cx).status() == ThreadStatus::Idle
+                        && Self::get_agent_summary_content(
+                            this.thread.read(cx).entries(),
+                            entry_ix,
+                            cx,
+                        )
+                        .is_some();
+                    let verdict_addition = chunks.and_then(|chunks| {
+                        chunks.iter().find_map(|chunk| {
+                            let md = match chunk {
+                                AssistantMessageChunk::Message { block, .. } => block.markdown(),
+                                AssistantMessageChunk::Thought { block, .. } => block.markdown(),
+                            }?;
+                            let markdown = md.read(cx);
+                            if !markdown.has_selection() {
+                                return None;
+                            }
+                            markdown
+                                .context_menu_selected_text()
+                                .or_else(|| markdown.context_menu_selected_markdown())
+                                .map(|text| text.to_string())
+                        })
+                    });
+
                     let copy_this_agent_response =
                         ContextMenuEntry::new("Copy This Agent Response").handler({
                             let entity = entity.clone();
@@ -9353,6 +9398,21 @@ impl ThreadView {
                             }
                         });
 
+                    let verdict_entry = ContextMenuEntry::new("Verdict with Claude")
+                        .disabled(!verdict_ready)
+                        .handler({
+                            let entity = entity.clone();
+                            move |window, cx| {
+                                let addition = entity
+                                    .read(cx)
+                                    .selected_text_for_entry(entry_ix, cx)
+                                    .or(verdict_addition.clone());
+                                entity.update(cx, |this, cx| {
+                                    this.request_verdict(addition, window, cx);
+                                });
+                            }
+                        });
+
                     menu.when_some(focus, |menu, focus| menu.context(focus))
                         .when_some(context_menu_link, |menu, url| {
                             menu.entry("Copy Link", None, move |_, cx| {
@@ -9366,12 +9426,42 @@ impl ThreadView {
                             Box::new(markdown::CopyAsMarkdown),
                         )
                         .item(copy_this_agent_response)
+                        .when(verdict_gate, |menu| menu.item(verdict_entry))
                         .separator()
                         .item(scroll_item)
                         .item(open_thread_as_markdown)
                 })
             })
             .into_any_element()
+    }
+
+    /// The plain text selected in this entry's markdown chunks, if any. Set
+    /// by the markdown element during a right-click (used by the message
+    /// context menu's "Verdict with Claude" entry).
+    fn selected_text_for_entry(&self, entry_ix: usize, cx: &App) -> Option<String> {
+        let chunks =
+            self.thread
+                .read(cx)
+                .entries()
+                .get(entry_ix)
+                .and_then(|entry| match entry {
+                    AgentThreadEntry::AssistantMessage(message) => Some(&message.chunks),
+                    _ => None,
+                })?;
+        chunks.iter().find_map(|chunk| {
+            let md = match chunk {
+                AssistantMessageChunk::Message { block, .. } => block.markdown(),
+                AssistantMessageChunk::Thought { block, .. } => block.markdown(),
+            }?;
+            let markdown = md.read(cx);
+            if !markdown.has_selection() {
+                return None;
+            }
+            markdown
+                .context_menu_selected_text()
+                .or_else(|| markdown.context_menu_selected_markdown())
+                .map(|text| text.to_string())
+        })
     }
 
     fn get_agent_message_content(

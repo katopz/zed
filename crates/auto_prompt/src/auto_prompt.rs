@@ -4323,14 +4323,6 @@ pub(crate) fn is_auto_prompt_summary_response(text: &str) -> bool {
     section_matches >= 3
 }
 
-/// Public probe for UI callers: does this message read as the structured
-/// summary format the auto-prompt pipeline expects? Used by the verdict
-/// button (proposal 001) to decide whether a thread is ready for a reviewer
-/// verdict.
-pub fn message_looks_like_summary(text: &str) -> bool {
-    is_auto_prompt_summary_response(text)
-}
-
 /// Check if the LLM explicitly declares that ALL remaining tasks are blocked,
 /// not just that some tasks happen to mention blocking keywords.
 ///

@@ -102,6 +102,11 @@ thread (and must not derail the parent), so the whole thing runs as a sub-agent 
   `auto_prompt::verdict_loop` — `auto_prompt` does not depend on `agent`, and `acp_thread`
   is the one crate all consumers (agent tool, auto_prompt deciders, agent_ui watchdog)
   already depend on.
+- UI (phase 4 revision): the trigger is a "Verdict with Claude" icon button in the
+  per-turn controls row directly behind "Copy Summary" (same summary-present condition),
+  plus a "Verdict with Claude" entry in the native-thread message right-click menu.
+  Chat-input text (button) or the selected markdown text (context menu) rides along as a
+  `## User addition` section the parent must relay to the reviewer.
 - Validation: `cargo test -p acp_thread verdict` (6), `cargo test -p agent request_verdict`
   (2), full `cargo test -p agent` (735 passed), `cargo test -p agent_ui conversation_view::tests`
   (116, incl. watchdog), `cargo test -p auto_prompt` (40), targeted clippy clean.
