@@ -19,7 +19,9 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use sysinfo::{MemoryRefreshKind, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
+use sysinfo::{
+    MemoryRefreshKind, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, RefreshKind, System,
+};
 use util::ResultExt;
 use workspace::WorkspaceStore;
 
@@ -95,6 +97,11 @@ const MEMORY_USAGE_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const MEMORY_USAGE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const MEMORY_USAGE_MINIMUM_LOGGED_DELTA: u64 = 64 * 1024 * 1024;
 
+/// Logs a warning once this process holds more descriptors than a busy session
+/// plausibly needs, so an fd leak is visible in the log long before spawns
+/// start failing with EMFILE ("Too many open files").
+const OPEN_FD_WARNING_THRESHOLD: usize = 1024;
+
 /// Log panics to the standard log (Zed.log / stderr) before unwinding, and
 /// print the backtrace once. Without this, a panic in a GUI launch dies at the
 /// runloop FFI boundary with the message on a stderr nobody sees — an app that
@@ -153,6 +160,7 @@ fn start_memory_usage_logging(workspace_store: Entity<WorkspaceStore>, cx: &App)
                 && let Some(process) = system.process(pid)
             {
                 let resident = process.memory();
+                let virtual_memory = process.virtual_memory();
                 let significant_change = last_logged_resident.is_none_or(|last| {
                     resident.abs_diff(last) >= (last / 10).max(MEMORY_USAGE_MINIMUM_LOGGED_DELTA)
                 });
@@ -165,10 +173,23 @@ fn start_memory_usage_logging(workspace_store: Entity<WorkspaceStore>, cx: &App)
                         }
                         None => String::new(),
                     };
+                    let mut resource_diagnostics = String::new();
+                    if let Some(open_fds) = open_file_descriptor_count() {
+                        resource_diagnostics.push_str(&format!(", open fds {open_fds}"));
+                        if open_fds >= OPEN_FD_WARNING_THRESHOLD {
+                            log::warn!(
+                                "open fd count {open_fds} exceeds {OPEN_FD_WARNING_THRESHOLD}; \
+                                 an fd leak is likely — inspect with `lsof -p {pid}`"
+                            );
+                        }
+                    }
+                    if let Some(zombies) = zombie_child_count(&mut system, pid) {
+                        resource_diagnostics.push_str(&format!(", zombie children {zombies}"));
+                    }
                     log::info!(
-                        "memory usage: resident {} MiB{delta}, virtual {} MiB",
+                        "memory usage: resident {} MiB{delta}, virtual {} MiB{resource_diagnostics}",
                         resident / MIB,
-                        process.virtual_memory() / MIB,
+                        virtual_memory / MIB,
                     );
                     if diagnostics_sender.unbounded_send(()).is_err() {
                         return;
@@ -181,6 +202,61 @@ fn start_memory_usage_logging(workspace_store: Entity<WorkspaceStore>, cx: &App)
         }
     })
     .detach();
+}
+
+/// Counts this process' open file descriptors.
+///
+/// On macOS `/dev/fd` and on Linux `/proc/self/fd` the kernel materializes one
+/// directory entry per open descriptor, so a plain read_dir count is exact
+/// enough for a trend metric (off by at most the directory's own fd).
+#[cfg(unix)]
+fn open_file_descriptor_count() -> Option<usize> {
+    const FD_DIR: &str = if cfg!(target_os = "macos") {
+        "/dev/fd"
+    } else {
+        "/proc/self/fd"
+    };
+    Some(
+        fs::read_dir(FD_DIR)
+            .ok()?
+            .filter_map(Result::ok)
+            .count(),
+    )
+}
+
+/// Counts this process' child processes that exited but were never reaped.
+///
+/// Zombies hold kernel PID slots rather than fds, so they cannot by themselves
+/// exhaust descriptors — but a rising count points at a caller dropping a
+/// `Child` without reaping, which historically accompanied the fd leaks this
+/// diagnostic exists for.
+#[cfg(unix)]
+fn zombie_child_count(system: &mut System, parent_pid: sysinfo::Pid) -> Option<usize> {
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing(),
+    );
+    Some(
+        system
+            .processes()
+            .values()
+            .filter(|process| {
+                process.parent() == Some(parent_pid)
+                    && process.status() == ProcessStatus::Zombie
+            })
+            .count(),
+    )
+}
+
+#[cfg(not(unix))]
+fn open_file_descriptor_count() -> Option<usize> {
+    None
+}
+
+#[cfg(not(unix))]
+fn zombie_child_count(_system: &mut System, _parent_pid: sysinfo::Pid) -> Option<usize> {
+    None
 }
 
 fn log_worktree_diagnostics(workspace_store: &Entity<WorkspaceStore>, cx: &App) {
