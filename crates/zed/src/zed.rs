@@ -785,14 +785,6 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
         let channels_panel =
             collab_ui::collab_panel::CollabPanel::load(workspace_handle.clone(), cx.clone());
         let debug_panel = DebugPanel::load(workspace_handle.clone(), cx);
-        // War room (Plan 024): eagerly added so the icon is always present.
-        // Cheap to construct — all network lives in the BoardRuntime global.
-        // Skipped when the board subsystem isn't initialized (e.g. tests that
-        // build a workspace without `agent_board::init`).
-        let war_room_panel = workspace_handle.update_in(cx, |_, window, cx| {
-            agent_board::runtime::BoardRuntime::try_global(cx)
-                .map(|_| agent_board::war_room::WarRoomPanel::new(window, cx))
-        });
 
         async fn add_panel_when_ready(
             panel_task: impl Future<Output = anyhow::Result<Entity<impl workspace::Panel>>> + 'static,
@@ -819,13 +811,9 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
             initialize_agent_panel(workspace_handle.clone(), cx.clone()).map(|r| r.log_err()),
         );
 
-        if let Ok(Some(panel)) = war_room_panel {
-            workspace_handle
-                .update_in(cx, |workspace, window, cx| {
-                    workspace.add_panel(panel, window, cx);
-                })
-                .log_err();
-        }
+        // War room (Plan 024) is retired (.docs/012) — no eager panel
+        // registration; the dock icon must not appear. The panel stays
+        // reachable only via its Toggle action for historical inspection.
 
         anyhow::Ok(())
     })
