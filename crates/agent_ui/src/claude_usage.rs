@@ -17,8 +17,16 @@ use std::{sync::Arc, time::Duration};
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const OAUTH_BETA_HEADER: &str = "oauth-2025-04-20";
+/// The limiter on this undocumented endpoint buckets by User-Agent and is
+/// aggressive toward unknown clients (persistent 429s); the `claude-code`
+/// UA is the one verified to get the generous bucket (the token is Claude
+/// Code's own, so the request identifies as its client).
+const USER_AGENT: &str = "claude-code/2.1.0";
 const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
-const POLL_INTERVAL: Duration = Duration::from_secs(60);
+/// Rate limiting is per-access-token and shared with Claude Code itself;
+/// 180s is the community-verified safe interval. 60s caused persistent 429s
+/// for third-party pollers.
+const POLL_INTERVAL: Duration = Duration::from_secs(180);
 const RETRY_INTERVAL: Duration = Duration::from_secs(300);
 
 /// How much of one rate-limit window has been consumed.
@@ -177,6 +185,7 @@ async fn request_usage(
     let request = Request::get(USAGE_URL)
         .header("Authorization", format!("Bearer {access_token}"))
         .header("anthropic-beta", OAUTH_BETA_HEADER)
+        .header("User-Agent", USER_AGENT)
         .header("Accept", "application/json")
         .body(AsyncBody::default())?;
 

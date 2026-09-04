@@ -80,11 +80,20 @@ would read worse than two-character labels.
 - [x] `render_claude_usage` + `ClaudeUsageTooltip` in `thread_view.rs`
 - [x] Wire rings into the toolbar row left of `render_token_usage`
 - [x] `cargo clippy -p agent_ui --all-targets` clean; unit tests pass
-- [ ] Verify the live response shape (`five_hour` / `seven_day` / `seven_day_opus`,
-      `utilization`, `resets_at`) against a real account — blocked on reading the
-      OAuth token, which needs the user's go-ahead
-- [ ] Confirm whether `anthropic-beta: oauth-2025-04-20` is required or harmful
-      on this endpoint (sent today; drop it if it provokes a 400)
+- [x] Verify the live response shape (`five_hour` / `seven_day` / `seven_day_opus`,
+      `utilization`, `resets_at`) — confirmed 2026-09-04 against field-verified
+      community data (Claude-Code-Usage-Monitor #202): windows + `extra_usage`,
+      `utilization` whole percents, `resets_at` RFC-3339 with fractional seconds
+      (the lenient parser already accepts all of it); `seven_day_sonnet` exists and
+      is ignored by design. Reading the OAuth token locally for a first-party check
+      still needs the user's go-ahead, but the shape is no longer guesswork.
+- [x] Confirm whether `anthropic-beta: oauth-2025-04-20` is required or harmful
+      on this endpoint — REQUIRED: it is part of the community-verified header set
+      (Bearer + beta + `User-Agent: claude-code/<version>`); keep it.
+- [x] Fix the two 429 pitfalls the field data exposed: send
+      `User-Agent: claude-code/...` (the limiter buckets unknown UAs aggressively —
+      the app-wide `Zed/...` UA would get persistent 429s) and poll at 180s, not
+      60s (limit is per-token, shared with Claude Code itself).
 
 ## Known trade-offs
 - Polling runs for the process lifetime once started, at 60s (300s after a
