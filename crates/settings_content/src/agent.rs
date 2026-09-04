@@ -239,10 +239,10 @@ pub struct AgentSettingsContent {
     pub subagent_model: Option<LanguageModelSelection>,
     /// Whether the `request_verdict` tool is registered for native agent
     /// threads (verdict ping-pong, `.proposals/001_claude_sub_agent_verdict.md`).
-    /// Experimental — promote to default only if the GOAT benchmark shows
-    /// post-hoc rework dropping.
+    /// Purely user-invoked (button / right-click menu), so on by default; the
+    /// GOAT benchmark (`.issues/016`) decides whether it stays.
     ///
-    /// Default: false
+    /// Default: true
     pub verdict_ping_pong: Option<bool>,
     /// The model for the reviewer subagent spawned by the `request_verdict`
     /// tool. Defaults to the parent agent's model when not specified.

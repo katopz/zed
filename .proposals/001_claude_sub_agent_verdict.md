@@ -1,8 +1,8 @@
 # Claude Sub-Agent Verdict (ping-pong second opinion)
 
-Status: IMPLEMENTED (phases 1-6) — GOAT benchmark pending (`.issues/016`) before promoting to default
+Status: IMPLEMENTED (phases 1-6) — gate defaults ON (user-invoked only); `.issues/016` benchmark tracks whether it stays
 
-Commit: e5b496bf46 (phases 1-5), phase 6 commit (see plan 029)
+Commit: e5eb82579c (button + right-click menu), f975fcd392 (phase 6), e5b496bf46 (phases 1-5)
 
 ## Goal
 
@@ -80,14 +80,18 @@ thread (and must not derail the parent), so the whole thing runs as a sub-agent 
       via new `ThreadEnvironment::create_verdict_subagent` (model pinned to
       `agent.verdict_model`, falls back to parent model); rounds budget
       enforced pre-resume; output carries `round`/`max_rounds`
-- [x] Phase 4: button in message-editor toolbar (root views only; disabled
-      without a summary per `auto_prompt::message_looks_like_summary`); click
-      sends the ping-pong instruction; settings `agent.verdict_ping_pong`,
-      `agent.verdict_model`, `agent.verdict_max_rounds` (default 3)
-- [x] Phase 5 (GOAT gate): feature flag `verdict_ping_pong` default false —
-      tool unregistered and button hidden when off; benchmark
+- [x] Phase 4: "Verdict with Claude" button in the per-turn controls row
+      directly behind "Copy Summary" (same summary-present condition; root
+      views only); chat-input text rides along as a `## User addition` and
+      the input is cleared. Plus "Verdict with Claude" in the native-thread
+      message right-click menu, with the selected markdown text as the
+      addition. Settings `agent.verdict_ping_pong`, `agent.verdict_model`,
+      `agent.verdict_max_rounds` (default 3)
+- [x] Phase 5 (GOAT gate): feature flag `verdict_ping_pong` — purely
+      user-invoked (button / right-click), so the default was flipped to ON;
+      the flag remains as the opt-out/demote path. Benchmark
       (threads-with-verdict vs without: post-hoc fix rate, rounds, token cost)
-      still pending before promoting to default
+      decides whether it stays
 - [x] Phase 6: Claude Code subscription path via ACP-connection verdict session
       (`.plans/029_claude_code_verdict_reviewer.md`; `agent.verdict_reviewer =
       "claude_code"`; teardown limitation in `.issues/016`)

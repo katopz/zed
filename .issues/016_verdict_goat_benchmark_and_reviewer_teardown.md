@@ -5,9 +5,12 @@ Status: PART 1 harness SHIPPED (persistence + scorer), Part 2 teardown FIXED (dr
 ## Context
 
 `.proposals/001_claude_sub_agent_verdict.md` shipped phases 1-6 behind the
-`verdict_ping_pong` GOAT gate (default off). Promotion to default requires the
-phase 5 benchmark: measurable evidence that a reviewer verdict reduces rework
-enough to justify 2N extra LLM calls per negotiation (N = rounds, default cap 3).
+`verdict_ping_pong` GOAT gate — now defaulting ON (the feature is purely
+user-invoked via button/right-click, so there is no autonomous cost). The
+benchmark plus real-usage data decides whether it STAYS enabled or is demoted
+(flag set to false). The benchmark measures evidence that a reviewer verdict
+reduces rework enough to justify 2N extra LLM calls per negotiation
+(N = rounds, default cap 3).
 
 Also tracked here: the phase 6 teardown limitation below.
 

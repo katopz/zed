@@ -7837,7 +7837,8 @@ impl ThreadView {
 
         // Verdict ping-pong (proposal 001): sits right behind "Copy Summary"
         // and only when that button does — a summary to review must exist.
-        // GOAT-gated; root views only (subagents can't spawn reviewers).
+        // Root views only (subagents can't spawn reviewers); set
+        // agent.verdict_ping_pong = false to hide it.
         let verdict_button = (AgentSettings::get_global(cx).verdict_ping_pong
             && !self.is_subagent())
         .then(|| {

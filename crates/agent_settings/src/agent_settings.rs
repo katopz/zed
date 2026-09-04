@@ -221,7 +221,8 @@ pub struct AgentSettings {
     pub default_model: Option<LanguageModelSelection>,
     pub subagent_model: Option<LanguageModelSelection>,
     /// Whether the `request_verdict` tool is registered for native agent
-    /// threads (verdict ping-pong, proposal 001). GOAT gate — default off.
+    /// threads (verdict ping-pong, proposal 001). User-invoked only; set
+    /// false to opt out while the GOAT benchmark runs.
     pub verdict_ping_pong: bool,
     /// Model for the `request_verdict` reviewer subagent. `None` inherits the
     /// parent thread's model.
@@ -800,7 +801,7 @@ impl Settings for AgentSettings {
             flexible: agent.flexible.unwrap(),
             default_model: Some(agent.default_model.unwrap()),
             subagent_model: agent.subagent_model,
-            verdict_ping_pong: agent.verdict_ping_pong.unwrap_or(false),
+            verdict_ping_pong: agent.verdict_ping_pong.unwrap_or(true),
             verdict_model: agent.verdict_model,
             verdict_max_rounds: agent
                 .verdict_max_rounds

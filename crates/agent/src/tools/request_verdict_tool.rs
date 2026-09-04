@@ -264,13 +264,13 @@ impl AgentTool for RequestVerdictTool {
                 )
             });
 
-            // GOAT gate (proposal 001 phase 5): the tool stays silent unless
-            // the flag opts in, so default builds never pay for the loop.
+            // GOAT gate (proposal 001 phase 5): user-invoked only, so the
+            // gate defaults on — it exists as the demote path while the
+            // benchmark (issue 016) decides whether the feature stays.
             if !verdict_enabled || max_rounds == 0 {
                 return Err(error_output(
                     None,
-                    "verdict ping-pong is disabled (set agent.verdict_ping_pong = true)"
-                        .to_string(),
+                    "verdict ping-pong is disabled (agent.verdict_ping_pong)".to_string(),
                     setting_label(&reviewer_setting),
                     None,
                 ));
@@ -284,7 +284,7 @@ impl AgentTool for RequestVerdictTool {
                         error,
                         setting_label(&reviewer_setting),
                         None,
-                    ))
+                    ));
                 }
             };
 
@@ -306,7 +306,12 @@ impl AgentTool for RequestVerdictTool {
                         cx.update(|cx| verdict::complete_reviewer(&session_id, cx));
                     }
                 }
-                return Err(error_output(Some(session_id), error, route_label(&route), None));
+                return Err(error_output(
+                    Some(session_id),
+                    error,
+                    route_label(&route),
+                    None,
+                ));
             }
 
             let mut route = route;
@@ -411,7 +416,7 @@ impl AgentTool for RequestVerdictTool {
                                     err.to_string(),
                                     route_label(&route),
                                     None,
-                                ))
+                                ));
                             }
                         };
                         let session_id = cx.update(|cx| thread.read(cx).session_id().clone());
