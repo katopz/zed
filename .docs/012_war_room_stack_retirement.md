@@ -30,6 +30,9 @@ rather than optimized:
 
 ## Follow-ups
 
-- None. If the operator board is ever needed again, rebuild it against a
-  cheaper transport (local WebSocket relay, no per-view KV reads) — do not
-  resurrect the deleted KV namespace pattern.
+- `8d494cb07f` (2026-09-04): removed the eager `WarRoomPanel` registration
+  in `initialize_panels` — the retired "War Room (obsolete)" dock icon no
+  longer appears (operator report). Panel reachable only via its Toggle
+  action. None further: if the operator board is ever needed again, rebuild
+  it against a cheaper transport (local WebSocket relay, no per-view KV
+  reads) — do not resurrect the deleted KV namespace pattern.
