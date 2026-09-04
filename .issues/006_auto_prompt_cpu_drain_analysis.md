@@ -8,8 +8,18 @@
 - [x] P1 fix landed: zombie reaping in `util::command::darwin::Child::drop` (see `.docs/006_*`)
 - [-] P1 investigation: MCP duplicate-spawn (deferred — needs live debug; guards look correct)
 - [-] P1 investigation: action_log observer (no change needed — already per-thread, NOT global)
-- [ ] P2 fixes (concurrent-stream cap, SSE idle timeout, background decision log)
-- [ ] GOAT verified (live CPU measurement after P0+P1 land)
+- [x] P2 fixes (concurrent-stream cap, SSE idle timeout, background decision log):
+  - [x] SSE idle timeout — already shipped in `87f48d95c4` (compaction idle timeout
+        + `stream_idle_timeout_future` raced in `run_turn_internal`); checkbox was stale
+  - [x] Decision log off the foreground thread — already shipped (`spawn_write` detached
+        background task + test, default-off since P0); checkbox was stale
+  - [x] Concurrent-streaming cap — `MAX_CONCURRENT_STREAMING_THREADS` (2) gate in
+        `dispatch_action`: background chains (focus_new_thread == false) queue via a
+        5s retry loop instead of stacking a third stream; manual/auto-focus dispatch
+        bypasses; `AgentPanel::generating_thread_count(cx, skip_view)` counts streams
+        across active + retained views (dispatching view skipped — double-lease);
+        gate runs BEFORE draft stash/editor clear so a deferring attempt loses nothing
+- [ ] GOAT verified (live CPU measurement after P0+P1+P2 land)
 
 ## Correction
 

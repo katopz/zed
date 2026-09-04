@@ -462,6 +462,14 @@ fn start_context_block(
     Some(block)
 }
 
+/// Issue 006 P2: maximum agent threads that may stream simultaneously before
+/// auto_prompt queues new background continuations. Manual and auto-focus
+/// dispatches (user intent) bypass this cap.
+const MAX_CONCURRENT_STREAMING_THREADS: usize = 2;
+
+/// How long a stream-cap-deferred chain waits before re-dispatching.
+const STREAM_CAP_RETRY_DELAY_MS: u64 = 5_000;
+
 pub(crate) fn dispatch_action(
     action: auto_prompt::AutoPromptAction,
     conversation_view: &crate::ConversationView,
@@ -596,6 +604,36 @@ pub(crate) fn dispatch_action(
         .and_then(|native_thread| native_thread.read(cx).model().cloned())
     {
         model.reset_key_session(cx);
+    }
+
+    // Issue 006 P2: bound concurrent streams. A silent background chain
+    // (focus_new_thread == false — run_auto_prompt ORs in is_manual before
+    // dispatching) must not stack another generating thread once the cap is
+    // reached: N concurrent streams each drive window-wide repaints (the
+    // 3N-repaints/sec death spiral). Queue instead: re-dispatch after a
+    // delay. This runs BEFORE the draft stash is consumed and before the
+    // live editor is cleared, so a deferring attempt loses nothing. The
+    // dispatching view is skipped in the count — it is leased right now
+    // (reading it would double-lease) and, having just stopped, is not one
+    // of the streams the cap is budgeting anyway.
+    if !action.focus_new_thread {
+        let generating = conversation_view
+            .workspace()
+            .upgrade()
+            .and_then(|workspace| workspace.read(cx).panel::<crate::AgentPanel>(cx))
+            .map(|panel| {
+                panel.read(cx).generating_thread_count(cx, Some(dispatching_view_id))
+            })
+            .unwrap_or(0);
+        if generating >= MAX_CONCURRENT_STREAMING_THREADS {
+            log::info!(
+                "[auto_prompt] dispatch_action: {generating} threads already generating \
+                 (cap {MAX_CONCURRENT_STREAMING_THREADS}), queueing new-thread dispatch \
+                 for retry in {STREAM_CAP_RETRY_DELAY_MS}ms"
+            );
+            spawn_stream_cap_retry(action, window, cx);
+            return;
+        }
     }
 
     let decision_prompt = auto_prompt::extract_decision_prompt(&action.next_prompt);
@@ -777,6 +815,30 @@ pub(crate) fn dispatch_action(
     });
 
     log::info!("[auto_prompt] dispatch_action: new thread creation deferred");
+}
+
+/// Re-dispatch a stream-cap-deferred action after
+/// [`STREAM_CAP_RETRY_DELAY_MS`]. Detached: the loop self-terminates when a
+/// retry finds capacity, when the source view is dropped (`update_in`
+/// errors), or when the watchdog clears a wedged stream that was holding a
+/// slot forever.
+fn spawn_stream_cap_retry(
+    action: auto_prompt::AutoPromptAction,
+    window: &mut Window,
+    cx: &mut gpui::Context<crate::ConversationView>,
+) {
+    cx.spawn_in(window, async move |view, cx| {
+        cx.background_executor()
+            .timer(std::time::Duration::from_millis(STREAM_CAP_RETRY_DELAY_MS))
+            .await;
+        if let Err(err) = view.update_in(cx, |view, window, cx| {
+            log::info!("[auto_prompt] stream-cap queue: retrying deferred dispatch");
+            dispatch_action(action, view, window, cx);
+        }) {
+            log::warn!("[auto_prompt] stream-cap queue abandoned (view dropped): {err}");
+        }
+    })
+    .detach();
 }
 
 fn is_cancelled(

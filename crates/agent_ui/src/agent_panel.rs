@@ -4675,6 +4675,38 @@ impl AgentPanel {
         actives
     }
 
+    /// Number of agent threads currently `Generating`, across the active and
+    /// retained conversation views. Used by the auto_prompt dispatch cap
+    /// (issue 006 P2): background continuation chains must queue instead of
+    /// stacking unbounded concurrent streams (each stream drives window-wide
+    /// repaint pressure — the 3N-repaints/sec death spiral).
+    ///
+    /// `skip_view` excludes one conversation view from the count — pass the
+    /// dispatching view's id when called from inside its update (reading it
+    /// would double-lease), the same pattern as [`Self::active_thread_activity`].
+    pub(crate) fn generating_thread_count(
+        &self,
+        cx: &App,
+        skip_view: Option<gpui::EntityId>,
+    ) -> usize {
+        self.conversation_views()
+            .iter()
+            .filter(|view| {
+                if skip_view.is_some_and(|id| id == view.entity_id()) {
+                    return false;
+                }
+                view.read(cx)
+                    .active_thread()
+                    .is_some_and(|thread_view| {
+                        matches!(
+                            thread_view.read(cx).thread.read(cx).status(),
+                            acp_thread::ThreadStatus::Generating
+                        )
+                    })
+            })
+            .count()
+    }
+
     pub fn active_thread_view(&self, cx: &App) -> Option<Entity<ThreadView>> {
         let server_view = self.active_conversation_view()?;
         server_view.read(cx).root_thread_view()
@@ -12077,6 +12109,153 @@ mod tests {
                     "generating threads must survive the hard-cap backstop"
                 );
             }
+        });
+    }
+
+    /// Issue 006 P2: the generating-thread count (the auto_prompt dispatch
+    /// cap's input) must span both the active view and retained threads.
+    #[gpui::test]
+    async fn test_generating_thread_count_mixed_states(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let connection = StubAgentConnection::new()
+            .with_supports_load_session(true)
+            .with_agent_id("loadable-stub".into())
+            .with_telemetry_id("loadable-stub".into());
+
+        // Thread A: open, then parked idle.
+        let (session_a, _id_a) =
+            open_generating_thread_with_loadable_connection(&panel, &connection, &mut cx);
+        park_idle_thread(&panel, &connection, &session_a, &mut cx);
+
+        // Threads B and C: left Generating (B parks in retained_threads when
+        // C opens and becomes active).
+        let (_session_b, _id_b) =
+            open_generating_thread_with_loadable_connection(&panel, &connection, &mut cx);
+        let (session_c, _id_c) =
+            open_generating_thread_with_loadable_connection(&panel, &connection, &mut cx);
+
+        panel.read_with(&cx, |panel, cx| {
+            assert_eq!(
+                panel.generating_thread_count(cx, None),
+                2,
+                "generating threads must be counted across retained + active views"
+            );
+        });
+
+        // Park the active thread; the count must drop to the retained one.
+        park_idle_thread(&panel, &connection, &session_c, &mut cx);
+        panel.read_with(&cx, |panel, cx| {
+            assert_eq!(
+                panel.generating_thread_count(cx, None),
+                1,
+                "only the retained generating thread remains"
+            );
+        });
+    }
+
+    /// Issue 006 P2: when the concurrent-stream cap is reached, a background
+    /// chain (focus_new_thread == false) must NOT create its continuation
+    /// thread — it queues and retries. Once a slot frees, the retry creates
+    /// the thread. The dispatching view itself is excluded from the count
+    /// (it is leased during dispatch and, in real flows, has just stopped).
+    #[gpui::test]
+    async fn test_stream_cap_defers_background_continuation_until_slot_frees(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let connection = StubAgentConnection::new()
+            .with_supports_load_session(true)
+            .with_agent_id("loadable-stub".into())
+            .with_telemetry_id("loadable-stub".into());
+
+        // Three generating threads: A and B park in retained_threads as C
+        // opens and becomes active. Register the panel with the workspace so
+        // dispatch's panel lookup resolves (setup_panel keeps it standalone;
+        // production panels are registered at startup).
+        let (session_a, _id_a) =
+            open_generating_thread_with_loadable_connection(&panel, &connection, &mut cx);
+        let (_session_b, _id_b) =
+            open_generating_thread_with_loadable_connection(&panel, &connection, &mut cx);
+        let (session_c, _id_c) =
+            open_generating_thread_with_loadable_connection(&panel, &connection, &mut cx);
+
+        let active_view = panel.update(&mut cx, |panel, _cx| {
+            panel.active_conversation_view().expect("active view").clone()
+        });
+        let workspace = active_view
+            .read_with(&cx, |view, _| view.workspace().upgrade().expect("workspace"));
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.add_panel(panel.clone(), window, cx);
+        });
+
+        // Sanity: two streams counted (active C excluded from the cap budget).
+        panel.read_with(&cx, |panel, cx| {
+            assert_eq!(
+                panel.generating_thread_count(cx, Some(active_view.entity_id())),
+                2,
+                "A and B must count against the cap; the leased dispatching view must not"
+            );
+        });
+
+        let view_count_at_cap = panel.read_with(&cx, |panel, _cx| panel.conversation_views().len());
+        assert_eq!(view_count_at_cap, 3);
+
+        let action = auto_prompt::AutoPromptAction {
+            from_session_id: session_c,
+            from_title: None,
+            next_prompt: "continue the work".to_string(),
+            work_dirs: None,
+            original_user_message: None,
+            profile_id: None,
+            actual_input_tokens: None,
+            approximate_token_count: 0,
+            last_assistant_message: None,
+            force_new_thread: true,
+            focus_new_thread: false,
+        };
+
+        // Dispatch from the active conversation view: at cap, this must
+        // queue (no new thread, retry timer pending).
+        active_view.update_in(&mut cx, |view, window, cx| {
+            crate::auto_prompt::dispatch_action(action, view, window, cx);
+        });
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, _cx| {
+            assert_eq!(
+                panel.conversation_views().len(),
+                view_count_at_cap,
+                "at cap the background continuation must be queued, not created"
+            );
+        });
+
+        // Free a slot: end the retained thread A's turn.
+        cx.update(|_, _cx| {
+            connection.end_turn(session_a.clone(), acp::StopReason::EndTurn);
+        });
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, cx| {
+            assert_eq!(
+                panel.generating_thread_count(cx, Some(active_view.entity_id())),
+                1,
+                "ending the retained thread's turn must free a stream slot"
+            );
+        });
+
+        // Advance past the retry delay; the queued dispatch must now create
+        // the continuation thread.
+        cx.executor().advance_clock(std::time::Duration::from_millis(
+            5_000,
+        ));
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, _cx| {
+            assert_eq!(
+                panel.conversation_views().len(),
+                view_count_at_cap + 1,
+                "queued continuation must be created once a stream slot frees"
+            );
         });
     }
 

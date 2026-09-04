@@ -232,3 +232,33 @@ Three unrelated agent_ui tests (`test_new_workspace_load_uses_global_terminal_en
 part of the full suite, but **pass in isolation** and **fail identically
 on unmodified `develop`** — confirmed pre-existing flakes, not regressions
 from these changes.
+
+## P2 — concurrent-stream cap (2026-09-04)
+
+All three P2 items closed:
+
+- **SSE idle timeout** — already shipped in `87f48d95c4` (compaction idle
+  timeout + `stream_idle_timeout_future` raced against `events.next()` in
+  `run_turn_internal`); the issue checkbox was stale.
+- **Decision log off the foreground thread** — already shipped: `debug_log::spawn_write`
+  hands each write to a detached background task (names carry `{ms}_{seq}`
+  ordering, so out-of-order completion is harmless); default-off since P0.
+- **Concurrent-streaming cap** — the last real code work:
+  - `AgentPanel::generating_thread_count(cx, skip_view)` — counts
+    `ThreadStatus::Generating` across active + retained views; the
+    dispatching view is excludable (reading it inside its own update
+    double-leases; same pattern as `active_thread_activity`).
+  - Gate at the top of `dispatch_action`'s new-thread path:
+    background chains (`focus_new_thread == false` after `run_auto_prompt`
+    ORs in `is_manual`) defer when `generating >= MAX_CONCURRENT_STREAMING_THREADS` (2)
+    and retry every `STREAM_CAP_RETRY_DELAY_MS` (5s) until a slot frees,
+    the source view drops, or the watchdog clears a wedged stream. Manual
+    and auto-focus dispatches bypass the cap. The gate runs BEFORE the
+    draft stash is consumed / live editor cleared, so deferring loses nothing.
+
+Validation: `cargo test -p agent_ui --lib` 469/469 (incl. new
+`test_generating_thread_count_mixed_states` and
+`test_stream_cap_defers_background_continuation_until_slot_frees`),
+`cargo test -p auto_prompt --lib` 403/403, `./script/clippy --package agent_ui` clean.
+
+Remaining: GOAT live CPU measurement (needs a dev build + real sessions).
