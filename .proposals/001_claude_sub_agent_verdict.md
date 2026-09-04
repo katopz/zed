@@ -110,3 +110,8 @@ thread (and must not derail the parent), so the whole thing runs as a sub-agent 
 - Validation: `cargo test -p acp_thread verdict` (6), `cargo test -p agent request_verdict`
   (2), full `cargo test -p agent` (735 passed), `cargo test -p agent_ui conversation_view::tests`
   (116, incl. watchdog), `cargo test -p auto_prompt` (40), targeted clippy clean.
+- Follow-up commits: `7d1efff7c5` (TTL-expired reviewer sessions drain-closed via
+  the panel's 10s loop — `.issues/016` Part 2), `83c1b65dce` + `019a350225`
+  (GOAT scorer: reviewer label persisted in thread records, continuation-chain
+  linking for cross-thread fix detection — `.issues/016` Part 1 harness),
+  `e5eb82579c` (button relocated behind "Copy Summary" + right-click entry).
