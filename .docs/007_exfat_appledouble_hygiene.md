@@ -78,3 +78,23 @@ Rules going forward:
   incident; if a release rebuild is ever needed, move it to `/tmp` too.
 - `mdutil -s /Volumes/SDXC1TB` should report "Indexing disabled." — re-check after
   volume remounts.
+
+## 2026-09-04 addendum — sweep under sibling load: run it detached
+
+Audit: **291,967 sidecars** had regenerated (largest wave yet — the repo is
+actively edited daily, and every xattr-carrying write re-seeds them). Two
+lessons from this sweep:
+
+- **`.git` first, with `ls -a` verification.** Plain `ls` hides `._*` (they start
+  with a dot), so `ls .git/objects/pack/ | grep -c '^\._'` reported 0 while the
+  sidecars were still there — only `find .git -name '._*' -delete` (plus fsck to
+  catch `refs/heads/._develop`-class bad refs) gives the truth. A targeted
+  `.git`-only sweep is fast even under load and silences the git stderr spam
+  immediately; the worktree remainder can follow.
+- **Foreground `find -delete` does not finish under a sibling compile storm.**
+  With rustc processes hammering the same volume, unlink throughput collapsed to
+  ~1,600 files/min — a 292K sweep needs hours and blew two 20-minute terminal
+  timeouts. The working form: `nohup nice -n 20 find . -path ./.git -prune -o
+  \( -name '._*' -o -name '.DS_Store' \) -type f -delete > /tmp/... &`, then
+  check progress later with `find . -name '._*' -type f | wc -l`. Verify with
+  `git ls-files '._*'` → empty first (nothing tracked), as always.
