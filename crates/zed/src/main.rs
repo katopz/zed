@@ -197,8 +197,62 @@ fn fail_to_open_window(e: anyhow::Error, _cx: &mut App) {
 }
 static STARTUP_TIME: OnceLock<Instant> = OnceLock::new();
 
+/// Soft fd limit to request when the hard limit allows it.
+///
+/// GUI-launched Zed inherits launchd's low soft limit (2560 on current macOS)
+/// while the hard limit is unlimited. A long agent session runs language
+/// servers, MCP servers, PTYs and project searches concurrently, and an fd
+/// leak otherwise turns into EMFILE spawn failures that kill the whole session
+/// ("Too many open files"). Raising the soft limit adds headroom so the
+/// open-fd diagnostic in the reliability log fires long before that point.
+#[cfg(unix)]
+const TARGET_OPEN_FILE_LIMIT: libc::rlim_t = 65536;
+
+#[cfg(unix)]
+fn raise_open_file_limit() {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: plain syscalls with out-parameters we own.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        log::warn!(
+            "failed to query the open file limit: {}",
+            std::io::Error::last_os_error()
+        );
+        return;
+    }
+    let target = if limit.rlim_max == libc::RLIM_INFINITY {
+        TARGET_OPEN_FILE_LIMIT
+    } else {
+        TARGET_OPEN_FILE_LIMIT.min(limit.rlim_max)
+    };
+    if target <= limit.rlim_cur {
+        return;
+    }
+    let raised = libc::rlimit {
+        rlim_cur: target,
+        rlim_max: limit.rlim_max,
+    };
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0 {
+        log::info!(
+            "raised open file limit: {} -> {target}",
+            limit.rlim_cur
+        );
+    } else {
+        log::warn!(
+            "failed to raise open file limit from {}: {}",
+            limit.rlim_cur,
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
 fn main() {
     STARTUP_TIME.get_or_init(|| Instant::now());
+
+    #[cfg(unix)]
+    raise_open_file_limit();
 
     // If this process was re-executed as a Linux sandbox helper, run that mode
     // without returning. Must run before argument parsing: the wrapped command's
