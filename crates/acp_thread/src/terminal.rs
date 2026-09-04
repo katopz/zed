@@ -519,6 +519,12 @@ impl Terminal {
     pub fn kill(&mut self, cx: &mut App) {
         self.terminal.update(cx, |terminal, _cx| {
             terminal.kill_active_task();
+            // This entity lives as long as the thread's tool-call history, so
+            // the PTY event loop must not keep draining after the tool is done:
+            // a leftover process holding the PTY slave (e.g. a background job)
+            // would otherwise pin the master fd and its io thread until Zed
+            // exits.
+            terminal.shutdown_backend();
         });
     }
 

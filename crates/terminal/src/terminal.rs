@@ -3269,8 +3269,16 @@ fn spawn_task_subprocess(
     })
 }
 
-impl Drop for Terminal {
-    fn drop(&mut self) {
+impl Terminal {
+    /// Tears down the terminal backend: stops the PTY event loop and kills the
+    /// child (or the headless subprocess). Idempotent; `Drop` also calls this.
+    ///
+    /// Agent tool-call terminals stay alive for the whole thread's tool-call
+    /// history after their command exits, so without this their PTY master fd
+    /// and event-loop thread are only released when every process holding the
+    /// PTY slave disappears — a command that leaves a background process behind
+    /// (e.g. `npm run dev &`) then pins them until Zed exits.
+    pub fn shutdown_backend(&mut self) {
         if let Some(subprocess) = self.subprocess.take() {
             subprocess.kill();
         }
@@ -3288,6 +3296,12 @@ impl Drop for Terminal {
                 })
                 .detach();
         }
+    }
+}
+
+impl Drop for Terminal {
+    fn drop(&mut self) {
+        self.shutdown_backend();
     }
 }
 
