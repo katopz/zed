@@ -44,12 +44,14 @@ continuation worked. The summary fast path itself was never at fault.
       `deferral N/240`; escalation warns loudly with elapsed minutes.
 - [x] Cap is configurable: `max_concurrent_streams` in `auto_prompt.json` or
       `ZED_AUTO_PROMPT_MAX_CONCURRENT_STREAMS` (default 2; `0` = unlimited).
-      Multi-agent workloads raise it so forks flow without queueing.
+      Multi-agent workloads raise it so forks flow without queueing. Set to 6
+      in the owner's `~/.config/zed/auto_prompt.json`.
+- [x] Chain gates session-scoped (see follow-up below, `0ee52c5864`).
 - [x] Tests: `stream_cap_decision` dispatch/defer/escalate matrix
       (agent_ui) + `max_concurrent_streams_defaults_and_overrides`
       (auto_prompt config serde). Full `auto_prompt` lib suite 404/404.
 
-## Follow-up: silent-skip gates resolved against the wrong thread (`<hash>`)
+## Follow-up: silent-skip gates resolved against the wrong thread (`0ee52c5864`)
 
 Log re-review (19:10–19:46 window) caught two threads stopping normally
 (19:21:08, 19:32:24) with **no** `on_thread_stopped` entry point. Root cause
