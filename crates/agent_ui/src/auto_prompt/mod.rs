@@ -511,19 +511,75 @@ fn start_context_block(
 }
 
 /// Issue 006 P2: maximum agent threads that may stream simultaneously before
-/// auto_prompt queues new background continuations. Manual and auto-focus
-/// dispatches (user intent) bypass this cap.
-const MAX_CONCURRENT_STREAMING_THREADS: usize = 2;
-
-/// How long a stream-cap-deferred chain waits before re-dispatching.
+/// Cap on concurrently-generating threads before auto_prompt queues new
+/// background continuations (issue 006 P2). Configurable via
+/// `max_concurrent_streams` in `auto_prompt.json` (0 = unlimited); manual and
+/// auto-focus dispatches (user intent) bypass the cap.
 const STREAM_CAP_RETRY_DELAY_MS: u64 = 5_000;
+
+/// A stream-cap-deferred chain escalates — dispatches despite the cap — after
+/// this many consecutive deferrals (240 × 5s = 20 minutes). Without this bound
+/// a saturated agent farm (≥cap threads generating for hours — long terminal
+/// turns, background continuations) starved summary forks forever: the fork
+/// retried every 5s, silently, reading as "auto_prompt never triggered" and
+/// forcing a manual click (issue 018). The override admits one extra stream,
+/// once, per starved chain — bounded repaint-pressure cost vs. a dead chain.
+const STREAM_CAP_MAX_DEFERRALS: u32 = 240;
+
+/// Outcome of the stream-cap gate for one background new-thread dispatch.
+#[derive(PartialEq, Eq, Debug)]
+enum StreamCapDecision {
+    /// Under the cap — dispatch now.
+    Dispatch,
+    /// At/over the cap with starvation budget left — queue another retry.
+    Defer,
+    /// Starved past [`STREAM_CAP_MAX_DEFERRALS`] — dispatch anyway.
+    Escalate,
+}
+
+fn stream_cap_decision(generating: usize, cap: usize, deferrals: u32) -> StreamCapDecision {
+    if generating < cap {
+        return StreamCapDecision::Dispatch;
+    }
+    if deferrals >= STREAM_CAP_MAX_DEFERRALS {
+        StreamCapDecision::Escalate
+    } else {
+        StreamCapDecision::Defer
+    }
+}
+
+/// The configured stream cap, with `0` resolved to unlimited.
+fn effective_stream_cap() -> usize {
+    let configured = auto_prompt::load_config_cached()
+        .ok()
+        .map(|config| config.max_concurrent_streams)
+        .unwrap_or(auto_prompt::DEFAULT_MAX_CONCURRENT_STREAMS);
+    if configured == 0 {
+        usize::MAX
+    } else {
+        configured
+    }
+}
 
 pub(crate) fn dispatch_action(
     action: auto_prompt::AutoPromptAction,
     conversation_view: &crate::ConversationView,
     window: &mut Window,
     cx: &mut gpui::Context<crate::ConversationView>,
-) {
+) -> bool {
+    dispatch_action_with_attempts(action, conversation_view, window, cx, 0)
+}
+
+/// `stream_cap_attempts` is the number of deferrals this action has already
+/// burned in the stream-cap queue; only the queue itself passes a non-zero
+/// value. Returns `true` when the dispatch was deferred back into the queue.
+pub(crate) fn dispatch_action_with_attempts(
+    action: auto_prompt::AutoPromptAction,
+    conversation_view: &crate::ConversationView,
+    window: &mut Window,
+    cx: &mut gpui::Context<crate::ConversationView>,
+    stream_cap_attempts: u32,
+) -> bool {
     let is_native_agent = conversation_view
         .active_thread()
         .is_some_and(|tv| tv.read(cx).thread.read(cx).connection().agent_id() == *ZED_AGENT_ID);
@@ -617,7 +673,7 @@ pub(crate) fn dispatch_action(
                 "[auto_prompt] dispatch_action: sent continuation to same thread (tokens={:?})",
                 action.actual_input_tokens,
             );
-            return;
+            return false;
         }
         // ACP agents (Claude, etc.) must never create new threads on their own
         // — they rely on conversation history in the same thread. Exception
@@ -630,7 +686,7 @@ pub(crate) fn dispatch_action(
             log::warn!(
                 "[auto_prompt] dispatch_action: no active thread for ACP agent continuation, stopping (ACP agents cannot use new threads)"
             );
-            return;
+            return false;
         }
         log::warn!(
             "[auto_prompt] dispatch_action: no active thread for native agent continuation, falling back to new thread"
@@ -666,6 +722,12 @@ pub(crate) fn dispatch_action(
     // dispatching view is skipped in the count — it is leased right now
     // (reading it would double-lease) and, having just stopped, is not one
     // of the streams the cap is budgeting anyway.
+    //
+    // Issue 018: the queue is bounded — after STREAM_CAP_MAX_DEFERRALS the
+    // chain escalates and dispatches despite the cap. The unbounded queue
+    // livelocked when the farm stayed saturated for hours (4–5 threads
+    // generating vs. cap 2), starving summary forks silently until the user
+    // clicked manually.
     if !action.focus_new_thread {
         let generating = conversation_view
             .workspace()
@@ -677,14 +739,37 @@ pub(crate) fn dispatch_action(
                     .generating_thread_count(cx, Some(dispatching_view_id))
             })
             .unwrap_or(0);
-        if generating >= MAX_CONCURRENT_STREAMING_THREADS {
-            log::info!(
-                "[auto_prompt] dispatch_action: {generating} threads already generating \
-                 (cap {MAX_CONCURRENT_STREAMING_THREADS}), queueing new-thread dispatch \
-                 for retry in {STREAM_CAP_RETRY_DELAY_MS}ms"
-            );
-            spawn_stream_cap_retry(action, window, cx);
-            return;
+        let cap = effective_stream_cap();
+        match stream_cap_decision(generating, cap, stream_cap_attempts) {
+            StreamCapDecision::Dispatch => {}
+            StreamCapDecision::Escalate => {
+                log::warn!(
+                    "[auto_prompt] dispatch_action: stream cap still saturated ({generating} generating, \
+                     cap {cap}) after {stream_cap_attempts} deferrals (~{} min) — dispatching anyway \
+                     (bounded override, issue 018)",
+                    stream_cap_attempts * STREAM_CAP_RETRY_DELAY_MS as u32 / 60_000
+                );
+            }
+            StreamCapDecision::Defer => {
+                let next_attempts = stream_cap_attempts + 1;
+                if stream_cap_attempts == 0 {
+                    log::warn!(
+                        "[auto_prompt] dispatch_action: stream cap saturated ({generating} generating, \
+                         cap {cap}) — new-thread fork queued, retrying every \
+                         {STREAM_CAP_RETRY_DELAY_MS}ms, escalating past the cap after \
+                         ~{} min (issue 018)",
+                        STREAM_CAP_MAX_DEFERRALS * STREAM_CAP_RETRY_DELAY_MS as u32 / 60_000
+                    );
+                }
+                log::info!(
+                    "[auto_prompt] dispatch_action: {generating} threads already generating \
+                     (cap {cap}), queueing new-thread dispatch \
+                     for retry in {STREAM_CAP_RETRY_DELAY_MS}ms \
+                     (deferral {next_attempts}/{STREAM_CAP_MAX_DEFERRALS})"
+                );
+                spawn_stream_cap_retry(action, next_attempts, window, cx);
+                return true;
+            }
         }
     }
 
@@ -735,7 +820,7 @@ pub(crate) fn dispatch_action(
     let workspace_handle = conversation_view.workspace();
     let Some(workspace) = workspace_handle.upgrade() else {
         log::warn!("[auto_prompt] dispatch_action: workspace dropped, cannot create new thread");
-        return;
+        return false;
     };
 
     window.defer(cx, move |window, cx| {
@@ -854,27 +939,40 @@ pub(crate) fn dispatch_action(
     });
 
     log::info!("[auto_prompt] dispatch_action: new thread creation deferred");
+    false
 }
 
 /// Re-dispatch a stream-cap-deferred action after
-/// [`STREAM_CAP_RETRY_DELAY_MS`]. Detached: the loop self-terminates when a
-/// retry finds capacity, when the source view is dropped (`update_in`
-/// errors), or when the watchdog clears a wedged stream that was holding a
-/// slot forever.
+/// [`STREAM_CAP_RETRY_DELAY_MS`]. Detached. The loop now owns the starvation
+/// budget (issue 018): each requeue carries an incremented deferral count
+/// back into [`dispatch_action_with_attempts`], which either defers again
+/// (loop continues), escalates past the cap at [`STREAM_CAP_MAX_DEFERRALS`]
+/// (dispatches, loop ends), or finds capacity (dispatches, loop ends). The
+/// loop also ends when the source view is dropped (`update_in` errors).
 fn spawn_stream_cap_retry(
     action: auto_prompt::AutoPromptAction,
+    deferrals: u32,
     window: &mut Window,
     cx: &mut gpui::Context<crate::ConversationView>,
 ) {
     cx.spawn_in(window, async move |view, cx| {
-        cx.background_executor()
-            .timer(std::time::Duration::from_millis(STREAM_CAP_RETRY_DELAY_MS))
-            .await;
-        if let Err(err) = view.update_in(cx, |view, window, cx| {
-            log::info!("[auto_prompt] stream-cap queue: retrying deferred dispatch");
-            dispatch_action(action, view, window, cx);
-        }) {
-            log::warn!("[auto_prompt] stream-cap queue abandoned (view dropped): {err}");
+        let mut deferrals = deferrals;
+        loop {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(STREAM_CAP_RETRY_DELAY_MS))
+                .await;
+            let deferred = view.update_in(cx, |view, window, cx| {
+                log::info!("[auto_prompt] stream-cap queue: retrying deferred dispatch");
+                dispatch_action_with_attempts(action.clone(), view, window, cx, deferrals)
+            });
+            match deferred {
+                Ok(true) => deferrals += 1,
+                Ok(false) => break,
+                Err(err) => {
+                    log::warn!("[auto_prompt] stream-cap queue abandoned (view dropped): {err}");
+                    break;
+                }
+            }
         }
     })
     .detach();
@@ -2131,6 +2229,47 @@ pub fn cancel_watchdog_for_thread(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Issue 018: the stream-cap gate must stay dispatch-under-cap, defer
+    // with budget left, and escalate at the bound — a saturated farm may
+    // delay a chain but never starve it forever.
+    #[test]
+    fn stream_cap_decision_dispatches_under_cap() {
+        assert_eq!(
+            stream_cap_decision(0, 2, 0),
+            StreamCapDecision::Dispatch
+        );
+        assert_eq!(
+            stream_cap_decision(1, 2, 0),
+            StreamCapDecision::Dispatch
+        );
+        // Cap 0 resolves to usize::MAX (unlimited) before this fn runs; any
+        // finite count is then "under cap".
+        assert_eq!(
+            stream_cap_decision(5, usize::MAX, 0),
+            StreamCapDecision::Dispatch
+        );
+    }
+
+    #[test]
+    fn stream_cap_decision_defers_then_escalates_at_bound() {
+        assert_eq!(
+            stream_cap_decision(2, 2, 0),
+            StreamCapDecision::Defer
+        );
+        assert_eq!(
+            stream_cap_decision(5, 2, STREAM_CAP_MAX_DEFERRALS - 1),
+            StreamCapDecision::Defer
+        );
+        assert_eq!(
+            stream_cap_decision(5, 2, STREAM_CAP_MAX_DEFERRALS),
+            StreamCapDecision::Escalate
+        );
+        assert_eq!(
+            stream_cap_decision(5, 2, STREAM_CAP_MAX_DEFERRALS + 50),
+            StreamCapDecision::Escalate
+        );
+    }
 
     // Plan 023 B3: drafts are keyed by session id, stash skips empties, take
     // removes (once).

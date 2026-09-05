@@ -127,6 +127,15 @@ pub struct AutoPromptConfig {
     /// restart. Env equivalent: ZED_AUTO_PROMPT_PAUSED ("0"/"false" = off).
     #[serde(default = "default_paused")]
     pub paused: bool,
+
+    /// Cap on concurrently-generating threads before a background new-thread
+    /// fork (auto-decided continuation) is queued for retry instead of
+    /// dispatched (issue 006 P2). Manual and auto-focus dispatches bypass the
+    /// cap entirely. `0` = unlimited. Queued forks escalate past the cap after
+    /// 20 minutes of starvation (agent_ui `STREAM_CAP_MAX_DEFERRALS`) so a
+    /// saturated agent farm can never starve a chain forever (issue 018).
+    #[serde(default = "default_max_concurrent_streams")]
+    pub max_concurrent_streams: usize,
 }
 
 fn default_max_iterations() -> u32 {
@@ -183,8 +192,17 @@ fn default_housekeeping_command() -> Option<String> {
     Some("housekeeping".to_string())
 }
 
+/// Default for [`AutoPromptConfig::max_concurrent_streams`]: the cap on
+/// concurrently-generating threads before auto_prompt queues new background
+/// continuations (issue 006 P2).
+pub const DEFAULT_MAX_CONCURRENT_STREAMS: usize = 2;
+
 fn default_paused() -> bool {
     false
+}
+
+fn default_max_concurrent_streams() -> usize {
+    DEFAULT_MAX_CONCURRENT_STREAMS
 }
 
 fn default_elicitation_auto_answer_enabled() -> bool {
@@ -213,6 +231,7 @@ impl Default for AutoPromptConfig {
             elicitation_auto_answer_enabled: default_elicitation_auto_answer_enabled(),
             elicitation_countdown_secs: default_elicitation_countdown_secs(),
             paused: default_paused(),
+            max_concurrent_streams: default_max_concurrent_streams(),
         }
     }
 }
@@ -343,6 +362,12 @@ impl AutoPromptConfig {
             .map(|v| !matches!(v.as_str(), "0" | "false"))
             .unwrap_or_else(default_paused);
 
+        let max_concurrent_streams =
+            std::env::var("ZED_AUTO_PROMPT_MAX_CONCURRENT_STREAMS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(default_max_concurrent_streams);
+
         Self {
             system_prompt,
             max_iterations,
@@ -359,6 +384,7 @@ impl AutoPromptConfig {
             elicitation_auto_answer_enabled,
             elicitation_countdown_secs,
             paused,
+            max_concurrent_streams,
         }
     }
 
@@ -483,5 +509,25 @@ mod tests {
         assert!(!AutoPromptConfig::default().paused);
         let config: AutoPromptConfig = serde_json::from_str(r#"{"paused": true}"#).unwrap();
         assert!(config.paused);
+    }
+
+    #[test]
+    fn max_concurrent_streams_defaults_and_overrides() {
+        // Issue 018: the dispatch cap must be raiseable for multi-agent
+        // workloads; missing field falls back to the issue-006 default, and
+        // 0 means unlimited.
+        assert_eq!(default_max_concurrent_streams(), 2);
+        assert_eq!(
+            AutoPromptConfig::default().max_concurrent_streams,
+            DEFAULT_MAX_CONCURRENT_STREAMS
+        );
+        let config: AutoPromptConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.max_concurrent_streams, 2);
+        let config: AutoPromptConfig =
+            serde_json::from_str(r#"{"max_concurrent_streams": 6}"#).unwrap();
+        assert_eq!(config.max_concurrent_streams, 6);
+        let config: AutoPromptConfig =
+            serde_json::from_str(r#"{"max_concurrent_streams": 0}"#).unwrap();
+        assert_eq!(config.max_concurrent_streams, 0);
     }
 }

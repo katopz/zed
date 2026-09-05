@@ -25,7 +25,9 @@ pub fn set_plan_source_git_spawns_disabled(disabled: bool) {
     plan_source::set_git_spawns_disabled(disabled);
 }
 
-pub use config::{AutoPromptConfig, default_max_context_tokens};
+pub use config::{
+    AutoPromptConfig, DEFAULT_MAX_CONCURRENT_STREAMS, default_max_context_tokens,
+};
 pub use context::{
     AutoPromptContext, AutoPromptResponse, PlanFileContent, StopPhase, truncate_to_paragraph_budget,
 };
