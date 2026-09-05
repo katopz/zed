@@ -24,8 +24,8 @@ use agent_client_protocol::schema::v1 as acp;
 use anyhow::Context as _;
 use futures::{StreamExt, future, pin_mut};
 use language_model::{
-    LanguageModel, LanguageModelCompletionEvent, LanguageModelRequest,
-    LanguageModelRequestMessage, Role,
+    LanguageModel, LanguageModelCompletionEvent, LanguageModelRequest, LanguageModelRequestMessage,
+    Role,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -41,8 +41,9 @@ const OTHER_FIELD: &str = "other";
 /// id (string); armed in `arm_if_enabled`, cleared on
 /// `AcpThreadEvent::ElicitationResponded`. The card reads it on every frame
 /// (the countdown label is animation-driven) so lookups must be cheap.
-static AUTO_ANSWER_DEADLINES: std::sync::RwLock<Option<std::collections::HashMap<String, Instant>>> =
-    std::sync::RwLock::new(None);
+static AUTO_ANSWER_DEADLINES: std::sync::RwLock<
+    Option<std::collections::HashMap<String, Instant>>,
+> = std::sync::RwLock::new(None);
 
 pub(crate) fn set_deadline(elicitation_id: &ElicitationEntryId, deadline: Instant) {
     let mut guard = AUTO_ANSWER_DEADLINES
@@ -73,10 +74,7 @@ pub(crate) fn deadline_for(elicitation_id: &ElicitationEntryId) -> Option<Instan
 /// The visible countdown text for an armed elicitation. Pure (takes `now`)
 /// so the card can recompute it every animation frame without hidden state.
 /// `None` when no auto-answer is armed for this elicitation.
-pub(crate) fn countdown_text(
-    elicitation_id: &ElicitationEntryId,
-    now: Instant,
-) -> Option<String> {
+pub(crate) fn countdown_text(elicitation_id: &ElicitationEntryId, now: Instant) -> Option<String> {
     let deadline = deadline_for(elicitation_id)?;
     let remaining = deadline.saturating_duration_since(now);
     Some(if remaining.is_zero() {
@@ -122,7 +120,12 @@ pub(crate) fn extract_question(
         let enum_labels: Vec<String> = string_schema
             .one_of
             .as_ref()
-            .map(|options| options.iter().map(|option| option.value.clone()).collect::<Vec<_>>())
+            .map(|options| {
+                options
+                    .iter()
+                    .map(|option| option.value.clone())
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default()
             .into_iter()
             .chain(string_schema.enum_values.clone().unwrap_or_default())
@@ -159,7 +162,10 @@ fn build_accept_response(
 ) -> acp::CreateElicitationResponse {
     let mut content: BTreeMap<String, acp::ElicitationContentValue> = BTreeMap::new();
     if let Some(field) = &question.choice_field {
-        content.insert(field.clone(), acp::ElicitationContentValue::String(choice.to_string()));
+        content.insert(
+            field.clone(),
+            acp::ElicitationContentValue::String(choice.to_string()),
+        );
     }
     if let (Some(field), Some(rationale)) = (question.free_text_field.as_deref(), rationale) {
         let combined = if rationale.contains(choice) {
@@ -167,7 +173,10 @@ fn build_accept_response(
         } else {
             format!("{choice} — {rationale}")
         };
-        content.insert(field.to_string(), acp::ElicitationContentValue::String(combined));
+        content.insert(
+            field.to_string(),
+            acp::ElicitationContentValue::String(combined),
+        );
     }
     acp::CreateElicitationResponse::new(acp::ElicitationAction::Accept(
         acp::ElicitationAcceptAction::new().content(content),
@@ -178,7 +187,11 @@ fn build_accept_response(
 /// recommended default), or Decline when the form has no options to pick.
 fn build_fallback_response(question: &ElicitationQuestion) -> acp::CreateElicitationResponse {
     match question.options.first() {
-        Some(first) => build_accept_response(question, first, Some("auto-selected default (countdown expired)")),
+        Some(first) => build_accept_response(
+            question,
+            first,
+            Some("auto-selected default (countdown expired)"),
+        ),
         None => acp::CreateElicitationResponse::new(acp::ElicitationAction::Decline),
     }
 }
@@ -307,9 +320,7 @@ pub fn arm_if_enabled(
 ) {
     let config = auto_prompt::load_config_cached().unwrap_or_default();
     if !config.elicitation_auto_answer_enabled {
-        log::debug!(
-            "[auto_prompt::elicitation_auto_answer] skipping — disabled in config"
-        );
+        log::debug!("[auto_prompt::elicitation_auto_answer] skipping — disabled in config");
         return;
     }
 
@@ -343,7 +354,11 @@ pub fn arm_if_enabled(
         question.message,
         question.options.len(),
         countdown.as_secs(),
-        if model.is_some() { "on" } else { "OFF — backstop only" }
+        if model.is_some() {
+            "on"
+        } else {
+            "OFF — backstop only"
+        }
     );
     // Register the deadline BEFORE spawning so the countdown label renders
     // on the card's very next frame, not one countdown late.
@@ -510,9 +525,10 @@ mod tests {
 
     #[test]
     fn test_build_accept_response_fields() {
-        let question = extract_question(&ask_user_request(&["Approach A", "Approach B"], true))
-            .unwrap();
-        let response = build_accept_response(&question, "Approach A", Some("safer, keeps behaviour"));
+        let question =
+            extract_question(&ask_user_request(&["Approach A", "Approach B"], true)).unwrap();
+        let response =
+            build_accept_response(&question, "Approach A", Some("safer, keeps behaviour"));
         let acp::ElicitationAction::Accept(accept) = &response.action else {
             panic!("expected Accept");
         };
@@ -531,8 +547,8 @@ mod tests {
 
     #[test]
     fn test_build_fallback_response_first_option() {
-        let question = extract_question(&ask_user_request(&["Approach A", "Approach B"], false))
-            .unwrap();
+        let question =
+            extract_question(&ask_user_request(&["Approach A", "Approach B"], false)).unwrap();
         let response = build_fallback_response(&question);
         let acp::ElicitationAction::Accept(accept) = &response.action else {
             panic!("expected Accept");
@@ -548,10 +564,7 @@ mod tests {
     fn test_build_fallback_response_no_options_declines() {
         let question = extract_question(&ask_user_request(&[], true)).unwrap();
         let response = build_fallback_response(&question);
-        assert!(matches!(
-            response.action,
-            acp::ElicitationAction::Decline
-        ));
+        assert!(matches!(response.action, acp::ElicitationAction::Decline));
     }
 
     #[test]

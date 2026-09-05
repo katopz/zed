@@ -992,12 +992,7 @@ impl ThreadMetadataStore {
     /// Set or clear the pinned state for a thread. Pinned threads float to the
     /// top of their sidebar project group. Emits `ThreadPinned` so observers
     /// can rebuild entries without polling.
-    pub fn set_pinned(
-        &mut self,
-        thread_id: ThreadId,
-        pinned: bool,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn set_pinned(&mut self, thread_id: ThreadId, pinned: bool, cx: &mut Context<Self>) {
         if let Some(thread) = self.threads.get(&thread_id) {
             if thread.pinned == pinned {
                 return;

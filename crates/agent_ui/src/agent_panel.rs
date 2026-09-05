@@ -4695,14 +4695,12 @@ impl AgentPanel {
                 if skip_view.is_some_and(|id| id == view.entity_id()) {
                     return false;
                 }
-                view.read(cx)
-                    .active_thread()
-                    .is_some_and(|thread_view| {
-                        matches!(
-                            thread_view.read(cx).thread.read(cx).status(),
-                            acp_thread::ThreadStatus::Generating
-                        )
-                    })
+                view.read(cx).active_thread().is_some_and(|thread_view| {
+                    matches!(
+                        thread_view.read(cx).thread.read(cx).status(),
+                        acp_thread::ThreadStatus::Generating
+                    )
+                })
             })
             .count()
     }
@@ -12180,10 +12178,14 @@ mod tests {
             open_generating_thread_with_loadable_connection(&panel, &connection, &mut cx);
 
         let active_view = panel.update(&mut cx, |panel, _cx| {
-            panel.active_conversation_view().expect("active view").clone()
+            panel
+                .active_conversation_view()
+                .expect("active view")
+                .clone()
         });
-        let workspace = active_view
-            .read_with(&cx, |view, _| view.workspace().upgrade().expect("workspace"));
+        let workspace = active_view.read_with(&cx, |view, _| {
+            view.workspace().upgrade().expect("workspace")
+        });
         workspace.update_in(&mut cx, |workspace, window, cx| {
             workspace.add_panel(panel.clone(), window, cx);
         });
@@ -12245,9 +12247,8 @@ mod tests {
 
         // Advance past the retry delay; the queued dispatch must now create
         // the continuation thread.
-        cx.executor().advance_clock(std::time::Duration::from_millis(
-            5_000,
-        ));
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(5_000));
         cx.run_until_parked();
 
         panel.read_with(&cx, |panel, _cx| {
