@@ -44,6 +44,54 @@ fn take_stashed_draft(session_id: &str) -> Option<String> {
     guard.as_mut().and_then(|map| map.remove(session_id))
 }
 
+/// Combine the stashed and live drafts for dispatch (plan 023 B3). The stash
+/// wins; `live_editor_overwritten` marks callers whose subsequent `set_message`
+/// destroys the editor contents (same-thread continuation) — there an
+/// unconsumed live text would be lost, so it is joined onto the stashed draft.
+/// Returns the draft and whether the caller must clear the live editor (only
+/// when a live draft was consumed and the caller does not overwrite it).
+fn merge_user_draft(
+    stashed: Option<String>,
+    live: Option<String>,
+    live_editor_overwritten: bool,
+) -> (Option<String>, bool) {
+    match (stashed, live, live_editor_overwritten) {
+        (Some(stashed), Some(live), true) => (Some(format!("{stashed}\n\n{live}")), false),
+        (Some(stashed), _, _) => (Some(stashed), false),
+        (None, live, overwritten) => {
+            let clear = live.is_some() && !overwritten;
+            (live, clear)
+        }
+    }
+}
+
+/// Resolve the user's input-box draft for a dispatch: the draft stashed at
+/// Phase-1/clarify time first (set_message + send destroy the live editor),
+/// then a live read of the active editor. Shared by the same-thread and
+/// new-thread paths.
+fn take_user_draft(
+    conversation_view: &crate::ConversationView,
+    session_key: &str,
+    live_editor_overwritten: bool,
+    cx: &gpui::App,
+) -> (Option<String>, bool) {
+    let live_draft = conversation_view.active_thread().and_then(|active_tv| {
+        let text = active_tv
+            .read(cx)
+            .message_editor
+            .read(cx)
+            .text(cx)
+            .trim()
+            .to_string();
+        (!text.is_empty()).then_some(text)
+    });
+    merge_user_draft(
+        take_stashed_draft(session_key),
+        live_draft,
+        live_editor_overwritten,
+    )
+}
+
 /// Stash the user's current input-box draft for `active_tv`'s thread, if any.
 /// Call BEFORE any `set_message` on the same editor — the editor overwrite is
 /// exactly what destroys the draft otherwise.
@@ -531,24 +579,26 @@ pub(crate) fn dispatch_action(
     // → summarize → new thread when tokens exceed the limit.
     if !use_new_thread {
         if let Some(active_tv) = conversation_view.active_thread() {
-            // Check if the user is mid-composition in the active thread's editor.
-            // The same-thread path overwrites the editor via set_message, which
-            // would destroy the user's draft. We log the state for diagnosis.
-            let editor_has_text = active_tv
-                .read(cx)
-                .message_editor
-                .read(cx)
-                .text(cx)
-                .trim()
-                .is_empty();
-            log::info!(
-                "[auto_prompt] SAME-THREAD continuation: editor_was_empty={}, sending to same thread (tokens={:?})",
-                editor_has_text,
-                action.actual_input_tokens
-            );
+            // Plan 023 B3: carry the user's input-box draft into the
+            // continuation with the same precedence as the new-thread path
+            // (stashed first, then live). set_message below overwrites the
+            // editor, so a consumed live draft needs no separate clear — and
+            // an unconsumed live text is joined onto the stashed draft
+            // instead of being destroyed by the overwrite.
+            let session_key = action.from_session_id.to_string();
+            let (draft, _clear_live_editor) =
+                take_user_draft(conversation_view, &session_key, true, cx);
+            if let Some(draft) = draft.as_deref() {
+                log::info!(
+                    "[auto_prompt] SAME-THREAD continuation: carrying input-box draft ({} chars) as ## 4. Addition request (tokens={:?})",
+                    draft.len(),
+                    action.actual_input_tokens
+                );
+            }
             let decision = strip_first_prompt_wrapper(&action.next_prompt);
             let mut prompt =
                 build_continuation_prompt(action.last_assistant_message.as_deref(), &decision);
+            prompt = auto_prompt::append_addition_request(&prompt, draft.as_deref());
             if let Some(start_context) = start_context.as_deref() {
                 prompt.push_str("\n\n---\n\n");
                 prompt.push_str(start_context);
@@ -622,7 +672,9 @@ pub(crate) fn dispatch_action(
             .upgrade()
             .and_then(|workspace| workspace.read(cx).panel::<crate::AgentPanel>(cx))
             .map(|panel| {
-                panel.read(cx).generating_thread_count(cx, Some(dispatching_view_id))
+                panel
+                    .read(cx)
+                    .generating_thread_count(cx, Some(dispatching_view_id))
             })
             .unwrap_or(0);
         if generating >= MAX_CONCURRENT_STREAMING_THREADS {
@@ -639,24 +691,11 @@ pub(crate) fn dispatch_action(
     let decision_prompt = auto_prompt::extract_decision_prompt(&action.next_prompt);
 
     // Plan 023 B3 (req 2.1): carry the user's input-box draft into the new
-    // thread as `## 4. Addition request`. Prefer the draft stashed at
-    // Phase-1/clarify time (set_message + send destroy it); fall back to a
-    // live read for the voluntary-summary path, which skips Phase 1.
+    // thread as `## 4. Addition request`, via the same resolution as the
+    // same-thread path. The editor survives here, so an unconsumed live text
+    // stays put instead of being joined onto the stashed draft.
     let session_key = action.from_session_id.to_string();
-    let live_draft = conversation_view.active_thread().and_then(|active_tv| {
-        let text = active_tv
-            .read(cx)
-            .message_editor
-            .read(cx)
-            .text(cx)
-            .trim()
-            .to_string();
-        (!text.is_empty()).then_some(text)
-    });
-    let (draft, clear_live_editor) = match take_stashed_draft(&session_key) {
-        Some(stashed) => (Some(stashed), false),
-        None => (live_draft.clone(), live_draft.is_some()),
-    };
+    let (draft, clear_live_editor) = take_user_draft(conversation_view, &session_key, false, cx);
     if clear_live_editor {
         // The live draft rides in the new thread; clear it here so it is
         // neither lost nor duplicated.
@@ -2109,6 +2148,47 @@ mod tests {
     fn draft_stash_ignores_empty_drafts() {
         stash_draft("draft-empty-test", "   ".to_string());
         assert_eq!(take_stashed_draft("draft-empty-test"), None);
+    }
+
+    // Plan 023 B3: the stash wins in both dispatch paths; the live editor is
+    // only cleared when a live draft was consumed and the caller leaves it
+    // intact (new-thread path). The same-thread path overwrites the editor,
+    // so an unconsumed live text joins the stashed draft instead of dying.
+    #[test]
+    fn merge_user_draft_stash_wins_editor_preserved() {
+        let (draft, clear) =
+            merge_user_draft(Some("stashed".to_string()), Some("live".to_string()), false);
+        assert_eq!(draft.as_deref(), Some("stashed"));
+        assert!(!clear);
+    }
+
+    #[test]
+    fn merge_user_draft_stash_wins_overwrite_joins_live() {
+        let (draft, clear) =
+            merge_user_draft(Some("stashed".to_string()), Some("live".to_string()), true);
+        assert_eq!(draft.as_deref(), Some("stashed\n\nlive"));
+        assert!(!clear);
+    }
+
+    #[test]
+    fn merge_user_draft_live_fallback_needs_clear_when_preserved() {
+        let (draft, clear) = merge_user_draft(None, Some("live".to_string()), false);
+        assert_eq!(draft.as_deref(), Some("live"));
+        assert!(clear);
+    }
+
+    #[test]
+    fn merge_user_draft_live_fallback_overwrite_needs_no_clear() {
+        let (draft, clear) = merge_user_draft(None, Some("live".to_string()), true);
+        assert_eq!(draft.as_deref(), Some("live"));
+        assert!(!clear);
+    }
+
+    #[test]
+    fn merge_user_draft_none_yields_none() {
+        let (draft, clear) = merge_user_draft(None, None, true);
+        assert_eq!(draft, None);
+        assert!(!clear);
     }
 
     // Plan 023 E: housekeeping fires at most once per session.
