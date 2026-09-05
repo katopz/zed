@@ -1884,8 +1884,13 @@ impl ConversationView {
                         cx,
                     );
 
+                    // Gate on the STOPPED thread's own toggle, not whatever
+                    // thread the user happens to be viewing: a background
+                    // thread's chain must not die silently because the
+                    // focused view has auto-prompt off (issue 018 follow-up;
+                    // same resolution principle as the elicitation arm above).
                     let auto_prompt_enabled = self
-                        .active_thread()
+                        .thread_view(&session_id)
                         .is_some_and(|tv| tv.read(cx).auto_prompt_enabled);
                     if auto_prompt_enabled {
                         let has_in_progress = thread.read(cx).has_in_progress_tool_calls();
@@ -1903,8 +1908,11 @@ impl ConversationView {
                                 // arming at this point would start the timer during
                                 // the orchestration LLM call (before the worker
                                 // begins generating).
-                                if let Some(active) = self.active_thread() {
-                                    active.update(cx, |active, cx| {
+                                // Store on the stopped thread's own view: the task
+                                // belongs to that thread's chain, not to whichever
+                                // thread is focused (issue 018 follow-up).
+                                if let Some(stopped_view) = self.thread_view(&session_id) {
+                                    stopped_view.update(cx, |active, cx| {
                                         active._auto_prompt_task = Some(task);
                                         cx.notify();
                                     });
@@ -1969,8 +1977,11 @@ impl ConversationView {
                     } else {
                         "Session"
                     };
+                    // Same session-scoped resolution as the Stopped path: the
+                    // errored (background) thread's own toggle decides both
+                    // the notification wording and whether the chain continues.
                     let auto_prompt_enabled = self
-                        .active_thread()
+                        .thread_view(&session_id)
                         .is_some_and(|tv| tv.read(cx).auto_prompt_enabled);
                     let (notification, icon) = match (&session_limit, auto_prompt_enabled) {
                         (Some(limit), true) => (
@@ -2015,6 +2026,10 @@ impl ConversationView {
                     };
 
                     if sent_queued_message {
+                        // Reset the QUEUED THREAD's chain state (the queue lives
+                        // on the root/active view that just auto-sent), matching
+                        // the pre-existing active-view resolution here — the
+                        // queued entry was dispatched from this view.
                         if let Some(active) = self.active_thread() {
                             active.update(cx, |active, cx| {
                                 if active._auto_prompt_task.is_some() {
@@ -2027,7 +2042,7 @@ impl ConversationView {
                         }
                     } else {
                         let auto_prompt_enabled = self
-                            .active_thread()
+                            .thread_view(&session_id)
                             .is_some_and(|tv| tv.read(cx).auto_prompt_enabled);
                         let has_in_progress = thread.read(cx).has_in_progress_tool_calls();
                         if has_in_progress {
@@ -2039,7 +2054,7 @@ impl ConversationView {
                             // Don't override a task already set by the Stopped handler.
                             // Error events can fire alongside Stopped (e.g. MaxTokens emits both).
                             let already_has_task = self
-                                .active_thread()
+                                .thread_view(&session_id)
                                 .is_some_and(|tv| tv.read(cx)._auto_prompt_task.is_some());
                             if already_has_task {
                                 log::info!(
@@ -2055,8 +2070,10 @@ impl ConversationView {
                             ) {
                                 // The watchdog is armed inside send_content when
                                 // the next generation actually starts.
-                                if let Some(active) = self.active_thread() {
-                                    active.update(cx, |active, cx| {
+                                // Store on the errored thread's own view, matching
+                                // the Stopped path (issue 018 follow-up).
+                                if let Some(errored_view) = self.thread_view(&session_id) {
+                                    errored_view.update(cx, |active, cx| {
                                         active._auto_prompt_task = Some(task);
                                         cx.notify();
                                     });

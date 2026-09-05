@@ -49,6 +49,19 @@ continuation worked. The summary fast path itself was never at fault.
       (agent_ui) + `max_concurrent_streams_defaults_and_overrides`
       (auto_prompt config serde). Full `auto_prompt` lib suite 404/404.
 
+## Follow-up: silent-skip gates resolved against the wrong thread (`<hash>`)
+
+Log re-review (19:10–19:46 window) caught two threads stopping normally
+(19:21:08, 19:32:24) with **no** `on_thread_stopped` entry point. Root cause
+of the skip class: the `Stopped`/`Error` handlers in `conversation_view.rs`
+gated auto-prompt on `self.active_thread()` — the thread the user is
+VIEWING — instead of the thread that stopped. A background chain died
+silently whenever the focused view had auto-prompt off. Fixed by resolving
+the gate, the `already_has_task` check, and the `_auto_prompt_task` storage
+by `session_id` (same principle the elicitation path already documented).
+The queued-message reset intentionally stays active-view (the queue
+dispatches from the root view).
+
 ## Known race left open (pre-existing)
 
 A queued loop is not cancelled when the user manually continues the same
