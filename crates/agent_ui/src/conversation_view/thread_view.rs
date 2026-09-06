@@ -43,7 +43,9 @@ use language_model::{
     LanguageModelProvider, LanguageModelProviderId, LanguageModelRegistry, Speed,
 };
 use notifications::status_toast::StatusToast;
-use settings::{SettingsStore, update_settings_file, update_settings_file_with_completion};
+use settings::{
+    SettingsStore, VerdictReviewerSetting, update_settings_file, update_settings_file_with_completion,
+};
 use ui::{
     ButtonLike, CalloutBorderPosition, Checkbox, SpinnerLabel, SpinnerVariant, SplitButton,
     SplitButtonStyle, Tab, ToggleState,
@@ -6334,6 +6336,17 @@ impl ThreadView {
         }
     }
 
+    /// Honest label for the verdict entry points: only the `claude_code`
+    /// reviewer backend is actually Claude; the default native route spawns a
+    /// subagent on `verdict_model` (inheriting the parent's own model when
+    /// unset), so calling it "Claude" there would misrepresent the review.
+    fn verdict_label(cx: &App) -> &'static str {
+        match AgentSettings::get_global(cx).verdict_reviewer {
+            VerdictReviewerSetting::ClaudeCode => "Verdict with Claude",
+            VerdictReviewerSetting::Native => "Request Verdict",
+        }
+    }
+
     fn verdict_request_prompt(max_rounds: usize, addition: Option<&str>) -> String {
         let mut prompt = format!(
             "Request a second-opinion verdict on your latest `## Summary` from a fresh reviewer thread:\n\n\
@@ -6344,10 +6357,11 @@ impl ThreadView {
              2. If the reply starts with `#Verdict: REVISE`, address every reason with evidence, then \
              call `request_verdict` again with the SAME `session_id` so the negotiation continues in \
              the same thread. Never start a new session mid-negotiation.\n\
-             3. When the reviewer replies `#Verdict: AGREE` and you agree with it, reply \
-             `#Verdict: AGREE` yourself, restate the final agreed summary in the `## Summary` \
-             format, and stop \u{2014} pass `final_round: true` on that closing call so the reviewer \
-             session is freed.\n\
+             3. When the reviewer replies `#Verdict: AGREE` and you agree with it, close the \
+             negotiation: reply `#Verdict: AGREE` yourself and state that both sides agree, \
+             so no more verdict rounds are needed. Restate the final agreed summary in the \
+             `## Summary` format and stop \u{2014} pass `final_round: true` on that closing call so \
+             the reviewer session is freed.\n\
              4. Hard cap: {max_rounds} rounds. If you reach the cap, stop calling the tool and \
              present the remaining disagreement to the user."
         );
@@ -6383,7 +6397,11 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.is_subagent() || self.thread.read(cx).status() != ThreadStatus::Idle {
+        if self.is_subagent()
+            || self.thread.read(cx).connection().agent_id().as_ref()
+                != agent::ZED_AGENT_ID.as_ref()
+            || self.thread.read(cx).status() != ThreadStatus::Idle
+        {
             return;
         }
 
@@ -7837,10 +7855,13 @@ impl ThreadView {
 
         // Verdict ping-pong (proposal 001): sits right behind "Copy Summary"
         // and only when that button does — a summary to review must exist.
-        // Root views only (subagents can't spawn reviewers); set
+        // Root views only (subagents can't spawn reviewers) of native agent
+        // threads (external agents don't have `request_verdict`); set
         // agent.verdict_ping_pong = false to hide it.
         let verdict_button = (AgentSettings::get_global(cx).verdict_ping_pong
-            && !self.is_subagent())
+            && !self.is_subagent()
+            && thread.read(cx).connection().agent_id().as_ref()
+                == agent::ZED_AGENT_ID.as_ref())
         .then(|| {
             copy_response_index.filter(|&response_index| {
                 Self::get_agent_summary_content(thread.read(cx).entries(), response_index, cx)
@@ -7853,7 +7874,7 @@ impl ThreadView {
                 .icon_size(IconSize::Small)
                 .icon_color(Color::Muted)
                 .disabled(is_generating)
-                .tooltip(Tooltip::text("Verdict with Claude"))
+                .tooltip(Tooltip::text(Self::verdict_label(cx)))
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.handle_request_verdict_click(window, cx);
                 }))
@@ -9399,7 +9420,7 @@ impl ThreadView {
                             }
                         });
 
-                    let verdict_entry = ContextMenuEntry::new("Verdict with Claude")
+                    let verdict_entry = ContextMenuEntry::new(Self::verdict_label(cx))
                         .disabled(!verdict_ready)
                         .handler({
                             let entity = entity.clone();

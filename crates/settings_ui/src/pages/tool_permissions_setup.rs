@@ -1426,6 +1426,9 @@ mod tests {
             // tool calls inside the spawned thread, not the spawning itself.
             "create_thread",
             "spawn_agent",
+            // The verdict reviewer runs in its own thread; permission checks
+            // apply to the tools it invokes there, not the negotiation.
+            "request_verdict",
         ];
 
         let tool_info_ids: Vec<&str> = TOOLS.iter().map(|t| t.id).collect();

@@ -217,6 +217,7 @@ tools! {
     MovePathTool,
     ReadFileTool,
     RenameTool,
+    RequestVerdictTool,
     SkillTool,
     SpawnAgentTool,
     TerminalTool,
