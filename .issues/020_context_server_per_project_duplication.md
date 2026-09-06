@@ -64,8 +64,9 @@ extension API surface.
 
 ## Refs
 
-- `.issues/006_auto_prompt_cpu_drain_analysis.md` — deferred P1 item, resolved
-  as by-design with this evidence (2026-09-06).
+- `.docs/006_auto_prompt_cpu_drain_p0_fixes.md` — the deferred P1 item was
+  resolved as by-design with this evidence (2026-09-06); this issue is the
+  design-fix follow-up.
 - `crates/project/src/context_server_store.rs` — `new_internal` (per-store
   subscriptions), `maintain_servers` (fleet expansion), `run_server` (guard).
 - `crates/project/src/project.rs` L1231 — per-project store construction.

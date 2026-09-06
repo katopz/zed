@@ -93,6 +93,6 @@ reap regression becomes visible.
 | `crates/zed/src/main.rs` | `raise_open_file_limit()` |
 | `crates/zed/Cargo.toml` | `libc.workspace = true` |
 
-Related: `.issues/006_auto_prompt_cpu_drain_analysis.md` (zombie reaping P1,
+Related: `.docs/006_auto_prompt_cpu_drain_p0_fixes.md` (zombie reaping P1,
 retained threads), upstream zed-industries/zed#63418 (terminal tool degradation
 in long agent sessions).

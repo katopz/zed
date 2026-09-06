@@ -73,5 +73,5 @@ unbounded queue had the same race with worse timing). Candidate follow-up:
 suppress the queue when the source session already has a `continued_from`
 successor in `ThreadMetadataStore`.
 
-Related: `.issues/006_auto_prompt_cpu_drain_analysis.md` (P2 cap origin),
+Related: `.docs/006_auto_prompt_cpu_drain_p0_fixes.md` (P2 cap origin),
 `.issues/017_fd_exhaustion_terminal_tool.md` (same session family).

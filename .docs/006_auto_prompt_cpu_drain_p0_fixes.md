@@ -1,7 +1,8 @@
 # 006 — auto_prompt CPU drain: P0 fixes
 
 ## Status
-- [x] Diagnosis filed (`.issues/006_auto_prompt_cpu_drain_analysis.md`)
+- [x] Diagnosis filed — analysis absorbed into this doc (Resolution section
+      below); original file removed from `.issues/` 2026-09-06
 - [x] P0 fixes implemented (this doc)
 - [x] `cargo clippy` clean on `auto_prompt` and `agent_ui`
 - [x] `cargo test -p auto_prompt --lib` — 250/250 pass (6 new tests added)
@@ -261,4 +262,32 @@ Validation: `cargo test -p agent_ui --lib` 469/469 (incl. new
 `test_stream_cap_defers_background_continuation_until_slot_frees`),
 `cargo test -p auto_prompt --lib` 403/403, `./script/clippy --package agent_ui` clean.
 
-Remaining: GOAT live CPU measurement (needs a dev build + real sessions).
+## Resolution — GOAT live CPU measurement (2026-09-06)
+
+The last open item — live CPU verification — is measured and closed. Measured
+against the running instance (Zed Dev, started 13:46, 6.5h heavy auto-prompt
+farm session with sibling agents active):
+
+- **Zombie children: 0** (pre-fix pathology: 34 defunct children) — the P1
+  reaping fix in `util::command::darwin::Child::drop` holds under a
+  full-day farm workload.
+- **No sustained multi-core peg**: top per-interval samples 0% → 50% → 43%,
+  with the 43–50% coinciding with this session's own `cargo` release/test
+  builds in the Zed terminal; lifetime average 63% over a build-heavy day.
+  Pre-fix pathology was "1.6 GB RSS + ~36% sustained IDLE CPU + spikes to
+  1500%". A clean-idle re-check on the 16:04 binary rides the next relaunch.
+- **MCP duplicate-spawn (deferred P1 item): resolved as by-design.** Live
+  evidence: 1 window, 8 MCP processes = 2 full generations of the 4
+  configured servers, 1s apart at boot, all direct children of zed; `lsof
+  cwd` attributes one generation to the katgpt-rs farm project and the other
+  to the zed workspace project. Each project's `ContextServerStore` correctly
+  expands the globally-configured fleet — guards are correct within a store;
+  nothing dedupes across stores. Design fix (app-level refcounted registry
+  keyed by resolved config, fork-on-write on config drift) filed as
+  `.issues/020_context_server_per_project_duplication.md`. Not a CPU driver:
+  the duplicates are idle remote-HTTP bridges; the tax is memory/footprint.
+
+Analysis-issue archive note: the original `.issues/006` file (Jul 19 evidence
+tables, root-cause corrections, recommended-fix priorities) was absorbed into
+this doc and removed from `.issues/` per the noise-reduction rule; the raw
+evidence remains in git history (`git log --follow -- .issues/006_*`).
