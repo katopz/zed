@@ -6,7 +6,17 @@
 - [x] Fix proposed (see "Recommended fixes" — pick subset per priority)
 - [x] P0 fixes landed (see `.docs/006_auto_prompt_cpu_drain_p0_fixes.md`)
 - [x] P1 fix landed: zombie reaping in `util::command::darwin::Child::drop` (see `.docs/006_*`)
-- [-] P1 investigation: MCP duplicate-spawn (deferred — needs live debug; guards look correct)
+- [-] P1 investigation: MCP duplicate-spawn (deferred — needs live debug;
+      guards look correct) **→ RESOLVED as by-design 2026-09-06, live debug
+      done:** 1 window, 2 spawn generations 1s apart at boot, all 8 processes
+      direct children of zed, `lsof cwd` proves they belong to TWO projects
+      (katgpt-rs farm project + the zed workspace project) — each
+      `ContextServerStore` correctly expands the globally-configured servers
+      per project; guards are correct within one store. Not a leak, not a
+      race: a design collision (global settings × per-project isolation ×
+      multi-repo farm). Cost: ~4 extra node processes (~100–200 MB) per
+      additional farm project. Design fix filed as
+      `.issues/020_context_server_per_project_duplication.md`.
 - [-] P1 investigation: action_log observer (no change needed — already per-thread, NOT global)
 - [x] P2 fixes (concurrent-stream cap, SSE idle timeout, background decision log):
   - [x] SSE idle timeout — already shipped in `87f48d95c4` (compaction idle timeout
@@ -19,7 +29,18 @@
         bypasses; `AgentPanel::generating_thread_count(cx, skip_view)` counts streams
         across active + retained views (dispatching view skipped — double-lease);
         gate runs BEFORE draft stash/editor clear so a deferring attempt loses nothing
-- [ ] GOAT verified (live CPU measurement after P0+P1+P2 land)
+- [x] GOAT verified (live CPU measurement after P0+P1+P2 land) — measured
+      2026-09-06 against the running instance (started 13:46, 6.5h heavy
+      auto-prompt farm session): **0 zombie children** (was 34 pre-fix; P1
+      reaping works), children all live `Ss`, no sustained multi-core peg
+      (top per-interval 0%→50%→43% — the 43-50% samples coincide with this
+      session's own `cargo` release/test builds in the Zed terminal;
+      lifetime avg 63% over a build-heavy session, vs the pre-fix pathology
+      "1.6 GB RSS + ~36% sustained IDLE CPU + 1500% spikes"). Final
+      clean-idle number rides the next relaunch (running binary predates
+      today's 16:04 install). Residual finding: 4 MCP servers × 2
+      instances — root-caused as per-project store expansion, not a CPU
+      driver; split out to `.issues/020_context_server_per_project_duplication.md`.
 
 ## Correction
 
