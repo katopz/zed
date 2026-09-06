@@ -1,4 +1,4 @@
-use acp_thread::{AcpThread, AgentThreadEntry, AssistantMessageChunk, ToolCall, ToolCallStatus};
+use acp_thread::{AcpThread, AgentThreadEntry, AssistantMessageChunk, ToolCallStatus};
 use chrono::Local;
 use gpui::App;
 use serde::{Deserialize, Serialize};
@@ -97,7 +97,7 @@ pub struct AutoPromptContext {
 }
 
 /// A plan entry with its status.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PlanEntryContext {
     pub content: String,
     pub status: String,
@@ -112,14 +112,14 @@ pub struct PlanFileContent {
 }
 
 /// A single message in the conversation context.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ContextMessage {
     pub role: ContextMessageRole,
     pub content: String,
 }
 
 /// Role of a context message.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextMessageRole {
     User,
@@ -144,6 +144,176 @@ pub struct AutoPromptResponse {
     /// The active plan should be bolded (e.g. **plan 083**) in the summary text.
     #[serde(default)]
     pub thread_summary: Option<String>,
+}
+
+/// Main-thread snapshot of an [`AcpThread`] feeding [`AutoPromptContext`].
+///
+/// Every `cx`-dependent read is already resolved into owned plain data, so
+/// this struct is `Send + 'static` and the O(thread) processing (markdown
+/// stripping, per-chunk caps, JSON pretty-printing, joins, token estimation)
+/// can run on a background thread via [`finish`](Self::finish).
+#[derive(Debug)]
+pub struct AutoPromptContextSnapshot {
+    collected_at: String,
+    current_paths: Vec<String>,
+    session_id: String,
+    title: Option<String>,
+    stop_reason: String,
+    had_error: bool,
+    had_api_error: bool,
+    actual_input_tokens: Option<u64>,
+    entry_count: usize,
+    collect_messages: bool,
+    used_tools: bool,
+    first_user_message: Option<String>,
+    entries: Vec<SnapshotEntry>,
+    /// Raw markdown sources of the trailing consecutive assistant run, in
+    /// reverse entry order. Only gathered on the fast path (token usage
+    /// reported) where `last_assistant_message` cannot be derived from
+    /// `messages`.
+    trailing_assistant_chunks: Vec<String>,
+    current_plan: Vec<SnapshotPlanEntry>,
+    plan_files: Vec<PlanFileContent>,
+    doc_files: Vec<String>,
+    iteration_count: u32,
+}
+
+#[derive(Debug)]
+enum SnapshotEntry {
+    User { source: String },
+    Assistant { chunk_sources: Vec<String> },
+    Plan { content_sources: Vec<String> },
+    Tool(SnapshotToolCall),
+}
+
+/// Resolved `ToolCall`: label/status read out, raw input/output owned.
+#[derive(Debug)]
+struct SnapshotToolCall {
+    label: String,
+    status_label: &'static str,
+    is_edit: bool,
+    raw_input_markdown: Option<String>,
+    raw_input: Option<serde_json::Value>,
+    raw_output: Option<serde_json::Value>,
+}
+
+#[derive(Debug)]
+struct SnapshotPlanEntry {
+    content: String,
+    status: &'static str,
+    priority: &'static str,
+}
+
+impl AutoPromptContextSnapshot {
+    /// Pure, `cx`-free half of [`AutoPromptContext::collect`]: builds the
+    /// context from the snapshot. This is the O(thread) work — safe to run on
+    /// a background thread.
+    pub fn finish(self) -> AutoPromptContext {
+        let mut messages = Vec::with_capacity(if self.collect_messages {
+            self.entries.len()
+        } else {
+            0
+        });
+        let mut modified_files = Vec::new();
+
+        for entry in self.entries {
+            match entry {
+                SnapshotEntry::User { source } => {
+                    if !source.is_empty() {
+                        messages.push(ContextMessage {
+                            role: ContextMessageRole::User,
+                            content: source,
+                        });
+                    }
+                }
+                SnapshotEntry::Assistant { chunk_sources } => {
+                    push_assistant_chunks(&chunk_sources, &mut messages);
+                }
+                SnapshotEntry::Plan { content_sources } => {
+                    let content = content_sources.join("\n");
+                    if !content.is_empty() {
+                        messages.push(ContextMessage {
+                            role: ContextMessageRole::Plan,
+                            content,
+                        });
+                    }
+                }
+                SnapshotEntry::Tool(tool) => {
+                    collect_modified_file(&tool, &mut modified_files);
+                    if self.collect_messages {
+                        let content = serialize_tool_call(&tool);
+                        messages.push(ContextMessage {
+                            role: ContextMessageRole::Tool,
+                            content,
+                        });
+                    }
+                }
+            }
+        }
+
+        let last_assistant_message = if self.collect_messages {
+            join_trailing_assistant_messages(&messages)
+        } else {
+            let mut trailing: Vec<ContextMessage> = Vec::new();
+            push_assistant_chunks(&self.trailing_assistant_chunks, &mut trailing);
+            join_trailing_assistant_messages(&trailing)
+        };
+
+        let active_plan_claims =
+            crate::plan_registry::active_claims_for_others(&self.session_id);
+
+        let mut context = AutoPromptContext {
+            current_datetime: self.collected_at,
+            current_paths: self.current_paths,
+            session_id: self.session_id,
+            title: self.title,
+            messages,
+            used_tools: self.used_tools,
+            entry_count: self.entry_count,
+            current_plan: self
+                .current_plan
+                .into_iter()
+                .map(|entry| PlanEntryContext {
+                    content: entry.content,
+                    status: entry.status.to_string(),
+                    priority: entry.priority.to_string(),
+                })
+                .collect(),
+            plan_files: self.plan_files,
+            doc_files: self.doc_files,
+            stop_reason: self.stop_reason,
+            had_error: self.had_error,
+            had_api_error: self.had_api_error,
+            approximate_token_count: 0,
+            actual_input_tokens: self.actual_input_tokens,
+            iteration_count: self.iteration_count,
+            stop_phase: StopPhase::Working,
+            verification_count: 0,
+            was_truncated: false,
+            plan_has_checkboxes: false,
+            first_plan_filename: String::new(),
+            plan_number: String::new(),
+            first_user_message: self.first_user_message,
+            last_assistant_message,
+            modified_files,
+            active_plan_claims,
+        };
+
+        context.approximate_token_count = context.estimate_token_count();
+
+        log::info!(
+            "[auto_prompt::context] token counts: actual_input_tokens={:?}, estimated_chars_div_4={}",
+            context.actual_input_tokens,
+            context.approximate_token_count
+        );
+
+        // Compute helper fields
+        context.plan_has_checkboxes = context.compute_plan_has_checkboxes();
+        context.first_plan_filename = context.compute_first_plan_filename();
+        context.plan_number = context.compute_plan_number();
+
+        context
+    }
 }
 
 /// Take complete paragraphs until total exceeds `budget` chars.
@@ -174,6 +344,10 @@ impl AutoPromptContext {
     /// `plan_files` should be pre-read from `.plan` folders on disk.
     /// `doc_files` should be pre-read filenames from `.docs` folders on disk.
     /// `iteration_count` tracks how many auto-prompt cycles have occurred.
+    ///
+    /// Sync form of the two-phase pipeline: [`Self::snapshot`] +
+    /// [`AutoPromptContextSnapshot::finish`]. Use the split form to run the
+    /// O(thread) processing off the main thread.
     pub fn collect(
         thread: &AcpThread,
         cx: &App,
@@ -182,7 +356,24 @@ impl AutoPromptContext {
         doc_files: Vec<String>,
         iteration_count: u32,
     ) -> Self {
-        let current_datetime = Local::now().to_rfc3339();
+        Self::snapshot(thread, cx, stop_reason, plan_files, doc_files, iteration_count).finish()
+    }
+
+    /// Main-thread phase of [`Self::collect`]: resolves every `cx`-dependent
+    /// read of `thread` (entity `source()` strings, tool JSON values) into an
+    /// owned, `Send` snapshot. This is a memcpy-grade clone per entry — the
+    /// expensive processing is deferred to
+    /// [`AutoPromptContextSnapshot::finish`], which is pure and can run on a
+    /// background thread.
+    pub fn snapshot(
+        thread: &AcpThread,
+        cx: &App,
+        stop_reason: String,
+        plan_files: Vec<PlanFileContent>,
+        doc_files: Vec<String>,
+        iteration_count: u32,
+    ) -> AutoPromptContextSnapshot {
+        let collected_at = Local::now().to_rfc3339();
 
         let current_paths = thread
             .work_dirs()
@@ -198,70 +389,83 @@ impl AutoPromptContext {
         let title = thread.title().map(|t| t.to_string());
         let had_error = thread.had_error();
         let had_api_error = thread.had_api_error();
+        let actual_input_tokens = thread.token_usage().map(|u| u.input_tokens);
 
-        let entries = thread.entries();
-        let entry_count = entries.len();
-
-        // Serializing every entry to markdown is O(thread size) on the main
-        // thread and only feeds the chars/4 `approximate_token_count` — no
-        // runtime consumer of this context (lightweight orchestrator, plan
-        // detectors, summary flow) reads `messages`. When the provider reports
-        // real token usage, serialize only the first user message and the
-        // trailing assistant run, which is what downstream machines read.
+        // Serializing every entry to markdown is O(thread size) and only feeds
+        // the chars/4 `approximate_token_count` — no runtime consumer of this
+        // context (lightweight orchestrator, plan detectors, summary flow)
+        // reads `messages`. When the provider reports real token usage,
+        // serialize only the first user message and the trailing assistant
+        // run, which is what downstream machines read.
         let collect_messages = thread.token_usage().is_none();
 
-        let mut used_tools = false;
-        let mut messages = Vec::with_capacity(if collect_messages { entry_count } else { 0 });
-        let mut modified_files = Vec::new();
-        let mut first_user_message: Option<String> = None;
+        let thread_entries = thread.entries();
+        let entry_count = thread_entries.len();
 
-        for entry in entries {
+        let mut used_tools = false;
+        let mut first_user_message: Option<String> = None;
+        let mut entries = Vec::new();
+
+        for entry in thread_entries {
             match entry {
                 AgentThreadEntry::UserMessage(msg) => {
+                    // On the fast path stop reading user content once the
+                    // first non-empty message is captured.
                     if collect_messages || first_user_message.is_none() {
-                        let content = msg.content.to_markdown(cx).to_string();
-                        if !content.is_empty() {
+                        let source = msg.content.to_markdown(cx).to_string();
+                        if !source.is_empty() {
                             if first_user_message.is_none() {
-                                first_user_message = Some(content.clone());
+                                first_user_message = Some(source.clone());
                             }
                             if collect_messages {
-                                messages.push(ContextMessage {
-                                    role: ContextMessageRole::User,
-                                    content,
-                                });
+                                entries.push(SnapshotEntry::User { source });
                             }
                         }
                     }
                 }
                 AgentThreadEntry::AssistantMessage(msg) => {
                     if collect_messages {
-                        push_assistant_chunks(&msg.chunks, cx, &mut messages);
+                        let chunk_sources = assistant_chunk_sources(&msg.chunks, cx);
+                        if !chunk_sources.is_empty() {
+                            entries.push(SnapshotEntry::Assistant { chunk_sources });
+                        }
                     }
                 }
                 AgentThreadEntry::ToolCall(tool) => {
                     used_tools = true;
-                    collect_modified_file(tool, cx, &mut modified_files);
-                    if collect_messages {
-                        let content = serialize_tool_call(tool, cx);
-                        messages.push(ContextMessage {
-                            role: ContextMessageRole::Tool,
-                            content,
-                        });
+                    let is_edit = matches!(tool.kind, agent_client_protocol::schema::v1::ToolKind::Edit);
+                    if collect_messages || is_edit {
+                        entries.push(SnapshotEntry::Tool(SnapshotToolCall {
+                            label: tool.label.read(cx).source().to_string(),
+                            status_label: tool_status_label(&tool.status),
+                            is_edit,
+                            raw_input_markdown: if collect_messages {
+                                tool.raw_input_markdown
+                                    .as_ref()
+                                    .map(|markdown| markdown.read(cx).source().to_string())
+                            } else {
+                                None
+                            },
+                            raw_input: if collect_messages {
+                                tool.raw_input.clone()
+                            } else {
+                                None
+                            },
+                            raw_output: if collect_messages {
+                                tool.raw_output.clone()
+                            } else {
+                                None
+                            },
+                        }));
                     }
                 }
                 AgentThreadEntry::CompletedPlan(plan_entries) => {
                     if collect_messages {
-                        let content = plan_entries
+                        let content_sources = plan_entries
                             .iter()
                             .map(|entry| entry.content.read(cx).source().to_string())
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        if !content.is_empty() {
-                            messages.push(ContextMessage {
-                                role: ContextMessageRole::Plan,
-                                content,
-                            });
-                        }
+                            .collect();
+                        entries.push(SnapshotEntry::Plan { content_sources });
                     }
                 }
                 AgentThreadEntry::ContextCompaction(_) => {}
@@ -270,74 +474,58 @@ impl AutoPromptContext {
             }
         }
 
-        let current_plan = collect_plan_entries(thread, cx);
-
-        let last_assistant_message = if collect_messages {
-            join_trailing_assistant_messages(&messages)
-        } else {
-            // The trailing assistant run: from the last assistant entry back
-            // through consecutive assistant entries — matches the run
-            // `join_trailing_assistant_messages` would see over fully built
-            // messages, without serializing the rest of the thread.
-            let mut trailing: Vec<ContextMessage> = Vec::new();
-            for entry in entries
-                .iter()
-                .rev()
-                .skip_while(|entry| !matches!(entry, AgentThreadEntry::AssistantMessage(_)))
-                .take_while(|entry| matches!(entry, AgentThreadEntry::AssistantMessage(_)))
-            {
-                if let AgentThreadEntry::AssistantMessage(msg) = entry {
-                    push_assistant_chunks(&msg.chunks, cx, &mut trailing);
+        // The trailing assistant run feeds `last_assistant_message` on the
+        // fast path; on the full path it is derived from `messages` instead.
+        // Matches the original `rev().skip_while(!assistant).take_while(
+        // assistant)` walk: trailing non-assistant entries (e.g. a final tool
+        // call) are skipped, then consecutive assistant entries are taken.
+        let mut trailing_assistant_chunks = Vec::new();
+        if !collect_messages {
+            let mut in_trailing_run = false;
+            for entry in thread_entries.iter().rev() {
+                match entry {
+                    AgentThreadEntry::AssistantMessage(msg) => {
+                        in_trailing_run = true;
+                        trailing_assistant_chunks
+                            .extend(assistant_chunk_sources(&msg.chunks, cx));
+                    }
+                    _ if in_trailing_run => break,
+                    _ => {}
                 }
             }
-            join_trailing_assistant_messages(&trailing)
-        };
+        }
 
-        let active_plan_claims = crate::plan_registry::active_claims_for_others(&session_id);
+        let current_plan = thread
+            .plan()
+            .entries
+            .iter()
+            .map(|entry| SnapshotPlanEntry {
+                content: entry.content.read(cx).source().to_string(),
+                status: plan_status_label(&entry.status),
+                priority: plan_priority_label(&entry.priority),
+            })
+            .collect();
 
-        let mut context = Self {
-            current_datetime,
+        AutoPromptContextSnapshot {
+            collected_at,
             current_paths,
             session_id,
             title,
-            messages,
-            used_tools,
-            entry_count,
-            current_plan,
-            plan_files,
-            doc_files,
             stop_reason,
             had_error,
             had_api_error,
-            approximate_token_count: 0,
-            actual_input_tokens: thread.token_usage().map(|u| u.input_tokens),
-            iteration_count,
-            stop_phase: StopPhase::Working,
-            verification_count: 0,
-            was_truncated: false,
-            plan_has_checkboxes: false,
-            first_plan_filename: String::new(),
-            plan_number: String::new(),
+            actual_input_tokens,
+            entry_count,
+            collect_messages,
+            used_tools,
             first_user_message,
-            last_assistant_message,
-            modified_files,
-            active_plan_claims,
-        };
-
-        context.approximate_token_count = context.estimate_token_count();
-
-        log::info!(
-            "[auto_prompt::context] token counts: actual_input_tokens={:?}, estimated_chars_div_4={}",
-            context.actual_input_tokens,
-            context.approximate_token_count
-        );
-
-        // Compute helper fields
-        context.plan_has_checkboxes = context.compute_plan_has_checkboxes();
-        context.first_plan_filename = context.compute_first_plan_filename();
-        context.plan_number = context.compute_plan_number();
-
-        context
+            entries,
+            trailing_assistant_chunks,
+            current_plan,
+            plan_files,
+            doc_files,
+            iteration_count,
+        }
     }
 
     /// Rough token estimate: ~4 chars per token. Conversation messages count
@@ -505,71 +693,53 @@ impl AutoPromptContext {
     }
 }
 
-/// Collect plan entries from the thread.
-fn collect_plan_entries(thread: &AcpThread, cx: &App) -> Vec<PlanEntryContext> {
-    thread
-        .plan()
-        .entries
+/// Clone the raw markdown sources of a message's non-thought chunks. Pure
+/// snapshot work — processing (strip/cap) happens in `finish`.
+fn assistant_chunk_sources(chunks: &[AssistantMessageChunk], cx: &App) -> Vec<String> {
+    chunks
         .iter()
-        .map(|entry| {
-            let content = entry.content.read(cx).source().to_string();
-            let status = match entry.status {
-                agent_client_protocol::schema::v1::PlanEntryStatus::Pending => "pending",
-                agent_client_protocol::schema::v1::PlanEntryStatus::InProgress => "in_progress",
-                agent_client_protocol::schema::v1::PlanEntryStatus::Completed => "completed",
-                _ => "unknown",
-            };
-            let priority = match entry.priority {
-                agent_client_protocol::schema::v1::PlanEntryPriority::High => "high",
-                agent_client_protocol::schema::v1::PlanEntryPriority::Medium => "medium",
-                agent_client_protocol::schema::v1::PlanEntryPriority::Low => "low",
-                _ => "unknown",
-            };
-            PlanEntryContext {
-                content,
-                status: status.to_string(),
-                priority: priority.to_string(),
+        .filter_map(|chunk| match chunk {
+            AssistantMessageChunk::Message { block, .. } => {
+                Some(block.to_markdown(cx).to_string())
             }
+            AssistantMessageChunk::Thought { .. } => None,
         })
         .collect()
 }
 
-/// Serialize assistant message chunks into `out`, skipping thoughts and empty
+/// Serialize assistant chunk sources into `out`, skipping thoughts and empty
 /// content and applying the per-chunk size cap. Shared by the full-serialization
-/// path in [`AutoPromptContext::collect`] and the trailing-run fast path so both
-/// produce identical `ContextMessage`s.
-fn push_assistant_chunks(
-    chunks: &[AssistantMessageChunk],
-    cx: &App,
-    out: &mut Vec<ContextMessage>,
-) {
-    for chunk in chunks {
-        let content = match chunk {
-            AssistantMessageChunk::Message { block, .. } => {
-                strip_code_blocks(block.to_markdown(cx))
-            }
-            AssistantMessageChunk::Thought { .. } => continue,
-        };
+/// path in [`AutoPromptContextSnapshot::finish`] and the trailing-run fast path
+/// so both produce identical `ContextMessage`s.
+fn push_assistant_chunks(chunk_sources: &[String], out: &mut Vec<ContextMessage>) {
+    for source in chunk_sources {
+        let content = process_assistant_chunk(source);
         if content.is_empty() {
             continue;
         }
-        let content = if content.len() > MAX_ASSISTANT_CHUNK_BYTES {
-            let mut end = MAX_ASSISTANT_CHUNK_BYTES;
-            while !content.is_char_boundary(end) {
-                end -= 1;
-            }
-            format!(
-                "{}…\n[truncated: {} bytes total]",
-                &content[..end],
-                content.len()
-            )
-        } else {
-            content
-        };
         out.push(ContextMessage {
             role: ContextMessageRole::Assistant,
             content,
         });
+    }
+}
+
+/// Process one assistant chunk source: strip code blocks, then apply the
+/// per-chunk byte cap with a char-boundary-safe cut.
+fn process_assistant_chunk(source: &str) -> String {
+    let content = strip_code_blocks(source);
+    if content.len() > MAX_ASSISTANT_CHUNK_BYTES {
+        let mut end = MAX_ASSISTANT_CHUNK_BYTES;
+        while !content.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!(
+            "{}…\n[truncated: {} bytes total]",
+            &content[..end],
+            content.len()
+        )
+    } else {
+        content
     }
 }
 
@@ -613,13 +783,12 @@ fn strip_code_blocks(content: &str) -> String {
     result
 }
 
-/// Extract file path from an Edit/Write tool call label and add to the list.
-fn collect_modified_file(tool: &ToolCall, cx: &App, modified_files: &mut Vec<String>) {
-    if !matches!(tool.kind, agent_client_protocol::schema::v1::ToolKind::Edit) {
+/// Extract file path from an Edit tool call snapshot label and add to the list.
+fn collect_modified_file(tool: &SnapshotToolCall, modified_files: &mut Vec<String>) {
+    if !tool.is_edit {
         return;
     }
-    let label = tool.label.read(cx).source().to_string();
-    for path in extract_backtick_paths(&label) {
+    for path in extract_backtick_paths(&tool.label) {
         if !modified_files.contains(&path) {
             modified_files.push(path);
         }
@@ -648,25 +817,13 @@ fn extract_backtick_paths(text: &str) -> Vec<String> {
     paths
 }
 
-/// Serialize a tool call into a readable string for context.
-fn serialize_tool_call(tool: &ToolCall, cx: &App) -> String {
-    let status_label = match &tool.status {
-        ToolCallStatus::Pending => "pending",
-        ToolCallStatus::WaitingForConfirmation { .. } => "waiting_confirmation",
-        ToolCallStatus::InProgress => "in_progress",
-        ToolCallStatus::Completed => "completed",
-        ToolCallStatus::Failed => "failed",
-        _ => "unknown",
-    };
-
-    let title = tool.label.read(cx).source().to_string();
-
-    let mut parts = vec![format!("[Tool: {title} ({status_label})]")];
+/// Serialize a tool call snapshot into a readable string for context.
+fn serialize_tool_call(tool: &SnapshotToolCall) -> String {
+    let mut parts = vec![format!("[Tool: {} ({})]", tool.label, tool.status_label)];
 
     if let Some(raw_input) = &tool.raw_input_markdown {
-        let input_text = raw_input.read(cx).source().to_string();
-        if !input_text.is_empty() {
-            parts.push(format!("Input: {input_text}"));
+        if !raw_input.is_empty() {
+            parts.push(format!("Input: {raw_input}"));
         }
     } else if let Some(raw_input) = &tool.raw_input {
         let input_str =
@@ -695,4 +852,37 @@ fn serialize_tool_call(tool: &ToolCall, cx: &App) -> String {
     }
 
     parts.join("\n")
+}
+
+fn tool_status_label(status: &ToolCallStatus) -> &'static str {
+    match status {
+        ToolCallStatus::Pending => "pending",
+        ToolCallStatus::WaitingForConfirmation { .. } => "waiting_confirmation",
+        ToolCallStatus::InProgress => "in_progress",
+        ToolCallStatus::Completed => "completed",
+        ToolCallStatus::Failed => "failed",
+        _ => "unknown",
+    }
+}
+
+fn plan_status_label(
+    status: &agent_client_protocol::schema::v1::PlanEntryStatus,
+) -> &'static str {
+    match status {
+        agent_client_protocol::schema::v1::PlanEntryStatus::Pending => "pending",
+        agent_client_protocol::schema::v1::PlanEntryStatus::InProgress => "in_progress",
+        agent_client_protocol::schema::v1::PlanEntryStatus::Completed => "completed",
+        _ => "unknown",
+    }
+}
+
+fn plan_priority_label(
+    priority: &agent_client_protocol::schema::v1::PlanEntryPriority,
+) -> &'static str {
+    match priority {
+        agent_client_protocol::schema::v1::PlanEntryPriority::High => "high",
+        agent_client_protocol::schema::v1::PlanEntryPriority::Medium => "medium",
+        agent_client_protocol::schema::v1::PlanEntryPriority::Low => "low",
+        _ => "unknown",
+    }
 }

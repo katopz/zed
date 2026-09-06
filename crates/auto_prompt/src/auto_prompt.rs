@@ -29,7 +29,8 @@ pub use config::{
     AutoPromptConfig, DEFAULT_MAX_CONCURRENT_STREAMS, default_max_context_tokens,
 };
 pub use context::{
-    AutoPromptContext, AutoPromptResponse, PlanFileContent, StopPhase, truncate_to_paragraph_budget,
+    AutoPromptContext, AutoPromptContextSnapshot, AutoPromptResponse, PlanFileContent, StopPhase,
+    truncate_to_paragraph_budget,
 };
 pub use plan_registry::ActivePlanClaim;
 
@@ -1256,11 +1257,12 @@ pub fn decide(
 }
 
 /// Non-blocking variant of [`decide`]: the `.plans/`/`.docs/` reads (up to 10
-/// × 100KB files plus directory scans) run on a background executor so the UI
-/// thread stays responsive; everything needing `&App` still runs on the main
-/// thread. Behavior is identical to the sync path, except plan files are
-/// sourced from origin's remote-tracking refs (with a gated `git fetch
-/// origin` first — see `plan_source`), never the possibly-dirty working tree.
+/// × 100KB files plus directory scans) and the O(thread) context serialization
+/// run on a background executor so the UI thread stays responsive; only cheap
+/// entity-source snapshots and the decision logic run on the main thread.
+/// Behavior is identical to the sync path, except plan files are sourced from
+/// origin's remote-tracking refs (with a gated `git fetch origin` first — see
+/// `plan_source`), never the possibly-dirty working tree.
 pub async fn decide_async(
     thread: gpui::Entity<acp_thread::AcpThread>,
     used_tools: bool,
@@ -1274,6 +1276,7 @@ pub async fn decide_async(
     let inputs = cx.update(|cx| context_file_inputs(&thread.read(cx), cx));
     let bg_inputs = inputs.clone();
     let executor = cx.background_executor().clone();
+    let plan_executor = executor.clone();
     let (plan_files, doc_files) = cx
         .background_executor()
         .spawn(async move {
@@ -1282,26 +1285,75 @@ pub async fn decide_async(
             // Background thread: refresh remote-tracking refs via a gated
             // `git fetch origin`, then read plans from them — never from the
             // possibly-dirty working tree.
-            let plan_files = read_plan_files(&bg_inputs, Some(&executor)).await;
+            let plan_files = read_plan_files(&bg_inputs, Some(&plan_executor)).await;
             (plan_files, doc_files)
         })
         .await;
+    // Main thread: cheap snapshot of the thread (entity-source clones only).
+    let (snapshot, thread_title) = cx.update(|cx| {
+        snapshot_decision_context(
+            &thread,
+            &stop_reason,
+            &pre,
+            &inputs,
+            plan_files,
+            doc_files,
+            cx,
+        )
+    });
+    // O(thread) markdown/JSON serialization runs off the UI thread.
+    let mut auto_prompt_ctx = executor.spawn(async move { snapshot.finish() }).await;
+    auto_prompt_ctx.stop_phase = pre.stop_phase.clone();
+    auto_prompt_ctx.verification_count = pre.verification_count;
     cx.update(|cx| {
-        decide_finish(
+        decide_with_context(
             &thread,
             &stop_reason,
             *pre,
-            inputs,
-            plan_files,
-            doc_files,
+            auto_prompt_ctx,
+            inputs.session_id,
+            thread_title,
+            inputs.work_dirs,
             cx,
         )
     })
 }
 
-/// Second half of the decide pipeline: builds the full [`AutoPromptContext`]
-/// from the (pre-read) plan/doc files and runs the decision logic. Runs on the
-/// main thread (entity reads); the callers own how the file reads happen.
+/// Shared main-thread preamble of both decide paths: heartbeats the claimed
+/// plan files, snapshots every `cx`-dependent read of the thread (cheap
+/// clones — the O(thread) processing is offloaded by [`decide_async`]), and
+/// reads the thread title.
+fn snapshot_decision_context(
+    thread: &gpui::Entity<acp_thread::AcpThread>,
+    stop_reason: &acp::StopReason,
+    pre: &DecidePrecheckContext,
+    inputs: &ContextFileInputs,
+    plan_files: Vec<PlanFileContent>,
+    doc_files: Vec<String>,
+    cx: &gpui::App,
+) -> (AutoPromptContextSnapshot, Option<String>) {
+    let thread_ref = thread.read(cx);
+    let stop_reason_str = format!("{stop_reason:?}").to_lowercase();
+    let sid_str = inputs.session_id.to_string();
+    for plan in &plan_files {
+        plan_registry::heartbeat(&plan.path, &sid_str);
+    }
+    let snapshot = AutoPromptContext::snapshot(
+        thread_ref,
+        cx,
+        stop_reason_str,
+        plan_files,
+        doc_files,
+        pre.iteration_count,
+    );
+    let thread_title = thread_ref.title().map(|t| t.to_string());
+    (snapshot, thread_title)
+}
+
+/// Second half of the sync decide pipeline: collects the full
+/// [`AutoPromptContext`] on the main thread and runs the decision logic.
+/// `decide_async` shares [`decide_with_context`] but runs the serialization
+/// on a background executor.
 fn decide_finish(
     thread: &gpui::Entity<acp_thread::AcpThread>,
     stop_reason: &acp::StopReason,
@@ -1311,36 +1363,45 @@ fn decide_finish(
     doc_files: Vec<String>,
     cx: &gpui::App,
 ) -> AutoPromptDecision {
+    let (snapshot, thread_title) =
+        snapshot_decision_context(thread, stop_reason, &pre, &inputs, plan_files, doc_files, cx);
+    let mut auto_prompt_ctx = snapshot.finish();
+    auto_prompt_ctx.stop_phase = pre.stop_phase.clone();
+    auto_prompt_ctx.verification_count = pre.verification_count;
+    decide_with_context(
+        thread,
+        stop_reason,
+        pre,
+        auto_prompt_ctx,
+        inputs.session_id,
+        thread_title,
+        inputs.work_dirs,
+        cx,
+    )
+}
+
+/// Decision logic over an already-collected [`AutoPromptContext`]. Runs on the
+/// main thread (one `thread.read(cx)` for the session-limit check); shared by
+/// the sync and async decide paths.
+#[allow(clippy::too_many_arguments)]
+fn decide_with_context(
+    thread: &gpui::Entity<acp_thread::AcpThread>,
+    stop_reason: &acp::StopReason,
+    pre: DecidePrecheckContext,
+    auto_prompt_ctx: AutoPromptContext,
+    session_id: acp::SessionId,
+    thread_title: Option<String>,
+    work_dirs: Option<Vec<std::path::PathBuf>>,
+    cx: &gpui::App,
+) -> AutoPromptDecision {
     let DecidePrecheckContext {
         project_root,
         iteration_count,
         config,
         stop_phase,
-        verification_count,
         model,
+        ..
     } = pre;
-
-    let (auto_prompt_ctx, session_id, thread_title, work_dirs) = {
-        let thread_ref = thread.read(cx);
-        let stop_reason_str = format!("{stop_reason:?}").to_lowercase();
-        let sid = inputs.session_id;
-        let sid_str = sid.to_string();
-        for plan in &plan_files {
-            plan_registry::heartbeat(&plan.path, &sid_str);
-        }
-        let mut ctx = AutoPromptContext::collect(
-            thread_ref,
-            cx,
-            stop_reason_str,
-            plan_files,
-            doc_files,
-            iteration_count,
-        );
-        ctx.stop_phase = stop_phase.clone();
-        ctx.verification_count = verification_count;
-        let title = thread_ref.title().map(|t| t.to_string());
-        (ctx, sid, title, inputs.work_dirs)
-    };
 
     // Extract the raw original user message, unwrapping any auto-generated chain wrapper.
     let original_user_message = auto_prompt_ctx

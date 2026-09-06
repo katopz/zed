@@ -843,4 +843,122 @@ mod collect_from_thread {
         assert_eq!(context.actual_input_tokens, None);
         assert!(context.approximate_token_count > 0);
     }
+
+    /// The two-phase pipeline must produce exactly what the sync `collect`
+    /// produces, on both the fast (token usage reported) and full (no usage)
+    /// paths — with `finish` running on a background executor, as the async
+    /// decide path does in production.
+    #[gpui::test]
+    async fn test_snapshot_finish_off_thread_matches_collect(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let thread = make_thread(cx).await;
+        add_user_and_assistant_turn(&thread, cx);
+
+        // End the thread with a tool call: the trailing-run walk must skip
+        // trailing non-assistant entries to still find the last assistant run
+        // (mirrors rev().skip_while(!assistant).take_while(assistant)).
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread
+                    .handle_session_update(
+                        acp::SessionUpdate::ToolCall(
+                            acp::ToolCall::new(acp::ToolCallId::new("tool-1"), "Read file")
+                                .kind(acp::ToolKind::Read),
+                        ),
+                        cx,
+                    )
+                    .unwrap();
+            });
+        });
+
+        // Fast path: token usage reported → no messages, trailing-run
+        // last_assistant_message.
+        thread.update(cx, |thread, cx| {
+            thread.update_token_usage(
+                Some(acp_thread::TokenUsage {
+                    input_tokens: 42,
+                    ..Default::default()
+                }),
+                cx,
+            );
+        });
+        let snapshot = cx.update(|cx| {
+            AutoPromptContext::snapshot(
+                thread.read(cx),
+                cx,
+                "end_turn".to_string(),
+                Vec::new(),
+                Vec::new(),
+                1,
+            )
+        });
+        let off_thread_context = cx
+            .background_executor
+            .spawn(async move { snapshot.finish() })
+            .await;
+        assert!(off_thread_context.messages.is_empty());
+        assert_eq!(off_thread_context.first_user_message.as_deref(), Some("First task"));
+        assert_eq!(
+            off_thread_context.last_assistant_message(),
+            Some("Answer one\nAnswer two")
+        );
+        assert_eq!(off_thread_context.actual_input_tokens, Some(42));
+        assert!(off_thread_context.used_tools);
+        assert_eq!(off_thread_context.entry_count, 3);
+
+        // Full path: no token usage → messages serialized. Sync collect vs
+        // snapshot + background finish must agree field for field.
+        thread.update(cx, |thread, cx| {
+            thread.update_token_usage(None, cx);
+        });
+        let sync_context = cx.update(|cx| {
+            AutoPromptContext::collect(
+                thread.read(cx),
+                cx,
+                "end_turn".to_string(),
+                Vec::new(),
+                Vec::new(),
+                1,
+            )
+        });
+        let snapshot = cx.update(|cx| {
+            AutoPromptContext::snapshot(
+                thread.read(cx),
+                cx,
+                "end_turn".to_string(),
+                Vec::new(),
+                Vec::new(),
+                1,
+            )
+        });
+        let off_thread_context = cx
+            .background_executor
+            .spawn(async move { snapshot.finish() })
+            .await;
+        assert_eq!(off_thread_context.messages, sync_context.messages);
+        assert_eq!(
+            off_thread_context.first_user_message,
+            sync_context.first_user_message
+        );
+        assert_eq!(
+            off_thread_context.last_assistant_message,
+            sync_context.last_assistant_message
+        );
+        assert_eq!(
+            off_thread_context.modified_files,
+            sync_context.modified_files
+        );
+        assert_eq!(
+            off_thread_context.current_plan,
+            sync_context.current_plan
+        );
+        assert_eq!(
+            off_thread_context.approximate_token_count,
+            sync_context.approximate_token_count
+        );
+        assert_eq!(
+            off_thread_context.entry_count,
+            sync_context.entry_count
+        );
+    }
 }
