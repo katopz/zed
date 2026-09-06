@@ -1440,14 +1440,19 @@ impl Sidebar {
             let group_key = &group.key;
             let group_workspaces = &group.workspaces;
 
-            let workspace_by_path_list: HashMap<PathList, &Entity<Workspace>> = group_workspaces
+            // A Vec + linear scan, not a HashMap: `PathList::hash` parses every
+            // path component, while `PathList::eq` is a byte-wise memcmp. This
+            // closure runs once per sidebar row (12k+ rows in large stores), so
+            // hashing was the dominant cost of every rebuild.
+            let workspace_by_path_list: Vec<(PathList, &Entity<Workspace>)> = group_workspaces
                 .iter()
                 .map(|ws| (workspace_path_list(ws, cx), ws))
                 .collect();
             let resolve_workspace = |folder_paths: &PathList| -> ThreadEntryWorkspace {
                 workspace_by_path_list
-                    .get(folder_paths)
-                    .map(|ws| ThreadEntryWorkspace::Open((*ws).clone()))
+                    .iter()
+                    .find(|(paths, _)| paths == folder_paths)
+                    .map(|(_, ws)| ThreadEntryWorkspace::Open((*ws).clone()))
                     .unwrap_or_else(|| ThreadEntryWorkspace::Closed {
                         folder_paths: folder_paths.clone(),
                         project_group_key: group_key.clone(),
@@ -1560,11 +1565,34 @@ impl Sidebar {
             if should_load_threads {
                 let thread_store = ThreadMetadataStore::global(cx);
 
-                let make_thread_entry =
+                // Worktree chips derive from `worktree_paths` alone, and
+                // thousands of rows in a group share the same path set —
+                // computing (and allocating) them per row dominated rebuilds
+                // in large thread stores. Memoize per distinct path set.
+                let mut worktree_info_cache: Vec<(WorktreePaths, Arc<[ThreadItemWorktreeInfo]>)> =
+                    Vec::new();
+
+                let mut make_thread_entry =
                     |row: ThreadMetadata, workspace: ThreadEntryWorkspace| -> Arc<ThreadEntry> {
                         let (icon, icon_from_external_svg) = resolve_agent_icon(&row.agent_id);
-                        let worktrees =
-                            worktree_info_from_thread_paths(&row.worktree_paths, &branch_by_path);
+                        let worktree_infos = match worktree_info_cache
+                            .iter()
+                            .find(|(paths, _)| paths == &row.worktree_paths)
+                        {
+                            Some((_, infos)) => infos.clone(),
+                            None => {
+                                let infos: Arc<[ThreadItemWorktreeInfo]> =
+                                    worktree_info_from_thread_paths(
+                                        &row.worktree_paths,
+                                        &branch_by_path,
+                                    )
+                                    .into();
+                                worktree_info_cache
+                                    .push((row.worktree_paths.clone(), infos.clone()));
+                                infos
+                            }
+                        };
+                        let worktrees = worktree_infos.to_vec();
                         // Start drafts as `WithContent`; the post-processing
                         // pass below downgrades them to `Empty` if no draft
                         // label can be derived.
