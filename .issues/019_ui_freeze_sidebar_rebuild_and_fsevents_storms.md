@@ -1,6 +1,6 @@
 # 019: UI freeze regression — sidebar rebuild cost + exFAT FSEvents rescan storms
 
-**Status:** Fixed — `240b7cfa05` (fs watcher) + `50c090fbc5` (sidebar rebuild), pushed to `develop` 2026-09-06. Follow-ups: `AutoPromptContext::collect` serialization fixed (`a087ed63e8`); sidebar weekly view filter + env-gated metadata retention added (see below).
+**Status:** Fixed — `240b7cfa05` (fs watcher) + `50c090fbc5` (sidebar rebuild), pushed to `develop` 2026-09-06. Follow-ups: `AutoPromptContext::collect` serialization fixed (`a087ed63e8`) and its remaining O(thread) work offloaded to the background executor (see below); sidebar weekly view filter + env-gated metadata retention added (see below).
 
 ## Symptoms
 
@@ -95,3 +95,23 @@
   thread bodies untouched, threads stay reachable in the archive view.
   Pinned threads and threads updated within 7 days are never archived.
   Covered by `test_retention_*` (4 tests) in thread_metadata_store.rs.
+- **`AutoPromptContext` collect offloaded from the main thread** (`dbce6dc705`)
+  — collect is
+  now two-phase: `AutoPromptContext::snapshot` (main thread) resolves every
+  `&App`-dependent read — entity `source()` strings, tool labels, plan entry
+  contents, raw tool input/output JSON — into a `Send` plain-data
+  `AutoPromptContextSnapshot` (memcpy-grade clones, no processing), and
+  `snapshot.finish()` (pure, `cx`-free) does all O(thread) work: markdown
+  stripping, per-chunk byte caps, JSON pretty-printing, joins, token
+  estimation. Sync `collect()` = `snapshot().finish()` (behavior identical);
+  `decide_async` (the primary dispatch path) spawns `finish()` on the
+  background executor between the existing plan/doc reads and the decision
+  logic, so the UI thread no longer pays the full-thread serialization for
+  providers that don't report token usage (the farm case). Shared
+  `snapshot_decision_context` + new `decide_with_context` keep both decide
+  paths DRY. The trailing-run walk keeps the original
+  skip-while-non-assistant semantics (a thread ending in a tool call still
+  yields its last assistant run). Equivalence covered by
+  `test_snapshot_finish_off_thread_matches_collect` (sync collect vs
+  background finish, fast + full paths, trailing-tool-call thread); 43/43
+  `cargo test -p auto_prompt`, clippy clean.
