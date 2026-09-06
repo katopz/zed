@@ -1,6 +1,6 @@
 # 019: UI freeze regression — sidebar rebuild cost + exFAT FSEvents rescan storms
 
-**Status:** Fixed — `240b7cfa05` (fs watcher) + `50c090fbc5` (sidebar rebuild), pushed to `develop` 2026-09-06.
+**Status:** Fixed — `240b7cfa05` (fs watcher) + `50c090fbc5` (sidebar rebuild), pushed to `develop` 2026-09-06. First follow-up (`AutoPromptContext::collect` main-thread serialization) also fixed — see below.
 
 ## Symptoms
 
@@ -51,16 +51,23 @@
 
 ## Known follow-ups (not fixed here)
 
-- `AutoPromptContext::collect` (crates/auto_prompt/src/context.rs) still
-  serializes the WHOLE thread via per-entry `to_markdown` on the main thread
-  inside `decide_finish` (called from `cx.update` in `decide_async`) for every
-  non-summary stop. Verified no runtime consumer reads `messages` from
-  `context_json` (lightweight orchestrator, retry context, plan detectors,
-  pending-question all read only `last_assistant_message`/`plan_files`/
-  `current_paths`); `messages` only feeds the chars/4 `approximate_token_count`
-  fallback for providers that don't report usage. Candidates: derive the
-  estimate from raw source lengths without building per-message Strings, or
-  gate full serialization on `actual_input_tokens.is_none()`. Sub-second cost
-  today; not the multi-second freeze sampled above.
+- ~~`AutoPromptContext::collect` (crates/auto_prompt/src/context.rs) still
+  serializes the WHOLE thread via per-entry `to_markdown` on the main thread~~
+  **FIXED (follow-up commit):** `collect` now gates per-message serialization
+  on `thread.token_usage().is_none()`. When the provider reports usage (the
+  common case), it serializes only the first user message + the trailing
+  assistant run (what consumers actually read: `first_user_message`,
+  `last_assistant_message`, plan fields) and skips all tool-call
+  serializations and historical messages; `messages` stays empty and the
+  chars/4 estimate covers only plan/doc sources (superseded by
+  `actual_input_tokens` anyway). Full serialization remains as the fallback
+  for providers without usage. Verified all `context_json` consumers parse
+  only `session_id`/`plan_files`/`last_assistant_message`/`current_paths`
+  (lightweight orchestrator, retry context, plan detectors, plan landscape,
+  checkbox verification, auto-claim). Thread-backed regression tests added in
+  `tests/context_helpers_test.rs` (`collect_from_thread`): fast path vs full
+  path parity for `first_user_message`/`last_assistant_message`. Side benefit:
+  `context_json` shrinks from ~80K+ chars to ~1-2K per stop, speeding every
+  `serde_json::from_str` parse in the plan/summary machines.
 - Sidebar store hygiene: 12,699 rows (3,819 with empty folder_paths) — an
   archive/cleanup pass would shrink every rebuild proportionally.

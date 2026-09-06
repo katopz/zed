@@ -1,4 +1,4 @@
-use acp_thread::{AcpThread, AgentThreadEntry, ToolCall, ToolCallStatus};
+use acp_thread::{AcpThread, AgentThreadEntry, AssistantMessageChunk, ToolCall, ToolCallStatus};
 use chrono::Local;
 use gpui::App;
 use serde::{Deserialize, Serialize};
@@ -30,7 +30,10 @@ pub struct AutoPromptContext {
     pub session_id: String,
     /// The thread's title, if any.
     pub title: Option<String>,
-    /// Serialized conversation entries.
+    /// Serialized conversation entries. Only populated when the thread has no
+    /// token usage (i.e. the provider doesn't report it) — it feeds the
+    /// chars/4 `approximate_token_count` fallback; runtime consumers of this
+    /// context read `first_user_message`/`last_assistant_message` instead.
     pub messages: Vec<ContextMessage>,
     /// Whether tools were used since last user message.
     pub used_tools: bool,
@@ -52,7 +55,10 @@ pub struct AutoPromptContext {
     /// This is the signal to use when reasoning about actual API exhaustion.
     #[serde(default)]
     pub had_api_error: bool,
-    /// Approximate token count of this context (chars / 4).
+    /// Approximate token count of this context (chars / 4). Includes
+    /// conversation messages only when `messages` is populated (no token
+    /// usage reported); otherwise it covers just plan/doc sources and is
+    /// superseded by `actual_input_tokens` anyway.
     pub approximate_token_count: usize,
     /// Actual input token count from the thread's API usage response.
     /// This is the real token count shown in the UI, as opposed to the
@@ -196,70 +202,66 @@ impl AutoPromptContext {
         let entries = thread.entries();
         let entry_count = entries.len();
 
+        // Serializing every entry to markdown is O(thread size) on the main
+        // thread and only feeds the chars/4 `approximate_token_count` — no
+        // runtime consumer of this context (lightweight orchestrator, plan
+        // detectors, summary flow) reads `messages`. When the provider reports
+        // real token usage, serialize only the first user message and the
+        // trailing assistant run, which is what downstream machines read.
+        let collect_messages = thread.token_usage().is_none();
+
         let mut used_tools = false;
-        let mut messages = Vec::with_capacity(entry_count);
+        let mut messages = Vec::with_capacity(if collect_messages { entry_count } else { 0 });
         let mut modified_files = Vec::new();
+        let mut first_user_message: Option<String> = None;
 
         for entry in entries {
             match entry {
                 AgentThreadEntry::UserMessage(msg) => {
-                    let content = msg.content.to_markdown(cx).to_string();
-                    if !content.is_empty() {
-                        messages.push(ContextMessage {
-                            role: ContextMessageRole::User,
-                            content,
-                        });
+                    if collect_messages || first_user_message.is_none() {
+                        let content = msg.content.to_markdown(cx).to_string();
+                        if !content.is_empty() {
+                            if first_user_message.is_none() {
+                                first_user_message = Some(content.clone());
+                            }
+                            if collect_messages {
+                                messages.push(ContextMessage {
+                                    role: ContextMessageRole::User,
+                                    content,
+                                });
+                            }
+                        }
                     }
                 }
                 AgentThreadEntry::AssistantMessage(msg) => {
-                    for chunk in &msg.chunks {
-                        let content = match chunk {
-                            acp_thread::AssistantMessageChunk::Message { block, .. } => {
-                                strip_code_blocks(block.to_markdown(cx))
-                            }
-                            acp_thread::AssistantMessageChunk::Thought { .. } => continue,
-                        };
-                        if !content.is_empty() {
-                            let content = if content.len() > MAX_ASSISTANT_CHUNK_BYTES {
-                                let mut end = MAX_ASSISTANT_CHUNK_BYTES;
-                                while !content.is_char_boundary(end) {
-                                    end -= 1;
-                                }
-                                format!(
-                                    "{}…\n[truncated: {} bytes total]",
-                                    &content[..end],
-                                    content.len()
-                                )
-                            } else {
-                                content
-                            };
-                            messages.push(ContextMessage {
-                                role: ContextMessageRole::Assistant,
-                                content,
-                            });
-                        }
+                    if collect_messages {
+                        push_assistant_chunks(&msg.chunks, cx, &mut messages);
                     }
                 }
                 AgentThreadEntry::ToolCall(tool) => {
                     used_tools = true;
                     collect_modified_file(tool, cx, &mut modified_files);
-                    let content = serialize_tool_call(tool, cx);
-                    messages.push(ContextMessage {
-                        role: ContextMessageRole::Tool,
-                        content,
-                    });
-                }
-                AgentThreadEntry::CompletedPlan(plan_entries) => {
-                    let content = plan_entries
-                        .iter()
-                        .map(|entry| entry.content.read(cx).source().to_string())
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    if !content.is_empty() {
+                    if collect_messages {
+                        let content = serialize_tool_call(tool, cx);
                         messages.push(ContextMessage {
-                            role: ContextMessageRole::Plan,
+                            role: ContextMessageRole::Tool,
                             content,
                         });
+                    }
+                }
+                AgentThreadEntry::CompletedPlan(plan_entries) => {
+                    if collect_messages {
+                        let content = plan_entries
+                            .iter()
+                            .map(|entry| entry.content.read(cx).source().to_string())
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        if !content.is_empty() {
+                            messages.push(ContextMessage {
+                                role: ContextMessageRole::Plan,
+                                content,
+                            });
+                        }
                     }
                 }
                 AgentThreadEntry::ContextCompaction(_) => {}
@@ -270,10 +272,26 @@ impl AutoPromptContext {
 
         let current_plan = collect_plan_entries(thread, cx);
 
-        let first_user_message = messages
-            .iter()
-            .find(|m| matches!(m.role, ContextMessageRole::User))
-            .map(|m| m.content.clone());
+        let last_assistant_message = if collect_messages {
+            join_trailing_assistant_messages(&messages)
+        } else {
+            // The trailing assistant run: from the last assistant entry back
+            // through consecutive assistant entries — matches the run
+            // `join_trailing_assistant_messages` would see over fully built
+            // messages, without serializing the rest of the thread.
+            let mut trailing: Vec<ContextMessage> = Vec::new();
+            for entry in entries
+                .iter()
+                .rev()
+                .skip_while(|entry| !matches!(entry, AgentThreadEntry::AssistantMessage(_)))
+                .take_while(|entry| matches!(entry, AgentThreadEntry::AssistantMessage(_)))
+            {
+                if let AgentThreadEntry::AssistantMessage(msg) = entry {
+                    push_assistant_chunks(&msg.chunks, cx, &mut trailing);
+                }
+            }
+            join_trailing_assistant_messages(&trailing)
+        };
 
         let active_plan_claims = crate::plan_registry::active_claims_for_others(&session_id);
 
@@ -301,7 +319,7 @@ impl AutoPromptContext {
             first_plan_filename: String::new(),
             plan_number: String::new(),
             first_user_message,
-            last_assistant_message: None,
+            last_assistant_message,
             modified_files,
             active_plan_claims,
         };
@@ -318,12 +336,13 @@ impl AutoPromptContext {
         context.plan_has_checkboxes = context.compute_plan_has_checkboxes();
         context.first_plan_filename = context.compute_first_plan_filename();
         context.plan_number = context.compute_plan_number();
-        context.last_assistant_message = context.compute_last_assistant_message();
 
         context
     }
 
-    /// Rough token estimate: ~4 chars per token.
+    /// Rough token estimate: ~4 chars per token. Conversation messages count
+    /// toward this only when `messages` is populated, i.e. when the thread has
+    /// no token usage and this estimate is the actual fallback.
     pub fn estimate_token_count(&self) -> usize {
         let total_chars: usize = self
             .messages
@@ -363,27 +382,7 @@ impl AutoPromptContext {
     pub const LAST_MESSAGE_PARAGRAPH_BUDGET: usize = 10_000;
 
     pub fn compute_last_assistant_message(&self) -> Option<String> {
-        let mut chunks: Vec<&str> = self
-            .messages
-            .iter()
-            .rev()
-            .skip_while(|m| !matches!(m.role, ContextMessageRole::Assistant))
-            .take_while(|m| matches!(m.role, ContextMessageRole::Assistant))
-            .map(|m| m.content.as_str())
-            .collect();
-        chunks.reverse();
-        if chunks.is_empty() {
-            return None;
-        }
-        let full = chunks.join("\n");
-        Some(Self::truncate_to_paragraph_budget(&full))
-    }
-
-    /// Take complete paragraphs until total exceeds the budget.
-    /// The paragraph that crosses the threshold is included — this ensures we
-    /// always return complete paragraphs (1-4 typically) without mid-sentence cuts.
-    fn truncate_to_paragraph_budget(text: &str) -> String {
-        truncate_to_paragraph_budget(text, Self::LAST_MESSAGE_PARAGRAPH_BUDGET)
+        join_trailing_assistant_messages(&self.messages)
     }
 
     /// Returns the count of plan items by status.
@@ -533,6 +532,66 @@ fn collect_plan_entries(thread: &AcpThread, cx: &App) -> Vec<PlanEntryContext> {
             }
         })
         .collect()
+}
+
+/// Serialize assistant message chunks into `out`, skipping thoughts and empty
+/// content and applying the per-chunk size cap. Shared by the full-serialization
+/// path in [`AutoPromptContext::collect`] and the trailing-run fast path so both
+/// produce identical `ContextMessage`s.
+fn push_assistant_chunks(
+    chunks: &[AssistantMessageChunk],
+    cx: &App,
+    out: &mut Vec<ContextMessage>,
+) {
+    for chunk in chunks {
+        let content = match chunk {
+            AssistantMessageChunk::Message { block, .. } => {
+                strip_code_blocks(block.to_markdown(cx))
+            }
+            AssistantMessageChunk::Thought { .. } => continue,
+        };
+        if content.is_empty() {
+            continue;
+        }
+        let content = if content.len() > MAX_ASSISTANT_CHUNK_BYTES {
+            let mut end = MAX_ASSISTANT_CHUNK_BYTES;
+            while !content.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!(
+                "{}…\n[truncated: {} bytes total]",
+                &content[..end],
+                content.len()
+            )
+        } else {
+            content
+        };
+        out.push(ContextMessage {
+            role: ContextMessageRole::Assistant,
+            content,
+        });
+    }
+}
+
+/// Join the trailing run of assistant messages (from the end backwards, stopping
+/// at the first non-assistant message) into one string under the paragraph budget.
+fn join_trailing_assistant_messages(messages: &[ContextMessage]) -> Option<String> {
+    let mut chunks: Vec<&str> = messages
+        .iter()
+        .rev()
+        .skip_while(|m| !matches!(m.role, ContextMessageRole::Assistant))
+        .take_while(|m| matches!(m.role, ContextMessageRole::Assistant))
+        .map(|m| m.content.as_str())
+        .collect();
+    chunks.reverse();
+    if chunks.is_empty() {
+        return None;
+    }
+    let full = chunks.join("\n");
+    Some(truncate_to_paragraph_budget(
+        &full,
+        AutoPromptContext::LAST_MESSAGE_PARAGRAPH_BUDGET,
+    ))
 }
 
 /// Strip fenced code blocks (```...```) from markdown content.

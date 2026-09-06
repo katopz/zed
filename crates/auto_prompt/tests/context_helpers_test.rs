@@ -698,3 +698,149 @@ fn test_public_truncate_empty_string() {
     let result = auto_prompt::truncate_to_paragraph_budget("", 2_500);
     assert_eq!(result, "");
 }
+
+// ===== Thread-backed collect() tests: fast path (token usage) vs full path =====
+// Regression coverage for the issue-019 follow-up: per-message markdown
+// serialization on the main thread is skipped when the provider reports token
+// usage, while first_user_message / last_assistant_message stay intact.
+mod collect_from_thread {
+    use acp_thread::{AgentConnection, StubAgentConnection};
+    use agent_client_protocol::schema::v1 as acp;
+    use auto_prompt::context::{AutoPromptContext, ContextMessageRole};
+    use std::rc::Rc;
+    use util::path_list::PathList;
+
+    fn init_test(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let mut settings_store = settings::SettingsStore::test(cx);
+            settings_store.register_setting::<feature_flags::FeatureFlagsSettings>();
+            cx.set_global(settings_store);
+        });
+    }
+
+    async fn make_thread(cx: &mut gpui::TestAppContext) -> gpui::Entity<acp_thread::AcpThread> {
+        let fs = fs::FakeFs::new(cx.executor());
+        let project = project::Project::test(fs, [], cx).await;
+        let connection = Rc::new(StubAgentConnection::new());
+        cx.update(|cx| Rc::clone(&connection).new_session(project, PathList::default(), cx))
+            .await
+            .expect("stub new_session succeeded")
+    }
+
+    /// One user turn followed by one assistant turn with two chunks. Distinct
+    /// message ids keep the chunks as separate Markdown blocks — same-message
+    /// chunks stream through a buffered reveal task (async), which would make
+    /// the thread content nondeterministic in a synchronous test read.
+    fn add_user_and_assistant_turn(
+        thread: &gpui::Entity<acp_thread::AcpThread>,
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread
+                    .handle_session_update(
+                        acp::SessionUpdate::UserMessageChunk(acp::ContentChunk::new(
+                            "First task".into(),
+                        )),
+                        cx,
+                    )
+                    .unwrap();
+                thread
+                    .handle_session_update(
+                        acp::SessionUpdate::AgentMessageChunk(
+                            acp::ContentChunk::new("Answer one".into())
+                                .message_id("assistant-msg-1"),
+                        ),
+                        cx,
+                    )
+                    .unwrap();
+                thread
+                    .handle_session_update(
+                        acp::SessionUpdate::AgentMessageChunk(
+                            acp::ContentChunk::new("Answer two".into())
+                                .message_id("assistant-msg-2"),
+                        ),
+                        cx,
+                    )
+                    .unwrap();
+            });
+        });
+    }
+
+    #[gpui::test]
+    async fn test_collect_skips_message_serialization_when_token_usage_reported(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        let thread = make_thread(cx).await;
+        add_user_and_assistant_turn(&thread, cx);
+        thread.update(cx, |thread, cx| {
+            thread.update_token_usage(
+                Some(acp_thread::TokenUsage {
+                    input_tokens: 999,
+                    ..Default::default()
+                }),
+                cx,
+            );
+        });
+
+        let context = cx.update(|cx| {
+            AutoPromptContext::collect(
+                thread.read(cx),
+                cx,
+                "end_turn".to_string(),
+                Vec::new(),
+                Vec::new(),
+                1,
+            )
+        });
+
+        assert!(
+            context.messages.is_empty(),
+            "messages must not be serialized when token usage is reported"
+        );
+        assert_eq!(context.first_user_message.as_deref(), Some("First task"));
+        assert_eq!(
+            context.last_assistant_message(),
+            Some("Answer one\nAnswer two")
+        );
+        assert_eq!(context.actual_input_tokens, Some(999));
+        assert_eq!(context.entry_count, 2);
+        assert_eq!(context.approximate_token_count, 0);
+    }
+
+    #[gpui::test]
+    async fn test_collect_serializes_messages_without_token_usage(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let thread = make_thread(cx).await;
+        add_user_and_assistant_turn(&thread, cx);
+
+        let context = cx.update(|cx| {
+            AutoPromptContext::collect(
+                thread.read(cx),
+                cx,
+                "end_turn".to_string(),
+                Vec::new(),
+                Vec::new(),
+                1,
+            )
+        });
+
+        assert_eq!(context.messages.len(), 3);
+        assert!(matches!(context.messages[0].role, ContextMessageRole::User));
+        assert_eq!(context.messages[0].content, "First task");
+        assert!(matches!(
+            context.messages[1].role,
+            ContextMessageRole::Assistant
+        ));
+        assert_eq!(context.messages[1].content, "Answer one");
+        assert_eq!(context.messages[2].content, "Answer two");
+        assert_eq!(context.first_user_message.as_deref(), Some("First task"));
+        assert_eq!(
+            context.last_assistant_message(),
+            Some("Answer one\nAnswer two")
+        );
+        assert_eq!(context.actual_input_tokens, None);
+        assert!(context.approximate_token_count > 0);
+    }
+}
