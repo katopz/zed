@@ -305,6 +305,22 @@ fn migrate_thread_ids(cx: &mut App) {
 struct GlobalThreadMetadataStore(Entity<ThreadMetadataStore>);
 impl Global for GlobalThreadMetadataStore {}
 
+/// Per-project unarchived-thread retention cap, enforced when the store
+/// reloads. Unset or zero disables auto-archiving (default). Threads beyond
+/// the cap are archived metadata-only: bodies stay on disk and threads stay
+/// reachable in the archive view.
+const AUTO_ARCHIVE_CAP_ENV: &str = "ZED_AUTO_ARCHIVE_THREAD_CAP";
+
+/// Threads updated more recently than this are never auto-archived,
+/// regardless of the cap — a thread could still be live mid-session.
+const AUTO_ARCHIVE_MIN_AGE_DAYS: i64 = 7;
+
+fn retention_cap_from_env() -> Option<usize> {
+    let raw = std::env::var(AUTO_ARCHIVE_CAP_ENV).ok()?;
+    let cap: usize = raw.trim().parse().ok()?;
+    (cap > 0).then_some(cap)
+}
+
 /// Lightweight metadata for any thread (native or ACP), enough to populate
 /// the sidebar list and route to the correct load path when clicked.
 #[derive(Debug, Clone, PartialEq)]
@@ -700,6 +716,8 @@ impl ThreadMetadataStore {
                     for row in rows {
                         this.cache_thread_metadata(row);
                     }
+
+                    this.enforce_retention_cap(retention_cap_from_env(), cx);
 
                     cx.notify();
                 })
@@ -1265,6 +1283,61 @@ impl ThreadMetadataStore {
             });
             cx.notify();
         }
+    }
+
+    /// Auto-archive unarchived threads beyond `cap` per project (folder paths
+    /// + remote identity), oldest first. Metadata-only — thread bodies and
+    /// worktrees are untouched (no archive job is passed), and threads stay
+    /// reachable in the archive view. Pinned threads, drafts, threads updated
+    /// within [`AUTO_ARCHIVE_MIN_AGE_DAYS`], and threads in groups under the
+    /// cap are never archived. No-op when `cap` is None.
+    fn enforce_retention_cap(&mut self, cap: Option<usize>, cx: &mut Context<Self>) {
+        let Some(cap) = cap else {
+            return;
+        };
+        let now = Utc::now();
+        let min_age = chrono::Duration::days(AUTO_ARCHIVE_MIN_AGE_DAYS);
+        let cutoff = now - min_age;
+
+        let mut groups: HashMap<
+            (PathList, Option<RemoteConnectionOptions>),
+            Vec<(DateTime<Utc>, ThreadId)>,
+        > = HashMap::default();
+        for thread in self.threads.values() {
+            if thread.archived || thread.pinned || thread.is_draft() {
+                continue;
+            }
+            if thread.updated_at > cutoff {
+                continue;
+            }
+            groups
+                .entry((
+                    thread.folder_paths().clone(),
+                    thread.remote_connection.clone(),
+                ))
+                .or_default()
+                .push((thread.updated_at, thread.thread_id));
+        }
+
+        let mut to_archive: Vec<ThreadId> = Vec::new();
+        for mut group in groups.into_values() {
+            if group.len() <= cap {
+                continue;
+            }
+            group.sort_unstable_by_key(|(updated_at, _)| *updated_at);
+            to_archive.extend(group[..group.len() - cap].iter().map(|(_, id)| *id));
+        }
+
+        if to_archive.is_empty() {
+            return;
+        }
+        let archived_count = to_archive.len();
+        for thread_id in to_archive {
+            self.archive(thread_id, None, cx);
+        }
+        log::info!(
+            "[thread_metadata_store] auto-archived {archived_count} thread(s) beyond retention cap"
+        );
     }
 
     pub fn delete(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) {
@@ -3450,6 +3523,220 @@ mod tests {
             assert_eq!(path_entries, vec!["session-1"]);
 
             assert_eq!(store.archived_entries().count(), 0);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_retention_cap_disabled_when_none(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let paths = PathList::new(&[Path::new("/project-a")]);
+        let now = Utc::now();
+        let metadata: Vec<ThreadMetadata> = (0..3)
+            .map(|i| {
+                make_metadata(
+                    &format!("session-{i}"),
+                    &format!("Thread {i}"),
+                    now - chrono::Duration::days(30 - i),
+                    paths.clone(),
+                )
+            })
+            .collect();
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            store.update(cx, |store, cx| {
+                for metadata in metadata {
+                    store.save(metadata, cx);
+                }
+                store.enforce_retention_cap(None, cx);
+            });
+        });
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            let store = store.read(cx);
+            assert_eq!(store.archived_entries().count(), 0);
+            assert_eq!(store.entries_for_path(&paths, None).count(), 3);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_retention_cap_archives_oldest_beyond_cap(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let paths = PathList::new(&[Path::new("/project-a")]);
+        let now = Utc::now();
+        // Five stale threads in one project; ages 30..=26 days ago.
+        let metadata: Vec<ThreadMetadata> = (0..5)
+            .map(|i| {
+                make_metadata(
+                    &format!("session-{i}"),
+                    &format!("Thread {i}"),
+                    now - chrono::Duration::days(30 - i),
+                    paths.clone(),
+                )
+            })
+            .collect();
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            store.update(cx, |store, cx| {
+                for metadata in metadata {
+                    store.save(metadata, cx);
+                }
+                store.enforce_retention_cap(Some(2), cx);
+            });
+        });
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            let store = store.read(cx);
+
+            // The three oldest were archived; the two newest remain.
+            let mut remaining: Vec<_> = store
+                .entries_for_path(&paths, None)
+                .filter_map(|e| e.session_id.as_ref().map(|s| s.0.to_string()))
+                .collect();
+            remaining.sort();
+            assert_eq!(remaining, vec!["session-3", "session-4"]);
+
+            let mut archived: Vec<_> = store
+                .archived_entries()
+                .filter_map(|e| e.session_id.as_ref().map(|s| s.0.to_string()))
+                .collect();
+            archived.sort();
+            assert_eq!(archived, vec!["session-0", "session-1", "session-2"]);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_retention_cap_protects_pinned_and_recent_threads(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let paths = PathList::new(&[Path::new("/project-a")]);
+        let now = Utc::now();
+
+        let mut pinned = make_metadata(
+            "pinned",
+            "Pinned Thread",
+            now - chrono::Duration::days(30),
+            paths.clone(),
+        );
+        pinned.pinned = true;
+        let recent = make_metadata(
+            "recent",
+            "Recent Thread",
+            now - chrono::Duration::hours(1),
+            paths.clone(),
+        );
+        let old1 = make_metadata(
+            "old-1",
+            "Old Thread 1",
+            now - chrono::Duration::days(29),
+            paths.clone(),
+        );
+        let old2 = make_metadata(
+            "old-2",
+            "Old Thread 2",
+            now - chrono::Duration::days(28),
+            paths.clone(),
+        );
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            store.update(cx, |store, cx| {
+                for metadata in [pinned, recent, old1, old2] {
+                    store.save(metadata, cx);
+                }
+                // Candidates are only the stale unpinned threads (old-1,
+                // old-2) — pinned is exempt from grouping and recent is
+                // inside the age floor. Cap 1 archives the older of the two.
+                store.enforce_retention_cap(Some(1), cx);
+            });
+        });
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            let store = store.read(cx);
+
+            // Pinned and recent threads are exempt; only the oldest stale
+            // unpinned thread crosses the cap.
+            let mut archived: Vec<_> = store
+                .archived_entries()
+                .filter_map(|e| e.session_id.as_ref().map(|s| s.0.to_string()))
+                .collect();
+            archived.sort();
+            assert_eq!(archived, vec!["old-1"]);
+
+            let mut remaining: Vec<_> = store
+                .entries_for_path(&paths, None)
+                .filter_map(|e| e.session_id.as_ref().map(|s| s.0.to_string()))
+                .collect();
+            remaining.sort();
+            assert_eq!(remaining, vec!["old-2", "pinned", "recent"]);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_retention_cap_groups_by_remote_connection(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let paths = PathList::new(&[Path::new("/project-a")]);
+        let now = Utc::now();
+        let remote = Some(RemoteConnectionOptions::Ssh(remote::SshConnectionOptions {
+            host: "remote-host".into(),
+            ..Default::default()
+        }));
+
+        let mut make_remote = |session_id: &str, age_days: i64| {
+            let mut metadata = make_metadata(
+                session_id,
+                session_id,
+                now - chrono::Duration::days(age_days),
+                paths.clone(),
+            );
+            metadata.remote_connection = remote.clone();
+            metadata
+        };
+
+        let local1 = make_metadata(
+            "local-1",
+            "Local 1",
+            now - chrono::Duration::days(30),
+            paths.clone(),
+        );
+        let local2 = make_metadata(
+            "local-2",
+            "Local 2",
+            now - chrono::Duration::days(28),
+            paths.clone(),
+        );
+        let remote1 = make_remote("remote-1", 30);
+        let remote2 = make_remote("remote-2", 28);
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            store.update(cx, |store, cx| {
+                for metadata in [local1, local2, remote1, remote2] {
+                    store.save(metadata, cx);
+                }
+                store.enforce_retention_cap(Some(1), cx);
+            });
+        });
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            let store = store.read(cx);
+
+            // Groups are independent: each connection's oldest thread is
+            // archived, never mixing identities within a group.
+            let mut archived: Vec<_> = store
+                .archived_entries()
+                .filter_map(|e| e.session_id.as_ref().map(|s| s.0.to_string()))
+                .collect();
+            archived.sort();
+            assert_eq!(archived, vec!["local-1", "remote-1"]);
         });
     }
 
