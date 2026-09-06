@@ -229,8 +229,13 @@ fn setup_sidebar_closed(
     cx: &mut gpui::VisualTestContext,
 ) -> Entity<Sidebar> {
     let multi_workspace = multi_workspace.clone();
-    let sidebar =
-        cx.update(|window, cx| cx.new(|cx| Sidebar::new(multi_workspace.clone(), window, cx)));
+    let sidebar = cx.update(|window, cx| {
+        let sidebar = cx.new(|cx| Sidebar::new(multi_workspace.clone(), window, cx));
+        // Tests seed threads with old timestamps and expect them listed; the
+        // weekly filter is exercised explicitly by the tests that own it.
+        sidebar.update(cx, |sidebar, _| sidebar.weekly_filter_enabled = false);
+        sidebar
+    });
     multi_workspace.update(cx, |mw, cx| {
         mw.register_sidebar(sidebar.clone(), cx);
     });
@@ -810,6 +815,7 @@ async fn test_restore_serialized_archive_view_does_not_panic(cx: &mut TestAppCon
     let serialized = serde_json::to_string(&SerializedSidebar {
         width: Some(400.0),
         active_view: SerializedSidebarView::History,
+        weekly_filter_enabled: true,
     })
     .expect("serialization should succeed");
 
@@ -10787,6 +10793,78 @@ async fn test_archived_threads_excluded_from_sidebar_entries(cx: &mut TestAppCon
             "archived-thread"
         );
     });
+}
+
+#[gpui::test]
+async fn test_weekly_filter_hides_old_threads_and_toggle_lists_all(cx: &mut TestAppContext) {
+    let project = init_test_project("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+
+    let now = Utc::now();
+    save_thread_metadata(
+        acp::SessionId::new(Arc::from("recent-thread")),
+        Some("Recent Thread".into()),
+        now - chrono::Duration::days(2),
+        None,
+        None,
+        &project,
+        cx,
+    );
+    save_thread_metadata(
+        acp::SessionId::new(Arc::from("old-thread")),
+        Some("Old Thread".into()),
+        now - chrono::Duration::days(30),
+        None,
+        None,
+        &project,
+        cx,
+    );
+
+    multi_workspace.update_in(cx, |_, _window, cx| cx.notify());
+    cx.run_until_parked();
+
+    // Weekly filter on — only the recent thread is listed.
+    sidebar.update(cx, |sidebar, cx| {
+        sidebar.weekly_filter_enabled = true;
+        sidebar.update_entries(cx);
+    });
+    cx.run_until_parked();
+
+    let entries = visible_entries_as_strings(&sidebar, cx);
+    assert!(
+        entries.iter().any(|e| e.contains("Recent Thread")),
+        "expected recent thread in sidebar, got: {entries:?}"
+    );
+    assert!(
+        !entries.iter().any(|e| e.contains("Old Thread")),
+        "expected old thread to be filtered out, got: {entries:?}"
+    );
+
+    // Toggle the filter off — the full history is listed.
+    sidebar.update(cx, |sidebar, cx| {
+        sidebar.weekly_filter_enabled = false;
+        sidebar.update_entries(cx);
+    });
+    cx.run_until_parked();
+
+    let entries = visible_entries_as_strings(&sidebar, cx);
+    assert!(
+        entries.iter().any(|e| e.contains("Recent Thread"))
+            && entries.iter().any(|e| e.contains("Old Thread")),
+        "expected both threads listed with filter off, got: {entries:?}"
+    );
+
+    // Toggle back on — the old thread is hidden again.
+    sidebar.update(cx, |sidebar, cx| {
+        sidebar.weekly_filter_enabled = true;
+        sidebar.update_entries(cx);
+    });
+    cx.run_until_parked();
+
+    let entries = visible_entries_as_strings(&sidebar, cx);
+    assert!(!entries.iter().any(|e| e.contains("Old Thread")),);
 }
 
 #[gpui::test]

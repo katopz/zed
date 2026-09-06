@@ -105,6 +105,11 @@ const DEFAULT_WIDTH: Pixels = px(300.0);
 const MIN_WIDTH: Pixels = px(200.0);
 const MAX_WIDTH: Pixels = px(800.0);
 
+/// Age cap for the default weekly thread filter in the sidebar header. Only
+/// threads interacted or updated within this window are listed while the
+/// filter toggle is on; unchecking it lists the full history.
+const WEEKLY_FILTER_DAYS: i64 = 7;
+
 #[derive(Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum SerializedSidebarView {
     #[default]
@@ -125,6 +130,12 @@ struct SerializedSidebar {
     width: Option<f32>,
     #[serde(default)]
     active_view: SerializedSidebarView,
+    #[serde(default = "default_true")]
+    weekly_filter_enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Default)]
@@ -789,6 +800,10 @@ pub struct Sidebar {
     /// Display names of other release channels that have threads available to
     /// import.
     cross_channel_import_channels: Vec<SharedString>,
+    /// When true (default), the thread list only shows threads interacted or
+    /// updated within [`WEEKLY_FILTER_DAYS`]; the header filter icon toggles
+    /// it so the full history can be listed on demand.
+    weekly_filter_enabled: bool,
 }
 
 impl Sidebar {
@@ -920,6 +935,7 @@ impl Sidebar {
             update_task: None,
             import_banners_use_verbose_labels: None,
             cross_channel_import_channels: Vec::new(),
+            weekly_filter_enabled: true,
         }
     }
 
@@ -1414,6 +1430,38 @@ impl Sidebar {
         let path_detail_map: HashMap<PathBuf, usize> =
             all_paths.into_iter().zip(path_details).collect();
 
+        // Weekly view filter: when enabled (default) and no search query is
+        // active, only threads touched within the last week are gathered.
+        // Search bypasses the filter so old threads stay findable, and the
+        // active/retained threads of every workspace are always exempt — an
+        // old thread that is open must not vanish from the sidebar.
+        let weekly_cutoff = if self.weekly_filter_enabled && query.is_empty() {
+            Some(Utc::now() - chrono::Duration::days(WEEKLY_FILTER_DAYS))
+        } else {
+            None
+        };
+        let protected_thread_ids: HashSet<agent_ui::ThreadId> = if weekly_cutoff.is_some() {
+            let mut protected = HashSet::default();
+            for workspace in &workspaces {
+                if let Some(agent_panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
+                    let panel = agent_panel.read(cx);
+                    if let Some(thread_id) = panel.active_thread_id(cx) {
+                        protected.insert(thread_id);
+                    }
+                    protected.extend(panel.retained_threads().keys().copied());
+                }
+            }
+            protected
+        } else {
+            HashSet::default()
+        };
+        let passes_weekly_filter = |row: &ThreadMetadata| {
+            weekly_cutoff.is_none_or(|cutoff| {
+                protected_thread_ids.contains(&row.thread_id)
+                    || Self::thread_display_time(row) >= cutoff
+            })
+        };
+
         let mut branch_by_path: HashMap<PathBuf, SharedString> = HashMap::new();
         for ws in &workspaces {
             let project = ws.read(cx).project().read(cx);
@@ -1622,6 +1670,9 @@ impl Sidebar {
                     .entries_for_main_worktree_path(group_key.path_list(), group_host.as_ref())
                     .cloned()
                 {
+                    if !passes_weekly_filter(&row) {
+                        continue;
+                    }
                     if !seen_thread_ids.insert(row.thread_id) {
                         continue;
                     }
@@ -1638,6 +1689,9 @@ impl Sidebar {
                     .entries_for_path(group_key.path_list(), group_host.as_ref())
                     .cloned()
                 {
+                    if !passes_weekly_filter(&row) {
+                        continue;
+                    }
                     if !seen_thread_ids.insert(row.thread_id) {
                         continue;
                     }
@@ -1666,6 +1720,9 @@ impl Sidebar {
                         .entries_for_path(&ws_paths, group_host.as_ref())
                         .cloned()
                     {
+                        if !passes_weekly_filter(&row) {
+                            continue;
+                        }
                         if !seen_thread_ids.insert(row.thread_id) {
                             continue;
                         }
@@ -1683,6 +1740,9 @@ impl Sidebar {
                         .entries_for_path(worktree_path_list, group_host.as_ref())
                         .cloned()
                     {
+                        if !passes_weekly_filter(&row) {
+                            continue;
+                        }
                         if !seen_thread_ids.insert(row.thread_id) {
                             continue;
                         }
@@ -1850,15 +1910,21 @@ impl Sidebar {
                 store
                     .entries_for_main_worktree_path(group_key.path_list(), group_host.as_ref())
                     .any(|metadata| {
-                        let workspace = resolve_workspace(metadata.folder_paths());
-                        thread_metadata_would_render_sidebar_row(metadata, &workspace, cx)
+                        passes_weekly_filter(metadata)
+                            && {
+                                let workspace = resolve_workspace(metadata.folder_paths());
+                                thread_metadata_would_render_sidebar_row(metadata, &workspace, cx)
+                            }
                     })
-                    || store
-                        .entries_for_path(group_key.path_list(), group_host.as_ref())
-                        .any(|metadata| {
-                            let workspace = resolve_workspace(metadata.folder_paths());
-                            thread_metadata_would_render_sidebar_row(metadata, &workspace, cx)
-                        })
+                || store
+                    .entries_for_path(group_key.path_list(), group_host.as_ref())
+                    .any(|metadata| {
+                        passes_weekly_filter(metadata)
+                            && {
+                                let workspace = resolve_workspace(metadata.folder_paths());
+                                thread_metadata_would_render_sidebar_row(metadata, &workspace, cx)
+                            }
+                    })
             };
             let has_threads = has_visible_rows || has_stored_thread_rows;
 
@@ -3392,6 +3458,19 @@ impl Sidebar {
 
     fn has_filter_query(&self, cx: &App) -> bool {
         !self.filter_editor.read(cx).text(cx).is_empty()
+    }
+
+    fn toggle_weekly_filter(
+        &mut self,
+        _: &gpui::ClickEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.weekly_filter_enabled = !self.weekly_filter_enabled;
+        // The selected index may now point past the filtered list.
+        self.selection = None;
+        self.serialize(cx);
+        self.update_entries(cx);
     }
 
     fn start_renaming_thread(
@@ -7487,6 +7566,17 @@ impl Sidebar {
                                     && !self.filter_editor.focus_handle(cx).is_focused(window),
                                 |this| this.child(KeyBinding::for_action(&FocusSidebarFilter, cx)),
                             )
+                            .child(
+                                IconButton::new("weekly-thread-filter", IconName::Filter)
+                                    .icon_size(IconSize::Small)
+                                    .toggle_state(self.weekly_filter_enabled)
+                                    .tooltip(Tooltip::text(if self.weekly_filter_enabled {
+                                        "Showing threads from the last 7 days — click to list all"
+                                    } else {
+                                        "Showing all threads — click to list only the last 7 days"
+                                    }))
+                                    .on_click(cx.listener(Self::toggle_weekly_filter)),
+                            )
                             .when(has_query, |this| {
                                 this.child(
                                     IconButton::new("clear_filter", IconName::Close)
@@ -7960,6 +8050,7 @@ impl WorkspaceSidebar for Sidebar {
                 SidebarView::ThreadList => SerializedSidebarView::ThreadList,
                 SidebarView::Archive(_) => SerializedSidebarView::History,
             },
+            weekly_filter_enabled: self.weekly_filter_enabled,
         };
         serde_json::to_string(&serialized).ok()
     }
@@ -7973,6 +8064,10 @@ impl WorkspaceSidebar for Sidebar {
         if let Some(serialized) = serde_json::from_str::<SerializedSidebar>(state).log_err() {
             if let Some(width) = serialized.width {
                 self.width = px(width).clamp(MIN_WIDTH, MAX_WIDTH);
+            }
+            if serialized.weekly_filter_enabled != self.weekly_filter_enabled {
+                self.weekly_filter_enabled = serialized.weekly_filter_enabled;
+                self.schedule_update_entries(false, cx);
             }
             if serialized.active_view == SerializedSidebarView::History {
                 cx.defer_in(window, |this, window, cx| {

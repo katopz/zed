@@ -1,6 +1,6 @@
 # 019: UI freeze regression — sidebar rebuild cost + exFAT FSEvents rescan storms
 
-**Status:** Fixed — `240b7cfa05` (fs watcher) + `50c090fbc5` (sidebar rebuild), pushed to `develop` 2026-09-06. First follow-up (`AutoPromptContext::collect` main-thread serialization) also fixed — see below.
+**Status:** Fixed — `240b7cfa05` (fs watcher) + `50c090fbc5` (sidebar rebuild), pushed to `develop` 2026-09-06. Follow-ups: `AutoPromptContext::collect` serialization fixed (`a087ed63e8`); sidebar weekly view filter + env-gated metadata retention added (see below).
 
 ## Symptoms
 
@@ -71,3 +71,27 @@
   `serde_json::from_str` parse in the plan/summary machines.
 - Sidebar store hygiene: 12,699 rows (3,819 with empty folder_paths) — an
   archive/cleanup pass would shrink every rebuild proportionally.
+
+## Follow-ups landed (2026-09-06, same day)
+
+- **Sidebar weekly view filter (default on)** — `Sidebar::weekly_filter_enabled`
+  (persisted via `SerializedSidebar.weekly_filter_enabled`, default true).
+  With no search query active, `rebuild_contents` gathers only threads with
+  `thread_display_time` (interacted_at/updated_at) within the last
+  `WEEKLY_FILTER_DAYS = 7` days; a header filter icon
+  (`IconName::Filter`, `toggle_state`) toggles it — checked = last 7 days,
+  unchecked = full history. Search bypasses the filter so old threads stay
+  findable, and the active/retained threads of every workspace are always
+  exempt (an open old thread must never vanish from the list).
+  `has_stored_thread_rows` applies the same predicate so fully-stale groups
+  render the "No threads yet" empty state. Test-harness sidebars start with
+  the filter off (they seed old-timestamp threads); the behavior is covered
+  by `test_weekly_filter_hides_old_threads_and_toggle_lists_all`.
+- **Env-gated metadata retention** — `ThreadMetadataStore::enforce_retention_cap`
+  runs after each store reload. Reads `ZED_AUTO_ARCHIVE_THREAD_CAP` (unset/0
+  = disabled, default). When set (e.g. 500): groups unarchived non-draft
+  threads by (folder_paths, remote identity), archives oldest-beyond-cap via
+  `archive(id, None, cx)` — metadata-only flag flip, no worktree archive jobs,
+  thread bodies untouched, threads stay reachable in the archive view.
+  Pinned threads and threads updated within 7 days are never archived.
+  Covered by `test_retention_*` (4 tests) in thread_metadata_store.rs.
