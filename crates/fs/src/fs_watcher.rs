@@ -203,7 +203,12 @@ pub fn requires_poll_watcher(path: &Path) -> bool {
         return detect_requires_poll_watcher_linux(path);
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        return detect_requires_poll_watcher_macos(path);
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = path;
         false
@@ -305,6 +310,59 @@ fn detect_requires_poll_watcher_linux(path: &Path) -> bool {
     }
 
     false
+}
+
+/// macOS mirror of the Linux statfs detection. FSEvents silently degrades on
+/// filesystems whose kernel doesn't feed the fseventsd pipe: FAT/exFAT
+/// (external SD/USB media) drop events under load and answer with
+/// `kFSEventStreamEventFlagMustScanSubDirs` ("watcher lost sync") storms, and
+/// network filesystems (SMB/NFS/WebDAV) deliver at best unreliably. Such
+/// volumes get the poll watcher instead — a bounded periodic scan beats a
+/// full rescan of every watched tree whenever the card hiccups.
+#[cfg(target_os = "macos")]
+fn detect_requires_poll_watcher_macos(path: &Path) -> bool {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = match CString::new(path.as_os_str().as_bytes()) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+
+    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(c_path.as_ptr(), &mut stat) } != 0 {
+        return false;
+    }
+
+    // `f_mntonname` is the mount point; `f_fstypename` is the FS identifier
+    // ("apfs", "exfat", "msdos", "smbfs", "nfs", ...). C `char` on macOS is
+    // signed, so reinterpret bytes before the UTF-8 lossy conversion.
+    let fs_type = String::from_utf8_lossy(
+        &stat
+            .f_fstypename
+            .iter()
+            .take_while(|&&byte| byte != 0)
+            .map(|&byte| byte as u8)
+            .collect::<Vec<u8>>(),
+    )
+    .into_owned();
+
+    match fs_type.as_str() {
+        // FAT/exFAT: FSEvents events are dropped under load, triggering
+        // must-rescan storms over every watched tree.
+        "exfat" | "msdos" | "fat32" | "fat16" | "fat12"
+        // Network/virtual filesystems: native events unreliable.
+        | "smbfs" | "afpfs" | "nfs" | "webdav" | "sshfs" | "osxfuse" | "fusefs" | "muterdisk"
+        | "devfs" | "procfs" | "linprocfs" => {
+            log::info!(
+                "Detected filesystem type '{}' at {}, using poll watcher",
+                fs_type,
+                path.display()
+            );
+            true
+        }
+        _ => false,
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1141,6 +1199,45 @@ fn global_watcher() -> &'static GlobalWatcher {
 mod tests {
     use super::*;
     use std::{collections::HashSet, path::PathBuf};
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_poll_detection_says_no_for_apfs_tmp() {
+        // /tmp resolves to the root APFS container in the default macOS
+        // install. If this machine mounts something exotic at /tmp the test
+        // still passes as long as the FS is not in the poll list.
+        let requires_poll = detect_requires_poll_watcher_macos(Path::new("/tmp"));
+        let fs_type = filesystem_type_name(Path::new("/tmp"));
+        let in_poll_list = matches!(
+            fs_type.as_deref(),
+            Some("exfat" | "msdos" | "smbfs" | "afpfs" | "nfs" | "webdav" | "sshfs")
+        );
+        assert_eq!(requires_poll, in_poll_list);
+    }
+
+    /// Best-effort FS type probe for tests: mirrors the statfs read in
+    /// `detect_requires_poll_watcher_macos`.
+    #[cfg(target_os = "macos")]
+    fn filesystem_type_name(path: &Path) -> Option<String> {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
+        let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statfs(c_path.as_ptr(), &mut stat) } != 0 {
+            return None;
+        }
+        Some(
+            String::from_utf8_lossy(
+                &stat
+                    .f_fstypename
+                    .iter()
+                    .take_while(|&&byte| byte != 0)
+                    .map(|&byte| byte as u8)
+                    .collect::<Vec<u8>>(),
+            )
+            .into_owned(),
+        )
+    }
 
     fn rescan(path: &str) -> PathEvent {
         PathEvent {
