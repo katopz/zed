@@ -645,7 +645,12 @@ manual — is stamped with a `## Start context` block assembled by code at
 
 The worker agent can then make resource- and fleet-aware decisions without
 spending tool calls probing the machine (`nvidia-smi`, `powermetrics`, …) or
-polling the agent board. Test builds skip the block entirely (no cache, no
+polling the agent board. Sibling/peer excerpts are wrapped in
+`<other_agent>…</other_agent>` tags with a trailing do-not-act guard line: a
+sibling's truncated last message routinely contains imperative text ("now
+compose the final answer: …") or a full `## Summary` block, which the worker
+otherwise reads as instructions addressed to it (or as its own overflow
+sentinel). Test builds skip the block entirely (no cache, no
 process spawns under the deterministic test scheduler).
 
 ### Manual auto-prompt (sparkle button)
