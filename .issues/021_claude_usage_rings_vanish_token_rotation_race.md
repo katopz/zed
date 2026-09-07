@@ -1,6 +1,6 @@
 # Issue 021: Claude 5h/weekly usage rings vanish — first poll races claude-acp's OAuth token rotation
 
-Status: FIXED — unconditional 401 re-read + bounded fast retry landed (`20316921a8`); pre-existing clippy blocker cleared in `fe8bbb3eca`. Gate: clippy green, in-tree test execution NOT completed (see Gate section). Live-verify pending: next cold start that opens a Claude thread should show the rings within ~15s instead of blacking out for 300s.
+Status: FIXED — unconditional 401 re-read + bounded fast retry landed (`20316921a8`); pre-existing clippy blocker cleared in `fe8bbb3eca`. Gate: clippy green + 5/5 tests passing (see Gate section). Live-verify pending: next cold start that opens a Claude thread should show the rings within ~15s instead of blacking out for 300s.
 
 ## Symptom
 
@@ -85,7 +85,7 @@ additions" rule. Worth a follow-up if this recurs.
 - [x] Verify the anyhow downcast assumption against the pinned version (1.0.102)
 - [x] Clippy clean (`-p agent_ui --lib --tests -- --deny warnings` → exit 0)
 - [x] Commit + push
-- [ ] Execute the test suite in-tree (blocked, see Gate)
+- [x] Execute the test suite in-tree (`5 passed; 0 failed`)
 - [ ] Run the mandated `./script/clippy` release gate (blocked, see Gate)
 - [ ] Live-verify the rings appear on a cold start
 
@@ -101,16 +101,20 @@ Honest record, because the mandated gate did not run:
   30+ minutes by a wedged foreign `cargo check -p agent_ui` (0.2% CPU) belonging to another
   session, which must not be killed. A cold release build was impossible: the boot volume
   backing `/tmp` is at 100% capacity with ~14Gi free.
-- **In-tree test execution: NOT COMPLETED.** Repeated attempts stalled with cargo in
-  uninterruptible wait at 0% CPU and zero file writes. Cause is environmental, not the code:
+- **In-tree tests: PASSED.** `cargo test -p agent_ui --lib claude_usage` →
+  `test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 476 filtered out`, `TEST_EXIT=0`.
+  This took several restarts and ~40 min of wall clock: attempts repeatedly stalled with cargo
+  in uninterruptible wait at 0% CPU and zero file writes. That was environmental, not the code —
   exFAT on the SDXC card does not support hard links, so rustc reports `hard linking files in
   the incremental compilation cache failed. copying files instead` for every unit, while
   XProtect/Spotlight scan the fresh artifacts and a 168%-CPU `qemu-system-xtensa` from another
-  session competes for the machine.
-- **Compensating evidence for the untested assertion.** The one non-obvious thing the new test
-  covers — that `anyhow::Error::downcast_ref::<TokenRejected>()` still resolves through the
+  session competes for the machine. Build the repo from a hard-link-capable filesystem to avoid
+  this.
+- **Independent check of the key assumption.** Before the in-tree run completed, the one
+  non-obvious thing the new test covers — that `anyhow::Error::downcast_ref::<TokenRejected>()` still resolves through the
   `.context()` layer carrying the status code — was executed standalone against zed's pinned
   anyhow 1.0.102: downcast through context `true`, display retains `401`, negative case `true`.
   The module's other tests cover pure functions untouched by this change.
 
-Anyone picking this up should run the full gate on a machine where the repo is not on exFAT.
+Still open: the mandated `./script/clippy` release gate. Anyone picking this up should run it
+from a hard-link-capable filesystem.
