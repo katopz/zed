@@ -3689,7 +3689,7 @@ mod tests {
             ..Default::default()
         }));
 
-        let mut make_remote = |session_id: &str, age_days: i64| {
+        let make_remote = |session_id: &str, age_days: i64| {
             let mut metadata = make_metadata(
                 session_id,
                 session_id,
