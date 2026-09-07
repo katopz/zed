@@ -28,6 +28,28 @@ const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 /// for third-party pollers.
 const POLL_INTERVAL: Duration = Duration::from_secs(180);
 const RETRY_INTERVAL: Duration = Duration::from_secs(300);
+/// The `claude-acp` server refreshes the shared OAuth token while it starts
+/// up, and opening a Claude thread both spawns that server and creates this
+/// store — so the very first poll routinely races the rotation and gets a 401.
+/// Retry that case quickly instead of hiding the rings for `RETRY_INTERVAL`.
+const AUTH_RETRY_INTERVAL: Duration = Duration::from_secs(15);
+/// API-key accounts have no subscription usage and 401 forever, so fast
+/// retries are bounded to keep off the endpoint's 429 bucket.
+const MAX_AUTH_RETRIES: u32 = 3;
+
+/// A rejected OAuth token, as opposed to an unreachable endpoint or an
+/// account without a subscription. Retrying this is worthwhile because the
+/// token is shared with Claude Code, which rotates it out from under us.
+#[derive(Debug)]
+struct TokenRejected;
+
+impl std::fmt::Display for TokenRejected {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Claude rejected the stored OAuth token")
+    }
+}
+
+impl std::error::Error for TokenRejected {}
 
 /// How much of one rate-limit window has been consumed.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -95,6 +117,7 @@ impl ClaudeUsageStore {
     fn poll(cx: &mut Context<Self>) -> Task<()> {
         cx.spawn(async move |this, cx| {
             let token_cache = Arc::new(Mutex::new(None));
+            let mut auth_retries = 0;
             loop {
                 let http_client = cx.update(|cx| cx.http_client());
                 let token_cache = token_cache.clone();
@@ -107,6 +130,7 @@ impl ClaudeUsageStore {
                         // Feed auto_prompt's session-limit scheduler — exact
                         // `resets_at` timestamps beat parsing error text.
                         auto_prompt::session_limit::record_usage_hint((&usage).into());
+                        auth_retries = 0;
                         let applied = this.update(cx, |this, cx| {
                             this.failing = false;
                             if this.usage.as_ref() != Some(&usage) {
@@ -129,7 +153,16 @@ impl ClaudeUsageStore {
                             Ok(true) => log::debug!("could not read Claude usage: {error:#}"),
                             Err(_) => return,
                         }
-                        RETRY_INTERVAL
+
+                        match error.downcast_ref::<TokenRejected>().is_some()
+                            && auth_retries < MAX_AUTH_RETRIES
+                        {
+                            true => {
+                                auth_retries += 1;
+                                AUTH_RETRY_INTERVAL
+                            }
+                            false => RETRY_INTERVAL,
+                        }
                     }
                 };
 
@@ -146,21 +179,33 @@ async fn fetch_usage(
     token_cache: Arc<Mutex<Option<String>>>,
 ) -> Result<ClaudeUsage> {
     let cached_token = token_cache.lock().clone();
-    let was_cached = cached_token.is_some();
     let mut access_token = match cached_token {
         Some(token) => token,
         None => read_access_token().await?,
     };
 
     let (mut status, mut body) = request_usage(&http_client, &access_token).await?;
-    if was_cached && matches!(status.as_u16(), 401 | 403) {
-        access_token = read_access_token().await?;
-        (status, body) = request_usage(&http_client, &access_token).await?;
+
+    // A token read moments before `claude-acp` rotates it is rejected just
+    // like a long-cached one, so gating this retry on the token having come
+    // from our cache would leave the first poll of a session permanently
+    // stale. Comparing against the keychain covers both and skips the second
+    // request when nothing rotated.
+    if matches!(status.as_u16(), 401 | 403) {
+        let refreshed_token = read_access_token().await?;
+        if refreshed_token != access_token {
+            access_token = refreshed_token;
+            (status, body) = request_usage(&http_client, &access_token).await?;
+        }
     }
 
     // The body echoes account details, so keep it out of the error.
     if !status.is_success() {
         token_cache.lock().take();
+        if matches!(status.as_u16(), 401 | 403) {
+            return Err(anyhow::Error::new(TokenRejected)
+                .context(format!("Claude usage request failed with status {status}")));
+        }
         bail!("Claude usage request failed with status {status}");
     }
 
@@ -392,6 +437,20 @@ mod tests {
             .into();
 
         assert!(usage.is_empty());
+    }
+
+    /// The fast-retry decision downcasts through the `context` layer that
+    /// carries the status code, so a regression here would silently restore
+    /// the five-minute blackout.
+    #[test]
+    fn test_token_rejected_survives_context() {
+        let error = anyhow::Error::new(TokenRejected)
+            .context("Claude usage request failed with status 401 Unauthorized");
+        assert!(error.downcast_ref::<TokenRejected>().is_some());
+        assert!(format!("{error:#}").contains("401"));
+
+        let other = anyhow::anyhow!("Claude usage request failed with status 429 Too Many Requests");
+        assert!(other.downcast_ref::<TokenRejected>().is_none());
     }
 
     #[test]
