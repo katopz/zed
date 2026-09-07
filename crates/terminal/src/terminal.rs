@@ -2993,6 +2993,26 @@ impl Terminal {
         Task::ready(None)
     }
 
+    /// Completes a still-running task without waiting for the backend to
+    /// report the child's exit. Used where no exit event can ever arrive
+    /// anymore (backend teardown); without this, everything awaiting
+    /// `wait_for_completed_task` would hang forever.
+    fn complete_running_task(&mut self, exit_status: Option<ExitStatus>) {
+        let Some(task) = &mut self.task else {
+            return;
+        };
+        if task.status != TaskStatus::Running {
+            return;
+        }
+        if let Some(tx) = &self.completion_tx {
+            tx.try_send(exit_status).ok();
+        }
+        match exit_status.and_then(|status| status.code()) {
+            Some(error_code) => task.status.register_task_exit(error_code),
+            None => task.status.register_terminal_exit(),
+        }
+    }
+
     fn register_task_finished(
         &mut self,
         exit_status: Option<ExitStatus>,
@@ -3279,6 +3299,12 @@ impl Terminal {
     /// PTY slave disappears — a command that leaves a background process behind
     /// (e.g. `npm run dev &`) then pins them until Zed exits.
     pub fn shutdown_backend(&mut self) {
+        // Once the backend is torn down no `ChildExit`/`Exit` event can ever
+        // arrive, so a still-running task must be completed here. Otherwise
+        // everything awaiting `wait_for_completed_task` (the agent's terminal
+        // tool call and the tool-call card's running indicator) hangs forever
+        // after Stop — the spinner that can't be stopped.
+        self.complete_running_task(None);
         if let Some(subprocess) = self.subprocess.take() {
             subprocess.kill();
         }
@@ -5607,6 +5633,90 @@ mod tests {
             content.contains("done"),
             "Output should still be present after no-op kill, got: {content}"
         );
+    }
+
+    /// Regression test: `shutdown_backend` must complete a still-running task.
+    /// Once the backend is torn down no `ChildExit`/`Exit` event can ever
+    /// arrive, so without the flush the agent tool call and the tool-call
+    /// card's running indicator hang forever after the user clicks Stop —
+    /// a spinner that can't be stopped.
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_shutdown_backend_completes_running_task(cx: &mut TestAppContext) {
+        use task::Shell;
+        use util::shell_builder::ShellBuilder;
+
+        cx.executor().allow_parking();
+
+        // A task-backed PTY terminal, mirroring what
+        // Project::create_terminal_task builds for agent tool calls: the
+        // shell runs a long command and the task is still Running.
+        let (completion_tx, completion_rx) = async_channel::unbounded();
+        let (program, args) = ShellBuilder::new(&Shell::System, false).build(
+            Some("printf 'before_shutdown\\n' && sleep 60".to_owned()),
+            &[],
+        );
+        let task_state = TaskState {
+            status: TaskStatus::Running,
+            completion_rx: completion_rx.clone(),
+            spawned_task: SpawnInTerminal {
+                command: Some(program.clone()),
+                args: args.clone(),
+                ..Default::default()
+            },
+        };
+
+        let builder = cx
+            .update(|cx| {
+                TerminalBuilder::new(
+                    None,
+                    Some(task_state),
+                    task::Shell::WithArguments {
+                        program,
+                        args,
+                        title_override: None,
+                    },
+                    HashMap::default(),
+                    SettingsCursorShape::default(),
+                    AlternateScroll::On,
+                    None,
+                    vec![],
+                    0,
+                    false,
+                    0,
+                    Some(completion_tx),
+                    cx,
+                    vec![],
+                    PathStyle::local(),
+                )
+            })
+            .await
+            .unwrap();
+        let terminal = cx.new(|cx| builder.subscribe(cx));
+
+        terminal.update(cx, |term, _cx| {
+            assert_eq!(
+                term.task().map(|task| task.status),
+                Some(TaskStatus::Running)
+            );
+            term.shutdown_backend();
+        });
+
+        let exit_status = completion_rx
+            .recv()
+            .await
+            .expect("completion channel should be flushed by shutdown_backend");
+        assert!(
+            exit_status.is_none(),
+            "shutdown_backend has no real exit status to report, got {exit_status:?}"
+        );
+
+        terminal.update(cx, |term, _cx| {
+            assert_ne!(
+                term.task().map(|task| task.status),
+                Some(TaskStatus::Running)
+            );
+        });
     }
 
     mod perf {
