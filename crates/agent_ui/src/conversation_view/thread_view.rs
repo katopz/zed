@@ -6337,9 +6337,10 @@ impl ThreadView {
     }
 
     /// Honest label for the verdict entry points: only the `claude_code`
-    /// reviewer backend is actually Claude; the default native route spawns a
-    /// subagent on `verdict_model` (inheriting the parent's own model when
-    /// unset), so calling it "Claude" there would misrepresent the review.
+    /// reviewer backend (the default) is actually Claude; the `native` route
+    /// spawns a subagent on `verdict_model` (inheriting the parent's own
+    /// model when unset), so calling it "Claude" there would misrepresent
+    /// the review.
     fn verdict_label(cx: &App) -> &'static str {
         match AgentSettings::get_global(cx).verdict_reviewer {
             VerdictReviewerSetting::ClaudeCode => "Verdict with Claude",

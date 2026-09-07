@@ -1,6 +1,6 @@
 # Claude Code Verdict Reviewer (phase 6 of proposal 001)
 
-Status: IMPLEMENTED — `agent.verdict_reviewer = "claude_code"` behind the ping-pong gate; teardown limitation fixed via `.issues/016` part 2 (drain pattern)
+Status: IMPLEMENTED — `agent.verdict_reviewer = "claude_code"` behind the ping-pong gate, **and now the shipped default** (flipped from `native` in commit fdeb4e98d8's follow-up); teardown limitation fixed via `.issues/016` part 2 (drain pattern)
 
 ## Goal
 
@@ -50,7 +50,9 @@ a provider trait + global in `acp_thread`, implemented and registered by
   connection (`entry.wait_for_connection`), spawns the session. Registered in
   `AgentPanel::new` next to the connection store.
 - `crates/agent/src/tools/request_verdict_tool.rs`
-  - routing: `agent.verdict_reviewer` = `native` (default) | `claude_code`
+  - routing: `agent.verdict_reviewer` = `claude_code` (default) | `native`;
+    default flipped to claude_code once the tool became reachable in default
+    profiles (see request_verdict reachability fix, commit fdeb4e98d8)
   - pure `resolve_route()` (unit-tested); claude_code without a registered
     provider → clear error, never silent fallback
   - `final_round` input flag → closes the reviewer session on agreement
@@ -82,7 +84,8 @@ TTL-expired reviewer sessions (parent abandoned mid-negotiation without
       (`register_reviewer_session`/`reviewer_thread`), bounded turn runner
       (`reviewer_turn`, 180s), `complete_reviewer` close path; 8 tests green
 - [x] settings — `agent.verdict_reviewer` (`native` | `claude_code`, default
-      native) through `settings_content` + `agent_settings` + test literals
+      claude_code since the reachability fix) through `settings_content` +
+      `agent_settings` + test literals
 - [x] ThreadEnvironment — `project`/`work_dirs` accessors (default `None`,
       native impls read thread + parent ACP wrapper)
 - [x] tool — `resolve_route` (pure, never silently falls back), `final_round`

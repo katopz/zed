@@ -608,7 +608,14 @@ mod tests {
     }
 
     #[test]
-    fn resolve_route_defaults_to_native_and_never_silently_falls_back() {
+    fn resolve_route_never_silently_falls_back() {
+        // claude_code is the shipped default (real second opinion); pin it so
+        // a future refactor can't quietly flip back to self-review.
+        assert_eq!(
+            VerdictReviewerSetting::default(),
+            VerdictReviewerSetting::ClaudeCode
+        );
+
         assert_eq!(
             resolve_route(&VerdictReviewerSetting::Native, None),
             Ok(ReviewerRoute::Native)

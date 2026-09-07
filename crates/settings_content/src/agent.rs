@@ -636,10 +636,13 @@ pub enum NotifyWhenAgentWaiting {
 #[serde(rename_all = "snake_case")]
 pub enum VerdictReviewerSetting {
     /// Subagent pinned to `verdict_model` (inherits parent model when unset).
-    #[default]
+    /// Opt in via `agent.verdict_reviewer = "native"`.
     Native,
     /// Off-screen Claude Code session on its existing connection — uses
     /// Claude Code's own subscription auth, no Anthropic API key required.
+    /// Default. Requires Claude Code connected in the agent panel; errors
+    /// honestly when absent — never falls back to the worker's own model.
+    #[default]
     ClaudeCode,
 }
 
