@@ -1755,7 +1755,9 @@ impl AgentPanel {
 
         // Verdict ping-pong (proposal 001 phase 6): expose the panel's Claude
         // Code connection to the `request_verdict` tool. Re-registered if a
-        // second panel spawns (last one wins); cleared when this panel drops.
+        // second panel spawns (last one wins); the reviewer re-resolves a
+        // live store at spawn time, so a stale registration after this panel
+        // drops is harmless.
         acp_thread::verdict::set_reviewer(Some(crate::verdict_reviewer::ClaudeCodeReviewer::new(
             connection_store.downgrade(),
         )));
