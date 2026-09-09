@@ -104,3 +104,15 @@ TTL-expired reviewer sessions (parent abandoned mid-negotiation without
 - full `cargo test -p agent` — 737 passed; `agent_ui conversation_view` — 116
   passed (caught + fixed a discarded-`Deferred` bug in the first registration)
 - targeted clippy clean on acp_thread / agent / agent_ui
+
+## Follow-up fixes
+
+- [x] stale registration: closing the last-registered panel (second window
+      closed / workspace swapped) left the global reviewer pointing at a
+      dropped `AgentConnectionStore` while other live panels kept Claude
+      connected, so `request_verdict` failed with "agent panel connection
+      store is gone". `spawn_session` now re-resolves a live store on every
+      call — registered handle is only a hint, live panels are scanned
+      (workspace roots incl. MultiWorkspace) and ranked Claude-entry >
+      same project > registered. 3 gpui tests in `verdict_reviewer.rs`.
+      Landed 2026-09-09: 19556c5841
