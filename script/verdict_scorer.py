@@ -188,6 +188,14 @@ class ThreadScore:
         return any(not call.is_error for call in self.verdict_calls)
 
     @property
+    def verdict_attempted(self) -> bool:
+        # Every call errored (e.g. "agent panel connection store is gone"):
+        # the negotiation never started, so the chain is neither a verdict-on
+        # data point nor a clean verdict-off baseline member — it is a failed
+        # attempt, and the errors are the abort metric's spawn-failure class.
+        return bool(self.verdict_calls) and not self.verdict_on
+
+    @property
     def rounds_used(self) -> int:
         return max((call.round or 0 for call in self.verdict_calls), default=0)
 
@@ -383,7 +391,8 @@ def main() -> int:
         scores.append(score_thread(str(thread_id), thread))
 
     verdict_on = [s for s in scores if s.verdict_on]
-    verdict_off = [s for s in scores if not s.verdict_on]
+    verdict_off = [s for s in scores if not s.verdict_on and not s.verdict_attempted]
+    verdict_failed = [s for s in scores if s.verdict_attempted]
 
     # Group threads into continuation chains: corrections in follow-up threads
     # count against the originating thread, and a continuation whose FIRST
@@ -408,6 +417,8 @@ def main() -> int:
             "root": root,
             "members": [m.thread_id for m in members],
             "verdict_on": any(m.verdict_on for m in members),
+            "verdict_failed": (not any(m.verdict_on for m in members))
+            and any(m.verdict_attempted for m in members),
             "has_summary": any(m.has_summary for m in members),
             "corrections": corrections,
             "rounds_used": max((m.rounds_used for m in members), default=0),
@@ -419,7 +430,10 @@ def main() -> int:
 
     chain_records = [chain_record(root, members) for root, members in chains.items()]
     on_chains = [c for c in chain_records if c["verdict_on"]]
-    off_chains = [c for c in chain_records if not c["verdict_on"]]
+    failed_chains = [c for c in chain_records if c["verdict_failed"]]
+    off_chains = [
+        c for c in chain_records if not c["verdict_on"] and not c["verdict_failed"]
+    ]
     report = {
         "db": str(db_path),
         "metadata_db_linked": bool(edges),
@@ -428,6 +442,7 @@ def main() -> int:
         "parse_failures": parse_failures,
         "verdict_on": cohort_stats(on_chains),
         "verdict_off": cohort_stats(off_chains),
+        "verdict_failed": cohort_stats(failed_chains),
         "chains": [
             {
                 "root": c["root"],
@@ -448,7 +463,11 @@ def main() -> int:
         f"scored: {report['scored_threads']} threads in {len(chain_records)} chains "
         f"({parse_failures} parse failures, continuation links: {len(edges)})\n"
     )
-    for label, cohort in (("verdict ON", report["verdict_on"]), ("verdict OFF", report["verdict_off"])):
+    for label, cohort in (
+        ("verdict ON", report["verdict_on"]),
+        ("verdict OFF", report["verdict_off"]),
+        ("verdict FAILED (all-error attempts, excluded from both cohorts)", report["verdict_failed"]),
+    ):
         rate = cohort["post_hoc_fix_rate"]
         rate_str = f"{rate:.1%}" if rate is not None else "n/a"
         print(f"{label}:")

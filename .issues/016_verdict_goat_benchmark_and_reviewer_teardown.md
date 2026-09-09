@@ -1,6 +1,6 @@
 # Verdict ping-pong GOAT benchmark + reviewer session teardown
 
-Status: PART 1 harness SHIPPED (persistence + scorer), Part 2 teardown FIXED (drain pattern); remaining: run the >= 20-task benchmark and record the GOAT verdict
+Status: PART 1 harness SHIPPED (persistence + scorer), Part 2 teardown FIXED (drain pattern); interim bench recorded 2026-09-09 (`.benchmarks/001_verdict_ping_pong_goat.md`): baseline 6.4% (460/7234 chains), FAILED cohort instrumented (2 spawn-aborts), ON cohort still 0 — the running app predates the stale-registration fix `19556c5841`, so live verdict attempts must wait for a rebuild + restart; remaining: accumulate the >= 20-task cohort post-restart, then record the GOAT verdict
 
 ## Context
 
@@ -95,4 +95,5 @@ close-counting connection asserted end-to-end).
 
 - `.proposals/001_claude_sub_agent_verdict.md`
 - `.plans/029_claude_code_verdict_reviewer.md`
+- `.benchmarks/001_verdict_ping_pong_goat.md` (interim record, 2026-09-09)
 - commits: e5b496bf46 (phases 1-5), phase 6 commit (this issue's sibling)
