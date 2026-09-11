@@ -1,6 +1,6 @@
 # GLM endpoint rejects non-text content parts + WAF 405 blocks
 
-status: open (follow-ups from 1210 title-gen fix c876a4ef8a; WAF item owner-gated)
+status: open (WAF item owner-gated; 1210 fully fixed in c876a4ef8a + c2df6463d3)
 
 ## Context
 
@@ -21,11 +21,13 @@ independent ways:
 
 ## Remaining follow-ups
 
-- [ ] Main-turn path has the same latent hazard: if a user switches a thread
-      from an image-capable model to a text-only model, replayed history still
-      contains image parts → 1210 on the next turn. Consider applying
-      `strip_unsupported_images` (or equivalent capability gating) to the main
-      request build path in `crates/agent/src/thread.rs`.
+- [x] Main-turn + compaction paths sanitized (was: latent hazard when a user
+      switches a thread from an image-capable model to a text-only model).
+      Fixed in c2df6463d3: `run_turn_internal` sanitizes against the model
+      actually used (covers refusal fallback), `build_compaction_request`
+      sanitizes against the compaction model; helper takes the request by
+      value with an image-presence early-out so the hot path pays a scan, not
+      a copy. 2 end-to-end tests + compaction suite green.
 - [ ] Owner: tune Aliyun WAF rules for the GLM endpoint (405 HTML block pages
       abort whole turns; log tag `[acp_thread] Error in run turn`).
 - [x] Title/summary 1210 — fixed in c876a4ef8a (remove this file once both
