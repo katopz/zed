@@ -909,6 +909,19 @@ pub fn summary_continuation_fast_path(data: &LlmCallData) -> Option<AutoPromptOu
     if data.context_exceeds_limit {
         return None;
     }
+    // The source turn failed at the API level: the "voluntary summary" we're
+    // about to act on is STALE (it predates the failed turn — no new assistant
+    // message was produced). Continuing from it (including the housekeeping
+    // directive) dispatches straight back into the same blocked API and loops
+    // forever: send → 405 → error-path chaining → summary fast path → send.
+    // Defer to the LLM path instead, whose retry-exhaustion guard backs off
+    // and stops the chain when the API stays down.
+    if data.had_api_error {
+        log::warn!(
+            "[auto_prompt] summary fast path skipped: source turn had an API error — not continuing from a stale summary"
+        );
+        return None;
+    }
     let last = data.last_assistant_message.as_deref()?;
     if !looks_like_voluntary_summary(last) {
         return None;
@@ -1966,6 +1979,17 @@ fn maybe_clarification_request(data: &LlmCallData) -> Option<AutoPromptOutcome> 
     Some(AutoPromptOutcome::ClarificationRequest(action))
 }
 
+/// Whether the retry-exhaustion path in `decide_with_llm` (all lightweight
+/// retries failed) must defer (`RetryAfterBackoff`) instead of running the
+/// no-LLM safety nets (`detect_remaining_work` / `detect_remaining_plan_tasks`).
+/// When the source thread's turn itself failed at the API level, a safety-net
+/// "continue" dispatches back into the same blocked API forever (the
+/// send → 405 → decide → send loop that froze Zed while the GLM endpoint was
+/// WAF-blocked, 2026-09-11). Extracted so the rule is directly testable.
+fn should_defer_after_retry_exhaustion(had_api_error: bool) -> bool {
+    had_api_error
+}
+
 pub async fn decide_with_llm(
     data: LlmCallData,
     cx: &gpui::AsyncApp,
@@ -2438,6 +2462,30 @@ pub async fn decide_with_llm(
                                         reason: stop_reason,
                                     })
                                 }
+                            }
+                            None if should_defer_after_retry_exhaustion(data.had_api_error) => {
+                                // The worker's own turn failed at the API level
+                                // (`had_api_error`: 405/429/5xx from the provider) and
+                                // every orchestration retry just failed too — the API is
+                                // down. The safety nets in the arm below would "continue"
+                                // from the STALE last assistant message straight back into
+                                // the same blocked API: an infinite send → 405 → decide →
+                                // send loop (~7 doomed requests per cycle) that also keeps
+                                // the provider's WAF block alive. Defer instead — the
+                                // unified retry loop in `run_auto_prompt` applies backoff
+                                // against the shared failure budget and converts to
+                                // Stopped once max_llm_retries is spent.
+                                log::warn!(
+                                    "auto_prompt: all lightweight retries failed with had_api_error — deferring with backoff instead of safety-net continue"
+                                );
+                                Ok(AutoPromptOutcome::RetryAfterBackoff {
+                                    delay_ms: load_config_cached()
+                                        .unwrap_or_default()
+                                        .backoff_delay_ms(1),
+                                    reason: format!(
+                                        "source turn API error + all retries failed: {reason}"
+                                    ),
+                                })
                             }
                             None => {
                                 log::warn!(
@@ -5054,6 +5102,25 @@ mod tests {
             Some("## Summary\n\nDid the refactor.\n\n## What Remains\n\n- [ ] T2: verify build"),
         );
         data.context_exceeds_limit = true;
+        assert!(summary_continuation_fast_path(&data).is_none());
+    }
+
+    #[test]
+    fn summary_fast_path_skipped_on_api_error() {
+        // Bugfix (2026-09-11 WAF-block freeze): when the source turn failed at
+        // the API level, the summary is stale (no new assistant message was
+        // produced) and continuing from it — including the housekeeping
+        // directive — would loop send → 405 → decide → send against a blocked
+        // API. The fast path must step aside so the LLM path's retry-exhaustion
+        // guard can back off and stop the chain.
+        let session = "summary-fast-path-api-error-test";
+        clear_summary_for_session(session);
+        let mut data = overflow_test_data(
+            session,
+            Some("## Summary\n\nDid the refactor.\n\n## What Remains\n\n- [ ] T2: verify build"),
+        );
+        data.context_exceeds_limit = false;
+        data.had_api_error = true;
         assert!(summary_continuation_fast_path(&data).is_none());
     }
 
@@ -8157,6 +8224,28 @@ Ready to execute Issue 024 (Hero → Avatar rename)?";
             );
             prev = delay;
         }
+    }
+
+    /// Bugfix contract (2026-09-11 WAF-block freeze): when every orchestration
+    /// retry has failed AND the source thread's turn itself failed at the API
+    /// level (`had_api_error`), the retry-exhaustion path must defer
+    /// (`RetryAfterBackoff`) rather than fall through to the no-LLM safety
+    /// nets (`detect_remaining_work` / `detect_remaining_plan_tasks`), which
+    /// would "continue" from a stale assistant message into the same blocked
+    /// API — the infinite send → 405 → decide → send loop. Mirrors the
+    /// issue-007 contract style: the rule lives in
+    /// `should_defer_after_retry_exhaustion`, which the match guard on the
+    /// exhaustion arm calls, so flipping the rule breaks this test.
+    #[test]
+    fn test_retry_exhaustion_with_api_error_defers_instead_of_safety_net() {
+        assert!(
+            should_defer_after_retry_exhaustion(true),
+            "had_api_error + all retries failed must defer, not safety-net continue"
+        );
+        assert!(
+            !should_defer_after_retry_exhaustion(false),
+            "no API error: safety nets stay reachable for ordinary retry exhaustion"
+        );
     }
 
     /// The RetryAfterBackoff variant must be constructible and Debug-printable
