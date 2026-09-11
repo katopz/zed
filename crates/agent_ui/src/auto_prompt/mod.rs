@@ -713,19 +713,6 @@ pub(crate) fn dispatch_action_with_attempts(
         action.actual_input_tokens
     );
 
-    // Plan 027 / issue 029: a new thread picks its spare key fresh via the
-    // per-thread sticky map + rotation cursor (no shared state to clear), and
-    // this hook re-probes every configured key (including backed-off ones)
-    // so stale backoffs clear before the first turn picks a key. No-op for
-    // single-key providers (Claude/ACP, cloud, local).
-    if let Some(model) = conversation_view
-        .active_thread()
-        .and_then(|tv| tv.read(cx).as_native_thread(cx))
-        .and_then(|native_thread| native_thread.read(cx).model().cloned())
-    {
-        model.reset_key_session(cx);
-    }
-
     // Issue 006 P2: bound concurrent streams. A silent background chain
     // (focus_new_thread == false — run_auto_prompt ORs in is_manual before
     // dispatching) must not stack another generating thread once the cap is
@@ -781,10 +768,42 @@ pub(crate) fn dispatch_action_with_attempts(
                      for retry in {STREAM_CAP_RETRY_DELAY_MS}ms \
                      (deferral {next_attempts}/{STREAM_CAP_MAX_DEFERRALS})"
                 );
-                spawn_stream_cap_retry(action, next_attempts, window, cx);
+                // Only the INITIAL deferral enqueues a retry loop. When this
+                // function is called from inside an existing
+                // `spawn_stream_cap_retry` loop (stream_cap_attempts >= 1),
+                // that loop re-drives the action itself on its next wake —
+                // spawning another loop here made every deferral fork a new
+                // concurrent retry loop while the old ones kept running,
+                // doubling the loop population every retry interval
+                // (2026-09-11 22:16 freeze: hundreds of loops at deferral
+                // generations 19–21 drowned the main thread and spun 1MB of
+                // logs in the final second).
+                if stream_cap_attempts == 0 {
+                    spawn_stream_cap_retry(action, next_attempts, window, cx);
+                }
                 return true;
             }
         }
+    }
+
+    // Plan 027 / issue 029: a new thread picks its spare key fresh via the
+    // per-thread sticky map + rotation cursor (no shared state to clear), and
+    // this hook re-probes every configured key (including backed-off ones)
+    // so stale backoffs clear before the first turn picks a key. No-op for
+    // single-key providers (Claude/ACP, cloud, local).
+    //
+    // Runs AFTER the stream-cap gate (and only when we actually create the
+    // thread): reset_key_session probes every configured key over HTTP, so
+    // calling it on cap-deferred attempts hammered the provider — during the
+    // 2026-09-11 fan-out freeze, each of the thousands of deferred retries
+    // fired a full key-slot probe burst into GLM, which is what got the
+    // endpoint blocked.
+    if let Some(model) = conversation_view
+        .active_thread()
+        .and_then(|tv| tv.read(cx).as_native_thread(cx))
+        .and_then(|native_thread| native_thread.read(cx).model().cloned())
+    {
+        model.reset_key_session(cx);
     }
 
     let decision_prompt = auto_prompt::extract_decision_prompt(&action.next_prompt);

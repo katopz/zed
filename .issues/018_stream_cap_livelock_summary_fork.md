@@ -1,6 +1,6 @@
 # Issue 018: Stream-cap queue livelocked summary forks — "auto_prompt not triggered at all"
 
-Status: FIXED — bounded escalation + configurable cap landed (`77c01056b0`). GOAT live-verify pending: next saturated-farm session should show `deferral N/240` and either a slot win or the 20-min escalation, never an unbounded silent queue.
+Status: FIXED — bounded escalation + configurable cap landed (`77c01056b0`); REGRESSION of that fix (retry-loop fan-out freeze + provider probe storm) fixed in the 2026-09-11 22:16 follow-up — see `.docs/016_auto_prompt_stream_cap_retry_fanout.md`.
 
 ## Symptom
 
