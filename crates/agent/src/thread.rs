@@ -5117,6 +5117,47 @@ pub fn build_thread_title_request(
 const METADATA_GENERATION_MAX_RETRIES: u32 = 2;
 const METADATA_GENERATION_RETRY_DELAY: Duration = Duration::from_millis(500);
 
+const IMAGE_PLACEHOLDER: &str = "[image omitted: this model doesn't support images]";
+
+/// Metadata calls (thread summary/title) run against the summarization model,
+/// which can differ from the thread's main model and lack image support.
+/// Replaying history that contains image parts to such a model gets the whole
+/// request rejected by the endpoint (e.g. GLM error 1210 `messages.content.type
+/// is invalid, allowed values: ['text']`), so image parts are replaced with
+/// text placeholders.
+pub(crate) fn strip_unsupported_images(
+    model: &Arc<dyn LanguageModel>,
+    request: &LanguageModelRequest,
+) -> LanguageModelRequest {
+    if model.supports_images() {
+        return request.clone();
+    }
+    let mut request = request.clone();
+    for message in &mut request.messages {
+        message.content = std::mem::take(&mut message.content)
+            .into_iter()
+            .map(|content| match content {
+                MessageContent::Image(_) => MessageContent::Text(IMAGE_PLACEHOLDER.into()),
+                MessageContent::ToolResult(mut tool_result) => {
+                    tool_result.content = tool_result
+                        .content
+                        .into_iter()
+                        .map(|part| match part {
+                            LanguageModelToolResultContent::Image(_) => {
+                                LanguageModelToolResultContent::Text(IMAGE_PLACEHOLDER.into())
+                            }
+                            part => part,
+                        })
+                        .collect();
+                    MessageContent::ToolResult(tool_result)
+                }
+                content => content,
+            })
+            .collect();
+    }
+    request
+}
+
 async fn stream_completion_with_retry(
     model: &Arc<dyn LanguageModel>,
     request: &LanguageModelRequest,
@@ -5128,6 +5169,7 @@ async fn stream_completion_with_retry(
     >,
     LanguageModelCompletionError,
 > {
+    let request = &strip_unsupported_images(model, request);
     let mut attempt = 0;
     loop {
         match model.stream_completion(request.clone(), cx).await {

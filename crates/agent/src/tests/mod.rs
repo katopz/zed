@@ -3997,6 +3997,134 @@ async fn test_stream_thread_title_stops_when_newline_ends_chunk(cx: &mut TestApp
     assert_eq!(title, "Hello world");
 }
 
+#[gpui::test]
+async fn test_title_request_strips_images_for_summary_model_without_image_support(
+    cx: &mut TestAppContext,
+) {
+    let messages = vec![Arc::new(crate::thread::Message::User(
+        crate::thread::UserMessage {
+            id: ClientUserMessageId::new(),
+            content: Arc::from(vec![
+                crate::thread::UserMessageContent::Text("What's in this image?".to_string()),
+                crate::thread::UserMessageContent::Image(
+                    language_model::LanguageModelImage::empty(),
+                ),
+            ]),
+        },
+    ))];
+
+    // FakeLanguageModel defaults to supports_images(false), matching text-only
+    // summarization models whose endpoints reject image content parts.
+    let model = Arc::new(FakeLanguageModel::default());
+    let request = crate::thread::build_thread_title_request(&messages, None);
+
+    let title_task = cx.spawn({
+        let model = model.clone();
+        async move |cx| crate::stream_thread_title(model, request, &cx).await
+    });
+    cx.run_until_parked();
+
+    let sent_request = model.pending_completions().pop().unwrap();
+    let mut placeholders = 0;
+    for message in &sent_request.messages {
+        for content in &message.content {
+            assert!(!matches!(content, MessageContent::Image(_)));
+            if matches!(content, MessageContent::Text(text) if text.contains("[image omitted")) {
+                placeholders += 1;
+            }
+        }
+    }
+    assert_eq!(placeholders, 1);
+
+    model.send_last_completion_stream_text_chunk("Image question\nmore");
+    model.end_last_completion_stream();
+    let title = title_task.await.unwrap();
+    assert_eq!(title, "Image question");
+}
+
+#[gpui::test]
+async fn test_title_request_keeps_images_for_summary_model_with_image_support(
+    cx: &mut TestAppContext,
+) {
+    let messages = vec![Arc::new(crate::thread::Message::User(
+        crate::thread::UserMessage {
+            id: ClientUserMessageId::new(),
+            content: Arc::from(vec![crate::thread::UserMessageContent::Image(
+                language_model::LanguageModelImage::empty(),
+            )]),
+        },
+    ))];
+
+    let model = Arc::new(FakeLanguageModel::default());
+    model.set_supports_images(true);
+    let request = crate::thread::build_thread_title_request(&messages, None);
+
+    let title_task = cx.spawn({
+        let model = model.clone();
+        async move |cx| crate::stream_thread_title(model, request, &cx).await
+    });
+    cx.run_until_parked();
+
+    let sent_request = model.pending_completions().pop().unwrap();
+    assert!(sent_request.messages.iter().any(|message| {
+        message
+            .content
+            .iter()
+            .any(|content| matches!(content, MessageContent::Image(_)))
+    }));
+
+    model.send_last_completion_stream_text_chunk("Title\ngunk");
+    model.end_last_completion_stream();
+    title_task.await.unwrap();
+}
+
+#[test]
+fn test_strip_unsupported_images_replaces_tool_result_images() {
+    let text_model: Arc<dyn LanguageModel> = Arc::new(FakeLanguageModel::default());
+    let with_tool_result = LanguageModelRequest {
+        messages: vec![LanguageModelRequestMessage {
+            role: Role::Assistant,
+            content: vec![MessageContent::ToolResult(LanguageModelToolResult {
+                tool_use_id: "tool_1".into(),
+                tool_name: "screenshot".into(),
+                is_error: false,
+                content: vec![
+                    "some text".into(),
+                    language_model::LanguageModelToolResultContent::Image(
+                        language_model::LanguageModelImage::empty(),
+                    ),
+                ],
+                output: Some("some text".into()),
+            })],
+            cache: false,
+            reasoning_details: None,
+        }],
+        ..Default::default()
+    };
+
+    let stripped = crate::thread::strip_unsupported_images(&text_model, &with_tool_result);
+    let MessageContent::ToolResult(tool_result) = &stripped.messages[0].content[0] else {
+        panic!("expected tool result");
+    };
+    assert_eq!(tool_result.content.len(), 2);
+    assert!(matches!(
+        &tool_result.content[1],
+        language_model::LanguageModelToolResultContent::Text(text) if text.contains("[image omitted")
+    ));
+
+    let fake_image_model = Arc::new(FakeLanguageModel::default());
+    fake_image_model.set_supports_images(true);
+    let image_model: Arc<dyn LanguageModel> = fake_image_model;
+    let untouched = crate::thread::strip_unsupported_images(&image_model, &with_tool_result);
+    let MessageContent::ToolResult(tool_result) = &untouched.messages[0].content[0] else {
+        panic!("expected tool result");
+    };
+    assert!(matches!(
+        &tool_result.content[1],
+        language_model::LanguageModelToolResultContent::Image(_)
+    ));
+}
+
 // `Thread::to_markdown` (live native) and `DbThread::to_markdown` (persisted
 // native) must stay byte-for-byte identical for the same messages, since both
 // back the sidebar's native "Open Thread as Markdown" action. This pins that
