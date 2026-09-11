@@ -2935,6 +2935,7 @@ impl Thread {
                     .ok_or_else(|| anyhow!(NoModelConfiguredError))?;
                 this.refresh_turn_tools(cx);
                 let request = this.build_completion_request(intent, cx)?;
+                let request = strip_unsupported_images(&model, request);
                 this.current_request_token_usage = TokenUsage::default();
                 anyhow::Ok((model, request))
             })??;
@@ -4658,7 +4659,7 @@ impl Thread {
             reasoning_details: None,
         });
 
-        request
+        strip_unsupported_images(model, request)
     }
 
     pub fn to_markdown(&self) -> String {
@@ -5119,41 +5120,50 @@ const METADATA_GENERATION_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 const IMAGE_PLACEHOLDER: &str = "[image omitted: this model doesn't support images]";
 
-/// Metadata calls (thread summary/title) run against the summarization model,
-/// which can differ from the thread's main model and lack image support.
-/// Replaying history that contains image parts to such a model gets the whole
-/// request rejected by the endpoint (e.g. GLM error 1210 `messages.content.type
-/// is invalid, allowed values: ['text']`), so image parts are replaced with
-/// text placeholders.
+/// Metadata calls (thread summary/title), compaction, and main turns run
+/// against models that can differ from the one that accepted an image when it
+/// was added to the thread (summarization/compaction model selection, model
+/// switch mid-thread, refusal fallback). Replaying history that contains
+/// image parts to a model without image support gets the whole request
+/// rejected by the endpoint (e.g. GLM error 1210 `messages.content.type is
+/// invalid, allowed values: ['text']`), so image parts are replaced with text
+/// placeholders. Takes the request by value and only rewrites content when
+/// image parts are actually present, so the hot path pays a scan, not a copy.
 pub(crate) fn strip_unsupported_images(
     model: &Arc<dyn LanguageModel>,
-    request: &LanguageModelRequest,
+    mut request: LanguageModelRequest,
 ) -> LanguageModelRequest {
-    if model.supports_images() {
-        return request.clone();
+    fn contains_image(message: &LanguageModelRequestMessage) -> bool {
+        message.content.iter().any(|content| match content {
+            MessageContent::Image(_) => true,
+            MessageContent::ToolResult(tool_result) => tool_result
+                .content
+                .iter()
+                .any(|part| matches!(part, LanguageModelToolResultContent::Image(_))),
+            _ => false,
+        })
     }
-    let mut request = request.clone();
+
+    if model.supports_images() || !request.messages.iter().any(contains_image) {
+        return request;
+    }
+
     for message in &mut request.messages {
-        message.content = std::mem::take(&mut message.content)
-            .into_iter()
-            .map(|content| match content {
-                MessageContent::Image(_) => MessageContent::Text(IMAGE_PLACEHOLDER.into()),
-                MessageContent::ToolResult(mut tool_result) => {
-                    tool_result.content = tool_result
-                        .content
-                        .into_iter()
-                        .map(|part| match part {
-                            LanguageModelToolResultContent::Image(_) => {
-                                LanguageModelToolResultContent::Text(IMAGE_PLACEHOLDER.into())
-                            }
-                            part => part,
-                        })
-                        .collect();
-                    MessageContent::ToolResult(tool_result)
+        for content in &mut message.content {
+            match content {
+                MessageContent::Image(_) => {
+                    *content = MessageContent::Text(IMAGE_PLACEHOLDER.into())
                 }
-                content => content,
-            })
-            .collect();
+                MessageContent::ToolResult(tool_result) => {
+                    for part in &mut tool_result.content {
+                        if matches!(part, LanguageModelToolResultContent::Image(_)) {
+                            *part = LanguageModelToolResultContent::Text(IMAGE_PLACEHOLDER.into());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
     }
     request
 }
@@ -5169,7 +5179,7 @@ async fn stream_completion_with_retry(
     >,
     LanguageModelCompletionError,
 > {
-    let request = &strip_unsupported_images(model, request);
+    let request = &strip_unsupported_images(model, request.clone());
     let mut attempt = 0;
     loop {
         match model.stream_completion(request.clone(), cx).await {

@@ -4102,7 +4102,7 @@ fn test_strip_unsupported_images_replaces_tool_result_images() {
         ..Default::default()
     };
 
-    let stripped = crate::thread::strip_unsupported_images(&text_model, &with_tool_result);
+    let stripped = crate::thread::strip_unsupported_images(&text_model, with_tool_result.clone());
     let MessageContent::ToolResult(tool_result) = &stripped.messages[0].content[0] else {
         panic!("expected tool result");
     };
@@ -4115,7 +4115,7 @@ fn test_strip_unsupported_images_replaces_tool_result_images() {
     let fake_image_model = Arc::new(FakeLanguageModel::default());
     fake_image_model.set_supports_images(true);
     let image_model: Arc<dyn LanguageModel> = fake_image_model;
-    let untouched = crate::thread::strip_unsupported_images(&image_model, &with_tool_result);
+    let untouched = crate::thread::strip_unsupported_images(&image_model, with_tool_result);
     let MessageContent::ToolResult(tool_result) = &untouched.messages[0].content[0] else {
         panic!("expected tool result");
     };
@@ -4123,6 +4123,79 @@ fn test_strip_unsupported_images_replaces_tool_result_images() {
         &tool_result.content[1],
         language_model::LanguageModelToolResultContent::Image(_)
     ));
+}
+
+#[gpui::test]
+async fn test_main_turn_strips_images_for_model_without_image_support(cx: &mut TestAppContext) {
+    let ThreadTest { model, thread, .. } = setup(cx, TestModel::Fake).await;
+    let fake_model = model.as_fake();
+
+    // History can contain images even for a text-only model: Thread::send
+    // stores content unconditionally (paste happened under an image-capable
+    // model, or the message arrived over ACP).
+    let send = thread
+        .update(cx, |thread, cx| {
+            thread.send(
+                ClientUserMessageId::new(),
+                [
+                    UserMessageContent::Text("What's in this image?".to_string()),
+                    UserMessageContent::Image(language_model::LanguageModelImage::empty()),
+                ],
+                cx,
+            )
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    let completion = fake_model.pending_completions().pop().unwrap();
+    let mut placeholders = 0;
+    for message in &completion.messages {
+        for content in &message.content {
+            assert!(!matches!(content, MessageContent::Image(_)));
+            if matches!(content, MessageContent::Text(text) if text.contains("[image omitted")) {
+                placeholders += 1;
+            }
+        }
+    }
+    assert_eq!(placeholders, 1);
+
+    fake_model.send_completion_stream_text_chunk(&completion, "An image");
+    fake_model.end_completion_stream(&completion);
+    send.collect::<Vec<_>>().await;
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+async fn test_main_turn_keeps_images_for_model_with_image_support(cx: &mut TestAppContext) {
+    let ThreadTest { model, thread, .. } = setup(cx, TestModel::Fake).await;
+    let fake_model = model.as_fake();
+    fake_model.set_supports_images(true);
+
+    let send = thread
+        .update(cx, |thread, cx| {
+            thread.send(
+                ClientUserMessageId::new(),
+                [UserMessageContent::Image(
+                    language_model::LanguageModelImage::empty(),
+                )],
+                cx,
+            )
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    let completion = fake_model.pending_completions().pop().unwrap();
+    assert!(completion.messages.iter().any(|message| {
+        message
+            .content
+            .iter()
+            .any(|content| matches!(content, MessageContent::Image(_)))
+    }));
+
+    fake_model.send_completion_stream_text_chunk(&completion, "An image");
+    fake_model.end_completion_stream(&completion);
+    send.collect::<Vec<_>>().await;
+    cx.run_until_parked();
 }
 
 // `Thread::to_markdown` (live native) and `DbThread::to_markdown` (persisted
