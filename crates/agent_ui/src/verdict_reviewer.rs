@@ -15,7 +15,7 @@ use std::sync::Arc;
 use acp_thread::AcpThread;
 use acp_thread::verdict::VerdictReviewer;
 use agent_servers::CLAUDE_AGENT_ID;
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result};
 use gpui::{App, Entity, Task, WeakEntity};
 use project::{AgentId, Project};
 use util::path_list::PathList;
@@ -113,17 +113,25 @@ impl VerdictReviewer for ClaudeCodeReviewer {
             let store =
                 cx.update(|cx| resolve_connection_store(&registered_store, &project, cx))?;
 
-            // Connected entry → shared connect task (also covers the
-            // still-connecting case; this awaits it like any panel consumer).
             let connect_task = cx.update(|cx| {
-                store
-                    .read(cx)
-                    .entry(&ClaudeCodeReviewer::claude_key())
-                    .map(|entry| entry.read(cx).wait_for_connection())
+                let claude_key = ClaudeCodeReviewer::claude_key();
+                if let Some(entry) = store.read(cx).entry(&claude_key) {
+                    return entry.read(cx).wait_for_connection();
+                }
+                // Entries disappear on agent-server updates and
+                // version-available events and only reappear when a panel
+                // flow re-requests the connection. Request it here, exactly
+                // like the panel's own ensure path, so the reviewer works
+                // whenever Claude Code is configured — not only when some
+                // other flow happened to connect it first.
+                let fs = store.read(cx).project().read(cx).fs().clone();
+                let thread_store = agent::ThreadStore::global(cx);
+                let server = claude_key.server(fs, thread_store);
+                let entry = store.update(cx, |store, cx| {
+                    store.request_connection(claude_key, server, cx)
+                });
+                entry.read(cx).wait_for_connection()
             });
-            let Some(connect_task) = connect_task else {
-                bail!("Claude Code is not connected — open the agent panel to connect it");
-            };
 
             let connected = connect_task
                 .await
@@ -157,8 +165,12 @@ mod tests {
     use std::rc::Rc;
     use workspace::MultiWorkspace;
 
-    /// Window + panel with a connected Claude Code entry in its store.
-    async fn bootstrap_panel(cx: &mut TestAppContext) -> (Entity<Project>, Entity<AgentPanel>) {
+    /// Window + panel; `with_claude_entry` controls whether a connected
+    /// Claude Code entry is pre-inserted into the store.
+    async fn bootstrap_panel(
+        cx: &mut TestAppContext,
+        with_claude_entry: bool,
+    ) -> (Entity<Project>, Entity<AgentPanel>) {
         init_test(cx);
         cx.update(|cx| {
             agent::ThreadStore::init_global(cx);
@@ -181,18 +193,21 @@ mod tests {
             panel
         });
 
-        let connection = StubAgentConnection::new().with_agent_id(AgentId(CLAUDE_AGENT_ID.into()));
-        panel.update_in(cx, |panel, _window, cx| {
-            panel
-                .connection_store()
-                .update(cx, |store, cx| {
-                    store.request_connection(
-                        ClaudeCodeReviewer::claude_key(),
-                        Rc::new(StubAgentServer::new(connection)),
-                        cx,
-                    );
-                });
-        });
+        if with_claude_entry {
+            let connection =
+                StubAgentConnection::new().with_agent_id(AgentId(CLAUDE_AGENT_ID.into()));
+            panel.update_in(cx, |panel, _window, cx| {
+                panel
+                    .connection_store()
+                    .update(cx, |store, cx| {
+                        store.request_connection(
+                            ClaudeCodeReviewer::claude_key(),
+                            Rc::new(StubAgentServer::new(connection)),
+                            cx,
+                        );
+                    });
+            });
+        }
         cx.run_until_parked();
         (project, panel)
     }
@@ -201,7 +216,7 @@ mod tests {
     async fn spawn_session_falls_back_to_live_panel_after_registered_store_drops(
         cx: &mut TestAppContext,
     ) {
-        let (project, _panel) = bootstrap_panel(cx).await;
+        let (project, _panel) = bootstrap_panel(cx, true).await;
 
         // A later registration whose store has since been dropped, as happens
         // when a second panel/window closes: the global slot kept pointing at
@@ -222,7 +237,7 @@ mod tests {
 
     #[gpui::test]
     async fn spawn_session_uses_registered_store_while_alive(cx: &mut TestAppContext) {
-        let (project, panel) = bootstrap_panel(cx).await;
+        let (project, panel) = bootstrap_panel(cx, true).await;
         let store = panel.read_with(cx, |panel, _cx| panel.connection_store().downgrade());
 
         let reviewer = ClaudeCodeReviewer::new(store);
@@ -252,6 +267,35 @@ mod tests {
         assert!(
             error.to_string().contains("no open agent panel"),
             "unexpected error: {error:#}"
+        );
+    }
+
+    #[gpui::test]
+    async fn spawn_session_requests_the_connection_when_the_entry_is_absent(
+        cx: &mut TestAppContext,
+    ) {
+        let (project, panel) = bootstrap_panel(cx, false).await;
+        let store = panel.read_with(cx, |panel, _cx| panel.connection_store().downgrade());
+
+        // No Claude entry exists (pruned by an agent-server update or never
+        // requested in this panel instance). The reviewer must REQUEST the
+        // connection like the panel's own ensure path — not bail with
+        // "not connected". In this test the real CustomAgentServer fails to
+        // connect (the agent is not registered), which is the honest
+        // connection error rather than the old not-connected bail.
+        let reviewer = ClaudeCodeReviewer::new(store);
+        let error = cx
+            .update(|cx| reviewer.spawn_session(project, PathList::default(), cx))
+            .await
+            .expect_err("unregistered agent should fail at connect");
+        let error = error.to_string();
+        assert!(
+            !error.contains("not connected"),
+            "reviewer should request the connection instead of bailing: {error}"
+        );
+        assert!(
+            error.contains("connection failed"),
+            "unexpected error: {error}"
         );
     }
 }
