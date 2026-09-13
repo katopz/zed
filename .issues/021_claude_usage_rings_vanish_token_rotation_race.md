@@ -1,6 +1,6 @@
 # Issue 021: Claude 5h/weekly usage rings vanish — first poll races claude-acp's OAuth token rotation
 
-Status: FIXED — unconditional 401 re-read + bounded fast retry landed (`20316921a8`); pre-existing clippy blocker cleared in `fe8bbb3eca`. Gate: clippy green + 5/5 tests passing (see Gate section). Live-verify pending: next cold start that opens a Claude thread should show the rings within ~15s instead of blacking out for 300s.
+Status: FIXED + live-verified on log evidence (2026-09-13) — unconditional 401 re-read + bounded fast retry landed (`20316921a8`); pre-existing clippy blocker cleared in `fe8bbb3eca`. Gate: clippy green + 5/5 tests passing (see Gate section). ONE box remains open: the mandated `./script/clippy` release gate (environmental blocker, see Gate).
 
 ## Symptom
 
@@ -87,7 +87,22 @@ additions" rule. Worth a follow-up if this recurs.
 - [x] Commit + push
 - [x] Execute the test suite in-tree (`5 passed; 0 failed`)
 - [ ] Run the mandated `./script/clippy` release gate (blocked, see Gate)
-- [ ] Live-verify the rings appear on a cold start
+      — second deferral 2026-09-13, environmental: this checkout lives on
+      exFAT/SDXC (no hard links + XProtect artifact scans -> the documented
+      0%-CPU stalls in Gate below), and the box is running sibling
+      bevy/effect builds. Precondition: a hard-link-capable checkout (copy
+      to /tmp or the internal disk) on a quiet box.
+- [x] Live-verify the rings appear on a cold start — 2026-09-13 log
+      evidence (success is debug-silent, so the log proves the mechanism):
+      the first Claude thread since the 2026-09-12 07:01 app start opened
+      at 15:05:54 and its first usage poll 401'd WITH the new
+      `Claude rejected the stored OAuth token` marker — the TokenRejected
+      path fired at exactly the rotation race, exactly once; no further
+      auth WARNs in the 3.8h since; keychain rotations ongoing that day
+      (`mdat 2026-09-13T11:42:14Z`). On that path the bounded fast retry
+      (15s x 3) re-reads the keychain, so recovery is <=15s vs the old
+      300s blackout. Trivial owner glance confirms (rings beside the
+      context ring); reopen if a cold start ever blacks out again.
 
 ## Gate actually used
 

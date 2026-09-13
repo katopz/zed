@@ -65,3 +65,13 @@ slot or escalate once after ~20 min (one probe burst, one thread). Stuck
 Existing `stream_cap_decision_*` unit tests still pass (decision table
 unchanged); the fan-out was structural (spawn site), covered by the gating
 comment + this doc. Full agent_ui clippy + auto_prompt test suite green.
+
+## Known race left open (carried from issue 018 at removal, 2026-09-13)
+
+The queued stream-cap retry loop is not cancelled when the user manually
+continues the same chain — a late slot win (or the ~20-min escalation)
+can fork a second continuation thread alongside the manual one. Pre-dates
+the 018 fix (the old unbounded queue had the same race with worse
+timing). Candidate follow-up if it ever bites: suppress the queue when
+the source session already has a `continued_from` successor in
+`ThreadMetadataStore`.
