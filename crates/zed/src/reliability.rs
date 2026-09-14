@@ -19,9 +19,9 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use sysinfo::{
-    MemoryRefreshKind, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, RefreshKind, System,
-};
+#[cfg(unix)]
+use sysinfo::ProcessStatus;
+use sysinfo::{MemoryRefreshKind, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 use util::ResultExt;
 use workspace::WorkspaceStore;
 

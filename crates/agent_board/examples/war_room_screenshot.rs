@@ -17,16 +17,30 @@
 //! `target/agent_board`) and prints the path. macOS-only (needs the Metal
 //! headless renderer); exits non-zero if capture is unavailable.
 
-use std::sync::Arc;
-use std::time::Duration;
+#[cfg(not(target_os = "macos"))]
+fn main() {
+    eprintln!("war room screenshot example is only supported on macOS");
+    std::process::exit(1);
+}
 
-use agent_board::runtime::BoardRuntime;
-use agent_board::types::{ActiveScope, AgentStateMessage, BoardMessage, DeviceStatus, RoomSnapshot, ScopeKind};
-use agent_board::war_room::WarRoomPanel;
-use agent_board::AgentBoardConfig;
-use gpui::{AppContext, Context, Entity, IntoElement, ParentElement, Render, Styled, Window, div, px, size};
-use ui::ActiveTheme;
+#[cfg(target_os = "macos")]
+use {
+    agent_board::AgentBoardConfig,
+    agent_board::runtime::BoardRuntime,
+    agent_board::types::{
+        ActiveScope, AgentStateMessage, BoardMessage, DeviceStatus, RoomSnapshot, ScopeKind,
+    },
+    agent_board::war_room::WarRoomPanel,
+    gpui::{
+        AppContext, Context, Entity, IntoElement, ParentElement, Render, Styled, Window, div, px,
+        size,
+    },
+    std::sync::Arc,
+    std::time::Duration,
+    ui::ActiveTheme,
+};
 
+#[cfg(target_os = "macos")]
 /// Window root that hosts the panel the way the dock does: the dock supplies
 /// the panel background, so a standalone render must too (the window clear
 /// color is otherwise black and a dark-on-dark render would be unreadable).
@@ -34,6 +48,7 @@ struct ScreenshotRoot {
     panel: Entity<WarRoomPanel>,
 }
 
+#[cfg(target_os = "macos")]
 impl Render for ScreenshotRoot {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let background = cx.theme().colors().panel_background;
@@ -41,6 +56,7 @@ impl Render for ScreenshotRoot {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn main() {
     // Mirror crates/zed/src/visual_test_runner.rs: stateless mode keeps
     // settings::init away from the real user config directories.
@@ -56,7 +72,9 @@ fn main() {
         Arc::new(assets::Assets),
     );
     cx.update(|cx| {
-        assets::Assets.load_fonts(cx).expect("failed to load bundled fonts");
+        assets::Assets
+            .load_fonts(cx)
+            .expect("failed to load bundled fonts");
         settings::init(cx);
         theme_settings::init(theme::LoadThemes::JustBase, cx);
         // Force One Dark regardless of system appearance so the artifact is
@@ -86,23 +104,39 @@ fn main() {
         task_summary: summary.to_string(),
         scope_kind: ScopeKind::Plan,
     };
-    let status = |device: &str, updated_at: i64, stale: bool, scopes: Vec<ActiveScope>| DeviceStatus {
-        v: 1,
-        device_id: format!("id-{device}"),
-        device_name: device.to_string(),
-        location_hash: String::new(),
-        project_path: "/repo".to_string(),
-        scopes,
-        updated_at,
-        stale,
-    };
+    let status =
+        |device: &str, updated_at: i64, stale: bool, scopes: Vec<ActiveScope>| DeviceStatus {
+            v: 1,
+            device_id: format!("id-{device}"),
+            device_name: device.to_string(),
+            location_hash: String::new(),
+            project_path: "/repo".to_string(),
+            scopes,
+            updated_at,
+            stale,
+        };
     let snapshot = RoomSnapshot {
         v: 1,
         room: "test-room".to_string(),
         statuses: vec![
-            status("m3", now - 10_000, false, vec![scope("f3a2ffff", race_path, "GOAT gate: mention pipeline")]),
-            status("SHIKUWA", now - 20_000, false, vec![scope("b1c9ffff", race_path, "same plan — race ⚠")]),
-            status("OLD", now - 6 * 60 * 60 * 1000, true, vec![scope("aaaa1111", "/repo/.plans/old.md", "ancient scope")]),
+            status(
+                "m3",
+                now - 10_000,
+                false,
+                vec![scope("f3a2ffff", race_path, "GOAT gate: mention pipeline")],
+            ),
+            status(
+                "SHIKUWA",
+                now - 20_000,
+                false,
+                vec![scope("b1c9ffff", race_path, "same plan — race ⚠")],
+            ),
+            status(
+                "OLD",
+                now - 6 * 60 * 60 * 1000,
+                true,
+                vec![scope("aaaa1111", "/repo/.plans/old.md", "ancient scope")],
+            ),
         ],
         messages: vec![
             BoardMessage {
@@ -135,9 +169,7 @@ fn main() {
         replies: Vec::new(),
     };
     cx.update(|cx| {
-        BoardRuntime::global(cx).update(cx, |runtime, cx| {
-            runtime.on_snapshot(snapshot, cx)
-        })
+        BoardRuntime::global(cx).update(cx, |runtime, cx| runtime.on_snapshot(snapshot, cx))
     });
 
     let window = cx

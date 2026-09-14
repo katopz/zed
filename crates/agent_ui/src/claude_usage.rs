@@ -22,6 +22,7 @@ const OAUTH_BETA_HEADER: &str = "oauth-2025-04-20";
 /// UA is the one verified to get the generous bucket (the token is Claude
 /// Code's own, so the request identifies as its client).
 const USER_AGENT: &str = "claude-code/2.1.0";
+#[cfg(target_os = "macos")]
 const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 /// Rate limiting is per-access-token and shared with Claude Code itself;
 /// 180s is the community-verified safe interval. 60s caused persistent 429s
