@@ -14,19 +14,21 @@
 //! is upstream Zed with no `.plans/` at all, while `origin/develop` is the
 //! active integration line.
 //!
-//! All git access is async (`smol::process`): callers on the main thread must
+//! All git access is async and goes through `util::command`, whose Windows
+//! impl sets `CREATE_NO_WINDOW` — a snapshot spawns ~10 git processes, which
+//! each flash a console window without it. Callers on the main thread must
 //! use the cached accessor or prewarm via the async path.
 
 use futures::future::{Either, select};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::{Output, Stdio};
+use std::process::Output;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use smol::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
-use smol::process::{Child, Command};
+use util::command::{Child, Command, Stdio};
 
 /// Byte cap per plan file — parity with the worktree reader in
 /// `auto_prompt::read_plan_files`.
@@ -683,7 +685,6 @@ async fn git_output(repo: &Path, args: &[&str]) -> Option<String> {
 mod tests {
     use super::*;
     use futures::future::BoxFuture;
-    use smol::process::Command as SmolCommand;
     use tempfile::TempDir;
 
     struct Fixture {
@@ -693,7 +694,7 @@ mod tests {
 
     fn have_git() -> bool {
         smol::block_on(async {
-            SmolCommand::new("git")
+            Command::new("git")
                 .arg("--version")
                 .output()
                 .await
@@ -703,7 +704,7 @@ mod tests {
     }
 
     fn git(dir: &Path, args: &[&str], date: Option<&str>) -> BoxFuture<'static, Output> {
-        let mut command = SmolCommand::new("git");
+        let mut command = Command::new("git");
         command.arg("-C").arg(dir).args(args);
         command
             .env("GIT_AUTHOR_NAME", "t")
