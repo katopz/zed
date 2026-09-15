@@ -668,8 +668,17 @@ fn git_command(repo: &Path, args: &[&str]) -> Command {
     command
         .arg("-C")
         .arg(repo)
+        // Parity with the git crate's guard (GitBinary::build_command):
+        // never let these invocations auto-spawn git's fsmonitor daemon —
+        // the Git for Windows installer enables it system-wide by default,
+        // and a detached daemon per repo would accumulate as orphaned
+        // git.exe processes. kill_on_drop covers task cancellation: a
+        // snapshot future dropped mid-spawn kills its git child instead of
+        // leaving it running detached.
+        .args(["-c", "core.fsmonitor=false"])
         .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0");
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .kill_on_drop(true);
     command
 }
 
