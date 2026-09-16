@@ -8169,24 +8169,25 @@ impl ThreadView {
         }
     }
 
-    /// Branches the current thread into a new thread at `up_to_user_message`.
+    /// Branches the current thread into a new thread carrying only the first
+    /// `carry_turns` user turns — the context above the branch point.
     ///
     /// For native-agent threads this forks the real message history: the new
     /// thread renders the original user/assistant turns and tool cards as-is,
-    /// with no model round-trip. The branch boundary is inclusive — everything
-    /// up to and including the given user message is carried over. When
-    /// `up_to_user_message` is `None`, the whole conversation is forked.
+    /// with no model round-trip. Everything from the (`carry_turns` + 1)-th
+    /// user message onward is dropped, so clicking the separator after turn
+    /// N forks exactly turns 1..=N.
     ///
     /// For external ACP agents (history lives server-side and can't be forked)
-    /// this falls back to copying a verbatim transcript into the new thread's
-    /// composer.
+    /// this falls back to copying a verbatim transcript of the carried turns
+    /// into the new thread's composer.
     ///
     /// The boundary computation itself is delegated to
     /// [`slice_messages_for_branch`] / [`transcript_entry_count`] so it can be
     /// unit-tested without rendering a view.
     fn branch_to_new_thread(
         &mut self,
-        up_to_user_message: Option<ClientUserMessageId>,
+        carry_turns: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -8202,16 +8203,10 @@ impl ThreadView {
         // local message log we can fork; external ACP agents hold history
         // server-side with no protocol-level fork, so they fall through to the
         // transcript path below.
-        //
-        // A `None` slice means the requested branch point couldn't be found in
-        // native history, so we fall through to the transcript path (which
-        // itself degrades to the whole thread). `up_to_user_message = None`
-        // (turn-end-separator button) forks the whole conversation.
         let native_branch = self.as_native_thread(cx).and_then(|native_thread| {
             let connection = self.as_native_connection(cx)?;
             let messages = native_thread.read(cx).messages().to_vec();
-            slice_messages_for_branch(&messages, up_to_user_message.as_ref())
-                .map(|sliced| (connection, sliced))
+            Some((connection, slice_messages_for_branch(&messages, carry_turns)))
         });
 
         // Fallback transcript for external ACP agents: a flattened copy of the
@@ -8219,7 +8214,7 @@ impl ThreadView {
         // thread can be created with it as initial composer content.
         let transcript_fallback = if native_branch.is_none() {
             let entries = thread.entries();
-            let take = transcript_entry_count(entries, up_to_user_message.as_ref());
+            let take = transcript_entry_count(entries, carry_turns);
             Some(
                 entries
                     .iter()
@@ -8367,10 +8362,16 @@ impl ThreadView {
                                 .color(Color::Muted),
                         )
                         .tooltip(Tooltip::text(
-                            "Start a new thread that carries this conversation as context.",
+                            "Start a new thread that carries the conversation above this point as context.",
                         ))
                         .on_click(cx.listener(move |this, _, window, cx| {
-                            this.branch_to_new_thread(None, window, cx);
+                            // Recompute from the current entries rather than
+                            // capturing a count at render time, so a click on a
+                            // stale separator still branches at the turn it
+                            // was rendered after.
+                            let carry_turns =
+                                turns_above_separator(this.thread.read(cx).entries(), entry_ix);
+                            this.branch_to_new_thread(carry_turns, window, cx);
                         })),
                 )
                 .child(Divider::horizontal().flex_1())
@@ -15107,56 +15108,76 @@ fn format_retries_elapsed(elapsed: Duration) -> String {
     }
 }
 
-/// Computes the inclusive slice of native `messages` to fork into a branched
-/// thread.
+/// Computes the slice of native `messages` to fork into a branched thread so
+/// it carries the first `carry_turns` user turns: everything strictly before
+/// the (`carry_turns` + 1)-th user message.
 ///
-/// - `up_to = None` → the whole conversation is forked (`Some(all)`).
-/// - `up_to = Some(id)` → everything up to and *including* the matching user
-///   message (`Some(slice)`). Returns `None` when no such message exists,
-///   which makes `branch_to_new_thread` fall through to the transcript path.
+/// A `carry_turns` at or past the number of user messages in the history
+/// carries the whole history — the separator at the bottom of a thread passes
+/// exactly that, so the last turn's branch still forks everything.
 ///
-/// Extracted from `branch_to_new_thread` so the inclusive-boundary logic can
-/// be unit-tested without rendering a view.
-fn slice_messages_for_branch(
-    messages: &[Arc<agent::Message>],
-    up_to: Option<&ClientUserMessageId>,
-) -> Option<Vec<Arc<agent::Message>>> {
-    let Some(target_id) = up_to else {
-        return Some(messages.to_vec());
-    };
-    let end = messages.iter().position(
-        |message| matches!(&**message, agent::Message::User(user) if &user.id == target_id),
-    )?;
-    Some(messages.iter().take(end + 1).cloned().collect())
-}
-
-/// Computes how many leading rendered `entries` to include in a verbatim
-/// transcript when branching an external (non-native) thread.
-///
-/// - `up_to = None` → the whole thread (`entries.len()`).
-/// - `up_to = Some(id)` → inclusive of the entry whose user-message id matches.
-///   When the id isn't found, falls back to the whole thread: the branch is a
-///   no-op against the boundary, so the full transcript is the only sensible
-///   copy. This mirrors `slice_messages_for_branch`'s not-found semantics
-///   (the native path returns `None` there and also lands on the full-thread
-///   transcript here).
+/// Turn-count based (not user-message-id based) on purpose: ids don't survive
+/// every path that produces entries (server-loaded history carries no client
+/// ids), while user-turn ordering is consistent between a native thread's
+/// message log and its rendered entries.
 ///
 /// Extracted from `branch_to_new_thread` so the boundary logic can be
 /// unit-tested without rendering a view.
-fn transcript_entry_count(
-    entries: &[AgentThreadEntry],
-    up_to: Option<&ClientUserMessageId>,
-) -> usize {
-    match up_to {
-        Some(id) => entries
-            .iter()
-            .position(|entry| {
-                matches!(entry, AgentThreadEntry::UserMessage(m) if m.client_id.as_ref() == Some(id))
-            })
-            .map(|ix| ix + 1)
-            .unwrap_or_else(|| entries.len()),
-        None => entries.len(),
-    }
+fn slice_messages_for_branch(
+    messages: &[Arc<agent::Message>],
+    carry_turns: usize,
+) -> Vec<Arc<agent::Message>> {
+    let mut user_messages_seen = 0;
+    let end = messages
+        .iter()
+        .position(|message| {
+            if matches!(&**message, agent::Message::User(_)) {
+                user_messages_seen += 1;
+                user_messages_seen > carry_turns
+            } else {
+                false
+            }
+        })
+        .unwrap_or(messages.len());
+    messages.iter().take(end).cloned().collect()
+}
+
+/// Computes how many leading rendered `entries` to include in a verbatim
+/// transcript when branching an external (non-native) thread: everything
+/// strictly before the (`carry_turns` + 1)-th user-message entry, including
+/// the carried turns' trailing entries (canceled tool calls, compaction
+/// markers). At or past the end, the whole thread is taken.
+///
+/// Extracted from `branch_to_new_thread` so the boundary logic can be
+/// unit-tested without rendering a view.
+fn transcript_entry_count(entries: &[AgentThreadEntry], carry_turns: usize) -> usize {
+    let mut user_messages_seen = 0;
+    entries
+        .iter()
+        .position(|entry| {
+            if matches!(entry, AgentThreadEntry::UserMessage(_)) {
+                user_messages_seen += 1;
+                user_messages_seen > carry_turns
+            } else {
+                false
+            }
+        })
+        .unwrap_or(entries.len())
+}
+
+/// Number of user turns at or above the turn-end separator rendered after
+/// `entry_ix` — the turns a branch clicked there carries. The assistant
+/// message at `entry_ix` belongs to the last of those turns, so it is
+/// included; everything after the separator is dropped.
+///
+/// Extracted from the turn-end separator's click handler so the boundary
+/// logic can be unit-tested without rendering a view.
+fn turns_above_separator(entries: &[AgentThreadEntry], entry_ix: usize) -> usize {
+    entries
+        .iter()
+        .take(entry_ix + 1)
+        .filter(|entry| matches!(entry, AgentThreadEntry::UserMessage(_)))
+        .count()
 }
 
 /// Whether the assistant message at `entry_ix` is the LAST assistant
@@ -15214,18 +15235,7 @@ mod branch_boundary_tests {
     }
 
     #[test]
-    fn slice_none_up_to_forks_whole_conversation() {
-        let id_a = ClientUserMessageId::new();
-        let messages = vec![native_user(&id_a, "u1"), native_agent("a1")];
-        let sliced =
-            slice_messages_for_branch(&messages, None).expect("None up_to forks everything");
-        assert_eq!(sliced.len(), 2);
-        assert_eq!(sliced[0], messages[0]);
-        assert_eq!(sliced[1], messages[1]);
-    }
-
-    #[test]
-    fn slice_some_up_to_is_inclusive_of_matching_user_message() {
+    fn slice_carries_first_turn_exclusively_of_the_next() {
         let id_a = ClientUserMessageId::new();
         let id_b = ClientUserMessageId::new();
         let messages = vec![
@@ -15234,48 +15244,68 @@ mod branch_boundary_tests {
             native_user(&id_b, "u2"),
             native_agent("a2"),
         ];
-        // Branch at id_b: inclusive → keeps u1, a1, u2 (drops the trailing a2).
-        let sliced = slice_messages_for_branch(&messages, Some(&id_b))
-            .expect("matching id should produce a slice");
-        assert_eq!(sliced.len(), 3);
+        // Carrying 1 turn keeps u1 + its reply, drops u2 and everything after.
+        let sliced = slice_messages_for_branch(&messages, 1);
+        assert_eq!(sliced.len(), 2);
         assert_eq!(sliced[0], messages[0]);
-        assert_eq!(sliced[2], messages[2]);
+        assert_eq!(sliced[1], messages[1]);
     }
 
     #[test]
-    fn slice_some_up_to_first_message_keeps_only_first() {
+    fn slice_carry_at_turn_count_forks_whole_history() {
+        // The separator at the bottom of a thread carries every turn, which
+        // must still fork the full history (previously the `None` case).
         let id_a = ClientUserMessageId::new();
         let id_b = ClientUserMessageId::new();
         let messages = vec![
             native_user(&id_a, "u1"),
             native_agent("a1"),
             native_user(&id_b, "u2"),
+            native_agent("a2"),
         ];
-        let sliced = slice_messages_for_branch(&messages, Some(&id_a))
-            .expect("first-message branch should produce a slice");
-        assert_eq!(sliced.len(), 1);
-        assert_eq!(sliced[0], messages[0]);
+        let sliced = slice_messages_for_branch(&messages, 2);
+        assert_eq!(sliced.len(), 4);
     }
 
     #[test]
-    fn slice_unknown_up_to_returns_none_so_transcript_path_is_used() {
+    fn slice_carry_past_turn_count_still_forks_whole_history() {
+        // A stale separator can carry more turns than remain after edits;
+        // degrading to the whole history is the safe floor, never an empty fork.
         let id_a = ClientUserMessageId::new();
-        let missing = ClientUserMessageId::new();
         let messages = vec![native_user(&id_a, "u1"), native_agent("a1")];
-        assert!(
-            slice_messages_for_branch(&messages, Some(&missing)).is_none(),
-            "an unknown branch id must fall through to the transcript path"
-        );
+        let sliced = slice_messages_for_branch(&messages, 5);
+        assert_eq!(sliced.len(), 2);
     }
 
     #[test]
-    fn slice_up_to_pointing_at_an_assistant_message_is_not_a_match() {
-        // Branch ids are user-message ids; an assistant message never matches,
-        // so pointing `up_to` at an id that isn't any user message returns None.
+    fn slice_keeps_non_user_messages_above_the_boundary() {
+        // Resume/Compaction markers interleaved with the carried turns come
+        // along; the ones after the boundary are dropped with their turn.
+        let id_a = ClientUserMessageId::new();
+        let id_b = ClientUserMessageId::new();
+        let messages = vec![
+            Arc::new(AgentMessageKind::Resume),
+            native_user(&id_a, "u1"),
+            native_agent("a1"),
+            native_user(&id_b, "u2"),
+            Arc::new(AgentMessageKind::Resume),
+            native_agent("a2"),
+        ];
+        let sliced = slice_messages_for_branch(&messages, 1);
+        assert_eq!(sliced.len(), 3);
+        assert!(matches!(&*sliced[0], AgentMessageKind::Resume));
+        assert_eq!(sliced[1], messages[1]);
+        assert_eq!(sliced[2], messages[2]);
+    }
+
+    #[test]
+    fn slice_zero_carry_forks_nothing() {
+        // API floor: carry 0 = branch before the first turn. Unreachable from
+        // the separator (it always renders after at least one user turn) but
+        // pinned so the boundary arithmetic stays honest.
         let id_a = ClientUserMessageId::new();
         let messages = vec![native_user(&id_a, "u1"), native_agent("a1")];
-        let not_in_thread = ClientUserMessageId::new();
-        assert!(slice_messages_for_branch(&messages, Some(&not_in_thread)).is_none());
+        assert!(slice_messages_for_branch(&messages, 0).is_empty());
     }
 
     // --- transcript_entry_count (external ACP transcript fallback) ---
@@ -15303,49 +15333,69 @@ mod branch_boundary_tests {
     }
 
     #[test]
-    fn transcript_none_up_to_takes_whole_thread() {
+    fn transcript_carries_turn_tail_before_next_user_entry() {
+        let entries = vec![
+            entry_user(None, "u1"),
+            entry_assistant(),
+            entry_other(),
+            entry_user(None, "u2"),
+            entry_assistant(),
+        ];
+        // Carrying 1 turn keeps u1, its reply, and the turn's trailing marker;
+        // only u2 and after are dropped.
+        assert_eq!(transcript_entry_count(&entries, 1), 3);
+    }
+
+    #[test]
+    fn transcript_carry_at_turn_count_takes_whole_thread() {
         let entries = vec![
             entry_user(None, "u1"),
             entry_assistant(),
             entry_user(None, "u2"),
+            entry_assistant(),
         ];
-        assert_eq!(transcript_entry_count(&entries, None), 3);
+        assert_eq!(transcript_entry_count(&entries, 2), 4);
     }
 
     #[test]
-    fn transcript_some_up_to_is_inclusive_of_matching_entry() {
-        let id_b = ClientUserMessageId::new();
+    fn transcript_carry_past_turn_count_takes_whole_thread() {
+        let entries = vec![entry_user(None, "u1"), entry_assistant()];
+        assert_eq!(transcript_entry_count(&entries, 9), 2);
+    }
+
+    #[test]
+    fn transcript_zero_carry_takes_nothing() {
+        let entries = vec![entry_user(None, "u1"), entry_assistant()];
+        assert_eq!(transcript_entry_count(&entries, 0), 0);
+    }
+
+    // --- turns_above_separator (turn-end separator branch point) ---
+
+    #[test]
+    fn turns_above_separator_counts_user_entries_through_the_separator() {
         let entries = vec![
             entry_user(None, "u1"),
             entry_assistant(),
-            entry_user(Some(id_b.clone()), "u2"),
+            entry_user(None, "u2"),
             entry_assistant(),
         ];
-        // Inclusive: keeps through the id_b entry (3), drops the trailing assistant.
-        assert_eq!(transcript_entry_count(&entries, Some(&id_b)), 3);
+        // Separator after a1 (turn 1): carry 1 turn.
+        assert_eq!(turns_above_separator(&entries, 1), 1);
+        // Separator after a2 (turn 2): carry both turns.
+        assert_eq!(turns_above_separator(&entries, 3), 2);
     }
 
     #[test]
-    fn transcript_unknown_up_to_degrades_to_whole_thread() {
-        // The external path has no native history to fall back to, so an
-        // unmatched branch id copies the entire thread rather than nothing.
-        let entries = vec![entry_user(None, "u1"), entry_assistant()];
-        let missing = ClientUserMessageId::new();
-        assert_eq!(transcript_entry_count(&entries, Some(&missing)), 2);
-    }
-
-    #[test]
-    fn transcript_first_matching_user_entry_when_ids_repeat_takes_first() {
-        // `position` returns the first match. This documents the (reasonable)
-        // behavior: branch-at-id forks up to the first occurrence of that id.
-        let id = ClientUserMessageId::new();
+    fn turns_above_separator_includes_trailing_turn_tail() {
+        // The turn's trailing marker sits after the closing assistant message;
+        // counting only up to the assistant (not past it) must still count the
+        // turn's own user message.
         let entries = vec![
-            entry_user(Some(id.clone()), "u1"),
+            entry_user(None, "u1"),
             entry_assistant(),
-            entry_user(Some(id.clone()), "u2"),
-            entry_assistant(),
+            entry_other(),
         ];
-        assert_eq!(transcript_entry_count(&entries, Some(&id)), 1);
+        assert_eq!(turns_above_separator(&entries, 1), 1);
     }
 
     // --- assistant_message_closes_turn (render_turn_end_separator guard) ---

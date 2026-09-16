@@ -1,8 +1,8 @@
 # Branch New Thread (real history fork) + prompt-jump bookends
 
-> **Status**: Implemented retroactively. Shipped as commit `76386141f5` on
-> `develop` before this plan file existed; this document records the design for
-> the trail.
+> **Status**: Superseded in part — turn-end separator now branches at the
+> clicked turn (see "Addendum: branch at the clicked turn"), not the whole
+> thread.
 
 ## Problem
 
@@ -84,10 +84,11 @@ genuine ceiling for non-native agents.
   dropped. This deliberately mirrors the existing `model_override` pattern
   rather than introducing a new lifetime-management scheme. Refactoring risks
   regressions for negligible gain.
-- **Branch boundary is inclusive of the selected user message** (checkpoint-row
-  button passes `Some(UserMessageId)`; the turn-end separator passes `None` =
-  whole thread). Inclusive matches the user mental model of "branch *from here*,
-  including this turn".
+- **Branch boundary is turn-count based** (see addendum — originally
+  inclusive-of-user-message-id, then whole-thread via `None` after the
+  checkpoint-row button was dropped in `22bd86974a`). The turn-end separator
+  now passes the number of user turns at/above itself; a count at or past the
+  total carries the whole thread, preserving the bottom-separator behavior.
 
 ## Tasks
 
@@ -154,6 +155,47 @@ The four original manual smoke items, re-assessed for automated coverage:
 
 All four smoke items are now fully automated. The prior analysis claimed checkpoint-row button presence was blocked on git-backed checkpoint setup, but `FakeFs` simulates git operations via `FakeGitRepositoryState` (see `FakeFsEntry::Dir { git_repo_state }` in `crates/fs/src/fs.rs`): inserting a `.git` directory + writing a file during a pending turn drives `compare_checkpoints` to return false, which sets `checkpoint.show = true`. This is the exact pattern `acp_thread::test_checkpoints` and `acp_thread::test_checkpoint_shows_when_file_changes_during_pending_message` already use — the prior session missed that `FakeFs` has built-in fake git support, not just in-memory file storage. `test_checkpoint_row_renders_with_show` applies this pattern from `agent_ui` using `StubAgentConnection`'s pending-turn (`response_tx`/`end_turn`) path to create the timing window for the file write. The **logic** behind all items is fully extracted and unit-tested, the **scroll wiring** (item 1) is automated, the **checkpoint-row render path with `checkpoint.show == true`** (item 2) is automated, the **native fork** (item 3) is end-to-end automated, and the **transcript slicing logic** (item 4) is unit-tested.
 
+## Addendum: branch at the clicked turn
+
+**Problem.** After `22bd86974a` removed the checkpoint-row Branch button, the
+only remaining entry point — the turn-end separator — passed `None`, so every
+"Branch New Thread" click forked the whole thread no matter which turn's
+separator was clicked. Clicking the separator after turn 2 of a 10-turn thread
+should carry only turns 1..=2 (the context above that point).
+
+**Fix.** Replace the id-based boundary (`Option<ClientUserMessageId>`, inclusive
+of the match, `None` = whole thread) with a turn-count boundary
+(`carry_turns: usize`, exclusive of the (`carry_turns`+1)-th user message):
+
+- `turns_above_separator(entries, entry_ix)` — counts user-message entries at
+  or above the separator; computed in the click handler from *current* entries
+  so a stale separator still branches at the turn it was rendered after.
+- `slice_messages_for_branch(messages, carry_turns)` — native fork carries
+  everything strictly before the (`carry_turns`+1)-th native user message;
+  Resume/Compaction markers above the cut come along. Count at/past the total
+  carries the whole history (the bottom separator still forks everything).
+- `transcript_entry_count(entries, carry_turns)` — external transcript carries
+  the leading entries strictly before the (`carry_turns`+1)-th user entry,
+  including the carried turns' trailing markers (canceled tool calls,
+  compaction), then degrades to the whole thread at/past the total.
+
+**Why counts, not ids.** Id matching required a `client_id` on the boundary
+user entry; server-loaded external history carries none, which would silently
+degrade those branches to whole-thread copies. User-turn ordering is consistent
+between a native thread's message log and its rendered entries, so counting is
+robust on both paths.
+
+### Tasks
+
+- [x] Switch `branch_to_new_thread` to `carry_turns: usize`
+- [x] Rewrite `slice_messages_for_branch` with count-based exclusive boundary
+- [x] Rewrite `transcript_entry_count` with count-based exclusive boundary
+- [x] Add `turns_above_separator` helper + wire into separator click handler
+- [x] Update separator tooltip ("carries the conversation above this point")
+- [x] Rewrite `branch_boundary_tests` for count semantics (16 tests)
+- [x] `cargo test -p agent_ui --lib branch_boundary` — 16/16 pass
+- [x] `./script/clippy -p agent_ui` — clean
+
 ## TL;DR
 
 Branch New Thread now forks *real* message history into a new native session
@@ -163,3 +205,7 @@ the slow LLM-summarisation round-trip entirely, and gains `[TOP]`/`[BOTTOM]`
 bookends on the prompt-jump strip. The checkpoint row shows both Restore and
 Branch. Two cosmetic tradeoffs (token-counter reset, detached subscription)
 are accepted as design decisions.
+
+**Addendum:** the turn-end separator now branches at the clicked turn — the
+fork carries only the user turns at/above that separator instead of the whole
+thread (turn-count boundary, not user-message-id matching).
