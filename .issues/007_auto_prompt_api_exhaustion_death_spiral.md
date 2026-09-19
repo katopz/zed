@@ -9,7 +9,7 @@
 - [x] Fix #2 implemented (`#[serde(default)]` on `quaternary` + forward-compat migration in `reload_persisted_health`)
 - [x] Fix #1 committed (`e2c73b2972` on `develop`)
 - [x] Fix #2 committed (`2047a3a60f` on `develop`)
-- [ ] GOAT verified (live behavior under real rate-limit conditions)
+- [-] GOAT verified (live behavior under real rate-limit conditions) — DEFERRED 2026-09-19: both fixes are committed (`e2c73b2972`, `2047a3a60f`) and unit-level, but the GOAT ask is specifically live behavior under REAL rate-limit conditions, which cannot be fabricated without burning real quota. Unblock condition: the next natural all-slots-rate-limited event (or a deliberate off-hours quota-exhaustion window) — verify no failed-thread cascade occurs (new threads stay suppressed while `RetryAfterBackoff` holds) and the persisted-health v1→v2 migration survives a real restart against a pre-Quaternary health file. Until such an event: the two regression guards added with the fixes are the standing coverage.
 
 ## Symptom
 
