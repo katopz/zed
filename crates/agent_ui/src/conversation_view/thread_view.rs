@@ -37,6 +37,7 @@ use db::kvp::KeyValueStore;
 use gpui::List;
 use gpui::Stateful;
 use gpui::TaskExt;
+use gpui::{PathBuilder, canvas, point};
 use heapless::Vec as ArrayVec;
 use language_model::{
     FastModeConfirmation, LanguageModel, LanguageModelEffortLevel, LanguageModelId,
@@ -44,7 +45,8 @@ use language_model::{
 };
 use notifications::status_toast::StatusToast;
 use settings::{
-    SettingsStore, VerdictReviewerSetting, update_settings_file, update_settings_file_with_completion,
+    SettingsStore, VerdictReviewerSetting, update_settings_file,
+    update_settings_file_with_completion,
 };
 use ui::{
     ButtonLike, CalloutBorderPosition, Checkbox, SpinnerLabel, SpinnerVariant, SplitButton,
@@ -59,6 +61,84 @@ use super::elicitation::{
 use super::*;
 
 const DATA_RETENTION_LEARN_MORE_URL: &str = "https://support.claude.com/en/articles/15425996-data-retention-practices-for-mythos-class-models";
+
+/// Fraction (0..1) of the backoff window still remaining, driving the drain
+/// ring beside a backed-off K-chip: 1.0 renders a full ring, the arc shrinks
+/// as the countdown progresses, and 0.0 means the backoff is over (the caller
+/// stops rendering the ring). An unknown total (a backoff persisted by an
+/// older Zed) keeps the ring full until expiry.
+fn backoff_ring_fraction(remaining: Duration, total: Option<Duration>) -> f32 {
+    match total {
+        Some(total) if total > Duration::ZERO => {
+            (remaining.as_secs_f64() / total.as_secs_f64()).clamp(0.0, 1.0) as f32
+        }
+        _ => 1.0,
+    }
+}
+
+/// Draws the K-chip countdown ring. It appears full when the key rotates out
+/// and empties clockwise from 12 o'clock as the backoff drains; a faint full
+/// track underneath keeps the ring shape readable while draining. The caller
+/// removes the element entirely once the backoff expires.
+fn render_backoff_ring(
+    fraction: f32,
+    size: Pixels,
+    color: Hsla,
+    track_color: Hsla,
+) -> impl IntoElement {
+    let stroke_width = px(1.5);
+    canvas(
+        move |_, _, _| {},
+        move |bounds, _, window, _| {
+            let center = bounds.center();
+            let radius =
+                (bounds.size.width.min(bounds.size.height) / 2. - stroke_width / 2.).max(px(0.5));
+            if radius <= px(0.0) {
+                return;
+            }
+            let paint_arc = |fraction: f32, color: Hsla, window: &mut Window| {
+                let mut builder = PathBuilder::stroke(stroke_width);
+                if fraction >= 0.999 {
+                    // Nearly-full arcs degenerate in `arc_to` (start == end);
+                    // draw a true circle in two half arcs instead.
+                    let right = point(center.x + radius, center.y);
+                    let left = point(center.x - radius, center.y);
+                    builder.move_to(right);
+                    builder.arc_to(point(radius, radius), px(0.), false, true, left);
+                    builder.arc_to(point(radius, radius), px(0.), false, true, right);
+                    builder.close();
+                } else if fraction > 0.001 {
+                    // Start at 12 o'clock and sweep clockwise (y is down, so
+                    // increasing angle reads as clockwise on screen).
+                    let start_angle = -std::f32::consts::FRAC_PI_2;
+                    let end_angle = start_angle + fraction * std::f32::consts::TAU;
+                    builder.move_to(point(
+                        center.x + radius * start_angle.cos(),
+                        center.y + radius * start_angle.sin(),
+                    ));
+                    builder.arc_to(
+                        point(radius, radius),
+                        px(0.),
+                        fraction > 0.5,
+                        true,
+                        point(
+                            center.x + radius * end_angle.cos(),
+                            center.y + radius * end_angle.sin(),
+                        ),
+                    );
+                } else {
+                    return;
+                }
+                if let Ok(path) = builder.build() {
+                    window.paint_path(path, color);
+                }
+            };
+            paint_arc(1.0, track_color, window);
+            paint_arc(fraction, color, window);
+        },
+    )
+    .size(size)
+}
 
 #[derive(Default)]
 struct ThreadFeedbackState {
@@ -669,6 +749,11 @@ pub struct ThreadView {
     /// Debounce task that clears `is_scrolling` after a short period of no
     /// scroll-wheel activity.
     pub _scroll_clear_task: Option<Task<()>>,
+    /// 1s tick that re-renders the K1–K4 key-status chips while any slot is
+    /// backed off, so the drain ring + tooltip countdown stay live. Idle
+    /// otherwise (no chips in backoff → no task). See
+    /// `render_key_status_buttons`.
+    key_backoff_tick_task: Option<Task<()>>,
     pub skill_loading_issues: Vec<SkillLoadingIssue>,
     /// Issues the user has explicitly dismissed. Each entry is matched against
     /// emitted issues by full equality; when an issue no longer appears in the
@@ -1137,6 +1222,7 @@ impl ThreadView {
             conversation_hovered: false,
             is_scrolling: false,
             _scroll_clear_task: None,
+            key_backoff_tick_task: None,
             skill_loading_issues: Vec::new(),
             dismissed_skill_loading_issues: HashSet::default(),
             thread_search_bar: None,
@@ -6136,7 +6222,7 @@ impl ThreadView {
             }))
     }
 
-    fn render_key_status_buttons(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn render_key_status_buttons(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         // Only render for OpenAI-compatible (and similar multi-key) providers.
         // `key_slot_status` returns `None` for single-key providers (Copilot,
         // Zed Cloud, Ollama, Anthropic, Bedrock direct, etc.) so the footer
@@ -6146,15 +6232,65 @@ impl ThreadView {
             .and_then(|thread| thread.read(cx).model())?;
         let summary = model.key_slot_status(cx)?;
 
+        // While any slot is backed off, tick once a second so the drain ring
+        // and tooltip countdowns stay live; the task ends itself once no slot
+        // is backed off (the ring disappears at that point per the design).
+        if summary.0.iter().any(|status| status.is_backed_off)
+            && self.key_backoff_tick_task.is_none()
+        {
+            self.key_backoff_tick_task = Some(cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(Duration::from_secs(1)).await;
+                    let still_backed_off = this
+                        .update(cx, |this, cx| {
+                            let any_backed_off = this
+                                .as_native_thread(cx)
+                                .and_then(|thread| thread.read(cx).model())
+                                .and_then(|model| model.key_slot_status(cx))
+                                .map(|summary| summary.0.iter().any(|s| s.is_backed_off))
+                                .unwrap_or(false);
+                            if any_backed_off {
+                                cx.notify();
+                            }
+                            any_backed_off
+                        })
+                        .unwrap_or(false);
+                    if !still_backed_off {
+                        break;
+                    }
+                }
+            }));
+        }
+
         // Build one chip per slot, in fixed [K1, K2, K3, K4] order. Slots with
         // no configured key render as a muted "empty" placeholder so the user
         // sees that the slot exists but is unconfigured (clicking does nothing).
+        // A backed-off slot additionally gets a drain ring beside the chip:
+        // it renders full when the backoff starts and empties as the countdown
+        // progresses, disappearing once the backoff expires.
         let chips: Vec<AnyElement> = summary
             .0
             .iter()
             .enumerate()
             .map(|(idx, status)| {
-                self.render_one_key_status_chip(idx, status, cx)
+                let chip = self
+                    .render_one_key_status_chip(idx, status, cx)
+                    .into_any_element();
+                if !status.is_backed_off {
+                    return chip;
+                }
+                let fraction =
+                    backoff_ring_fraction(status.backoff_remaining, status.backoff_total);
+                if fraction <= 0.0 {
+                    return chip;
+                }
+                let warning = ui::Color::Warning.color(cx);
+                let track = warning.opacity(0.2);
+                h_flex()
+                    .gap_0p5()
+                    .items_center()
+                    .child(render_backoff_ring(fraction, px(10.), warning, track))
+                    .child(chip)
                     .into_any_element()
             })
             .collect();
@@ -6198,15 +6334,24 @@ impl ThreadView {
             let countdown = language_models::provider::open_ai_compatible::format_backoff_remaining(
                 status.backoff_remaining,
             );
-            (
-                Color::Warning,
-                format!(
+            let total = status
+                .backoff_total
+                .map(language_models::provider::open_ai_compatible::format_backoff_remaining);
+            let tooltip_text = match total {
+                Some(total) => format!(
+                    "K{}: in backoff — {} remaining of {} window, {} failure(s). Click to disable.",
+                    slot_index + 1,
+                    countdown,
+                    total,
+                    status.consecutive_failures
+                ),
+                None => format!(
                     "K{}: in backoff ({countdown}), {} failure(s). Click to disable.",
                     slot_index + 1,
                     status.consecutive_failures
-                )
-                .into(),
-            )
+                ),
+            };
+            (Color::Warning, tooltip_text.into())
         } else {
             (
                 Color::Accent,
@@ -6399,8 +6544,7 @@ impl ThreadView {
         cx: &mut Context<Self>,
     ) {
         if self.is_subagent()
-            || self.thread.read(cx).connection().agent_id().as_ref()
-                != agent::ZED_AGENT_ID.as_ref()
+            || self.thread.read(cx).connection().agent_id().as_ref() != agent::ZED_AGENT_ID.as_ref()
             || self.thread.read(cx).status() != ThreadStatus::Idle
         {
             return;
@@ -7861,8 +8005,7 @@ impl ThreadView {
         // agent.verdict_ping_pong = false to hide it.
         let verdict_button = (AgentSettings::get_global(cx).verdict_ping_pong
             && !self.is_subagent()
-            && thread.read(cx).connection().agent_id().as_ref()
-                == agent::ZED_AGENT_ID.as_ref())
+            && thread.read(cx).connection().agent_id().as_ref() == agent::ZED_AGENT_ID.as_ref())
         .then(|| {
             copy_response_index.filter(|&response_index| {
                 Self::get_agent_summary_content(thread.read(cx).entries(), response_index, cx)
@@ -8206,7 +8349,10 @@ impl ThreadView {
         let native_branch = self.as_native_thread(cx).and_then(|native_thread| {
             let connection = self.as_native_connection(cx)?;
             let messages = native_thread.read(cx).messages().to_vec();
-            Some((connection, slice_messages_for_branch(&messages, carry_turns)))
+            Some((
+                connection,
+                slice_messages_for_branch(&messages, carry_turns),
+            ))
         });
 
         // Fallback transcript for external ACP agents: a flattened copy of the
@@ -15390,11 +15536,7 @@ mod branch_boundary_tests {
         // The turn's trailing marker sits after the closing assistant message;
         // counting only up to the assistant (not past it) must still count the
         // turn's own user message.
-        let entries = vec![
-            entry_user(None, "u1"),
-            entry_assistant(),
-            entry_other(),
-        ];
+        let entries = vec![entry_user(None, "u1"), entry_assistant(), entry_other()];
         assert_eq!(turns_above_separator(&entries, 1), 1);
     }
 

@@ -78,6 +78,9 @@ pub struct ModelKeySlotStatus {
     pub enabled: bool,
     pub is_backed_off: bool,
     pub backoff_remaining: Duration,
+    /// The full backoff window (`Some` only while backed off), so the UI can
+    /// render a proportional drain ring (remaining / total).
+    pub backoff_total: Option<Duration>,
     pub consecutive_failures: u32,
 }
 
@@ -88,6 +91,7 @@ impl Default for ModelKeySlotStatus {
             enabled: true,
             is_backed_off: false,
             backoff_remaining: Duration::ZERO,
+            backoff_total: None,
             consecutive_failures: 0,
         }
     }

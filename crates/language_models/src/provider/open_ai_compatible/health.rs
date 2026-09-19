@@ -47,6 +47,10 @@ pub enum KeySlot {
 pub struct KeyHealth {
     pub consecutive_failures: u32,
     pub backoff_until: Option<Instant>,
+    /// The full backoff window set alongside `backoff_until`. The UI drains a
+    /// countdown ring as `remaining / total` — without the total, a draining
+    /// ring can't be proportional. `None` when the slot is not backed off.
+    pub backoff_total: Option<Duration>,
     pub enabled: bool,
 }
 
@@ -55,6 +59,7 @@ impl Default for KeyHealth {
         Self {
             consecutive_failures: 0,
             backoff_until: None,
+            backoff_total: None,
             enabled: true,
         }
     }
@@ -69,6 +74,9 @@ pub struct SlotHealthStatus {
     pub has_key: bool,
     pub is_backed_off: bool,
     pub backoff_remaining: Duration,
+    /// The full backoff window (`Some` only while `is_backed_off`), so the UI
+    /// can render a proportional drain ring (remaining / total).
+    pub backoff_total: Option<Duration>,
     pub consecutive_failures: u32,
     /// User-controlled on/off toggle. `false` excludes the slot from rotation
     /// even when the key is otherwise healthy.
@@ -173,6 +181,7 @@ impl KeyHealthTracker {
         let health = self.get_mut(slot);
         health.consecutive_failures = 0;
         health.backoff_until = None;
+        health.backoff_total = None;
     }
 
     /// Records a backoff-worthy failure on the slot: bumps the failure counter
@@ -184,6 +193,7 @@ impl KeyHealthTracker {
         health.consecutive_failures = health.consecutive_failures.saturating_add(1);
         let backoff = compute_backoff(health.consecutive_failures);
         health.backoff_until = Some(now + backoff);
+        health.backoff_total = Some(backoff);
     }
 
     /// Records a rate-limit failure on the slot. When the upstream supplied a
@@ -203,6 +213,7 @@ impl KeyHealthTracker {
         health.consecutive_failures = health.consecutive_failures.saturating_add(1);
         let backoff = retry_after.unwrap_or_else(|| compute_backoff(health.consecutive_failures));
         health.backoff_until = Some(now + backoff);
+        health.backoff_total = Some(backoff);
     }
 
     /// Toggles the user-controlled `enabled` flag on a slot. Does not touch the
@@ -238,6 +249,12 @@ impl KeyHealthTracker {
 pub struct PersistedKeyHealth {
     pub consecutive_failures: u32,
     pub backoff_remaining_secs: Option<f64>,
+    /// The full backoff window at save time, so a restarted Zed still renders
+    /// a proportional drain ring. `#[serde(default)]` so v2 schema files (which
+    /// predate this field) load with `None` — the ring then falls back to
+    /// starting full and draining over the remaining time.
+    #[serde(default)]
+    pub backoff_total_secs: Option<f64>,
     #[serde(default = "default_true")]
     pub enabled: bool,
 }
@@ -251,6 +268,7 @@ impl Default for PersistedKeyHealth {
         Self {
             consecutive_failures: 0,
             backoff_remaining_secs: None,
+            backoff_total_secs: None,
             enabled: true,
         }
     }
@@ -286,7 +304,7 @@ pub struct PersistedKeyHealthFile {
     pub quaternary: PersistedKeyHealth,
 }
 
-pub const PERSISTED_KEY_HEALTH_SCHEMA_VERSION: u32 = 2;
+pub const PERSISTED_KEY_HEALTH_SCHEMA_VERSION: u32 = 3;
 
 /// Subdirectory under `paths::data_dir()` holding one JSON file per provider.
 pub const PERSIST_DIR_NAME: &str = "openai_compatible_backoff";
@@ -304,6 +322,7 @@ impl PersistedKeyHealth {
         Self {
             consecutive_failures: health.consecutive_failures,
             backoff_remaining_secs,
+            backoff_total_secs: health.backoff_total.map(|total| total.as_secs_f64()),
             enabled: health.enabled,
         }
     }
@@ -317,9 +336,16 @@ impl PersistedKeyHealth {
             .backoff_remaining_secs
             .filter(|secs| *secs > elapsed_secs)
             .map(|secs| now + Duration::from_secs_f64((secs - elapsed_secs).max(0.0)));
+        // Keep the total window as-is: the drain ring scales by remaining/total,
+        // and the total doesn't shrink while Zed is closed.
+        let backoff_total = self
+            .backoff_total_secs
+            .filter(|secs| *secs > 0.0)
+            .map(Duration::from_secs_f64);
         KeyHealth {
             consecutive_failures: self.consecutive_failures,
             backoff_until,
+            backoff_total,
             enabled: self.enabled,
         }
     }
@@ -1901,7 +1927,7 @@ mod tests {
         let json = serde_json::to_value(&persisted).unwrap();
         let obj = json.as_object().unwrap();
         assert_eq!(obj.len(), 6, "expected schema_version + saved_at + 4 slots");
-        assert_eq!(obj.get("schema_version").and_then(|v| v.as_u64()), Some(2));
+        assert_eq!(obj.get("schema_version").and_then(|v| v.as_u64()), Some(3));
         // saved_at_unix_secs is a positive integer (wall-clock).
         assert!(
             obj.get("saved_at_unix_secs")

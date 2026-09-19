@@ -214,6 +214,7 @@ impl State {
         let health = tracker.get_mut(slot);
         health.consecutive_failures = 0;
         health.backoff_until = None;
+        health.backoff_total = None;
         drop(tracker);
         self.schedule_persist_key_health(cx);
     }
@@ -493,6 +494,7 @@ impl State {
             has_key,
             is_backed_off,
             backoff_remaining,
+            backoff_total: is_backed_off.then(|| health.backoff_total).flatten(),
             consecutive_failures: health.consecutive_failures,
             enabled: health.enabled,
         }
@@ -1051,6 +1053,7 @@ impl LanguageModel for OpenAiCompatibleLanguageModel {
                 enabled: s.enabled,
                 is_backed_off: s.is_backed_off,
                 backoff_remaining: s.backoff_remaining,
+                backoff_total: s.backoff_total,
                 consecutive_failures: s.consecutive_failures,
             }
         })))
