@@ -186,6 +186,25 @@ impl KeyHealthTracker {
         health.backoff_until = Some(now + backoff);
     }
 
+    /// Records a rate-limit failure on the slot. When the upstream supplied a
+    /// retry hint (`retry-after` header or a reset timestamp parsed from the
+    /// error body — see `parse_body_retry_hint`), it wins over the exponential
+    /// schedule: the server told us exactly when the quota resets, which can be
+    /// far beyond the 1h exponential cap (e.g. a weekly limit) or far below it
+    /// ("try again in 20s"). Without a hint this behaves like
+    /// [`Self::record_failure`].
+    pub fn record_rate_limit(
+        &mut self,
+        slot: KeySlot,
+        now: Instant,
+        retry_after: Option<Duration>,
+    ) {
+        let health = self.get_mut(slot);
+        health.consecutive_failures = health.consecutive_failures.saturating_add(1);
+        let backoff = retry_after.unwrap_or_else(|| compute_backoff(health.consecutive_failures));
+        health.backoff_until = Some(now + backoff);
+    }
+
     /// Toggles the user-controlled `enabled` flag on a slot. Does not touch the
     /// failure counter or backoff window, so re-enabling a previously-disabled
     /// slot preserves its prior health state. Persisted via `PersistedKeyHealth`.
@@ -378,9 +397,10 @@ pub fn sanitize_provider_id_for_filename(provider_id: &str) -> String {
 
 /// `paths::data_dir()/openai_compatible_backoff/{sanitized_id}.json`.
 pub fn key_health_path_for(provider_id: &str) -> PathBuf {
-    paths::data_dir()
-        .join(PERSIST_DIR_NAME)
-        .join(format!("{}.json", sanitize_provider_id_for_filename(provider_id)))
+    paths::data_dir().join(PERSIST_DIR_NAME).join(format!(
+        "{}.json",
+        sanitize_provider_id_for_filename(provider_id)
+    ))
 }
 
 /// Loads a `KeyHealthTracker` from disk. Missing file and parse errors are
@@ -452,7 +472,10 @@ pub async fn persist_key_health(
 ) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs.create_dir(parent).await.with_context(|| {
-            format!("creating parent dir for key health persistence: {}", parent.display())
+            format!(
+                "creating parent dir for key health persistence: {}",
+                parent.display()
+            )
         })?;
     }
     let serialized = serde_json::to_string(&PersistedKeyHealthFile::from_tracker(
@@ -489,7 +512,10 @@ pub fn schedule_persist_key_health_inner(
         // (e.g. inside retry_stream's loop) collapse into a single write.
         timer_executor.timer(PERSIST_DEBOUNCE).await;
         if let Err(err) = persist_key_health(&fs, path.clone(), snapshot).await {
-            log::warn!("failed to persist key health to {}: {err:#}", path.display());
+            log::warn!(
+                "failed to persist key health to {}: {err:#}",
+                path.display()
+            );
         }
     });
     // Replace any prior pending task. Dropping the old `Task` cancels it.
@@ -528,16 +554,20 @@ pub fn compute_backoff(failures: u32) -> Duration {
 }
 
 /// Formats a remaining backoff duration for the ConfigurationView badge.
-/// Hour precision drops the seconds (the user doesn't need them at that scale);
-/// sub-minute durations still show seconds so short backoffs feel responsive.
-/// Returns `"0s"` for `Duration::ZERO` (e.g. slot just exited backoff between
-/// snapshot and render).
+/// Day precision for multi-day upstream reset hints (e.g. a weekly quota),
+/// hour precision drops the seconds (the user doesn't need them at that
+/// scale); sub-minute durations still show seconds so short backoffs feel
+/// responsive. Returns `"0s"` for `Duration::ZERO` (e.g. slot just exited
+/// backoff between snapshot and render).
 pub fn format_backoff_remaining(remaining: Duration) -> String {
     let total_secs = remaining.as_secs();
-    let hours = total_secs / 3600;
+    let days = total_secs / 86400;
+    let hours = (total_secs % 86400) / 3600;
     let minutes = (total_secs % 3600) / 60;
     let seconds = total_secs % 60;
-    if hours > 0 {
+    if days > 0 {
+        format!("{days}d {hours}h")
+    } else if hours > 0 {
         format!("{hours}h {minutes}m")
     } else if minutes > 0 {
         format!("{minutes}m {seconds}s")
@@ -554,10 +584,7 @@ pub fn format_backoff_remaining(remaining: Duration) -> String {
 /// *next* request. The slot that hit the limit is still backed off (so the
 /// next request skips it), we just don't burn its siblings.
 pub fn is_rate_limit(err: &LanguageModelCompletionError) -> bool {
-    matches!(
-        err,
-        LanguageModelCompletionError::RateLimitExceeded { .. }
-    )
+    matches!(err, LanguageModelCompletionError::RateLimitExceeded { .. })
 }
 
 /// Returns true for errors that suggest the *key* or *upstream* is the problem
@@ -682,7 +709,10 @@ pub fn select_from_candidates(
         if let Some(thread_id) = thread_id {
             health.thread_picks.insert(
                 thread_id.to_string(),
-                ThreadKeyPick { slot, last_used: now },
+                ThreadKeyPick {
+                    slot,
+                    last_used: now,
+                },
             );
         }
         return Some((key, slot));
@@ -724,6 +754,10 @@ pub fn record_key_success(key_health: &Arc<ParkingMutex<KeyHealthTracker>>, slot
 /// Updates per-key health after a failed request. Only backoff-worthy errors
 /// (see `is_backoff_worthy`) bump the failure counter and reschedule backoff;
 /// other errors are no-ops because they would recur on every key.
+///
+/// For `RateLimitExceeded` the upstream's retry hint (when present) replaces
+/// the exponential schedule via `record_rate_limit` — the server-provided
+/// reset time is strictly more accurate than the local guess.
 pub fn record_key_failure(
     key_health: &Arc<ParkingMutex<KeyHealthTracker>>,
     slot: KeySlot,
@@ -733,7 +767,12 @@ pub fn record_key_failure(
         return;
     }
     let mut health = key_health.lock();
-    health.record_failure(slot, Instant::now());
+    match err {
+        LanguageModelCompletionError::RateLimitExceeded { retry_after, .. } => {
+            health.record_rate_limit(slot, Instant::now(), *retry_after);
+        }
+        _ => health.record_failure(slot, Instant::now()),
+    }
 }
 
 /// Helper: snapshots the health tracker under the mutex so the (borrowing)
@@ -890,9 +929,11 @@ mod tests {
         tracker.record_failure(KeySlot::Primary, start);
         let backed_until = tracker.get(KeySlot::Primary).backoff_until.unwrap();
         // During the window, slot is backed off.
-        assert!(tracker
-            .get(KeySlot::Primary)
-            .is_backed_off(start + Duration::from_secs(1)));
+        assert!(
+            tracker
+                .get(KeySlot::Primary)
+                .is_backed_off(start + Duration::from_secs(1))
+        );
         // After the backoff duration, slot re-qualifies automatically — this is
         // the "5h auto-clear" guarantee, but at the small scale of the actual
         // backoff (test asserts the mechanism, not the 5h cap).
@@ -911,15 +952,19 @@ mod tests {
         let mut tracker = KeyHealthTracker::default();
         tracker.record_failure(KeySlot::Secondary, start);
         tracker.record_failure(KeySlot::Secondary, start + Duration::from_secs(5));
-        assert!(tracker
-            .get(KeySlot::Secondary)
-            .is_backed_off(start + Duration::from_secs(1)));
+        assert!(
+            tracker
+                .get(KeySlot::Secondary)
+                .is_backed_off(start + Duration::from_secs(1))
+        );
         tracker.record_success(KeySlot::Secondary);
         assert_eq!(tracker.get(KeySlot::Secondary).consecutive_failures, 0);
         assert_eq!(tracker.get(KeySlot::Secondary).backoff_until, None);
-        assert!(!tracker
-            .get(KeySlot::Secondary)
-            .is_backed_off(start + Duration::from_secs(1)));
+        assert!(
+            !tracker
+                .get(KeySlot::Secondary)
+                .is_backed_off(start + Duration::from_secs(1))
+        );
     }
 
     #[test]
@@ -935,41 +980,97 @@ mod tests {
     }
 
     #[test]
+    fn record_rate_limit_uses_server_hint_verbatim() {
+        // An upstream reset hint wins over the exponential schedule — even
+        // when it exceeds the 1h exponential cap (weekly quota resets can be
+        // days away).
+        let mut tracker = KeyHealthTracker::default();
+        let now = Instant::now();
+        let hint = Duration::from_secs(3 * 86400);
+        tracker.record_rate_limit(KeySlot::Tertiary, now, Some(hint));
+        let health = tracker.get(KeySlot::Tertiary);
+        assert_eq!(health.consecutive_failures, 1);
+        assert_eq!(health.backoff_until, Some(now + hint));
+    }
+
+    #[test]
+    fn record_rate_limit_without_hint_falls_back_to_exponential() {
+        let mut tracker = KeyHealthTracker::default();
+        let now = Instant::now();
+        tracker.record_rate_limit(KeySlot::Quaternary, now, None);
+        let health = tracker.get(KeySlot::Quaternary);
+        assert_eq!(health.consecutive_failures, 1);
+        let backoff = health.backoff_until.unwrap() - now;
+        // Same jittered band as compute_backoff(1): [15s, 45s).
+        assert!(backoff >= Duration::from_secs(15) && backoff < Duration::from_secs(45));
+    }
+
+    #[test]
+    fn format_backoff_remaining_includes_days_for_multi_day_hints() {
+        assert_eq!(
+            format_backoff_remaining(Duration::from_secs(3 * 86400)),
+            "3d 0h"
+        );
+        assert_eq!(
+            format_backoff_remaining(Duration::from_secs(2 * 86400 + 5 * 3600)),
+            "2d 5h"
+        );
+        assert_eq!(
+            format_backoff_remaining(Duration::from_secs(35 * 60 + 39)),
+            "35m 39s"
+        );
+        assert_eq!(
+            format_backoff_remaining(Duration::from_secs(4 * 3600)),
+            "4h 0m"
+        );
+        assert_eq!(format_backoff_remaining(Duration::from_secs(59)), "59s");
+        assert_eq!(format_backoff_remaining(Duration::ZERO), "0s");
+    }
+
+    #[test]
     fn is_backoff_worthy_classification() {
         let provider = provider_name();
 
         // Backoff-worthy (transient / per-key).
-        assert!(is_backoff_worthy(&LanguageModelCompletionError::RateLimitExceeded {
-            provider: provider.clone(),
-            retry_after: None,
-        }));
-        assert!(is_backoff_worthy(&LanguageModelCompletionError::ServerOverloaded {
-            provider: provider.clone(),
-            retry_after: None,
-        }));
+        assert!(is_backoff_worthy(
+            &LanguageModelCompletionError::RateLimitExceeded {
+                provider: provider.clone(),
+                retry_after: None,
+            }
+        ));
+        assert!(is_backoff_worthy(
+            &LanguageModelCompletionError::ServerOverloaded {
+                provider: provider.clone(),
+                retry_after: None,
+            }
+        ));
         assert!(is_backoff_worthy(
             &LanguageModelCompletionError::ApiInternalServerError {
                 provider: provider.clone(),
                 message: "boom".into(),
             }
         ));
-        assert!(is_backoff_worthy(&LanguageModelCompletionError::AuthenticationError {
-            provider: provider.clone(),
-            message: "bad key".into(),
-        }));
+        assert!(is_backoff_worthy(
+            &LanguageModelCompletionError::AuthenticationError {
+                provider: provider.clone(),
+                message: "bad key".into(),
+            }
+        ));
         assert!(is_backoff_worthy(
             &LanguageModelCompletionError::StreamEndedUnexpectedly {
                 provider: provider.clone(),
             }
         ));
-        assert!(is_backoff_worthy(&LanguageModelCompletionError::Other(anyhow::anyhow!(
-            "unknown"
-        ))));
+        assert!(is_backoff_worthy(&LanguageModelCompletionError::Other(
+            anyhow::anyhow!("unknown")
+        )));
 
         // NOT backoff-worthy (would recur on every key).
-        assert!(!is_backoff_worthy(&LanguageModelCompletionError::NoApiKey {
-            provider: provider.clone(),
-        }));
+        assert!(!is_backoff_worthy(
+            &LanguageModelCompletionError::NoApiKey {
+                provider: provider.clone(),
+            }
+        ));
         assert!(!is_backoff_worthy(
             &LanguageModelCompletionError::PromptTooLarge { tokens: None }
         ));
@@ -997,9 +1098,7 @@ mod tests {
     fn select_from_candidates_returns_none_when_no_keys_configured() {
         let candidates: Vec<(Arc<str>, KeySlot)> = Vec::new();
         let mut health = KeyHealthTracker::default();
-        assert!(
-            select_from_candidates(&candidates, &mut health, None, Instant::now()).is_none()
-        );
+        assert!(select_from_candidates(&candidates, &mut health, None, Instant::now()).is_none());
     }
 
     #[test]
@@ -1017,8 +1116,7 @@ mod tests {
         let now = Instant::now();
         // Secondary is the only healthy candidate, so it must be picked.
         for _ in 0..20 {
-            let (key, slot) =
-                select_from_candidates(&candidates, &mut health, None, now).unwrap();
+            let (key, slot) = select_from_candidates(&candidates, &mut health, None, now).unwrap();
             assert_eq!(slot, KeySlot::Secondary);
             assert_eq!(&*key, "key-b");
         }
@@ -1049,7 +1147,10 @@ mod tests {
         };
 
         let pick = select_from_candidates(&candidates, &mut health, None, now);
-        assert!(pick.is_some(), "fail-open should return a key even when all backed off");
+        assert!(
+            pick.is_some(),
+            "fail-open should return a key even when all backed off"
+        );
         // Secondary expires sooner, so it must be picked.
         let (_, slot) = pick.unwrap();
         assert_eq!(slot, KeySlot::Secondary);
@@ -1069,9 +1170,12 @@ mod tests {
         let mut health = KeyHealthTracker::default();
         let now = Instant::now();
         for _ in 0..20 {
-            let (key, slot) =
-                select_from_candidates(&candidates, &mut health, None, now).unwrap();
-            assert_eq!(slot, KeySlot::Primary, "Primary must be sticky while healthy");
+            let (key, slot) = select_from_candidates(&candidates, &mut health, None, now).unwrap();
+            assert_eq!(
+                slot,
+                KeySlot::Primary,
+                "Primary must be sticky while healthy"
+            );
             assert_eq!(&*key, "key-a");
         }
     }
@@ -1092,7 +1196,11 @@ mod tests {
         let first = select_from_candidates(&candidates, &mut health, None, now)
             .unwrap()
             .1;
-        assert_ne!(first, KeySlot::Primary, "backed-off Primary must never be picked");
+        assert_ne!(
+            first,
+            KeySlot::Primary,
+            "backed-off Primary must never be picked"
+        );
         let second = select_from_candidates(&candidates, &mut health, None, now)
             .unwrap()
             .1;
@@ -1155,7 +1263,11 @@ mod tests {
                 t1_pick = Some(slot);
             }
         }
-        assert_eq!((secondary, tertiary, quaternary), (2, 2, 2), "rotation must be even");
+        assert_eq!(
+            (secondary, tertiary, quaternary),
+            (2, 2, 2),
+            "rotation must be even"
+        );
         let again = select_from_candidates(&candidates, &mut health, Some("t1"), now)
             .unwrap()
             .1;
@@ -1186,7 +1298,11 @@ mod tests {
         );
         let (_, slot) =
             select_from_candidates(&candidates, &mut health, Some("thread-1"), now).unwrap();
-        assert_eq!(slot, KeySlot::Tertiary, "unhealthy thread pick must be skipped");
+        assert_eq!(
+            slot,
+            KeySlot::Tertiary,
+            "unhealthy thread pick must be skipped"
+        );
         // The dropped pick is replaced by the fresh one.
         assert_eq!(
             health.thread_picks.get("thread-1").map(|pick| pick.slot),
@@ -1215,7 +1331,10 @@ mod tests {
             },
         );
         let _ = select_from_candidates(&candidates, &mut health, Some("fresh"), now).unwrap();
-        assert!(!health.thread_picks.contains_key("stale"), "expired pick must be pruned");
+        assert!(
+            !health.thread_picks.contains_key("stale"),
+            "expired pick must be pruned"
+        );
         assert!(health.thread_picks.contains_key("fresh"));
         assert_eq!(health.thread_picks.len(), 1);
     }
@@ -1250,14 +1369,14 @@ mod tests {
         health.set_enabled(KeySlot::Primary, false);
         let now = Instant::now();
         for _ in 0..20 {
-            let (_, slot) =
-                select_from_candidates(&candidates, &mut health, None, now).unwrap();
+            let (_, slot) = select_from_candidates(&candidates, &mut health, None, now).unwrap();
             assert_eq!(slot, KeySlot::Secondary, "disabled Primary must be skipped");
         }
     }
 
     #[test]
-    fn select_from_candidates_returns_none_when_all_enabled_slots_backed_off_and_disabled_skipped() {
+    fn select_from_candidates_returns_none_when_all_enabled_slots_backed_off_and_disabled_skipped()
+    {
         // All slots are either disabled or backed off. The disabled slot must
         // NOT be used in fail-open — `None` is the correct outcome because the
         // user explicitly opted that slot out.
@@ -1273,7 +1392,11 @@ mod tests {
         let pick = select_from_candidates(&candidates, &mut health, None, now);
         assert!(pick.is_some(), "enabled backed-off slot should fail-open");
         let (_, slot) = pick.unwrap();
-        assert_eq!(slot, KeySlot::Secondary, "fail-open must skip disabled slots");
+        assert_eq!(
+            slot,
+            KeySlot::Secondary,
+            "fail-open must skip disabled slots"
+        );
     }
 
     #[test]
@@ -1303,12 +1426,24 @@ mod tests {
         let before = tracker.get(KeySlot::Tertiary).clone();
         tracker.set_enabled(KeySlot::Tertiary, false);
         assert!(!tracker.get(KeySlot::Tertiary).enabled);
-        assert_eq!(tracker.get(KeySlot::Tertiary).consecutive_failures, before.consecutive_failures);
-        assert_eq!(tracker.get(KeySlot::Tertiary).backoff_until, before.backoff_until);
+        assert_eq!(
+            tracker.get(KeySlot::Tertiary).consecutive_failures,
+            before.consecutive_failures
+        );
+        assert_eq!(
+            tracker.get(KeySlot::Tertiary).backoff_until,
+            before.backoff_until
+        );
         tracker.set_enabled(KeySlot::Tertiary, true);
         assert!(tracker.get(KeySlot::Tertiary).enabled);
-        assert_eq!(tracker.get(KeySlot::Tertiary).consecutive_failures, before.consecutive_failures);
-        assert_eq!(tracker.get(KeySlot::Tertiary).backoff_until, before.backoff_until);
+        assert_eq!(
+            tracker.get(KeySlot::Tertiary).consecutive_failures,
+            before.consecutive_failures
+        );
+        assert_eq!(
+            tracker.get(KeySlot::Tertiary).backoff_until,
+            before.backoff_until
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1429,7 +1564,8 @@ mod tests {
             "failed slot should be poisoned"
         );
         assert_eq!(
-            health.get(second_slot).consecutive_failures, 0,
+            health.get(second_slot).consecutive_failures,
+            0,
             "succeeded slot should have cleared health"
         );
     }
@@ -1462,7 +1598,10 @@ mod tests {
         ));
 
         assert!(
-            matches!(result, Err(LanguageModelCompletionError::RateLimitExceeded { .. })),
+            matches!(
+                result,
+                Err(LanguageModelCompletionError::RateLimitExceeded { .. })
+            ),
             "should return the rate-limit error"
         );
         let attempts = attempts.lock();
@@ -1510,7 +1649,10 @@ mod tests {
             },
         ));
 
-        assert!(matches!(result, Err(LanguageModelCompletionError::BadRequestFormat { .. })));
+        assert!(matches!(
+            result,
+            Err(LanguageModelCompletionError::BadRequestFormat { .. })
+        ));
         // Only one attempt — non-backoff-worthy errors don't rotate.
         assert_eq!(attempts.lock().len(), 1);
         // No slot should have been poisoned (the error wasn't backoff-worthy).
@@ -1545,10 +1687,17 @@ mod tests {
             },
         ));
 
-        assert!(matches!(result, Err(LanguageModelCompletionError::ServerOverloaded { .. })));
+        assert!(matches!(
+            result,
+            Err(LanguageModelCompletionError::ServerOverloaded { .. })
+        ));
         // Exactly one attempt per candidate — no slot tried twice.
         let attempts = attempts.lock();
-        assert_eq!(attempts.len(), 3, "each candidate tried exactly once: {attempts:?}");
+        assert_eq!(
+            attempts.len(),
+            3,
+            "each candidate tried exactly once: {attempts:?}"
+        );
         let unique: std::collections::HashSet<&String> = attempts.iter().collect();
         assert_eq!(unique.len(), 3, "no candidate retried: {attempts:?}");
     }
@@ -1566,7 +1715,10 @@ mod tests {
             move |_api_key| Box::pin(async move { Ok(1_i32) }),
         ));
 
-        assert!(matches!(result, Err(LanguageModelCompletionError::NoApiKey { .. })));
+        assert!(matches!(
+            result,
+            Err(LanguageModelCompletionError::NoApiKey { .. })
+        ));
     }
 
     // ------------------------------------------------------------------
@@ -1605,7 +1757,10 @@ mod tests {
         // The 1h cap (plan 027)
         assert_eq!(format_backoff_remaining(BACKOFF_MAX), "1h 0m");
         // Durations past the cap still format correctly if ever displayed.
-        assert_eq!(format_backoff_remaining(Duration::from_secs(5 * 3600)), "5h 0m");
+        assert_eq!(
+            format_backoff_remaining(Duration::from_secs(5 * 3600)),
+            "5h 0m"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1718,7 +1873,10 @@ mod tests {
 
         // If elapsed exceeds remaining, the slot loads as healthy.
         let expired = slot.to_health(now, 700.0);
-        assert_eq!(expired.backoff_until, None, "elapsed > remaining -> healthy");
+        assert_eq!(
+            expired.backoff_until, None,
+            "elapsed > remaining -> healthy"
+        );
     }
 
     #[test]
@@ -1746,7 +1904,10 @@ mod tests {
         assert_eq!(obj.get("schema_version").and_then(|v| v.as_u64()), Some(2));
         // saved_at_unix_secs is a positive integer (wall-clock).
         assert!(
-            obj.get("saved_at_unix_secs").and_then(|v| v.as_u64()).unwrap_or(0) > 0,
+            obj.get("saved_at_unix_secs")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+                > 0,
             "saved_at_unix_secs should be a positive unix timestamp"
         );
         let primary = obj.get("primary").unwrap().as_object().unwrap();
@@ -1764,7 +1925,9 @@ mod tests {
         );
         let secondary = obj.get("secondary").unwrap().as_object().unwrap();
         assert_eq!(
-            secondary.get("consecutive_failures").and_then(|v| v.as_u64()),
+            secondary
+                .get("consecutive_failures")
+                .and_then(|v| v.as_u64()),
             Some(0)
         );
         assert!(secondary.get("backoff_remaining_secs").unwrap().is_null());
@@ -1777,7 +1940,9 @@ mod tests {
         );
         let tertiary = obj.get("tertiary").unwrap().as_object().unwrap();
         assert_eq!(
-            tertiary.get("consecutive_failures").and_then(|v| v.as_u64()),
+            tertiary
+                .get("consecutive_failures")
+                .and_then(|v| v.as_u64()),
             Some(0)
         );
         assert!(tertiary.get("backoff_remaining_secs").unwrap().is_null());
@@ -1788,7 +1953,9 @@ mod tests {
         );
         let quaternary = obj.get("quaternary").unwrap().as_object().unwrap();
         assert_eq!(
-            quaternary.get("consecutive_failures").and_then(|v| v.as_u64()),
+            quaternary
+                .get("consecutive_failures")
+                .and_then(|v| v.as_u64()),
             Some(0)
         );
         assert!(quaternary.get("backoff_remaining_secs").unwrap().is_null());
@@ -1835,7 +2002,10 @@ mod tests {
     fn sanitize_provider_id_for_filename_strips_unsafe_chars() {
         // Path separators get replaced with `_`; otherwise the id is preserved
         // so per-provider files don't collide.
-        assert_eq!(sanitize_provider_id_for_filename("my-provider"), "my-provider");
+        assert_eq!(
+            sanitize_provider_id_for_filename("my-provider"),
+            "my-provider"
+        );
         assert_eq!(sanitize_provider_id_for_filename("foo.bar"), "foo.bar");
         assert_eq!(sanitize_provider_id_for_filename("a/b"), "a_b");
         assert_eq!(sanitize_provider_id_for_filename("a\\b"), "a_b");
@@ -1853,7 +2023,11 @@ mod tests {
         // existing state-recovery and backup flows, and must be a `.json` file
         // inside the `openai_compatible_backoff` subdir.
         let path = key_health_path_for("my-provider");
-        assert!(path.starts_with(paths::data_dir()), "got {}", path.display());
+        assert!(
+            path.starts_with(paths::data_dir()),
+            "got {}",
+            path.display()
+        );
         assert_eq!(
             path.parent().unwrap().file_name().unwrap(),
             PERSIST_DIR_NAME,
@@ -1888,9 +2062,7 @@ mod tests {
     /// the common case on first launch and must yield a fresh (all-healthy)
     /// tracker rather than an error.
     #[gpui::test]
-    async fn reload_persisted_health_missing_file_returns_default(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    async fn reload_persisted_health_missing_file_returns_default(cx: &mut gpui::TestAppContext) {
         let fs: Arc<dyn Fs> = fs::FakeFs::new(cx.background_executor.clone());
         let path = PathBuf::from("/nonexistent/provider.json");
         let loaded = reload_persisted_health(&fs, &path).await;
@@ -1900,17 +2072,12 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn reload_persisted_health_corrupt_json_returns_default(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    async fn reload_persisted_health_corrupt_json_returns_default(cx: &mut gpui::TestAppContext) {
         let fs: Arc<dyn Fs> = fs::FakeFs::new(cx.background_executor.clone());
         let path = PathBuf::from("/corrupt/provider.json");
-        fs.atomic_write(
-            path.clone(),
-            "not json at all {{{{".to_string(),
-        )
-        .await
-        .unwrap();
+        fs.atomic_write(path.clone(), "not json at all {{{{".to_string())
+            .await
+            .unwrap();
         let loaded = reload_persisted_health(&fs, &path).await;
         assert_eq!(loaded, KeyHealthTracker::default());
     }
@@ -1984,18 +2151,26 @@ mod tests {
         let loaded = reload_persisted_health(&fs, &path).await;
 
         // v1 state must survive the migration.
-        assert_eq!(loaded.primary.consecutive_failures, 3,
-            "primary failures must be preserved across v1→v2 migration");
-        assert!(loaded.primary.backoff_until.is_some(),
-            "primary backoff must be preserved (was 14454.5s in v1 file)");
+        assert_eq!(
+            loaded.primary.consecutive_failures, 3,
+            "primary failures must be preserved across v1→v2 migration"
+        );
+        assert!(
+            loaded.primary.backoff_until.is_some(),
+            "primary backoff must be preserved (was 14454.5s in v1 file)"
+        );
         assert_eq!(loaded.secondary.consecutive_failures, 0);
         assert_eq!(loaded.tertiary.consecutive_failures, 0);
 
         // Quaternary must come in as the healthy default — it didn't exist in v1.
-        assert_eq!(loaded.quaternary.consecutive_failures, 0,
-            "quaternary must default to 0 failures on v1 migration");
-        assert_eq!(loaded.quaternary.backoff_until, None,
-            "quaternary must default to no backoff on v1 migration");
+        assert_eq!(
+            loaded.quaternary.consecutive_failures, 0,
+            "quaternary must default to 0 failures on v1 migration"
+        );
+        assert_eq!(
+            loaded.quaternary.backoff_until, None,
+            "quaternary must default to no backoff on v1 migration"
+        );
     }
 
     #[gpui::test]
@@ -2010,12 +2185,16 @@ mod tests {
         let fs: Arc<dyn Fs> = fs::FakeFs::new(cx.background_executor.clone());
         let path = PathBuf::from("/v1/contract.json");
         let v1_json = r#"{"schema_version":1,"saved_at_unix_secs":1700000000,"primary":{"consecutive_failures":7,"backoff_remaining_secs":60.0},"secondary":{"consecutive_failures":0,"backoff_remaining_secs":null},"tertiary":{"consecutive_failures":0,"backoff_remaining_secs":null}}"#;
-        fs.atomic_write(path.clone(), v1_json.to_string()).await.unwrap();
+        fs.atomic_write(path.clone(), v1_json.to_string())
+            .await
+            .unwrap();
 
         let loaded = reload_persisted_health(&fs, &path).await;
         // If the parse-error path fired, we'd get default() with 0 failures everywhere.
-        assert_eq!(loaded.primary.consecutive_failures, 7,
-            "v1 file must not fall through to parse-error default");
+        assert_eq!(
+            loaded.primary.consecutive_failures, 7,
+            "v1 file must not fall through to parse-error default"
+        );
     }
 
     #[gpui::test]
@@ -2066,9 +2245,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn persist_and_reload_expired_backoff_loads_as_healthy(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    async fn persist_and_reload_expired_backoff_loads_as_healthy(cx: &mut gpui::TestAppContext) {
         // If the backoff window already elapsed between persist and reload
         // (e.g. user closed Zed overnight), the slot should load as healthy,
         // not stuck backed-off forever.

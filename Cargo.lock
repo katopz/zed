@@ -10146,6 +10146,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-lock",
+ "chrono",
  "cloud_llm_client",
  "futures 0.3.32",
  "gpui_shared_string",
@@ -10174,6 +10175,7 @@ dependencies = [
  "aws_http_client",
  "base64 0.22.1",
  "bedrock",
+ "chrono",
  "client",
  "clock",
  "cloud_api_client",

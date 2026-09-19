@@ -280,7 +280,8 @@ impl LanguageModelCompletionError {
             },
             StatusCode::TOO_MANY_REQUESTS => Self::RateLimitExceeded {
                 provider,
-                retry_after,
+                retry_after: retry_after
+                    .or_else(|| parse_body_retry_hint(&message, chrono::Local::now())),
             },
             StatusCode::INTERNAL_SERVER_ERROR => Self::ApiInternalServerError { provider, message },
             StatusCode::SERVICE_UNAVAILABLE => Self::ServerOverloaded {
@@ -298,6 +299,39 @@ impl LanguageModelCompletionError {
             },
         }
     }
+}
+
+/// Extracts a retry hint from a 429 response *body* for providers that don't
+/// send a `retry-after` header. Z.AI's coding endpoint (an OpenAI-compatible
+/// API) embeds the quota reset as an absolute wall-clock timestamp in the
+/// human-readable error message, e.g.:
+///
+/// ```text
+/// {"error":{"code":"1308","message":"Usage limit reached for 5 hour. Your limit will reset at 2026-09-19 23:42:39"}}
+/// {"error":{"code":"1310","message":"Weekly/Monthly Limit Exhausted. Your limit will reset at 2026-09-22 19:05:52"}}
+/// ```
+///
+/// The timestamp carries no timezone marker; it is interpreted in the local
+/// timezone. A mis-interpretation self-heals: the backoff clears on the first
+/// successful request, the settings-page Check probe, or new-thread key
+/// probing.
+///
+/// Returns the duration from `now` until the parsed reset time, or `None` when
+/// no parseable future reset time is present (callers keep their existing
+/// backoff strategy in that case).
+pub fn parse_body_retry_hint(body: &str, now: chrono::DateTime<chrono::Local>) -> Option<Duration> {
+    const NEEDLE: &str = "reset at ";
+    let rest = body.split_once(NEEDLE)?.1;
+    // Fixed-width timestamp: `YYYY-MM-DD HH:MM:SS` (19 ASCII chars).
+    let timestamp: String = rest.chars().take(19).collect();
+    let naive = chrono::NaiveDateTime::parse_from_str(&timestamp, "%Y-%m-%d %H:%M:%S").ok()?;
+    use chrono::TimeZone as _;
+    let reset = chrono::Local.from_local_datetime(&naive).single()?;
+    let delta = reset.signed_duration_since(now);
+    if delta <= chrono::TimeDelta::zero() {
+        return None;
+    }
+    delta.to_std().ok()
 }
 
 fn is_invalid_encrypted_content_message(message: &str) -> bool {
@@ -961,5 +995,98 @@ mod tests {
         assert_eq!(deserialized.id, original.id);
         assert_eq!(deserialized.name, original.name);
         assert_eq!(deserialized.thought_signature, None);
+    }
+
+    #[test]
+    fn test_parse_body_retry_hint_zai_five_hour_limit() {
+        use chrono::TimeZone as _;
+        let now = chrono::Local
+            .with_ymd_and_hms(2026, 9, 19, 23, 7, 0)
+            .unwrap();
+        let body = r#"{"error":{"code":"1308","message":"Usage limit reached for 5 hour. Your limit will reset at 2026-09-19 23:42:39"}}"#;
+        let hint = parse_body_retry_hint(body, now).expect("should parse Z.AI 1308 body");
+        assert_eq!(hint, std::time::Duration::from_secs(35 * 60 + 39));
+    }
+
+    #[test]
+    fn test_parse_body_retry_hint_zai_weekly_limit() {
+        use chrono::TimeZone as _;
+        let now = chrono::Local
+            .with_ymd_and_hms(2026, 9, 19, 23, 7, 0)
+            .unwrap();
+        let body = r#"{"error":{"code":"1310","message":"Weekly/Monthly Limit Exhausted. Your limit will reset at 2026-09-22 19:05:52"}}"#;
+        let hint = parse_body_retry_hint(body, now).expect("should parse Z.AI 1310 body");
+        // 2026-09-19 23:07:00 -> 2026-09-22 19:05:52 = 2d 19h 58m 52s.
+        assert_eq!(
+            hint,
+            std::time::Duration::from_secs(2 * 86400 + 19 * 3600 + 58 * 60 + 52)
+        );
+    }
+
+    #[test]
+    fn test_parse_body_retry_hint_past_timestamp_is_none() {
+        use chrono::TimeZone as _;
+        let now = chrono::Local
+            .with_ymd_and_hms(2026, 9, 19, 23, 7, 0)
+            .unwrap();
+        let body =
+            r#"{"error":{"code":"1308","message":"Your limit will reset at 2020-01-01 00:00:00"}}"#;
+        assert_eq!(parse_body_retry_hint(body, now), None);
+    }
+
+    #[test]
+    fn test_parse_body_retry_hint_unrelated_body_is_none() {
+        use chrono::TimeZone as _;
+        let now = chrono::Local
+            .with_ymd_and_hms(2026, 9, 19, 23, 7, 0)
+            .unwrap();
+        assert_eq!(parse_body_retry_hint("rate limited", now), None);
+        assert_eq!(parse_body_retry_hint("reset at garbage", now), None);
+        assert_eq!(parse_body_retry_hint("", now), None);
+    }
+
+    #[test]
+    fn test_from_http_status_429_parses_body_hint_when_header_missing() {
+        // Build a body whose reset time is far in the future so the test is
+        // insensitive to how long `Local::now()` inside `from_http_status`
+        // takes.
+        let far_future = (chrono::Local::now() + chrono::TimeDelta::try_days(365).unwrap())
+            .format("%Y-%m-%d %H:%M:%S");
+        let body = format!(
+            r#"{{"error":{{"code":"1310","message":"Weekly/Monthly Limit Exhausted. Your limit will reset at {far_future}"}}}}"#
+        );
+        let error = LanguageModelCompletionError::from_http_status(
+            String::from("GLM").into(),
+            StatusCode::TOO_MANY_REQUESTS,
+            body,
+            None,
+        );
+        match error {
+            LanguageModelCompletionError::RateLimitExceeded { retry_after, .. } => {
+                assert!(
+                    retry_after.is_some(),
+                    "body hint should populate retry_after"
+                );
+            }
+            other => panic!("expected RateLimitExceeded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_from_http_status_429_header_wins_over_body_hint() {
+        let body =
+            r#"{"error":{"code":"1308","message":"Your limit will reset at 2099-01-01 00:00:00"}}"#;
+        let error = LanguageModelCompletionError::from_http_status(
+            String::from("GLM").into(),
+            StatusCode::TOO_MANY_REQUESTS,
+            body.to_string(),
+            Some(std::time::Duration::from_secs(17)),
+        );
+        match error {
+            LanguageModelCompletionError::RateLimitExceeded { retry_after, .. } => {
+                assert_eq!(retry_after, Some(std::time::Duration::from_secs(17)));
+            }
+            other => panic!("expected RateLimitExceeded, got {other:?}"),
+        }
     }
 }

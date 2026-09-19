@@ -5,20 +5,20 @@ use fs::Fs;
 use futures::{FutureExt, StreamExt, future::BoxFuture};
 use gpui::{App, AsyncApp, Context, ElementId, Entity, SharedString, Task, TaskExt, Window};
 use http_client::{CustomHeaders, HttpClient};
-use parking_lot::Mutex as ParkingMutex;
 use language_model::{
     ApiKeyState, AuthenticateError, EnvVar, IconOrSvg, LanguageModel, LanguageModelCompletionError,
     LanguageModelCompletionEvent, LanguageModelEffortLevel, LanguageModelId, LanguageModelName,
     LanguageModelProvider, LanguageModelProviderId, LanguageModelProviderName,
     LanguageModelProviderState, LanguageModelRequest, LanguageModelToolChoice,
-    LanguageModelToolSchemaFormat, ModelKeySlotStatus, ModelKeySlotStatusSummary, ProviderSettingsView,
-    RateLimiter, SubPageProviderSettings,
+    LanguageModelToolSchemaFormat, ModelKeySlotStatus, ModelKeySlotStatusSummary,
+    ProviderSettingsView, RateLimiter, SubPageProviderSettings,
 };
 use open_ai::{
     ResponseStreamEvent,
     responses::{Request as ResponseRequest, StreamEvent as ResponsesStreamEvent, stream_response},
     stream_completion,
 };
+use parking_lot::Mutex as ParkingMutex;
 use settings::{Settings, SettingsStore};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -39,9 +39,8 @@ pub use health::format_backoff_remaining;
 
 mod health;
 use health::{
-    KeyHealthTracker, KeySlot, SlotHealthStatus,
-    key_health_path_for, record_key_success, reload_persisted_health, retry_stream,
-    schedule_persist_key_health_inner, snapshot_health,
+    KeyHealthTracker, KeySlot, SlotHealthStatus, key_health_path_for, record_key_success,
+    reload_persisted_health, retry_stream, schedule_persist_key_health_inner, snapshot_health,
 };
 
 /// Placeholder text shown in the (empty) primary/secondary/tertiary API key
@@ -112,7 +111,14 @@ fn truncate_key_preview(key: &str) -> String {
         return key.to_string();
     }
     let head: String = key.chars().take(HEAD).collect();
-    let tail: String = key.chars().rev().take(TAIL).collect::<Vec<_>>().into_iter().rev().collect();
+    let tail: String = key
+        .chars()
+        .rev()
+        .take(TAIL)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
     format!("{head}...{tail}")
 }
 
@@ -122,8 +128,11 @@ fn truncate_key_preview(key: &str) -> String {
 pub enum KeyProbeResult {
     /// The probe completed without an error.
     Ok,
-    /// The upstream returned a rate-limit error (429).
-    RateLimit,
+    /// The upstream returned a rate-limit error (429). `retry_after` is the
+    /// upstream-provided reset hint when one could be extracted (the
+    /// `retry-after` header or a reset timestamp parsed from the error body),
+    /// so the backoff can end exactly when the quota resets.
+    RateLimit { retry_after: Option<Duration> },
     /// Any other error; the message is surfaced as a tooltip.
     Err(SharedString),
 }
@@ -209,6 +218,18 @@ impl State {
         self.schedule_persist_key_health(cx);
     }
 
+    /// Backs the slot off for exactly `retry_after` — used when a probe (or a
+    /// real request, via `record_key_failure`) got a reset hint from the
+    /// upstream, so the rotation can skip the key until the quota actually
+    /// resets instead of until the exponential guess expires. Mirrors
+    /// `clear_slot_backoff`'s persistence behavior.
+    fn record_slot_rate_limit(&self, slot: KeySlot, retry_after: Duration, cx: &App) {
+        let mut tracker = self.key_health.lock();
+        tracker.record_rate_limit(slot, Instant::now(), Some(retry_after));
+        drop(tracker);
+        self.schedule_persist_key_health(cx);
+    }
+
     /// Toggles the user-controlled `enabled` flag on a slot. Persisted to disk
     /// so the choice survives restarts. Does not clear the failure counter or
     /// backoff window — re-enabling a previously-disabled slot preserves its
@@ -256,7 +277,11 @@ impl State {
         )
     }
 
-    fn set_api_key_2(&mut self, api_key: Option<String>, cx: &mut Context<Self>) -> Task<Result<()>> {
+    fn set_api_key_2(
+        &mut self,
+        api_key: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
         let credentials_provider = self.credentials_provider.clone();
         let api_url = secondary_key_url(&self.settings.api_url);
         self.api_key_state_2.store(
@@ -268,7 +293,11 @@ impl State {
         )
     }
 
-    fn set_api_key_3(&mut self, api_key: Option<String>, cx: &mut Context<Self>) -> Task<Result<()>> {
+    fn set_api_key_3(
+        &mut self,
+        api_key: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
         let credentials_provider = self.credentials_provider.clone();
         let api_url = tertiary_key_url(&self.settings.api_url);
         self.api_key_state_3.store(
@@ -280,7 +309,11 @@ impl State {
         )
     }
 
-    fn set_api_key_4(&mut self, api_key: Option<String>, cx: &mut Context<Self>) -> Task<Result<()>> {
+    fn set_api_key_4(
+        &mut self,
+        api_key: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
         let credentials_provider = self.credentials_provider.clone();
         let api_url = quaternary_key_url(&self.settings.api_url);
         self.api_key_state_4.store(
@@ -677,10 +710,8 @@ impl LanguageModelProvider for OpenAiCompatibleLanguageModelProvider {
         let http_client = self.http_client.clone();
         Some(ProviderSettingsView::SubPage(SubPageProviderSettings::new(
             move |window, cx| {
-                cx.new(|cx| {
-                    ConfigurationView::new(state.clone(), http_client.clone(), window, cx)
-                })
-                .into()
+                cx.new(|cx| ConfigurationView::new(state.clone(), http_client.clone(), window, cx))
+                    .into()
             },
         )))
     }
@@ -1001,7 +1032,8 @@ impl LanguageModel for OpenAiCompatibleLanguageModel {
     }
 
     fn last_used_key_label(&self, cx: &App) -> Option<String> {
-        self.state.read_with(cx, |state, _| state.last_used_key_label())
+        self.state
+            .read_with(cx, |state, _| state.last_used_key_label())
     }
 
     fn key_slot_status(&self, cx: &App) -> Option<ModelKeySlotStatusSummary> {
@@ -1010,13 +1042,17 @@ impl LanguageModel for OpenAiCompatibleLanguageModel {
         // are configured, so the footer can render the four chips as "empty".
         // However, providers that aren't OpenAI-compatible never reach this
         // impl, so this is the only `LanguageModel` impl that returns `Some`.
-        let snapshot = self.state.read_with(cx, |state, _| state.slot_health_snapshot());
-        Some(ModelKeySlotStatusSummary(snapshot.map(|s| ModelKeySlotStatus {
-            has_key: s.has_key,
-            enabled: s.enabled,
-            is_backed_off: s.is_backed_off,
-            backoff_remaining: s.backoff_remaining,
-            consecutive_failures: s.consecutive_failures,
+        let snapshot = self
+            .state
+            .read_with(cx, |state, _| state.slot_health_snapshot());
+        Some(ModelKeySlotStatusSummary(snapshot.map(|s| {
+            ModelKeySlotStatus {
+                has_key: s.has_key,
+                enabled: s.enabled,
+                is_backed_off: s.is_backed_off,
+                backoff_remaining: s.backoff_remaining,
+                consecutive_failures: s.consecutive_failures,
+            }
         })))
     }
 
@@ -1041,9 +1077,8 @@ impl LanguageModel for OpenAiCompatibleLanguageModel {
         // rotation cursor. The probes below remain: they re-verify every
         // configured key (including backed-off ones) so stale backoffs clear
         // before the new thread's first pick.
-        let (probe_inputs, key_health, key_health_dirty, key_health_path) = self
-            .state
-            .read_with(cx, |state, _| {
+        let (probe_inputs, key_health, key_health_dirty, key_health_path) =
+            self.state.read_with(cx, |state, _| {
                 (
                     state.all_probe_inputs(),
                     state.key_health.clone(),
@@ -1069,14 +1104,20 @@ impl LanguageModel for OpenAiCompatibleLanguageModel {
                 let result = run_key_probe(http_client.clone(), inputs).await;
                 // Same semantics as the settings-page Check button: a healthy
                 // probe clears stale backoff (the key is NOT really limited);
-                // rate-limit confirms the backoff is warranted; any other
-                // error is ambiguous and changes nothing.
-                if result == KeyProbeResult::Ok {
-                    record_key_success(&key_health, slot);
+                // a rate-limit probe with a reset hint pins the backoff to
+                // exactly what the upstream reported; any other error (or a
+                // bare rate limit) is ambiguous and changes nothing.
+                match &result {
+                    KeyProbeResult::Ok => record_key_success(&key_health, slot),
+                    KeyProbeResult::RateLimit {
+                        retry_after: Some(retry_after),
+                    } => {
+                        let mut health = key_health.lock();
+                        health.record_rate_limit(slot, Instant::now(), Some(*retry_after));
+                    }
+                    _ => {}
                 }
-                log::info!(
-                    "reset_key_session probe: slot={slot:?} result={result:?}"
-                );
+                log::info!("reset_key_session probe: slot={slot:?} result={result:?}");
             }
             if snapshot_health(&key_health) != health_before {
                 schedule_persist_key_health_inner(
@@ -1180,7 +1221,13 @@ impl LanguageModel for OpenAiCompatibleLanguageModel {
 /// Run on the background executor from `ConfigurationView::probe_key`; the
 /// result is written back into `probe_results` on the foreground thread.
 async fn run_key_probe(http_client: Arc<dyn HttpClient>, inputs: KeyProbeInputs) -> KeyProbeResult {
-    let KeyProbeInputs { api_key, model, api_url, extra_headers, provider_name } = inputs;
+    let KeyProbeInputs {
+        api_key,
+        model,
+        api_url,
+        extra_headers,
+        provider_name,
+    } = inputs;
     let request = open_ai::Request {
         model,
         messages: vec![open_ai::RequestMessage::User {
@@ -1211,12 +1258,21 @@ async fn run_key_probe(http_client: Arc<dyn HttpClient>, inputs: KeyProbeInputs)
     {
         Ok(mut stream) => {
             // Drain the first event: a successful setup with an inline error
-            // (common for late-detected rate limits) should classify as
-            // rate-limit/error, not ok.
+            // (common for late-detected rate limits) must not classify as ok —
+            // a false "healthy" would clear a warranted backoff and show a
+            // green check for a dead key. A reset hint in the message means
+            // rate-limit; anything else is a plain error.
             match stream.next().await {
-                Some(Ok(_)) => KeyProbeResult::Ok,
-                Some(Err(_)) => KeyProbeResult::Ok,
-                None => KeyProbeResult::Ok,
+                Some(Ok(_)) | None => KeyProbeResult::Ok,
+                Some(Err(err)) => {
+                    let message = format!("{err:#}");
+                    match language_model::parse_body_retry_hint(&message, chrono::Local::now()) {
+                        Some(retry_after) => KeyProbeResult::RateLimit {
+                            retry_after: Some(retry_after),
+                        },
+                        None => KeyProbeResult::Err(capped_first_line(&message).into()),
+                    }
+                }
             }
         }
         Err(err) => classify_probe_error(err),
@@ -1224,30 +1280,27 @@ async fn run_key_probe(http_client: Arc<dyn HttpClient>, inputs: KeyProbeInputs)
 }
 
 /// Maps an `open_ai::RequestError` (the setup-phase error type returned by
-/// `stream_completion`) onto the three-way `KeyProbeResult`. A 429 / rate-limit
-/// becomes `RateLimit`; anything else becomes `Err` with a short message.
+/// `stream_completion`) onto the three-way `KeyProbeResult`. Deliberately
+/// routes through the same `LanguageModelCompletionError` conversion the real
+/// request path uses, so the probe and actual requests classify 429s
+/// identically — including the retry hint extracted from the `retry-after`
+/// header or the error body.
 fn classify_probe_error(err: open_ai::RequestError) -> KeyProbeResult {
-    match err {
-        open_ai::RequestError::HttpResponseError { status_code, .. }
-            if status_code.as_u16() == 429 =>
-        {
-            KeyProbeResult::RateLimit
+    let raw = format!("{err:#}");
+    match LanguageModelCompletionError::from(err) {
+        LanguageModelCompletionError::RateLimitExceeded { retry_after, .. } => {
+            KeyProbeResult::RateLimit { retry_after }
         }
-        other => KeyProbeResult::Err(format_probe_error_message(&other).into()),
+        _ => KeyProbeResult::Err(capped_first_line(&raw).into()),
     }
 }
 
-/// Trims an `open_ai::RequestError` to a one-line string short enough for a
-/// tooltip. Keeps the variant name + the first line of any body/message so the
-/// user can tell auth (401) from not-found (404) from a 500, without dumping
-/// the full upstream JSON.
-fn format_probe_error_message(err: &open_ai::RequestError) -> String {
-    let raw = format!("{err:#}");
-    // Take the first line and cap its length so a huge upstream body doesn't
-    // blow out the tooltip. Char-safe truncation via `chars()`.
-    let first_line = raw.lines().next().unwrap_or(&raw);
-    let capped: String = first_line.chars().take(160).collect();
-    capped
+/// Trims a raw error string to a one-line string short enough for a tooltip.
+/// Keeps the first line and caps its length so a huge upstream body doesn't
+/// blow out the tooltip. Char-safe truncation via `chars()`.
+fn capped_first_line(raw: &str) -> String {
+    let first_line = raw.lines().next().unwrap_or(raw);
+    first_line.chars().take(160).collect()
 }
 
 struct ConfigurationView {
@@ -1320,9 +1373,7 @@ impl ConfigurationView {
                 let mut last_snapshot: [SlotHealthStatus; 4] =
                     state.read_with(cx, |state, _| state.slot_health_snapshot());
                 loop {
-                    cx.background_executor()
-                        .timer(Duration::from_secs(1))
-                        .await;
+                    cx.background_executor().timer(Duration::from_secs(1)).await;
                     let update_result = this.update(cx, |_, cx| {
                         let current = state.read(cx).slot_health_snapshot();
                         let changed = current != last_snapshot;
@@ -1500,7 +1551,8 @@ impl ConfigurationView {
     /// isn't currently backed off — the button is only rendered when it is, but
     /// this stays defensive against a stale snapshot between render and click.
     fn clear_backoff(&mut self, slot: KeySlot, cx: &mut Context<Self>) {
-        self.state.update(cx, |state, cx| state.clear_slot_backoff(slot, cx));
+        self.state
+            .update(cx, |state, cx| state.clear_slot_backoff(slot, cx));
         // A manual clear is a strong signal the user wants this slot forgotten;
         // also discard any stale probe result so the button resets to idle.
         let idx = slot_index(slot);
@@ -1518,9 +1570,11 @@ impl ConfigurationView {
     ///
     /// On `Ok` the slot's backoff is also cleared: a successful probe is direct
     /// evidence the key works right now, so any stale backoff (e.g. the upstream
-    /// quota reset) shouldn't keep the key rotated out until the 1h window
+    /// quota reset) shouldn't keep the key rotated out until the backoff window
     /// elapses. This mirrors the per-key success path in `retry_stream`, which
-    /// clears health on the first successful request.
+    /// clears health on the first successful request. A rate-limit probe with a
+    /// reset hint does the opposite — it pins the backoff to exactly when the
+    /// upstream says the quota resets.
     fn probe_key(&mut self, slot: KeySlot, window: &mut Window, cx: &mut Context<Self>) {
         let idx = slot_index(slot);
         // Coalesce: if a probe is already in flight for this slot, ignore.
@@ -1538,12 +1592,21 @@ impl ConfigurationView {
                 let idx = slot_index(slot);
                 // A successful probe means the key is healthy right now — clear
                 // any backoff so the slot re-enters rotation immediately instead
-                // of waiting out the 1h window. Non-ok results leave backoff
-                // untouched (a rate-limit probe confirms the backoff is still
-                // warranted; an error probe is ambiguous and shouldn't quietly
-                // clear a backoff earned by real request failures).
+                // of waiting out the backoff window. A rate-limit probe with a
+                // reset hint pins the backoff to exactly what the upstream
+                // reported (the exponential guess may be far off). Other results
+                // leave backoff untouched (an error probe is ambiguous and
+                // shouldn't quietly change a backoff earned by real requests).
                 if result == KeyProbeResult::Ok {
-                    this.state.update(cx, |state, cx| state.clear_slot_backoff(slot, cx));
+                    this.state
+                        .update(cx, |state, cx| state.clear_slot_backoff(slot, cx));
+                } else if let KeyProbeResult::RateLimit {
+                    retry_after: Some(retry_after),
+                } = &result
+                {
+                    this.state.update(cx, |state, cx| {
+                        state.record_slot_rate_limit(slot, *retry_after, cx)
+                    });
                 }
                 this.probe_results[idx] = Some(result);
                 this.probe_tasks[idx] = None;
@@ -1563,7 +1626,8 @@ impl ConfigurationView {
     /// - `Check` probes the key and reflects the latest result on its face:
     ///   `Check…` (in flight, disabled), `check(ok)` (green), `check(hit)`
     ///   (warning, rate-limited), `check(err)` (error, other) with the message
-    ///   as a tooltip.
+    ///   as a tooltip. When the upstream reported a reset time for a rate
+    ///   limit, the tooltip includes the exact remaining wait.
     /// - `Reset` clears the key (unchanged from before).
     ///
     /// `id_prefix` must be unique per slot so the `Button::new` ids don't
@@ -1604,11 +1668,20 @@ impl ConfigurationView {
                 (Some(KeyProbeResult::Ok), false) => {
                     ("check(ok)".to_string(), Color::Success, None)
                 }
-                (Some(KeyProbeResult::RateLimit), false) => (
-                    "check(hit)".to_string(),
-                    Color::Warning,
-                    Some("Upstream returned a rate-limit (429) for this key.".into()),
-                ),
+                (Some(KeyProbeResult::RateLimit { retry_after }), false) => {
+                    let tooltip = match retry_after {
+                        Some(retry_after) => format!(
+                            "Upstream rate-limited this key (429). Retry in {}.",
+                            format_backoff_remaining(*retry_after)
+                        ),
+                        None => "Upstream returned a rate-limit (429) for this key.".to_string(),
+                    };
+                    (
+                        "check(hit)".to_string(),
+                        Color::Warning,
+                        Some(tooltip.into()),
+                    )
+                }
                 (Some(KeyProbeResult::Err(msg)), false) => (
                     "check(err)".to_string(),
                     Color::Error,
@@ -1654,14 +1727,17 @@ impl ConfigurationView {
 
     /// Builds the left-hand status row of a configured-key card. Shows a green
     /// check by default; replaces it with a warning icon + live backoff
-    /// countdown when the slot is currently backed off. The countdown string
-    /// stays in sync with `backoff_refresh_task`, which polls every second and
-    /// re-renders when the snapshot changes.
+    /// countdown when the slot is currently backed off, and with a warning /
+    /// error icon when the latest probe result contradicts "healthy" — a key
+    /// that just probed as rate-limited or erroring must not read as green.
+    /// The countdown string stays in sync with `backoff_refresh_task`, which
+    /// polls every second and re-renders when the snapshot changes.
     ///
     /// `badge_id` must be unique per slot so the stateful tooltip div doesn't
-    /// collide across the three rendered cards.
+    /// collide across the rendered cards.
     fn render_key_status_row(
         status: &SlotHealthStatus,
+        probe_result: Option<&KeyProbeResult>,
         label_text: SharedString,
         badge_id: impl Into<ElementId>,
     ) -> impl IntoElement {
@@ -1676,7 +1752,7 @@ impl ConfigurationView {
             let failures = status.consecutive_failures;
             let tooltip_msg = format!(
                 "Key temporarily rotated out after {failures} consecutive \
-                 failure(s). Auto-recovers when backoff expires (max 5h)."
+                 failure(s). Recovers automatically when the backoff expires."
             );
             h_flex()
                 .flex_1()
@@ -1697,11 +1773,16 @@ impl ConfigurationView {
                         ),
                 )
         } else {
+            let (icon, color) = match probe_result {
+                Some(KeyProbeResult::RateLimit { .. }) => (IconName::Warning, Color::Warning),
+                Some(KeyProbeResult::Err(_)) => (IconName::XCircle, Color::Error),
+                Some(KeyProbeResult::Ok) | None => (IconName::Check, Color::Success),
+            };
             h_flex()
                 .flex_1()
                 .min_w_0()
                 .gap_1()
-                .child(Icon::new(IconName::Check).color(Color::Success))
+                .child(Icon::new(icon).color(color))
                 .child(label_node)
         }
     }
@@ -1741,10 +1822,26 @@ impl Render for ConfigurationView {
         // Truncated key previews (e.g. `sk-...x9F`) so the user can tell cards
         // apart. Only available for keychain-stored keys; env-var keys keep the
         // env-var label since we deliberately don't read the env value here.
-        let primary_preview = if primary_env_var_set { None } else { state.key_preview(KeySlot::Primary) };
-        let secondary_preview = if secondary_env_var_set { None } else { state.key_preview(KeySlot::Secondary) };
-        let tertiary_preview = if tertiary_env_var_set { None } else { state.key_preview(KeySlot::Tertiary) };
-        let quaternary_preview = if quaternary_env_var_set { None } else { state.key_preview(KeySlot::Quaternary) };
+        let primary_preview = if primary_env_var_set {
+            None
+        } else {
+            state.key_preview(KeySlot::Primary)
+        };
+        let secondary_preview = if secondary_env_var_set {
+            None
+        } else {
+            state.key_preview(KeySlot::Secondary)
+        };
+        let tertiary_preview = if tertiary_env_var_set {
+            None
+        } else {
+            state.key_preview(KeySlot::Tertiary)
+        };
+        let quaternary_preview = if quaternary_env_var_set {
+            None
+        } else {
+            state.key_preview(KeySlot::Quaternary)
+        };
 
         // Primary API key section
         let primary_section = if !primary_has_key {
@@ -1779,7 +1876,12 @@ impl Render for ConfigurationView {
                 .border_1()
                 .border_color(cx.theme().colors().border)
                 .bg(cx.theme().colors().background)
-                .child(Self::render_key_status_row(primary_status, label_text.into(), "primary-backoff-badge"))
+                .child(Self::render_key_status_row(
+                    primary_status,
+                    self.probe_results[0].as_ref(),
+                    label_text.into(),
+                    "primary-backoff-badge",
+                ))
                 .child(self.render_key_actions(
                     KeySlot::Primary,
                     primary_status,
@@ -1822,7 +1924,8 @@ impl Render for ConfigurationView {
                 .into_any()
         } else {
             let label_text: SharedString = if secondary_env_var_set {
-                format!("Secondary API key set in {secondary_env_var_name} environment variable").into()
+                format!("Secondary API key set in {secondary_env_var_name} environment variable")
+                    .into()
             } else if let Some(preview) = secondary_preview.as_deref() {
                 format!("Secondary: {preview}").into()
             } else {
@@ -1836,7 +1939,12 @@ impl Render for ConfigurationView {
                 .border_1()
                 .border_color(cx.theme().colors().border)
                 .bg(cx.theme().colors().background)
-                .child(Self::render_key_status_row(secondary_status, label_text, "secondary-backoff-badge"))
+                .child(Self::render_key_status_row(
+                    secondary_status,
+                    self.probe_results[1].as_ref(),
+                    label_text,
+                    "secondary-backoff-badge",
+                ))
                 .child(self.render_key_actions(
                     KeySlot::Secondary,
                     secondary_status,
@@ -1879,7 +1987,8 @@ impl Render for ConfigurationView {
                 .into_any()
         } else {
             let label_text: SharedString = if tertiary_env_var_set {
-                format!("Tertiary API key set in {tertiary_env_var_name} environment variable").into()
+                format!("Tertiary API key set in {tertiary_env_var_name} environment variable")
+                    .into()
             } else if let Some(preview) = tertiary_preview.as_deref() {
                 format!("Tertiary: {preview}").into()
             } else {
@@ -1893,7 +2002,12 @@ impl Render for ConfigurationView {
                 .border_1()
                 .border_color(cx.theme().colors().border)
                 .bg(cx.theme().colors().background)
-                .child(Self::render_key_status_row(tertiary_status, label_text, "tertiary-backoff-badge"))
+                .child(Self::render_key_status_row(
+                    tertiary_status,
+                    self.probe_results[2].as_ref(),
+                    label_text,
+                    "tertiary-backoff-badge",
+                ))
                 .child(self.render_key_actions(
                     KeySlot::Tertiary,
                     tertiary_status,
@@ -1936,7 +2050,8 @@ impl Render for ConfigurationView {
                 .into_any()
         } else {
             let label_text: SharedString = if quaternary_env_var_set {
-                format!("Quaternary API key set in {quaternary_env_var_name} environment variable").into()
+                format!("Quaternary API key set in {quaternary_env_var_name} environment variable")
+                    .into()
             } else if let Some(preview) = quaternary_preview.as_deref() {
                 format!("Quaternary: {preview}").into()
             } else {
@@ -1950,7 +2065,12 @@ impl Render for ConfigurationView {
                 .border_1()
                 .border_color(cx.theme().colors().border)
                 .bg(cx.theme().colors().background)
-                .child(Self::render_key_status_row(quaternary_status, label_text, "quaternary-backoff-badge"))
+                .child(Self::render_key_status_row(
+                    quaternary_status,
+                    self.probe_results[3].as_ref(),
+                    label_text,
+                    "quaternary-backoff-badge",
+                ))
                 .child(self.render_key_actions(
                     KeySlot::Quaternary,
                     quaternary_status,
@@ -2183,9 +2303,13 @@ mod tests {
             };
         }
         let snapshot = state.slot_health_snapshot();
-        assert!(!snapshot[1].is_backed_off, "expired backoff should auto-clear");
+        assert!(
+            !snapshot[1].is_backed_off,
+            "expired backoff should auto-clear"
+        );
         assert_eq!(
-            snapshot[1].backoff_remaining, Duration::ZERO,
+            snapshot[1].backoff_remaining,
+            Duration::ZERO,
             "expired backoff remaining should clamp to zero"
         );
         // consecutive_failures is still recorded (historical), even though the
@@ -2242,7 +2366,10 @@ mod tests {
         // Primary + Tertiary untouched (still poisoned).
         assert!(after[0].is_backed_off, "Primary should still be backed off");
         assert_eq!(after[0].consecutive_failures, 3);
-        assert!(after[2].is_backed_off, "Tertiary should still be backed off");
+        assert!(
+            after[2].is_backed_off,
+            "Tertiary should still be backed off"
+        );
         assert_eq!(after[2].consecutive_failures, 5);
     }
 
@@ -2296,7 +2423,67 @@ mod tests {
             body: String::new(),
             headers: Box::new(http_client::http::HeaderMap::new()),
         };
-        assert_eq!(classify_probe_error(err), KeyProbeResult::RateLimit);
+        assert_eq!(
+            classify_probe_error(err),
+            KeyProbeResult::RateLimit { retry_after: None }
+        );
+    }
+
+    #[test]
+    fn classify_probe_error_extracts_reset_hint_from_zai_body() {
+        // Empirical Z.AI 429 body: no retry-after header, reset timestamp in
+        // the message. A far-future date keeps the test insensitive to clock
+        // drift between parse and assert.
+        let err = open_ai::RequestError::HttpResponseError {
+            provider: "test".to_string(),
+            status_code: http_client::http::StatusCode::TOO_MANY_REQUESTS,
+            body: r#"{"error":{"code":"1310","message":"Weekly/Monthly Limit Exhausted. Your limit will reset at 2099-01-01 00:00:00"}}"#.to_string(),
+            headers: Box::new(http_client::http::HeaderMap::new()),
+        };
+        match classify_probe_error(err) {
+            KeyProbeResult::RateLimit { retry_after } => {
+                assert!(
+                    retry_after.is_some(),
+                    "reset hint from body should populate retry_after"
+                );
+            }
+            other => panic!("expected RateLimit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_probe_error_ignores_past_reset_hint() {
+        let err = open_ai::RequestError::HttpResponseError {
+            provider: "test".to_string(),
+            status_code: http_client::http::StatusCode::TOO_MANY_REQUESTS,
+            body: r#"{"error":{"code":"1308","message":"Usage limit reached for 5 hour. Your limit will reset at 2020-01-01 00:00:00"}}"#.to_string(),
+            headers: Box::new(http_client::http::HeaderMap::new()),
+        };
+        assert_eq!(
+            classify_probe_error(err),
+            KeyProbeResult::RateLimit { retry_after: None }
+        );
+    }
+
+    #[test]
+    fn classify_probe_error_rate_limit_header_populates_retry_after() {
+        let mut headers = http_client::http::HeaderMap::new();
+        headers.insert(
+            http_client::http::header::RETRY_AFTER,
+            http_client::http::HeaderValue::from_static("17"),
+        );
+        let err = open_ai::RequestError::HttpResponseError {
+            provider: "test".to_string(),
+            status_code: http_client::http::StatusCode::TOO_MANY_REQUESTS,
+            body: String::new(),
+            headers: Box::new(headers),
+        };
+        assert_eq!(
+            classify_probe_error(err),
+            KeyProbeResult::RateLimit {
+                retry_after: Some(Duration::from_secs(17))
+            }
+        );
     }
 
     #[test]
@@ -2309,7 +2496,10 @@ mod tests {
         };
         match classify_probe_error(err) {
             KeyProbeResult::Err(msg) => {
-                assert!(msg.as_ref().contains("401"), "message should mention status: {msg}");
+                assert!(
+                    msg.as_ref().contains("401"),
+                    "message should mention status: {msg}"
+                );
             }
             other => panic!("expected Err, got {other:?}"),
         }
