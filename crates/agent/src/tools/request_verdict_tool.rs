@@ -379,14 +379,16 @@ impl AgentTool for RequestVerdictTool {
                     };
                     route = ReviewerRoute::external(provider.clone());
 
-                    let (thread, session_id) = if let Some(session_id) = input.session_id.clone() {
+                    let (thread, session_id, turn_timeout) = if let Some(session_id) =
+                        input.session_id.clone()
+                    {
                         match verdict::reviewer_thread(&session_id) {
-                            Some(thread) => (thread, session_id),
+                            Some(thread) => (thread, session_id, verdict::REVIEWER_TURN_TIMEOUT),
                             None => {
                                 return Err(error_output(
                                     Some(session_id),
                                     "verdict reviewer session expired — start a new negotiation \
-                                     (call request_verdict without session_id)"
+                                         (call request_verdict without session_id)"
                                         .to_string(),
                                     route_label(&route),
                                     None,
@@ -420,20 +422,21 @@ impl AgentTool for RequestVerdictTool {
                             }
                         };
                         let session_id = cx.update(|cx| thread.read(cx).session_id().clone());
-                        (thread, session_id)
+                        // Fresh session: the first turn also pays the CLI's
+                        // one-time cold start (see REVIEWER_COLD_START_TURN_TIMEOUT).
+                        (
+                            thread,
+                            session_id,
+                            verdict::REVIEWER_COLD_START_TURN_TIMEOUT,
+                        )
                     };
 
                     let round = cx.update(|_cx| {
                         verdict::register_reviewer_session(&session_id, thread.clone())
                     });
 
-                    match verdict::reviewer_turn(
-                        &thread,
-                        input.message.clone(),
-                        verdict::REVIEWER_TURN_TIMEOUT,
-                        cx,
-                    )
-                    .await
+                    match verdict::reviewer_turn(&thread, input.message.clone(), turn_timeout, cx)
+                        .await
                     {
                         Ok(reply) => {
                             if input.final_round {

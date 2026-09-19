@@ -22,11 +22,19 @@ use util::path_list::PathList;
 /// mid-flight" case.
 pub const SESSION_TTL: Duration = Duration::from_secs(30 * 60);
 
-/// Upper bound for one external reviewer turn (proposal 001 phase 6). Mirrors
-/// the hidden orchestrator's budget: generous for Claude Code session startup
-/// plus a single judgment turn, tight enough that a runaway reviewer can't
-/// wedge the worker's tool call.
+/// Upper bound for one external reviewer turn on a warm session (proposal 001
+/// phase 6). Mirrors the hidden orchestrator's budget: generous for a single
+/// judgment turn, tight enough that a runaway reviewer can't wedge the
+/// worker's tool call.
 pub const REVIEWER_TURN_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Upper bound for the first turn of a freshly spawned external reviewer
+/// session. That turn additionally pays the underlying CLI's one-time cold
+/// start (process boot, MCP server init, auth) before the judgment turn even
+/// begins, which observably blows past [`REVIEWER_TURN_TIMEOUT`] on Claude
+/// Code: the first verdict timed out and only the manual retry against the
+/// now-warm session succeeded. Follow-up turns reuse the warm budget.
+pub const REVIEWER_COLD_START_TURN_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// A pluggable backend that can spawn external reviewer sessions for verdict
 /// ping-pong negotiations (proposal 001 phase 6). Implemented by `agent_ui`,
@@ -255,7 +263,10 @@ pub fn drain_pending_closes(cx: &mut App) {
     if pending.is_empty() {
         return;
     }
-    log::debug!("[verdict] closing {} expired reviewer session(s)", pending.len());
+    log::debug!(
+        "[verdict] closing {} expired reviewer session(s)",
+        pending.len()
+    );
     for thread in pending {
         close_thread_session(&thread, cx);
     }
@@ -571,9 +582,11 @@ mod tests {
         let connection = Rc::new(CloseCountingConnection::default());
         let thread = cx
             .update(|cx| {
-                connection
-                    .clone()
-                    .new_session(project, PathList::new(&[Path::new(path!("/verdict-test"))]), cx)
+                connection.clone().new_session(
+                    project,
+                    PathList::new(&[Path::new(path!("/verdict-test"))]),
+                    cx,
+                )
             })
             .await
             .unwrap();
