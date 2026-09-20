@@ -3,7 +3,8 @@
 > **OBSOLETE (2026-08-28, issue 030):** the war room + worker stack this
 > WebUI served is retired — Cloudflare worker + KV namespace deleted
 > (commits `845972dfc2`, `38917190c3`). The acceptance criteria below are
-> unmeetable; kept for historical context only.
+> unmeetable; kept for historical context only. **DEFERRED 2026-09-20 —
+> remaining boxes flipped to `- [-]` per triage; do not pick up.**
 
 ## Goal
 A minimal single-page HTML dashboard served by the Cloudflare Worker so the
@@ -411,26 +412,26 @@ No new crate dependencies. `agent_board` gains `websocket_client` module.
       VERIFIED (2026-08-18, live): https://agent-board-worker.foxfox.workers.dev
       → 200, 11.2KB HTML with reply input, accordion (toggleDev/toggleAg),
       status indicator, WS connect logic, GIS script tag. `test/goat.mjs` T1.
-- [ ] GitHub sign-in works; only `katopz` accepted.
+- [-] GitHub sign-in works; only `katopz` accepted.
       (2026-08-18: Google Sign-In replaced with GitHub device flow.)
       BLOCKED: `GITHUB_CLIENT_ID` empty in wrangler.toml (create an OAuth
       App with Device Flow enabled → paste client id → redeploy). Token
       verification (`api.github.com/user` + allowlist) + bad-token close
       4001 verified live; the real browser flow needs the client id.
-- [ ] WebSocket connects on page load; status indicator shows 🟢.
+- [-] WebSocket connects on page load; status indicator shows 🟢.
       Mechanism VERIFIED live (T7: WS upgrade + ed25519 auth_ok + fan-out;
       T8: bad token → close 4001). Browser-rendered 🟢 pending GITHUB_CLIENT_ID
       (GitHub path is the only browser auth).
-- [ ] Clicking an agent expands its state timeline (accordion).
+- [-] Clicking an agent expands its state timeline (accordion).
       Browser-UX item — needs interactive session (JS handlers verified present
       in served HTML, T1).
-- [ ] REPLY input populates `REPLY:[device:sess4]` when clicking an item.
+- [-] REPLY input populates `REPLY:[device:sess4]` when clicking an item.
       Browser-UX item — same as above.
 - [x] State updates from Zed appear in browser instantly via WebSocket (no refresh).
       VERIFIED (2026-08-18, live): signed POST /status + /state → relayed to
       connected SSE and WS clients in 889–906ms warm (<1s). `test/goat.mjs`
       T3/T4/T7.
-- [ ] Reply posted from browser reaches target Zed device:
+- [-] Reply posted from browser reaches target Zed device:
       - WebSocket ON: <1s.
       - WebSocket OFF: <15s (poll fallback).
       Worker side VERIFIED live (T6): POST /reply → 201 → typed SSE relay
@@ -438,13 +439,13 @@ No new crate dependencies. `agent_board` gains `websocket_client` module.
       Zed side: reply drain + injection unit-tested (W8/W9/W10), live panel
       run pending (~/.config/zed/agent_board.json now points at the worker
       with realtime_enabled=true).
-- [ ] Native agent thread receives the reply as a steering message.
+- [-] Native agent thread receives the reply as a steering message.
       Needs live Zed panel session (GUI).
-- [ ] Claude agent thread receives the reply as a regular user message.
+- [-] Claude agent thread receives the reply as a regular user message.
       Needs live Zed panel session (GUI).
-- [ ] Zed 📡 toggle: ON = instant replies, OFF = poll fallback.
+- [-] Zed 📡 toggle: ON = instant replies, OFF = poll fallback.
       Needs live Zed panel session (GUI).
-- [ ] Zed chat panel shows 🌐 badge for web-originated replies.
+- [-] Zed chat panel shows 🌐 badge for web-originated replies.
       Needs live Zed panel session (GUI).
 - [x] 4-char session prefix resolves correctly (exact match, no collision).
       Verified by `test_thread_for_session_prefix_resolves_active_thread` in `agent_panel.rs`.
