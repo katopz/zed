@@ -1,6 +1,7 @@
 # GLM endpoint rejects non-text content parts + WAF 405 blocks
 
-status: open (WAF item owner-gated; 1210 fully fixed in c876a4ef8a + c2df6463d3)
+status: closed 2026-09-20 (1210 fixed in c876a4ef8a + c2df6463d3; WAF item deferred
+— endpoint-operator config, not reproducible, owner call)
 
 ## Context
 
@@ -28,7 +29,23 @@ independent ways:
       sanitizes against the compaction model; helper takes the request by
       value with an image-presence early-out so the hot path pays a scan, not
       a copy. 2 end-to-end tests + compaction suite green.
-- [ ] Owner: tune Aliyun WAF rules for the GLM endpoint (405 HTML block pages
-      abort whole turns; log tag `[acp_thread] Error in run turn`).
-- [x] Title/summary 1210 — fixed in c876a4ef8a (remove this file once both
-      remaining boxes are closed).
+- [-] Owner: tune Aliyun WAF rules for the GLM endpoint (405 HTML block pages
+      abort whole turns; log tag `[acp_thread] Error in run turn`). **Deferred
+      2026-09-20** — the fix lives in Z.ai/Aliyun WAF config, not in this repo,
+      and there is nothing left to patch in Zed. No recurrence in the retained
+      logs: `Zed.log` + `Zed.log.old` contain zero `405` / `Method Not Allowed`
+      HTTP responses (every `405` hit is a plan filename). Reopen only if a
+      fresh HTML block page shows up — capture the response body + Aliyun trace
+      id from `~/Library/Logs/Zed/Zed.log` and hand it to the endpoint operator.
+- [x] Title/summary 1210 — fixed in c876a4ef8a.
+
+## Tombstone note
+
+Kept (not deleted) because this is the only write-up of *why* image
+sanitization is capability-gated on `model.supports_images()` and applied at
+the `stream_completion_with_retry` choke point rather than per-provider.
+
+Unrelated-but-adjacent, for whoever greps this next: GLM turns can also abort
+with `error sending HTTP request to GLM API` (transport/connect failure, seen
+3× on 2026-09-20). That is **not** the WAF 405 signature — don't reopen this
+issue for it.
