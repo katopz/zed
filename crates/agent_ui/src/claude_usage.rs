@@ -450,7 +450,8 @@ mod tests {
         assert!(error.downcast_ref::<TokenRejected>().is_some());
         assert!(format!("{error:#}").contains("401"));
 
-        let other = anyhow::anyhow!("Claude usage request failed with status 429 Too Many Requests");
+        let other =
+            anyhow::anyhow!("Claude usage request failed with status 429 Too Many Requests");
         assert!(other.downcast_ref::<TokenRejected>().is_none());
     }
 

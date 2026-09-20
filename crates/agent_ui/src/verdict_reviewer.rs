@@ -183,7 +183,9 @@ mod tests {
         let multi_workspace =
             cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
         let workspace = multi_workspace
-            .read_with(cx, |multi_workspace, _cx| multi_workspace.workspace().clone())
+            .read_with(cx, |multi_workspace, _cx| {
+                multi_workspace.workspace().clone()
+            })
             .unwrap();
         workspace.update(cx, |workspace, _cx| workspace.set_random_database_id());
         let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
@@ -197,15 +199,13 @@ mod tests {
             let connection =
                 StubAgentConnection::new().with_agent_id(AgentId(CLAUDE_AGENT_ID.into()));
             panel.update_in(cx, |panel, _window, cx| {
-                panel
-                    .connection_store()
-                    .update(cx, |store, cx| {
-                        store.request_connection(
-                            ClaudeCodeReviewer::claude_key(),
-                            Rc::new(StubAgentServer::new(connection)),
-                            cx,
-                        );
-                    });
+                panel.connection_store().update(cx, |store, cx| {
+                    store.request_connection(
+                        ClaudeCodeReviewer::claude_key(),
+                        Rc::new(StubAgentServer::new(connection)),
+                        cx,
+                    );
+                });
             });
         }
         cx.run_until_parked();

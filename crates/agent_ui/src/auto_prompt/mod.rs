@@ -2268,14 +2268,8 @@ mod tests {
     // delay a chain but never starve it forever.
     #[test]
     fn stream_cap_decision_dispatches_under_cap() {
-        assert_eq!(
-            stream_cap_decision(0, 2, 0),
-            StreamCapDecision::Dispatch
-        );
-        assert_eq!(
-            stream_cap_decision(1, 2, 0),
-            StreamCapDecision::Dispatch
-        );
+        assert_eq!(stream_cap_decision(0, 2, 0), StreamCapDecision::Dispatch);
+        assert_eq!(stream_cap_decision(1, 2, 0), StreamCapDecision::Dispatch);
         // Cap 0 resolves to usize::MAX (unlimited) before this fn runs; any
         // finite count is then "under cap".
         assert_eq!(
@@ -2286,10 +2280,7 @@ mod tests {
 
     #[test]
     fn stream_cap_decision_defers_then_escalates_at_bound() {
-        assert_eq!(
-            stream_cap_decision(2, 2, 0),
-            StreamCapDecision::Defer
-        );
+        assert_eq!(stream_cap_decision(2, 2, 0), StreamCapDecision::Defer);
         assert_eq!(
             stream_cap_decision(5, 2, STREAM_CAP_MAX_DEFERRALS - 1),
             StreamCapDecision::Defer
