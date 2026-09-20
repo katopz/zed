@@ -1,11 +1,12 @@
 # Issue 012: `gemini-web` / `gemini_cli_proxy` — DEAD (captcha wall)
 
-> **Status: DEAD.** Removed from codebase. The native LLM provider that drove
+> **Status: DEAD + DEFERRED (2026-09-20).** Removed from codebase. The native LLM provider that drove
 > `gemini.google.com` via Chrome DevTools Protocol hit Google's bot-detection
 > captcha after the first few requests, making it unusable as a reliable LLM
 > backend. All code, settings, UI buttons, and the `gemini-web` provider were
 > removed in a follow-up commit. Kept here as a tombstone so we don't retry
-> the same path without a captcha-solving story.
+> the same path without a captcha-solving story. Remaining open boxes below
+> flipped to `- [-]` (defer) — do not pick up without a captcha story.
 
 ---
 
@@ -283,7 +284,7 @@ Each `stream_completion_text(request, cx)` call:
       - Sent `"Say exactly the word PONG and nothing else."` via
         `Input.insertText` + `Enter`; received `"PONG"` back at ~t=6s.
         Full ask loop works as designed.
-- [ ] End-to-end smoke from inside Zed (not just the standalone CDP probe):
+- [-] End-to-end smoke from inside Zed (not just the standalone CDP probe):
       native Zed agent with `provider: "gemini-web"`, model `gemini-web-3`,
       send a prompt, get a sensible reply. **Blocked on user reporting
       whether the provider shows in the model dropdown after auth completes**
@@ -292,24 +293,24 @@ Each `stream_completion_text(request, cx)` call:
 
 ### Polish (deferred increments)
 
-- [ ] Streaming responses via `MutationObserver` → CDP binding → completion
+- [-] Streaming responses via `MutationObserver` → CDP binding → completion
       events.
-- [ ] 1:1 Zed-thread ↔ Gemini-conversation mapping (each Zed thread opens a
+- [-] 1:1 Zed-thread ↔ Gemini-conversation mapping (each Zed thread opens a
       fresh Gemini conversation URL).
-- [ ] Tool calling (probably out of scope forever — Gemini web tools aren't
+- [-] Tool calling (probably out of scope forever — Gemini web tools aren't
       a public surface).
-- [ ] Graceful `Browser.close` on provider drop instead of process-group
+- [-] Graceful `Browser.close` on provider drop instead of process-group
       kill (avoids "restore pages?" prompt on next Chrome launch).
-- [ ] Right-click "Ask Gemini" context-menu entries — separate increment
+- [-] Right-click "Ask Gemini" context-menu entries — separate increment
       once the provider is solid.
 
 ### Validation
 
-- [ ] `cargo clippy -p language_models -- --deny warnings` clean.
-- [ ] `./script/clippy` clean on the touched files.
-- [ ] `cargo test -p language_models` — at minimum a test that
+- [-] `cargo clippy -p language_models -- --deny warnings` clean.
+- [-] `./script/clippy` clean on the touched files.
+- [-] `cargo test -p language_models` — at minimum a test that
       `truncate_at_char_boundary` is used when capping prompt size.
-- [ ] End-to-end: native Zed agent using the provider returns a real reply
+- [-] End-to-end: native Zed agent using the provider returns a real reply
       from `gemini.google.com`.
 
 ## Open questions
