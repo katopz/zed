@@ -39,7 +39,7 @@ pub use health::format_backoff_remaining;
 
 mod health;
 use health::{
-    KeyHealthTracker, KeySlot, SlotHealthStatus, key_health_path_for,
+    KeyHealthTracker, KeySlot, SlotHealthStatus, key_health_path_for, record_key_success,
     reload_persisted_health, retry_stream, schedule_persist_key_health_inner, snapshot_health,
 };
 
@@ -1109,9 +1109,9 @@ impl LanguageModel for OpenAiCompatibleLanguageModel {
                 // Same semantics as the settings-page Check button:
                 //
                 // * `Ok` clears the slot outright, upstream-hinted windows
-                //   included — see `record_probe_success` for why a reachable
-                //   endpoint outranks a reset hint parsed from a timestamp with
-                //   no timezone marker.
+                //   included — see `KeyHealthTracker::record_success` for why a
+                //   reachable endpoint outranks a reset hint parsed from a
+                //   timestamp with no timezone marker.
                 // * A rate limit is recorded either way. With a hint the
                 //   backoff is pinned to exactly what the upstream reported;
                 //   without one we still know the key is limited and only the
@@ -1120,10 +1120,7 @@ impl LanguageModel for OpenAiCompatibleLanguageModel {
                 //   provably limited key rendering as healthy.
                 // * Any other error is genuinely ambiguous and changes nothing.
                 match &result {
-                    KeyProbeResult::Ok => {
-                        let mut health = key_health.lock();
-                        health.record_probe_success(slot, Instant::now());
-                    }
+                    KeyProbeResult::Ok => record_key_success(&key_health, slot),
                     KeyProbeResult::RateLimit { retry_after } => {
                         let mut health = key_health.lock();
                         health.record_rate_limit(slot, Instant::now(), *retry_after);

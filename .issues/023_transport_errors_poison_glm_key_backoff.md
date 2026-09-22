@@ -144,8 +144,8 @@ trip, so it was silently overturning real limits.
   never shorten**. A fresh upstream hint still wins outright in both directions:
   if the quota came back early, the shorter hint applies.
 - Probes record hintless 429s via the local schedule instead of dropping them.
-- New `record_probe_success` (see the correction in round four — the
-  upstream-hint guard it originally carried was wrong and has been removed).
+- A probe-success path that was later folded away — see round four; the
+  upstream-hint guard it carried was wrong and the wrapper went with it.
 - Migration discriminator: a pre-v4 window **longer than `BACKOFF_MAX`** can only
   have come from an upstream hint, since the local exponential is clamped to that
   cap. Those survive and are tagged; windows within the cap are dropped.
@@ -239,8 +239,9 @@ Two further points settle the direction:
   which immediately re-records the correct hint. Clearing too reluctantly
   strands a working key for **hours**.
 
-`record_probe_success` now clears the slot unconditionally. The provenance flag
-itself stays — it is well-supported where it was actually derived from evidence
+With the guard gone, `record_probe_success` was identical to `record_success`
+apart from an unused return value, so it was folded away and its reasoning moved
+onto `record_success`. The provenance flag itself stays — it is well-supported where it was actually derived from evidence
 (`apply_local_backoff`'s never-shorten rule, from the observed 28905s → 3600s
 clobber) and in fail-open ranking.
 
