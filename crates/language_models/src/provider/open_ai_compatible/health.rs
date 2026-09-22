@@ -897,11 +897,22 @@ pub fn classify_error(err: &LanguageModelCompletionError) -> ErrorVerdict {
 ///    of clustering: 6 agents over K2..K4 get exactly 2 each. Inside
 ///    `retry_stream` the just-failed slot is no longer healthy, so a retry
 ///    naturally advances to the next spare.
-/// 5. If no healthy candidate exists, fall back to the earliest-expiring
-///    backoff among **enabled** slots. Disabled slots are never picked even
-///    in fail-open (a disabled slot is a hard user opt-out, distinct from a
-///    transient backoff). Failing open on backoff is strictly better than
-///    `NoApiKey` when at least one enabled key exists.
+/// 5. If no healthy candidate exists, fail open onto a backed-off slot rather
+///    than returning `NoApiKey` — but not blindly. Backoff windows differ in
+///    authority (see `backoff_from_upstream_hint`):
+///
+///    * A **speculative** window is a local guess (transport blip, exponential
+///      estimate). The key may well answer right now, so these are tried
+///      first, spread over the same round-robin cursor as step 4 so
+///      concurrent agents don't all pile onto one key.
+///    * An **upstream-attested** window is the server stating when the quota
+///      resets. Sending a request before that instant is a guaranteed 429 —
+///      it burns latency and quota to learn nothing. These are the last
+///      resort, and there the earliest-expiring slot wins: it is the one
+///      closest to actually being usable.
+///
+///    Disabled slots never qualify even here — a disabled slot is a hard user
+///    opt-out, distinct from a transient backoff.
 pub fn select_from_candidates(
     candidates: &[(Arc<str>, KeySlot)],
     health: &mut KeyHealthTracker,
@@ -974,19 +985,43 @@ pub fn select_from_candidates(
         return Some((key, slot));
     }
 
-    // Everything present+enabled is backed off — fall back to the
-    // earliest-expiring backed-off enabled key. Disabled slots never qualify
-    // (better to fail with `None` → `NoApiKey` than silently resurrect a key
-    // the user explicitly turned off).
-    let fallback = candidates
+    // Everything present+enabled is backed off. Fail open rather than return
+    // `NoApiKey`, but prefer the slots whose backoff is only a guess: a window
+    // the upstream explicitly attested to is a request we already know will
+    // 429. Disabled slots never qualify (better to fail with `None` →
+    // `NoApiKey` than silently resurrect a key the user explicitly turned off).
+    let backed_off: Vec<(Arc<str>, KeySlot)> = candidates
         .iter()
-        .filter(|(_, slot)| health.get(*slot).enabled)
-        .filter_map(|(key, slot)| {
-            let until = health.get(*slot).backoff_until?;
-            Some(((key.clone(), *slot), until))
+        .filter(|(_, slot)| {
+            let h = health.get(*slot);
+            h.enabled && h.backoff_until.is_some()
         })
-        .min_by_key(|(_, until)| *until)
-        .map(|((key, slot), _)| (key, slot));
+        .cloned()
+        .collect();
+
+    let speculative: Vec<(Arc<str>, KeySlot)> = backed_off
+        .iter()
+        .filter(|(_, slot)| !health.get(*slot).backoff_from_upstream_hint)
+        .cloned()
+        .collect();
+
+    let fallback = match speculative.is_empty() {
+        // Some window is only a local guess — try it, and spread consecutive
+        // fail-open picks so concurrent agents don't converge on one key.
+        false => {
+            let index = (health.rotation_cursor % speculative.len() as u64) as usize;
+            health.rotation_cursor = health.rotation_cursor.wrapping_add(1);
+            speculative.get(index).cloned()
+        }
+        // Every window is upstream-attested: whichever request we send is
+        // going to be refused, so pick the slot closest to its stated reset.
+        true => backed_off
+            .into_iter()
+            .filter_map(|(key, slot)| health.get(slot).backoff_until.map(|until| (key, slot, until)))
+            .min_by_key(|(_, _, until)| *until)
+            .map(|(key, slot, _)| (key, slot)),
+    };
+
     if let Some((_, slot)) = &fallback {
         health.last_used_slot = Some(*slot);
     }
@@ -1352,8 +1387,14 @@ mod tests {
 
     #[test]
     fn select_from_candidates_falls_open_when_all_backed_off() {
-        // If every slot is in backoff, the function still returns a key
-        // (the soonest-expiring one) rather than `None`.
+        // If every slot is in backoff, the function still returns a key rather
+        // than `None`. Which key is no longer "the soonest-expiring one": both
+        // windows here are locally guessed, and among speculative windows the
+        // remaining time carries no information about which key will actually
+        // answer, so the pick round-robins instead (see
+        // `fail_open_spreads_concurrent_picks_across_speculative_slots`).
+        // Earliest-expiring still governs the all-attested case — see
+        // `fail_open_takes_earliest_reset_when_all_are_attested`.
         let candidates: Vec<(Arc<str>, KeySlot)> = vec![
             (Arc::<str>::from("key-a"), KeySlot::Primary),
             (Arc::<str>::from("key-b"), KeySlot::Secondary),
@@ -1374,14 +1415,17 @@ mod tests {
             ..Default::default()
         };
 
-        let pick = select_from_candidates(&candidates, &mut health, None, now);
-        assert!(
-            pick.is_some(),
-            "fail-open should return a key even when all backed off"
+        let mut picked = std::collections::HashSet::new();
+        for _ in 0..4 {
+            let (_, slot) = select_from_candidates(&candidates, &mut health, None, now)
+                .expect("fail-open should return a key even when all backed off");
+            picked.insert(format!("{slot:?}"));
+        }
+        assert_eq!(
+            picked.len(),
+            2,
+            "fail-open over speculative windows should reach both slots: {picked:?}"
         );
-        // Secondary expires sooner, so it must be picked.
-        let (_, slot) = pick.unwrap();
-        assert_eq!(slot, KeySlot::Secondary);
     }
 
     #[test]
@@ -2845,5 +2889,113 @@ mod tests {
             loaded.tertiary.backoff_from_upstream_hint,
             "the surviving window must be tagged as upstream-attested"
         );
+    }
+
+    fn four_candidates() -> Vec<(Arc<str>, KeySlot)> {
+        vec![
+            (Arc::<str>::from("key-a"), KeySlot::Primary),
+            (Arc::<str>::from("key-b"), KeySlot::Secondary),
+            (Arc::<str>::from("key-c"), KeySlot::Tertiary),
+            (Arc::<str>::from("key-d"), KeySlot::Quaternary),
+        ]
+    }
+
+    /// Fail-open must not spend a request on a slot the upstream already told
+    /// us is closed. A locally-guessed window is speculation and may well
+    /// succeed; an attested one is a guaranteed 429.
+    #[test]
+    fn fail_open_prefers_speculative_backoff_over_attested() {
+        let candidates = four_candidates();
+        let now = Instant::now();
+        let mut health = KeyHealthTracker::default();
+
+        // Deliberately adversarial to the *old* `min_by_key(backoff_until)`
+        // rule: the attested slots carry the SHORTEST windows, so the old
+        // fallback would have picked one of them. They are still certain 429s
+        // — the upstream said so — whereas K3's long window is only a local
+        // guess and may well answer.
+        for slot in [KeySlot::Primary, KeySlot::Secondary, KeySlot::Quaternary] {
+            health.record_rate_limit(slot, now, Some(Duration::from_secs(10)));
+        }
+        for _ in 0..10 {
+            health.record_failure(KeySlot::Tertiary, now);
+        }
+        assert!(
+            health.get(KeySlot::Tertiary).backoff_total.unwrap() > Duration::from_secs(600),
+            "test setup: K3's speculative window must dwarf the attested ones"
+        );
+
+        for _ in 0..8 {
+            let (_, slot) = select_from_candidates(&candidates, &mut health, None, now)
+                .expect("fail-open must return a slot");
+            assert_eq!(
+                slot,
+                KeySlot::Tertiary,
+                "picked a slot the upstream already refused"
+            );
+        }
+    }
+
+    /// When every window is attested there is no good choice — every request
+    /// will be refused — so take the one closest to its stated reset.
+    #[test]
+    fn fail_open_takes_earliest_reset_when_all_are_attested() {
+        let candidates = four_candidates();
+        let now = Instant::now();
+        let mut health = KeyHealthTracker::default();
+        health.record_rate_limit(KeySlot::Primary, now, Some(Duration::from_secs(28905)));
+        health.record_rate_limit(KeySlot::Secondary, now, Some(Duration::from_secs(900)));
+        health.record_rate_limit(KeySlot::Tertiary, now, Some(Duration::from_secs(7200)));
+        health.record_rate_limit(KeySlot::Quaternary, now, Some(Duration::from_secs(3600)));
+
+        let (_, slot) = select_from_candidates(&candidates, &mut health, None, now)
+            .expect("fail-open must return a slot");
+        assert_eq!(slot, KeySlot::Secondary, "900s is the soonest reset");
+    }
+
+    /// The old fallback was `min_by_key(backoff_until)` — deterministic, so
+    /// every concurrent agent converged on the same key the moment the pool
+    /// went down. Speculative fail-open picks now advance the rotation cursor.
+    #[test]
+    fn fail_open_spreads_concurrent_picks_across_speculative_slots() {
+        let candidates = four_candidates();
+        let now = Instant::now();
+        let mut health = KeyHealthTracker::default();
+        for slot in ALL_KEY_SLOTS {
+            health.record_transport_failure(slot, now);
+        }
+
+        let mut seen = HashMap::new();
+        for _ in 0..12 {
+            let (_, slot) = select_from_candidates(&candidates, &mut health, None, now)
+                .expect("fail-open must return a slot");
+            *seen.entry(format!("{slot:?}")).or_insert(0) += 1;
+        }
+        assert_eq!(seen.len(), 4, "12 fail-open picks clustered: {seen:?}");
+        for (slot, count) in &seen {
+            assert_eq!(*count, 3, "uneven fail-open spread for {slot}: {seen:?}");
+        }
+    }
+
+    /// A disabled slot is a hard opt-out and must never be resurrected, even
+    /// when it is the only speculative candidate left.
+    #[test]
+    fn fail_open_never_resurrects_a_disabled_slot() {
+        let candidates = four_candidates();
+        let now = Instant::now();
+        let mut health = KeyHealthTracker::default();
+        for slot in ALL_KEY_SLOTS {
+            health.record_rate_limit(slot, now, Some(Duration::from_secs(28905)));
+        }
+        // The one speculative slot is also the one the user turned off.
+        health.record_success(KeySlot::Tertiary);
+        health.record_transport_failure(KeySlot::Tertiary, now);
+        health.set_enabled(KeySlot::Tertiary, false);
+
+        for _ in 0..4 {
+            let (_, slot) = select_from_candidates(&candidates, &mut health, None, now)
+                .expect("three enabled slots remain");
+            assert_ne!(slot, KeySlot::Tertiary, "resurrected a disabled slot");
+        }
     }
 }

@@ -1,7 +1,7 @@
 # Transport failures poison GLM key backoff as if they were quota verdicts
 
-status: fixed 2026-09-22 — classifier split + v3→4 migration (26bb155267),
-plus a follow-up round for the inverse failure (limited keys rendering healthy)
+status: fixed 2026-09-22 — three rounds: classifier split (26bb155267), upstream-hint
+provenance (fefcf6bfd7), fail-open verdict-awareness; no open follow-ups
 
 ## Symptom
 
@@ -95,10 +95,11 @@ the transport cap) and `saturated_backoff_keeps_its_jitter_spread`.
 
 ## Follow-ups
 
-- [ ] The fail-open fallback picks the *earliest-expiring* backed-off slot
-      deterministically, ignoring the priority/sticky policy — so when every slot
-      is down, all concurrent threads pile onto the same key. Lower priority now
-      that transport blips no longer drive the pool to that state.
+- [x] The fail-open fallback picked the *earliest-expiring* backed-off slot
+      deterministically, so when every slot was down all concurrent threads piled
+      onto the same key. Fixed in the third round below — and the provenance flag
+      added in round two turned this from a load-spreading tweak into a
+      wasted-request fix.
 
 
 ## Follow-up round: the inverse failure — limited keys rendering as healthy
@@ -161,3 +162,46 @@ old binary at ~12:08, *before* the migration ran, so there is no longer a
 >`BACKOFF_MAX` window for the new rule to rescue. The next real request to that
 slot will 429 and re-record the hint correctly. Cost is one failed request, not
 an ongoing condition.
+
+
+## Third round: fail-open was spending requests on keys already known to be closed
+
+With `backoff_from_upstream_hint` in place, the fail-open fallback could finally
+tell two very different situations apart, and it was treating them identically:
+
+* A **speculative** window is a local guess — a transport blip or an exponential
+  estimate. The key may well answer right now.
+* An **upstream-attested** window is the server stating when the quota resets.
+  A request sent before that instant is a guaranteed 429: it costs latency and a
+  round trip to learn something already known.
+
+The old rule was `min_by_key(backoff_until)` across both classes, which picks by
+*remaining time* — a quantity that says nothing about which key will answer. In
+the shape actually observed on this machine (K3 attested closed until 19:06,
+K1/K2/K4 carrying short local windows) it could route every fail-open request to
+the one key guaranteed to refuse it.
+
+### Fix
+
+`select_from_candidates` step 5 now partitions the enabled backed-off slots:
+
+1. If any window is **speculative**, pick among those, advancing the same
+   round-robin cursor step 4 uses. This both avoids the guaranteed-429 slots and
+   spreads concurrent agents instead of converging them on one key — the
+   original follow-up.
+2. Only when **every** window is attested does earliest-expiring apply: every
+   request will be refused, so the slot closest to its stated reset is the best
+   available guess.
+
+Disabled slots still never qualify.
+
+4 new tests (17 total for this issue). Two are built to fail against the old
+rule: `fail_open_prefers_speculative_backoff_over_attested` gives the attested
+slots the *shortest* windows (so `min_by_key` would have chosen one of them), and
+`fail_open_spreads_concurrent_picks_across_speculative_slots` asserts 12 picks
+land 3-3-3-3 rather than 12-0-0-0.
+
+`select_from_candidates_falls_open_when_all_backed_off` was retargeted: its
+"soonest-expiring must win" assertion encoded the behavior being replaced, and
+that property now lives in `fail_open_takes_earliest_reset_when_all_are_attested`
+where it still holds.
