@@ -98,3 +98,20 @@ lessons from this sweep:
   \( -name '._*' -o -name '.DS_Store' \) -type f -delete > /tmp/... &`, then
   check progress later with `find . -name '._*' -type f | wc -l`. Verify with
   `git ls-files '._*'` → empty first (nothing tracked), as always.
+
+## 2026-09-23 addendum — stale ref locks + the tar trap; issue 024 folded here
+
+The 2026-09-22 recurrence (1,075 sidecars; issue 024) added two facts this doc lacked:
+
+- **Stale ref locks ride the same failure mode.** An interrupted fetch left
+  `refs/remotes/upstream/background-agent/mvp-zed-4vt-20260220.lock` (zero-byte,
+  2026-08-19) as the sole `git fsck` complaint. Sweep it with the sidecars:
+  `find .git/refs -name "*.lock" -type f -mtime +1 -delete` (mtime guard: never
+  touch a live lock).
+- **`tar` cannot back these up.** bsdtar recognizes `._*` as AppleDouble metadata
+  and silently merges/skips them — an attempted backup tarball comes out empty or
+  partial. That behavior is itself confirmation they are cruft, not data; the real
+  safety net is the remote (clean tree + `HEAD == origin/<branch>` before sweeping).
+
+Issue 024 is folded into this doc and removed from `.issues/` (noise-reduction
+rule); its content lives here now.

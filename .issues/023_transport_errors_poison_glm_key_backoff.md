@@ -1,7 +1,7 @@
 # Transport failures poison GLM key backoff as if they were quota verdicts
 
 status: fixed 2026-09-22 — three rounds: classifier split (26bb155267), upstream-hint
-provenance (fefcf6bfd7), fail-open verdict-awareness; no open follow-ups
+provenance (fefcf6bfd7), fail-open verdict-awareness; one evidence-gated watch deferred (Z.AI reset-timestamp timezone)
 
 ## Symptom
 
@@ -253,3 +253,7 @@ there is no evidence here to settle it. Left as-is rather than guessed at: the
 parse is self-healing again, so a wrong timezone costs one probe cycle rather
 than a stranded key. Worth confirming against a captured 429 body the next time
 one appears, and worth an explicit timezone if Z.AI ever documents one.
+
+## Watch item (explicit defer, promoted 2026-09-23)
+
+- [-] Confirm which timezone Z.AI's reset timestamp carries (UTC+8 / UTC / account-local) — the round-four prose note above, promoted to an explicit defer so the state machine sees it. Unblock: a captured raw 429 body in `~/Library/Logs/Zed/Zed.log`, or Z.AI documenting it. Until then the parse stays self-healing: a wrong timezone guess costs one probe cycle, never a stranded key.
