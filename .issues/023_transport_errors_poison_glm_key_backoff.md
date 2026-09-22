@@ -1,6 +1,7 @@
 # Transport failures poison GLM key backoff as if they were quota verdicts
 
-status: fixed 2026-09-22 — classifier split + v3→v4 migration; self-heals on next launch
+status: fixed 2026-09-22 — classifier split + v3→4 migration (26bb155267),
+plus a follow-up round for the inverse failure (limited keys rendering healthy)
 
 ## Symptom
 
@@ -98,3 +99,65 @@ the transport cap) and `saturated_backoff_keeps_its_jitter_spread`.
       deterministically, ignoring the priority/sticky policy — so when every slot
       is down, all concurrent threads pile onto the same key. Lower priority now
       that transport blips no longer drive the pool to that state.
+
+
+## Follow-up round: the inverse failure — limited keys rendering as healthy
+
+Reported right after the first fix shipped: "when new thread it appear all
+usable but i dont think so, some should hot limit rn". Correct. Evidence from
+`Zed.log`:
+
+```
+11:04:06  reset_key_session probe: slot=Tertiary result=RateLimit { retry_after: Some(28905.334231s) }
+12:08:39  GLM.json tertiary: consecutive_failures 214, backoff_total_secs 3600.0
+12:20:27  migrating persisted key health from schema_version 3 to 4
+12:20:27  clearing pre-v4 key backoff
+```
+
+Tertiary held a **genuine ~8h upstream reset hint** (reset ≈ 19:06 local). Three
+separate defects destroyed it:
+
+1. **A local guess could shorten an upstream-attested window.** Between 11:04
+   and 12:08 a transport failure ran `record_failure`, which unconditionally
+   assigned `backoff_until = now + compute_backoff(n)` — overwriting the 8h hint
+   with the 1h local cap. The first fix made this *worse*: transport failures now
+   compute a 60s window, so the same path would have cut 8h down to a minute.
+   **Regression introduced by 26bb155267.**
+2. **The v3→v4 migration was too blunt**, dropping every window including
+   attributable ones.
+3. **Probes ignored hintless 429s.** `KeyProbeResult::RateLimit { retry_after:
+   None }` fell into `_ => {}` in both `reset_key_session` and the settings-page
+   Check button. The probe *observed a 429* — the strongest possible evidence the
+   key is limited — and recorded nothing, leaving the slot rendering healthy.
+   Only the duration was ambiguous, not the fact of the limit.
+
+Also latent: `reset_key_session` cleared backoff on any probe `Ok`, but a probe
+is a 1-token ping — it can slip through a quota a real 400k-token turn would
+trip, so it was silently overturning real limits.
+
+### Fix
+
+- `KeyHealth::backoff_from_upstream_hint` records provenance (persisted).
+- `apply_local_backoff` — all locally-computed schedules (`record_failure`,
+  `record_transport_failure`, hintless `record_rate_limit`) now **extend only,
+  never shorten**. A fresh upstream hint still wins outright in both directions:
+  if the quota came back early, the shorter hint applies.
+- Probes record hintless 429s via the local schedule instead of dropping them.
+- New `record_probe_success`: clears locally-guessed windows (the stale-backoff
+  case probing exists for) but will not overturn an unexpired upstream hint. A
+  real completion (`record_success`) still clears everything.
+- Migration discriminator: a pre-v4 window **longer than `BACKOFF_MAX`** can only
+  have come from an upstream hint, since the local exponential is clamped to that
+  cap. Those survive and are tagged; windows within the cap are dropped.
+
+6 more tests (13 total for this issue), including
+`local_backoff_never_shortens_an_upstream_window` built from the exact observed
+values (28905s hint vs. the 1h clobber).
+
+### Known data loss
+
+Tertiary's real 19:06 reset is unrecoverable — it was clobbered to 3600.0 by the
+old binary at ~12:08, *before* the migration ran, so there is no longer a
+>`BACKOFF_MAX` window for the new rule to rescue. The next real request to that
+slot will 429 and re-record the hint correctly. Cost is one failed request, not
+an ongoing condition.

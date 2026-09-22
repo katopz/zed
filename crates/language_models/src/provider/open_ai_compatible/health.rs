@@ -68,6 +68,13 @@ pub struct KeyHealth {
     /// countdown ring as `remaining / total` — without the total, a draining
     /// ring can't be proportional. `None` when the slot is not backed off.
     pub backoff_total: Option<Duration>,
+    /// True when the current window came from an upstream reset hint (a
+    /// `retry-after` header or a timestamp parsed out of the 429 body) rather
+    /// than from a local guess. Provenance matters because the two carry very
+    /// different authority: an upstream hint is the server stating when the
+    /// quota resets, and must not be overwritten by a locally-computed guess
+    /// or cleared by a 1-token liveness ping.
+    pub backoff_from_upstream_hint: bool,
     pub enabled: bool,
 }
 
@@ -78,6 +85,7 @@ impl Default for KeyHealth {
             transport_failures: 0,
             backoff_until: None,
             backoff_total: None,
+            backoff_from_upstream_hint: false,
             enabled: true,
         }
     }
@@ -201,6 +209,49 @@ impl KeyHealthTracker {
         health.transport_failures = 0;
         health.backoff_until = None;
         health.backoff_total = None;
+        health.backoff_from_upstream_hint = false;
+    }
+
+    /// Success of a **probe** — the 1-token liveness ping fired by
+    /// `reset_key_session` and the settings-page Check button. Weaker evidence
+    /// than a real completion: a minimal request can sail through a quota that
+    /// a full-size one would trip, so a probe must not overturn an upstream
+    /// reset hint that has not yet elapsed. It does clear locally-guessed
+    /// windows, which is the stale-backoff case the probing exists for.
+    ///
+    /// Returns whether anything changed, so callers can skip a persist.
+    pub fn record_probe_success(&mut self, slot: KeySlot, now: Instant) -> bool {
+        let health = self.get_mut(slot);
+        if health.backoff_from_upstream_hint && health.is_backed_off(now) {
+            return false;
+        }
+        let was_marked = health.consecutive_failures != 0
+            || health.transport_failures != 0
+            || health.backoff_until.is_some();
+        self.record_success(slot);
+        was_marked
+    }
+
+    /// Applies a locally-computed backoff without ever *shortening* the
+    /// slot's current window.
+    ///
+    /// A local guess is an estimate; the window already in place may be an
+    /// upstream-attested reset that is hours away. Overwriting it would hand
+    /// the key back to rotation long before the quota actually resets — and
+    /// the smaller the local guess, the worse the damage. Observed in the
+    /// wild: a slot pinned to a real 8h reset hint was knocked back to the 1h
+    /// local cap by an unrelated connect failure.
+    fn apply_local_backoff(health: &mut KeyHealth, now: Instant, candidate: Duration) {
+        let remaining = health
+            .backoff_until
+            .map(|until| until.saturating_duration_since(now))
+            .unwrap_or_default();
+        if candidate <= remaining {
+            return;
+        }
+        health.backoff_until = Some(now + candidate);
+        health.backoff_total = Some(candidate);
+        health.backoff_from_upstream_hint = false;
     }
 
     /// Records an upstream-attributed failure on the slot: bumps the failure
@@ -213,8 +264,7 @@ impl KeyHealthTracker {
         let health = self.get_mut(slot);
         health.consecutive_failures = health.consecutive_failures.saturating_add(1);
         let backoff = compute_backoff(health.consecutive_failures);
-        health.backoff_until = Some(now + backoff);
-        health.backoff_total = Some(backoff);
+        Self::apply_local_backoff(health, now, backoff);
     }
 
     /// Records a failure that carried **no upstream verdict** (connect/TLS/DNS
@@ -232,8 +282,7 @@ impl KeyHealthTracker {
         let health = self.get_mut(slot);
         health.transport_failures = health.transport_failures.saturating_add(1);
         let backoff = compute_transport_backoff(health.transport_failures);
-        health.backoff_until = Some(now + backoff);
-        health.backoff_total = Some(backoff);
+        Self::apply_local_backoff(health, now, backoff);
     }
 
     /// Records a rate-limit failure on the slot. When the upstream supplied a
@@ -252,9 +301,23 @@ impl KeyHealthTracker {
         let health = self.get_mut(slot);
         health.consecutive_failures = health.consecutive_failures.saturating_add(1);
         health.transport_failures = 0;
-        let backoff = retry_after.unwrap_or_else(|| compute_backoff(health.consecutive_failures));
-        health.backoff_until = Some(now + backoff);
-        health.backoff_total = Some(backoff);
+        match retry_after {
+            // Authoritative: the upstream just stated when the quota resets,
+            // so this wins outright — including when it is *shorter* than the
+            // current window (the quota may have reset early).
+            Some(hint) => {
+                health.backoff_until = Some(now + hint);
+                health.backoff_total = Some(hint);
+                health.backoff_from_upstream_hint = true;
+            }
+            // A 429 with no parseable hint still proves the key is limited;
+            // only the duration is unknown. Fall back to the local schedule,
+            // which must not shorten an existing window.
+            None => {
+                let backoff = compute_backoff(health.consecutive_failures);
+                Self::apply_local_backoff(health, now, backoff);
+            }
+        }
     }
 
     /// Toggles the user-controlled `enabled` flag on a slot. Does not touch the
@@ -300,6 +363,11 @@ pub struct PersistedKeyHealth {
     /// starting full and draining over the remaining time.
     #[serde(default)]
     pub backoff_total_secs: Option<f64>,
+    /// Provenance of the persisted window, so a restart can still tell an
+    /// upstream-attested reset from a local guess. `#[serde(default)]` → older
+    /// files load as "locally guessed", the conservative reading.
+    #[serde(default)]
+    pub backoff_from_upstream_hint: bool,
     #[serde(default = "default_true")]
     pub enabled: bool,
 }
@@ -315,6 +383,7 @@ impl Default for PersistedKeyHealth {
             transport_failures: 0,
             backoff_remaining_secs: None,
             backoff_total_secs: None,
+            backoff_from_upstream_hint: false,
             enabled: true,
         }
     }
@@ -370,6 +439,7 @@ impl PersistedKeyHealth {
             transport_failures: health.transport_failures,
             backoff_remaining_secs,
             backoff_total_secs: health.backoff_total.map(|total| total.as_secs_f64()),
+            backoff_from_upstream_hint: health.backoff_from_upstream_hint,
             enabled: health.enabled,
         }
     }
@@ -394,6 +464,7 @@ impl PersistedKeyHealth {
             transport_failures: self.transport_failures,
             backoff_until,
             backoff_total,
+            backoff_from_upstream_hint: self.backoff_from_upstream_hint,
             enabled: self.enabled,
         }
     }
@@ -527,20 +598,39 @@ pub async fn reload_persisted_health(fs: &Arc<dyn Fs>, path: &PathBuf) -> KeyHea
             }
             let mut tracker = file.to_tracker(Instant::now());
             // v3→v4: pre-v4 counters conflated verdict-less transport failures
-            // with upstream quota verdicts, so any backoff they describe is
-            // unattributable — files in the wild carry counts in the hundreds
-            // pinned at the 1h cap purely from connect failures. Carrying them
-            // forward would keep keys parked for up to an hour after upgrade
-            // for reasons the new classifier would never have produced. Drop
-            // the counters and the windows; `enabled` is a user decision and
-            // survives.
+            // with upstream quota verdicts, so most of the backoff they
+            // describe is unattributable — files in the wild carry counts in
+            // the hundreds pinned at the 1h cap purely from connect failures.
+            //
+            // But not *all* of it. A pre-v4 window longer than `BACKOFF_MAX`
+            // could only have come from an upstream reset hint, because the
+            // local exponential is clamped to that cap and can never exceed
+            // it. Those are genuine quota verdicts — a real "your limit resets
+            // at 19:06" — and dropping them would hand a still-limited key
+            // back to rotation. So the length of the window is the
+            // discriminator: keep what the upstream must have said, drop the
+            // local guesses. `enabled` is a user decision and always survives.
             if file.schema_version < 4 {
-                log::info!(
-                    "clearing pre-v4 key backoff at {} — counters predate the transport/upstream split",
-                    path.display()
-                );
                 for slot in ALL_KEY_SLOTS {
                     let health = tracker.get_mut(slot);
+                    let upstream_attested = health
+                        .backoff_total
+                        .is_some_and(|total| total > BACKOFF_MAX);
+                    if upstream_attested {
+                        health.backoff_from_upstream_hint = true;
+                        log::info!(
+                            "keeping pre-v4 {slot:?} backoff at {} — a {:?} window exceeds the local cap, so it came from an upstream reset hint",
+                            path.display(),
+                            health.backoff_total.unwrap_or_default(),
+                        );
+                        continue;
+                    }
+                    if health.backoff_until.is_some() {
+                        log::info!(
+                            "clearing pre-v4 {slot:?} backoff at {} — window is within the local cap, so it is not attributable to an upstream verdict",
+                            path.display()
+                        );
+                    }
                     health.consecutive_failures = 0;
                     health.transport_failures = 0;
                     health.backoff_until = None;
@@ -2601,6 +2691,159 @@ mod tests {
         assert!(
             !tracker.get(KeySlot::Secondary).enabled,
             "disabling is a user decision and must survive the migration"
+        );
+    }
+
+    /// Observed in the wild: Tertiary was pinned to a real upstream reset hint
+    /// of ~8h (`retry_after: Some(28905s)`), then an unrelated connect failure
+    /// overwrote it with the 1h local cap — handing a still-limited key back to
+    /// rotation 7 hours early. A local guess must never shorten the window.
+    #[test]
+    fn local_backoff_never_shortens_an_upstream_window() {
+        let now = Instant::now();
+        let upstream_hint = Duration::from_secs(28905);
+
+        for record_local in [
+            KeyHealthTracker::record_failure as fn(&mut KeyHealthTracker, KeySlot, Instant),
+            KeyHealthTracker::record_transport_failure,
+        ] {
+            let mut tracker = KeyHealthTracker::default();
+            tracker.record_rate_limit(KeySlot::Tertiary, now, Some(upstream_hint));
+            assert!(tracker.get(KeySlot::Tertiary).backoff_from_upstream_hint);
+
+            for _ in 0..20 {
+                record_local(&mut tracker, KeySlot::Tertiary, now);
+            }
+
+            let health = tracker.get(KeySlot::Tertiary);
+            assert_eq!(
+                health.backoff_total,
+                Some(upstream_hint),
+                "a local guess overwrote the upstream reset hint"
+            );
+            assert!(
+                health.backoff_from_upstream_hint,
+                "provenance must survive local failures"
+            );
+            assert!(health.is_backed_off(now + Duration::from_secs(28_000)));
+        }
+    }
+
+    /// The upstream is authoritative about timing in both directions: if it
+    /// reports a *shorter* reset than the window in place, the quota came back
+    /// early and the key should return to rotation.
+    #[test]
+    fn a_fresh_upstream_hint_may_shorten_the_window() {
+        let now = Instant::now();
+        let mut tracker = KeyHealthTracker::default();
+        tracker.record_rate_limit(KeySlot::Primary, now, Some(Duration::from_secs(28905)));
+        tracker.record_rate_limit(KeySlot::Primary, now, Some(Duration::from_secs(30)));
+        assert_eq!(
+            tracker.get(KeySlot::Primary).backoff_total,
+            Some(Duration::from_secs(30))
+        );
+    }
+
+    /// A 429 with no parseable reset hint still proves the key is limited —
+    /// only the duration is unknown. The old probe path ignored these outright,
+    /// leaving a provably limited key rendering as healthy.
+    #[test]
+    fn a_hintless_rate_limit_still_backs_the_slot_off() {
+        let now = Instant::now();
+        let mut tracker = KeyHealthTracker::default();
+        tracker.record_rate_limit(KeySlot::Secondary, now, None);
+
+        let health = tracker.get(KeySlot::Secondary);
+        assert!(health.is_backed_off(now), "a 429 must mark the slot");
+        assert_eq!(health.consecutive_failures, 1);
+        assert!(
+            !health.backoff_from_upstream_hint,
+            "no hint was supplied, so the window is a local guess"
+        );
+    }
+
+    /// A probe is a 1-token ping: it can slip through a quota that a real turn
+    /// would trip, so it must not overturn an upstream reset hint. It still
+    /// clears locally-guessed windows — the stale-backoff case probing is for.
+    #[test]
+    fn probe_success_clears_local_guesses_but_not_upstream_hints() {
+        let now = Instant::now();
+
+        let mut tracker = KeyHealthTracker::default();
+        tracker.record_transport_failure(KeySlot::Primary, now);
+        assert!(tracker.record_probe_success(KeySlot::Primary, now));
+        assert!(!tracker.get(KeySlot::Primary).is_backed_off(now));
+
+        let mut tracker = KeyHealthTracker::default();
+        tracker.record_rate_limit(KeySlot::Primary, now, Some(Duration::from_secs(28905)));
+        assert!(
+            !tracker.record_probe_success(KeySlot::Primary, now),
+            "a 1-token ping must not overturn an unexpired upstream reset hint"
+        );
+        assert!(tracker.get(KeySlot::Primary).is_backed_off(now));
+
+        // Once the hinted window elapses, the slot is healthy anyway and a
+        // probe success clears the bookkeeping.
+        let after = now + Duration::from_secs(28906);
+        assert!(tracker.record_probe_success(KeySlot::Primary, after));
+        assert_eq!(tracker.get(KeySlot::Primary).consecutive_failures, 0);
+    }
+
+    /// A real completion is strong evidence — unlike a probe, it clears an
+    /// upstream-hinted window too.
+    #[test]
+    fn real_success_clears_even_an_upstream_hinted_window() {
+        let now = Instant::now();
+        let mut tracker = KeyHealthTracker::default();
+        tracker.record_rate_limit(KeySlot::Primary, now, Some(Duration::from_secs(28905)));
+        tracker.record_success(KeySlot::Primary);
+
+        let health = tracker.get(KeySlot::Primary);
+        assert!(!health.is_backed_off(now));
+        assert!(!health.backoff_from_upstream_hint);
+    }
+
+    /// The v<4 migration keys off window length: the local exponential is
+    /// clamped to `BACKOFF_MAX`, so anything longer can only have come from an
+    /// upstream reset hint and must survive. Anything within the cap is
+    /// ambiguous (transport poisoning produced exactly these) and is dropped.
+    #[gpui::test]
+    async fn v3_migration_keeps_upstream_windows_and_drops_local_ones(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fs: Arc<dyn Fs> = fs::FakeFs::new(cx.background_executor.clone());
+        let path = PathBuf::from("/v3/provider.json");
+        let saved_at_unix_secs = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // primary: the transport-poisoned shape (27 failures pinned at the 1h
+        // cap). tertiary: a real ~8h upstream reset hint.
+        let v3_json = format!(
+            r#"{{"schema_version":3,"saved_at_unix_secs":{saved_at_unix_secs},
+                "primary":{{"consecutive_failures":27,"backoff_remaining_secs":3597.9,"backoff_total_secs":3600.0,"enabled":true}},
+                "secondary":{{"consecutive_failures":0,"backoff_remaining_secs":null}},
+                "tertiary":{{"consecutive_failures":214,"backoff_remaining_secs":28900.0,"backoff_total_secs":28905.3,"enabled":true}},
+                "quaternary":{{"consecutive_failures":0,"backoff_remaining_secs":null}}}}"#
+        );
+        fs.atomic_write(path.clone(), v3_json).await.unwrap();
+
+        let loaded = reload_persisted_health(&fs, &path).await;
+        let now = Instant::now();
+
+        assert!(
+            !loaded.primary.is_backed_off(now),
+            "a 1h window is within the local cap — unattributable, must be dropped"
+        );
+        assert_eq!(loaded.primary.consecutive_failures, 0);
+
+        assert!(
+            loaded.tertiary.is_backed_off(now),
+            "a 28905s window exceeds the local cap, so the upstream must have said it"
+        );
+        assert!(
+            loaded.tertiary.backoff_from_upstream_hint,
+            "the surviving window must be tagged as upstream-attested"
         );
     }
 }

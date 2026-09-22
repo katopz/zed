@@ -39,7 +39,7 @@ pub use health::format_backoff_remaining;
 
 mod health;
 use health::{
-    KeyHealthTracker, KeySlot, SlotHealthStatus, key_health_path_for, record_key_success,
+    KeyHealthTracker, KeySlot, SlotHealthStatus, key_health_path_for,
     reload_persisted_health, retry_stream, schedule_persist_key_health_inner, snapshot_health,
 };
 
@@ -220,14 +220,14 @@ impl State {
         self.schedule_persist_key_health(cx);
     }
 
-    /// Backs the slot off for exactly `retry_after` — used when a probe (or a
-    /// real request, via `record_key_failure`) got a reset hint from the
-    /// upstream, so the rotation can skip the key until the quota actually
-    /// resets instead of until the exponential guess expires. Mirrors
-    /// `clear_slot_backoff`'s persistence behavior.
-    fn record_slot_rate_limit(&self, slot: KeySlot, retry_after: Duration, cx: &App) {
+    /// Records a rate limit observed by a probe. With `Some(retry_after)` the
+    /// slot is backed off for exactly that long, so rotation skips the key
+    /// until the quota actually resets rather than until the exponential guess
+    /// expires; with `None` the local schedule supplies the unknown duration.
+    /// Mirrors `clear_slot_backoff`'s persistence behavior.
+    fn record_slot_rate_limit(&self, slot: KeySlot, retry_after: Option<Duration>, cx: &App) {
         let mut tracker = self.key_health.lock();
-        tracker.record_rate_limit(slot, Instant::now(), Some(retry_after));
+        tracker.record_rate_limit(slot, Instant::now(), retry_after);
         drop(tracker);
         self.schedule_persist_key_health(cx);
     }
@@ -1106,20 +1106,30 @@ impl LanguageModel for OpenAiCompatibleLanguageModel {
                 // of parallel pings right at thread start would compete with
                 // the thread's own first request for the rate limiter.
                 let result = run_key_probe(http_client.clone(), inputs).await;
-                // Same semantics as the settings-page Check button: a healthy
-                // probe clears stale backoff (the key is NOT really limited);
-                // a rate-limit probe with a reset hint pins the backoff to
-                // exactly what the upstream reported; any other error (or a
-                // bare rate limit) is ambiguous and changes nothing.
+                // Same semantics as the settings-page Check button:
+                //
+                // * `Ok` clears a *locally guessed* backoff — the stale-backoff
+                //   case this probing exists for. It deliberately does NOT
+                //   overturn an upstream reset hint that hasn't elapsed: this
+                //   is a 1-token ping, and a minimal request can slip through a
+                //   quota that a real turn would trip.
+                // * A rate limit is recorded either way. With a hint the
+                //   backoff is pinned to exactly what the upstream reported;
+                //   without one we still know the key is limited and only the
+                //   duration is unknown, so the local schedule fills in. The
+                //   old code ignored hintless 429s entirely, which left a
+                //   provably limited key rendering as healthy.
+                // * Any other error is genuinely ambiguous and changes nothing.
                 match &result {
-                    KeyProbeResult::Ok => record_key_success(&key_health, slot),
-                    KeyProbeResult::RateLimit {
-                        retry_after: Some(retry_after),
-                    } => {
+                    KeyProbeResult::Ok => {
                         let mut health = key_health.lock();
-                        health.record_rate_limit(slot, Instant::now(), Some(*retry_after));
+                        health.record_probe_success(slot, Instant::now());
                     }
-                    _ => {}
+                    KeyProbeResult::RateLimit { retry_after } => {
+                        let mut health = key_health.lock();
+                        health.record_rate_limit(slot, Instant::now(), *retry_after);
+                    }
+                    KeyProbeResult::Err(_) => {}
                 }
                 log::info!("reset_key_session probe: slot={slot:?} result={result:?}");
             }
@@ -1594,23 +1604,30 @@ impl ConfigurationView {
             let result = run_key_probe(http_client, inputs).await;
             let _ = this.update(cx, |this, cx| {
                 let idx = slot_index(slot);
-                // A successful probe means the key is healthy right now — clear
-                // any backoff so the slot re-enters rotation immediately instead
-                // of waiting out the backoff window. A rate-limit probe with a
-                // reset hint pins the backoff to exactly what the upstream
-                // reported (the exponential guess may be far off). Other results
-                // leave backoff untouched (an error probe is ambiguous and
-                // shouldn't quietly change a backoff earned by real requests).
-                if result == KeyProbeResult::Ok {
-                    this.state
-                        .update(cx, |state, cx| state.clear_slot_backoff(slot, cx));
-                } else if let KeyProbeResult::RateLimit {
-                    retry_after: Some(retry_after),
-                } = &result
-                {
-                    this.state.update(cx, |state, cx| {
-                        state.record_slot_rate_limit(slot, *retry_after, cx)
-                    });
+                // Unlike the automatic new-thread probing, this is an explicit
+                // user action, so an `Ok` clears the backoff outright — even an
+                // upstream-hinted one. Asking "is this key OK?" and being told
+                // yes should return it to rotation.
+                //
+                // A rate limit is recorded either way: with a hint the backoff
+                // is pinned to exactly what the upstream reported (the
+                // exponential guess may be far off); without one, the 429 still
+                // proves the key is limited and the local schedule fills in the
+                // unknown duration. Other results leave the backoff untouched —
+                // an error probe is ambiguous and shouldn't quietly overwrite a
+                // backoff earned by real requests.
+                match &result {
+                    KeyProbeResult::Ok => {
+                        this.state
+                            .update(cx, |state, cx| state.clear_slot_backoff(slot, cx));
+                    }
+                    KeyProbeResult::RateLimit { retry_after } => {
+                        let retry_after = *retry_after;
+                        this.state.update(cx, |state, cx| {
+                            state.record_slot_rate_limit(slot, retry_after, cx)
+                        });
+                    }
+                    KeyProbeResult::Err(_) => {}
                 }
                 this.probe_results[idx] = Some(result);
                 this.probe_tasks[idx] = None;
