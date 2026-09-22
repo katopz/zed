@@ -35,6 +35,14 @@ pub enum KeySlot {
     Quaternary,
 }
 
+/// Every slot, in the fixed order the UI and the persisted file use.
+pub const ALL_KEY_SLOTS: [KeySlot; 4] = [
+    KeySlot::Primary,
+    KeySlot::Secondary,
+    KeySlot::Tertiary,
+    KeySlot::Quaternary,
+];
+
 /// Per-key backoff state. Persisted across restarts as relative durations
 /// (see `PersistedKeyHealth`); in-memory `Instant`s are reconstructed on load.
 ///
@@ -45,7 +53,16 @@ pub enum KeySlot {
 /// opt-out, distinct from a transient backoff.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KeyHealth {
+    /// Failures the *upstream itself* reported against this key (429/401/403/
+    /// 402/5xx). Only this counter drives the quota-scale exponential schedule
+    /// in [`compute_backoff`], because only these carry an upstream verdict.
     pub consecutive_failures: u32,
+    /// Failures where no upstream verdict was received at all — the socket
+    /// never completed, the connection dropped mid-stream, or the body was
+    /// unreadable. Tracked separately so a local network blip can never
+    /// escalate a key onto the hour-scale quota schedule (see
+    /// [`compute_transport_backoff`]).
+    pub transport_failures: u32,
     pub backoff_until: Option<Instant>,
     /// The full backoff window set alongside `backoff_until`. The UI drains a
     /// countdown ring as `remaining / total` — without the total, a draining
@@ -58,6 +75,7 @@ impl Default for KeyHealth {
     fn default() -> Self {
         Self {
             consecutive_failures: 0,
+            transport_failures: 0,
             backoff_until: None,
             backoff_total: None,
             enabled: true,
@@ -180,18 +198,40 @@ impl KeyHealthTracker {
     pub fn record_success(&mut self, slot: KeySlot) {
         let health = self.get_mut(slot);
         health.consecutive_failures = 0;
+        health.transport_failures = 0;
         health.backoff_until = None;
         health.backoff_total = None;
     }
 
-    /// Records a backoff-worthy failure on the slot: bumps the failure counter
-    /// and recomputes `backoff_until = now + compute_backoff(count)`.
-    /// Non-backoff-worthy errors should not call this (they would poison the
-    /// slot without benefit since the same error would occur on every key).
+    /// Records an upstream-attributed failure on the slot: bumps the failure
+    /// counter and recomputes `backoff_until = now + compute_backoff(count)`.
+    /// Only call this for [`ErrorVerdict::KeyFault`] — the upstream answered
+    /// and its answer indicted this key. Transport failures must go through
+    /// [`Self::record_transport_failure`] instead, and benign errors must not
+    /// touch health at all.
     pub fn record_failure(&mut self, slot: KeySlot, now: Instant) {
         let health = self.get_mut(slot);
         health.consecutive_failures = health.consecutive_failures.saturating_add(1);
         let backoff = compute_backoff(health.consecutive_failures);
+        health.backoff_until = Some(now + backoff);
+        health.backoff_total = Some(backoff);
+    }
+
+    /// Records a failure that carried **no upstream verdict** (connect/TLS/DNS
+    /// failure, mid-stream drop, unreadable body). The key's quota is unknown:
+    /// the request never reached a point where the upstream could judge it, so
+    /// escalating onto the hour-scale quota schedule would be a fabricated
+    /// conclusion. Uses the short, low-cap [`compute_transport_backoff`]
+    /// schedule and a counter that never feeds [`compute_backoff`].
+    ///
+    /// The slot is still briefly skipped rather than left fully healthy: slots
+    /// can point at different hosts (`secondary_key_url` and friends), so a
+    /// transport failure *may* be endpoint-specific and rotating is worth one
+    /// attempt. It just must not cost the user an hour when it isn't.
+    pub fn record_transport_failure(&mut self, slot: KeySlot, now: Instant) {
+        let health = self.get_mut(slot);
+        health.transport_failures = health.transport_failures.saturating_add(1);
+        let backoff = compute_transport_backoff(health.transport_failures);
         health.backoff_until = Some(now + backoff);
         health.backoff_total = Some(backoff);
     }
@@ -211,6 +251,7 @@ impl KeyHealthTracker {
     ) {
         let health = self.get_mut(slot);
         health.consecutive_failures = health.consecutive_failures.saturating_add(1);
+        health.transport_failures = 0;
         let backoff = retry_after.unwrap_or_else(|| compute_backoff(health.consecutive_failures));
         health.backoff_until = Some(now + backoff);
         health.backoff_total = Some(backoff);
@@ -248,6 +289,10 @@ impl KeyHealthTracker {
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
 pub struct PersistedKeyHealth {
     pub consecutive_failures: u32,
+    /// `#[serde(default)]` so v3 files (which predate the transport/upstream
+    /// split) load with a zeroed transport counter.
+    #[serde(default)]
+    pub transport_failures: u32,
     pub backoff_remaining_secs: Option<f64>,
     /// The full backoff window at save time, so a restarted Zed still renders
     /// a proportional drain ring. `#[serde(default)]` so v2 schema files (which
@@ -267,6 +312,7 @@ impl Default for PersistedKeyHealth {
     fn default() -> Self {
         Self {
             consecutive_failures: 0,
+            transport_failures: 0,
             backoff_remaining_secs: None,
             backoff_total_secs: None,
             enabled: true,
@@ -304,7 +350,7 @@ pub struct PersistedKeyHealthFile {
     pub quaternary: PersistedKeyHealth,
 }
 
-pub const PERSISTED_KEY_HEALTH_SCHEMA_VERSION: u32 = 3;
+pub const PERSISTED_KEY_HEALTH_SCHEMA_VERSION: u32 = 4;
 
 /// Subdirectory under `paths::data_dir()` holding one JSON file per provider.
 pub const PERSIST_DIR_NAME: &str = "openai_compatible_backoff";
@@ -321,6 +367,7 @@ impl PersistedKeyHealth {
             .map(|until| until.saturating_duration_since(now).as_secs_f64());
         Self {
             consecutive_failures: health.consecutive_failures,
+            transport_failures: health.transport_failures,
             backoff_remaining_secs,
             backoff_total_secs: health.backoff_total.map(|total| total.as_secs_f64()),
             enabled: health.enabled,
@@ -344,6 +391,7 @@ impl PersistedKeyHealth {
             .map(Duration::from_secs_f64);
         KeyHealth {
             consecutive_failures: self.consecutive_failures,
+            transport_failures: self.transport_failures,
             backoff_until,
             backoff_total,
             enabled: self.enabled,
@@ -477,7 +525,29 @@ pub async fn reload_persisted_health(fs: &Arc<dyn Fs>, path: &PathBuf) -> KeyHea
                     path.display()
                 );
             }
-            file.to_tracker(Instant::now())
+            let mut tracker = file.to_tracker(Instant::now());
+            // v3→v4: pre-v4 counters conflated verdict-less transport failures
+            // with upstream quota verdicts, so any backoff they describe is
+            // unattributable — files in the wild carry counts in the hundreds
+            // pinned at the 1h cap purely from connect failures. Carrying them
+            // forward would keep keys parked for up to an hour after upgrade
+            // for reasons the new classifier would never have produced. Drop
+            // the counters and the windows; `enabled` is a user decision and
+            // survives.
+            if file.schema_version < 4 {
+                log::info!(
+                    "clearing pre-v4 key backoff at {} — counters predate the transport/upstream split",
+                    path.display()
+                );
+                for slot in ALL_KEY_SLOTS {
+                    let health = tracker.get_mut(slot);
+                    health.consecutive_failures = 0;
+                    health.transport_failures = 0;
+                    health.backoff_until = None;
+                    health.backoff_total = None;
+                }
+            }
+            tracker
         }
         Err(err) => {
             log::warn!(
@@ -558,25 +628,68 @@ pub const BACKOFF_MAX: Duration = Duration::from_secs(60 * 60);
 /// Base unit for the exponential schedule.
 pub const BACKOFF_BASE: Duration = Duration::from_secs(30);
 
-/// Computes an exponential backoff with jitter. The 1-hour cap is the
-/// dominant constraint regardless of how large `failures` gets.
+/// Jitter multiplier applied to every computed backoff. The upper bound is
+/// what forces `BACKOFF_CEILING` below to sit under `BACKOFF_MAX`.
+const JITTER_RANGE: std::ops::Range<f64> = 0.5..1.5;
+
+/// Pre-jitter ceiling, set so `ceiling * max_jitter == BACKOFF_MAX`. Clamping
+/// *after* jitter (the previous behavior) silently erased the jitter for every
+/// factor >= 1.0 — at the cap, half of all draws collapsed to exactly
+/// `BACKOFF_MAX`, so saturated keys unblocked in lockstep. That is precisely
+/// the thundering herd the jitter exists to prevent; observed in the wild as
+/// three of four slots persisting `backoff_total_secs: 3600.0` exactly.
+const BACKOFF_CEILING: Duration = Duration::from_secs(2400);
+
+/// Computes an exponential backoff with jitter, bounded by [`BACKOFF_MAX`].
+/// The cap is the dominant constraint regardless of how large `failures` gets.
 ///
-/// Jitter factor is in `[0.5, 1.5)` to avoid the thundering-herd case where
-/// all keys fail at the same instant and would otherwise all unblock together.
+/// Jitter is applied to a pre-clamped ceiling so the spread survives at the
+/// cap: saturated slots land anywhere in `[20m, 60m)` rather than all on the
+/// same instant.
 pub fn compute_backoff(failures: u32) -> Duration {
     if failures == 0 {
         return Duration::ZERO;
     }
     // 2^(failures-1), capped at 14 so the multiplication can't overflow `Duration`
-    // (2^14 * 30s ≈ 138h, already well past the 5h cap, so the clamp is a no-op).
+    // (2^14 * 30s ≈ 138h, already well past the cap, so the clamp is a no-op).
     let exponent = (failures - 1).min(14);
     let multiplier = 2u32.pow(exponent);
     let candidate = BACKOFF_BASE
         .checked_mul(multiplier)
-        .unwrap_or(BACKOFF_MAX)
-        .min(BACKOFF_MAX);
-    let jitter = rand::rng().random_range(0.5..1.5);
+        .unwrap_or(BACKOFF_CEILING)
+        .min(BACKOFF_CEILING);
+    let jitter = rand::rng().random_range(JITTER_RANGE);
     candidate.mul_f64(jitter).min(BACKOFF_MAX)
+}
+
+/// Base unit for the transport schedule. Connect/TLS/DNS failures and
+/// mid-stream drops are typically over in seconds, so the first retry should
+/// be nearly immediate.
+pub const TRANSPORT_BACKOFF_BASE: Duration = Duration::from_secs(5);
+
+/// Hard cap on the transport schedule. Deliberately two orders of magnitude
+/// below [`BACKOFF_MAX`]: a request that never got an answer says nothing
+/// about the key's quota, so the worst case must be "retry in a minute", not
+/// "this key is gone for an hour".
+pub const TRANSPORT_BACKOFF_MAX: Duration = Duration::from_secs(60);
+
+/// Exponential-with-jitter schedule for failures that carry no upstream
+/// verdict. Same shape as [`compute_backoff`], different constants — and the
+/// same post-clamp discipline, so the ceiling is derived from the max jitter
+/// factor rather than clamping the jitter away.
+pub fn compute_transport_backoff(failures: u32) -> Duration {
+    if failures == 0 {
+        return Duration::ZERO;
+    }
+    let exponent = (failures - 1).min(14);
+    let multiplier = 2u32.pow(exponent);
+    let ceiling = TRANSPORT_BACKOFF_MAX.div_f64(JITTER_RANGE.end);
+    let candidate = TRANSPORT_BACKOFF_BASE
+        .checked_mul(multiplier)
+        .unwrap_or(ceiling)
+        .min(ceiling);
+    let jitter = rand::rng().random_range(JITTER_RANGE);
+    candidate.mul_f64(jitter).min(TRANSPORT_BACKOFF_MAX)
 }
 
 /// Formats a remaining backoff duration for the ConfigurationView badge.
@@ -613,26 +726,53 @@ pub fn is_rate_limit(err: &LanguageModelCompletionError) -> bool {
     matches!(err, LanguageModelCompletionError::RateLimitExceeded { .. })
 }
 
-/// Returns true for errors that suggest the *key* or *upstream* is the problem
-/// (and so rotating to a different key may help), false for errors that will
-/// recur on every key (so poisoning the slot would just shrink the pool
-/// without benefit).
+/// How a failed attempt should be attributed to the key that produced it.
 ///
-/// This is intentionally permissive: the user reported upstream error labels
-/// are unreliable, so when in doubt we back off rather than burn requests.
-pub fn is_backoff_worthy(err: &LanguageModelCompletionError) -> bool {
+/// The distinction that matters is **whether the upstream answered at all**.
+/// A backoff is a claim about a key's availability, and the only evidence for
+/// that claim is an upstream response. Folding "the socket failed" into the
+/// same bucket as "the upstream said 429" manufactures a verdict nobody
+/// issued — and because the exponential schedule compounds, a handful of
+/// local network blips is enough to park every key at the 1-hour cap while
+/// the provider dashboard shows the quota barely touched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ErrorVerdict {
+    /// The upstream answered and its answer indicts this key (quota, auth,
+    /// billing) or its own servers. Poison the slot on the quota-scale
+    /// exponential schedule and rotate to a sibling.
+    KeyFault,
+    /// No usable answer from the upstream: connect/TLS/DNS failure, the
+    /// connection dropped mid-stream, or the body could not be read. The
+    /// key's standing is unknown. Rotate once (slots may point at different
+    /// hosts) but only on the short transport schedule.
+    Transport,
+    /// The request itself is the problem — too large, malformed, wrong
+    /// endpoint. Every key would answer identically, so neither poisoning
+    /// nor rotating helps.
+    Benign,
+}
+
+/// Classifies a completion error by what the upstream actually told us.
+///
+/// Note where `Other(_)` lands: it is an unclassified `anyhow` error with no
+/// HTTP status behind it, so it carries no verdict and gets the short
+/// transport schedule rather than the hour-scale one. The old code called it
+/// backoff-worthy on the reasoning that upstream error labels are unreliable
+/// — but "unreliable label" is an argument for a *short* penalty, not for
+/// treating an unlabeled failure as a confirmed quota exhaustion.
+pub fn classify_error(err: &LanguageModelCompletionError) -> ErrorVerdict {
     match err {
         LanguageModelCompletionError::RateLimitExceeded { .. }
         | LanguageModelCompletionError::ServerOverloaded { .. }
         | LanguageModelCompletionError::ApiInternalServerError { .. }
         | LanguageModelCompletionError::UpstreamProviderError { .. }
-        | LanguageModelCompletionError::StreamEndedUnexpectedly { .. }
-        | LanguageModelCompletionError::ApiReadResponseError { .. }
-        | LanguageModelCompletionError::HttpSend { .. }
         | LanguageModelCompletionError::AuthenticationError { .. }
         | LanguageModelCompletionError::PermissionError { .. }
-        | LanguageModelCompletionError::PaymentRequired
-        | LanguageModelCompletionError::Other(_) => true,
+        | LanguageModelCompletionError::PaymentRequired => ErrorVerdict::KeyFault,
+        LanguageModelCompletionError::HttpSend { .. }
+        | LanguageModelCompletionError::StreamEndedUnexpectedly { .. }
+        | LanguageModelCompletionError::ApiReadResponseError { .. }
+        | LanguageModelCompletionError::Other(_) => ErrorVerdict::Transport,
         LanguageModelCompletionError::PromptTooLarge { .. }
         | LanguageModelCompletionError::NoApiKey { .. }
         | LanguageModelCompletionError::BadRequestFormat { .. }
@@ -642,7 +782,7 @@ pub fn is_backoff_worthy(err: &LanguageModelCompletionError) -> bool {
         | LanguageModelCompletionError::SerializeRequest { .. }
         | LanguageModelCompletionError::BuildRequestBody { .. }
         | LanguageModelCompletionError::DeserializeResponse { .. }
-        | LanguageModelCompletionError::DataRetentionConsentRequired { .. } => false,
+        | LanguageModelCompletionError::DataRetentionConsentRequired { .. } => ErrorVerdict::Benign,
     }
 }
 
@@ -777,9 +917,10 @@ pub fn record_key_success(key_health: &Arc<ParkingMutex<KeyHealthTracker>>, slot
     health.record_success(slot);
 }
 
-/// Updates per-key health after a failed request. Only backoff-worthy errors
-/// (see `is_backoff_worthy`) bump the failure counter and reschedule backoff;
-/// other errors are no-ops because they would recur on every key.
+/// Updates per-key health after a failed request, routing by
+/// [`classify_error`]: upstream verdicts take the quota-scale schedule,
+/// verdict-less transport failures take the short one, and benign errors are
+/// no-ops because they would recur on every key.
 ///
 /// For `RateLimitExceeded` the upstream's retry hint (when present) replaces
 /// the exponential schedule via `record_rate_limit` — the server-provided
@@ -789,14 +930,16 @@ pub fn record_key_failure(
     slot: KeySlot,
     err: &LanguageModelCompletionError,
 ) {
-    if !is_backoff_worthy(err) {
+    let verdict = classify_error(err);
+    if verdict == ErrorVerdict::Benign {
         return;
     }
     let mut health = key_health.lock();
-    match err {
-        LanguageModelCompletionError::RateLimitExceeded { retry_after, .. } => {
+    match (verdict, err) {
+        (_, LanguageModelCompletionError::RateLimitExceeded { retry_after, .. }) => {
             health.record_rate_limit(slot, Instant::now(), *retry_after);
         }
+        (ErrorVerdict::Transport, _) => health.record_transport_failure(slot, Instant::now()),
         _ => health.record_failure(slot, Instant::now()),
     }
 }
@@ -813,13 +956,20 @@ pub fn snapshot_health(key_health: &Arc<ParkingMutex<KeyHealthTracker>>) -> KeyH
 /// Drives intra-request key rotation. Tries up to `candidates.len()` keys,
 /// each selected at the moment of the attempt (so a slot that just got backed
 /// off is skipped on the next pick). On the first success the resulting stream
-/// is returned and the slot's health is cleared. On a backoff-worthy failure
-/// the slot is poisoned and the next candidate is tried — *except* for
-/// `RateLimitExceeded`, which exits the loop immediately after poisoning the
-/// slot (see `is_rate_limit`: rate limits are commonly account-wide, so
-/// rotating would burn healthy siblings for no benefit). On any other
-/// (non-backoff-worthy) error the loop exits immediately — the error would
-/// recur on every key.
+/// is returned and the slot's health is cleared. Failures are routed by
+/// [`classify_error`]:
+///
+/// * [`ErrorVerdict::KeyFault`] — poison the slot on the quota schedule and
+///   try the next candidate, *except* for `RateLimitExceeded`, which exits
+///   the loop immediately after poisoning the slot (see `is_rate_limit`: rate
+///   limits are commonly account-wide, so rotating would burn healthy
+///   siblings for no benefit).
+/// * [`ErrorVerdict::Transport`] — mark the slot on the short transport
+///   schedule and try the next candidate. Slots can point at different hosts,
+///   so rotating is worth one attempt, but the mark must stay cheap: no
+///   upstream judged this key, so it cannot be treated as quota exhaustion.
+/// * [`ErrorVerdict::Benign`] — exit immediately without touching health; the
+///   error would recur on every key.
 ///
 /// `do_attempt` receives the chosen key and must return a `'static` future;
 /// callers are expected to clone the request template inside the closure
@@ -828,7 +978,7 @@ pub fn snapshot_health(key_health: &Arc<ParkingMutex<KeyHealthTracker>>) -> KeyH
 /// `LanguageModelCompletionError`.
 ///
 /// Bounds the worst-case latency to one full key rotation per user request
-/// (fewer on rate-limit or non-backoff-worthy errors), which is acceptable
+/// (fewer on rate-limit or benign errors), which is acceptable
 /// because the alternative (returning the error immediately) is strictly
 /// worse for the user's stated reliability goal.
 pub async fn retry_stream<S>(
@@ -842,7 +992,7 @@ pub async fn retry_stream<S>(
     let mut last_error: Option<LanguageModelCompletionError> = None;
 
     // Upper bound: try each configured key at most once. After that, even if
-    // every failure was backoff-worthy, we've exhausted the pool.
+    // every failure marked its slot, we've exhausted the pool.
     let max_attempts = remaining.len();
     for _ in 0..max_attempts {
         // Selection mutates ephemeral state (rotation cursor, per-thread
@@ -862,11 +1012,11 @@ pub async fn retry_stream<S>(
                 return Ok(stream);
             }
             Err(err) => {
-                let worthy = is_backoff_worthy(&err);
+                let verdict = classify_error(&err);
                 // Always record so health reflects reality; record_key_failure
-                // is a no-op for non-backoff-worthy errors.
+                // is a no-op for benign errors.
                 record_key_failure(key_health, slot, &err);
-                if !worthy {
+                if verdict == ErrorVerdict::Benign {
                     // Would fail on every key; don't waste the user's time.
                     return Err(err);
                 }
@@ -1053,71 +1203,33 @@ mod tests {
         assert_eq!(format_backoff_remaining(Duration::ZERO), "0s");
     }
 
+    /// Benign errors describe the *request*, not the key: every slot would
+    /// answer identically, so neither poisoning nor rotating helps. The
+    /// KeyFault/Transport halves of the taxonomy are covered by
+    /// `transport_errors_classify_as_transport_not_key_fault`.
     #[test]
-    fn is_backoff_worthy_classification() {
+    fn benign_errors_never_mark_the_slot() {
         let provider = provider_name();
-
-        // Backoff-worthy (transient / per-key).
-        assert!(is_backoff_worthy(
-            &LanguageModelCompletionError::RateLimitExceeded {
+        for err in [
+            LanguageModelCompletionError::NoApiKey {
                 provider: provider.clone(),
-                retry_after: None,
-            }
-        ));
-        assert!(is_backoff_worthy(
-            &LanguageModelCompletionError::ServerOverloaded {
-                provider: provider.clone(),
-                retry_after: None,
-            }
-        ));
-        assert!(is_backoff_worthy(
-            &LanguageModelCompletionError::ApiInternalServerError {
-                provider: provider.clone(),
-                message: "boom".into(),
-            }
-        ));
-        assert!(is_backoff_worthy(
-            &LanguageModelCompletionError::AuthenticationError {
-                provider: provider.clone(),
-                message: "bad key".into(),
-            }
-        ));
-        assert!(is_backoff_worthy(
-            &LanguageModelCompletionError::StreamEndedUnexpectedly {
-                provider: provider.clone(),
-            }
-        ));
-        assert!(is_backoff_worthy(&LanguageModelCompletionError::Other(
-            anyhow::anyhow!("unknown")
-        )));
-
-        // NOT backoff-worthy (would recur on every key).
-        assert!(!is_backoff_worthy(
-            &LanguageModelCompletionError::NoApiKey {
-                provider: provider.clone(),
-            }
-        ));
-        assert!(!is_backoff_worthy(
-            &LanguageModelCompletionError::PromptTooLarge { tokens: None }
-        ));
-        assert!(!is_backoff_worthy(
-            &LanguageModelCompletionError::BadRequestFormat {
+            },
+            LanguageModelCompletionError::PromptTooLarge { tokens: None },
+            LanguageModelCompletionError::BadRequestFormat {
                 provider: provider.clone(),
                 message: "bad".into(),
-            }
-        ));
-        assert!(!is_backoff_worthy(
-            &LanguageModelCompletionError::ApiEndpointNotFound {
+            },
+            LanguageModelCompletionError::ApiEndpointNotFound {
                 provider: provider.clone(),
-            }
-        ));
-        assert!(!is_backoff_worthy(
-            &LanguageModelCompletionError::HttpResponseError {
+            },
+            LanguageModelCompletionError::HttpResponseError {
                 provider,
                 status_code: StatusCode::NOT_IMPLEMENTED,
                 message: "bad".into(),
-            }
-        ));
+            },
+        ] {
+            assert_eq!(classify_error(&err), ErrorVerdict::Benign, "{err}");
+        }
     }
 
     #[test]
@@ -1927,7 +2039,7 @@ mod tests {
         let json = serde_json::to_value(&persisted).unwrap();
         let obj = json.as_object().unwrap();
         assert_eq!(obj.len(), 6, "expected schema_version + saved_at + 4 slots");
-        assert_eq!(obj.get("schema_version").and_then(|v| v.as_u64()), Some(3));
+        assert_eq!(obj.get("schema_version").and_then(|v| v.as_u64()), Some(4));
         // saved_at_unix_secs is a positive integer (wall-clock).
         assert!(
             obj.get("saved_at_unix_secs")
@@ -1940,6 +2052,12 @@ mod tests {
         assert_eq!(
             primary.get("consecutive_failures").and_then(|v| v.as_u64()),
             Some(2)
+        );
+        // v4 split: the transport counter is a distinct field so a reader can
+        // tell an upstream verdict from a connect failure after a restart.
+        assert_eq!(
+            primary.get("transport_failures").and_then(|v| v.as_u64()),
+            Some(0)
         );
         // 120.5s remaining, encoded as a float (not null).
         assert!(primary.get("backoff_remaining_secs").unwrap().is_f64());
@@ -2176,14 +2294,15 @@ mod tests {
 
         let loaded = reload_persisted_health(&fs, &path).await;
 
-        // v1 state must survive the migration.
+        // The v1 file parsed: all four slots exist. Failure counters are NOT
+        // asserted here — the v<4 migration deliberately drops them, because
+        // pre-v4 counters conflate transport failures with upstream verdicts
+        // (see `v3_migration_drops_unattributable_backoff_but_keeps_enabled`).
+        // The parse contract is probed by the companion test below.
+        assert_eq!(loaded.primary.consecutive_failures, 0);
         assert_eq!(
-            loaded.primary.consecutive_failures, 3,
-            "primary failures must be preserved across v1→v2 migration"
-        );
-        assert!(
-            loaded.primary.backoff_until.is_some(),
-            "primary backoff must be preserved (was 14454.5s in v1 file)"
+            loaded.primary.backoff_until, None,
+            "the v<4 migration must not carry an unattributable backoff forward"
         );
         assert_eq!(loaded.secondary.consecutive_failures, 0);
         assert_eq!(loaded.tertiary.consecutive_failures, 0);
@@ -2210,15 +2329,19 @@ mod tests {
         // primary's failures along with everything else).
         let fs: Arc<dyn Fs> = fs::FakeFs::new(cx.background_executor.clone());
         let path = PathBuf::from("/v1/contract.json");
-        let v1_json = r#"{"schema_version":1,"saved_at_unix_secs":1700000000,"primary":{"consecutive_failures":7,"backoff_remaining_secs":60.0},"secondary":{"consecutive_failures":0,"backoff_remaining_secs":null},"tertiary":{"consecutive_failures":0,"backoff_remaining_secs":null}}"#;
+        // `enabled: false` on secondary is the probe: it is the one field the
+        // v<4 migration preserves, so it distinguishes "parsed and migrated"
+        // from "fell through to `KeyHealthTracker::default()`". The failure
+        // counters can no longer serve as the probe — the migration zeroes
+        // them on purpose.
+        let v1_json = r#"{"schema_version":1,"saved_at_unix_secs":1700000000,"primary":{"consecutive_failures":7,"backoff_remaining_secs":60.0},"secondary":{"consecutive_failures":0,"backoff_remaining_secs":null,"enabled":false},"tertiary":{"consecutive_failures":0,"backoff_remaining_secs":null}}"#;
         fs.atomic_write(path.clone(), v1_json.to_string())
             .await
             .unwrap();
 
         let loaded = reload_persisted_health(&fs, &path).await;
-        // If the parse-error path fired, we'd get default() with 0 failures everywhere.
-        assert_eq!(
-            loaded.primary.consecutive_failures, 7,
+        assert!(
+            !loaded.secondary.enabled,
             "v1 file must not fall through to parse-error default"
         );
     }
@@ -2314,5 +2437,170 @@ mod tests {
         );
         // consecutive_failures is still preserved (historical record).
         assert_eq!(reloaded.primary.consecutive_failures, 2);
+    }
+
+    #[test]
+    fn transport_errors_classify_as_transport_not_key_fault() {
+        let provider = provider_name();
+        for err in [
+            LanguageModelCompletionError::HttpSend {
+                provider: provider.clone(),
+                error: anyhow::anyhow!("connection reset"),
+            },
+            LanguageModelCompletionError::StreamEndedUnexpectedly {
+                provider: provider.clone(),
+            },
+            LanguageModelCompletionError::ApiReadResponseError {
+                provider: provider.clone(),
+                error: std::io::Error::other("eof"),
+            },
+            LanguageModelCompletionError::Other(anyhow::anyhow!("unknown")),
+        ] {
+            assert_eq!(
+                classify_error(&err),
+                ErrorVerdict::Transport,
+                "{err} should carry no upstream verdict"
+            );
+        }
+
+        for err in [
+            LanguageModelCompletionError::RateLimitExceeded {
+                provider: provider.clone(),
+                retry_after: None,
+            },
+            LanguageModelCompletionError::AuthenticationError {
+                provider: provider.clone(),
+                message: "bad key".into(),
+            },
+            LanguageModelCompletionError::ApiInternalServerError {
+                provider,
+                message: "boom".into(),
+            },
+            LanguageModelCompletionError::PaymentRequired,
+        ] {
+            assert_eq!(classify_error(&err), ErrorVerdict::KeyFault);
+        }
+    }
+
+    /// The reported bug: repeated `error sending HTTP request to GLM API`
+    /// (a connect failure, no response body at all) drove every slot to
+    /// `consecutive_failures` in the tens-to-hundreds and pinned them at the
+    /// 1h cap, while the provider dashboard showed the quota ~half used.
+    #[test]
+    fn transport_errors_do_not_escalate_onto_the_quota_schedule() {
+        let mut tracker = KeyHealthTracker::default();
+        let now = Instant::now();
+        let err = LanguageModelCompletionError::HttpSend {
+            provider: provider_name(),
+            error: anyhow::anyhow!("error sending HTTP request"),
+        };
+
+        for _ in 0..30 {
+            match classify_error(&err) {
+                ErrorVerdict::Transport => tracker.record_transport_failure(KeySlot::Primary, now),
+                verdict => panic!("expected Transport, got {verdict:?}"),
+            }
+        }
+
+        let health = tracker.get(KeySlot::Primary);
+        assert_eq!(
+            health.consecutive_failures, 0,
+            "a verdict-less failure must never count as an upstream quota verdict"
+        );
+        assert_eq!(health.transport_failures, 30);
+        let window = health.backoff_total.expect("slot is backed off");
+        assert!(
+            window <= TRANSPORT_BACKOFF_MAX,
+            "30 connect failures yielded {window:?}, above the transport cap"
+        );
+    }
+
+    #[test]
+    fn success_clears_both_failure_counters() {
+        let mut tracker = KeyHealthTracker::default();
+        let now = Instant::now();
+        tracker.record_failure(KeySlot::Secondary, now);
+        tracker.record_transport_failure(KeySlot::Secondary, now);
+        tracker.record_success(KeySlot::Secondary);
+
+        let health = tracker.get(KeySlot::Secondary);
+        assert_eq!(health.consecutive_failures, 0);
+        assert_eq!(health.transport_failures, 0);
+        assert_eq!(health.backoff_until, None);
+        assert_eq!(health.backoff_total, None);
+    }
+
+    /// Clamping after jitter erased it for every factor >= 1.0, so saturated
+    /// slots all landed on exactly `BACKOFF_MAX` and unblocked together.
+    #[test]
+    fn saturated_backoff_keeps_its_jitter_spread() {
+        let samples: Vec<Duration> = (0..200).map(|_| compute_backoff(30)).collect();
+        for sample in &samples {
+            assert!(*sample <= BACKOFF_MAX, "{sample:?} exceeds the cap");
+        }
+        let at_cap = samples.iter().filter(|s| **s == BACKOFF_MAX).count();
+        assert!(
+            at_cap <= 2,
+            "{at_cap}/200 saturated backoffs collapsed onto the cap exactly"
+        );
+        let min = samples.iter().min().expect("non-empty");
+        let max = samples.iter().max().expect("non-empty");
+        assert!(
+            *max - *min > Duration::from_secs(600),
+            "spread {min:?}..{max:?} is too narrow to de-synchronize slots"
+        );
+    }
+
+    #[test]
+    fn transport_backoff_stays_under_its_cap() {
+        assert_eq!(compute_transport_backoff(0), Duration::ZERO);
+        for failures in [1, 2, 5, 30, 1000, u32::MAX] {
+            for _ in 0..50 {
+                let backoff = compute_transport_backoff(failures);
+                assert!(
+                    backoff <= TRANSPORT_BACKOFF_MAX,
+                    "failures={failures} yielded {backoff:?}"
+                );
+            }
+        }
+    }
+
+    /// Pre-v4 files carry counters built by the old classifier, which folded
+    /// transport failures into the quota schedule. Those windows are
+    /// unattributable, so the migration drops them instead of making the user
+    /// wait out an hour of backoff that the new classifier never would have
+    /// set.
+    #[test]
+    fn v3_migration_drops_unattributable_backoff_but_keeps_enabled() {
+        let file: PersistedKeyHealthFile = serde_json::from_str(
+            r#"{"schema_version":3,"saved_at_unix_secs":0,
+                "primary":{"consecutive_failures":27,"backoff_remaining_secs":3422.0,"backoff_total_secs":3424.0,"enabled":true},
+                "secondary":{"consecutive_failures":205,"backoff_remaining_secs":3597.0,"backoff_total_secs":3600.0,"enabled":false},
+                "tertiary":{"consecutive_failures":0,"backoff_remaining_secs":null},
+                "quaternary":{"consecutive_failures":0,"backoff_remaining_secs":null}}"#,
+        )
+        .expect("v3 file should still deserialize");
+        assert_eq!(file.primary.transport_failures, 0, "defaulted for v3");
+
+        let mut tracker = file.to_tracker(Instant::now());
+        // Mirror the migration branch in `reload_persisted_health`.
+        for slot in ALL_KEY_SLOTS {
+            let health = tracker.get_mut(slot);
+            health.consecutive_failures = 0;
+            health.transport_failures = 0;
+            health.backoff_until = None;
+            health.backoff_total = None;
+        }
+
+        let now = Instant::now();
+        for slot in ALL_KEY_SLOTS {
+            assert!(!tracker.get(slot).is_backed_off(now));
+            assert_eq!(tracker.get(slot).consecutive_failures, 0);
+        }
+        assert!(tracker.get(KeySlot::Primary).enabled);
+        assert!(
+            !tracker.get(KeySlot::Secondary).enabled,
+            "disabling is a user decision and must survive the migration"
+        );
     }
 }

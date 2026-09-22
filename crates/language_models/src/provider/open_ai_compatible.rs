@@ -213,6 +213,7 @@ impl State {
         let mut tracker = self.key_health.lock();
         let health = tracker.get_mut(slot);
         health.consecutive_failures = 0;
+        health.transport_failures = 0;
         health.backoff_until = None;
         health.backoff_total = None;
         drop(tracker);
