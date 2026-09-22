@@ -144,9 +144,8 @@ trip, so it was silently overturning real limits.
   never shorten**. A fresh upstream hint still wins outright in both directions:
   if the quota came back early, the shorter hint applies.
 - Probes record hintless 429s via the local schedule instead of dropping them.
-- New `record_probe_success`: clears locally-guessed windows (the stale-backoff
-  case probing exists for) but will not overturn an unexpired upstream hint. A
-  real completion (`record_success`) still clears everything.
+- New `record_probe_success` (see the correction in round four — the
+  upstream-hint guard it originally carried was wrong and has been removed).
 - Migration discriminator: a pre-v4 window **longer than `BACKOFF_MAX`** can only
   have come from an upstream hint, since the local exponential is clamped to that
   cap. Those survive and are tagged; windows within the cap are dropped.
@@ -205,3 +204,51 @@ land 3-3-3-3 rather than 12-0-0-0.
 "soonest-expiring must win" assertion encoded the behavior being replaced, and
 that property now lives in `fail_open_takes_earliest_reset_when_all_are_attested`
 where it still holds.
+
+
+## Fourth round: correcting an over-reach from round two
+
+Round two gave `record_probe_success` a guard: a 1-token probe could clear a
+locally-guessed window but not an upstream-hinted one, on the theory that a
+minimal request might slip through a quota a full turn would trip. Reviewing the
+selection path afterwards showed that guard was wrong on both counts.
+
+**It was never evidence-backed.** The one probe round in the retained logs is
+the opposite result — K3, genuinely limited, correctly returned `RateLimit`; the
+three healthy keys returned `Ok`. No probe ever falsely reported `Ok`. The
+guard was added on a hypothetical.
+
+**It silently broke a documented invariant.** `parse_body_retry_hint` reads a
+Z.AI timestamp that carries **no timezone marker** and assumes local time. Its
+doc comment states the correctness argument outright:
+
+> A mis-interpretation self-heals: the backoff clears on the first successful
+> request, the settings-page Check probe, or new-thread key probing.
+
+Round two disabled the third of those three. Z.AI is UTC+8 and this machine is
+UTC+7, so a one-hour overestimate is a live possibility — and with the guard in
+place there was no longer anything to correct it.
+
+Two further points settle the direction:
+
+- The limits this endpoint emits (1308 five-hour, 1310 weekly/monthly) are
+  *usage quotas*. While one is active it refuses every request, a 1-token ping
+  included. A probe returning `Ok` is therefore direct evidence from the
+  endpoint that the quota is open — not weaker evidence than a real turn.
+- The cost asymmetry is decisive. Clearing too eagerly costs **one request**,
+  which immediately re-records the correct hint. Clearing too reluctantly
+  strands a working key for **hours**.
+
+`record_probe_success` now clears the slot unconditionally. The provenance flag
+itself stays — it is well-supported where it was actually derived from evidence
+(`apply_local_backoff`'s never-shorten rule, from the observed 28905s → 3600s
+clobber) and in fail-open ranking.
+
+### Open question, deliberately not guessed
+
+Whether Z.AI stamps that reset timestamp in UTC+8, UTC, or the account's
+timezone is **unresolved** — the raw 429 bodies are not in the retained logs, so
+there is no evidence here to settle it. Left as-is rather than guessed at: the
+parse is self-healing again, so a wrong timezone costs one probe cycle rather
+than a stranded key. Worth confirming against a captured 429 body the next time
+one appears, and worth an explicit timezone if Z.AI ever documents one.

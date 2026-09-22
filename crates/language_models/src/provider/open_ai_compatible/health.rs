@@ -213,20 +213,33 @@ impl KeyHealthTracker {
     }
 
     /// Success of a **probe** — the 1-token liveness ping fired by
-    /// `reset_key_session` and the settings-page Check button. Weaker evidence
-    /// than a real completion: a minimal request can sail through a quota that
-    /// a full-size one would trip, so a probe must not overturn an upstream
-    /// reset hint that has not yet elapsed. It does clear locally-guessed
-    /// windows, which is the stale-backoff case the probing exists for.
+    /// `reset_key_session` and the settings-page Check button. Clears the slot
+    /// exactly like a real completion, including an upstream-hinted window
+    /// that has not yet elapsed.
+    ///
+    /// That last part is deliberate, and it is the opposite of what "a probe is
+    /// weaker evidence than a real turn" suggests. Two things decide it:
+    ///
+    /// * The limits this provider actually emits — Z.AI's 1308 (5-hour) and
+    ///   1310 (weekly/monthly) — are *usage quotas*: while one is active it
+    ///   refuses every request, a 1-token ping included. So a probe that comes
+    ///   back `Ok` is direct evidence from the endpoint that the quota is open.
+    /// * `parse_body_retry_hint` reads a timestamp that carries **no timezone
+    ///   marker** and assumes local time. This provider is UTC+8 and this
+    ///   machine is not, so an hours-long overestimate is a live possibility.
+    ///   That parser's correctness argument explicitly rests on probing being
+    ///   able to clear the window again.
+    ///
+    /// The cost asymmetry settles it: clearing too eagerly costs one request,
+    /// which re-records the hint correctly. Clearing too reluctantly strands a
+    /// working key for hours.
     ///
     /// Returns whether anything changed, so callers can skip a persist.
     pub fn record_probe_success(&mut self, slot: KeySlot, now: Instant) -> bool {
         let health = self.get_mut(slot);
-        if health.backoff_from_upstream_hint && health.is_backed_off(now) {
-            return false;
-        }
         let was_marked = health.consecutive_failures != 0
             || health.transport_failures != 0
+            || health.is_backed_off(now)
             || health.backoff_until.is_some();
         self.record_success(slot);
         was_marked
@@ -2806,11 +2819,13 @@ mod tests {
         );
     }
 
-    /// A probe is a 1-token ping: it can slip through a quota that a real turn
-    /// would trip, so it must not overturn an upstream reset hint. It still
-    /// clears locally-guessed windows — the stale-backoff case probing is for.
+    /// A probe reaching the endpoint successfully is evidence the quota is
+    /// open — Z.AI's usage limits refuse a 1-token ping just as readily as a
+    /// full turn. It must therefore clear an upstream-hinted window too, which
+    /// is what keeps `parse_body_retry_hint`'s timezone-free timestamp from
+    /// stranding a working key for hours when it reads an hour or more long.
     #[test]
-    fn probe_success_clears_local_guesses_but_not_upstream_hints() {
+    fn probe_success_clears_the_slot_including_upstream_hints() {
         let now = Instant::now();
 
         let mut tracker = KeyHealthTracker::default();
@@ -2820,17 +2835,18 @@ mod tests {
 
         let mut tracker = KeyHealthTracker::default();
         tracker.record_rate_limit(KeySlot::Primary, now, Some(Duration::from_secs(28905)));
+        assert!(tracker.record_probe_success(KeySlot::Primary, now));
+        let health = tracker.get(KeySlot::Primary);
         assert!(
-            !tracker.record_probe_success(KeySlot::Primary, now),
-            "a 1-token ping must not overturn an unexpired upstream reset hint"
+            !health.is_backed_off(now),
+            "a reachable endpoint outranks a hint that may have been mis-parsed"
         );
-        assert!(tracker.get(KeySlot::Primary).is_backed_off(now));
+        assert!(!health.backoff_from_upstream_hint);
+        assert_eq!(health.consecutive_failures, 0);
 
-        // Once the hinted window elapses, the slot is healthy anyway and a
-        // probe success clears the bookkeeping.
-        let after = now + Duration::from_secs(28906);
-        assert!(tracker.record_probe_success(KeySlot::Primary, after));
-        assert_eq!(tracker.get(KeySlot::Primary).consecutive_failures, 0);
+        // A healthy slot reports "nothing changed" so the caller can skip a
+        // disk write on the common case.
+        assert!(!tracker.record_probe_success(KeySlot::Primary, now));
     }
 
     /// A real completion is strong evidence — unlike a probe, it clears an

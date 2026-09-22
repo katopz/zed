@@ -1108,11 +1108,10 @@ impl LanguageModel for OpenAiCompatibleLanguageModel {
                 let result = run_key_probe(http_client.clone(), inputs).await;
                 // Same semantics as the settings-page Check button:
                 //
-                // * `Ok` clears a *locally guessed* backoff — the stale-backoff
-                //   case this probing exists for. It deliberately does NOT
-                //   overturn an upstream reset hint that hasn't elapsed: this
-                //   is a 1-token ping, and a minimal request can slip through a
-                //   quota that a real turn would trip.
+                // * `Ok` clears the slot outright, upstream-hinted windows
+                //   included — see `record_probe_success` for why a reachable
+                //   endpoint outranks a reset hint parsed from a timestamp with
+                //   no timezone marker.
                 // * A rate limit is recorded either way. With a hint the
                 //   backoff is pinned to exactly what the upstream reported;
                 //   without one we still know the key is limited and only the
