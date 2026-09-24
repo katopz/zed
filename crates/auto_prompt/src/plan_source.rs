@@ -390,7 +390,7 @@ async fn git_toplevel(work_dir: &Path) -> Option<PathBuf> {
 pub(crate) const PLAN_DIR_NAMES: &[&str] = &[".plan", ".plans", ".issues"];
 
 fn plan_prefixes(work_dir: &Path, repo_root: &Path) -> Option<Vec<String>> {
-    let rel = work_dir.strip_prefix(repo_root).ok()?;
+    let rel = relative_to_repo_root(work_dir, repo_root)?;
     let rel = rel.to_string_lossy();
     let rel = rel.trim_end_matches('/');
     Some(
@@ -402,6 +402,22 @@ fn plan_prefixes(work_dir: &Path, repo_root: &Path) -> Option<Vec<String>> {
             })
             .collect(),
     )
+}
+
+/// `git rev-parse --show-toplevel` prints the symlink-resolved root (macOS
+/// `/var` → `/private/var`, symlinked checkouts), so a work_dir reached
+/// through a symlink only strips once it is canonicalized too. Without this
+/// the origin scan silently degrades to the worktree fallback.
+fn relative_to_repo_root(work_dir: &Path, repo_root: &Path) -> Option<PathBuf> {
+    if let Ok(rel) = work_dir.strip_prefix(repo_root) {
+        return Some(rel.to_path_buf());
+    }
+    let work_dir = std::fs::canonicalize(work_dir).ok()?;
+    let repo_root = std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    work_dir
+        .strip_prefix(&repo_root)
+        .ok()
+        .map(Path::to_path_buf)
 }
 
 /// Candidate refs that exist as remote-tracking refs, in preference order,
@@ -921,6 +937,31 @@ mod tests {
             by_rel.get(".plans/001_a.md").expect("001").content,
             "develop v2"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_work_dir_maps_onto_resolved_repo_root() {
+        let tmp = TempDir::new().expect("tempdir");
+        let repo_root = tmp.path().join("repo");
+        std::fs::create_dir_all(repo_root.join("sub")).expect("mkdir");
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&repo_root, &link).expect("symlink");
+        let resolved_root = std::fs::canonicalize(&repo_root).expect("canonicalize");
+
+        assert_eq!(
+            relative_to_repo_root(&link.join("sub"), &resolved_root),
+            Some(PathBuf::from("sub"))
+        );
+        assert_eq!(
+            plan_prefixes(&link, &resolved_root),
+            Some(vec![
+                ".plan/".to_string(),
+                ".plans/".to_string(),
+                ".issues/".to_string()
+            ])
+        );
+        assert_eq!(relative_to_repo_root(tmp.path(), &resolved_root), None);
     }
 
     #[test]
