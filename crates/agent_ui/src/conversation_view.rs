@@ -1995,6 +1995,18 @@ impl ConversationView {
                             format!("Agent stopped: {limit_kind} limit reached"),
                             IconName::Warning,
                         ),
+                        // Unreachable API: auto-prompt retries the same thread
+                        // with backoff (`auto_prompt::api_unreachable`).
+                        (None, true)
+                            if error_text
+                                .as_deref()
+                                .is_some_and(auto_prompt::api_unreachable::is_network_error) =>
+                        {
+                            (
+                                "API unreachable — auto-retry scheduled with backoff".to_string(),
+                                IconName::Info,
+                            )
+                        }
                         (None, _) => (
                             "Agent stopped due to an error".to_string(),
                             IconName::Warning,
