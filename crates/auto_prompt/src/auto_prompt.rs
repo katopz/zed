@@ -1018,14 +1018,13 @@ fn decide_precheck(
         .read(cx)
         .work_dirs()
         .and_then(|pl| pl.paths().first().cloned());
-    let iteration_count = get_iteration();
 
     debug_log::write_log(
         "decide_entry",
         serde_json::json!({
             "stop_reason": format!("{stop_reason:?}"),
             "used_tools": used_tools,
-            "iteration": iteration_count,
+            "iteration": AUTO_PROMPT_ITERATION.load(Ordering::Relaxed),
         }),
     );
 
@@ -1100,6 +1099,15 @@ fn decide_precheck(
 
     log::info!("[auto_prompt::decide] Stop reason: {:?}", stop_reason);
 
+    // Before `get_iteration()`: connectivity retries have their own bounded
+    // budget and must not burn the chain's max-iterations runaway budget —
+    // otherwise a short outage ends the chain a few retries in. Also before
+    // any path that would call the dead API.
+    if let Some(decision) = api_unreachable_decision(thread, &config, cx) {
+        return DecidePrecheck::Decision(decision);
+    }
+    let iteration_count = get_iteration();
+
     // Rule-based check: if the last tool call was an interactive auth command
     // (browser login, device auth, etc.), the user is mid-flow — don't chain.
     if is_interactive_tool_pending(thread, cx) {
@@ -1133,12 +1141,6 @@ fn decide_precheck(
             }),
         );
         return DecidePrecheck::Decision(AutoPromptDecision::NoAction);
-    }
-
-    // After the max-iterations guard so a long outage still ends the chain,
-    // but before any path that would call the dead API.
-    if let Some(decision) = api_unreachable_decision(thread, &config, cx) {
-        return DecidePrecheck::Decision(decision);
     }
 
     let registry = language_model::LanguageModelRegistry::read_global(cx);
@@ -1738,6 +1740,23 @@ pub(crate) fn api_unreachable_decision(
         return None;
     };
     let streak = api_unreachable::record_unreachable();
+    if streak > api_unreachable::MAX_UNREACHABLE_STREAK {
+        api_unreachable::reset_unreachable_streak();
+        let session_id_str = thread_ref.session_id().to_string();
+        clear_summary_for_session(&session_id_str);
+        reset_iteration_with_session(&session_id_str);
+        log::warn!(
+            "[auto_prompt] PATH=api_unreachable: still unreachable after {} retries — stopping chain (session={}): {}",
+            api_unreachable::MAX_UNREACHABLE_STREAK,
+            thread_ref.session_id(),
+            truncate_at_char_boundary(&error, 200)
+        );
+        debug_log::write_log(
+            "no_action",
+            serde_json::json!({"reason": "api_unreachable_budget_exhausted"}),
+        );
+        return Some(AutoPromptDecision::NoAction);
+    }
     let delay_ms = config.backoff_delay_ms(streak);
     let session_id = thread_ref.session_id().clone();
     let summary_pending = summary_state_for(&session_id.to_string()) == 1;

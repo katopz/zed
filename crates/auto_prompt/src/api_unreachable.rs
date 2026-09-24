@@ -44,6 +44,11 @@ const NETWORK_MARKERS: [&str; 15] = [
 /// Claude Code prefixes its synthetic failure messages with this.
 const SYNTHETIC_ERROR_PREFIX: &str = "API Error";
 
+/// Consecutive unreachable retries before the chain stops. Retries at the
+/// 60s backoff cap cost nothing while offline (they fail locally), so the
+/// budget rides out ~4 hours of outage while still guaranteeing termination.
+pub const MAX_UNREACHABLE_STREAK: u32 = 240;
+
 static UNREACHABLE_STREAK: AtomicU32 = AtomicU32::new(0);
 
 /// Whether an error text names a connectivity failure.
