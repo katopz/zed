@@ -276,6 +276,17 @@ pub fn decide_claude(
         }
     }
 
+    // Unreachable API (e.g. `API Error: Can't reach the API server … (ENOTFOUND)`):
+    // back off and retry the same thread. Must precede the overflow gate —
+    // its Phase 1 summarize request and the orchestrator need the same dead
+    // API. Like the session-limit path, no model needs to be configured.
+    {
+        let config = crate::load_config_cached().unwrap_or_default();
+        if let Some(decision) = crate::api_unreachable_decision(thread, &config, cx) {
+            return decision;
+        }
+    }
+
     // Need a configured model to reason about the next step.
     let registry = language_model::LanguageModelRegistry::read_global(cx);
     let configured_model = registry.default_model();

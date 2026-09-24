@@ -5,6 +5,7 @@
 //! This crate contains the decision logic only. The caller (agent_ui)
 //! handles the actual GPUI action dispatch.
 
+pub mod api_unreachable;
 pub mod claude_agent;
 mod config;
 pub mod context;
@@ -1134,6 +1135,12 @@ fn decide_precheck(
         return DecidePrecheck::Decision(AutoPromptDecision::NoAction);
     }
 
+    // After the max-iterations guard so a long outage still ends the chain,
+    // but before any path that would call the dead API.
+    if let Some(decision) = api_unreachable_decision(thread, &config, cx) {
+        return DecidePrecheck::Decision(decision);
+    }
+
     let registry = language_model::LanguageModelRegistry::read_global(cx);
     let Some(configured_model) = registry.default_model() else {
         log::warn!("[auto_prompt::decide] No language model configured in Zed");
@@ -1708,6 +1715,72 @@ pub fn truncate_at_char_boundary(text: &str, max_chars: usize) -> String {
     text.chars().take(max_chars).collect()
 }
 
+/// Phase 1 request sent to the SAME thread — no `## 1/## 2/## 3` headers
+/// since the AI already has full conversation context. Raw instruction only.
+const CONTEXT_OVERFLOW_SUMMARY_PROMPT: &str = "Stop what you are doing and provide a concise summary of your progress. Include: (1) what was the original task, (2) what was accomplished, (3) what remains to be done, (4) the current state of any active plans (reference by filename). Be thorough — this summary will be used to continue in a fresh context.";
+
+/// Same-thread retry after backoff when the worker's turn ended because the
+/// provider API was unreachable. Shared by the native and Claude decision
+/// paths and checked before context overflow: the Phase 1 summarize request,
+/// the orchestrator call, and the rules-based summary handoff all need the
+/// same dead API, and none has fresh information to act on.
+///
+/// A pending Phase 1 (`summary_state == 1`) re-sends the summarize request,
+/// so Phase 2 never forks with the error text as the "summary".
+pub(crate) fn api_unreachable_decision(
+    thread: &gpui::Entity<acp_thread::AcpThread>,
+    config: &AutoPromptConfig,
+    cx: &gpui::App,
+) -> Option<AutoPromptDecision> {
+    let thread_ref = thread.read(cx);
+    let Some(error) = api_unreachable::unreachable_error_from_thread(thread_ref, cx) else {
+        api_unreachable::reset_unreachable_streak();
+        return None;
+    };
+    let streak = api_unreachable::record_unreachable();
+    let delay_ms = config.backoff_delay_ms(streak);
+    let session_id = thread_ref.session_id().clone();
+    let summary_pending = summary_state_for(&session_id.to_string()) == 1;
+    log::warn!(
+        "[auto_prompt] PATH=api_unreachable: streak={streak}, summary_pending={summary_pending} — retrying same thread in {delay_ms}ms (session={session_id}): {}",
+        truncate_at_char_boundary(&error, 200)
+    );
+    debug_log::write_log(
+        "api_unreachable_backoff",
+        serde_json::json!({
+            "streak": streak,
+            "delay_ms": delay_ms,
+            "summary_pending": summary_pending,
+            "error": debug_log::truncate(&error, 500),
+        }),
+    );
+    let next_prompt = if summary_pending {
+        CONTEXT_OVERFLOW_SUMMARY_PROMPT.to_string()
+    } else {
+        "The provider API was unreachable (network/DNS) and the connection has been retried. Continue from where you left off.".to_string()
+    };
+    let last_assistant_message = thread_ref
+        .last_assistant_message_text(cx)
+        .filter(|message| !api_unreachable::is_unreachable_message(message));
+    Some(AutoPromptDecision::DispatchAfterDelay {
+        action: AutoPromptAction {
+            from_session_id: session_id,
+            from_title: thread_ref.title().map(|title| title.to_string()),
+            next_prompt,
+            work_dirs: thread_ref.work_dirs().map(|list| list.paths().to_vec()),
+            original_user_message: None,
+            profile_id: None,
+            actual_input_tokens: thread_ref.token_usage().map(|usage| usage.input_tokens),
+            approximate_token_count: 0,
+            last_assistant_message,
+            force_new_thread: false,
+            focus_new_thread: false,
+        },
+        delay_ms,
+        reason: AutoPromptDelayReason::Backoff,
+    })
+}
+
 /// Deterministic Phase 1/2 state machine for context overflow.
 /// Never calls the LLM itself; deterministic state machine only.
 pub(crate) fn context_overflow_outcome(data: &LlmCallData) -> AutoPromptOutcome {
@@ -1738,7 +1811,13 @@ pub(crate) fn context_overflow_outcome(data: &LlmCallData) -> AutoPromptOutcome 
     // `had_error` is also set by a single failed tool call anywhere in
     // the turn — extremely common in normal agentic work and unrelated
     // to API availability.
-    if data.had_api_error {
+    // Also covers Claude Code's synthetic `API Error: … (ENOTFOUND)` message,
+    // which ends the turn normally with `had_api_error` false.
+    let api_unreachable_message = data
+        .last_assistant_message
+        .as_deref()
+        .is_some_and(api_unreachable::is_unreachable_message);
+    if data.had_api_error || api_unreachable_message {
         let config = load_config_cached().unwrap_or_default();
         // failure count is incremented by the caller's retry loop on
         // receipt of this outcome; use the current value to size the
@@ -1787,10 +1866,7 @@ pub(crate) fn context_overflow_outcome(data: &LlmCallData) -> AutoPromptOutcome 
     if summary_state == 0 && !skip_phase_1 {
         // Phase 1: Request summarization. Return ContextOverflow so the
         // UI sends a "summarize" message to the current thread.
-        //
-        // Always goes to the SAME thread — no need for ## 1/## 2/## 3 headers
-        // since the AI already has full conversation context. Raw instruction only.
-        let next_prompt = "Stop what you are doing and provide a concise summary of your progress. Include: (1) what was the original task, (2) what was accomplished, (3) what remains to be done, (4) the current state of any active plans (reference by filename). Be thorough — this summary will be used to continue in a fresh context.".to_string();
+        let next_prompt = CONTEXT_OVERFLOW_SUMMARY_PROMPT.to_string();
         set_summary_state(&session_id_str, 1);
         log::info!(
             "[auto_prompt::context_overflow] Returning ContextOverflow — requesting summary from AI (session={session_id_str})"
@@ -5122,6 +5198,32 @@ mod tests {
         data.context_exceeds_limit = false;
         data.had_api_error = true;
         assert!(summary_continuation_fast_path(&data).is_none());
+    }
+
+    #[test]
+    fn overflow_defers_on_claude_code_unreachable_message() {
+        // Claude Code ends the turn normally with a synthetic message when the
+        // API is unreachable, so `had_api_error` stays false. Phase 1 must not
+        // send a summarize request into the dead connection, and a pending
+        // Phase 1 must not fork with the error text as the "summary".
+        let message =
+            "API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)";
+        for summary_state in [0, 1] {
+            let session = "overflow-api-unreachable-test";
+            clear_summary_for_session(session);
+            set_summary_state(session, summary_state);
+            let mut data = overflow_test_data(session, Some(message));
+            data.context_exceeds_limit = true;
+            assert!(
+                matches!(
+                    context_overflow_outcome(&data),
+                    AutoPromptOutcome::RetryAfterBackoff { .. }
+                ),
+                "summary_state={summary_state} must defer"
+            );
+            assert_eq!(summary_state_for(session), summary_state);
+            clear_summary_for_session(session);
+        }
     }
 
     #[test]
