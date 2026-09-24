@@ -68,3 +68,9 @@ wrong per-file contents when a hotfix lands only on the older-tip branch.
 - Real-repo smoke: in this fork `origin/main` (upstream Zed) carries no
   `.plans/` — hardcoding it would have returned zero plans. Per-file newest
   resolution across `origin/develop` + `origin/main` is the correct semantic.
+- Symlink trap (fixed in 663ea3b80e): `git rev-parse --show-toplevel` prints
+  the symlink-resolved root (macOS `/var` → `/private/var`, symlinked
+  checkouts), so the bare `strip_prefix(work_dir, repo_root)` failed and the
+  origin scan silently fell back to the worktree reader. `relative_to_repo_root`
+  now canonicalizes both sides when the direct strip fails. This is also why
+  4 fixture tests failed only on macOS (TempDir under `/var/folders`).
