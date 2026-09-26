@@ -1,17 +1,15 @@
+use super::retry_on_rate_limit;
 use crate::{AgentTool, Template, Templates, TerminalTool, TerminalToolInput};
 use Role::*;
 use anyhow::{Context as _, Result};
 use client::{Client, RefreshLlmTokenListener, UserStore};
 use futures::{FutureExt as _, StreamExt};
 use gpui::{AppContext as _, AsyncApp, TestAppContext};
-use http_client::StatusCode;
 use language_model::{
-    LanguageModel, LanguageModelCompletionError, LanguageModelCompletionEvent,
-    LanguageModelRegistry, LanguageModelRequest, LanguageModelRequestMessage, MessageContent, Role,
-    SelectedModel,
+    LanguageModel, LanguageModelCompletionEvent, LanguageModelRegistry, LanguageModelRequest,
+    LanguageModelRequestMessage, MessageContent, Role, SelectedModel,
 };
 use prompt_store::{ProjectContext, WorktreeContext};
-use rand::prelude::*;
 use reqwest_client::ReqwestClient;
 use settings::SettingsStore;
 use std::{
@@ -19,7 +17,6 @@ use std::{
     path::Path,
     str::FromStr,
     sync::Arc,
-    time::Duration,
 };
 
 #[derive(Clone)]
@@ -374,64 +371,6 @@ async fn extract_tool_use(
     anyhow::bail!(
         "Stream ended without a terminal tool use{stop_reason_suffix}{parse_errors_suffix}{streamed_text_suffix}"
     )
-}
-
-async fn retry_on_rate_limit<R>(mut request: impl AsyncFnMut() -> Result<R>) -> Result<R> {
-    const MAX_RETRIES: usize = 20;
-    let mut attempt = 0;
-
-    loop {
-        attempt += 1;
-        let response = request().await;
-
-        if attempt >= MAX_RETRIES {
-            return response;
-        }
-
-        let retry_delay = match &response {
-            Ok(_) => None,
-            Err(err) => match err.downcast_ref::<LanguageModelCompletionError>() {
-                Some(err) => match &err {
-                    LanguageModelCompletionError::RateLimitExceeded { retry_after, .. }
-                    | LanguageModelCompletionError::ServerOverloaded { retry_after, .. } => {
-                        Some(retry_after.unwrap_or(Duration::from_secs(5)))
-                    }
-                    LanguageModelCompletionError::UpstreamProviderError {
-                        status,
-                        retry_after,
-                        ..
-                    } => {
-                        let should_retry = matches!(
-                            *status,
-                            StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
-                        ) || status.as_u16() == 529;
-
-                        if should_retry {
-                            Some(retry_after.unwrap_or(Duration::from_secs(5)))
-                        } else {
-                            None
-                        }
-                    }
-                    LanguageModelCompletionError::ApiReadResponseError { .. }
-                    | LanguageModelCompletionError::ApiInternalServerError { .. }
-                    | LanguageModelCompletionError::HttpSend { .. } => {
-                        Some(Duration::from_secs(2_u64.pow((attempt - 1) as u32).min(30)))
-                    }
-                    _ => None,
-                },
-                _ => None,
-            },
-        };
-
-        if let Some(retry_after) = retry_delay {
-            let jitter = retry_after.mul_f64(rand::rng().random_range(0.0..1.0));
-            eprintln!("Attempt #{attempt}: Retry after {retry_after:?} + jitter of {jitter:?}");
-            #[allow(clippy::disallowed_methods)]
-            async_io::Timer::after(retry_after + jitter).await;
-        } else {
-            return response;
-        }
-    }
 }
 
 fn run_eval(eval: EvalInput) -> eval_utils::EvalOutput<()> {
