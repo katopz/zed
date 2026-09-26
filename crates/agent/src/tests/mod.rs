@@ -4687,6 +4687,70 @@ async fn test_send_retry_on_error(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_send_retry_after_capped_on_rate_limit(cx: &mut TestAppContext) {
+    let ThreadTest { thread, model, .. } = setup(cx, TestModel::Fake).await;
+    let fake_model = model.as_fake();
+
+    let mut events = thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Hello!"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    fake_model.send_last_completion_stream_text_chunk("Hey,");
+    fake_model.send_last_completion_stream_error(LanguageModelCompletionError::RateLimitExceeded {
+        provider: LanguageModelProviderName::new("GLM"),
+        retry_after: Some(Duration::from_secs(9428)),
+    });
+    fake_model.end_last_completion_stream();
+
+    // The retry timer must fire at the capped delay, not at the provider's
+    // multi-hour hint: advancing only the cap proves the backoff was clamped.
+    cx.executor().advance_clock(crate::thread::MAX_RETRY_AFTER);
+    cx.run_until_parked();
+
+    fake_model.send_last_completion_stream_text_chunk("there!");
+    fake_model.end_last_completion_stream();
+    cx.run_until_parked();
+
+    let mut retry_events = Vec::new();
+    while let Some(Ok(event)) = events.next().await {
+        match event {
+            ThreadEvent::Retry(retry_status) => {
+                retry_events.push(retry_status);
+            }
+            ThreadEvent::Stop(..) => break,
+            _ => {}
+        }
+    }
+
+    assert_eq!(retry_events.len(), 1);
+    assert_eq!(retry_events[0].attempt, 1);
+    assert_eq!(retry_events[0].duration, crate::thread::MAX_RETRY_AFTER);
+    thread.read_with(cx, |thread, _cx| {
+        assert_eq!(
+            thread.to_markdown(),
+            indoc! {"
+                ## User
+
+                Hello!
+
+                ## Assistant
+
+                Hey,
+
+                [resume]
+
+                ## Assistant
+
+                there!
+            "}
+        )
+    });
+}
+
+#[gpui::test]
 async fn test_send_retry_finishes_tool_calls_on_error(cx: &mut TestAppContext) {
     let ThreadTest { thread, model, .. } = setup(cx, TestModel::Fake).await;
     let fake_model = model.as_fake();
@@ -6237,7 +6301,8 @@ async fn test_subagent_retry_does_not_signal_parent_cancel(cx: &mut TestAppConte
     model.end_last_completion_stream();
 
     // The parent's send should complete successfully (not error out).
-    send.await.expect("parent turn should complete successfully after subagent retry");
+    send.await
+        .expect("parent turn should complete successfully after subagent retry");
 
     // Verify the parent's tool call completed (not canceled)
     acp_thread.read_with(cx, |thread, cx| {

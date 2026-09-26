@@ -173,6 +173,17 @@ pub(crate) const BASE_RETRY_DELAY: Duration = Duration::from_secs(5);
 /// `BASE_RETRY_DELAY` because the provider hang that caused the silent
 /// stream typically outlasts a few seconds.
 const STREAM_IDLE_RETRY_DELAY: Duration = Duration::from_secs(30);
+/// Upper bound on a provider-supplied `retry_after` hint. Some providers
+/// send multi-hour values on transient 429s; honored raw, they pin the turn
+/// in a silent backoff with a stale retry callout for hours.
+pub(crate) const MAX_RETRY_AFTER: Duration = Duration::from_secs(2 * 60);
+
+fn retry_after_delay(retry_after: Option<Duration>) -> Duration {
+    match retry_after {
+        Some(delay) => delay.min(MAX_RETRY_AFTER),
+        None => BASE_RETRY_DELAY,
+    }
+}
 
 /// Payload of the `LanguageModelCompletionError::Other` raised when a stream
 /// goes silent past `agent.stream_idle_timeout_secs`. Typed so the retry
@@ -4695,7 +4706,7 @@ impl Thread {
             }),
             ServerOverloaded { retry_after, .. } | RateLimitExceeded { retry_after, .. } => {
                 Some(RetryStrategy::Fixed {
-                    delay: retry_after.unwrap_or(BASE_RETRY_DELAY),
+                    delay: retry_after_delay(*retry_after),
                     max_attempts: MAX_RETRY_ATTEMPTS,
                 })
             }
@@ -4706,12 +4717,12 @@ impl Thread {
             } => match *status {
                 StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE => {
                     Some(RetryStrategy::Fixed {
-                        delay: retry_after.unwrap_or(BASE_RETRY_DELAY),
+                        delay: retry_after_delay(*retry_after),
                         max_attempts: MAX_RETRY_ATTEMPTS,
                     })
                 }
                 StatusCode::INTERNAL_SERVER_ERROR => Some(RetryStrategy::Fixed {
-                    delay: retry_after.unwrap_or(BASE_RETRY_DELAY),
+                    delay: retry_after_delay(*retry_after),
                     // Internal Server Error could be anything, retry up to 3 times.
                     max_attempts: 3,
                 }),
@@ -4720,12 +4731,12 @@ impl Thread {
                     // but we frequently get them in practice. See https://http.dev/529
                     if status.as_u16() == 529 {
                         Some(RetryStrategy::Fixed {
-                            delay: retry_after.unwrap_or(BASE_RETRY_DELAY),
+                            delay: retry_after_delay(*retry_after),
                             max_attempts: MAX_RETRY_ATTEMPTS,
                         })
                     } else {
                         Some(RetryStrategy::Fixed {
-                            delay: retry_after.unwrap_or(BASE_RETRY_DELAY),
+                            delay: retry_after_delay(*retry_after),
                             max_attempts: 2,
                         })
                     }

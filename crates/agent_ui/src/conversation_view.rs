@@ -6007,6 +6007,101 @@ pub(crate) mod tests {
         });
     }
 
+    fn test_retry_status(duration: Duration) -> acp_thread::RetryStatus {
+        acp_thread::RetryStatus {
+            last_error: "GLM's API rate limit exceeded".into(),
+            attempt: 1,
+            max_attempts: 4,
+            started_at: Instant::now(),
+            duration,
+            meta: None,
+        }
+    }
+
+    #[gpui::test]
+    async fn test_retry_callout_cleared_when_turn_stops(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+
+        message_editor(&conversation_view, cx).update_in(cx, |editor, window, cx| {
+            editor.set_text("Hello", window, cx);
+        });
+        active_thread(&conversation_view, cx).update_in(cx, |view, window, cx| {
+            view.send(window, cx);
+        });
+        cx.run_until_parked();
+
+        let session_id = active_thread(&conversation_view, cx)
+            .read_with(cx, |view, cx| view.thread.read(cx).session_id().clone());
+
+        // A mid-turn provider retry surfaces the callout...
+        active_thread(&conversation_view, cx).update(cx, |view, cx| {
+            view.thread.update(cx, |thread, cx| {
+                thread.update_retry_status(test_retry_status(Duration::from_secs(9428)), cx);
+            });
+        });
+        active_thread(&conversation_view, cx).read_with(cx, |view, _cx| {
+            assert!(
+                view.thread_retry_status.is_some(),
+                "retry callout should be visible while backing off"
+            );
+        });
+
+        // ...and must not outlive the turn it belonged to.
+        connection.end_turn(session_id, acp::StopReason::EndTurn);
+        cx.run_until_parked();
+        active_thread(&conversation_view, cx).read_with(cx, |view, _cx| {
+            assert!(
+                view.thread_retry_status.is_none(),
+                "retry callout must be cleared when the turn stops"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_retry_callout_cleared_by_new_turn(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+
+        // A retry status can outlive its turn (external agents control their
+        // own retry semantics). While the thread is idle nothing clears it —
+        // only starting a new generation should.
+        active_thread(&conversation_view, cx).update(cx, |view, cx| {
+            view.thread.update(cx, |thread, cx| {
+                thread.update_retry_status(test_retry_status(Duration::from_secs(9428)), cx);
+            });
+        });
+        active_thread(&conversation_view, cx).read_with(cx, |view, _cx| {
+            assert!(view.thread_retry_status.is_some());
+        });
+
+        message_editor(&conversation_view, cx).update_in(cx, |editor, window, cx| {
+            editor.set_text("Next message", window, cx);
+        });
+        active_thread(&conversation_view, cx).update_in(cx, |view, window, cx| {
+            view.send(window, cx);
+        });
+        cx.run_until_parked();
+
+        active_thread(&conversation_view, cx).read_with(cx, |view, _cx| {
+            assert!(
+                view.thread_retry_status.is_none(),
+                "starting a new turn must drop a stale retry callout"
+            );
+        });
+
+        let session_id = active_thread(&conversation_view, cx)
+            .read_with(cx, |view, cx| view.thread.read(cx).session_id().clone());
+        connection.end_turn(session_id, acp::StopReason::EndTurn);
+        cx.run_until_parked();
+    }
+
     async fn setup_conversation_view_with_initial_content(
         agent: impl AgentServer + 'static,
         initial_content: AgentInitialContent,
