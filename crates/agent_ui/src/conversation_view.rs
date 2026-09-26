@@ -1822,8 +1822,12 @@ impl ConversationView {
                     let is_generating =
                         matches!(thread.read(cx).status(), ThreadStatus::Generating);
                     active.update(cx, |active, cx| {
+                        // The retry callout belongs to the turn that just
+                        // stopped. A follow-up turn may already be generating
+                        // (running_turn replaced); the stale callout must not
+                        // survive into it.
+                        active.thread_retry_status.take();
                         if !is_generating {
-                            active.thread_retry_status.take();
                             active.clear_auto_expand_tracking(cx);
                             if active.list_state.is_following_tail() {
                                 active.list_state.scroll_to_end();
@@ -1945,11 +1949,9 @@ impl ConversationView {
                     let is_generating =
                         matches!(thread.read(cx).status(), ThreadStatus::Generating);
                     active.update(cx, |active, cx| {
-                        if !is_generating {
-                            active.thread_retry_status.take();
-                            if active.list_state.is_following_tail() {
-                                active.list_state.scroll_to_end();
-                            }
+                        active.thread_retry_status.take();
+                        if !is_generating && active.list_state.is_following_tail() {
+                            active.list_state.scroll_to_end();
                         }
                         active.sync_generating_indicator(cx);
                     });

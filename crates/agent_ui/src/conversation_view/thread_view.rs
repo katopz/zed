@@ -1610,6 +1610,9 @@ impl ThreadView {
     // turns
 
     pub fn start_turn(&mut self, cx: &mut Context<Self>) -> usize {
+        // A new generation supersedes any retry backoff from a previous turn;
+        // without this the warning callout lingers while the new turn runs.
+        self.thread_retry_status = None;
         self.turn_fields.turn_generation += 1;
         let generation = self.turn_fields.turn_generation;
         self.turn_fields.turn_started_at = Some(Instant::now());
@@ -3471,7 +3474,16 @@ impl ThreadView {
                 .icon(IconName::Warning)
                 .severity(Severity::Warning)
                 .title(state.last_error.clone())
-                .description(retry_message),
+                .description(retry_message)
+                .dismiss_action(
+                    IconButton::new("dismiss-retry-status", IconName::Close)
+                        .icon_size(IconSize::Small)
+                        .tooltip(Tooltip::text("Dismiss"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.thread_retry_status = None;
+                            cx.notify();
+                        })),
+                ),
         )
     }
 
