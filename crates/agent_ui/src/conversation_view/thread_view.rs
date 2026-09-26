@@ -6316,13 +6316,10 @@ impl ThreadView {
                                 .and_then(|model| model.key_slot_status(cx));
                             let any_draining = summary
                                 .as_ref()
-                                .is_some_and(|summary| {
-                                    summary.0.iter().any(|s| s.is_backed_off)
-                                });
-                            let any_ringing = summary
-                                .is_some_and(|summary| {
-                                    summary.0.iter().any(|s| key_slot_ring(s).is_some())
-                                });
+                                .is_some_and(|summary| summary.0.iter().any(|s| s.is_backed_off));
+                            let any_ringing = summary.is_some_and(|summary| {
+                                summary.0.iter().any(|s| key_slot_ring(s).is_some())
+                            });
                             if any_ringing {
                                 cx.notify();
                             }
