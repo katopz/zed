@@ -8,6 +8,7 @@ pub mod fake_provider;
 pub use language_model_core::*;
 
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use futures::FutureExt;
 use futures::{StreamExt, future::BoxFuture, stream::BoxStream};
 use gpui::{AnyView, App, AsyncApp, Task, Window};
@@ -82,6 +83,13 @@ pub struct ModelKeySlotStatus {
     /// render a proportional drain ring (remaining / total).
     pub backoff_total: Option<Duration>,
     pub consecutive_failures: u32,
+    /// Wall-clock moment of the last upstream-attested limit hit (the 429 the
+    /// API answered with a reset hint). Drives the footer prediction ring;
+    /// `None` when the key has never been limited with a parseable hint.
+    pub last_limit_hit_at: Option<DateTime<Utc>>,
+    /// The reset-window duration the upstream supplied at that hit. Only
+    /// meaningful alongside `last_limit_hit_at`.
+    pub last_limit_window: Option<Duration>,
 }
 
 impl Default for ModelKeySlotStatus {
@@ -93,7 +101,41 @@ impl Default for ModelKeySlotStatus {
             backoff_remaining: Duration::ZERO,
             backoff_total: None,
             consecutive_failures: 0,
+            last_limit_hit_at: None,
+            last_limit_window: None,
         }
+    }
+}
+
+impl ModelKeySlotStatus {
+    /// The quota cycle implied by the last upstream-attested limit hit:
+    /// `(resets_at, predicted_next_hit_at)`. The API stated the quota reopens
+    /// one window after the hit; a usage pace similar to the one that drained
+    /// it is expected to drain it again one window after the reset.
+    /// Returns `None` without a recorded hit or a parseable window.
+    pub fn limit_prediction(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+        let hit_at = self.last_limit_hit_at?;
+        let window = self.last_limit_window?;
+        if window.is_zero() {
+            return None;
+        }
+        let window = chrono::TimeDelta::milliseconds((window.as_secs_f64() * 1000.0) as i64);
+        let resets_at = hit_at + window;
+        Some((resets_at, resets_at + window))
+    }
+
+    /// Fill fraction (0..1) of the prediction phase — time elapsed since the
+    /// quota reset, relative to the window — or `None` outside the phase:
+    /// before the reset (the backoff drain ring owns that phase) or after the
+    /// predicted next hit passed without an actual one (the record is stale).
+    pub fn prediction_fraction(&self, now: DateTime<Utc>) -> Option<f32> {
+        let (resets_at, next_hit_at) = self.limit_prediction()?;
+        if now < resets_at || now >= next_hit_at {
+            return None;
+        }
+        let fraction = (now - resets_at).num_milliseconds() as f32
+            / (next_hit_at - resets_at).num_milliseconds() as f32;
+        Some(fraction.clamp(0.0, 1.0))
     }
 }
 
@@ -611,5 +653,63 @@ impl LanguageModelCostInfo {
         } else {
             SharedString::from(format!("{:.2}", cost))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn status_with_hit(hit_at: DateTime<Utc>, window: Duration) -> ModelKeySlotStatus {
+        ModelKeySlotStatus {
+            last_limit_hit_at: Some(hit_at),
+            last_limit_window: Some(window),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn limit_prediction_spans_two_windows_from_the_hit() {
+        let hit_at = DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        let (resets_at, next_hit_at) =
+            status_with_hit(hit_at, Duration::from_secs(5 * 3600)).limit_prediction().unwrap();
+        assert_eq!(resets_at, hit_at + chrono::TimeDelta::hours(5));
+        assert_eq!(next_hit_at, hit_at + chrono::TimeDelta::hours(10));
+    }
+
+    #[test]
+    fn prediction_fraction_is_none_before_reset_and_after_predicted_hit() {
+        let hit_at = DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        let status = status_with_hit(hit_at, Duration::from_secs(3600));
+        let resets_at = hit_at + chrono::TimeDelta::hours(1);
+        let next_hit_at = hit_at + chrono::TimeDelta::hours(2);
+        assert_eq!(status.prediction_fraction(resets_at - chrono::TimeDelta::seconds(1)), None);
+        assert_eq!(
+            status.prediction_fraction(next_hit_at + chrono::TimeDelta::seconds(1)),
+            None,
+            "the record is stale once the predicted hit passes without an actual one"
+        );
+    }
+
+    #[test]
+    fn prediction_fraction_advances_across_the_prediction_phase() {
+        let hit_at = DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        let status = status_with_hit(hit_at, Duration::from_secs(3600));
+        let resets_at = hit_at + chrono::TimeDelta::hours(1);
+        assert_eq!(status.prediction_fraction(resets_at), Some(0.0));
+        assert_eq!(
+            status.prediction_fraction(resets_at + chrono::TimeDelta::minutes(30)),
+            Some(0.5)
+        );
+    }
+
+    #[test]
+    fn prediction_needs_a_recorded_hit_and_window() {
+        let empty = ModelKeySlotStatus::default();
+        assert_eq!(empty.limit_prediction(), None);
+        assert_eq!(empty.prediction_fraction(Utc::now()), None);
+        // A zero window (defensive) yields no prediction either.
+        let zero = status_with_hit(Utc::now(), Duration::ZERO);
+        assert_eq!(zero.limit_prediction(), None);
     }
 }

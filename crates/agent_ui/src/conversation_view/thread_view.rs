@@ -76,6 +76,49 @@ fn backoff_ring_fraction(remaining: Duration, total: Option<Duration>) -> f32 {
     }
 }
 
+/// Which cycle phase a K-chip's ring should depict. `Drain` counts down to
+/// the reset the API stated; `Predict` fills toward the estimated next hit.
+#[derive(Clone, Copy, PartialEq)]
+enum KeyRingPhase {
+    Drain,
+    Predict,
+}
+
+/// The ring state for one K-chip, if any should render beside it:
+/// `(fraction, phase)`. Backed-off slots get the drain ring (existing
+/// behavior); healthy, enabled slots with a recorded limit hit get the
+/// prediction ring. Disabled or unconfigured slots render no ring — the chip
+/// itself already communicates those states.
+fn key_slot_ring(status: &language_model::ModelKeySlotStatus) -> Option<(f32, KeyRingPhase)> {
+    if status.is_backed_off {
+        let fraction = backoff_ring_fraction(status.backoff_remaining, status.backoff_total);
+        return (fraction > 0.0).then_some((fraction, KeyRingPhase::Drain));
+    }
+    if !status.has_key || !status.enabled {
+        return None;
+    }
+    status
+        .prediction_fraction(Utc::now())
+        .map(|fraction| (fraction, KeyRingPhase::Predict))
+}
+
+/// Formats a predicted cycle time as a short local clock time, e.g. `23:42`.
+fn format_prediction_time(at: DateTime<Utc>) -> String {
+    at.with_timezone(&Local).format("%H:%M").to_string()
+}
+
+/// The prediction sentence for a slot's tooltip, e.g. "Quota reset at 18:42;
+/// next limit ≈ 23:42 (estimate from the last limit hit)." `None` when the
+/// slot carries no usable limit-hit record.
+fn prediction_tooltip(status: &language_model::ModelKeySlotStatus) -> Option<String> {
+    let (resets_at, next_hit_at) = status.limit_prediction()?;
+    Some(format!(
+        "Quota reset at {}; next limit ≈ {} (estimate from the last limit hit).",
+        format_prediction_time(resets_at),
+        format_prediction_time(next_hit_at),
+    ))
+}
+
 /// Draws the K-chip countdown ring. It appears full when the key rotates out
 /// and empties clockwise from 12 o'clock as the backoff drains; a faint full
 /// track underneath keeps the ring shape readable while draining. The caller
@@ -6233,31 +6276,56 @@ impl ThreadView {
         let summary = model.key_slot_status(cx)?;
 
         // While any slot is backed off, tick once a second so the drain ring
-        // and tooltip countdowns stay live; the task ends itself once no slot
-        // is backed off (the ring disappears at that point per the design).
-        if summary.0.iter().any(|status| status.is_backed_off)
+        // and tooltip countdowns stay live. Once backoffs lift, drop to a
+        // slower tick while any slot shows a prediction ring (its fraction
+        // advances toward the estimated next hit); the task ends itself when
+        // neither signal is active (both rings disappear at that point).
+        if summary
+            .0
+            .iter()
+            .any(|status| key_slot_ring(status).is_some())
             && self.key_backoff_tick_task.is_none()
         {
             self.key_backoff_tick_task = Some(cx.spawn(async move |this, cx| {
+                let mut interval = Duration::from_secs(1);
                 loop {
-                    cx.background_executor().timer(Duration::from_secs(1)).await;
-                    let still_backed_off = this
+                    cx.background_executor().timer(interval).await;
+                    let state = this
                         .update(cx, |this, cx| {
-                            let any_backed_off = this
+                            let summary = this
                                 .as_native_thread(cx)
                                 .and_then(|thread| thread.read(cx).model())
-                                .and_then(|model| model.key_slot_status(cx))
-                                .map(|summary| summary.0.iter().any(|s| s.is_backed_off))
-                                .unwrap_or(false);
-                            if any_backed_off {
+                                .and_then(|model| model.key_slot_status(cx));
+                            let any_draining = summary
+                                .as_ref()
+                                .is_some_and(|summary| {
+                                    summary.0.iter().any(|s| s.is_backed_off)
+                                });
+                            let any_ringing = summary
+                                .is_some_and(|summary| {
+                                    summary.0.iter().any(|s| key_slot_ring(s).is_some())
+                                });
+                            if any_ringing {
                                 cx.notify();
                             }
-                            any_backed_off
+                            (any_draining, any_ringing)
                         })
-                        .unwrap_or(false);
-                    if !still_backed_off {
-                        break;
-                    }
+                        .unwrap_or((false, false));
+                    interval = match state {
+                        (true, _) => Duration::from_secs(1),
+                        (false, true) => Duration::from_secs(15),
+                        _ => {
+                            // Release the spawn slot (checked via `is_none`
+                            // above) so a future ring — say, after a fresh
+                            // limit hit — can restart the ticker. Without
+                            // this the completed Task handle would sit in the
+                            // field forever and block any respawn.
+                            let _ = this.update(cx, |this, _| {
+                                this.key_backoff_tick_task = None;
+                            });
+                            break;
+                        }
+                    };
                 }
             }));
         }
@@ -6265,9 +6333,10 @@ impl ThreadView {
         // Build one chip per slot, in fixed [K1, K2, K3, K4] order. Slots with
         // no configured key render as a muted "empty" placeholder so the user
         // sees that the slot exists but is unconfigured (clicking does nothing).
-        // A backed-off slot additionally gets a drain ring beside the chip:
-        // it renders full when the backoff starts and empties as the countdown
-        // progresses, disappearing once the backoff expires.
+        // A ring is rendered beside the chip whenever a quota cycle is known:
+        // draining while backed off (counting down to the API-stated reset),
+        // then filling again through the prediction phase toward the estimated
+        // next hit — mirroring how the Claude agent's usage rings stay visible.
         let chips: Vec<AnyElement> = summary
             .0
             .iter()
@@ -6276,20 +6345,31 @@ impl ThreadView {
                 let chip = self
                     .render_one_key_status_chip(idx, status, cx)
                     .into_any_element();
-                if !status.is_backed_off {
+                let Some((fraction, phase)) = key_slot_ring(status) else {
                     return chip;
-                }
-                let fraction =
-                    backoff_ring_fraction(status.backoff_remaining, status.backoff_total);
-                if fraction <= 0.0 {
-                    return chip;
-                }
-                let warning = ui::Color::Warning.color(cx);
-                let track = warning.opacity(0.2);
+                };
+                let (fill, track) = match phase {
+                    KeyRingPhase::Drain => {
+                        let warning = ui::Color::Warning.color(cx);
+                        (warning, warning.opacity(0.2))
+                    }
+                    KeyRingPhase::Predict => {
+                        // Accent while the quota cycle is young, warning as it
+                        // approaches the predicted next hit (same 85% threshold
+                        // as the token-usage bar).
+                        let accent = ui::Color::Accent.color(cx);
+                        let fill = if fraction >= 0.85 {
+                            ui::Color::Warning.color(cx)
+                        } else {
+                            accent
+                        };
+                        (fill, accent.opacity(0.2))
+                    }
+                };
                 h_flex()
                     .gap_0p5()
                     .items_center()
-                    .child(render_backoff_ring(fraction, px(10.), warning, track))
+                    .child(render_backoff_ring(fraction, px(10.), fill, track))
                     .child(chip)
                     .into_any_element()
             })
@@ -6337,15 +6417,30 @@ impl ThreadView {
             let total = status
                 .backoff_total
                 .map(language_models::provider::open_ai_compatible::format_backoff_remaining);
-            let tooltip_text = match total {
-                Some(total) => format!(
+            let prediction = prediction_tooltip(status);
+            let tooltip_text = match (total, prediction) {
+                (Some(total), Some(prediction)) => format!(
+                    "K{}: in backoff — {} remaining of {} window, {} failure(s). {}. Click to disable.",
+                    slot_index + 1,
+                    countdown,
+                    total,
+                    status.consecutive_failures,
+                    prediction
+                ),
+                (Some(total), None) => format!(
                     "K{}: in backoff — {} remaining of {} window, {} failure(s). Click to disable.",
                     slot_index + 1,
                     countdown,
                     total,
                     status.consecutive_failures
                 ),
-                None => format!(
+                (None, Some(prediction)) => format!(
+                    "K{}: in backoff ({countdown}), {} failure(s). {}. Click to disable.",
+                    slot_index + 1,
+                    status.consecutive_failures,
+                    prediction
+                ),
+                (None, None) => format!(
                     "K{}: in backoff ({countdown}), {} failure(s). Click to disable.",
                     slot_index + 1,
                     status.consecutive_failures
@@ -6353,14 +6448,17 @@ impl ThreadView {
             };
             (Color::Warning, tooltip_text.into())
         } else {
-            (
-                Color::Accent,
-                format!(
-                    "K{}: healthy (in rotation). Click to disable temporarily.",
-                    slot_index + 1
-                )
-                .into(),
-            )
+            // Healthy: append the next-hit estimate when a cycle is known, so
+            // the user sees why the prediction ring is filling beside the chip.
+            let base = format!(
+                "K{}: healthy (in rotation). Click to disable temporarily.",
+                slot_index + 1
+            );
+            let tooltip_text = match prediction_tooltip(status) {
+                Some(prediction) => format!("{base} {prediction}"),
+                None => base,
+            };
+            (Color::Accent, tooltip_text.into())
         };
 
         let has_key = status.has_key;

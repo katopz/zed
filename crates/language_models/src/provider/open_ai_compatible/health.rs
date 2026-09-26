@@ -12,6 +12,7 @@
 //! only through [`LanguageModelCompletionError`].
 
 use anyhow::{Context as _, Result};
+use chrono::{DateTime, SubsecRound as _, Utc};
 use fs::Fs;
 use futures::future::BoxFuture;
 use gpui::{BackgroundExecutor, Task};
@@ -42,6 +43,22 @@ pub const ALL_KEY_SLOTS: [KeySlot; 4] = [
     KeySlot::Tertiary,
     KeySlot::Quaternary,
 ];
+
+/// Wall-clock record of the most recent upstream-attested limit hit on a key:
+/// the moment the 429 was observed and the reset window the API supplied. The
+/// footer prediction ring derives its estimate from this (see
+/// `ModelKeySlotStatus::limit_prediction` in the `language_model` crate — the
+/// cycle arithmetic lives there, on the provider-agnostic UI projection).
+/// `Instant` can't be used here: the record must survive restarts and be
+/// renderable as a wall-clock time, so it stores UTC directly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LimitHitRecord {
+    /// When the limit hit was observed (UTC).
+    pub hit_at: DateTime<Utc>,
+    /// The reset hint the upstream supplied: the quota reopens at
+    /// `hit_at + window`.
+    pub window: Duration,
+}
 
 /// Per-key backoff state. Persisted across restarts as relative durations
 /// (see `PersistedKeyHealth`); in-memory `Instant`s are reconstructed on load.
@@ -75,6 +92,12 @@ pub struct KeyHealth {
     /// quota resets, and must not be overwritten by a locally-computed guess
     /// or cleared by a 1-token liveness ping.
     pub backoff_from_upstream_hint: bool,
+    /// The most recent upstream-attested limit hit, kept **after** the backoff
+    /// lifts so the UI can predict the next hit. Deliberately survives
+    /// `record_success` — a success proves the quota is open now, but the
+    /// historical drain cycle remains the best estimator of the next one.
+    /// Only `clear_slot_backoff` (user clear / key replacement) wipes it.
+    pub last_limit_hit: Option<LimitHitRecord>,
     pub enabled: bool,
 }
 
@@ -86,6 +109,7 @@ impl Default for KeyHealth {
             backoff_until: None,
             backoff_total: None,
             backoff_from_upstream_hint: false,
+            last_limit_hit: None,
             enabled: true,
         }
     }
@@ -107,6 +131,10 @@ pub struct SlotHealthStatus {
     /// User-controlled on/off toggle. `false` excludes the slot from rotation
     /// even when the key is otherwise healthy.
     pub enabled: bool,
+    /// Last upstream-attested limit hit, for the footer prediction ring.
+    /// Independent of `is_backed_off`: the ring's estimate phase begins once
+    /// the backoff lifts, which is exactly when this is the only signal left.
+    pub last_limit_hit: Option<LimitHitRecord>,
 }
 
 impl KeyHealth {
@@ -229,6 +257,9 @@ impl KeyHealthTracker {
         health.backoff_until = None;
         health.backoff_total = None;
         health.backoff_from_upstream_hint = false;
+        // `last_limit_hit` deliberately survives: it is the historical drain
+        // cycle the prediction ring estimates from, and a success only proves
+        // the quota is open right now. `clear_slot_backoff` is the only wipe.
     }
 
     /// Applies a locally-computed backoff without ever *shortening* the
@@ -305,13 +336,22 @@ impl KeyHealthTracker {
             // so this wins outright — including when it is *shorter* than the
             // current window (the quota may have reset early).
             Some(hint) => {
+                // Wall clock (not `now`, which is monotonic) so the record can
+                // be displayed as a time of day and survive restarts. Truncated
+                // to whole seconds to match the persisted form exactly — the
+                // record round-trips losslessly and `Eq` holds across reloads.
+                health.last_limit_hit = Some(LimitHitRecord {
+                    hit_at: Utc::now().round_subsecs(0),
+                    window: hint,
+                });
                 health.backoff_until = Some(now + hint);
                 health.backoff_total = Some(hint);
                 health.backoff_from_upstream_hint = true;
             }
             // A 429 with no parseable hint still proves the key is limited;
             // only the duration is unknown. Fall back to the local schedule,
-            // which must not shorten an existing window.
+            // which must not shorten an existing window. No prediction record:
+            // without a window there is nothing to estimate the next hit from.
             None => {
                 let backoff = compute_backoff(health.consecutive_failures);
                 Self::apply_local_backoff(health, now, backoff);
@@ -369,6 +409,14 @@ pub struct PersistedKeyHealth {
     pub backoff_from_upstream_hint: bool,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Wall-clock timestamp of the last upstream-attested limit hit.
+    /// `#[serde(default)]` so v4 files (which predate the prediction ring)
+    /// load without one; `skip_serializing_if` keeps healthy slots clean.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_limit_hit_at_unix_secs: Option<i64>,
+    /// The reset-window duration observed at that hit, in seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_limit_window_secs: Option<f64>,
 }
 
 fn default_true() -> bool {
@@ -384,6 +432,8 @@ impl Default for PersistedKeyHealth {
             backoff_total_secs: None,
             backoff_from_upstream_hint: false,
             enabled: true,
+            last_limit_hit_at_unix_secs: None,
+            last_limit_window_secs: None,
         }
     }
 }
@@ -418,7 +468,7 @@ pub struct PersistedKeyHealthFile {
     pub quaternary: PersistedKeyHealth,
 }
 
-pub const PERSISTED_KEY_HEALTH_SCHEMA_VERSION: u32 = 4;
+pub const PERSISTED_KEY_HEALTH_SCHEMA_VERSION: u32 = 5;
 
 /// Subdirectory under `paths::data_dir()` holding one JSON file per provider.
 pub const PERSIST_DIR_NAME: &str = "openai_compatible_backoff";
@@ -440,6 +490,15 @@ impl PersistedKeyHealth {
             backoff_total_secs: health.backoff_total.map(|total| total.as_secs_f64()),
             backoff_from_upstream_hint: health.backoff_from_upstream_hint,
             enabled: health.enabled,
+            // Absolute wall-clock, so it needs no elapsed-time adjustment on
+            // load — unlike the backoff durations, the prediction record is
+            // already pinned to UTC timestamps.
+            last_limit_hit_at_unix_secs: health
+                .last_limit_hit
+                .map(|record| record.hit_at.timestamp()),
+            last_limit_window_secs: health
+                .last_limit_hit
+                .map(|record| record.window.as_secs_f64()),
         }
     }
 
@@ -458,12 +517,22 @@ impl PersistedKeyHealth {
             .backoff_total_secs
             .filter(|secs| *secs > 0.0)
             .map(Duration::from_secs_f64);
+        let last_limit_hit = match (self.last_limit_hit_at_unix_secs, self.last_limit_window_secs) {
+            (Some(hit_at_unix), Some(window_secs)) if window_secs > 0.0 => {
+                DateTime::from_timestamp(hit_at_unix, 0).map(|hit_at| LimitHitRecord {
+                    hit_at,
+                    window: Duration::from_secs_f64(window_secs),
+                })
+            }
+            _ => None,
+        };
         KeyHealth {
             consecutive_failures: self.consecutive_failures,
             transport_failures: self.transport_failures,
             backoff_until,
             backoff_total,
             backoff_from_upstream_hint: self.backoff_from_upstream_hint,
+            last_limit_hit,
             enabled: self.enabled,
         }
     }
@@ -500,7 +569,7 @@ impl PersistedKeyHealthFile {
             .and_then(|now_unix| now_unix.as_secs().checked_sub(self.saved_at_unix_secs))
             .map(|secs| secs as f64)
             .unwrap_or(0.0);
-        KeyHealthTracker {
+        let mut tracker = KeyHealthTracker {
             primary: self.primary.to_health(now, elapsed_secs),
             secondary: self.secondary.to_health(now, elapsed_secs),
             tertiary: self.tertiary.to_health(now, elapsed_secs),
@@ -511,7 +580,39 @@ impl PersistedKeyHealthFile {
             // very first turn after launch.
             last_used_slot: None,
             ..Default::default()
+        };
+        // v4→v5: files from before the prediction ring kept no standalone
+        // last-limit record. An upstream-attested window still in flight at
+        // save time encodes one: the hit happened `(total - remaining)` before
+        // the save. Derived regardless of whether the backoff itself survived
+        // the reload — the prediction's whole point is to outlive the window.
+        if self.schema_version < 5 {
+            for (slot, persisted) in [
+                (KeySlot::Primary, &self.primary),
+                (KeySlot::Secondary, &self.secondary),
+                (KeySlot::Tertiary, &self.tertiary),
+                (KeySlot::Quaternary, &self.quaternary),
+            ] {
+                let (Some(total), Some(remaining)) = (
+                    persisted.backoff_total_secs,
+                    persisted.backoff_remaining_secs,
+                ) else {
+                    continue;
+                };
+                if !persisted.backoff_from_upstream_hint || total <= 0.0 || remaining <= 0.0 {
+                    continue;
+                }
+                let hit_at_unix = self.saved_at_unix_secs as f64 - (total - remaining);
+                let Some(hit_at) = DateTime::from_timestamp(hit_at_unix as i64, 0) else {
+                    continue;
+                };
+                tracker.get_mut(slot).last_limit_hit = Some(LimitHitRecord {
+                    hit_at,
+                    window: Duration::from_secs_f64(total),
+                });
+            }
         }
+        tracker
     }
 }
 
@@ -634,6 +735,10 @@ pub async fn reload_persisted_health(fs: &Arc<dyn Fs>, path: &PathBuf) -> KeyHea
                     health.transport_failures = 0;
                     health.backoff_until = None;
                     health.backoff_total = None;
+                    // The v4→v5 step in `to_tracker` may have derived a
+                    // prediction record from the very window this branch just
+                    // judged unattributable — the record inherits the verdict.
+                    health.last_limit_hit = None;
                 }
             }
             tracker
@@ -1303,6 +1408,55 @@ mod tests {
         let backoff = health.backoff_until.unwrap() - now;
         // Same jittered band as compute_backoff(1): [15s, 45s).
         assert!(backoff >= Duration::from_secs(15) && backoff < Duration::from_secs(45));
+    }
+
+    /// The footer prediction ring estimates the next limit hit from the last
+    /// upstream-attested one: reset one window after the hit, next hit two
+    /// windows after. Only hinted hits carry a window to estimate from.
+    #[test]
+    fn record_rate_limit_records_the_hit_for_prediction() {
+        let mut tracker = KeyHealthTracker::default();
+        let hint = Duration::from_secs(5 * 3600);
+        tracker.record_rate_limit(KeySlot::Primary, Instant::now(), Some(hint));
+
+        let record = tracker
+            .get(KeySlot::Primary)
+            .last_limit_hit
+            .expect("an upstream-attested hit must be recorded");
+        assert_eq!(record.window, hint);
+        // `hit_at` is wall clock (not the monotonic `now` param), so assert
+        // proximity to real time rather than equality. Rounding may place it
+        // up to half a second in the future, hence the absolute skew.
+        let skew_ms = (Utc::now() - record.hit_at).num_milliseconds().unsigned_abs();
+        assert!(skew_ms < 5_000, "hit_at should be ~now, skew {skew_ms}ms");
+    }
+
+    #[test]
+    fn record_rate_limit_without_hint_records_no_prediction() {
+        let mut tracker = KeyHealthTracker::default();
+        tracker.record_rate_limit(KeySlot::Primary, Instant::now(), None);
+        assert_eq!(
+            tracker.get(KeySlot::Primary).last_limit_hit,
+            None,
+            "a hintless 429 has no window to estimate the next hit from"
+        );
+    }
+
+    #[test]
+    fn record_success_preserves_last_limit_hit() {
+        let mut tracker = KeyHealthTracker::default();
+        tracker.record_rate_limit(
+            KeySlot::Primary,
+            Instant::now(),
+            Some(Duration::from_secs(18000)),
+        );
+        tracker.record_success(KeySlot::Primary);
+        let health = tracker.get(KeySlot::Primary);
+        assert_eq!(health.backoff_until, None);
+        assert!(
+            health.last_limit_hit.is_some(),
+            "the historical drain cycle survives a success — it is the prediction basis"
+        );
     }
 
     #[test]
@@ -2172,7 +2326,7 @@ mod tests {
         let json = serde_json::to_value(&persisted).unwrap();
         let obj = json.as_object().unwrap();
         assert_eq!(obj.len(), 6, "expected schema_version + saved_at + 4 slots");
-        assert_eq!(obj.get("schema_version").and_then(|v| v.as_u64()), Some(4));
+        assert_eq!(obj.get("schema_version").and_then(|v| v.as_u64()), Some(5));
         // saved_at_unix_secs is a positive integer (wall-clock).
         assert!(
             obj.get("saved_at_unix_secs")
@@ -2200,6 +2354,11 @@ mod tests {
             Some(true),
             "primary should serialize enabled: true"
         );
+        // v5: the prediction record is omitted entirely for a slot with no
+        // recorded limit hit (`skip_serializing_if`), keeping the file shape
+        // unchanged for healthy slots.
+        assert!(primary.get("last_limit_hit_at_unix_secs").is_none());
+        assert!(primary.get("last_limit_window_secs").is_none());
         let secondary = obj.get("secondary").unwrap().as_object().unwrap();
         assert_eq!(
             secondary
@@ -2273,6 +2432,100 @@ mod tests {
         let json = serde_json::to_string(&original).unwrap();
         let restored: PersistedKeyHealthFile = serde_json::from_str(&json).unwrap();
         assert_eq!(original, restored);
+    }
+
+    /// The prediction record is absolute wall-clock, so a save/load must
+    /// reproduce it exactly — no elapsed-time adjustment like the backoff.
+    #[test]
+    fn persisted_health_round_trip_preserves_last_limit_hit() {
+        let now = Instant::now();
+        let mut tracker = KeyHealthTracker::default();
+        tracker.primary.last_limit_hit = Some(LimitHitRecord {
+            // `record_rate_limit` stores whole seconds (matching the persisted
+            // form), so the test injects the same precision.
+            hit_at: Utc::now().round_subsecs(0),
+            window: Duration::from_secs(18000),
+        });
+        let restored = PersistedKeyHealthFile::from_tracker(&tracker, now).to_tracker(now);
+        assert_eq!(
+            restored.primary.last_limit_hit, tracker.primary.last_limit_hit,
+            "the wall-clock hit record survives save/load unchanged"
+        );
+    }
+
+    /// A v4 file saved while an upstream-attested window was still in flight
+    /// encodes the prediction record implicitly: the hit happened
+    /// `(total - remaining)` before the save. The derivation must fire even
+    /// when the backoff itself has since expired — predicting past the reset
+    /// is the record's whole purpose.
+    #[test]
+    fn v4_file_derives_last_limit_hit_from_upstream_window() {
+        let saved_at = 1_800_000_000i64;
+        let file: PersistedKeyHealthFile = serde_json::from_str(
+            r#"{"schema_version":4,"saved_at_unix_secs":1800000000,
+                "primary":{"consecutive_failures":1,"backoff_remaining_secs":17000.0,"backoff_total_secs":18000.0,"backoff_from_upstream_hint":true,"enabled":true},
+                "secondary":{"consecutive_failures":0,"backoff_remaining_secs":null},
+                "tertiary":{"consecutive_failures":0,"backoff_remaining_secs":null},
+                "quaternary":{"consecutive_failures":0,"backoff_remaining_secs":null}}"#,
+        )
+        .expect("v4 file should deserialize");
+        let tracker = file.to_tracker(Instant::now());
+        let record = tracker
+            .get(KeySlot::Primary)
+            .last_limit_hit
+            .expect("in-flight upstream window should yield a prediction record");
+        assert_eq!(record.hit_at.timestamp(), saved_at - 1000);
+        assert_eq!(record.window, Duration::from_secs(18000));
+    }
+
+    #[test]
+    fn v4_file_local_window_yields_no_prediction() {
+        let file: PersistedKeyHealthFile = serde_json::from_str(
+            r#"{"schema_version":4,"saved_at_unix_secs":1800000000,
+                "primary":{"consecutive_failures":1,"backoff_remaining_secs":40.0,"backoff_total_secs":45.0,"backoff_from_upstream_hint":false,"enabled":true},
+                "secondary":{"consecutive_failures":0,"backoff_remaining_secs":null},
+                "tertiary":{"consecutive_failures":0,"backoff_remaining_secs":null},
+                "quaternary":{"consecutive_failures":0,"backoff_remaining_secs":null}}"#,
+        )
+        .expect("v4 file should deserialize");
+        let tracker = file.to_tracker(Instant::now());
+        assert_eq!(
+            tracker.get(KeySlot::Primary).last_limit_hit,
+            None,
+            "a locally guessed window is not an API-attested limit hit"
+        );
+    }
+
+    /// The v3→v4 migration judges windows ≤ the local cap unattributable and
+    /// clears them; the prediction record the v4→v5 derivation built from that
+    /// same window must be cleared with it.
+    #[test]
+    fn v3_migration_clears_derived_prediction_from_unattributable_window() {
+        let file: PersistedKeyHealthFile = serde_json::from_str(
+            r#"{"schema_version":3,"saved_at_unix_secs":0,
+                "primary":{"consecutive_failures":5,"backoff_remaining_secs":3422.0,"backoff_total_secs":3424.0,"backoff_from_upstream_hint":true,"enabled":true},
+                "secondary":{"consecutive_failures":0,"backoff_remaining_secs":null},
+                "tertiary":{"consecutive_failures":0,"backoff_remaining_secs":null},
+                "quaternary":{"consecutive_failures":0,"backoff_remaining_secs":null}}"#,
+        )
+        .expect("v3 file should deserialize");
+        let mut tracker = file.to_tracker(Instant::now());
+        assert!(
+            tracker.get(KeySlot::Primary).last_limit_hit.is_some(),
+            "precondition: the v4→v5 step derived a record"
+        );
+
+        // Mirror the migration branch in `reload_persisted_health`.
+        for slot in ALL_KEY_SLOTS {
+            let health = tracker.get_mut(slot);
+            health.consecutive_failures = 0;
+            health.transport_failures = 0;
+            health.backoff_until = None;
+            health.backoff_total = None;
+            health.last_limit_hit = None;
+        }
+
+        assert_eq!(tracker.get(KeySlot::Primary).last_limit_hit, None);
     }
 
     #[test]

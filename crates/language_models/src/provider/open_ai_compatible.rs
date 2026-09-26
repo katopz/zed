@@ -216,6 +216,10 @@ impl State {
         health.transport_failures = 0;
         health.backoff_until = None;
         health.backoff_total = None;
+        // Also wipes the prediction record: the user clearing the backoff (or
+        // replacing the key) asserts the recorded quota cycle no longer
+        // applies, so the footer prediction ring has no basis to render from.
+        health.last_limit_hit = None;
         drop(tracker);
         self.schedule_persist_key_health(cx);
     }
@@ -498,6 +502,7 @@ impl State {
             backoff_total: is_backed_off.then(|| health.backoff_total).flatten(),
             consecutive_failures: health.consecutive_failures,
             enabled: health.enabled,
+            last_limit_hit: health.last_limit_hit,
         }
     }
 
@@ -1056,6 +1061,8 @@ impl LanguageModel for OpenAiCompatibleLanguageModel {
                 backoff_remaining: s.backoff_remaining,
                 backoff_total: s.backoff_total,
                 consecutive_failures: s.consecutive_failures,
+                last_limit_hit_at: s.last_limit_hit.map(|record| record.hit_at),
+                last_limit_window: s.last_limit_hit.map(|record| record.window),
             }
         })))
     }
