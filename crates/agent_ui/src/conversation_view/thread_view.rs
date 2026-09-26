@@ -1656,6 +1656,12 @@ impl ThreadView {
         if thread.status() != ThreadStatus::Generating {
             return false;
         }
+        // A retry backoff is a dead stream — nothing else will repaint until
+        // the retry fires, so the timer must tick to animate the callout's
+        // countdown and retire it at expiry.
+        if self.thread_retry_status.is_some() {
+            return false;
+        }
         // No streaming repaints happen while a tool call is running or the
         // thread is blocked on confirmation — the timer is the only thing
         // keeping the elapsed display alive in those states.
