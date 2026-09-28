@@ -80,4 +80,4 @@ retry ever happens and the log is misleading.
   edition drift); only the new/edited code was formatted and two unrelated
   fmt-churn hunks were hand-reverted. Do NOT run `cargo fmt -p auto_prompt`
   with a stable toolchain here — it reformats unrelated files.
-- Fix commit: (hash added in closeout record).
+- Fix commit: 8a327152cf (develop).
