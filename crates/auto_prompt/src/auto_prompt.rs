@@ -556,6 +556,13 @@ pub struct LlmCallData {
     /// Whether the context exceeds `max_context_tokens` — skip the expensive
     /// full-context LLM call and go directly to the lightweight retry path.
     pub context_exceeds_limit: bool,
+    /// True when the turn ended with `StopReason::MaxTokens` AND the model's
+    /// context window is full (input + output ≈ window). A same-thread request
+    /// — including the Phase 1 "stop and summarize" — would be rejected by the
+    /// API because the input alone already fills the window, so the handoff
+    /// summary must be produced by the orchestrator call, then forked into a
+    /// fresh thread (`cutoff_context_full_outcome`).
+    pub cutoff_context_full: bool,
     /// Approximate token count (chars/4) of the auto_prompt context JSON.
     /// Passed through to AutoPromptAction as fallback when actual_input_tokens
     /// is None.
@@ -603,6 +610,7 @@ impl std::fmt::Debug for LlmCallData {
             .field("had_api_error", &self.had_api_error)
             .field("stop_phase", &self.stop_phase)
             .field("context_exceeds_limit", &self.context_exceeds_limit)
+            .field("cutoff_context_full", &self.cutoff_context_full)
             .field("approximate_token_count", &self.approximate_token_count)
             .finish()
     }
@@ -1184,7 +1192,18 @@ fn decide_precheck(
         if usage.is_some() && looks_like_voluntary_summary(&last_assistant_message) {
             let actual_input_tokens = usage;
             let effective_token_count = actual_input_tokens.unwrap_or(0) as usize;
-            let context_exceeds_limit = effective_token_count > config.max_context_tokens;
+            // A MaxTokens stop with a full window must still reach the Phase 1/2
+            // machine: `skip_phase_1` detects the voluntary summary and forks
+            // straight to Phase 2 — no doomed same-thread summarize request.
+            let usage = thread.read(cx).token_usage();
+            let window_full = matches!(stop_reason, acp::StopReason::MaxTokens)
+                && max_tokens_context_window_full(
+                    usage.map(|u| u.input_tokens),
+                    usage.map(|u| u.output_tokens).unwrap_or(0),
+                    model.max_token_count(),
+                );
+            let context_exceeds_limit =
+                effective_token_count > config.max_context_tokens || window_full;
             let session_id = thread.read(cx).session_id().clone();
             let light_data = LlmCallData {
                 model,
@@ -1221,6 +1240,7 @@ fn decide_precheck(
                 had_api_error: thread.read(cx).had_api_error(),
                 stop_phase,
                 context_exceeds_limit,
+                cutoff_context_full: false,
                 approximate_token_count: 0,
                 connection: None,
                 project: None,
@@ -1446,55 +1466,64 @@ fn decide_with_context(
         auto_prompt_ctx.had_error
     );
 
-    // MaxTokens is a hard context limit, not a transient error.
-    // No amount of waiting will help — dispatch new thread immediately.
+    let mut cutoff_context_full = false;
+    // MaxTokens = the response stream was cut off mid-generation. Two very
+    // different sub-cases share this stop reason:
+    //
+    // - Output cap: the window has room — the context is intact and the right
+    //   move is to resume the SAME thread. Forking here (the old behavior)
+    //   threw the whole conversation away: `build_prompt_summary` ignores the
+    //   last message, so the new thread got title + "context limit reached"
+    //   and no summary (2026-09-28 stream-cutoff bug).
+    // - Window full: input + output ≈ the model window. Every same-thread
+    //   request is now rejected by the API (input alone fills the window), so
+    //   neither a resume nor the Phase 1 summarize request can run. Route to
+    //   `cutoff_context_full_outcome`, which produces the handoff summary with
+    //   a bounded orchestrator call and then forks with a real summary.
     if matches!(stop_reason, acp::StopReason::MaxTokens) {
-        log::info!(
-            "auto_prompt: MaxTokens reached (context limit), dispatching new thread immediately"
-        );
-
-        // Preserve slash commands through context overflow so the new thread
-        // re-activates the skill and continues the loop.
-        let max_tokens_continuation = match original_user_message.as_deref() {
-            Some(msg) if msg.trim().starts_with('/') => {
-                let cmd = msg.trim();
+        let usage = thread.read(cx).token_usage();
+        let usage_input = usage.map(|u| u.input_tokens);
+        let usage_output = usage.map(|u| u.output_tokens).unwrap_or(0);
+        if max_tokens_context_window_full(usage_input, usage_output, model.max_token_count()) {
+            log::warn!(
+                "auto_prompt: MaxTokens with context window full (input={:?}, output={usage_output}, window={}) — routing to orchestrator-summary fork",
+                usage_input,
+                model.max_token_count(),
+            );
+            cutoff_context_full = true;
+            // Fall through to the shared NeedsLlmCall construction below.
+        } else {
+            let effective_token_count = auto_prompt_ctx
+                .actual_input_tokens
+                .map(|t| t as usize)
+                .unwrap_or(auto_prompt_ctx.approximate_token_count);
+            if effective_token_count > config.max_context_tokens {
+                // Over the soft gate but with window room: the existing Phase
+                // 1/2 machine summarizes same-thread (the request fits) and
+                // forks with that summary.
                 log::info!(
-                    "auto_prompt: MaxTokens — original message is slash command '{cmd}', preserving it"
+                    "auto_prompt: MaxTokens with window room but over the soft token gate — falling through to the Phase 1/2 machine"
                 );
-                format!(
-                    "{cmd}\n\nContext limit reached. Pick up where we left off. \
-                     Do NOT summarize — continue working immediately."
-                )
+            } else {
+                log::info!(
+                    "auto_prompt: MaxTokens is an output-cap cutoff (input={:?}, output={usage_output}) with window room — resuming same thread",
+                    usage_input
+                );
+                return AutoPromptDecision::DispatchNow(AutoPromptAction {
+                    from_session_id: session_id,
+                    from_title: thread_title,
+                    next_prompt: MAX_TOKENS_RESUME_PROMPT.to_string(),
+                    work_dirs,
+                    original_user_message,
+                    profile_id: None,
+                    actual_input_tokens: auto_prompt_ctx.actual_input_tokens,
+                    approximate_token_count: auto_prompt_ctx.approximate_token_count,
+                    last_assistant_message: _last_assistant_msg,
+                    force_new_thread: false,
+                    focus_new_thread: false,
+                });
             }
-            _ => "Context limit reached. Continue from where we left off.".to_string(),
-        };
-        let next_prompt = with_first_prompt_context(
-            max_tokens_continuation,
-            build_prompt_summary(
-                None,
-                thread_title.as_deref(),
-                Some("context limit reached (MaxTokens)"),
-                _last_assistant_msg.as_deref(),
-                original_user_message.as_deref(),
-                auto_prompt_ctx.first_user_message.as_deref(),
-            )
-            .as_deref(),
-            thread_title.as_deref(),
-            _last_assistant_msg.as_deref(),
-        );
-        return AutoPromptDecision::DispatchNow(AutoPromptAction {
-            from_session_id: session_id,
-            from_title: thread_title,
-            next_prompt,
-            work_dirs,
-            original_user_message,
-            profile_id: None,
-            actual_input_tokens: auto_prompt_ctx.actual_input_tokens,
-            approximate_token_count: auto_prompt_ctx.approximate_token_count,
-            last_assistant_message: _last_assistant_msg,
-            force_new_thread: false,
-            focus_new_thread: false,
-        });
+        }
     }
 
     if matches!(stop_reason, acp::StopReason::Refusal) {
@@ -1641,7 +1670,8 @@ fn decide_with_context(
         .actual_input_tokens
         .map(|t| t as usize)
         .unwrap_or(auto_prompt_ctx.approximate_token_count);
-    let context_exceeds_limit = effective_token_count > config.max_context_tokens;
+    let context_exceeds_limit =
+        effective_token_count > config.max_context_tokens || cutoff_context_full;
     if context_exceeds_limit {
         log::info!(
             "[auto_prompt::decide] Context exceeds limit (effective={effective_token_count} > {} tokens, actual={:?}, approx={}) — will use lightweight path",
@@ -1685,6 +1715,7 @@ fn decide_with_context(
         had_api_error: auto_prompt_ctx.had_api_error,
         stop_phase,
         context_exceeds_limit,
+        cutoff_context_full,
         approximate_token_count: auto_prompt_ctx.approximate_token_count,
         connection: None,
         project: None,
@@ -1720,6 +1751,45 @@ pub fn truncate_at_char_boundary(text: &str, max_chars: usize) -> String {
 /// Phase 1 request sent to the SAME thread — no `## 1/## 2/## 3` headers
 /// since the AI already has full conversation context. Raw instruction only.
 const CONTEXT_OVERFLOW_SUMMARY_PROMPT: &str = "Stop what you are doing and provide a concise summary of your progress. Include: (1) what was the original task, (2) what was accomplished, (3) what remains to be done, (4) the current state of any active plans (reference by filename). Be thorough — this summary will be used to continue in a fresh context.";
+
+/// Same-thread continuation for a MaxTokens stop where the window still has
+/// room: the generation hit the model's OUTPUT cap, not the context window,
+/// so the conversation is intact and no summary/fork is needed.
+const MAX_TOKENS_RESUME_PROMPT: &str = "Your last response was cut off mid-generation at the model's output token limit. The conversation context is intact — resume exactly where you stopped. Do not repeat or re-summarize earlier work.";
+
+/// Headroom a follow-up same-thread request needs (its own prompt plus the
+/// provider's `max_tokens` reservation) before we consider the window full.
+const MAX_TOKENS_NEXT_REQUEST_RESERVE_TOKENS: u64 = 8_192;
+
+/// Whether a `StopReason::MaxTokens` stop means the model's CONTEXT WINDOW is
+/// exhausted (`input + output + reserve >= window`), as opposed to a mere
+/// output-cap cut with room left. Without reported usage this returns false —
+/// callers keep the legacy behavior — and a zero `model_window` (unknown) is
+/// treated as not full.
+pub(crate) fn max_tokens_context_window_full(
+    input_tokens: Option<u64>,
+    output_tokens: u64,
+    model_window: u64,
+) -> bool {
+    let Some(input) = input_tokens else {
+        return false;
+    };
+    if model_window == 0 {
+        return false;
+    }
+    input.saturating_add(output_tokens) + MAX_TOKENS_NEXT_REQUEST_RESERVE_TOKENS >= model_window
+}
+
+/// Last `max_chars` characters of `text`, safe on multi-byte boundaries
+/// (emoji, CJK). Used to feed a bounded tail of a window-truncated output to
+/// the orchestrator summary call.
+fn tail_at_char_boundary(text: &str, max_chars: usize) -> String {
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
+        return text.to_string();
+    }
+    text.chars().skip(char_count - max_chars).collect()
+}
 
 /// Same-thread retry after backoff when the worker's turn ended because the
 /// provider API was unreachable. Shared by the native and Claude decision
@@ -2041,6 +2111,196 @@ pub(crate) fn context_overflow_outcome(data: &LlmCallData) -> AutoPromptOutcome 
     }
 }
 
+/// System prompt for the orchestrator-produced handoff summary when a
+/// MaxTokens stop coincided with a full context window. The summarizer cannot
+/// see the conversation — only bounded fragments — so it must say so honestly
+/// and still emit the four-part handoff format. Reuses the standard
+/// `AutoPromptResponse` JSON contract via `thread_summary`.
+const CUTOFF_CONTEXT_FULL_SUMMARY_SYSTEM: &str = "# version: cutoff_summary\
+    \n\nThe worker's response stream was cut off mid-generation because the conversation filled the model's context window.\
+    You cannot see the full conversation — only the fragments below. Write the handoff summary a fresh thread needs to continue the task.\
+    \n\nRespond ONLY with valid JSON:\
+    \n{\"confidence\": 0.9, \"next_prompt\": null, \"reason\": string, \"thread_summary\": string}\
+    \n\nthread_summary MUST contain these four sections:\
+    \n- (1) Original task — infer from the fragments; write \"unknown\" only if truly absent\
+    \n- (2) What was accomplished up to the cutoff\
+    \n- (3) What remains to be done\
+    \n- (4) Active plans/state — reference plan filenames when they appear in the fragments";
+
+/// Characters of the truncated final output fed to the cutoff summarizer
+/// (~6k tokens — keeps the orchestrator call itself far below the window).
+const CUTOFF_SUMMARY_TAIL_CHARS: usize = 24_000;
+
+/// Outcome machine for a MaxTokens stop that exhausted the model's context
+/// window (`LlmCallData::cutoff_context_full`). The Phase 1 same-thread
+/// summarize request is impossible here — the input alone already fills the
+/// window and the API rejects every follow-up — so the summary is produced by
+/// a bounded orchestrator call and the thread is forked with it. Falls back to
+/// the legacy bare continuation (fresh thread, title-only summary) when the
+/// orchestrator call fails, so the chain keeps moving instead of stalling.
+async fn cutoff_context_full_outcome(data: &LlmCallData, cx: &gpui::AsyncApp) -> AutoPromptOutcome {
+    let session_id_str = data.session_id.to_string();
+
+    // Bounded fragments: the new thread's seed context. The tail of the
+    // truncated output is the freshest signal about what the worker was doing
+    // when the window filled.
+    let tail = data
+        .last_assistant_message
+        .as_deref()
+        .map(|message| tail_at_char_boundary(message, CUTOFF_SUMMARY_TAIL_CHARS));
+    let mut context = format!(
+        "## Thread title\n{}\n\n## Original task\n{}\n\n## First prompt\n{}\n",
+        data.title.as_deref().unwrap_or("(none)"),
+        data.original_user_message.as_deref().unwrap_or("(none)"),
+        data.first_user_message.as_deref().unwrap_or("(none)"),
+    );
+    if let Some(tail) = tail.as_deref().filter(|tail| !tail.trim().is_empty()) {
+        context.push_str(&format!(
+            "\n## Truncated final output (tail — cut off mid-generation by the context window)\n{tail}\n"
+        ));
+    }
+
+    let mut summary = None;
+    for attempt in 1..=2u32 {
+        if attempt > 1 {
+            cx.background_executor()
+                .timer(Duration::from_millis(2_000))
+                .await;
+        }
+        match call_language_model(
+            &data.model,
+            CUTOFF_CONTEXT_FULL_SUMMARY_SYSTEM,
+            &context,
+            cx,
+        )
+        .await
+        {
+            Ok((_raw, response)) => match response.thread_summary.as_deref() {
+                Some(text) if !text.trim().is_empty() => {
+                    summary = Some(text.trim().to_string());
+                    break;
+                }
+                _ => log::warn!(
+                    "auto_prompt: cutoff summary attempt {attempt} returned no thread_summary"
+                ),
+            },
+            Err(err) => {
+                log::warn!("auto_prompt: cutoff summary attempt {attempt} failed: {err:#}")
+            }
+        }
+    }
+
+    let Some(summary) = summary else {
+        // Legacy fallback (pre-fix behavior, but forced to fork): the window
+        // is full, so a same-thread continuation is guaranteed to be rejected.
+        log::warn!(
+            "auto_prompt: cutoff summary unavailable — falling back to bare fork (session={session_id_str})"
+        );
+        let next_prompt = with_first_prompt_context(
+            "Context limit reached. Continue from where we left off.".to_string(),
+            build_prompt_summary(
+                None,
+                data.title.as_deref(),
+                Some("context limit reached (MaxTokens)"),
+                None,
+                data.original_user_message.as_deref(),
+                data.first_user_message.as_deref(),
+            )
+            .as_deref(),
+            data.title.as_deref(),
+            None,
+        );
+        let mut action = data.make_continue_action(next_prompt);
+        action.actual_input_tokens = None;
+        action.approximate_token_count = 0;
+        action.force_new_thread = true;
+        return AutoPromptOutcome::Continue(action);
+    };
+
+    log::warn!(
+        "auto_prompt: cutoff summary produced ({} chars) — forking with real handoff (session={session_id_str})",
+        summary.len()
+    );
+
+    // Mirror the Phase 2 fork: terminal summaries stop the chain, nothing-left
+    // summaries defer to plan tasks, otherwise continue with the summary's
+    // next steps plus the fixed directive. Slash-command originals are
+    // preserved so the fresh thread re-activates the skill.
+    if matches!(
+        extract_summary_next_steps(&summary),
+        Some(SummaryContinuation::Terminal)
+    ) {
+        return AutoPromptOutcome::Stopped {
+            reason: "cutoff summary is terminal — all remaining work is armed/deferred/owner-gated"
+                .to_string(),
+        };
+    }
+    let continuation = match extract_summary_next_steps(&summary) {
+        Some(SummaryContinuation::NothingLeft) => {
+            let plan_tasks_remain = detect_remaining_plan_tasks(
+                &data.context_json,
+                PlanRepoFilter::CurrentRepo,
+                data.work_dirs.as_deref(),
+            )
+            .or_else(|| {
+                detect_remaining_plan_tasks(
+                    &data.context_json,
+                    PlanRepoFilter::OtherRepos,
+                    data.work_dirs.as_deref(),
+                )
+            })
+            .is_some();
+            if plan_tasks_remain {
+                CONTINUE_REMAINS_DECISION.to_string()
+            } else {
+                housekeeping_continuation()
+            }
+        }
+        Some(SummaryContinuation::Steps(steps)) => {
+            format!("{steps}\n\n{CONTINUE_REMAINS_DECISION}")
+        }
+        _ => CONTINUE_REMAINS_DECISION.to_string(),
+    };
+    let continuation = match data.original_user_message.as_deref() {
+        Some(msg) if msg.trim().starts_with('/') => {
+            let cmd = msg.trim();
+            format!(
+                "{cmd}\n\nContext overflowed mid-task. Pick up where the summary left off. \
+                     Do NOT summarize again — continue working immediately."
+            )
+        }
+        _ => continuation,
+    };
+
+    let prompt_summary = build_prompt_summary(
+        None,
+        data.title.as_deref(),
+        Some("stream cut off by the context window; continuing in new thread with summary"),
+        Some(&summary),
+        data.original_user_message.as_deref(),
+        data.first_user_message.as_deref(),
+    );
+    let next_prompt = with_first_prompt_context(
+        continuation,
+        prompt_summary.as_deref(),
+        data.title.as_deref(),
+        Some(&summary),
+    );
+
+    auto_claim_plan(
+        &next_prompt,
+        &data.context_json,
+        &data.session_id,
+        data.title.as_deref(),
+    );
+    let mut action = data.make_continue_action(next_prompt);
+    // The fresh thread starts from the summary, not the bloated old context.
+    action.actual_input_tokens = None;
+    action.approximate_token_count = 0;
+    action.force_new_thread = true;
+    AutoPromptOutcome::Continue(action)
+}
+
 /// Build a one-shot pros/cons clarification request (plan 023 D, req 5).
 ///
 /// Fires only when ALL hold:
@@ -2103,6 +2363,22 @@ pub async fn decide_with_llm(
     );
 
     let session_id_str = data.session_id.to_string();
+
+    // ── MaxTokens + window full cutoff (plan 032) ──────────────────
+    //
+    // The stream was cut off because the conversation itself filled the
+    // model's context window. Every same-thread request is now rejected by
+    // the API, so neither the output-cap resume nor the Phase 1 summarize
+    // request can run — produce the handoff summary with a bounded
+    // orchestrator call and fork with it. Checked FIRST: the truncated
+    // mid-reasoning last message is neither a summary nor a question, so the
+    // fast paths below it have nothing to work with.
+    if data.cutoff_context_full {
+        log::warn!(
+            "[auto_prompt::decide_with_llm] MaxTokens + window full — orchestrating handoff summary then forking (session={session_id_str})"
+        );
+        return Ok(cutoff_context_full_outcome(&data, &cx).await);
+    }
 
     // ── Summary-first fast path (plan 027, tightened plan 031) ──────────
     //
@@ -4886,6 +5162,7 @@ mod tests {
             had_api_error: false,
             stop_phase: context::StopPhase::Working,
             context_exceeds_limit: true,
+            cutoff_context_full: false,
             approximate_token_count: 0,
             connection: None,
             project: None,
@@ -8661,5 +8938,174 @@ Ready to execute Issue 024 (Hero → Avatar rename)?";
         assert!(result.contains("NOT valid reasons to skip"));
         assert!(result.contains("GPU training"));
         assert!(result.contains("benchmarks"));
+    }
+
+    // ── MaxTokens stream cutoff (plan 032) ─────────────────────────────
+
+    #[test]
+    fn max_tokens_window_full_classifier() {
+        // Window fill: input + output + reserve >= window → full.
+        assert!(max_tokens_context_window_full(
+            Some(195_000),
+            5_000,
+            200_000
+        ));
+        // Exactly at the boundary.
+        assert!(max_tokens_context_window_full(Some(191_000), 808, 200_000));
+        // Output-cap cutoff with plenty of window room → not full.
+        assert!(!max_tokens_context_window_full(
+            Some(100_000),
+            8_192,
+            200_000
+        ));
+        // No usage reported → legacy behavior (not full).
+        assert!(!max_tokens_context_window_full(None, 50_000, 200_000));
+        // Unknown window → not full.
+        assert!(!max_tokens_context_window_full(Some(150_000), 50_000, 0));
+    }
+
+    #[test]
+    fn tail_at_char_boundary_basics() {
+        assert_eq!(tail_at_char_boundary("abcdef", 10), "abcdef");
+        assert_eq!(tail_at_char_boundary("abcdef", 3), "def");
+        assert_eq!(tail_at_char_boundary("", 5), "");
+        assert_eq!(tail_at_char_boundary("ab", 0), "");
+    }
+
+    #[test]
+    fn tail_at_char_boundary_multibyte() {
+        // Emoji + CJK must never be sliced mid-character.
+        let text = "🦀 analyis 完了 — done";
+        let tail = tail_at_char_boundary(text, 5);
+        assert!(text.ends_with(&tail));
+        assert_eq!(tail.chars().count(), 5);
+        // A longer-than-max multi-byte tail must stay valid UTF-8.
+        let emoji = "🦀🦀🦀🦀🦀";
+        let tail = tail_at_char_boundary(emoji, 2);
+        assert_eq!(tail, "🦀🦀");
+    }
+
+    fn cutoff_test_data(
+        session: &str,
+    ) -> (
+        LlmCallData,
+        std::sync::Arc<language_model::fake_provider::FakeLanguageModel>,
+    ) {
+        let fake = std::sync::Arc::new(language_model::fake_provider::FakeLanguageModel::default());
+        let mut data = overflow_test_data(
+            session,
+            Some(
+                "Same manifest, same cargo version, different result per invocation context. How?\n\n**The lockfile!** riir-ai's own",
+            ),
+        );
+        data.model = fake.clone();
+        data.cutoff_context_full = true;
+        (data, fake)
+    }
+
+    #[gpui::test]
+    async fn cutoff_fork_uses_orchestrated_summary(cx: &mut gpui::TestAppContext) {
+        let session = "cutoff-fork-success-test";
+        clear_summary_for_session(session);
+        let (data, fake) = cutoff_test_data(session);
+
+        let summary_json = serde_json::json!({
+            "confidence": 0.9,
+            "next_prompt": null,
+            "reason": "cutoff handoff",
+            "thread_summary": "## Summary\n\n(1) Original task: debug the invocation-context divergence.\n(2) Accomplished: narrowed it to the lockfile.\n(3) What remains: diff the two Cargo.lock files.\n(4) Active plans: 032 in flight."
+        })
+        .to_string();
+
+        let task = cx.spawn(async move |cx| cutoff_context_full_outcome(&data, &cx).await);
+        cx.run_until_parked();
+        assert_eq!(fake.completion_count(), 1, "one summary call expected");
+        fake.respond_to_last_pending_completion([LanguageModelCompletionEvent::Text(summary_json)]);
+
+        match task.await {
+            AutoPromptOutcome::Continue(action) => {
+                assert!(
+                    action.force_new_thread,
+                    "cutoff fork must create a new thread"
+                );
+                assert_eq!(action.actual_input_tokens, None);
+                assert_eq!(action.approximate_token_count, 0);
+                assert!(
+                    action.next_prompt.contains("(1) Original task"),
+                    "summary must ride into the new thread: {}",
+                    action.next_prompt
+                );
+                assert!(
+                    action.next_prompt.contains(CONTINUE_REMAINS_DECISION),
+                    "fixed directive must ride along: {}",
+                    action.next_prompt
+                );
+            }
+            other => panic!("expected Continue, got {other:?}"),
+        }
+        clear_summary_for_session(session);
+    }
+
+    #[gpui::test]
+    async fn cutoff_fork_falls_back_when_summary_unavailable(cx: &mut gpui::TestAppContext) {
+        let session = "cutoff-fork-fallback-test";
+        clear_summary_for_session(session);
+        let (data, fake) = cutoff_test_data(session);
+
+        let task = cx.spawn(async move |cx| cutoff_context_full_outcome(&data, &cx).await);
+        cx.run_until_parked();
+        fake.respond_to_last_pending_completion([LanguageModelCompletionEvent::Text(
+            "this is not json".to_string(),
+        )]);
+        // Attempt 2 backs off 2s before retrying.
+        cx.executor().advance_clock(Duration::from_millis(2_000));
+        cx.run_until_parked();
+        fake.respond_to_last_pending_completion([LanguageModelCompletionEvent::Text(
+            "still not json".to_string(),
+        )]);
+
+        match task.await {
+            AutoPromptOutcome::Continue(action) => {
+                // The window is full: even the legacy fallback must fork, not
+                // send a doomed same-thread continuation.
+                assert!(action.force_new_thread, "fallback must still fork");
+                assert!(
+                    action
+                        .next_prompt
+                        .contains("Context limit reached. Continue from where we left off."),
+                    "legacy fallback continuation expected: {}",
+                    action.next_prompt
+                );
+            }
+            other => panic!("expected Continue, got {other:?}"),
+        }
+        clear_summary_for_session(session);
+    }
+
+    #[gpui::test]
+    async fn cutoff_fork_stops_on_terminal_summary(cx: &mut gpui::TestAppContext) {
+        let session = "cutoff-fork-terminal-test";
+        clear_summary_for_session(session);
+        let (data, fake) = cutoff_test_data(session);
+
+        let summary_json = serde_json::json!({
+            "confidence": 0.9,
+            "next_prompt": null,
+            "reason": "cutoff handoff",
+            "thread_summary": "## Summary\n\n**(3) What remains:**\n- T2c-b — P3, deferred.\n- 32K cell is thermal-gated."
+        })
+        .to_string();
+
+        let task = cx.spawn(async move |cx| cutoff_context_full_outcome(&data, &cx).await);
+        cx.run_until_parked();
+        fake.respond_to_last_pending_completion([LanguageModelCompletionEvent::Text(summary_json)]);
+
+        match task.await {
+            AutoPromptOutcome::Stopped { reason } => {
+                assert!(reason.contains("terminal"), "reason: {reason}");
+            }
+            other => panic!("expected Stopped, got {other:?}"),
+        }
+        clear_summary_for_session(session);
     }
 }

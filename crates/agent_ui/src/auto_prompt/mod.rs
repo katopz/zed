@@ -1121,8 +1121,7 @@ fn run_auto_prompt(
 
     if matches!(stop_reason, acp::StopReason::MaxTokens) {
         log::warn!(
-            "[auto_prompt] Error/Rate Limit detected - stop_reason={:?}, will apply backoff retry",
-            stop_reason
+            "[auto_prompt] stop_reason=MaxTokens — decide classifies window-full (orchestrator summary → fork) vs output-cap (same-thread resume)",
         );
     }
 
