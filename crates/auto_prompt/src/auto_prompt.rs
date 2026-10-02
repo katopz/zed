@@ -6,6 +6,7 @@
 //! handles the actual GPUI action dispatch.
 
 pub mod api_unreachable;
+pub mod auth_failure;
 pub mod claude_agent;
 mod config;
 pub mod context;

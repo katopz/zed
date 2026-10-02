@@ -1997,6 +1997,18 @@ impl ConversationView {
                             format!("Agent stopped: {limit_kind} limit reached"),
                             IconName::Warning,
                         ),
+                        // Expired credentials: auto-prompt stops the chain
+                        // (`auto_prompt::auth_failure`) until re-login.
+                        (None, _)
+                            if error_text
+                                .as_deref()
+                                .is_some_and(auto_prompt::auth_failure::is_auth_error) =>
+                        {
+                            (
+                                "Agent stopped: authentication failed — sign in again".to_string(),
+                                IconName::Warning,
+                            )
+                        }
                         // Unreachable API: auto-prompt retries the same thread
                         // with backoff (`auto_prompt::api_unreachable`).
                         (None, true)

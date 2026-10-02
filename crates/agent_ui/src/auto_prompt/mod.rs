@@ -1119,6 +1119,22 @@ fn run_auto_prompt(
         return None;
     }
 
+    // Expired/revoked credentials: every downstream path (continuation,
+    // orchestrator, overflow summarize) needs the same login, so never enter
+    // `Processing` — stop the chain until the user signs in again. Manual
+    // clicks pass: the user may have just re-logged in.
+    if !is_manual {
+        let thread_ref = thread.read(cx);
+        if let Some(error) = auto_prompt::auth_failure::auth_failure_from_thread(thread_ref, cx) {
+            log::warn!(
+                "[auto_prompt] PATH=auth_failure: stopping chain until re-login (session={}): {error}",
+                thread_ref.session_id()
+            );
+            auto_prompt::reset_iteration_with_session(&thread_ref.session_id().to_string());
+            return None;
+        }
+    }
+
     if matches!(stop_reason, acp::StopReason::MaxTokens) {
         log::warn!(
             "[auto_prompt] stop_reason=MaxTokens — decide classifies window-full (orchestrator summary → fork) vs output-cap (same-thread resume)",

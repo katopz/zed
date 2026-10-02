@@ -73,9 +73,21 @@ pub fn is_unreachable_message(text: &str) -> bool {
 
 /// The connectivity error that ended the thread's latest turn, if any.
 pub fn unreachable_error_from_thread(thread: &AcpThread, cx: &App) -> Option<String> {
+    latest_turn_failure(thread, cx, is_network_error, is_unreachable_message)
+}
+
+/// The failure that ended the thread's latest turn, read from either source:
+/// the turn-level API error (matched by `is_error`) or a synthetic assistant
+/// message answering the latest user message (matched by `is_message`).
+pub(crate) fn latest_turn_failure(
+    thread: &AcpThread,
+    cx: &App,
+    is_error: fn(&str) -> bool,
+    is_message: fn(&str) -> bool,
+) -> Option<String> {
     if thread.had_api_error()
         && let Some(error) = thread.last_api_error()
-        && is_network_error(error)
+        && is_error(error)
     {
         return Some(error.to_string());
     }
@@ -96,7 +108,7 @@ pub fn unreachable_error_from_thread(thread: &AcpThread, cx: &App) -> Option<Str
     }
     thread
         .last_assistant_message_text(cx)
-        .filter(|message| is_unreachable_message(message))
+        .filter(|message| is_message(message))
 }
 
 /// Record one more consecutive unreachable turn; returns the streak length,
