@@ -32,7 +32,9 @@ actions!(
         /// Opens a following markdown preview that syncs with the editor.
         OpenFollowingPreview,
         /// Closes the markdown preview and returns focus to the source editor.
-        CloseAndReturnToEditor
+        CloseAndReturnToEditor,
+        /// Opens the previewed file in a text editor.
+        EditSource
     ]
 );
 

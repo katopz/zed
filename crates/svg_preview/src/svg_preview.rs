@@ -9,7 +9,9 @@ actions!(
     svg,
     [
         /// Opens a following SVG preview that syncs with the editor.
-        OpenFollowingPreview
+        OpenFollowingPreview,
+        /// Opens the previewed SVG file in a text editor.
+        EditSource
     ]
 );
 

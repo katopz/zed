@@ -23,7 +23,7 @@ use markdown::{
     MarkdownOptions, MarkdownStyle,
 };
 use project::search::SearchQuery;
-use project::{Project, ProjectPath, image_store};
+use project::{Project, ProjectEntryId, ProjectPath, image_store};
 use settings::{SeedQuerySetting, Settings, update_settings_file};
 use theme::{SystemAppearance, Theme, ThemeRegistry};
 use theme_settings::ThemeSettings;
@@ -48,8 +48,8 @@ use zed_actions::{DecreaseBufferFontSize, IncreaseBufferFontSize, ResetBufferFon
 
 use crate::markdown_preview_settings::MarkdownPreviewSettings;
 use crate::{
-    CloseAndReturnToEditor, OpenFollowingPreview, OpenPreview, OpenPreviewToTheSide, ScrollDown,
-    ScrollDownByItem,
+    CloseAndReturnToEditor, EditSource, OpenFollowingPreview, OpenPreview, OpenPreviewToTheSide,
+    ScrollDown, ScrollDownByItem,
 };
 use crate::{ScrollPageDown, ScrollPageUp, ScrollToBottom, ScrollToTop, ScrollUp, ScrollUpByItem};
 
@@ -203,6 +203,14 @@ impl MarkdownPreviewView {
         cx: &App,
     ) -> Option<usize> {
         let target_buffer = editor.read(cx).buffer().read(cx).as_singleton()?;
+        Self::find_existing_preview_item_idx_for_buffer(pane, &target_buffer, cx)
+    }
+
+    fn find_existing_preview_item_idx_for_buffer(
+        pane: &Pane,
+        buffer: &Entity<Buffer>,
+        cx: &App,
+    ) -> Option<usize> {
         pane.items_of_type::<MarkdownPreviewView>()
             .find(|view| {
                 // Only look for independent (Default mode) previews, not Follow previews.
@@ -211,7 +219,7 @@ impl MarkdownPreviewView {
                 // the editor the user is currently invoking the action on even though both
                 // wrap the same source buffer.
                 view.read(cx).mode == MarkdownPreviewMode::Default
-                    && view.read(cx).is_previewing(&target_buffer, cx)
+                    && view.read(cx).is_previewing(buffer, cx)
             })
             .and_then(|view| pane.index_for_item(&view))
     }
@@ -389,9 +397,30 @@ impl MarkdownPreviewView {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
-        let open_buffer = workspace
-            .project()
-            .update(cx, |project, cx| project.open_buffer(project_path, cx));
+        Self::load_buffer_and_open_preview(project_path, workspace, window, cx, false, true);
+    }
+
+    /// Opens the markdown preview for the given path as a replaceable preview tab.
+    pub fn open_preview_for_project_path(
+        project_path: ProjectPath,
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+        focus: bool,
+    ) {
+        Self::load_buffer_and_open_preview(project_path, workspace, window, cx, true, focus);
+    }
+
+    fn load_buffer_and_open_preview(
+        project_path: ProjectPath,
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+        mark_as_preview: bool,
+        focus: bool,
+    ) {
+        let project = workspace.project().clone();
+        let open_buffer = project.update(cx, |project, cx| project.open_buffer(project_path, cx));
 
         cx.spawn_in(window, async move |workspace, mut cx| {
             let Some(buffer) = open_buffer
@@ -402,16 +431,59 @@ impl MarkdownPreviewView {
             };
             workspace
                 .update_in(cx, |workspace, window, cx| {
-                    let project = workspace.project().clone();
-                    let editor = cx.new(|cx| Editor::for_buffer(buffer, Some(project), window, cx));
-                    let preview = Self::create_markdown_view(workspace, editor, window, cx);
-                    workspace.active_pane().update(cx, |pane, cx| {
-                        pane.add_item(Box::new(preview), true, true, None, window, cx);
-                    });
+                    Self::activate_or_add_preview_for_buffer(
+                        workspace,
+                        buffer,
+                        project,
+                        mark_as_preview,
+                        focus,
+                        window,
+                        cx,
+                    );
                 })
                 .ok();
         })
         .detach();
+    }
+
+    fn activate_or_add_preview_for_buffer(
+        workspace: &mut Workspace,
+        buffer: Entity<Buffer>,
+        project: Entity<Project>,
+        mark_as_preview: bool,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        let pane = workspace.active_pane().clone();
+        if let Some(existing_view_idx) =
+            Self::find_existing_preview_item_idx_for_buffer(pane.read(cx), &buffer, cx)
+        {
+            pane.update(cx, |pane, cx| {
+                pane.activate_item(existing_view_idx, focus, focus, window, cx);
+            });
+            return;
+        }
+
+        let editor = cx.new(|cx| Editor::for_buffer(buffer, Some(project), window, cx));
+        let view = Self::create_markdown_view(workspace, editor, window, cx);
+        pane.update(cx, |pane, cx| {
+            let destination_index = if mark_as_preview {
+                pane.replace_preview_item_id(view.item_id(), window, cx)
+            } else {
+                None
+            };
+            pane.add_item_inner(
+                Box::new(view),
+                true,
+                focus,
+                true,
+                destination_index,
+                window,
+                cx,
+            );
+        });
+        cx.notify();
     }
 
     pub fn is_markdown_file(editor: &Entity<Editor>, cx: &App) -> bool {
@@ -897,6 +969,14 @@ impl MarkdownPreviewView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.return_to_editor(window, cx);
+    }
+
+    fn edit_source(&mut self, _: &EditSource, window: &mut Window, cx: &mut Context<Self>) {
+        self.return_to_editor(window, cx);
+    }
+
+    fn return_to_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(editor) = self
             .active_editor
             .as_ref()
@@ -1617,6 +1697,27 @@ impl Item for MarkdownPreviewView {
         ItemBufferKind::Singleton
     }
 
+    fn tab_entry_to_resolve(&self, cx: &App) -> Option<ProjectEntryId> {
+        use project::ProjectItem as _;
+        let editor = self.active_editor.as_ref()?.editor.read(cx);
+        let buffer = editor.buffer().read(cx).as_singleton()?;
+        buffer.read(cx).entry_id(cx)
+    }
+
+    fn tab_extra_context_menu_actions(
+        &self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<(SharedString, Box<dyn gpui::Action>)> {
+        let has_source = self.active_editor.as_ref().is_some_and(|state| {
+            Self::project_path_for_active_editor(&state.editor.read(cx), cx).is_some()
+        });
+        if !has_source {
+            return Vec::new();
+        }
+        vec![("Edit".into(), Box::new(EditSource) as Box<dyn gpui::Action>)]
+    }
+
     fn as_searchable(
         &self,
         handle: &Entity<Self>,
@@ -1654,6 +1755,7 @@ impl Render for MarkdownPreviewView {
             .on_action(cx.listener(MarkdownPreviewView::scroll_to_top))
             .on_action(cx.listener(MarkdownPreviewView::scroll_to_bottom))
             .on_action(cx.listener(MarkdownPreviewView::close_and_return_to_editor))
+            .on_action(cx.listener(MarkdownPreviewView::edit_source))
             .on_action(cx.listener(MarkdownPreviewView::increase_font_size))
             .on_action(cx.listener(MarkdownPreviewView::decrease_font_size))
             .on_action(cx.listener(MarkdownPreviewView::reset_font_size))
@@ -2062,7 +2164,8 @@ mod tests {
     use editor::Editor;
     use fs::FakeFs;
     use gpui::{
-        App, AppContext as _, Entity, Focusable as _, Modifiers, TestAppContext, WindowHandle, px,
+        App, AppContext as _, Entity, Focusable as _, Modifiers, TestAppContext, VisualTestContext,
+        WindowHandle, px,
     };
     use language::{Buffer, DiskState, Point};
     use project::{Project, ProjectPath};
@@ -2989,6 +3092,171 @@ mod tests {
 
         assert_editor_is_active_and_focused(cx, &multi_workspace, &editor);
         assert_no_markdown_preview_items(cx, &multi_workspace);
+    }
+
+    #[gpui::test]
+    async fn open_preview_for_project_path_marks_preview_tab_and_dedupes(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/dir"),
+            json!({
+                "note.md": "# Note\n",
+                "other.md": "# Other\n"
+            }),
+        )
+        .await;
+        let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+
+        let note_path = project_path_for(cx, &multi_workspace, "note.md");
+        let other_path = project_path_for(cx, &multi_workspace, "other.md");
+
+        open_preview_for_path(cx, &multi_workspace, note_path.clone());
+        cx.run_until_parked();
+
+        let preview = multi_workspace.update(cx, |multi_workspace, cx| {
+            let workspace = multi_workspace.workspace().read(cx);
+            let pane = workspace.active_pane().read(cx);
+            let previews: Vec<_> = workspace.items_of_type::<MarkdownPreviewView>(cx).collect();
+            assert_eq!(
+                previews.len(),
+                1,
+                "opening a preview should add exactly one preview tab"
+            );
+            let preview = previews[0].clone();
+            assert_eq!(
+                pane.preview_item_id(),
+                Some(preview.entity_id()),
+                "click-opened preview should be the pane's preview tab"
+            );
+            preview
+        });
+
+        // Re-opening the same file activates the existing preview tab.
+        open_preview_for_path(cx, &multi_workspace, note_path);
+        cx.run_until_parked();
+        multi_workspace.update(cx, |multi_workspace, cx| {
+            let workspace = multi_workspace.workspace().read(cx);
+            assert_eq!(
+                workspace.items_of_type::<MarkdownPreviewView>(cx).count(),
+                1,
+                "re-opening the same file must not add a duplicate preview tab"
+            );
+            assert_eq!(
+                workspace.active_item_as::<MarkdownPreviewView>(cx),
+                Some(preview)
+            );
+        });
+
+        // Opening another file's preview replaces the previous preview tab.
+        open_preview_for_path(cx, &multi_workspace, other_path);
+        cx.run_until_parked();
+        multi_workspace.update(cx, |multi_workspace, cx| {
+            let workspace = multi_workspace.workspace().read(cx);
+            let previews: Vec<_> = workspace.items_of_type::<MarkdownPreviewView>(cx).collect();
+            assert_eq!(previews.len(), 1);
+            assert_eq!(
+                workspace.active_pane().read(cx).preview_item_id(),
+                Some(previews[0].entity_id())
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn open_path_does_not_dedupe_against_preview_tab(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/dir"), json!({ "note.md": "# Note\n" }))
+            .await;
+        let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let note_path = project_path_for(cx, &multi_workspace, "note.md");
+
+        open_preview_for_path(cx, &multi_workspace, note_path.clone());
+        cx.run_until_parked();
+
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        // Opening the file as a regular editor must add an editor tab, not
+        // deduplicate against the preview tab.
+        multi_workspace.update_in(cx, |_, window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace
+                    .open_path(note_path, None, true, window, cx)
+                    .detach();
+            });
+        });
+        cx.run_until_parked();
+
+        multi_workspace.update(cx, |multi_workspace, cx| {
+            let workspace = multi_workspace.workspace().read(cx);
+            assert_eq!(workspace.items_of_type::<Editor>(cx).count(), 1);
+            assert!(workspace.active_item_as::<Editor>(cx).is_some());
+            assert_eq!(
+                workspace.items_of_type::<MarkdownPreviewView>(cx).count(),
+                1,
+                "preview tab should remain open alongside the editor"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn preview_tab_resolves_source_entry_for_context_menu(cx: &mut TestAppContext) {
+        let (multi_workspace, editor) = open_markdown_file(cx, "note.md", "# Note\n").await;
+        let preview = open_preview_for_active_editor(cx, &multi_workspace);
+        cx.run_until_parked();
+
+        let preview_entry = preview.update(cx, |view, cx| {
+            workspace::item::Item::tab_entry_to_resolve(view, cx)
+        });
+        let editor_entry = editor.update(cx, |editor, cx| {
+            workspace::item::Item::tab_entry_to_resolve(editor, cx)
+        });
+        assert!(preview_entry.is_some());
+        assert_eq!(preview_entry, editor_entry);
+    }
+
+    fn project_path_for(
+        cx: &mut VisualTestContext,
+        multi_workspace: &Entity<MultiWorkspace>,
+        file_name: &str,
+    ) -> ProjectPath {
+        multi_workspace.read_with(cx, |multi_workspace, cx| {
+            let worktree_id = multi_workspace
+                .workspace()
+                .read(cx)
+                .project()
+                .read(cx)
+                .worktrees(cx)
+                .next()
+                .unwrap()
+                .read(cx)
+                .id();
+            (worktree_id, rel_path(file_name)).into()
+        })
+    }
+
+    fn open_preview_for_path(
+        cx: &mut VisualTestContext,
+        multi_workspace: &Entity<MultiWorkspace>,
+        project_path: ProjectPath,
+    ) {
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        multi_workspace.update_in(cx, |_, window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                MarkdownPreviewView::open_preview_for_project_path(
+                    project_path,
+                    workspace,
+                    window,
+                    cx,
+                    true,
+                );
+            });
+        });
     }
 
     #[gpui::test]

@@ -58,6 +58,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+use svg_preview::svg_preview_view::SvgPreviewView;
 use theme_settings::ThemeSettings;
 use ui::{
     ContextMenu, DecoratedIcon, IconDecoration, IconDecorationKind, IndentGuideColors,
@@ -411,6 +412,8 @@ actions!(
         Redo,
         /// Opens a markdown preview for the selected file.
         OpenMarkdownPreview,
+        /// Opens an SVG preview for the selected file.
+        OpenSvgPreview,
     ]
 );
 
@@ -900,36 +903,73 @@ impl ProjectPanel {
                             let worktree_id = worktree.read(cx).id();
                             let entry_id = entry.id;
                             let is_via_ssh = project.read(cx).is_via_remote_server();
+                            let is_file = entry.is_file();
+                            let is_svg =
+                                is_file && SvgPreviewView::is_svg_path(file_path.as_std_path());
+                            let is_markdown = is_file
+                                && MarkdownPreviewView::is_markdown_path(
+                                    file_path.as_std_path(),
+                                    project.read(cx).languages(),
+                                );
+                            // Double-clicks and explicit permanent opens still go to the
+                            // text editor; every other open of a previewable file opens
+                            // its preview view instead.
+                            let open_in_editor = focus_opened_item && !allow_preview;
 
-                            workspace
-                                .open_path_preview(
-                                    ProjectPath {
-                                        worktree_id,
-                                        path: file_path.clone(),
-                                    },
-                                    None,
-                                    focus_opened_item,
-                                    allow_preview,
-                                    true,
-                                    window, cx,
-                                )
-                                .detach_and_prompt_err("Failed to open file", window, cx, move |e, _, _| {
-                                    match e.error_code() {
-                                        ErrorCode::Disconnected => if is_via_ssh {
-                                            Some("Disconnected from SSH host".to_string())
-                                        } else {
-                                            Some("Disconnected from remote project".to_string())
+                            if is_file && (is_markdown || is_svg) && !open_in_editor {
+                                let project_path = ProjectPath {
+                                    worktree_id,
+                                    path: file_path,
+                                };
+                                if is_markdown {
+                                    MarkdownPreviewView::open_preview_for_project_path(
+                                        project_path,
+                                        workspace,
+                                        window,
+                                        cx,
+                                        focus_opened_item,
+                                    );
+                                } else {
+                                    SvgPreviewView::open_for_project_path(
+                                        project_path,
+                                        workspace,
+                                        window,
+                                        cx,
+                                        true,
+                                        focus_opened_item,
+                                    );
+                                }
+                            } else {
+                                workspace
+                                    .open_path_preview(
+                                        ProjectPath {
+                                            worktree_id,
+                                            path: file_path.clone(),
                                         },
-                                        ErrorCode::UnsharedItem => Some(format!(
-                                            "{} is not shared by the host. This could be because it has been marked as `private`",
-                                            file_path.display(path_style)
-                                        )),
-                                        // See note in worktree.rs where this error originates. Returning Some in this case prevents
-                                        // the error popup from saying "Try Again", which is a red herring in this case
-                                        ErrorCode::Internal if e.to_string().contains("File is too large to load") => Some(e.to_string()),
-                                        _ => None,
-                                    }
-                                });
+                                        None,
+                                        focus_opened_item,
+                                        allow_preview,
+                                        true,
+                                        window, cx,
+                                    )
+                                    .detach_and_prompt_err("Failed to open file", window, cx, move |e, _, _| {
+                                        match e.error_code() {
+                                            ErrorCode::Disconnected => if is_via_ssh {
+                                                Some("Disconnected from SSH host".to_string())
+                                            } else {
+                                                Some("Disconnected from remote project".to_string())
+                                            },
+                                            ErrorCode::UnsharedItem => Some(format!(
+                                                "{} is not shared by the host. This could be because it has been marked as `private`",
+                                                file_path.display(path_style)
+                                            )),
+                                            // See note in worktree.rs where this error originates. Returning Some in this case prevents
+                                            // the error popup from saying "Try Again", which is a red herring in this case
+                                            ErrorCode::Internal if e.to_string().contains("File is too large to load") => Some(e.to_string()),
+                                            _ => None,
+                                        }
+                                    });
+                            }
 
                             if let Some(project_panel) = project_panel.upgrade() {
                                 // Always select and mark the entry, regardless of whether it is opened or not.
@@ -1096,6 +1136,8 @@ impl ProjectPanel {
                     entry.path.as_std_path(),
                     project.languages(),
                 );
+            let is_svg = !is_dir && SvgPreviewView::is_svg_path(entry.path.as_std_path());
+            let is_previewable = is_markdown || is_svg;
 
             let settings = ProjectPanelSettings::get_global(cx);
             let visible_worktrees_count = project.visible_worktrees(cx).count();
@@ -1144,8 +1186,14 @@ impl ProjectPanel {
                                 menu.action("Open in Default App", Box::new(OpenWithSystem))
                             })
                             .action("Open in Terminal", Box::new(OpenInTerminal))
+                            .when(is_previewable, |menu| {
+                                menu.action("Edit", Box::new(OpenPermanent))
+                            })
                             .when(is_markdown, |menu| {
                                 menu.action("Open Markdown Preview", Box::new(OpenMarkdownPreview))
+                            })
+                            .when(is_svg, |menu| {
+                                menu.action("Open SVG Preview", Box::new(OpenSvgPreview))
                             })
                             .when(is_dir, |menu| {
                                 menu.separator()
@@ -1798,6 +1846,36 @@ impl ProjectPanel {
         self.workspace
             .update(cx, |workspace, cx| {
                 MarkdownPreviewView::open_for_project_path(project_path, workspace, window, cx);
+            })
+            .ok();
+    }
+
+    fn open_svg_preview(
+        &mut self,
+        _: &OpenSvgPreview,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((worktree, entry)) = self.selected_entry(cx) else {
+            return;
+        };
+        if !entry.is_file() || !SvgPreviewView::is_svg_path(entry.path.as_std_path()) {
+            return;
+        }
+        let project_path = ProjectPath {
+            worktree_id: worktree.id(),
+            path: entry.path.clone(),
+        };
+        self.workspace
+            .update(cx, |workspace, cx| {
+                SvgPreviewView::open_for_project_path(
+                    project_path,
+                    workspace,
+                    window,
+                    cx,
+                    false,
+                    true,
+                );
             })
             .ok();
     }
@@ -7083,6 +7161,7 @@ impl Render for ProjectPanel {
                 .on_action(cx.listener(Self::open_split_vertical))
                 .on_action(cx.listener(Self::open_split_horizontal))
                 .on_action(cx.listener(Self::open_markdown_preview))
+                .on_action(cx.listener(Self::open_svg_preview))
                 .on_action(cx.listener(Self::confirm))
                 .on_action(cx.listener(Self::cancel))
                 .on_action(cx.listener(Self::copy_path))

@@ -1,4 +1,5 @@
 use std::mem;
+use std::path::Path;
 use std::sync::Arc;
 
 use file_icons::FileIcons;
@@ -8,14 +9,17 @@ use gpui::{
 };
 use language::{Buffer, BufferEvent};
 use multi_buffer::MultiBuffer;
+use project::{ProjectEntryId, ProjectItem as _, ProjectPath};
 use ui::prelude::*;
-use workspace::item::Item;
+use workspace::item::{Item, ItemHandle};
+use workspace::notifications::NotifyResultExt;
 use workspace::{Pane, Workspace};
 
-use crate::{OpenFollowingPreview, OpenPreview, OpenPreviewToTheSide};
+use crate::{EditSource, OpenFollowingPreview, OpenPreview, OpenPreviewToTheSide};
 
 pub struct SvgPreviewView {
     focus_handle: FocusHandle,
+    workspace: WeakEntity<Workspace>,
     buffer: Option<Entity<Buffer>>,
     current_svg: Option<Result<Arc<RenderImage>, SharedString>>,
     _refresh: Task<()>,
@@ -56,6 +60,7 @@ impl SvgPreviewView {
 
             let mut this = Self {
                 focus_handle: cx.focus_handle(),
+                workspace: workspace_handle,
                 buffer,
                 current_svg: None,
                 _buffer_subscription: subscription,
@@ -190,16 +195,125 @@ impl SvgPreviewView {
         )
     }
 
+    pub fn is_svg_path(path: impl AsRef<Path>) -> bool {
+        path.as_ref()
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("svg"))
+    }
+
     pub fn is_svg_file(buffer: &Entity<MultiBuffer>, cx: &App) -> bool {
         buffer
             .read(cx)
             .as_singleton()
             .and_then(|buffer| buffer.read(cx).file())
-            .is_some_and(|file| {
-                std::path::Path::new(file.file_name(cx))
-                    .extension()
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("svg"))
-            })
+            .is_some_and(|file| Self::is_svg_path(file.file_name(cx)))
+    }
+
+    pub fn open_for_project_path(
+        project_path: ProjectPath,
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+        mark_as_preview: bool,
+        focus: bool,
+    ) {
+        let open_buffer = workspace
+            .project()
+            .update(cx, |project, cx| project.open_buffer(project_path, cx));
+
+        cx.spawn_in(window, async move |workspace, mut cx| {
+            let Some(buffer) = open_buffer
+                .await
+                .notify_workspace_async_err(workspace.clone(), &mut cx)
+            else {
+                return;
+            };
+            workspace
+                .update_in(cx, |workspace, window, cx| {
+                    Self::activate_or_add_preview_for_buffer(
+                        workspace,
+                        buffer,
+                        mark_as_preview,
+                        focus,
+                        window,
+                        cx,
+                    );
+                })
+                .ok();
+        })
+        .detach();
+    }
+
+    fn activate_or_add_preview_for_buffer(
+        workspace: &mut Workspace,
+        buffer: Entity<Buffer>,
+        mark_as_preview: bool,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        let pane = workspace.active_pane().clone();
+        let multibuffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+
+        if let Some(existing_view_idx) =
+            Self::find_existing_preview_item_idx(pane.read(cx), &multibuffer, cx)
+        {
+            pane.update(cx, |pane, cx| {
+                pane.activate_item(existing_view_idx, focus, focus, window, cx);
+            });
+            return;
+        }
+
+        let view =
+            Self::create_svg_view(SvgPreviewMode::Default, workspace, multibuffer, window, cx);
+        pane.update(cx, |pane, cx| {
+            let destination_index = if mark_as_preview {
+                pane.replace_preview_item_id(view.item_id(), window, cx)
+            } else {
+                None
+            };
+            pane.add_item_inner(
+                Box::new(view),
+                true,
+                focus,
+                true,
+                destination_index,
+                window,
+                cx,
+            );
+        });
+        cx.notify();
+    }
+
+    fn source_project_path(&self, cx: &App) -> Option<ProjectPath> {
+        let buffer = self.buffer.as_ref()?;
+        let file = buffer.read(cx).file()?;
+        Some(ProjectPath::from_file(file.as_ref(), cx))
+    }
+
+    fn edit_source(&mut self, _: &EditSource, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(project_path) = self.source_project_path(cx) else {
+            return;
+        };
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let preview_id = cx.entity_id();
+
+        window.defer(cx, move |window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace
+                    .open_path(project_path, None, true, window, cx)
+                    .detach_and_log_err(cx);
+
+                if let Some(pane) = workspace.pane_for_item_id(preview_id) {
+                    pane.update(cx, |pane, cx| {
+                        pane.close_item_by_id(preview_id, workspace::SaveIntent::Skip, window, cx)
+                    })
+                    .detach_and_log_err(cx);
+                }
+            });
+        });
     }
 
     pub fn open_preview_in_pane(
@@ -284,6 +398,7 @@ impl Render for SvgPreviewView {
             .track_focus(&self.focus_handle(cx))
             .size_full()
             .bg(cx.theme().colors().editor_background)
+            .on_action(cx.listener(Self::edit_source))
             .flex()
             .justify_center()
             .items_center()
@@ -337,4 +452,20 @@ impl Item for SvgPreviewView {
     }
 
     fn to_item_events(_event: &Self::Event, _f: &mut dyn FnMut(workspace::item::ItemEvent)) {}
+
+    fn tab_entry_to_resolve(&self, cx: &App) -> Option<ProjectEntryId> {
+        let buffer = self.buffer.as_ref()?;
+        buffer.read(cx).entry_id(cx)
+    }
+
+    fn tab_extra_context_menu_actions(
+        &self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<(SharedString, Box<dyn gpui::Action>)> {
+        if self.source_project_path(cx).is_none() {
+            return Vec::new();
+        }
+        vec![("Edit".into(), Box::new(EditSource) as Box<dyn gpui::Action>)]
+    }
 }

@@ -241,7 +241,7 @@ pub trait Item: Focusable + EventEmitter<Self::Event> + Render + Sized {
         ItemBufferKind::None
     }
 
-    /// Returns the project path that should be treated as active for this item.
+    /// Returns the project entry that should be treated as active for this item.
     ///
     /// Singleton items use their only project item by default. Items backed by
     /// multiple buffers should override this to return the path for the buffer
@@ -254,6 +254,27 @@ pub trait Item: Focusable + EventEmitter<Self::Event> + Render + Sized {
         let mut result = None;
         self.for_each_project_item(cx, &mut |_, item| {
             result = item.project_path(cx);
+        });
+        result
+    }
+
+    /// Returns the project entry that the item's tab context menu should resolve
+    /// against (Copy Path, Reveal in Finder, etc.).
+    ///
+    /// Defaults to the item's first project entry. Secondary views of a buffer,
+    /// such as preview views, override this instead of reporting project entries
+    /// themselves, because reporting entries would make them participate in pane
+    /// tab deduplication.
+    fn tab_entry_to_resolve(&self, cx: &App) -> Option<ProjectEntryId> {
+        if self.buffer_kind(cx) != ItemBufferKind::Singleton {
+            return None;
+        }
+
+        let mut result = None;
+        self.for_each_project_item(cx, &mut |_, item| {
+            if result.is_none() {
+                result = project::ProjectItem::entry_id(item, cx);
+            }
         });
         result
     }
@@ -497,6 +518,8 @@ pub trait ItemHandle: 'static + Send {
     ) -> AnyElement;
     fn project_path(&self, cx: &App) -> Option<ProjectPath>;
     fn project_entry_ids(&self, cx: &App) -> SmallVec<[ProjectEntryId; 3]>;
+    /// Returns the project entry that the item's tab context menu should resolve against.
+    fn tab_entry_to_resolve(&self, cx: &App) -> Option<ProjectEntryId>;
     fn project_paths(&self, cx: &App) -> SmallVec<[ProjectPath; 3]>;
     fn project_item_model_ids(&self, cx: &App) -> SmallVec<[EntityId; 3]>;
     fn for_each_project_item(
@@ -692,6 +715,10 @@ impl<T: Item> ItemHandle for Entity<T> {
             }
         });
         result
+    }
+
+    fn tab_entry_to_resolve(&self, cx: &App) -> Option<ProjectEntryId> {
+        self.read(cx).tab_entry_to_resolve(cx)
     }
 
     fn project_paths(&self, cx: &App) -> SmallVec<[ProjectPath; 3]> {

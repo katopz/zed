@@ -3074,9 +3074,7 @@ impl Pane {
                     }),
             );
 
-        let single_entry_to_resolve = (self.items[ix].buffer_kind(cx) == ItemBufferKind::Singleton)
-            .then(|| self.items[ix].project_entry_ids(cx).get(0).copied())
-            .flatten();
+        let single_entry_to_resolve = self.items[ix].tab_entry_to_resolve(cx);
 
         let total_items = self.items.len();
         let has_multibuffer_items = self
@@ -3261,7 +3259,11 @@ impl Pane {
                             let project_path = pane
                                 .read(cx)
                                 .item_for_entry(entry, cx)
-                                .and_then(|item| item.project_path(cx));
+                                .and_then(|item| item.project_path(cx))
+                                .or_else(|| {
+                                    let project = pane.read(cx).project.upgrade()?;
+                                    project.read(cx).path_for_entry(entry, cx)
+                                });
                             let worktree = project_path.as_ref().and_then(|project_path| {
                                 pane.read(cx)
                                     .project
