@@ -6920,13 +6920,36 @@ fn format_usage_percentage(window: UsageWindow) -> String {
 
 fn format_usage_reset(resets_at: DateTime<Utc>) -> String {
     format!(
-        "resets {}",
-        ui::utils::format_distance_from_now(
-            ui::utils::DateTimeType::Local(resets_at.with_timezone(&Local)),
-            false,
-            true,
-            true,
-        )
+        "resets in {}",
+        usage_reset_remaining(resets_at, Utc::now())
+    )
+}
+
+/// Compact unit-precise time until reset ("3h 10m", "1d 3h") rather than the
+/// coarse `format_distance` buckets, whose "1 day from now" hides whether a
+/// window still has hours to run.
+fn usage_reset_remaining(resets_at: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    let remaining = if resets_at > now {
+        resets_at - now
+    } else {
+        chrono::Duration::zero()
+    };
+    language_models::provider::open_ai_compatible::format_backoff_remaining(
+        remaining.to_std().unwrap_or_default(),
+    )
+}
+
+/// Equal 7-day split of a weekly window: each day's fair share of the
+/// allowance and the remaining budget expressed in days, so the weekly
+/// percentage can be paced against a 1-day budget instead of only watched.
+fn format_weekly_daily_split(window: UsageWindow) -> String {
+    const WEEK_DAYS: f32 = 7.0;
+    let remaining = (1.0 - window.used).clamp(0.0, 1.0);
+    format!(
+        "{:.1}%/day \u{2022} {}% left \u{2248} {:.1} of 7 days",
+        100.0 / WEEK_DAYS,
+        (remaining * 100.0).round() as i64,
+        remaining * WEEK_DAYS
     )
 }
 
@@ -6939,9 +6962,9 @@ impl Render for ClaudeUsageTooltip {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let separator_color = self.separator_color;
         let windows = [
-            ("5-hour", self.usage.five_hour),
-            ("Weekly", self.usage.seven_day),
-            ("Weekly (Opus)", self.usage.seven_day_opus),
+            ("5-hour", self.usage.five_hour, false),
+            ("Weekly", self.usage.seven_day, true),
+            ("Weekly (Opus)", self.usage.seven_day_opus, true),
         ];
 
         ui::tooltip_container(cx, move |container, _cx| {
@@ -6952,19 +6975,35 @@ impl Render for ClaudeUsageTooltip {
                         .color(Color::Muted)
                         .size(LabelSize::Small),
                 )
-                .children(windows.into_iter().filter_map(|(label, window)| {
+                .children(windows.into_iter().filter_map(|(label, window, weekly)| {
                     let window = window?;
                     Some(
-                        h_flex()
-                            .gap_0p5()
-                            .child(Label::new(label).color(Color::Muted).mr_0p5())
-                            .child(Label::new(format_usage_percentage(window)))
-                            .when_some(window.resets_at, |this, resets_at| {
-                                this.child(Label::new("\u{2022}").color(separator_color).mx_1())
-                                    .child(
-                                        Label::new(format_usage_reset(resets_at))
-                                            .color(Color::Muted),
-                                    )
+                        v_flex()
+                            .child(
+                                h_flex()
+                                    .gap_0p5()
+                                    .child(Label::new(label).color(Color::Muted).mr_0p5())
+                                    .child(Label::new(format_usage_percentage(window)))
+                                    .when_some(window.resets_at, |this, resets_at| {
+                                        this.child(
+                                            Label::new("\u{2022}")
+                                                .color(separator_color)
+                                                .mx_1(),
+                                        )
+                                        .child(
+                                            Label::new(format_usage_reset(resets_at))
+                                                .color(Color::Muted),
+                                        )
+                                    }),
+                            )
+                            .when(weekly, |this| {
+                                this.child(
+                                    h_flex().pl_3().child(
+                                        Label::new(format_weekly_daily_split(window))
+                                            .color(Color::Muted)
+                                            .size(LabelSize::XSmall),
+                                    ),
+                                )
                             }),
                     )
                 }))
@@ -14981,11 +15020,68 @@ fn extract_summary_section(markdown: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
     use project::{FakeFs, Project};
     use serde_json::json;
     use std::path::Path;
     use util::path;
     use workspace::MultiWorkspace;
+
+    #[test]
+    fn test_usage_reset_remaining_shows_precise_units() {
+        let now = Utc.with_ymd_and_hms(2026, 10, 8, 12, 0, 0).unwrap();
+
+        let one_day_three_hours = now + chrono::Duration::hours(27);
+        assert_eq!(
+            usage_reset_remaining(one_day_three_hours, now),
+            "1d 3h"
+        );
+
+        let three_hours_ten_minutes = now + chrono::Duration::minutes(190);
+        assert_eq!(
+            usage_reset_remaining(three_hours_ten_minutes, now),
+            "3h 10m"
+        );
+
+        let ten_minutes_forty_seconds = now + chrono::Duration::seconds(640);
+        assert_eq!(
+            usage_reset_remaining(ten_minutes_forty_seconds, now),
+            "10m 40s"
+        );
+    }
+
+    #[test]
+    fn test_usage_reset_remaining_clamps_past_resets() {
+        let now = Utc.with_ymd_and_hms(2026, 10, 8, 12, 0, 0).unwrap();
+        let already_passed = now - chrono::Duration::hours(2);
+        assert_eq!(usage_reset_remaining(already_passed, now), "0s");
+    }
+
+    #[test]
+    fn test_weekly_daily_split_shares_remaining_budget_across_days() {
+        // 50% of the weekly allowance used: half of each day's 14.3% share
+        // pool remains, worth 3.5 of the 7 equal day shares.
+        let window = UsageWindow {
+            used: 0.5,
+            resets_at: None,
+        };
+        assert_eq!(
+            format_weekly_daily_split(window),
+            "14.3%/day \u{2022} 50% left \u{2248} 3.5 of 7 days"
+        );
+    }
+
+    #[test]
+    fn test_weekly_daily_split_clamps_exhausted_window() {
+        let window = UsageWindow {
+            used: 1.2,
+            resets_at: None,
+        };
+        assert_eq!(
+            format_weekly_daily_split(window),
+            "14.3%/day \u{2022} 0% left \u{2248} 0.0 of 7 days"
+        );
+    }
 
     fn native_command(name: &str) -> acp::AvailableCommand {
         acp::AvailableCommand::new(name, "").meta(acp_thread::meta_with_command_category(
