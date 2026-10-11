@@ -14,9 +14,10 @@
 //! request, rules-based summary handoff) needs the same unreachable API, and a
 //! rules-based fallback has no fresh information to act on. The only useful
 //! move is to wait and retry the same thread, with exponential backoff that
-//! grows across consecutive unreachable turns.
+//! grows across consecutive unreachable turns of that thread.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::collections::HashMap;
+use std::sync::Mutex;
 
 use acp_thread::{AcpThread, AgentThreadEntry};
 use gpui::App;
@@ -49,7 +50,17 @@ const SYNTHETIC_ERROR_PREFIX: &str = "API Error";
 /// budget rides out ~4 hours of outage while still guaranteeing termination.
 pub const MAX_UNREACHABLE_STREAK: u32 = 240;
 
-static UNREACHABLE_STREAK: AtomicU32 = AtomicU32::new(0);
+/// Streaks are per session: with one global counter, N concurrently retrying
+/// threads burned the budget N times faster and shared one ever-growing
+/// exponent, and one thread's clean turn reset every other thread's backoff.
+static UNREACHABLE_STREAKS: Mutex<Option<HashMap<String, u32>>> = Mutex::new(None);
+
+fn with_streaks<R>(f: impl FnOnce(&mut HashMap<String, u32>) -> R) -> R {
+    let mut guard = UNREACHABLE_STREAKS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    f(guard.get_or_insert_with(HashMap::new))
+}
 
 /// Whether an error text names a connectivity failure.
 pub fn is_network_error(text: &str) -> bool {
@@ -111,17 +122,20 @@ pub(crate) fn latest_turn_failure(
         .filter(|message| is_message(message))
 }
 
-/// Record one more consecutive unreachable turn; returns the streak length,
-/// used as the backoff exponent.
-pub fn record_unreachable() -> u32 {
-    UNREACHABLE_STREAK
-        .fetch_add(1, Ordering::Relaxed)
-        .saturating_add(1)
+/// Record one more consecutive unreachable turn of `session_id`; returns the
+/// session's streak length, used as the backoff exponent.
+pub fn record_unreachable(session_id: &str) -> u32 {
+    with_streaks(|streaks| {
+        let streak = streaks.entry(session_id.to_string()).or_insert(0);
+        *streak = streak.saturating_add(1);
+        *streak
+    })
 }
 
-/// Clear the streak once a turn ends without a connectivity failure.
-pub fn reset_unreachable_streak() {
-    UNREACHABLE_STREAK.store(0, Ordering::Relaxed);
+/// Clear the session's streak once its turn ends without a connectivity
+/// failure (or its budget is spent).
+pub fn reset_unreachable_streak(session_id: &str) {
+    with_streaks(|streaks| streaks.remove(session_id));
 }
 
 #[cfg(test)]
@@ -149,6 +163,18 @@ mod tests {
         assert!(!is_unreachable_message(
             "API Error: 400 {\"type\":\"invalid_request_error\"}"
         ));
+    }
+
+    #[test]
+    fn streaks_are_tracked_per_session() {
+        assert_eq!(record_unreachable("streak-test-a"), 1);
+        assert_eq!(record_unreachable("streak-test-a"), 2);
+        assert_eq!(record_unreachable("streak-test-b"), 1);
+        reset_unreachable_streak("streak-test-b");
+        assert_eq!(record_unreachable("streak-test-a"), 3);
+        reset_unreachable_streak("streak-test-a");
+        assert_eq!(record_unreachable("streak-test-a"), 1);
+        reset_unreachable_streak("streak-test-a");
     }
 
     #[test]

@@ -3629,6 +3629,45 @@ async fn test_prompt_too_large_marks_token_usage_exceeded(cx: &mut TestAppContex
 }
 
 #[gpui::test]
+async fn test_repeated_resume_after_failure_does_not_stack(cx: &mut TestAppContext) {
+    let ThreadTest { model, thread, .. } = setup(cx, TestModel::Fake).await;
+    let fake_model = model.as_fake();
+
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Message 1"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    // A non-retryable error that doesn't trigger compaction.
+    let endpoint_error = || LanguageModelCompletionError::ApiEndpointNotFound {
+        provider: LanguageModelProviderName::new("fake"),
+    };
+    fake_model.send_last_completion_stream_error(endpoint_error());
+    fake_model.end_last_completion_stream();
+    cx.run_until_parked();
+
+    // Two consecutive failed retries (e.g. auto_prompt riding out an outage).
+    for _ in 0..2 {
+        thread.update(cx, |thread, cx| thread.resume(cx)).unwrap();
+        cx.run_until_parked();
+        fake_model.send_last_completion_stream_error(endpoint_error());
+        fake_model.end_last_completion_stream();
+        cx.run_until_parked();
+    }
+
+    thread.update(cx, |thread, cx| thread.resume(cx)).unwrap();
+    cx.run_until_parked();
+    let completion = fake_model.pending_completions().pop().unwrap();
+    let resume_turns = completion
+        .messages
+        .iter()
+        .filter(|message| message.string_contents() == "Continue where you left off")
+        .count();
+    assert_eq!(resume_turns, 1);
+}
+
+#[gpui::test]
 async fn test_prompt_too_large_uses_reported_token_count(cx: &mut TestAppContext) {
     let ThreadTest { model, thread, .. } = setup(cx, TestModel::Fake).await;
     let fake_model = model.as_fake();

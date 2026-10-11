@@ -2591,7 +2591,11 @@ impl Thread {
         &mut self,
         cx: &mut Context<Self>,
     ) -> Result<mpsc::UnboundedReceiver<Result<ThreadEvent>>> {
-        self.messages.push(Arc::new(Message::Resume));
+        // A trailing Resume was never answered (the turn failed before any
+        // reply), so another one would only stack duplicate user turns.
+        if !matches!(self.messages.last().map(Arc::as_ref), Some(Message::Resume)) {
+            self.messages.push(Arc::new(Message::Resume));
+        }
         cx.notify();
 
         log::debug!("Total messages in thread: {}", self.messages.len());

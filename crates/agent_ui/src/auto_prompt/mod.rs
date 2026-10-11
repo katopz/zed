@@ -1119,6 +1119,18 @@ fn run_auto_prompt(
         return None;
     }
 
+    // A user interrupt (or the watchdog's own cancel) always ends the chain —
+    // both decide paths return NoAction for it. Bail before `Processing` is
+    // set: the Claude path awaits `warm_plan_snapshots` (up to ~10s of git
+    // fetches) before reaching its Cancelled check, so the interrupted
+    // thread showed "Processing…" over the user's follow-up message.
+    if !is_manual && matches!(stop_reason, acp::StopReason::Cancelled) {
+        let session_id = thread.read(cx).session_id().to_string();
+        log::info!("[auto_prompt] Cancelled — chain stopped (session={session_id})");
+        auto_prompt::reset_iteration_with_session(&session_id);
+        return None;
+    }
+
     // Expired/revoked credentials: every downstream path (continuation,
     // orchestrator, overflow summarize) needs the same login, so never enter
     // `Processing` — stop the chain until the user signs in again. Manual
@@ -1304,6 +1316,17 @@ fn run_auto_prompt(
                                 window,
                                 cx,
                             );
+                        }
+                        if reason == auto_prompt::AutoPromptDelayReason::ApiUnreachable
+                            && let Some(stopped_view) = _view.thread_view(&action.from_session_id)
+                            && stopped_view.read(cx).thread.read(cx).can_retry(cx)
+                        {
+                            log::info!(
+                                "[auto_prompt] DispatchAfterDelay: re-running the failed turn (session={})",
+                                action.from_session_id
+                            );
+                            stopped_view.update(cx, |tv, cx| tv.retry_generation(window, cx));
+                            return;
                         }
                         dispatch_action(action, _view, window, cx);
                     }) {

@@ -494,6 +494,10 @@ pub enum AutoPromptDelayReason {
     UsageLimitReset,
     /// Generic backoff before retrying (e.g. after a refusal).
     Backoff,
+    /// Connectivity backoff: the failed turn is re-run in place (when the
+    /// agent supports retry) instead of sending `next_prompt`, so an outage
+    /// doesn't stack one continuation prompt + start-context block per retry.
+    ApiUnreachable,
 }
 
 /// Result of the auto-prompt decision logic.
@@ -1962,14 +1966,14 @@ pub(crate) fn api_unreachable_decision(
     cx: &gpui::App,
 ) -> Option<AutoPromptDecision> {
     let thread_ref = thread.read(cx);
+    let session_id_str = thread_ref.session_id().to_string();
     let Some(error) = api_unreachable::unreachable_error_from_thread(thread_ref, cx) else {
-        api_unreachable::reset_unreachable_streak();
+        api_unreachable::reset_unreachable_streak(&session_id_str);
         return None;
     };
-    let streak = api_unreachable::record_unreachable();
+    let streak = api_unreachable::record_unreachable(&session_id_str);
     if streak > api_unreachable::MAX_UNREACHABLE_STREAK {
-        api_unreachable::reset_unreachable_streak();
-        let session_id_str = thread_ref.session_id().to_string();
+        api_unreachable::reset_unreachable_streak(&session_id_str);
         clear_summary_for_session(&session_id_str);
         reset_iteration_with_session(&session_id_str);
         log::warn!(
@@ -2016,14 +2020,23 @@ pub(crate) fn api_unreachable_decision(
             work_dirs: thread_ref.work_dirs().map(|list| list.paths().to_vec()),
             original_user_message: None,
             profile_id: None,
-            actual_input_tokens: thread_ref.token_usage().map(|usage| usage.input_tokens),
+            // No token count: `dispatch_action` forks native threads above the
+            // same-thread threshold, and a fork here carries only the retry
+            // sentence — no summary, no context. Each fork then hit the same
+            // dead API and forked again. The retry must land on this thread.
+            actual_input_tokens: None,
             approximate_token_count: 0,
             last_assistant_message,
             force_new_thread: false,
             focus_new_thread: false,
         },
         delay_ms,
-        reason: AutoPromptDelayReason::Backoff,
+        // A pending Phase 1 must actually send the summarize request.
+        reason: if summary_pending {
+            AutoPromptDelayReason::Backoff
+        } else {
+            AutoPromptDelayReason::ApiUnreachable
+        },
     })
 }
 
