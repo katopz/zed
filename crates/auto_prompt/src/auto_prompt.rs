@@ -27,9 +27,7 @@ pub fn set_plan_source_git_spawns_disabled(disabled: bool) {
     plan_source::set_git_spawns_disabled(disabled);
 }
 
-pub use config::{
-    AutoPromptConfig, DEFAULT_MAX_CONCURRENT_STREAMS, default_max_context_tokens,
-};
+pub use config::{AutoPromptConfig, DEFAULT_MAX_CONCURRENT_STREAMS, default_max_context_tokens};
 pub use context::{
     AutoPromptContext, AutoPromptContextSnapshot, AutoPromptResponse, PlanFileContent, StopPhase,
     truncate_to_paragraph_budget,
@@ -581,6 +579,11 @@ pub struct LlmCallData {
     /// peers are active. Injected into the LLM/hidden-thread context so the
     /// decider can reason about concurrent work.
     pub peer_agent_states: Option<String>,
+    /// Computed when the thread's output-token budget ran (nearly) dry:
+    /// names the largest space consumers in the source thread so the resume
+    /// or forked thread avoids re-running them at full width. None when no
+    /// bloat evidence — keeps continuation prompts unpolluted.
+    pub bloat_directive: Option<String>,
 }
 
 impl std::fmt::Debug for LlmCallData {
@@ -613,12 +616,20 @@ impl std::fmt::Debug for LlmCallData {
             .field("context_exceeds_limit", &self.context_exceeds_limit)
             .field("cutoff_context_full", &self.cutoff_context_full)
             .field("approximate_token_count", &self.approximate_token_count)
+            .field(
+                "bloat_directive",
+                &self
+                    .bloat_directive
+                    .as_ref()
+                    .map(|s| format!("<{} chars>", s.len())),
+            )
             .finish()
     }
 }
 
 impl LlmCallData {
     pub(crate) fn make_continue_action(&self, next_prompt: String) -> AutoPromptAction {
+        let next_prompt = with_bloat_section(&next_prompt, self.bloat_directive.as_deref());
         AutoPromptAction {
             from_session_id: self.session_id.clone(),
             from_title: self.title.clone(),
@@ -1246,6 +1257,7 @@ fn decide_precheck(
                 connection: None,
                 project: None,
                 peer_agent_states: peer_states::unmuted_states_for_context(),
+                bloat_directive: output_bloat_directive(thread, cx),
             };
             log::info!(
                 "[auto_prompt::decide] voluntary summary — rules-based handoff, skipping plan scans + context serialization (over_limit={context_exceeds_limit}, session={:?})",
@@ -1406,8 +1418,15 @@ fn decide_finish(
     doc_files: Vec<String>,
     cx: &gpui::App,
 ) -> AutoPromptDecision {
-    let (snapshot, thread_title) =
-        snapshot_decision_context(thread, stop_reason, &pre, &inputs, plan_files, doc_files, cx);
+    let (snapshot, thread_title) = snapshot_decision_context(
+        thread,
+        stop_reason,
+        &pre,
+        &inputs,
+        plan_files,
+        doc_files,
+        cx,
+    );
     let mut auto_prompt_ctx = snapshot.finish();
     auto_prompt_ctx.stop_phase = pre.stop_phase.clone();
     auto_prompt_ctx.verification_count = pre.verification_count;
@@ -1510,10 +1529,17 @@ fn decide_with_context(
                     "auto_prompt: MaxTokens is an output-cap cutoff (input={:?}, output={usage_output}) with window room — resuming same thread",
                     usage_input
                 );
+                // The generation just proved the thread can blow the output
+                // budget: name the hog on the resume prompt, or the resume
+                // dies the same death (and the chain loops).
+                let next_prompt = match output_bloat_directive(thread, cx) {
+                    Some(directive) => format!("{MAX_TOKENS_RESUME_PROMPT}\n\n{directive}"),
+                    None => MAX_TOKENS_RESUME_PROMPT.to_string(),
+                };
                 return AutoPromptDecision::DispatchNow(AutoPromptAction {
                     from_session_id: session_id,
                     from_title: thread_title,
-                    next_prompt: MAX_TOKENS_RESUME_PROMPT.to_string(),
+                    next_prompt,
                     work_dirs,
                     original_user_message,
                     profile_id: None,
@@ -1721,6 +1747,7 @@ fn decide_with_context(
         connection: None,
         project: None,
         peer_agent_states: peer_states::unmuted_states_for_context(),
+        bloat_directive: output_bloat_directive(thread, cx),
     })
 }
 
@@ -1779,6 +1806,135 @@ pub(crate) fn max_tokens_context_window_full(
         return false;
     }
     input.saturating_add(output_tokens) + MAX_TOKENS_NEXT_REQUEST_RESERVE_TOKENS >= model_window
+}
+
+/// Output-usage fraction (output / max_output) at or above which a handoff
+/// or resume prompt carries the bloat-avoidance section.
+const OUTPUT_BLOAT_RATIO_THRESHOLD: f64 = 0.6;
+/// Smallest estimated entry size (in tokens) worth naming as a bloat source.
+/// Keeps the report free of ordinary tool calls.
+const OUTPUT_BLOAT_MIN_SOURCE_TOKENS: usize = 8_000;
+/// How many bloat sources to name at most — the report rides in every
+/// continuation prompt, so it must stay compact.
+const OUTPUT_BLOAT_MAX_SOURCES: usize = 3;
+
+const BLOAT_SECTION_HEADER: &str = "## Context bloat avoidance";
+
+/// A thread entry worth naming as a token hog.
+#[derive(Debug, Clone, PartialEq)]
+struct BloatSource {
+    label: String,
+    est_tokens: usize,
+}
+
+/// The bloat-avoidance directive for a thread that ran (nearly) out of
+/// output-token budget: names the largest space consumers found by scanning
+/// the thread from the top and states the avoidance rules. None when there
+/// is no evidence worth reporting — continuation prompts stay unpolluted.
+fn output_bloat_directive(
+    thread: &gpui::Entity<acp_thread::AcpThread>,
+    cx: &gpui::App,
+) -> Option<String> {
+    let usage = thread.read(cx).token_usage();
+    if !output_bloat_gate(
+        usage.map(|usage| usage.output_tokens),
+        usage.and_then(|usage| usage.max_output_tokens),
+    ) {
+        return None;
+    }
+    let mut sources: Vec<BloatSource> = thread
+        .read(cx)
+        .bloat_candidates(cx)
+        .into_iter()
+        .map(|(label, chars)| BloatSource {
+            label,
+            est_tokens: chars / 4,
+        })
+        .filter(|source| source.est_tokens >= OUTPUT_BLOAT_MIN_SOURCE_TOKENS)
+        .collect();
+    if sources.is_empty() {
+        return None;
+    }
+    sources.sort_by_key(|source| std::cmp::Reverse(source.est_tokens));
+    sources.truncate(OUTPUT_BLOAT_MAX_SOURCES);
+    Some(format_bloat_directive(
+        usage.map(|usage| (usage.output_tokens, usage.max_output_tokens)),
+        &sources,
+    ))
+}
+
+/// Cheap pre-scan gate: only pay for the per-entry measurement pass when the
+/// output budget is (nearly) exhausted — or when the provider reports no max
+/// at all, in which case the source-size floor alone decides. A low-ratio
+/// thread (routine stop, routine chain hop) exits before any scanning.
+fn output_bloat_gate(output_tokens: Option<u64>, max_output_tokens: Option<u64>) -> bool {
+    match (output_tokens, max_output_tokens) {
+        (Some(output), Some(max)) if max > 0 => {
+            output as f64 / max as f64 >= OUTPUT_BLOAT_RATIO_THRESHOLD
+        }
+        // No usage or no known cap: let the source-size floor decide.
+        _ => true,
+    }
+}
+
+fn format_bloat_directive(usage: Option<(u64, Option<u64>)>, sources: &[BloatSource]) -> String {
+    let usage_note = match usage {
+        Some((output, Some(max))) if max > 0 => format!(
+            " ({}k of {}k output tokens used)",
+            output / 1_000,
+            max / 1_000
+        ),
+        Some((output, None)) => format!(" ({output} output tokens used)"),
+        _ => String::new(),
+    };
+    let mut directive = format!(
+        "OUTPUT-BLOAT NOTICE: the previous turn died at the model's output token limit{usage_note}. Bisecting this thread from the top, the largest space consumers are:"
+    );
+    for source in sources {
+        directive.push_str(&format!(
+            "\n- `{}` — ~{}k tokens",
+            source.label,
+            source.est_tokens / 1_000
+        ));
+    }
+    directive.push_str(
+        "\nRules for the rest of this task:\n\
+        - Never re-run the listed commands at full width; sample with head/tail or line ranges and keep tool outputs small.\n\
+        - Keep narration between tool calls to one or two sentences; do not restate file contents.\n\
+        - Prefer small targeted edits over whole-file rewrites.\n\
+        - If a response nears the limit, stop cleanly and report state instead of being cut off mid-action.",
+    );
+    directive
+}
+
+/// Insert the bloat-avoidance section into an assembled
+/// `with_first_prompt_context` payload, before the decision slot so
+/// `extract_decision_prompt` (which cuts from the `## N. Decision` header on)
+/// never mistakes the section for decision text. Appended at the end when no
+/// decision header is present. Idempotent.
+pub fn with_bloat_section(prompt: &str, bloat_directive: Option<&str>) -> String {
+    let Some(directive) = bloat_directive.map(str::trim).filter(|d| !d.is_empty()) else {
+        return prompt.to_string();
+    };
+    if prompt.contains(BLOAT_SECTION_HEADER) {
+        return prompt.to_string();
+    }
+    let section = format!("{BLOAT_SECTION_HEADER}\n\n{directive}");
+    let decision_index = ["## 3. Decision", "## 2. Decision"]
+        .iter()
+        .filter_map(|marker| prompt.find(marker))
+        .min();
+    match decision_index {
+        Some(index) => {
+            let mut output = String::with_capacity(prompt.len() + section.len() + 4);
+            output.push_str(&prompt[..index]);
+            output.push_str(&section);
+            output.push_str("\n\n---\n\n");
+            output.push_str(&prompt[index..]);
+            output
+        }
+        None => format!("{prompt}\n\n---\n\n{section}"),
+    }
 }
 
 /// Last `max_chars` characters of `text`, safe on multi-byte boundaries
@@ -5168,6 +5324,7 @@ mod tests {
             connection: None,
             project: None,
             peer_agent_states: None,
+            bloat_directive: None,
         }
     }
 
@@ -5934,6 +6091,115 @@ mod tests {
         let pos3 = result.find("## 3.").unwrap();
         assert!(pos1 < pos2);
         assert!(pos2 < pos3);
+    }
+
+    // --- output bloat detection tests ---
+
+    fn bloat_source(label: &str, est_tokens: usize) -> BloatSource {
+        BloatSource {
+            label: label.to_string(),
+            est_tokens,
+        }
+    }
+
+    #[test]
+    fn test_output_bloat_gate() {
+        // High ratio → gate open.
+        assert!(output_bloat_gate(Some(128_000), Some(131_072)));
+        // At exactly the threshold → open.
+        assert!(output_bloat_gate(Some(60), Some(100)));
+        // Low ratio → closed.
+        assert!(!output_bloat_gate(Some(10_000), Some(131_072)));
+        // Unknown cap → open (source-size floor decides).
+        assert!(output_bloat_gate(Some(50_000), None));
+        // No usage at all → open (source-size floor decides).
+        assert!(output_bloat_gate(None, None));
+        // Zero max must not divide by zero.
+        assert!(output_bloat_gate(Some(50_000), Some(0)));
+    }
+
+    #[test]
+    fn test_format_bloat_directive_names_sources_and_rules() {
+        let sources = vec![
+            bloat_source("terminal: cargo check --workspace", 31_000),
+            bloat_source("assistant message", 9_500),
+        ];
+        let directive = format_bloat_directive(Some((128_000, Some(131_072))), &sources);
+        assert!(directive.contains("128k of 131k output tokens used"));
+        assert!(directive.contains("`terminal: cargo check --workspace` — ~31k tokens"));
+        assert!(directive.contains("`assistant message` — ~9k tokens"));
+        assert!(directive.contains("Never re-run the listed commands at full width"));
+        assert!(directive.contains("stop cleanly and report state"));
+    }
+
+    #[test]
+    fn test_format_bloat_directive_without_max() {
+        let sources = vec![bloat_source("terminal: cargo check", 31_000)];
+        let directive = format_bloat_directive(Some((50_000, None)), &sources);
+        assert!(directive.contains("50000 output tokens used"));
+    }
+
+    #[test]
+    fn test_with_bloat_section_inserts_before_decision() {
+        let prompt = with_first_prompt_context(
+            "continue the task".to_string(),
+            Some("summary of the work"),
+            None,
+            Some("last assistant message"),
+        );
+        let with_bloat = with_bloat_section(&prompt, Some("OUTPUT-BLOAT NOTICE: ..."));
+        let bloat_pos = with_bloat.find(BLOAT_SECTION_HEADER).unwrap();
+        let decision_pos = with_bloat.find("## 3. Decision").unwrap();
+        let summary_pos = with_bloat.find("## 1. Thread Summary").unwrap();
+        assert!(summary_pos < bloat_pos);
+        assert!(bloat_pos < decision_pos);
+        // Decision extraction is unaffected: cut starts at the decision header.
+        let extracted = extract_decision_prompt(&with_bloat).unwrap();
+        assert!(extracted.starts_with("continue the task"));
+        assert!(!extracted.contains(BLOAT_SECTION_HEADER));
+    }
+
+    #[test]
+    fn test_with_bloat_section_alternate_decision_header() {
+        // The no-summary branch of with_first_prompt_context uses "## 2. Decision".
+        let prompt = with_first_prompt_context(
+            "continue".to_string(),
+            None,
+            None,
+            Some("last assistant message"),
+        );
+        let with_bloat = with_bloat_section(&prompt, Some("OUTPUT-BLOAT NOTICE: ..."));
+        let bloat_pos = with_bloat.find(BLOAT_SECTION_HEADER).unwrap();
+        let decision_pos = with_bloat.find("## 2. Decision").unwrap();
+        assert!(bloat_pos < decision_pos);
+    }
+
+    #[test]
+    fn test_with_bloat_section_noop_and_idempotent() {
+        let prompt = "plain prompt".to_string();
+        // None / empty directive → unchanged.
+        assert_eq!(with_bloat_section(&prompt, None), prompt);
+        assert_eq!(with_bloat_section(&prompt, Some("   ")), prompt);
+        // No decision header → appended at the end.
+        let appended = with_bloat_section(&prompt, Some("NOTICE"));
+        assert!(appended.starts_with("plain prompt"));
+        assert!(appended.contains(BLOAT_SECTION_HEADER));
+        // Already present → unchanged (idempotent).
+        let twice = with_bloat_section(&appended, Some("NOTICE"));
+        assert_eq!(twice, appended);
+    }
+
+    #[test]
+    fn test_make_continue_action_applies_bloat_section() {
+        let mut data = overflow_test_data("bloat-choke-test", Some("mid-work message"));
+        data.bloat_directive = Some("OUTPUT-BLOAT NOTICE: test".to_string());
+        let action = data.make_continue_action("continue".to_string());
+        assert!(action.next_prompt.contains(BLOAT_SECTION_HEADER));
+        // And without the directive the prompt is untouched.
+        let mut plain = overflow_test_data("bloat-choke-test-2", Some("mid-work message"));
+        plain.bloat_directive = None;
+        let plain_action = plain.make_continue_action("continue".to_string());
+        assert!(!plain_action.next_prompt.contains(BLOAT_SECTION_HEADER));
     }
 
     #[test]

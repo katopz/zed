@@ -467,6 +467,7 @@ fn claude_context_overflow_decision(
         connection: None,
         project: None,
         peer_agent_states: crate::peer_states::unmuted_states_for_context(),
+        bloat_directive: None,
     }))
 }
 
@@ -522,6 +523,7 @@ fn claude_decision_needs_llm(
         connection: None,
         project: None,
         peer_agent_states: crate::peer_states::unmuted_states_for_context(),
+        bloat_directive: None,
     })
 }
 
@@ -639,6 +641,7 @@ fn claude_decision_hidden(
         connection: Some(connection),
         project: Some(project),
         peer_agent_states: crate::peer_states::unmuted_states_for_context(),
+        bloat_directive: None,
     })
 }
 
@@ -1765,6 +1768,7 @@ mod tests {
                 connection: Some(connection),
                 project: Some(project),
                 peer_agent_states: None,
+                bloat_directive: None,
             }
         }
 

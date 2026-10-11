@@ -875,6 +875,32 @@ impl AgentThreadEntry {
     }
 }
 
+/// Short human-readable label naming a tool call in the bloat report: the
+/// tool name plus, when present, the first command/path argument so the
+/// report can say "avoid re-running terminal: cargo check …" instead of a
+/// bare tool name.
+fn tool_call_bloat_label(tool_call: &ToolCall) -> String {
+    const MAX_HINT_CHARS: usize = 48;
+    let name = tool_call.tool_name.as_deref().unwrap_or("tool call");
+    let Some(raw_input) = tool_call.raw_input.as_ref() else {
+        return name.to_string();
+    };
+    let hint = ["command", "file_path", "path"]
+        .iter()
+        .find_map(|key| raw_input.get(key).and_then(|value| value.as_str()));
+    let Some(hint) = hint else {
+        return name.to_string();
+    };
+    let hint = hint.trim();
+    let first_line = hint.split_once('\n').map_or(hint, |(line, _)| line);
+    if first_line.chars().count() <= MAX_HINT_CHARS {
+        format!("{name}: {first_line}")
+    } else {
+        let truncated: String = first_line.chars().take(MAX_HINT_CHARS).collect();
+        format!("{name}: {truncated}…")
+    }
+}
+
 #[derive(Debug)]
 pub struct ToolCall {
     pub id: acp::ToolCallId,
@@ -2458,6 +2484,51 @@ impl AcpThread {
             }
         }
         None
+    }
+
+    /// Estimated character footprint of each sizable entry (tool calls and
+    /// assistant messages), in thread order. Tool calls measure their
+    /// raw_input/raw_output JSON; assistant messages measure their markdown
+    /// sources. Used by auto_prompt's bloat detection to name the largest
+    /// space consumers in a thread that died at the output token limit.
+    pub fn bloat_candidates(&self, cx: &App) -> Vec<(String, usize)> {
+        let mut candidates: Vec<(String, usize)> = Vec::new();
+        let json_len = |value: Option<&serde_json::Value>| {
+            value.map(|value| value.to_string().len()).unwrap_or(0)
+        };
+        for entry in &self.entries {
+            match entry {
+                AgentThreadEntry::ToolCall(tool_call) => {
+                    let chars = json_len(tool_call.raw_input.as_ref())
+                        + json_len(tool_call.raw_output.as_ref());
+                    if chars > 0 {
+                        candidates.push((self::tool_call_bloat_label(tool_call), chars));
+                    }
+                }
+                AgentThreadEntry::AssistantMessage(message) => {
+                    let chars: usize = message
+                        .chunks
+                        .iter()
+                        .filter_map(|chunk| match chunk {
+                            AssistantMessageChunk::Message {
+                                block: ContentBlock::Markdown { markdown },
+                                ..
+                            }
+                            | AssistantMessageChunk::Thought {
+                                block: ContentBlock::Markdown { markdown },
+                                ..
+                            } => Some(markdown.read(cx).source().len()),
+                            _ => None,
+                        })
+                        .sum();
+                    if chars > 0 {
+                        candidates.push(("assistant message".to_string(), chars));
+                    }
+                }
+                _ => {}
+            }
+        }
+        candidates
     }
 
     pub fn is_compacting(&self) -> bool {
