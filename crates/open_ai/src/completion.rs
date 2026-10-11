@@ -933,6 +933,20 @@ impl OpenAiEventMapper {
 
                 events.push(Ok(LanguageModelCompletionEvent::Stop(StopReason::ToolUse)));
             }
+            // "length" = output token cap hit mid-generation, "content_filter" =
+            // provider refused. Both must surface as real stop reasons: mapping
+            // them to EndTurn made truncated turns look like normal completions
+            // (no error, no auto-continue, nothing in the transcript).
+            Some("length") => {
+                events.push(Ok(LanguageModelCompletionEvent::Stop(
+                    StopReason::MaxTokens,
+                )));
+            }
+            Some("content_filter") => {
+                events.push(Ok(LanguageModelCompletionEvent::Stop(
+                    StopReason::Refusal,
+                )));
+            }
             Some(stop_reason) => {
                 log::error!("Unexpected OpenAI stop_reason: {stop_reason:?}",);
                 events.push(Ok(LanguageModelCompletionEvent::Stop(StopReason::EndTurn)));

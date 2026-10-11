@@ -1896,8 +1896,24 @@ impl ConversationView {
                     let auto_prompt_enabled = self
                         .thread_view(&session_id)
                         .is_some_and(|tv| tv.read(cx).auto_prompt_enabled);
+                    if !auto_prompt_enabled {
+                        // Every silent skip here is an undebuggable dead chain;
+                        // always name the reason in the log.
+                        log::warn!(
+                            "[auto_prompt] Stopped: chain skipped — auto-prompt disabled on this thread (session={:?}, stop_reason={:?})",
+                            session_id,
+                            stop_reason
+                        );
+                    }
                     if auto_prompt_enabled {
                         let has_in_progress = thread.read(cx).has_in_progress_tool_calls();
+                        if has_in_progress {
+                            log::warn!(
+                                "[auto_prompt] Stopped: chain skipped — tool calls still in progress (session={:?}, stop_reason={:?})",
+                                session_id,
+                                stop_reason
+                            );
+                        }
                         if !has_in_progress {
                             if let Some(task) = crate::auto_prompt::on_thread_stopped(
                                 self,

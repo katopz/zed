@@ -4026,6 +4026,31 @@ impl AcpThread {
                             if is_same_turn {
                                 this.cancel_pending_turn_entries(cx);
                             }
+                            // Toasts and the error banner are transient — without a
+                            // transcript entry a truncated turn leaves no trace once
+                            // they expire and the session reads as a silent stop.
+                            let usage_note = this
+                                .token_usage
+                                .as_ref()
+                                .map(|usage| {
+                                    format!(
+                                        " — {} output tokens used{}",
+                                        usage.output_tokens,
+                                        usage
+                                            .max_output_tokens
+                                            .map(|max| format!(" of {max}"))
+                                            .unwrap_or_default()
+                                    )
+                                })
+                                .unwrap_or_default();
+                            this.push_agent_board_notification(
+                                format!(
+                                    "Turn truncated: the model hit its output token limit{}. \
+                                     Continue the thread to resume where it stopped.",
+                                    usage_note
+                                ),
+                                cx,
+                            );
                             return Err(anyhow!(MaxOutputTokensError));
                         }
 
