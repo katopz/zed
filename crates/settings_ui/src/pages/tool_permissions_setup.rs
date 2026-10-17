@@ -1415,6 +1415,7 @@ mod tests {
             "grep",
             "list_agents_and_models",
             "list_directory",
+            "list_threads",
             "open",
             "read_file",
             "rename_symbol",
@@ -1426,6 +1427,9 @@ mod tests {
             // tool calls inside the spawned thread, not the spawning itself.
             "create_thread",
             "spawn_agent",
+            // Messages run as turns inside the target thread, whose own tool
+            // calls are permission-checked there.
+            "send_message",
             // The verdict reviewer runs in its own thread; permission checks
             // apply to the tools it invokes there, not the negotiation.
             "request_verdict",

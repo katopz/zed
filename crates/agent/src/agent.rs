@@ -8,13 +8,13 @@ mod templates;
 #[cfg(test)]
 mod tests;
 mod thread;
+mod thread_mailbox;
 mod thread_store;
 mod tool_permissions;
 mod tools;
 
 use context_server::ContextServerId;
 pub use db::*;
-use itertools::Itertools;
 pub use native_agent_server::NativeAgentServer;
 pub use pattern_extraction::*;
 pub use sandboxing::{
@@ -24,6 +24,10 @@ pub use sandboxing::{
 pub use shell_command_parser::extract_commands;
 pub use templates::*;
 pub use thread::*;
+pub use thread_mailbox::{
+    ThreadListing, ThreadListingKind, ThreadListingStatus, ThreadMessageDelivery,
+    ThreadMessageOutcome, ThreadMessageRequest,
+};
 pub use thread_store::*;
 pub use tool_permissions::*;
 pub use tools::*;
@@ -416,6 +420,8 @@ pub struct NativeAgent {
     models: LanguageModels,
     /// Handler installed by the UI for `create_thread` / `list_agents_and_models` tools.
     sibling_thread_host: Option<Rc<dyn SiblingThreadHost>>,
+    /// `send_message` mail waiting for its target thread's turn to end.
+    mailboxes: HashMap<acp::SessionId, Vec<thread_mailbox::MailboxMessage>>,
     fs: Arc<dyn Fs>,
     _subscriptions: Vec<Subscription>,
     /// Tracks the lifecycle of global skills directory observation. We
@@ -601,6 +607,7 @@ impl NativeAgent {
                 templates,
                 models: LanguageModels::new(cx),
                 sibling_thread_host: None,
+                mailboxes: HashMap::default(),
                 fs,
                 _subscriptions: subscriptions,
                 skills_state: SkillsState::default(),
@@ -833,6 +840,7 @@ impl NativeAgent {
         let subscriptions = vec![
             cx.subscribe(&thread_handle, Self::handle_thread_title_updated),
             cx.subscribe(&thread_handle, Self::handle_thread_token_usage_updated),
+            cx.subscribe(&acp_thread, Self::handle_acp_thread_event_for_mailbox),
             cx.observe(&thread_handle, move |this, thread, cx| {
                 this.save_thread(thread, cx)
             }),
@@ -1800,6 +1808,7 @@ impl NativeAgent {
 
         let thread = session.thread.clone();
         self.save_thread(thread, cx);
+        self.drop_mailbox(session_id);
         let Some(session) = self.sessions.remove(session_id) else {
             return Task::ready(Ok(()));
         };
@@ -3487,6 +3496,75 @@ impl ThreadEnvironment for NativeThreadEnvironment {
             })?;
         host.list_available_agents(cx)
     }
+
+    fn list_threads(&self, cx: &mut App) -> Result<Vec<ThreadListing>> {
+        let requester = self
+            .thread
+            .upgrade()
+            .context("Thread no longer exists")?
+            .read(cx)
+            .id()
+            .clone();
+        self.agent
+            .upgrade()
+            .context("Agent no longer exists")?
+            .read(cx)
+            .list_threads(&requester, cx)
+    }
+
+    fn send_message_to_thread(
+        &self,
+        request: ThreadMessageRequest,
+        cx: &mut AsyncApp,
+    ) -> Task<Result<ThreadMessageOutcome>> {
+        let agent = self.agent.clone();
+        let sender_thread = self.thread.clone();
+        cx.spawn(async move |cx| {
+            let sender = sender_thread.read_with(cx, |thread, _| thread.id().clone())?;
+            let wait_for_reply = request.wait_for_reply;
+            let (session_id, title, posted) = agent.update(cx, |agent, cx| {
+                agent.post_thread_message(&sender, request, cx)
+            })??;
+
+            let delivery = match posted {
+                thread_mailbox::PostedMessage::Queued { position } => {
+                    ThreadMessageDelivery::Queued { position }
+                }
+                thread_mailbox::PostedMessage::Delivered { turn, thread } => {
+                    // The turn runs detached so cancelling this tool call
+                    // never cancels the recipient's turn.
+                    let (response_tx, response_rx) = oneshot::channel();
+                    cx.spawn(async move |_| {
+                        response_tx.send(turn.await).ok();
+                    })
+                    .detach();
+
+                    let reply = if wait_for_reply {
+                        let response = response_rx
+                            .await
+                            .context("The target thread was dropped")??;
+                        if response.is_some_and(|response| {
+                            response.stop_reason == acp::StopReason::Cancelled
+                        }) {
+                            anyhow::bail!("The target thread's turn was cancelled");
+                        }
+                        thread.read_with(cx, |thread, _| {
+                            thread_mailbox::last_agent_message_text(thread)
+                        })
+                    } else {
+                        None
+                    };
+                    ThreadMessageDelivery::Delivered { reply }
+                }
+            };
+
+            Ok(ThreadMessageOutcome {
+                session_id,
+                title,
+                delivery,
+            })
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -3637,23 +3715,7 @@ impl SubagentHandle for NativeSubagentHandle {
 
             let result = match prompt_result {
                 SubagentPromptResult::Completed => thread.read_with(cx, |thread, _cx| {
-                    thread
-                        .last_message()
-                        .and_then(|message| {
-                            let content = message.as_agent_message()?
-                                .content
-                                .iter()
-                                .filter_map(|c| match c {
-                                    AgentMessageContent::Text(text) => Some(text.as_str()),
-                                    _ => None,
-                                })
-                                .join("\n\n");
-                            if content.is_empty() {
-                                None
-                            } else {
-                                Some( content)
-                            }
-                        })
+                    thread_mailbox::last_agent_message_text(thread)
                         .context("No response from subagent")
                 }),
                 SubagentPromptResult::Cancelled => Err(anyhow!("User canceled")),

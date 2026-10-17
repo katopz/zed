@@ -2,9 +2,10 @@ use crate::{
     ApplyCodeActionTool, AskUserTool, CodeActionStore, ContextServerRegistry, CopyPathTool,
     CreateDirectoryTool, CreateThreadTool, DbLanguageModel, DbThread, DeletePathTool,
     DiagnosticsTool, EditFileTool, FetchTool, FindPathTool, FindReferencesTool, GetCodeActionsTool,
-    GoToDefinitionTool, GrepTool, ListAgentsAndModelsTool, ListDirectoryTool, MovePathTool,
-    ProjectSnapshot, ReadFileTool, RenameTool, RequestVerdictTool, SandboxedTerminalTool,
-    SpawnAgentTool, SystemPromptTemplate, Template, Templates, TerminalTool,
+    GoToDefinitionTool, GrepTool, ListAgentsAndModelsTool, ListDirectoryTool, ListThreadsTool,
+    MovePathTool, ProjectSnapshot, ReadFileTool, RenameTool, RequestVerdictTool,
+    SandboxedTerminalTool, SendMessageTool, SpawnAgentTool, SystemPromptTemplate, Template,
+    Templates, TerminalTool, ThreadListing, ThreadMessageOutcome, ThreadMessageRequest,
     ToolPermissionDecision, WebSearchTool, WriteFileTool, decide_permission_from_settings,
 };
 use acp_thread::{ClientUserMessageId, MentionUri};
@@ -861,6 +862,28 @@ pub trait ThreadEnvironment {
         Err(anyhow::anyhow!(
             "Listing available agents is not supported in this environment"
         ))
+    }
+
+    /// Lists live threads in this project that `send_message_to_thread` can reach.
+    fn list_threads(&self, cx: &mut App) -> Result<Vec<ThreadListing>> {
+        let _ = cx;
+        Err(anyhow::anyhow!(
+            "Listing threads is not supported in this environment"
+        ))
+    }
+
+    /// Delivers a message to another live thread: immediately when it is idle,
+    /// otherwise once its current turn ends.
+    fn send_message_to_thread(
+        &self,
+        request: ThreadMessageRequest,
+        cx: &mut AsyncApp,
+    ) -> Task<Result<ThreadMessageOutcome>> {
+        let _ = request;
+        let _ = cx;
+        Task::ready(Err(anyhow::anyhow!(
+            "Messaging other threads is not supported in this environment"
+        )))
     }
 }
 
@@ -2290,7 +2313,9 @@ impl Thread {
         // to the model is gated by `CreateThreadToolFeatureFlag` in
         // `Thread::enabled_tools`.
         self.add_tool(CreateThreadTool::new(environment.clone()));
-        self.add_tool(ListAgentsAndModelsTool::new(environment));
+        self.add_tool(ListAgentsAndModelsTool::new(environment.clone()));
+        self.add_tool(ListThreadsTool::new(environment.clone()));
+        self.add_tool(SendMessageTool::new(environment));
     }
 
     pub fn add_tool<T: AgentTool>(&mut self, tool: T) {
