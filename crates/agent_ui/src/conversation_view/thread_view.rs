@@ -6606,23 +6606,53 @@ impl ThreadView {
         }
     }
 
-    fn verdict_request_prompt(max_rounds: usize, addition: Option<&str>) -> String {
+    /// "Verdict with <provider>" for the secondary reviewer, or `None` when
+    /// `agent.verdict_secondary_model` is unset (entry hidden).
+    fn secondary_verdict_label(cx: &App) -> Option<SharedString> {
+        AgentSettings::get_global(cx)
+            .verdict_secondary_model
+            .as_ref()
+            .map(|model| format!("Verdict with {}", model.provider.0).into())
+    }
+
+    fn verdict_request_prompt(
+        max_rounds: usize,
+        reviewer: agent::RequestedReviewer,
+        addition: Option<&str>,
+    ) -> String {
+        let reviewer_argument = match reviewer {
+            agent::RequestedReviewer::Default => "",
+            agent::RequestedReviewer::Secondary => {
+                " Pass `reviewer: \"secondary\"` on EVERY call of this negotiation."
+            }
+        };
         let mut prompt = format!(
             "Request a second-opinion verdict on your latest `## Summary` from a fresh reviewer thread:\n\n\
              1. Call the `request_verdict` tool with a message containing your complete `## Summary` \
              plus this instruction: \"Reply with a verdict that MUST start with `#Verdict: AGREE` or \
-             `#Verdict: REVISE` followed by bullet-point reasons.\" Include any file paths or plan \
-             state the reviewer needs \u{2014} it cannot see this conversation.\n\
+             `#Verdict: REVISE` followed by bullet-point reasons. If the summary lists owner-gated \
+             items, also add an `#OwnerGate` section with exactly one decision per item: \
+             `- <item>: DO <concrete action> | SKIP | DEFER \u{2014} <reason>`.\" Include any file \
+             paths or plan state the reviewer needs \u{2014} it cannot see this conversation.\
+             {reviewer_argument}\n\
              2. If the reply starts with `#Verdict: REVISE`, address every reason with evidence, then \
              call `request_verdict` again with the SAME `session_id` so the negotiation continues in \
              the same thread. Never start a new session mid-negotiation.\n\
              3. When the reviewer replies `#Verdict: AGREE` and you agree with it, close the \
              negotiation: reply `#Verdict: AGREE` yourself and state that both sides agree, \
              so no more verdict rounds are needed. Restate the final agreed summary in the \
-             `## Summary` format and stop \u{2014} pass `final_round: true` on that closing call so \
+             `## Summary` format \u{2014} pass `final_round: true` on that closing call so \
              the reviewer session is freed.\n\
              4. Hard cap: {max_rounds} rounds. If you reach the cap, stop calling the tool and \
-             present the remaining disagreement to the user."
+             present the remaining disagreement to the user.\n\
+             5. Owner-gated work: do not stall on items you parked as owner-gated. Before round 1, \
+             list every owner-gated or 'needs owner decision' item from your summary in the \
+             message. After the negotiation closes, carry out each `#OwnerGate` decision the \
+             reviewer gave (`DO` \u{2192} do it now, `SKIP`/`DEFER` \u{2192} record it in the plan) \
+             instead of stopping. Only actions that are destructive, irreversible, spend money, or \
+             publish outside this machine (deleting data, force-push, external posts) stay with \
+             the user \u{2014} list those explicitly. Whether the reply carries a verdict, \
+             owner-gate decisions, or both depends on your summary; handle whatever it contains."
         );
         if let Some(addition) = addition.map(str::trim).filter(|text| !text.is_empty()) {
             prompt.push_str("\n\n## User addition\n\n");
@@ -6635,7 +6665,12 @@ impl ThreadView {
         prompt
     }
 
-    fn handle_request_verdict_click(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn handle_request_verdict_click(
+        &mut self,
+        reviewer: agent::RequestedReviewer,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // Whatever the user typed in the chat input rides along as a user
         // addition, and is consumed (cleared) like a normal send.
         let addition = {
@@ -6647,11 +6682,12 @@ impl ThreadView {
             self.message_editor
                 .update(cx, |editor, cx| editor.clear(window, cx));
         }
-        self.request_verdict(addition, window, cx);
+        self.request_verdict(reviewer, addition, window, cx);
     }
 
     fn request_verdict(
         &mut self,
+        reviewer: agent::RequestedReviewer,
         addition: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -6664,7 +6700,7 @@ impl ThreadView {
         }
 
         let max_rounds = AgentSettings::get_global(cx).verdict_max_rounds;
-        let prompt = Self::verdict_request_prompt(max_rounds, addition.as_deref());
+        let prompt = Self::verdict_request_prompt(max_rounds, reviewer, addition.as_deref());
         let contents_task = Task::ready(anyhow::Ok(Some((
             vec![acp::ContentBlock::Text(acp::TextContent::new(prompt))],
             Vec::new(),
@@ -8155,26 +8191,44 @@ impl ThreadView {
         // Root views only (subagents can't spawn reviewers) of native agent
         // threads (external agents don't have `request_verdict`); set
         // agent.verdict_ping_pong = false to hide it.
-        let verdict_button = (AgentSettings::get_global(cx).verdict_ping_pong
+        let verdict_available = AgentSettings::get_global(cx).verdict_ping_pong
             && !self.is_subagent()
-            && thread.read(cx).connection().agent_id().as_ref() == agent::ZED_AGENT_ID.as_ref())
-        .then(|| {
-            copy_response_index.filter(|&response_index| {
+            && thread.read(cx).connection().agent_id().as_ref() == agent::ZED_AGENT_ID.as_ref()
+            && copy_response_index.is_some_and(|response_index| {
                 Self::get_agent_summary_content(thread.read(cx).entries(), response_index, cx)
                     .is_some()
-            })
-        })
-        .flatten()
-        .map(|_| {
+            });
+        let verdict_button = verdict_available.then(|| {
             IconButton::new(("request-verdict", entry_ix), IconName::Person)
                 .icon_size(IconSize::Small)
                 .icon_color(Color::Muted)
                 .disabled(is_generating)
                 .tooltip(Tooltip::text(Self::verdict_label(cx)))
                 .on_click(cx.listener(move |this, _, window, cx| {
-                    this.handle_request_verdict_click(window, cx);
+                    this.handle_request_verdict_click(
+                        agent::RequestedReviewer::Default,
+                        window,
+                        cx,
+                    );
                 }))
         });
+        let secondary_verdict_button = verdict_available
+            .then(|| Self::secondary_verdict_label(cx))
+            .flatten()
+            .map(|label| {
+                IconButton::new(("request-secondary-verdict", entry_ix), IconName::UserGroup)
+                    .icon_size(IconSize::Small)
+                    .icon_color(Color::Muted)
+                    .disabled(is_generating)
+                    .tooltip(Tooltip::text(label))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.handle_request_verdict_click(
+                            agent::RequestedReviewer::Secondary,
+                            window,
+                            cx,
+                        );
+                    }))
+            });
 
         let scroll_to_recent_user_prompt = IconButton::new(
             ("scroll_to_recent_user_prompt", entry_ix),
@@ -8317,6 +8371,7 @@ impl ThreadView {
             .when_some(feedback_buttons, |this, buttons| this.child(buttons))
             .when_some(copy_summary_button, |this, button| this.child(button))
             .when_some(verdict_button, |this, button| this.child(button))
+            .when_some(secondary_verdict_button, |this, button| this.child(button))
             .when_some(copy_response_button, |this, button| this.child(button))
             .child(manual_auto_prompt_button)
             .child(scroll_to_recent_user_prompt)
@@ -9720,20 +9775,29 @@ impl ThreadView {
                             }
                         });
 
-                    let verdict_entry = ContextMenuEntry::new(Self::verdict_label(cx))
-                        .disabled(!verdict_ready)
-                        .handler({
-                            let entity = entity.clone();
-                            move |window, cx| {
-                                let addition = entity
-                                    .read(cx)
-                                    .selected_text_for_entry(entry_ix, cx)
-                                    .or(verdict_addition.clone());
-                                entity.update(cx, |this, cx| {
-                                    this.request_verdict(addition, window, cx);
-                                });
-                            }
-                        });
+                    let verdict_entry = |label: SharedString, reviewer| {
+                        ContextMenuEntry::new(label)
+                            .disabled(!verdict_ready)
+                            .handler({
+                                let entity = entity.clone();
+                                let verdict_addition = verdict_addition.clone();
+                                move |window, cx| {
+                                    let addition = entity
+                                        .read(cx)
+                                        .selected_text_for_entry(entry_ix, cx)
+                                        .or(verdict_addition.clone());
+                                    entity.update(cx, |this, cx| {
+                                        this.request_verdict(reviewer, addition, window, cx);
+                                    });
+                                }
+                            })
+                    };
+                    let primary_verdict_entry = verdict_entry(
+                        Self::verdict_label(cx).into(),
+                        agent::RequestedReviewer::Default,
+                    );
+                    let secondary_verdict_entry = Self::secondary_verdict_label(cx)
+                        .map(|label| verdict_entry(label, agent::RequestedReviewer::Secondary));
 
                     menu.when_some(focus, |menu, focus| menu.context(focus))
                         .when_some(context_menu_link, |menu, url| {
@@ -9748,7 +9812,10 @@ impl ThreadView {
                             Box::new(markdown::CopyAsMarkdown),
                         )
                         .item(copy_this_agent_response)
-                        .when(verdict_gate, |menu| menu.item(verdict_entry))
+                        .when(verdict_gate, |menu| {
+                            menu.item(primary_verdict_entry)
+                                .when_some(secondary_verdict_entry, |menu, entry| menu.item(entry))
+                        })
                         .separator()
                         .item(scroll_item)
                         .item(open_thread_as_markdown)

@@ -581,6 +581,7 @@ mod tests {
             verdict_model: None,
             verdict_max_rounds: 3,
             verdict_reviewer: settings::VerdictReviewerSetting::default(),
+            verdict_secondary_model: None,
             inline_assistant_model: None,
             inline_assistant_use_streaming_tools: false,
             commit_message_model: None,

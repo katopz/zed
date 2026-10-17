@@ -3215,15 +3215,18 @@ impl NativeThreadEnvironment {
         self.create_subagent_thread_inner(label, None, cx)
     }
 
-    /// Creates a subagent pinned to the configured `verdict_model` (falls back
-    /// to the parent thread's model when unset). Used by the `request_verdict`
-    /// tool so the reviewer can be a different model than the worker.
+    /// Creates a subagent pinned to `model_override` (the secondary reviewer),
+    /// else the configured `verdict_model`, else the parent thread's model.
+    /// Used by the `request_verdict` tool so the reviewer can be a different
+    /// model than the worker.
     pub(crate) fn create_verdict_subagent_thread(
         &self,
         label: String,
+        model_override: Option<LanguageModelSelection>,
         cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>> {
-        let model = AgentSettings::get_global(cx).verdict_model.clone();
+        let model =
+            model_override.or_else(|| AgentSettings::get_global(cx).verdict_model.clone());
         self.create_subagent_thread_inner(label, model, cx)
     }
 
@@ -3440,9 +3443,10 @@ impl ThreadEnvironment for NativeThreadEnvironment {
     fn create_verdict_subagent(
         &self,
         label: String,
+        model_override: Option<LanguageModelSelection>,
         cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>> {
-        self.create_verdict_subagent_thread(label, cx)
+        self.create_verdict_subagent_thread(label, model_override, cx)
     }
 
     fn project(&self, cx: &App) -> Option<Entity<Project>> {

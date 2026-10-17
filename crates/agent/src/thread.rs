@@ -818,12 +818,14 @@ pub trait ThreadEnvironment {
         None
     }
 
-    /// Creates a subagent pinned to the configured `verdict_model` for the
-    /// `request_verdict` ping-pong (proposal 001). Environments that don't
-    /// support verdict negotiations reject the call.
+    /// Creates a subagent for the `request_verdict` ping-pong (proposal 001),
+    /// pinned to `model_override` when given, else the configured
+    /// `verdict_model`. Environments that don't support verdict negotiations
+    /// reject the call.
     fn create_verdict_subagent(
         &self,
         _label: String,
+        _model_override: Option<LanguageModelSelection>,
         _cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>> {
         Err(anyhow::anyhow!(

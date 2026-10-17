@@ -260,6 +260,14 @@ pub struct AgentSettingsContent {
     ///
     /// Default: native
     pub verdict_reviewer: Option<VerdictReviewerSetting>,
+    /// A second reviewer model offered next to the primary verdict entry
+    /// ("Verdict with <provider>", e.g. GLM). When set, `request_verdict`
+    /// accepts `reviewer: "secondary"` and runs the review as a native
+    /// subagent pinned to this model, so multi-key providers rotate keys as
+    /// usual. Unset hides the secondary entry.
+    ///
+    /// Default: null
+    pub verdict_secondary_model: Option<LanguageModelSelection>,
     /// Favorite models to show at the top of the model selector.
     #[serde(default)]
     pub favorite_models: Vec<LanguageModelSelection>,

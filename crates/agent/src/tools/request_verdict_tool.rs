@@ -8,7 +8,7 @@ use gpui::{App, SharedString, Task};
 use language_model::LanguageModelToolResultContent;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use settings::{Settings as _, VerdictReviewerSetting};
+use settings::{LanguageModelSelection, Settings as _, VerdictReviewerSetting};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -36,10 +36,17 @@ use crate::{AgentTool, ThreadEnvironment, ToolCallEventStream, ToolInput};
 /// - Rounds are capped (`agent.verdict_max_rounds`, default 3). When the cap
 ///   is hit the tool refuses further calls — present the remaining
 ///   disagreement to the user instead of looping.
+/// - Owner-gated items: when your summary parks work as owner-gated, list
+///   each item and ask the reviewer to add an `#OwnerGate` section with one
+///   decision per item. Act on those decisions afterwards instead of stopping
+///   on them, unless the action is destructive, irreversible, or outward-facing.
 ///
-/// The reviewer backend is `agent.verdict_reviewer`: `native` (a subagent
-/// pinned to `agent.verdict_model`) or `claude_code` (an off-screen Claude
-/// Code session using its own subscription auth).
+/// The default reviewer backend is `agent.verdict_reviewer`: `native` (a
+/// subagent pinned to `agent.verdict_model`) or `claude_code` (an off-screen
+/// Claude Code session using its own subscription auth). Pass
+/// `reviewer: "secondary"` only when the user asked for the secondary
+/// reviewer (`agent.verdict_secondary_model`, e.g. GLM); keep the same value
+/// for every round of a negotiation.
 ///
 /// ### Output
 /// - You receive only the reviewer's final message for this round, plus the
@@ -62,6 +69,21 @@ pub struct RequestVerdictToolInput {
     /// so the reviewer session is freed. Omit on every other round.
     #[serde(default)]
     pub final_round: bool,
+    /// Which reviewer runs the negotiation. Omit for the default reviewer;
+    /// `secondary` only when the user asked for it.
+    #[serde(default)]
+    pub reviewer: RequestedReviewer,
+}
+
+/// Reviewer requested by the worker for a `request_verdict` negotiation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestedReviewer {
+    /// The backend selected by `agent.verdict_reviewer`.
+    #[default]
+    Default,
+    /// A native subagent pinned to `agent.verdict_secondary_model`.
+    Secondary,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -145,6 +167,8 @@ impl RequestVerdictTool {
 enum ReviewerRoute {
     /// Subagent spawned through the environment (phase 1-4 path).
     Native,
+    /// Native subagent pinned to `agent.verdict_secondary_model`.
+    Secondary(LanguageModelSelection),
     /// External reviewer session spawned via the registered provider (phase 6).
     External(ReviewerLabel),
 }
@@ -181,6 +205,26 @@ fn resolve_route(
     }
 }
 
+/// Routes a negotiation by the worker's requested reviewer. A `secondary`
+/// request without `verdict_secondary_model` is an error, never a fallback
+/// to the default reviewer — the user explicitly asked for a different model.
+fn resolve_requested_route(
+    requested: RequestedReviewer,
+    setting: &VerdictReviewerSetting,
+    secondary_model: Option<LanguageModelSelection>,
+    provider: Option<Arc<dyn VerdictReviewer>>,
+) -> Result<ReviewerRoute, String> {
+    match requested {
+        RequestedReviewer::Default => resolve_route(setting, provider),
+        RequestedReviewer::Secondary => match secondary_model {
+            Some(model) => Ok(ReviewerRoute::Secondary(model)),
+            None => Err("reviewer is secondary but agent.verdict_secondary_model is not set \
+                 — set it (e.g. a GLM model) or omit `reviewer`"
+                .to_string()),
+        },
+    }
+}
+
 fn error_output(
     session_id: Option<acp::SessionId>,
     error: String,
@@ -200,6 +244,7 @@ fn error_output(
 fn route_label(route: &ReviewerRoute) -> String {
     match route {
         ReviewerRoute::Native => "native".to_string(),
+        ReviewerRoute::Secondary(model) => format!("secondary:{}/{}", model.provider.0, model.model),
         ReviewerRoute::External(label) => label.0.to_string(),
     }
 }
@@ -255,14 +300,16 @@ impl AgentTool for RequestVerdictTool {
                     session_info: None,
                 })?;
 
-            let (verdict_enabled, max_rounds, reviewer_setting) = cx.update(|cx| {
-                let settings = AgentSettings::get_global(cx);
-                (
-                    settings.verdict_ping_pong,
-                    settings.verdict_max_rounds,
-                    settings.verdict_reviewer.clone(),
-                )
-            });
+            let (verdict_enabled, max_rounds, reviewer_setting, secondary_model) =
+                cx.update(|cx| {
+                    let settings = AgentSettings::get_global(cx);
+                    (
+                        settings.verdict_ping_pong,
+                        settings.verdict_max_rounds,
+                        settings.verdict_reviewer.clone(),
+                        settings.verdict_secondary_model.clone(),
+                    )
+                });
 
             // GOAT gate (proposal 001 phase 5): user-invoked only, so the
             // gate defaults on — it exists as the demote path while the
@@ -276,7 +323,12 @@ impl AgentTool for RequestVerdictTool {
                 ));
             }
 
-            let route = match resolve_route(&reviewer_setting, verdict::reviewer()) {
+            let route = match resolve_requested_route(
+                input.reviewer,
+                &reviewer_setting,
+                secondary_model,
+                verdict::reviewer(),
+            ) {
                 Ok(route) => route,
                 Err(error) => {
                     return Err(error_output(
@@ -301,7 +353,9 @@ impl AgentTool for RequestVerdictTool {
                      disagreement to the user"
                 );
                 match &route {
-                    ReviewerRoute::Native => verdict::complete(&session_id),
+                    ReviewerRoute::Native | ReviewerRoute::Secondary(_) => {
+                        verdict::complete(&session_id)
+                    }
                     ReviewerRoute::External(_) => {
                         cx.update(|cx| verdict::complete_reviewer(&session_id, cx));
                     }
@@ -316,15 +370,22 @@ impl AgentTool for RequestVerdictTool {
 
             let mut route = route;
             let reply = match &route {
-                ReviewerRoute::Native => {
+                ReviewerRoute::Native | ReviewerRoute::Secondary(_) => {
+                    let model_override = match &route {
+                        ReviewerRoute::Secondary(model) => Some(model.clone()),
+                        _ => None,
+                    };
                     let subagent = cx.update(|cx| {
                         if let Some(session_id) = input.session_id.clone() {
                             self.environment.resume_subagent(session_id, cx)
                         } else {
-                            self.environment
-                                .create_verdict_subagent(input.label.clone(), cx)
+                            self.environment.create_verdict_subagent(
+                                input.label.clone(),
+                                model_override,
+                                cx,
+                            )
                         }
-                        .map_err(|err| error_output(None, err.to_string(), "native".into(), None))
+                        .map_err(|err| error_output(None, err.to_string(), route_label(&route), None))
                     });
                     let subagent = match subagent {
                         Ok(subagent) => subagent,
@@ -343,7 +404,7 @@ impl AgentTool for RequestVerdictTool {
                             return Err(error_output(
                                 Some(session_id.clone()),
                                 error,
-                                "native".into(),
+                                route_label(&route),
                                 Some(SubagentSessionInfo {
                                     session_id,
                                     message_start_index,
@@ -483,7 +544,7 @@ impl AgentTool for RequestVerdictTool {
                 SUBAGENT_SESSION_INFO_META_KEY.into(),
                 serde_json::json!(&session_info),
             )]));
-            if matches!(route, ReviewerRoute::Native) {
+            if matches!(route, ReviewerRoute::Native | ReviewerRoute::Secondary(_)) {
                 event_stream.subagent_spawned(session_id.clone());
                 event_stream
                     .update_fields_with_meta(acp::ToolCallUpdateFields::new(), meta.clone());
@@ -635,6 +696,62 @@ mod tests {
             Ok(ReviewerRoute::External(label)) => assert_eq!(label.0, "unavailable"),
             other => panic!("expected external route, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn secondary_reviewer_routes_to_its_model_and_never_falls_back() {
+        let input: RequestVerdictToolInput = serde_json::from_value(json!({
+            "label": "label",
+            "message": "message",
+        }))
+        .unwrap();
+        assert_eq!(input.reviewer, RequestedReviewer::Default);
+
+        let input: RequestVerdictToolInput = serde_json::from_value(json!({
+            "label": "label",
+            "message": "message",
+            "reviewer": "secondary",
+        }))
+        .unwrap();
+        assert_eq!(input.reviewer, RequestedReviewer::Secondary);
+
+        let glm = LanguageModelSelection {
+            provider: settings::LanguageModelProviderSetting("GLM".to_string()),
+            model: "glm-5.3".to_string(),
+            enable_thinking: false,
+            effort: None,
+            speed: None,
+        };
+        let route = resolve_requested_route(
+            RequestedReviewer::Secondary,
+            &VerdictReviewerSetting::ClaudeCode,
+            Some(glm.clone()),
+            None,
+        )
+        .expect("secondary model is configured");
+        assert_eq!(route_label(&route), "secondary:GLM/glm-5.3");
+        assert_eq!(route, ReviewerRoute::Secondary(glm));
+
+        // Unset secondary model must error rather than silently using the
+        // default reviewer the user did not pick.
+        let error = resolve_requested_route(
+            RequestedReviewer::Secondary,
+            &VerdictReviewerSetting::Native,
+            None,
+            None,
+        )
+        .expect_err("secondary requires verdict_secondary_model");
+        assert!(error.contains("verdict_secondary_model"));
+
+        assert_eq!(
+            resolve_requested_route(
+                RequestedReviewer::Default,
+                &VerdictReviewerSetting::Native,
+                None,
+                None,
+            ),
+            Ok(ReviewerRoute::Native)
+        );
     }
 
     #[test]
