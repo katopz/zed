@@ -106,6 +106,19 @@ mv Cargo.toml.backup Cargo.toml
 popd
 echo "Bundled ${app_path}"
 
+# Volumes without native extended attributes (exFAT, FAT, some network shares) store them in
+# AppleDouble `._*` files, which `codesign --deep` rejects as unsigned subcomponents. Finish the
+# bundle on a local temp dir instead; `ditto` folds the `._*` files back into real attributes.
+bundle_staging_directory=""
+if [[ -n "$(find "${app_path}" -name '._*' -print -quit)" ]]; then
+    bundle_staging_directory=$(mktemp -d)
+    staged_app_path="${bundle_staging_directory}/$(basename "${app_path}")"
+    echo "Bundle volume stores AppleDouble files; finishing bundle in ${bundle_staging_directory}"
+    ditto "${app_path}" "${staged_app_path}"
+    rm -rf "${app_path}"
+    app_path="${staged_app_path}"
+fi
+
 # DocumentTypes.plist references CFBundleTypeIconFile "Document", so the bundle must contain Document.icns.
 # We use the app icon as a placeholder document icon for now.
 document_icon_source="crates/zed/resources/Document.icns"
@@ -244,7 +257,7 @@ function sign_app_binaries() {
         fi
     else
         dmg_target_directory="target/${target_triple}/${target_dir}"
-        dmg_source_directory="${dmg_target_directory}/dmg"
+        dmg_source_directory="${bundle_staging_directory:-$dmg_target_directory}/dmg"
         dmg_file_path="${dmg_target_directory}/Zed-${arch_suffix}.dmg"
         xcode_bin_dir_path="$(xcode-select -p)/usr/bin"
 
