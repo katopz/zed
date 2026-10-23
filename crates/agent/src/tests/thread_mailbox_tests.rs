@@ -188,6 +188,67 @@ async fn test_send_message_tool_waits_for_idle_reply(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_list_threads_tool_runs_during_turn(cx: &mut TestAppContext) {
+    let (agent, threads) = setup_threads(2, cx).await;
+    let [sender, recipient] = threads.as_slice() else {
+        panic!("expected two threads");
+    };
+
+    let sender_turn = sender
+        .acp_thread
+        .update(cx, |thread, cx| thread.send_raw("List the threads", cx));
+    cx.run_until_parked();
+
+    let tool_input = json!({});
+    sender
+        .model
+        .send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(
+            LanguageModelToolUse {
+                id: "list_1".into(),
+                name: ListThreadsTool::NAME.into(),
+                raw_input: tool_input.to_string(),
+                input: language_model::LanguageModelToolUseInput::Json(tool_input),
+                is_input_complete: true,
+                thought_signature: None,
+            },
+        ));
+    sender.model.end_last_completion_stream();
+    cx.run_until_parked();
+
+    let follow_up = sender.model.pending_completions();
+    assert_eq!(follow_up.len(), 1);
+    let tool_result = follow_up[0]
+        .messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .find_map(|content| match content {
+            MessageContent::ToolResult(result) => Some(result.content.clone()),
+            _ => None,
+        })
+        .expect("list_threads tool result");
+    let tool_result = tool_result
+        .iter()
+        .map(|content| match content {
+            language_model::LanguageModelToolResultContent::Text(text) => text.to_string(),
+            other => panic!("unexpected tool result {other:?}"),
+        })
+        .collect::<String>();
+    assert!(
+        tool_result.contains(&format!("\"session_id\":\"{}\"", sender.session_id)),
+        "{tool_result}"
+    );
+    assert!(tool_result.contains("\"kind\":\"self\""), "{tool_result}");
+    assert!(
+        tool_result.contains(&format!("\"session_id\":\"{}\"", recipient.session_id)),
+        "{tool_result}"
+    );
+
+    sender.model.end_last_completion_stream();
+    sender_turn.await.unwrap();
+    assert!(agent.read_with(cx, |agent, _| agent.mailboxes.is_empty()));
+}
+
+#[gpui::test]
 async fn test_thread_cannot_message_itself(cx: &mut TestAppContext) {
     let (agent, threads) = setup_threads(1, cx).await;
     let thread = &threads[0];
