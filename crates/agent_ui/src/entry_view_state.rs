@@ -421,8 +421,14 @@ impl EntryViewState {
                 }
             }
             AgentThreadEntry::AgentBoardNotification(_) => {
-                // Notifications are stateless display-only cards — no
-                // EntryViewState slot is needed.
+                // Stateless display-only card, but the vec is indexed densely
+                // 1:1 with thread entries, so it still needs its own slot.
+                if !matches!(
+                    self.entries.get(index),
+                    Some(Entry::AgentBoardNotification)
+                ) {
+                    self.set_entry(index, Entry::AgentBoardNotification);
+                }
             }
         };
     }
@@ -471,7 +477,8 @@ impl EntryViewState {
                 | Entry::AssistantMessage { .. }
                 | Entry::Elicitation { .. }
                 | Entry::CompletedPlan
-                | Entry::ContextCompaction => {}
+                | Entry::ContextCompaction
+                | Entry::AgentBoardNotification => {}
                 Entry::ToolCall(ToolCallEntry { content, .. }) => {
                     for view in content.values() {
                         if let Ok(diff_editor) = view.clone().downcast::<Editor>() {
@@ -542,6 +549,7 @@ pub enum Entry {
     Elicitation { focus_handle: FocusHandle },
     CompletedPlan,
     ContextCompaction,
+    AgentBoardNotification,
 }
 
 impl Entry {
@@ -551,7 +559,7 @@ impl Entry {
             Self::AssistantMessage(message) => Some(message.focus_handle.clone()),
             Self::ToolCall(tool_call) => Some(tool_call.focus_handle.clone()),
             Self::Elicitation { focus_handle } => Some(focus_handle.clone()),
-            Self::CompletedPlan | Self::ContextCompaction => None,
+            Self::CompletedPlan | Self::ContextCompaction | Self::AgentBoardNotification => None,
         }
     }
 
@@ -562,7 +570,8 @@ impl Entry {
             | Self::ToolCall(_)
             | Self::Elicitation { .. }
             | Self::CompletedPlan
-            | Self::ContextCompaction => None,
+            | Self::ContextCompaction
+            | Self::AgentBoardNotification => None,
         }
     }
 
@@ -593,7 +602,8 @@ impl Entry {
             | Self::ToolCall(_)
             | Self::Elicitation { .. }
             | Self::CompletedPlan
-            | Self::ContextCompaction => None,
+            | Self::ContextCompaction
+            | Self::AgentBoardNotification => None,
         }
     }
 
@@ -612,7 +622,8 @@ impl Entry {
             | Self::AssistantMessage(_)
             | Self::Elicitation { .. }
             | Self::CompletedPlan
-            | Self::ContextCompaction => false,
+            | Self::ContextCompaction
+            | Self::AgentBoardNotification => false,
         }
     }
 }
@@ -630,7 +641,9 @@ impl Focusable for Entry {
             Self::AssistantMessage(message) => message.focus_handle.clone(),
             Self::ToolCall(tool_call) => tool_call.focus_handle.clone(),
             Self::Elicitation { focus_handle } => focus_handle.clone(),
-            Self::CompletedPlan | Self::ContextCompaction => cx.focus_handle(),
+            Self::CompletedPlan | Self::ContextCompaction | Self::AgentBoardNotification => {
+                cx.focus_handle()
+            }
         }
     }
 }
@@ -925,6 +938,91 @@ mod tests {
             assert!(matches!(
                 view_state.entry(1),
                 Some(Entry::AssistantMessage(_))
+            ));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_board_notification_keeps_entry_slots_dense(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", json!({})).await;
+        let project = Project::test(fs, [Path::new(path!("/project"))], cx).await;
+
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+        let connection = Rc::new(StubAgentConnection::new());
+        let thread = cx
+            .update(|_, cx| {
+                connection.clone().new_session(
+                    project.clone(),
+                    PathList::new(&[Path::new(path!("/project"))]),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        let session_id = thread.update(cx, |thread, _| thread.session_id().clone());
+
+        cx.update(|_, cx| {
+            connection.send_update(
+                session_id.clone(),
+                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                    acp::ContentBlock::Text(acp::TextContent::new("hello")),
+                )),
+                cx,
+            );
+        });
+        thread.update(cx, |thread, cx| {
+            thread.push_agent_board_notification("peer status update", cx)
+        });
+        let _response_task = thread.update(cx, |thread, cx| {
+            thread
+                .request_elicitation(
+                    acp::CreateElicitationRequest::new(
+                        acp::ElicitationFormMode::new(
+                            acp::ElicitationSessionScope::new(session_id.clone()),
+                            acp::ElicitationSchema::new().string("name", true),
+                        ),
+                        "Provide a name",
+                    ),
+                    cx,
+                )
+                .unwrap()
+        });
+        assert_eq!(thread.read_with(cx, |thread, _| thread.entries().len()), 3);
+
+        let view_state = cx.new(|_cx| {
+            EntryViewState::new(
+                workspace.downgrade(),
+                project.downgrade(),
+                None,
+                Arc::new(RwLock::new(SessionCapabilities::default())),
+                "Test Agent".into(),
+            )
+        });
+
+        view_state.update_in(cx, |view_state, window, cx| {
+            view_state.sync_entry(0, &thread, window, cx);
+            view_state.sync_entry(1, &thread, window, cx);
+            view_state.sync_entry(2, &thread, window, cx);
+        });
+
+        view_state.read_with(cx, |view_state, _cx| {
+            assert!(matches!(
+                view_state.entry(0),
+                Some(Entry::AssistantMessage(_))
+            ));
+            assert!(matches!(
+                view_state.entry(1),
+                Some(Entry::AgentBoardNotification)
+            ));
+            assert!(matches!(
+                view_state.entry(2),
+                Some(Entry::Elicitation { .. })
             ));
         });
     }
