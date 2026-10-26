@@ -67,3 +67,4 @@ crates/docs_preprocessor/actions.json
 ._*
 
 .local*
+.refine/
