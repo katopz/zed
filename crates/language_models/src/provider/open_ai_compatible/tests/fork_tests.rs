@@ -2,6 +2,9 @@
 //! do not conflict on them (plan 038).
 
 use super::*;
+use health::KeyHealth;
+use std::future::Future;
+use std::pin::Pin;
 
 /// Minimal `CredentialsProvider` impl for unit tests; not actually read
 /// since these tests construct `State` directly without going through

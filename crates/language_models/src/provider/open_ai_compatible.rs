@@ -65,54 +65,6 @@ pub struct OpenAiCompatibleLanguageModelProvider {
     request_limiters: ModelRateLimiters,
 }
 
-pub struct State {
-    id: Arc<str>,
-    pub api_key_state: ApiKeyState,
-    api_key_state_2: ApiKeyState,
-    api_key_state_3: ApiKeyState,
-    api_key_state_4: ApiKeyState,
-    /// Shared across threads so the request closure (background executor) can
-    /// record outcomes without going through GPUI's `Entity::update`.
-    /// `parking_lot::Mutex` (not `std::sync::Mutex`) because the background
-    /// executor's thread pool contends here on every inference request, and
-    /// `parking_lot` spins before parking the OS thread — measurably better
-    /// under subagent fan-out.
-    key_health: Arc<ParkingMutex<KeyHealthTracker>>,
-    /// Latest pending debounced save task. Replacing this cancels the prior
-    /// task, coalescing bursts of failures into a single disk write.
-    key_health_dirty: Arc<ParkingMutex<Option<Task<()>>>>,
-    /// Path under `paths::data_dir()` where `key_health` is persisted.
-    key_health_path: PathBuf,
-    settings: OpenAiCompatibleSettings,
-    credentials_provider: Arc<dyn CredentialsProvider>,
-}
-
-/// Outcome of a manual "Check" probe of a single key. Stored per-slot in the
-/// ConfigurationView so the button face shows the latest result for that key.
-#[derive(Clone, Debug, PartialEq)]
-pub enum KeyProbeResult {
-    /// The probe completed without an error.
-    Ok,
-    /// The upstream returned a rate-limit error (429). `retry_after` is the
-    /// upstream-provided reset hint when one could be extracted (the
-    /// `retry-after` header or a reset timestamp parsed from the error body),
-    /// so the backoff can end exactly when the quota resets.
-    RateLimit { retry_after: Option<Duration> },
-    /// Any other error; the message is surfaced as a tooltip.
-    Err(SharedString),
-}
-
-/// Owned bundle of inputs needed to fire a single-key probe request from the
-/// UI thread. Built by `State::probe_inputs` and moved into a background task
-/// so the probe never holds a borrow on `State`.
-struct KeyProbeInputs {
-    api_key: Arc<str>,
-    model: String,
-    api_url: Arc<str>,
-    extra_headers: CustomHeaders,
-    provider_name: Arc<str>,
-}
-
 impl OpenAiCompatibleLanguageModelProvider {
     pub fn new(
         id: Arc<str>,
@@ -120,107 +72,16 @@ impl OpenAiCompatibleLanguageModelProvider {
         credentials_provider: Arc<dyn CredentialsProvider>,
         cx: &mut App,
     ) -> Self {
-        fn resolve_settings<'a>(id: &'a str, cx: &'a App) -> Option<&'a OpenAiCompatibleSettings> {
-            crate::AllLanguageModelSettings::get_global(cx)
-                .openai_compatible
-                .get(id)
-        }
-
-        let api_key_env_var_name = format!("{}_API_KEY", id).to_case(Case::UpperSnake).into();
-        let api_key_env_var_name_2 = format!("{}_API_KEY_2", id).to_case(Case::UpperSnake).into();
-        let api_key_env_var_name_3 = format!("{}_API_KEY_3", id).to_case(Case::UpperSnake).into();
-        let api_key_env_var_name_4 = format!("{}_API_KEY_4", id).to_case(Case::UpperSnake).into();
-        let state = cx.new(|cx| {
-            cx.observe_global::<SettingsStore>(|this: &mut State, cx| {
-                let Some(settings) = resolve_settings(&this.id, cx).cloned() else {
-                    return;
-                };
-                if &this.settings != &settings {
-                    let credentials_provider = this.credentials_provider.clone();
-                    let api_url = SharedString::new(settings.api_url.as_str());
-                    let secondary_url = secondary_key_url(&api_url);
-                    let tertiary_url = tertiary_key_url(&api_url);
-                    let quaternary_url = quaternary_key_url(&api_url);
-                    this.api_key_state.handle_url_change(
-                        api_url,
-                        |this| &mut this.api_key_state,
-                        credentials_provider.clone(),
-                        cx,
-                    );
-                    this.api_key_state_2.handle_url_change(
-                        secondary_url,
-                        |this| &mut this.api_key_state_2,
-                        credentials_provider.clone(),
-                        cx,
-                    );
-                    this.api_key_state_3.handle_url_change(
-                        tertiary_url,
-                        |this| &mut this.api_key_state_3,
-                        credentials_provider.clone(),
-                        cx,
-                    );
-                    this.api_key_state_4.handle_url_change(
-                        quaternary_url,
-                        |this| &mut this.api_key_state_4,
-                        credentials_provider,
-                        cx,
-                    );
-                    this.settings = settings;
-                    cx.notify();
-                }
-            })
-            .detach();
-            let settings = resolve_settings(&id, cx).cloned().unwrap_or_default();
-            let key_health = Arc::new(ParkingMutex::new(KeyHealthTracker::default()));
-            let key_health_dirty: Arc<ParkingMutex<Option<Task<()>>>> =
-                Arc::new(ParkingMutex::new(None));
-            let key_health_path = key_health_path_for(&id);
-
-            // Load persisted backoff state off the foreground thread. The
-            // in-memory tracker starts healthy; once the load completes we
-            // overwrite it under the mutex. Errors are logged inside
-            // `reload_persisted_health` and never propagate — a missing or
-            // corrupt file just means "start fresh", which is safe.
-            //
-            // Detached rather than stored: we don't need to await it, and a
-            // late-arriving load just refreshes the (possibly already-mutated)
-            // in-memory state. The race is benign: either the disk wins
-            // (restoring backed-off state) or an in-flight request has already
-            // recorded an outcome (in which case the freshest data wins).
-            let fs = <dyn Fs>::global(cx);
-            let load_health = key_health.clone();
-            let load_path = key_health_path.clone();
-            cx.background_spawn(async move {
-                let loaded = reload_persisted_health(&fs, &load_path).await;
-                *load_health.lock() = loaded;
-            })
-            .detach();
-
-            State {
-                id: id.clone(),
-                api_key_state: ApiKeyState::new(
-                    SharedString::new(settings.api_url.as_str()),
-                    EnvVar::new(api_key_env_var_name),
-                ),
-                api_key_state_2: ApiKeyState::new(
-                    secondary_key_url(&settings.api_url),
-                    EnvVar::new(api_key_env_var_name_2),
-                ),
-                api_key_state_3: ApiKeyState::new(
-                    tertiary_key_url(&settings.api_url),
-                    EnvVar::new(api_key_env_var_name_3),
-                ),
-                api_key_state_4: ApiKeyState::new(
-                    quaternary_key_url(&settings.api_url),
-                    EnvVar::new(api_key_env_var_name_4),
-                ),
-                key_health,
-                key_health_dirty,
-                key_health_path,
-                settings,
-                credentials_provider,
-            }
-        });
+        let state = State::new(
+            id.clone(),
+            credentials_provider,
+            |id, cx| {
+                crate::AllLanguageModelSettings::get_global(cx)
+                    .openai_compatible
+                    .get(id)
+            },
+            cx,
+        );
 
         Self {
             id: id.clone().into(),
@@ -295,77 +156,25 @@ impl OpenAiCompatibleLanguageModelProvider {
             LanguageModelCompletionError,
         >,
     > {
-        let http_client = self.http_client.clone();
-
-        let (key_health, key_health_dirty, key_health_path, candidates, api_url, extra_headers, fs) =
-            self.state.read_with(cx, |state, cx| {
-                (
-                    state.key_health.clone(),
-                    state.key_health_dirty.clone(),
-                    state.key_health_path.clone(),
-                    state.gather_candidates(),
-                    Arc::<str>::from(state.settings.api_url.as_str()),
-                    state.settings.custom_headers.clone(),
-                    <dyn Fs>::global(cx),
-                )
-            });
-
-        let provider = self.name.clone();
-        let provider_name = provider.0.clone();
-        // Capture the background executor and Fs handle up-front so the
-        // rate-limited stream closure — which must be `Send` to satisfy
-        // `BoxFuture<'static, ...>` — can schedule a debounced persist after
-        // `retry_stream` without dragging the `!Send` `AsyncApp` along.
-        let persist_executor = cx.background_executor().clone();
-        let future = request_limiter.stream(async move {
-            if candidates.is_empty() {
-                return Err(LanguageModelCompletionError::NoApiKey { provider });
-            }
-            let health_before = snapshot_health(&key_health);
-            let result = retry_stream(
-                &candidates,
-                &key_health,
-                thread_id.as_deref(),
-                provider,
-                move |api_key| {
-                    let http_client = http_client.clone();
-                    let api_url = api_url.clone();
-                    let extra_headers = extra_headers.clone();
-                    let provider_name = provider_name.clone();
-                    let attempt_request = request.clone();
-                    Box::pin(async move {
-                        // Return the stream directly after HTTP setup (no
-                        // `probe_first_event`). Probing the first SSE event added
-                        // time-to-first-token latency to the critical path of
-                        // every request and held the rate-limiter permit during
-                        // that wait, which serialized subagent fan-out. Setup-phase
-                        // errors (auth, 429, 5xx) still surface here and drive
-                        // key rotation; first-event-in-stream errors are rare and
-                        // handled by the consumer like any stream error.
-                        Ok(stream_completion(
-                            http_client.as_ref(),
-                            provider_name.as_str(),
-                            api_url.as_ref(),
-                            api_key.as_ref(),
-                            attempt_request,
-                            &extra_headers,
-                        )
-                        .await?)
-                    })
-                },
-            )
-            .await;
-            if snapshot_health(&key_health) != health_before {
-                schedule_persist_key_health_inner(
-                    &key_health,
-                    &key_health_dirty,
-                    key_health_path.clone(),
-                    persist_executor.clone(),
-                    fs.clone(),
-                );
-            }
-            result
-        });
+        let future = request_limiter.stream(self.with_key_rotation(
+            request,
+            thread_id,
+            cx,
+            |attempt, request| {
+                async move {
+                    Ok(stream_completion(
+                        attempt.http_client.as_ref(),
+                        &attempt.provider_name,
+                        &attempt.api_url,
+                        &attempt.api_key,
+                        request,
+                        &attempt.extra_headers,
+                    )
+                    .await?)
+                }
+                .boxed()
+            },
+        ));
 
         async move { Ok(future.await?.boxed()) }.boxed()
     }
@@ -385,70 +194,25 @@ impl OpenAiCompatibleLanguageModelProvider {
             >,
         >,
     > {
-        let http_client = self.http_client.clone();
-
-        let (key_health, key_health_dirty, key_health_path, candidates, api_url, extra_headers, fs) =
-            self.state.read_with(cx, |state, cx| {
-                (
-                    state.key_health.clone(),
-                    state.key_health_dirty.clone(),
-                    state.key_health_path.clone(),
-                    state.gather_candidates(),
-                    Arc::<str>::from(state.settings.api_url.as_str()),
-                    state.settings.custom_headers.clone(),
-                    <dyn Fs>::global(cx),
-                )
-            });
-
-        let provider = self.name.clone();
-        let provider_name = provider.0.clone();
-        // Capture the background executor and Fs handle up-front so the
-        // rate-limited stream closure — which must be `Send` to satisfy
-        // `BoxFuture<'static, ...>` — can schedule a debounced persist after
-        // `retry_stream` without dragging the `!Send` `AsyncApp` along.
-        let persist_executor = cx.background_executor().clone();
-        let future = request_limiter.stream(async move {
-            if candidates.is_empty() {
-                return Err(LanguageModelCompletionError::NoApiKey { provider });
-            }
-            let health_before = snapshot_health(&key_health);
-            let result = retry_stream(
-                &candidates,
-                &key_health,
-                thread_id.as_deref(),
-                provider,
-                move |api_key| {
-                    let http_client = http_client.clone();
-                    let api_url = api_url.clone();
-                    let extra_headers = extra_headers.clone();
-                    let provider_name = provider_name.clone();
-                    let attempt_request = request.clone();
-                    Box::pin(async move {
-                        // See stream_completion: no probe_first_event.
-                        Ok(stream_response(
-                            http_client.as_ref(),
-                            provider_name.as_str(),
-                            api_url.as_ref(),
-                            api_key.as_ref(),
-                            attempt_request,
-                            &extra_headers,
-                        )
-                        .await?)
-                    })
-                },
-            )
-            .await;
-            if snapshot_health(&key_health) != health_before {
-                schedule_persist_key_health_inner(
-                    &key_health,
-                    &key_health_dirty,
-                    key_health_path.clone(),
-                    persist_executor.clone(),
-                    fs.clone(),
-                );
-            }
-            result
-        });
+        let future = request_limiter.stream(self.with_key_rotation(
+            request,
+            thread_id,
+            cx,
+            |attempt, request| {
+                async move {
+                    Ok(stream_response(
+                        attempt.http_client.as_ref(),
+                        &attempt.provider_name,
+                        &attempt.api_url,
+                        &attempt.api_key,
+                        request,
+                        &attempt.extra_headers,
+                    )
+                    .await?)
+                }
+                .boxed()
+            },
+        ));
 
         async move { Ok(future.await?.boxed()) }.boxed()
     }
@@ -601,25 +365,7 @@ impl LanguageModelClient for OpenAiCompatibleLanguageModelProvider {
         _model: &LanguageModel,
         cx: &App,
     ) -> Option<ModelKeySlotStatusSummary> {
-        // Only meaningful for providers with at least one key configured. We
-        // still return the summary (with `has_key: false` slots) when zero keys
-        // are configured, so the footer can render the four chips as "empty".
-        // Providers that aren't OpenAI-compatible keep the default `None`.
-        let snapshot = self
-            .state
-            .read_with(cx, |state, _| state.slot_health_snapshot());
-        Some(ModelKeySlotStatusSummary(snapshot.map(|s| {
-            ModelKeySlotStatus {
-                has_key: s.has_key,
-                enabled: s.enabled,
-                is_backed_off: s.is_backed_off,
-                backoff_remaining: s.backoff_remaining,
-                backoff_total: s.backoff_total,
-                consecutive_failures: s.consecutive_failures,
-                last_limit_hit_at: s.last_limit_hit.map(|record| record.hit_at),
-                last_limit_window: s.last_limit_hit.map(|record| record.window),
-            }
-        })))
+        Some(self.key_slot_status_summary(cx))
     }
 
     fn set_key_slot_enabled(
@@ -629,83 +375,11 @@ impl LanguageModelClient for OpenAiCompatibleLanguageModelProvider {
         enabled: bool,
         cx: &mut App,
     ) {
-        let Some(slot) = slot_from_index(slot_index) else {
-            return;
-        };
-        self.state.read_with(cx, |state, _| {
-            state.set_slot_enabled(slot, enabled, cx);
-        });
-        // `set_slot_enabled` mutates `key_health` under a parking_lot mutex
-        // (not via `Entity::update`), so `cx.observe(&state, ...)` wouldn't
-        // fire. Notify explicitly so the footer re-renders immediately.
-        self.state.update(cx, |_, cx| cx.notify());
+        self.set_slot_enabled_and_notify(slot_index, enabled, cx);
     }
 
     fn reset_key_session(&self, _model: &LanguageModel, cx: &App) {
-        // Issue 029: per-thread sticky picks make clearing selection state
-        // unnecessary — a new thread has a new id and picks fresh via the
-        // rotation cursor. The probes below remain: they re-verify every
-        // configured key (including backed-off ones) so stale backoffs clear
-        // before the new thread's first pick.
-        let (probe_inputs, key_health, key_health_dirty, key_health_path) =
-            self.state.read_with(cx, |state, _| {
-                (
-                    state.all_probe_inputs(),
-                    state.key_health.clone(),
-                    state.key_health_dirty.clone(),
-                    state.key_health_path.clone(),
-                )
-            });
-        if probe_inputs.is_empty() {
-            return;
-        }
-        let http_client = self.http_client.clone();
-        let persist_executor = cx.background_executor().clone();
-        let fs = <dyn Fs>::global(cx);
-        // Detached: the new thread's first request must not wait for the
-        // probes — they only *clear* stale backoffs when they arrive; the
-        // in-memory health is already usable as-is.
-        cx.background_spawn(async move {
-            let health_before = snapshot_health(&key_health);
-            for (slot, inputs) in probe_inputs {
-                // Sequential on purpose: probes are 1-token pings, and a burst
-                // of parallel pings right at thread start would compete with
-                // the thread's own first request for the rate limiter.
-                let result = run_key_probe(http_client.clone(), inputs).await;
-                // Same semantics as the settings-page Check button:
-                //
-                // * `Ok` clears the slot outright, upstream-hinted windows
-                //   included — see `KeyHealthTracker::record_success` for why a
-                //   reachable endpoint outranks a reset hint parsed from a
-                //   timestamp with no timezone marker.
-                // * A rate limit is recorded either way. With a hint the
-                //   backoff is pinned to exactly what the upstream reported;
-                //   without one we still know the key is limited and only the
-                //   duration is unknown, so the local schedule fills in. The
-                //   old code ignored hintless 429s entirely, which left a
-                //   provably limited key rendering as healthy.
-                // * Any other error is genuinely ambiguous and changes nothing.
-                match &result {
-                    KeyProbeResult::Ok => record_key_success(&key_health, slot),
-                    KeyProbeResult::RateLimit { retry_after } => {
-                        let mut health = key_health.lock();
-                        health.record_rate_limit(slot, Instant::now(), *retry_after);
-                    }
-                    KeyProbeResult::Err(_) => {}
-                }
-                log::info!("reset_key_session probe: slot={slot:?} result={result:?}");
-            }
-            if snapshot_health(&key_health) != health_before {
-                schedule_persist_key_health_inner(
-                    &key_health,
-                    &key_health_dirty,
-                    key_health_path,
-                    persist_executor,
-                    fs,
-                );
-            }
-        })
-        .detach();
+        self.reprobe_all_keys(cx);
     }
 }
 
@@ -783,41 +457,12 @@ fn disable_response_thinking_for_none_effort(
     }
 }
 
-struct ConfigurationView {
-    api_key_editor: Entity<InputField>,
-    api_key_editor_2: Entity<InputField>,
-    api_key_editor_3: Entity<InputField>,
-    api_key_editor_4: Entity<InputField>,
-    state: Entity<State>,
-    http_client: Arc<dyn HttpClient>,
-    load_credentials_task: Option<Task<()>>,
-    /// Latest "Check" probe result per slot (Primary, Secondary, Tertiary, Quaternary), or
-    /// `None` if the slot hasn't been probed (or was reset on key change).
-    /// Drives the button face label (`check(ok)` / `check(hit)` / `check(err)`).
-    probe_results: [Option<KeyProbeResult>; 4],
-    /// In-flight probe task per slot. When `Some`, the button shows `Check…` and
-    /// is disabled. Stored so dropping the view cancels pending probes.
-    probe_tasks: [Option<Task<()>>; 4],
-    /// Polls `slot_health_snapshot` every second while the settings page is open
-    /// and calls `cx.notify()` only when the snapshot changes. Required because
-    /// `key_health` is updated from background request closures through
-    /// `Arc<Mutex<KeyHealthTracker>>`, bypassing `cx.notify()` on `State` —
-    /// so the view wouldn't otherwise learn about backoff state transitions or
-    /// the countdown ticking down. The task is dropped (cancelled) with the view.
-    #[allow(dead_code)]
-    backoff_refresh_task: Option<Task<()>>,
-}
-
-impl ConfigurationView {}
-
 #[cfg(test)]
 mod tests {
     mod fork_tests;
     use super::*;
-    use health::KeyHealth;
+
     use serde_json::json;
-    use std::future::Future;
-    use std::pin::Pin;
 
     fn available_model(reasoning_effort: Option<open_ai::ReasoningEffort>) -> AvailableModel {
         AvailableModel {
