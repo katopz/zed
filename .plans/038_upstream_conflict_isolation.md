@@ -1,5 +1,5 @@
 # 038 — Isolate the fork lane from upstream files (shrink merge-conflict surface)
-Status: in progress — `script/fork-surface` shipped; acp_thread, agent, thread, thread_view fork code extracted; surface 16,609 → 11,949 lines (130 files)
+Status: in progress — `script/fork-surface` shipped; acp_thread, agent, thread, thread_view, agent_panel fork code extracted; surface 16,609 → 10,794 lines (130 files)
 
 ## Why
 
@@ -36,7 +36,7 @@ to it. Pattern proven by plan 037 (`acp/detachable.rs`: 7 one-line upstream touc
 - [x] `thread_view.rs` → `thread_view/fork.rs` (20 fork-only free items/trait impls + 26 fork-only `ThreadView` methods), `thread_view/branch_boundary_tests.rs` (fork-only test module), `thread_view/tests/fork_tests.rs` (6 fork tests); seam = `mod fork; use fork::*;`. thread_view.rs fork lines 3361 → 885 (remaining: inline render fragments + struct fields inside upstream fns). Tool: `script/fork-split-items FILE upstream/main` (generic; reusable for the other files)
 - [x] `conversation_view.rs` fork tests (20 items, 1231 lines) → `conversation_view/tests/fork_tests.rs` via one `mod fork_tests;` seam — `efaac2e25b`; file surface 1893 → 285, total 16,241 → 14,800
 - [ ] `conversation_view.rs` → remaining auto-allow countdown + watchdog glue (285 lines) into `conversation_view/auto_allow.rs`
-- [ ] `agent_panel.rs` → retained-thread cap + war-room into `agent_panel_fork.rs`
+- [x] `agent_panel.rs` → `agent_panel/fork.rs` (4 free items + 8 `AgentPanel` methods via `script/fork-split-items`) and `agent_panel/tests/fork_tests.rs` (10 fork tests incl. retained-thread hard cap + stream cap); agent_panel.rs fork lines 1543 → 372
 - [x] `agent/src/thread.rs` → `thread/fork.rs` (stream-idle-timeout type + retry consts/`retry_after_delay`, `messages`/`set_messages`, `stream_idle_timeout_future`, metadata-call retry + `strip_unsupported_images`; seam = `mod fork; pub(crate) use fork::*;`) and its 3 fork idle-timeout tests → `thread/tests/fork_tests.rs`; thread.rs fork lines 632 → 220
 - [x] `agent/src/agent.rs` → `agent_fork.rs`: CLAUDE.md symlink (+ statics), `seed_history`, verdict subagent, peer-thread list/send (trait methods now one-line delegations), `running_successor_execution`; agent.rs fork lines 565 → 295 (remaining: struct fields, call-site seams, internal_tests regression tests)
 - [x] `acp_thread.rs` → fork `impl AcpThread` (board notification, bloat candidates, subagent retry completion, api-error/turn-id accessors) + `tool_call_bloat_label` moved to `acp_thread/src/fork.rs`; acp_thread.rs fork lines 409 → 216 (remaining: enum variant, struct fields, inline turn-truncation note, regression test that needs private `tests` helpers). Also fixed `acp_thread` standalone build: uuid `v7` feature was only satisfied via workspace unification
