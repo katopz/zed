@@ -53,6 +53,11 @@ Fork code inside upstream files follows the seam pattern from plan 038:
   take upstream's side and re-add the one-line call.
 
 When resolving, keep upstream's version of any line that is not a seam.
+Never copy an upstream function body into a fork file to change its inputs:
+"take upstream, re-add the seam call" then deletes upstream's new body and
+leaves the fork copy stale with no conflict to flag it. Split the function in
+place instead (upstream's header calls a private helper holding upstream's
+unchanged body), as `create_subagent_thread_inner` in `agent.rs` does.
 If a resolution needs more than a seam line, move that code into the fork file.
 
 ## After the merge
