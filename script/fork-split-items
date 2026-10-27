@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+"""Move fork-only items out of an upstream-owned Rust file (plan 038).
+
+Moves, into a child module file:
+  * top-level `fn` / `const` / `static` items whose name does not exist upstream
+  * whole trait impls (`impl Trait for Type`) whose header does not exist upstream
+  * methods of inherent impls (`impl Type {`) whose name does not exist upstream
+
+Structs/enums stay (their private fields would become invisible to the parent),
+as do `mod tests` contents (use a dedicated test split for those). Moved items
+that were private become `pub(super)`; `pub(super)` widens to `pub(crate)`
+because the item now lives one module deeper. The parent gets a two-line seam:
+`mod <name>;` + `use <name>::*;` after its last top-level `use`.
+
+Usage: script/fork-split-items FILE UPSTREAM_REF [MODULE_NAME]
+Writes <FILE stem>/<MODULE_NAME>.rs (default module name `fork`). Compile and
+test afterwards: the brace scanner is heuristic and refuses on surprises.
+"""
+
+import os
+import re
+import subprocess
+import sys
+
+path, upstream_ref = sys.argv[1], sys.argv[2]
+module = sys.argv[3] if len(sys.argv) > 3 else "fork"
+lines = open(path).read().split("\n")
+upstream = subprocess.run(
+    ["git", "show", f"{upstream_ref}:{path}"], capture_output=True, text=True, check=True
+).stdout
+
+ITEM_NAME = re.compile(
+    r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:const\s+)?(?:async\s+)?(?:unsafe\s+)?"
+    r"(fn|const|static)\s+(\w+)"
+)
+
+
+def block_end(start):
+    """Index of the line closing the item that starts at `start`.
+
+    Character-level scan aware of (multi-line) strings, raw strings, char
+    literals vs lifetimes, and line/block comments.
+    """
+    text = "\n".join(lines[start:])
+    depth, seen, position, length = 0, False, 0, len(text)
+    while position < length:
+        char = text[position]
+        if text.startswith("//", position):
+            position = text.find("\n", position)
+            position = length if position < 0 else position
+            continue
+        if text.startswith("/*", position):
+            position = text.index("*/", position) + 2
+            continue
+        raw = re.match(r'b?r(#*)"', text[position:position + 260])
+        if raw and (position == 0 or not (text[position - 1].isalnum() or text[position - 1] == "_")):
+            terminator = '"' + raw.group(1)
+            position = text.index(terminator, position + raw.end()) + len(terminator)
+            continue
+        if char == '"':
+            position += 1
+            while text[position] != '"':
+                position += 2 if text[position] == "\\" else 1
+            position += 1
+            continue
+        if char == "'":
+            literal = re.match(r"'(\\.[^']*|[^\\'])'", text[position:position + 12])
+            position += literal.end() if literal else 1
+            continue
+        if char == "{":
+            depth += 1
+            seen = True
+        elif char == "}":
+            depth -= 1
+        elif char == ";" and depth == 0 and not seen:
+            return start + text.count("\n", 0, position)
+        if seen and depth == 0:
+            return start + text.count("\n", 0, position)
+        position += 1
+    sys.exit(f"unterminated item at {start + 1}")
+
+
+def leading_attrs(start, indent):
+    """Back up over doc comments / attributes directly above an item."""
+    index = start
+    while index > 0:
+        previous = lines[index - 1]
+        if previous.startswith(indent + "///") or previous.startswith(indent + "#") or (
+            previous.startswith(indent + "//") and not previous.startswith(indent + "///")
+        ):
+            index -= 1
+        else:
+            break
+    return index
+
+
+def upstream_has_fn(kind, name):
+    return re.search(rf"\b{kind}\s+{re.escape(name)}\b", upstream) is not None
+
+
+def widen(line, indent):
+    body = line[len(indent):]
+    if body.startswith("pub(super)"):
+        return indent + "pub(crate)" + body[len("pub(super)"):]
+    if body.startswith("pub"):
+        return line
+    return indent + "pub(super) " + body
+
+
+moved_top = []  # (attr_start, end, text_lines)
+moved_methods = {}  # impl header -> list of text blocks
+moved_mods = []  # (name, body lines) of fork-only inline modules -> own files
+drop = set()  # lines of moved items (a trailing blank line goes with them)
+mod_body_drop = set()  # bodies of inline modules turned into `mod name;`
+index = 0
+while index < len(lines):
+    line = lines[index]
+    inline_mod = re.match(r"^(pub(?:\([^)]*\))?\s+)?mod (\w+) \{$", line.rstrip())
+    if inline_mod:
+        end = block_end(index)
+        name = inline_mod.group(2)
+        if not re.search(rf"\bmod {name}\b", upstream):
+            moved_mods.append((name, lines[index + 1:end]))
+            lines[index] = line.rstrip()[:-2] + ";"
+            mod_body_drop.update(range(index + 1, end + 1))
+        index = end + 1
+        continue
+    match = ITEM_NAME.match(line)
+    if match and not line.startswith(" "):
+        kind, name = match.groups()
+        end = block_end(index)
+        if not upstream_has_fn(kind, name):
+            start = leading_attrs(index, "")
+            block = lines[start:end + 1]
+            signature = index - start
+            block[signature] = widen(block[signature], "")
+            moved_top.append(block)
+            drop.update(range(start, end + 1))
+        index = end + 1
+        continue
+    if line.startswith("impl") and line.rstrip().endswith("{"):
+        end = block_end(index)
+        header = line.rstrip()
+        if " for " in header and header not in upstream:
+            start = leading_attrs(index, "")
+            moved_top.append(lines[start:end + 1])
+            drop.update(range(start, end + 1))
+        elif " for " not in header and header in upstream:
+            inner = index + 1
+            while inner < end:
+                member = lines[inner]
+                member_match = ITEM_NAME.match(member)
+                if member_match and member.startswith("    ") and not member.startswith("     "):
+                    kind, name = member_match.groups()
+                    member_end = block_end(inner)
+                    if not upstream_has_fn(kind, name):
+                        start = leading_attrs(inner, "    ")
+                        block = lines[start:member_end + 1]
+                        signature = inner - start
+                        block[signature] = widen(block[signature], "    ")
+                        moved_methods.setdefault(header, []).append(block)
+                        drop.update(range(start, member_end + 1))
+                    inner = member_end + 1
+                else:
+                    inner += 1
+        index = end + 1
+        continue
+    index += 1
+
+if not moved_top and not moved_methods and not moved_mods:
+    sys.exit("nothing to move")
+
+drop |= {
+    i + 1
+    for i in drop
+    if i + 1 < len(lines) and i + 1 not in drop and lines[i + 1].strip() == ""
+}
+drop |= mod_body_drop
+
+kept = [line for line_index, line in enumerate(lines) if line_index not in drop]
+if moved_top or moved_methods:
+    use_pattern = re.compile(r"^(pub(\([^)]*\))? )?use ")
+    last_use_start = max(i for i, line in enumerate(kept) if use_pattern.match(line))
+    last_use_end = next(i for i in range(last_use_start, len(kept)) if kept[i].rstrip().endswith(";"))
+    # Re-export the moved free items at the widest visibility any of them has.
+    signatures = [line for block in moved_top for line in block if ITEM_NAME.match(line)]
+    if any(re.match(r"^pub\s", line) for line in signatures):
+        use_visibility = "pub "
+    elif any(line.startswith("pub(crate)") for line in signatures):
+        use_visibility = "pub(crate) "
+    else:
+        use_visibility = ""
+    seam = ["", f"mod {module};"]
+    if signatures:
+        seam.append(f"{use_visibility}use {module}::*;")
+    kept[last_use_end + 1:last_use_end + 1] = seam
+open(path, "w").write("\n".join(kept))
+
+parent = os.path.basename(path)[:-3]
+out_dir = os.path.join(os.path.dirname(path), parent)
+os.makedirs(out_dir, exist_ok=True)
+for name, body in moved_mods:
+    dedented = [line[4:] if line.startswith("    ") else line for line in body]
+    open(os.path.join(out_dir, f"{name}.rs"), "w").write("\n".join(dedented).rstrip("\n") + "\n")
+    print(f"moved inline mod {name} into {out_dir}/{name}.rs")
+
+if not moved_top and not moved_methods:
+    sys.exit(0)
+
+out = [
+    f"//! Fork-owned items split out of `{parent}.rs` so upstream syncs don't",
+    "//! conflict on them (plan 038; generated by script/fork-split-items).",
+    "",
+    "use super::*;",
+    "",
+]
+for block in moved_top:
+    out.extend(block)
+    out.append("")
+for header, blocks in moved_methods.items():
+    out.append(header)
+    for number, block in enumerate(blocks):
+        if number:
+            out.append("")
+        out.extend(block)
+    out.append("}")
+    out.append("")
+open(os.path.join(out_dir, f"{module}.rs"), "w").write("\n".join(out).rstrip("\n") + "\n")
+print(
+    f"moved {len(moved_top)} top-level items and "
+    f"{sum(len(b) for b in moved_methods.values())} methods into {out_dir}/{module}.rs"
+)
