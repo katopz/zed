@@ -72,7 +72,7 @@ start any external agent. Close M3 freely; reopen and pick the thread from histo
 - [x] P2 `detachable.rs` hook + shim (fallback-tested) + `work_remote` crate + menu item
 - [ ] P3 real e2e: M3 Zed → M5 over Tailscale with Claude/Codex ACP; close M3 mid-turn; reopen; verify history + live stream
   - BLOCKED (2026-10-27, access): tailnet macOS hosts `amo` (100.111.186.76) refuses ssh (Remote Login off) and `bmo` (100.100.117.44) rejects M3's key. Needs owner: enable Remote Login on the M5 + add M3's `~/.ssh/id_ed25519.pub` to its `authorized_keys`
-- [ ] P3 verify Zed's reconnect flow calls `session/load` (not only `session/list`) for external agents on window restore
+- [x] P3 verify Zed's reconnect flow calls `session/load` (not only `session/list`) for external agents on window restore — by code: `conversation_view.rs` (~L1420) calls `load_session` whenever the connection reports `supports_load_session()` (= the `loadSession` capability, `agent_servers/src/acp/v1.rs`), which zed-agentd always advertises; `resume_session` (no history) is only the fallback for agents without it. The live confirmation rides on the P3 e2e item
 - [x] P4 native Zed agent as a backend: `zed-agentd attach -- eval-cli --acp` (`c212b13be4`, harness `767ba226e9`); verified locally incl. kill-mid-turn detach + replay. Structured diffs + model switching over ACP done; follow-up (real-host run) in `.issues/036_native_agent_acp_stdio_server.md`
 - [ ] P4 live turn-state on reattach: synthesize a "turn still running" indicator (ACP has no turn-ended notification; today replay just keeps streaming)
 - [ ] P4 auto-deploy `zed-agentd` to host on Work Remote (reuse remote_server upload path) instead of manual `cargo install`
