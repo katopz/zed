@@ -46,11 +46,7 @@ use language_model::{
 use lightweight_context::{count_actionable_tasks, has_unchecked_items, is_actionable_checkbox};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
-
-/// LLM orchestration call failure counter for the current chain.
-static AUTO_PROMPT_LLM_FAILURE_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// Per-session summary tracking for the context-overflow flow.
 ///
@@ -2087,7 +2083,7 @@ pub(crate) fn context_overflow_outcome(data: &LlmCallData) -> AutoPromptOutcome 
         // receipt of this outcome; use the current value to size the
         // initial delay so we don't pile up retries faster than the
         // upstream API can recover.
-        let current_failures = AUTO_PROMPT_LLM_FAILURE_COUNT.load(Ordering::Relaxed);
+        let current_failures = chain::llm_failures(&session_id_str);
         let delay_ms = config.backoff_delay_ms(current_failures.saturating_add(1));
         log::warn!(
             "[auto_prompt::context_overflow] overflow + had_api_error — deferring Phase 1/2 by {delay_ms}ms (current_failures={current_failures}, session={session_id_str})"
@@ -3363,28 +3359,21 @@ fn is_interactive_auth_command(command: &str) -> bool {
         })
 }
 
-pub fn reset_iteration() {
-    AUTO_PROMPT_LLM_FAILURE_COUNT.store(0, Ordering::Relaxed);
-    // Summary state is now per-session in SUMMARY_REGISTRY and cleared
-    // via clear_summary_for_session / reset_iteration_with_session.
-}
-
 /// Reset the auto-prompt chain counters **and** release any plan claims held by
 /// the given session. Call this at every chain stop point so competing agents
 /// can pick up the released plans.
 pub fn reset_iteration_with_session(session_id: &str) {
-    reset_iteration();
     clear_summary_for_session(session_id);
     chain::clear_session(session_id);
     plan_registry::release_all_for_session(session_id);
 }
 
-pub fn increment_llm_failure_count() -> u32 {
-    AUTO_PROMPT_LLM_FAILURE_COUNT.fetch_add(1, Ordering::Relaxed) + 1
+pub fn increment_llm_failure_count(session_id: &str) -> u32 {
+    chain::record_llm_failure(session_id)
 }
 
-pub fn reset_llm_failure_count() {
-    AUTO_PROMPT_LLM_FAILURE_COUNT.store(0, Ordering::Relaxed);
+pub fn reset_llm_failure_count(session_id: &str) {
+    chain::reset_llm_failures(session_id);
 }
 
 /// Cheap inputs needed to read the `.plans/`/`.docs/` context files off the

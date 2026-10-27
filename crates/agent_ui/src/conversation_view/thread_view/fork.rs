@@ -1657,7 +1657,8 @@ impl ThreadView {
             log::info!("[auto_prompt] Manual retry triggered by user");
             if let Some(retry_data) = self.fork._auto_prompt_retry_data.take() {
                 let retry_data_for_restore = retry_data.clone();
-                auto_prompt::reset_llm_failure_count(); // Reset counter for fresh retry
+                let retry_session_id = retry_data.session_id.to_string();
+                auto_prompt::reset_llm_failure_count(&retry_session_id); // Reset counter for fresh retry
                 self.fork.auto_prompt_state = crate::auto_prompt::AutoPromptState::Processing;
                 cx.notify();
 
@@ -1704,7 +1705,7 @@ impl ThreadView {
 
                     match result {
                         Ok(auto_prompt::AutoPromptOutcome::Continue(action)) => {
-                            auto_prompt::reset_llm_failure_count();
+                            auto_prompt::reset_llm_failure_count(&retry_session_id);
                             if let Some(ref tv) = thread_weak {
                                 if let Err(err) = tv.update(cx, |tv, cx| {
                                     tv.fork.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;
@@ -1728,7 +1729,7 @@ impl ThreadView {
                             }
                         }
                         Ok(auto_prompt::AutoPromptOutcome::Stopped { reason }) => {
-                            auto_prompt::reset_llm_failure_count();
+                            auto_prompt::reset_llm_failure_count(&retry_session_id);
                             if let Some(ref tv) = thread_weak {
                                 if let Err(err) = tv.update(cx, |tv, cx| {
                                     tv.fork.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;
@@ -1741,7 +1742,7 @@ impl ThreadView {
                             log::info!("[auto_prompt] Retry chain stopped: {reason}");
                         }
                         Ok(auto_prompt::AutoPromptOutcome::ContextOverflow(action)) => {
-                            auto_prompt::reset_llm_failure_count();
+                            auto_prompt::reset_llm_failure_count(&retry_session_id);
                             if let Some(ref tv) = thread_weak {
                                 if let Err(err) = tv.update(cx, |tv, cx| {
                                     tv.fork.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;
@@ -1768,7 +1769,7 @@ impl ThreadView {
                             // Manual retry path treats this as a soft stop — the user can click
                             // retry again after the upstream rate limit has cleared. We surface
                             // the wait hint so the user knows why no work was dispatched.
-                            auto_prompt::increment_llm_failure_count();
+                            auto_prompt::increment_llm_failure_count(&retry_session_id);
                             if let Some(ref tv) = thread_weak {
                                 if let Err(err) = tv.update(cx, |tv, cx| {
                                     tv.fork.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;
@@ -1786,7 +1787,7 @@ impl ThreadView {
                             // Plan 023 D: manual retry got a clarify verdict —
                             // dispatch_action sends it to the same thread
                             // (force_new_thread=false, tokens below threshold).
-                            auto_prompt::reset_llm_failure_count();
+                            auto_prompt::reset_llm_failure_count(&retry_session_id);
                             if let Some(ref tv) = thread_weak {
                                 if let Err(err) = tv.update(cx, |tv, cx| {
                                     tv.fork.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;

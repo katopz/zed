@@ -1486,7 +1486,7 @@ fn run_auto_prompt(
                 loop {
                     let (delay_ms, retry_label) = match &result {
                         Err(err) => {
-                            let failure_count = auto_prompt::increment_llm_failure_count();
+                            let failure_count = auto_prompt::increment_llm_failure_count(&data.session_id.to_string());
                             if failure_count > config.max_llm_retries {
                                 break; // Max retries exhausted — fall through to error handler.
                             }
@@ -1503,7 +1503,7 @@ fn run_auto_prompt(
                             // Issue 007 deferred decision. Counted against the same retry budget
                             // as orchestration-call failures so a permanently-exhausted API
                             // eventually surfaces a Stopped to the user instead of looping.
-                            let failure_count = auto_prompt::increment_llm_failure_count();
+                            let failure_count = auto_prompt::increment_llm_failure_count(&data.session_id.to_string());
                             if failure_count > config.max_llm_retries {
                                 log::warn!(
                                     "[auto_prompt] RetryAfterBackoff exhausted {} retries — converting to Stopped ({reason})",
@@ -1558,7 +1558,7 @@ fn run_auto_prompt(
 
                 match result {
                     Ok(auto_prompt::AutoPromptOutcome::Continue(mut action)) => {
-                        auto_prompt::reset_llm_failure_count();
+                        auto_prompt::reset_llm_failure_count(&data.session_id.to_string());
                         action.focus_new_thread |= is_manual;
                         if let Some(ref tv) = thread_weak {
                             if let Err(err) = tv.update(cx, |tv, cx| {
@@ -1590,7 +1590,7 @@ fn run_auto_prompt(
                         }
                     }
                     Ok(auto_prompt::AutoPromptOutcome::ContextOverflow(action)) => {
-                        auto_prompt::reset_llm_failure_count();
+                        auto_prompt::reset_llm_failure_count(&data.session_id.to_string());
                         if let Some(ref tv) = thread_weak {
                             if let Err(err) = tv.update(cx, |tv, cx| {
                                 tv.fork._auto_prompt_task = None;
@@ -1643,7 +1643,7 @@ fn run_auto_prompt(
                         }
                     }
                     Ok(auto_prompt::AutoPromptOutcome::ClarificationRequest(action)) => {
-                        auto_prompt::reset_llm_failure_count();
+                        auto_prompt::reset_llm_failure_count(&data.session_id.to_string());
                         if let Some(ref tv) = thread_weak {
                             if let Err(err) = tv.update(cx, |tv, cx| {
                                 tv.fork._auto_prompt_task = None;
@@ -1694,7 +1694,7 @@ fn run_auto_prompt(
                         }
                     }
                     Ok(auto_prompt::AutoPromptOutcome::Stopped { reason }) => {
-                        auto_prompt::reset_llm_failure_count();
+                        auto_prompt::reset_llm_failure_count(&data.session_id.to_string());
                         if let Some(ref tv) = thread_weak {
                             if let Err(err) = tv.update(cx, |tv, cx| {
                                 tv.fork.auto_prompt_state = AutoPromptState::Idle;
@@ -1839,7 +1839,7 @@ fn run_auto_prompt(
                         log::warn!(
                             "[auto_prompt] RetryAfterBackoff reached post-loop match unexpectedly — treating as Stopped ({delay_ms}ms, {reason})"
                         );
-                        auto_prompt::reset_llm_failure_count();
+                        auto_prompt::reset_llm_failure_count(&data.session_id.to_string());
                         if let Some(ref tv) = thread_weak {
                             if let Err(err) = tv.update(cx, |tv, cx| {
                                 tv.fork.auto_prompt_state = AutoPromptState::Idle;

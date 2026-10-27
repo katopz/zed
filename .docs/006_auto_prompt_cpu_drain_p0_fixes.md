@@ -339,5 +339,8 @@ for 10+ rounds with nothing to do. Three guards should have stopped it:
   edit/delete/move tool call, no `git commit`/`git push`), so it never cuts off
   a productive chain (`f426bb830d`). The Claude decide path applies it too.
 
-Still global: `AUTO_PROMPT_LLM_FAILURE_COUNT` (orchestrator call failures).
-Low impact, since any session's success resetting it only delays a fallback.
+The orchestrator-call failure budget (`max_llm_retries`) had the same defect
+(any session's success refilled every session's budget, so a dead
+orchestrator could retry without bound) and moved into `chain.rs` too
+(`increment_llm_failure_count` / `reset_llm_failure_count` now take the
+session id).

@@ -1,6 +1,6 @@
 //! Per-session auto-prompt chain state: turn counts, the no-progress streak
-//! the runaway cap reads, pre-stop verification attempts, and the repetition
-//! of a summary's next steps.
+//! the runaway cap reads, pre-stop verification attempts, orchestration-call
+//! failures, and the repetition of a summary's next steps.
 //!
 //! Everything is keyed by session. These used to be process-wide atomics that
 //! every thread incremented and any thread's stop reset, so with several agents
@@ -28,6 +28,7 @@ struct ChainState {
     turns: u32,
     idle_turns: u32,
     verification_attempts: u32,
+    llm_failures: u32,
     last_turn_secs: u64,
     steps_fingerprint: Option<u64>,
     steps_repeats: u32,
@@ -99,6 +100,23 @@ pub fn verification_attempts(session_id: &str) -> u32 {
 
 pub fn record_verification_attempt(session_id: &str) {
     with_chain(session_id, |chain| chain.verification_attempts += 1);
+}
+
+/// Counts a failed (or deferred) orchestration call and returns the session's
+/// consecutive failures, which the caller compares against `max_llm_retries`.
+pub fn record_llm_failure(session_id: &str) -> u32 {
+    with_chain(session_id, |chain| {
+        chain.llm_failures += 1;
+        chain.llm_failures
+    })
+}
+
+pub fn llm_failures(session_id: &str) -> u32 {
+    with_chain(session_id, |chain| chain.llm_failures)
+}
+
+pub fn reset_llm_failures(session_id: &str) {
+    with_chain(session_id, |chain| chain.llm_failures = 0);
 }
 
 /// Case, punctuation and whitespace are ignored so cosmetic rewording of the
@@ -225,6 +243,23 @@ mod tests {
         clear_session(session);
         assert_eq!(verification_attempts(session), 0);
         clear_session(session);
+    }
+
+    #[test]
+    fn llm_failures_are_per_session() {
+        let session = "chain-test-llm-failures";
+        let other = "chain-test-llm-failures-other";
+        clear_session(session);
+        clear_session(other);
+        assert_eq!(record_llm_failure(session), 1);
+        // Another session succeeding never refills this session's budget.
+        record_llm_failure(other);
+        reset_llm_failures(other);
+        assert_eq!(record_llm_failure(session), 2);
+        reset_llm_failures(session);
+        assert_eq!(record_llm_failure(session), 1);
+        clear_session(session);
+        clear_session(other);
     }
 
     #[test]
