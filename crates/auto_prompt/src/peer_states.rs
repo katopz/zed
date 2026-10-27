@@ -89,8 +89,33 @@ static NOTIFIED_SIGNATURES: LazyLock<RwLock<HashSet<String>>> =
 /// that are waiting to be injected into agent threads. Keyed by the 4-char
 /// session_id prefix so the agent_ui can resolve them by prefix-matching
 /// active session_ids. Drained by the notification timer in agent_panel.
-static WEB_REPLIES: LazyLock<RwLock<Vec<(String, String)>>> =
+static WEB_REPLIES: LazyLock<RwLock<Vec<PendingWebReply>>> =
     LazyLock::new(|| RwLock::new(Vec::new()));
+
+/// A steering reply waiting to be injected into the agent thread whose
+/// session id starts with `session_prefix`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingWebReply {
+    pub session_prefix: String,
+    /// GitHub login of a browser poster; empty when the reply came from a
+    /// signed Zed device or a war-room mention, which label their own text.
+    pub author_login: String,
+    pub text: String,
+}
+
+impl PendingWebReply {
+    /// The message injected into the agent thread. A browser reply names its
+    /// GitHub author so the agent can tell remote input from the operator's
+    /// own prompts (issue 038).
+    pub fn steering_message(&self) -> String {
+        let session_prefix = &self.session_prefix;
+        let text = &self.text;
+        match self.author_login.as_str() {
+            "" => format!("🌐 REPLY:[{session_prefix}] {text}"),
+            login => format!("🌐 REPLY:[{session_prefix}] (web reply from GitHub @{login}) {text}"),
+        }
+    }
+}
 
 /// Register the agent-state broadcaster (called by `agent_board`'s panel
 /// during init). Pass `None` to unregister (board disabled). When no
@@ -152,17 +177,17 @@ pub fn set_peer_states(states: Vec<PeerAgentState>, own_device_id: &str) {
 /// queued by its 4-char session-id prefix and drained by the agent_panel
 /// notification timer, which resolves the prefix to an active session and
 /// injects the text into the agent thread.
-pub fn inject_web_reply(session_prefix: String, text: String) {
+pub fn inject_web_reply(reply: PendingWebReply) {
     if let Ok(mut guard) = WEB_REPLIES.write() {
-        guard.push((session_prefix, text));
+        guard.push(reply);
     }
 }
 
 /// Drain all pending web replies. Called by the agent_panel notification
-/// timer alongside `drain_unseen_notifications`. Returns `(session_prefix, text)`
-/// pairs. The caller resolves the prefix to an active AcpThread and injects
-/// the text via `send` (native: + steering; Claude: regular send).
-pub fn drain_web_replies() -> Vec<(String, String)> {
+/// timer alongside `drain_unseen_notifications`. The caller resolves each
+/// prefix to an active AcpThread and injects the text via `send` (native:
+/// + steering; Claude: regular send).
+pub fn drain_web_replies() -> Vec<PendingWebReply> {
     if let Ok(mut guard) = WEB_REPLIES.write() {
         std::mem::take(&mut *guard)
     } else {
@@ -715,20 +740,37 @@ mod tests {
 
     // ── Web reply tests (Plan 015) ──
 
+    fn pending_reply(session_prefix: &str, text: &str) -> PendingWebReply {
+        PendingWebReply {
+            session_prefix: session_prefix.to_string(),
+            author_login: String::new(),
+            text: text.to_string(),
+        }
+    }
+
     #[test]
     fn inject_and_drain_web_reply() {
         let _lock = setup();
-        inject_web_reply("f3a2".to_string(), "commit now".to_string());
+        inject_web_reply(pending_reply("f3a2", "commit now"));
         let replies = drain_web_replies();
-        assert_eq!(replies.len(), 1);
-        assert_eq!(replies[0].0, "f3a2");
-        assert_eq!(replies[0].1, "commit now");
+        assert_eq!(replies, vec![pending_reply("f3a2", "commit now")]);
+    }
+
+    #[test]
+    fn steering_message_names_the_web_author() {
+        let mut reply = pending_reply("f3a2", "commit now");
+        assert_eq!(reply.steering_message(), "🌐 REPLY:[f3a2] commit now");
+        reply.author_login = "katopz".to_string();
+        assert_eq!(
+            reply.steering_message(),
+            "🌐 REPLY:[f3a2] (web reply from GitHub @katopz) commit now"
+        );
     }
 
     #[test]
     fn drain_clears_pending_replies() {
         let _lock = setup();
-        inject_web_reply("a1b2".to_string(), "reply 1".to_string());
+        inject_web_reply(pending_reply("a1b2", "reply 1"));
         let first = drain_web_replies();
         assert_eq!(first.len(), 1);
         // Second drain should be empty — the first drain cleared the queue.
@@ -739,13 +781,13 @@ mod tests {
     #[test]
     fn multiple_replies_different_sessions() {
         let _lock = setup();
-        inject_web_reply("f3a2".to_string(), "reply for f3a2".to_string());
-        inject_web_reply("b1c9".to_string(), "reply for b1c9".to_string());
-        inject_web_reply("f3a2".to_string(), "second reply for f3a2".to_string());
-        let replies = drain_web_replies();
-        assert_eq!(replies.len(), 3);
-        assert_eq!(replies[0].0, "f3a2");
-        assert_eq!(replies[1].0, "b1c9");
-        assert_eq!(replies[2].0, "f3a2");
+        inject_web_reply(pending_reply("f3a2", "reply for f3a2"));
+        inject_web_reply(pending_reply("b1c9", "reply for b1c9"));
+        inject_web_reply(pending_reply("f3a2", "second reply for f3a2"));
+        let prefixes: Vec<String> = drain_web_replies()
+            .into_iter()
+            .map(|reply| reply.session_prefix)
+            .collect();
+        assert_eq!(prefixes, ["f3a2", "b1c9", "f3a2"]);
     }
 }

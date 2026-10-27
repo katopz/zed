@@ -371,7 +371,8 @@ impl AgentPanel {
                 let replies = auto_prompt::peer_states::drain_web_replies();
                 if !replies.is_empty() {
                     this.update(cx, |panel, cx| {
-                        for (session_prefix, text) in &replies {
+                        for reply in &replies {
+                            let session_prefix = &reply.session_prefix;
                             let Some(thread) =
                                 panel.thread_for_session_prefix(session_prefix, cx)
                             else {
@@ -380,7 +381,7 @@ impl AgentPanel {
                                 );
                                 continue;
                             };
-                            let trimmed = text.trim();
+                            let trimmed = reply.text.trim();
                             match trimmed {
                                 "!stop" => {
                                     thread.update(cx, |thread, cx| {
@@ -408,10 +409,8 @@ impl AgentPanel {
                                     );
                                 }
                                 _ => {
-                                    let text = text.clone();
+                                    let reply_text = reply.steering_message();
                                     thread.update(cx, |thread, cx| {
-                                        let reply_text =
-                                            format!("🌐 REPLY:[{session_prefix}] {text}");
                                         let future = thread.send(vec![reply_text.into()], cx);
                                         cx.background_executor()
                                             .spawn(async move {

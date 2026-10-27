@@ -129,17 +129,20 @@ async fn connect_and_drain(
             if value.get("target_device").is_some() {
                 // Reply push: inject only when it targets this device.
                 if value.get("target_device").and_then(|v| v.as_str()) == Some(device_name) {
-                    let prefix = value
-                        .get("target_session_prefix")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let text = value
-                        .get("text")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    auto_prompt::peer_states::inject_web_reply(prefix, text);
+                    let field = |name: &str| {
+                        value
+                            .get(name)
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string()
+                    };
+                    auto_prompt::peer_states::inject_web_reply(
+                        auto_prompt::peer_states::PendingWebReply {
+                            session_prefix: field("target_session_prefix"),
+                            author_login: field("author_login"),
+                            text: field("text"),
+                        },
+                    );
                 }
             } else {
                 let is_feed_event = parse_board_message(&value).is_some()

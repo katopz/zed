@@ -16,6 +16,7 @@ import { describe, it, expect, beforeAll } from "vitest";
 import { Miniflare } from "miniflare";
 import * as esbuild from "esbuild";
 import * as ed from "@noble/ed25519";
+import { MockAgent } from "undici";
 
 // ── ed25519 helpers ──────────────────────────────────────────────────────
 
@@ -49,7 +50,7 @@ async function signHeaders(device, bodyText) {
 
 // ── Miniflare harness ────────────────────────────────────────────────────
 
-async function makeMf() {
+async function makeMf({ bindings = {}, fetchMock } = {}) {
   // Bundle the worker with esbuild so Miniflare can resolve `@noble/ed25519`.
   const bundled = await esbuild.build({
     entryPoints: ["src/index.js"],
@@ -72,7 +73,10 @@ async function makeMf() {
       GOOGLE_CLIENT_ID: "",
       ALLOWED_EMAIL: "katopz@gmail.com",
       DEFAULT_TTL_SECONDS: "604800",
+      GITHUB_CLIENT_ID: "test-client-id",
+      ...bindings,
     },
+    ...(fetchMock ? { fetchMock } : {}),
   });
   await mf.ready;
   return mf;
@@ -88,7 +92,7 @@ describe("GET / (W1 dashboard)", () => {
   });
 
   it("returns HTML with the dashboard shell", async () => {
-    const res = await mf.dispatchFetch("http://localhost/");
+    const res = await mf.dispatchFetch("http://localhost/?room=test-room");
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).toContain("<!DOCTYPE html>");
@@ -99,7 +103,7 @@ describe("GET / (W1 dashboard)", () => {
   });
 
   it("includes the GitHub device-flow sign-in affordances", async () => {
-    const res = await mf.dispatchFetch("http://localhost/");
+    const res = await mf.dispatchFetch("http://localhost/?room=test-room");
     const html = await res.text();
     expect(html).toContain('id="ghbtn"');
     expect(html).toContain("Sign in with GitHub");
@@ -217,5 +221,98 @@ describe("auth gate (ed25519 bootstrap)", () => {
       },
     );
     expect(res.status).toBe(401);
+  });
+});
+
+// ── GitHub login allowlist (issue 038) ─────────────────────────────────
+
+// Each token maps to the login GitHub would report for it.
+const GITHUB_LOGINS = { "owner-token": "katopz", "stranger-token": "mallory" };
+
+function githubMock() {
+  const agent = new MockAgent();
+  agent.disableNetConnect();
+  agent
+    .get("https://api.github.com")
+    .intercept({ path: "/user", method: "GET" })
+    .reply(({ headers }) => {
+      const token = String(headers.authorization ?? headers.Authorization ?? "")
+        .replace(/^Bearer\s+/i, "");
+      const login = GITHUB_LOGINS[token];
+      return login
+        ? { statusCode: 200, data: JSON.stringify({ login }) }
+        : { statusCode: 401, data: "{}" };
+    })
+    .persist();
+  return agent;
+}
+
+async function postGithubReply(mf, token) {
+  const res = await mf.dispatchFetch("http://localhost/v1/rooms/gh-room/reply", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ target_device: "d", target_session_prefix: "s", text: "hi" }),
+  });
+  return { status: res.status, json: await res.json() };
+}
+
+// Resolves with the first frame the room sends after the auth message, or the
+// close reason if it closes the socket instead.
+async function githubWebSocketAuth(mf, token) {
+  const res = await mf.dispatchFetch("http://localhost/ws?room=gh-room", {
+    headers: { Upgrade: "websocket" },
+  });
+  const ws = res.webSocket;
+  expect(ws).toBeTruthy();
+  const outcome = new Promise((resolve) => {
+    ws.addEventListener("message", (event) => resolve({ message: JSON.parse(event.data) }));
+    ws.addEventListener("close", (event) => resolve({ closed: event.code, reason: event.reason }));
+  });
+  ws.accept();
+  ws.send(JSON.stringify({ type: "auth", github_token: token }));
+  const result = await outcome;
+  ws.close();
+  return result;
+}
+
+describe("GitHub login allowlist", () => {
+  it("blank ALLOWED_LOGIN rejects every login on /reply and WebSocket auth", async () => {
+    const mf = await makeMf({ bindings: { ALLOWED_LOGIN: "" }, fetchMock: githubMock() });
+    const reply = await postGithubReply(mf, "owner-token");
+    expect(reply.status).toBe(401);
+    expect(reply.json.error).toContain("ALLOWED_LOGIN is not set");
+    const ws = await githubWebSocketAuth(mf, "owner-token");
+    expect(ws.closed).toBe(4001);
+    await mf.dispose();
+  });
+
+  it("a login outside the allowlist gets 401 on /reply and WebSocket auth", async () => {
+    const mf = await makeMf({ bindings: { ALLOWED_LOGIN: "katopz" }, fetchMock: githubMock() });
+    const reply = await postGithubReply(mf, "stranger-token");
+    expect(reply.status).toBe(401);
+    expect(reply.json.error).toContain("mallory not allowlisted");
+    const ws = await githubWebSocketAuth(mf, "stranger-token");
+    expect(ws.closed).toBe(4001);
+    expect(ws.reason).toContain("not allowlisted");
+    await mf.dispose();
+  });
+
+  it("an allowlisted login is accepted, case-insensitively, from a list", async () => {
+    const mf = await makeMf({
+      bindings: { ALLOWED_LOGIN: "someone-else, KatOpz" },
+      fetchMock: githubMock(),
+    });
+    const reply = await postGithubReply(mf, "owner-token");
+    expect(reply.status).toBe(201);
+    const ws = await githubWebSocketAuth(mf, "owner-token");
+    expect(ws.message).toEqual({ type: "auth_ok" });
+    await mf.dispose();
+  });
+
+  it("allows any login only with an explicit *", async () => {
+    const mf = await makeMf({ bindings: { ALLOWED_LOGIN: "*" }, fetchMock: githubMock() });
+    const reply = await postGithubReply(mf, "stranger-token");
+    expect(reply.status).toBe(201);
+    await mf.dispose();
   });
 });

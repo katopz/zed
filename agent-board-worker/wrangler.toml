@@ -29,7 +29,8 @@ STALE_STATUS_SECS = "300"
 # e.g. the worker URL) and ENABLE the Device Flow checkbox in its advanced
 # settings, then paste its client id here.
 GITHUB_CLIENT_ID = "Iv23li2pZ9Pmv79Y77Fh"
-# Login allowlist for the web dashboard (GitHub login, not email).
-# Blank = any GitHub account that completes the device flow may sign in
-# (the client_id alone does not restrict who can authorize the app).
-ALLOWED_LOGIN = ""
+# Login allowlist for the web dashboard: comma-separated GitHub logins (not
+# emails). Blank rejects every login. "*" allows any GitHub account, which is
+# unsafe: the client_id does not restrict who can authorize the app, and the
+# default room id is derivable from the public key at github.com/<login>.keys.
+ALLOWED_LOGIN = "katopz"

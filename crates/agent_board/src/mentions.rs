@@ -256,7 +256,11 @@ pub fn inject_route(route: &MentionRoute) -> MentionDecision {
     match decision {
         MentionDecision::Allow => {
             let text = format!("📢 war-room [@{}] {}", route.sender_label, route.text);
-            auto_prompt::peer_states::inject_web_reply(route.prefix.clone(), text);
+            auto_prompt::peer_states::inject_web_reply(auto_prompt::peer_states::PendingWebReply {
+                session_prefix: route.prefix.clone(),
+                author_login: String::new(),
+                text,
+            });
             record_injection();
         }
         // Still visible in the feed — the operator sees the storm even when

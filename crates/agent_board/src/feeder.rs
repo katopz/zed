@@ -68,8 +68,8 @@ pub async fn sync_round(
     //    4-char session-id prefix. The agent_panel notification timer resolves
     //    the prefix to an active session and injects the text.
     let device_name = identity.device_name();
-    for (prefix, text) in extract_replies_for_device(&snapshot, device_name) {
-        auto_prompt::peer_states::inject_web_reply(prefix, text);
+    for reply in extract_replies_for_device(&snapshot, device_name) {
+        auto_prompt::peer_states::inject_web_reply(reply);
     }
 
     // 4. Push our own status (local claims only) so other devices see us.
@@ -93,12 +93,16 @@ pub async fn sync_round(
 pub(crate) fn extract_replies_for_device(
     snapshot: &RoomSnapshot,
     device_name: &str,
-) -> Vec<(String, String)> {
+) -> Vec<auto_prompt::peer_states::PendingWebReply> {
     snapshot
         .replies
         .iter()
         .filter(|reply| reply.target_device == device_name)
-        .map(|reply| (reply.target_session_prefix.clone(), reply.text.clone()))
+        .map(|reply| auto_prompt::peer_states::PendingWebReply {
+            session_prefix: reply.target_session_prefix.clone(),
+            author_login: reply.author_login.clone(),
+            text: reply.text.clone(),
+        })
         .collect()
 }
 
@@ -278,12 +282,23 @@ mod tests {
             make_reply("m3", "9d0e", "rebase first"),
         ]);
         let result = extract_replies_for_device(&snapshot, "m3");
-        assert_eq!(result.len(), 2);
+        let routed: Vec<(&str, &str, &str)> = result
+            .iter()
+            .map(|reply| {
+                (
+                    reply.session_prefix.as_str(),
+                    reply.author_login.as_str(),
+                    reply.text.as_str(),
+                )
+            })
+            .collect();
         assert_eq!(
-            result[0],
-            ("f3a2".to_string(), "stop and commit".to_string())
+            routed,
+            [
+                ("f3a2", "katopz", "stop and commit"),
+                ("9d0e", "katopz", "rebase first")
+            ]
         );
-        assert_eq!(result[1], ("9d0e".to_string(), "rebase first".to_string()));
     }
 
     #[test]

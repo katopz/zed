@@ -133,16 +133,28 @@ async function sha256Hex(text) {
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-// Verify a GitHub user token by asking GitHub whose it is. When ALLOWED_LOGIN
-// is set (non-blank) the login must match it (case-insensitive); when blank or
-// unset, any GitHub account that completed the device flow is accepted — the
-// client_id alone does NOT restrict who can authorize the app.
-// Returns { ok: true, login } or { ok: false, error }.
+// ALLOWED_LOGIN fails closed: blank or unset rejects every GitHub login. The
+// client_id does not restrict who can authorize the app, and the default room
+// id is derivable from a public SSH key, so allow-all would let any GitHub
+// account inject text into agents. Allowing everyone takes an explicit "*".
+// Otherwise it is a comma-separated list of logins, matched case-insensitively.
+function parseAllowedLogins(env) {
+  return String(env.ALLOWED_LOGIN ?? "")
+    .split(",")
+    .map((login) => login.trim().toLowerCase())
+    .filter((login) => login !== "");
+}
+
+// Verify a GitHub user token by asking GitHub whose it is, then check the
+// login against ALLOWED_LOGIN. Returns { ok: true, login } or { ok: false, error }.
 async function verifyGithubToken(env, token) {
   if (!token) return { ok: false, error: "missing token" };
-  const allowedLogin = String(env.ALLOWED_LOGIN ?? "").trim().toLowerCase();
+  const allowedLogins = parseAllowedLogins(env);
+  if (allowedLogins.length === 0) {
+    return { ok: false, error: "github sign-in disabled: ALLOWED_LOGIN is not set" };
+  }
   const isLoginAllowed = (login) =>
-    allowedLogin === "" || login.toLowerCase() === allowedLogin;
+    allowedLogins.includes("*") || allowedLogins.includes(login.toLowerCase());
   const key = await sha256Hex(token);
   const cached = githubTokenCache.get(key);
   if (cached && cached.expiresAt > Date.now()) {
@@ -433,7 +445,7 @@ function noRoomHtml() {
 <ul>
 <li><b>Zed war room panel</b> — click the <code>🌐 web</code> button in the panel header; it opens this page with the room already filled in.</li>
 <li><b>Config</b> — an explicit <code>room</code> in <code>~/.config/zed/agent_board.json</code> is used verbatim.</li>
-<li><b>Default</b> — with no <code>room</code> set, every device derives the same id from its SSH key: <code>blake3(raw_ed25519_pubkey)</code> hex (64 chars). Two devices sharing a key auto-join the same room.</li>
+<li><b>Default</b> — with no <code>room</code> set, every device derives the same id from its SSH private key (a 64-char hex BLAKE3 key derivation, not computable from the public key). Two devices sharing a key auto-join the same room.</li>
 </ul>
 </body>
 </html>`;

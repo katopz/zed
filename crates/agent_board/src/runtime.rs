@@ -215,8 +215,9 @@ impl BoardRuntime {
         // Captured before the identity moves into the client — `on_snapshot`
         // scans mentions with just the name.
         let device_name = identity.device_name().to_string();
-        // Room = hash(ssh-key) by default so two devices sharing a key auto-join
-        // the same room; an explicit config.room overrides.
+        // Room is derived from the ssh key's secret half by default so two
+        // devices sharing a key auto-join the same room; an explicit
+        // config.room overrides.
         let room = if self.config.room.trim().is_empty() {
             identity.room_id().to_string()
         } else {
@@ -522,6 +523,13 @@ mod tests {
     use crate::types::{BoardMessage, RoomSnapshot};
     use gpui::TestAppContext;
 
+    fn drain_reply_texts() -> Vec<(String, String)> {
+        auto_prompt::peer_states::drain_web_replies()
+            .into_iter()
+            .map(|reply| (reply.session_prefix, reply.text))
+            .collect()
+    }
+
     fn inert_http() -> Arc<dyn HttpClient> {
         // Local-only runtimes never issue requests; if one ever does, the 404
         // fails the round instead of hitting the network.
@@ -689,7 +697,7 @@ mod tests {
             )
         });
         assert_eq!(
-            auto_prompt::peer_states::drain_web_replies(),
+            drain_reply_texts(),
             vec![
                 ("f3a2".to_string(), "📢 war-room [@m3:aaaa] rebase please".to_string())
             ],
@@ -748,7 +756,7 @@ mod tests {
             )
         });
         assert_eq!(
-            auto_prompt::peer_states::drain_web_replies(),
+            drain_reply_texts(),
             vec![("bbbb".to_string(), "📢 war-room [@web] deploy".to_string())],
         );
         assert_eq!(crate::mentions::unwatched_mention_count(), 2);
@@ -770,7 +778,7 @@ mod tests {
         });
         let replies = auto_prompt::peer_states::drain_web_replies();
         assert_eq!(replies.len(), 3, "a fresh budget allows exactly the cap");
-        assert!(replies.iter().all(|(prefix, _)| prefix == "f3a2"));
+        assert!(replies.iter().all(|reply| reply.session_prefix == "f3a2"));
         assert_eq!(crate::mentions::unwatched_mention_count(), 5);
 
         // A second storm the same hour: the cap is exhausted — zero more.
@@ -798,7 +806,7 @@ mod tests {
             crate::mentions::ScanOutcome::Routed
         );
         assert_eq!(
-            auto_prompt::peer_states::drain_web_replies(),
+            drain_reply_texts(),
             vec![("cccc".to_string(), "📢 war-room [@web] fresh".to_string())],
         );
         assert_eq!(

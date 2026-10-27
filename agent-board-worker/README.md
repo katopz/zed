@@ -54,9 +54,11 @@ GitHub issues the token, then sends it as the first WebSocket message
 (`{type:"auth", github_token}`) or as `Authorization: Bearer <token>` on
 `POST /reply`. Tokens are opaque, so verification asks `api.github.com/user`
 whose token it is (cached 10 min by sha256(token)) and asserts
-`login == ALLOWED_LOGIN` when that var is set; blank/unset allows **any**
-GitHub account that completed the device flow (the client_id does not
-restrict who can authorize the app).
+the login is in `ALLOWED_LOGIN` (comma-separated, case-insensitive). Blank or
+unset rejects **every** GitHub login. `"*"` allows any GitHub account that
+completed the device flow; avoid it, because the client_id does not restrict
+who can authorize the app and the default room id is derivable from the
+public key at `github.com/<login>.keys`.
 
 **Setup** (one-time): GitHub → Settings → Developer settings → OAuth Apps →
 New OAuth App (callback URL can be the worker URL; it is unused by device

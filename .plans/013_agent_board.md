@@ -133,7 +133,9 @@ coding at that moment. Agents talk to each other by posting to the board.
 
 #### P2.1 — Room = hash(ssh-key) (points 1-2)
 - [x] `DeviceIdentity::room_id()` → `blake3(raw_ed25519_pubkey_32)` hex
-      (same as device_id — same key = same room).
+      (same as device_id — same key = same room). Superseded by issue 038:
+      now `blake3::derive_key(context, secret_key_32)` hex, because the
+      public key is published at `github.com/<login>.keys`.
 - [x] `AgentBoardConfig`: deprecate `room` field; derive from identity when empty.
 - [x] `feeder::sync_round`: use derived room id (via panel's `resolved_room`).
 - [x] The worker already keys by room name — the room id is just a string.
@@ -259,7 +261,8 @@ agent_ui ─→ auto_prompt ─→ (hidden orchestrator, plan_registry)
 
 ### GOAT gate (Phase 2)
 - [x] Two devices with same ssh-key auto-join same room.
-      (Verified: `room_id() == device_id() == blake3(pubkey)` — tests `room_id_equals_device_id`,
+      (Verified: `room_id() == device_id() == blake3(pubkey)` — tests `room_id_equals_device_id`
+      (since issue 038: `room_id_is_not_derivable_from_public_key`),
       `same_key_same_room`, `device_id_is_stable`, `device_id_differs_per_key` in identity.rs.
       Same key deterministically derives same room id; different keys derive different rooms.)
 - [x] Agent states visible in chat on both devices.

@@ -8,6 +8,11 @@
 //!
 //! Device id = hex(blake3(raw_ed25519_pubkey_32)). This is stable across
 //! sessions and unique per SSH key.
+//!
+//! Default room id = hex(blake3::derive_key(ROOM_KEY_CONTEXT, secret_key_32)).
+//! It comes from the secret half of the key because the public half is
+//! published at `github.com/<login>.keys`: a room derived from it could be
+//! computed by anyone (issue 038).
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
@@ -19,6 +24,10 @@ use ssh_key::PrivateKey;
 const B64: base64::engine::general_purpose::GeneralPurpose =
     base64::engine::general_purpose::STANDARD;
 
+/// BLAKE3 key-derivation context for the default room id. Changing it moves
+/// every device that uses the default room to a new room.
+const ROOM_KEY_CONTEXT: &str = "zed agent_board 2026-10-27 default room id";
+
 /// A loaded device identity backed by an ed25519 SSH key.
 pub struct DeviceIdentity {
     signing_key: SigningKey,
@@ -26,6 +35,8 @@ pub struct DeviceIdentity {
     public_key_32: [u8; 32],
     /// hex(blake3(public_key_32)).
     device_id: String,
+    /// hex(blake3::derive_key(ROOM_KEY_CONTEXT, secret_key_32)).
+    room_id: String,
     device_name: String,
     location_hash: String,
 }
@@ -56,10 +67,12 @@ impl DeviceIdentity {
         // (secret is a stack array, dropped at scope end — nothing more to do.)
 
         let device_id = device_id_from_pubkey(&public_key_32);
+        let room_id = room_id_from_secret(&secret);
         Ok(Self {
             signing_key,
             public_key_32,
             device_id,
+            room_id,
             device_name,
             location_hash,
         })
@@ -77,12 +90,11 @@ impl DeviceIdentity {
         &self.location_hash
     }
 
-    /// Room id = `blake3(raw_ed25519_pubkey_32)` hex. This is the same value as
-    /// [`device_id`](Self::device_id) — by design: two devices sharing the same
-    /// SSH key auto-join the same room (operator spec Phase 2 point 1-2). The
-    /// room id is just the device id repurposed as a room name.
+    /// Default room id, derived from the secret key: two devices sharing the
+    /// same SSH key auto-join the same room (operator spec Phase 2 point 1-2),
+    /// but holding only the public key does not reveal it.
     pub fn room_id(&self) -> &str {
-        &self.device_id
+        &self.room_id
     }
 
     /// Raw 32-byte verifying key, base64-encoded, for the `X-Pubkey` header.
@@ -121,6 +133,11 @@ impl DeviceIdentity {
 pub fn device_id_from_pubkey(public_key_32: &[u8; 32]) -> String {
     let hash = blake3::hash(public_key_32);
     hex::encode(hash.as_bytes())
+}
+
+/// Derive the default room id from a raw 32-byte ed25519 secret key.
+pub fn room_id_from_secret(secret_key_32: &[u8; 32]) -> String {
+    hex::encode(blake3::derive_key(ROOM_KEY_CONTEXT, secret_key_32))
 }
 
 /// Best-effort location fingerprint: blake3(hostname + primary network
@@ -208,27 +225,28 @@ mod tests {
         assert_ne!(device_id_from_pubkey(&a), device_id_from_pubkey(&b));
     }
 
-    /// Phase 2 point 1-2: two devices sharing the same SSH key auto-join the
-    /// same room because `room_id()` == `device_id()` == `blake3(pubkey)`.
+    /// Issue 038: the default room must not be computable from the public key
+    /// (published at github.com/<login>.keys), so it differs from both the
+    /// device id and a plain hash of the public key.
     #[test]
-    fn room_id_equals_device_id() {
+    fn room_id_is_not_derivable_from_public_key() {
         let key = random_key();
-        let pk = key.verifying_key().to_bytes();
-        let expected = device_id_from_pubkey(&pk);
-        // room_id and device_id produce the same value for the same pubkey.
-        assert_eq!(expected, device_id_from_pubkey(&pk));
-        assert_eq!(expected.len(), 64);
+        let public_key = key.verifying_key().to_bytes();
+        let room = room_id_from_secret(&key.to_bytes());
+        assert_eq!(room.len(), 64);
+        assert_ne!(room, device_id_from_pubkey(&public_key));
+        assert_ne!(room, hex::encode(blake3::hash(&key.to_bytes()).as_bytes()));
     }
 
-    /// Phase 2 point 1-2: same pubkey → same room id, regardless of how many
-    /// times we derive it (simulates two devices with the same key).
+    /// Phase 2 point 1-2: same key → same room id (simulates two devices with
+    /// the same key); a different key → a different room.
     #[test]
     fn same_key_same_room() {
         let key = random_key();
-        let pk = key.verifying_key().to_bytes();
-        let room_a = device_id_from_pubkey(&pk);
-        let room_b = device_id_from_pubkey(&pk);
+        let room_a = room_id_from_secret(&key.to_bytes());
+        let room_b = room_id_from_secret(&key.to_bytes());
         assert_eq!(room_a, room_b, "same key must derive same room");
+        assert_ne!(room_a, room_id_from_secret(&random_key().to_bytes()));
     }
 
     /// The signing scheme round-trips: sign then verify. This exercises the
