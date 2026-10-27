@@ -16,7 +16,9 @@ use chrono::{DateTime, SubsecRound as _, Utc};
 use fs::Fs;
 use futures::future::BoxFuture;
 use gpui::{BackgroundExecutor, Task};
-use language_model::{LanguageModelCompletionError, LanguageModelProviderName};
+use language_model::{
+    LanguageModelCompletionError, LanguageModelProviderName, ProviderErrorCategory,
+};
 use parking_lot::Mutex as ParkingMutex;
 use paths;
 use rand::Rng;
@@ -909,7 +911,7 @@ pub fn format_backoff_remaining(remaining: Duration) -> String {
     }
 }
 
-/// True for `RateLimitExceeded` specifically. Used by `retry_stream` to decide
+/// True for a `ProviderRejection` categorized as `RateLimit` specifically. Used by `retry_stream` to decide
 /// whether to stop rotating after the first failure: rate limits are
 /// frequently account/org-wide (multiple keys under one quota), so a 429 on
 /// key A is a strong predictor of a 429 on key B. Rotating in that case just
@@ -917,7 +919,13 @@ pub fn format_backoff_remaining(remaining: Duration) -> String {
 /// *next* request. The slot that hit the limit is still backed off (so the
 /// next request skips it), we just don't burn its siblings.
 pub fn is_rate_limit(err: &LanguageModelCompletionError) -> bool {
-    matches!(err, LanguageModelCompletionError::RateLimitExceeded { .. })
+    matches!(
+        err,
+        LanguageModelCompletionError::ProviderRejection {
+            category: ProviderErrorCategory::RateLimit,
+            ..
+        }
+    )
 }
 
 /// How a failed attempt should be attributed to the key that produced it.
@@ -956,26 +964,34 @@ pub enum ErrorVerdict {
 /// treating an unlabeled failure as a confirmed quota exhaustion.
 pub fn classify_error(err: &LanguageModelCompletionError) -> ErrorVerdict {
     match err {
-        LanguageModelCompletionError::RateLimitExceeded { .. }
-        | LanguageModelCompletionError::ServerOverloaded { .. }
-        | LanguageModelCompletionError::ApiInternalServerError { .. }
-        | LanguageModelCompletionError::UpstreamProviderError { .. }
-        | LanguageModelCompletionError::AuthenticationError { .. }
-        | LanguageModelCompletionError::PermissionError { .. }
-        | LanguageModelCompletionError::PaymentRequired => ErrorVerdict::KeyFault,
+        LanguageModelCompletionError::ProviderRejection { category, .. } => match category {
+            ProviderErrorCategory::RateLimit
+            | ProviderErrorCategory::Overloaded
+            | ProviderErrorCategory::InternalServer
+            | ProviderErrorCategory::Authentication
+            | ProviderErrorCategory::Permission
+            | ProviderErrorCategory::PaymentRequired => ErrorVerdict::KeyFault,
+            // Request-shaped rejections (and unclassified statuses, which the
+            // old `HttpResponseError` arm also treated as benign) would recur
+            // identically on every key.
+            ProviderErrorCategory::PromptTooLarge { .. }
+            | ProviderErrorCategory::InvalidEncryptedContent
+            | ProviderErrorCategory::ContentPolicy
+            | ProviderErrorCategory::EndpointNotFound
+            | ProviderErrorCategory::InvalidRequest
+            | ProviderErrorCategory::Conflict
+            | ProviderErrorCategory::Timeout
+            | ProviderErrorCategory::Other => ErrorVerdict::Benign,
+        },
         LanguageModelCompletionError::HttpSend { .. }
         | LanguageModelCompletionError::StreamEndedUnexpectedly { .. }
         | LanguageModelCompletionError::ApiReadResponseError { .. }
         | LanguageModelCompletionError::Other(_) => ErrorVerdict::Transport,
-        LanguageModelCompletionError::PromptTooLarge { .. }
-        | LanguageModelCompletionError::NoApiKey { .. }
-        | LanguageModelCompletionError::BadRequestFormat { .. }
-        | LanguageModelCompletionError::InvalidEncryptedContent { .. }
-        | LanguageModelCompletionError::ApiEndpointNotFound { .. }
-        | LanguageModelCompletionError::HttpResponseError { .. }
+        LanguageModelCompletionError::NoApiKey { .. }
         | LanguageModelCompletionError::SerializeRequest { .. }
         | LanguageModelCompletionError::BuildRequestBody { .. }
         | LanguageModelCompletionError::DeserializeResponse { .. }
+        | LanguageModelCompletionError::ModelUnavailable { .. }
         | LanguageModelCompletionError::DataRetentionConsentRequired { .. } => ErrorVerdict::Benign,
     }
 }
@@ -1151,7 +1167,7 @@ pub fn record_key_success(key_health: &Arc<ParkingMutex<KeyHealthTracker>>, slot
 /// verdict-less transport failures take the short one, and benign errors are
 /// no-ops because they would recur on every key.
 ///
-/// For `RateLimitExceeded` the upstream's retry hint (when present) replaces
+/// For a `RateLimit` rejection the upstream's retry hint (when present) replaces
 /// the exponential schedule via `record_rate_limit` — the server-provided
 /// reset time is strictly more accurate than the local guess.
 pub fn record_key_failure(
@@ -1165,7 +1181,14 @@ pub fn record_key_failure(
     }
     let mut health = key_health.lock();
     match (verdict, err) {
-        (_, LanguageModelCompletionError::RateLimitExceeded { retry_after, .. }) => {
+        (
+            _,
+            LanguageModelCompletionError::ProviderRejection {
+                category: ProviderErrorCategory::RateLimit,
+                retry_after,
+                ..
+            },
+        ) => {
             health.record_rate_limit(slot, Instant::now(), *retry_after);
         }
         (ErrorVerdict::Transport, _) => health.record_transport_failure(slot, Instant::now()),
@@ -1189,7 +1212,7 @@ pub fn snapshot_health(key_health: &Arc<ParkingMutex<KeyHealthTracker>>) -> KeyH
 /// [`classify_error`]:
 ///
 /// * [`ErrorVerdict::KeyFault`] — poison the slot on the quota schedule and
-///   try the next candidate, *except* for `RateLimitExceeded`, which exits
+///   try the next candidate, *except* for a `RateLimit` rejection, which exits
 ///   the loop immediately after poisoning the slot (see `is_rate_limit`: rate
 ///   limits are commonly account-wide, so rotating would burn healthy
 ///   siblings for no benefit).
@@ -1487,24 +1510,17 @@ mod tests {
     /// `transport_errors_classify_as_transport_not_key_fault`.
     #[test]
     fn benign_errors_never_mark_the_slot() {
-        let provider = provider_name();
         for err in [
             LanguageModelCompletionError::NoApiKey {
-                provider: provider.clone(),
+                provider: provider_name(),
             },
-            LanguageModelCompletionError::PromptTooLarge { tokens: None },
-            LanguageModelCompletionError::BadRequestFormat {
-                provider: provider.clone(),
-                message: "bad".into(),
-            },
-            LanguageModelCompletionError::ApiEndpointNotFound {
-                provider: provider.clone(),
-            },
-            LanguageModelCompletionError::HttpResponseError {
-                provider,
-                status_code: StatusCode::NOT_IMPLEMENTED,
-                message: "bad".into(),
-            },
+            rejection(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                ProviderErrorCategory::PromptTooLarge { tokens: None },
+            ),
+            rejection(StatusCode::BAD_REQUEST, ProviderErrorCategory::InvalidRequest),
+            rejection(StatusCode::NOT_FOUND, ProviderErrorCategory::EndpointNotFound),
+            rejection(StatusCode::IM_A_TEAPOT, ProviderErrorCategory::Other),
         ] {
             assert_eq!(classify_error(&err), ErrorVerdict::Benign, "{err}");
         }
@@ -1880,27 +1896,29 @@ mod tests {
     // without a real HTTP client.
     // ------------------------------------------------------------------
 
-    fn rate_limit_err() -> LanguageModelCompletionError {
-        LanguageModelCompletionError::RateLimitExceeded {
+    fn rejection(status: StatusCode, category: ProviderErrorCategory) -> LanguageModelCompletionError {
+        LanguageModelCompletionError::ProviderRejection {
             provider: provider_name(),
+            status: Some(status),
+            code: None,
+            message: "bad".into(),
             retry_after: None,
+            category,
         }
+    }
+
+    fn rate_limit_err() -> LanguageModelCompletionError {
+        rejection(StatusCode::TOO_MANY_REQUESTS, ProviderErrorCategory::RateLimit)
     }
 
     fn server_overloaded_err() -> LanguageModelCompletionError {
         // Backoff-worthy but NOT a rate limit: rotation should proceed.
-        LanguageModelCompletionError::ServerOverloaded {
-            provider: provider_name(),
-            retry_after: None,
-        }
+        rejection(StatusCode::SERVICE_UNAVAILABLE, ProviderErrorCategory::Overloaded)
     }
 
     fn bad_request_err() -> LanguageModelCompletionError {
         // Non-backoff-worthy: should abort retry loop immediately.
-        LanguageModelCompletionError::BadRequestFormat {
-            provider: provider_name(),
-            message: "bad".into(),
-        }
+        rejection(StatusCode::BAD_REQUEST, ProviderErrorCategory::InvalidRequest)
     }
 
     #[test]
@@ -2025,7 +2043,10 @@ mod tests {
         assert!(
             matches!(
                 result,
-                Err(LanguageModelCompletionError::RateLimitExceeded { .. })
+                Err(LanguageModelCompletionError::ProviderRejection {
+                    category: ProviderErrorCategory::RateLimit,
+                    ..
+                })
             ),
             "should return the rate-limit error"
         );
@@ -2076,7 +2097,10 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(LanguageModelCompletionError::BadRequestFormat { .. })
+            Err(LanguageModelCompletionError::ProviderRejection {
+                category: ProviderErrorCategory::InvalidRequest,
+                ..
+            })
         ));
         // Only one attempt — non-backoff-worthy errors don't rotate.
         assert_eq!(attempts.lock().len(), 1);
@@ -2114,7 +2138,10 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(LanguageModelCompletionError::ServerOverloaded { .. })
+            Err(LanguageModelCompletionError::ProviderRejection {
+                category: ProviderErrorCategory::Overloaded,
+                ..
+            })
         ));
         // Exactly one attempt per candidate — no slot tried twice.
         let attempts = attempts.lock();
@@ -2831,13 +2858,14 @@ mod tests {
         for err in [
             LanguageModelCompletionError::HttpSend {
                 provider: provider.clone(),
+                host: "api.example.com".into(),
                 error: anyhow::anyhow!("connection reset"),
             },
             LanguageModelCompletionError::StreamEndedUnexpectedly {
                 provider: provider.clone(),
             },
             LanguageModelCompletionError::ApiReadResponseError {
-                provider: provider.clone(),
+                provider,
                 error: std::io::Error::other("eof"),
             },
             LanguageModelCompletionError::Other(anyhow::anyhow!("unknown")),
@@ -2850,19 +2878,16 @@ mod tests {
         }
 
         for err in [
-            LanguageModelCompletionError::RateLimitExceeded {
-                provider: provider.clone(),
-                retry_after: None,
-            },
-            LanguageModelCompletionError::AuthenticationError {
-                provider: provider.clone(),
-                message: "bad key".into(),
-            },
-            LanguageModelCompletionError::ApiInternalServerError {
-                provider,
-                message: "boom".into(),
-            },
-            LanguageModelCompletionError::PaymentRequired,
+            rate_limit_err(),
+            rejection(StatusCode::UNAUTHORIZED, ProviderErrorCategory::Authentication),
+            rejection(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ProviderErrorCategory::InternalServer,
+            ),
+            rejection(
+                StatusCode::PAYMENT_REQUIRED,
+                ProviderErrorCategory::PaymentRequired,
+            ),
         ] {
             assert_eq!(classify_error(&err), ErrorVerdict::KeyFault);
         }
@@ -2878,6 +2903,7 @@ mod tests {
         let now = Instant::now();
         let err = LanguageModelCompletionError::HttpSend {
             provider: provider_name(),
+            host: "api.example.com".into(),
             error: anyhow::anyhow!("error sending HTTP request"),
         };
 

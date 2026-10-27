@@ -24,7 +24,7 @@
 //!   3. The only hard stops are: user cancel, no model configured, or the
 //!      configured default model is not Anthropic (see `decide_claude`).
 
-use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::schema::v2 as acp;
 use anyhow::Context as _;
 use futures::{StreamExt, pin_mut};
 use gpui::App;
@@ -32,7 +32,6 @@ use language_model::{
     LanguageModel, LanguageModelCompletionEvent, LanguageModelRequest, LanguageModelRequestMessage,
     Role,
 };
-use std::sync::Arc;
 use std::time::Duration;
 
 use crate::{
@@ -317,7 +316,7 @@ pub fn decide_claude(
             log::warn!("[auto_prompt::claude] No language model configured in Zed — stopping");
             return AutoPromptDecision::NoAction;
         };
-        let model = configured_model.model;
+        let model = configured_model;
 
         // Claude Code authenticates itself (browser/subscription) outside Zed's
         // LanguageModelRegistry, so the only way to orchestrate its continuation
@@ -401,7 +400,7 @@ fn claude_effective_context_tokens(usage: &acp_thread::TokenUsage) -> u64 {
 /// configured model (the normal backends then handle the NoAction).
 fn claude_context_overflow_decision(
     thread: &gpui::Entity<acp_thread::AcpThread>,
-    configured_model: Option<&language_model::ConfiguredModel>,
+    configured_model: Option<&LanguageModel>,
     cx: &App,
 ) -> Option<AutoPromptDecision> {
     let threshold = crate::load_config_cached()
@@ -442,7 +441,7 @@ fn claude_context_overflow_decision(
     .to_string();
 
     Some(AutoPromptDecision::NeedsLlmCall(LlmCallData {
-        model: configured.model.clone(),
+        model: configured.clone(),
         // Unused by the overflow path (Phase 1/2 are deterministic and the
         // pending-question fast path has its own prompt).
         system_prompt: String::new(),
@@ -478,7 +477,7 @@ fn claude_context_overflow_decision(
 fn claude_decision_needs_llm(
     thread: &gpui::Entity<acp_thread::AcpThread>,
     stop_reason: &acp::StopReason,
-    model: Arc<dyn LanguageModel>,
+    model: LanguageModel,
     cx: &App,
 ) -> AutoPromptDecision {
     let Some((session_id, title, work_dirs, last_assistant_message)) =
@@ -500,8 +499,8 @@ fn claude_decision_needs_llm(
     .to_string();
 
     AutoPromptDecision::NeedsLlmCall(LlmCallData {
-        model: configured.model,
-        system_prompt: HIDDEN_ORCHESTRATOR_PROMPT.to_string(),
+        model,
+        system_prompt: CLAUDE_SYSTEM_PROMPT.to_string(),
         context_json,
         project_root: work_dirs.as_ref().and_then(|d| d.first().cloned()),
         session_id,
@@ -563,7 +562,7 @@ fn compute_claude_stop_phase() -> crate::context::StopPhase {
 fn claude_decision_hidden(
     thread: &gpui::Entity<acp_thread::AcpThread>,
     stop_reason: &acp::StopReason,
-    configured_model: Option<language_model::ConfiguredModel>,
+    configured_model: Option<LanguageModel>,
     cx: &App,
 ) -> AutoPromptDecision {
     let connection = thread.read(cx).connection().clone();
@@ -618,7 +617,7 @@ fn claude_decision_hidden(
     .to_string();
 
     AutoPromptDecision::NeedsLlmCall(LlmCallData {
-        model: configured.model,
+        model: configured,
         system_prompt: HIDDEN_ORCHESTRATOR_PROMPT.to_string(),
         context_json,
         project_root: work_dirs.as_ref().and_then(|d| d.first().cloned()),
@@ -1025,7 +1024,7 @@ async fn judge_with_hidden_session(
 /// the minimal Claude context (just the last paragraphs JSON). Falls back to
 /// a stop verdict on empty/error responses so we never silently loop.
 async fn call_claude_orchestrator(
-    model: &Arc<dyn LanguageModel>,
+    model: &LanguageModel,
     context_json: &str,
     cx: &gpui::AsyncApp,
 ) -> anyhow::Result<String> {
@@ -1048,8 +1047,7 @@ async fn call_claude_orchestrator(
     };
 
     let completion_future = async {
-        let mut stream = model
-            .stream_completion(request, cx)
+        let mut stream = crate::stream_model_completion(model, request, cx)
             .await
             .context("auto_prompt::claude: failed to start completion stream")?;
 
@@ -1727,20 +1725,22 @@ mod tests {
     mod hidden_thread_async {
         use super::*;
         use acp_thread::StubAgentConnection;
+        use agent_client_protocol::schema::v1 as acp_v1;
         use std::rc::Rc;
 
         /// Minimal LlmCallData for the hidden-thread path. Only `connection`,
         /// `project`, `system_prompt`, `context_json`, `session_id`,
         /// `last_assistant_message`, and `work_dirs` are read by
         /// `decide_claude_with_hidden_thread`; the rest are zeroed/filled with
-        /// a FakeLanguageModel placeholder.
+        /// a fake provider model placeholder.
         fn build_test_data(
             connection: Rc<dyn acp_thread::AgentConnection>,
             project: gpui::Entity<project::Project>,
             worker_output: &str,
         ) -> LlmCallData {
             LlmCallData {
-                model: Arc::new(language_model::fake_provider::FakeLanguageModel::default()),
+                model: language_model::fake_provider::FakeLanguageModelProvider::default()
+                    .model("fake"),
                 system_prompt: HIDDEN_ORCHESTRATOR_PROMPT.to_string(),
                 context_json: serde_json::json!({
                     "session_id": "test-worker",
@@ -1791,8 +1791,8 @@ mod tests {
             // Pre-set the hidden session's response: a well-formed continue
             // verdict. The stub's `prompt` drains these updates and auto-ends
             // the turn, so `thread.send` resolves immediately.
-            connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
-                acp::ContentChunk::new(
+            connection.set_next_prompt_updates(vec![acp_v1::SessionUpdate::AgentMessageChunk(
+                acp_v1::ContentChunk::new(
                     r#"{"continue": true, "confidence": 0.8, "next_prompt": "Run the failing test.", "reason": "Test still failing."}"#
                         .into(),
                 ),
@@ -1825,8 +1825,8 @@ mod tests {
             let project = project::Project::test(fs, [], cx).await;
 
             let connection = Rc::new(StubAgentConnection::new());
-            connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
-                acp::ContentChunk::new(
+            connection.set_next_prompt_updates(vec![acp_v1::SessionUpdate::AgentMessageChunk(
+                acp_v1::ContentChunk::new(
                     r#"{"continue": false, "confidence": 0.9, "next_prompt": null, "reason": "Task complete."}"#
                         .into(),
                 ),
@@ -1859,8 +1859,8 @@ mod tests {
             let connection = Rc::new(StubAgentConnection::new());
             // Simulate a tool-leak: the hidden session returned prose instead
             // of JSON. The async path must map this to Stopped, never loop.
-            connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
-                acp::ContentChunk::new("I read the file and the bug is on line 42.".into()),
+            connection.set_next_prompt_updates(vec![acp_v1::SessionUpdate::AgentMessageChunk(
+                acp_v1::ContentChunk::new("I read the file and the bug is on line 42.".into()),
             )]);
 
             let data = build_test_data(connection, project, "Investigating the bug in file.rs.");
@@ -1904,12 +1904,12 @@ mod tests {
             // must stop BEFORE parsing, because the tool use is the violation.
             let valid_continue_json = r#"{"continue": true, "confidence": 0.9, "next_prompt": "Keep going.", "reason": "More work."}"#;
             connection.set_next_prompt_updates(vec![
-                acp::SessionUpdate::ToolCall(
-                    acp::ToolCall::new("leaked-read", "Read file.rs")
-                        .kind(acp::ToolKind::Fetch)
-                        .status(acp::ToolCallStatus::Completed),
+                acp_v1::SessionUpdate::ToolCall(
+                    acp_v1::ToolCall::new("leaked-read", "Read file.rs")
+                        .kind(acp_v1::ToolKind::Fetch)
+                        .status(acp_v1::ToolCallStatus::Completed),
                 ),
-                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(
                     valid_continue_json.into(),
                 )),
             ]);
@@ -1943,8 +1943,8 @@ mod tests {
 
             let connection = Rc::new(StubAgentConnection::new());
             // continue=true but confidence below the 0.5 threshold → must stop.
-            connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
-                acp::ContentChunk::new(
+            connection.set_next_prompt_updates(vec![acp_v1::SessionUpdate::AgentMessageChunk(
+                acp_v1::ContentChunk::new(
                     r#"{"continue": true, "confidence": 0.2, "next_prompt": "maybe continue?", "reason": "unsure"}"#
                         .into(),
                 ),
@@ -1982,8 +1982,8 @@ mod tests {
             let connection = Rc::new(StubAgentConnection::new());
             // continue=true with high confidence but next_prompt is null.
             // The code must fall back to the default nudge.
-            connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
-                acp::ContentChunk::new(
+            connection.set_next_prompt_updates(vec![acp_v1::SessionUpdate::AgentMessageChunk(
+                acp_v1::ContentChunk::new(
                     r#"{"continue": true, "confidence": 0.9, "next_prompt": null, "reason": "keep going"}"#
                         .into(),
                 ),
@@ -2020,8 +2020,8 @@ mod tests {
             // continue=true but confidence field is entirely absent.
             // parse_claude_response returns confidence=None, which
             // unwrap_or(0.0) makes 0.0 < threshold → must stop.
-            connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
-                acp::ContentChunk::new(
+            connection.set_next_prompt_updates(vec![acp_v1::SessionUpdate::AgentMessageChunk(
+                acp_v1::ContentChunk::new(
                     r#"{"continue": true, "next_prompt": "do something", "reason": "unsure"}"#
                         .into(),
                 ),
@@ -2061,8 +2061,8 @@ mod tests {
             let project = project::Project::test(fs, [], cx).await;
 
             let connection = Rc::new(StubAgentConnection::new().with_supports_close_session(true));
-            connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
-                acp::ContentChunk::new(
+            connection.set_next_prompt_updates(vec![acp_v1::SessionUpdate::AgentMessageChunk(
+                acp_v1::ContentChunk::new(
                     r#"{"continue": false, "confidence": 0.9, "next_prompt": null, "reason": "done"}"#
                         .into(),
                 ),
@@ -2099,8 +2099,8 @@ mod tests {
             let project = project::Project::test(fs, [], cx).await;
 
             let connection = Rc::new(StubAgentConnection::new());
-            connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
-                acp::ContentChunk::new(
+            connection.set_next_prompt_updates(vec![acp_v1::SessionUpdate::AgentMessageChunk(
+                acp_v1::ContentChunk::new(
                     r#"{"continue": false, "confidence": 0.9, "next_prompt": null, "reason": "done"}"#
                         .into(),
                 ),
@@ -2129,7 +2129,7 @@ mod tests {
         /// No-API-key guarantee (GOAT item): the hidden-thread path must NEVER
         /// call the LanguageModel's stream_completion. It uses Claude Code's
         /// own auth via the ACP connection, not Zed's LanguageModelRegistry.
-        /// This test captures the FakeLanguageModel and asserts completion_count
+        /// This test captures the fake provider and asserts completion_count
         /// stays 0 after a full Continue verdict roundtrip — if the hidden path
         /// ever regressed to calling the model (e.g. by accidentally routing to
         /// decide_claude_with_llm), this count would be 1.
@@ -2141,17 +2141,17 @@ mod tests {
             let project = project::Project::test(fs, [], cx).await;
 
             let connection = Rc::new(StubAgentConnection::new());
-            connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
-                acp::ContentChunk::new(
+            connection.set_next_prompt_updates(vec![acp_v1::SessionUpdate::AgentMessageChunk(
+                acp_v1::ContentChunk::new(
                     r#"{"continue": true, "confidence": 0.9, "next_prompt": "Keep going.", "reason": "More work."}"#
                         .into(),
                 ),
             )]);
 
-            let model = Arc::new(language_model::fake_provider::FakeLanguageModel::default());
+            let provider = cx.update(language_model::LanguageModelRegistry::test);
             let mut data =
                 build_test_data(connection, project, "Investigating the bug in file.rs.");
-            data.model = model.clone();
+            data.model = provider.model("fake");
 
             let outcome = cx
                 .update(|cx| {
@@ -2165,7 +2165,7 @@ mod tests {
                 "expected Continue, got {outcome:?}"
             );
             assert_eq!(
-                model.completion_count(),
+                provider.completion_count(),
                 0,
                 "hidden-thread path must never call stream_completion on the LanguageModel"
             );
@@ -2204,13 +2204,13 @@ mod tests {
 
             // Decision A: continue, run the failing test.
             connection_a.set_next_prompt_updates(vec![
-                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(
                     r#"{"continue": true, "confidence": 0.9, "next_prompt": "Run test A.", "reason": "A still failing."}"#.into(),
                 )),
             ]);
             // Decision B: stop, task complete.
             connection_b.set_next_prompt_updates(vec![
-                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(
                     r#"{"continue": false, "confidence": 0.9, "next_prompt": null, "reason": "B done."}"#.into(),
                 )),
             ]);
@@ -2292,8 +2292,8 @@ mod tests {
             // The hidden session sees plan_summary with unchecked tasks and
             // returns continue (the new prompt rule fires). The worker's own
             // output says "all done" — plan_summary must win.
-            connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
-                acp::ContentChunk::new(
+            connection.set_next_prompt_updates(vec![acp_v1::SessionUpdate::AgentMessageChunk(
+                acp_v1::ContentChunk::new(
                     r#"{"continue": true, "confidence": 0.9, "next_prompt": "Continue with T4.4 from .plans/330. Mark completed steps as [x].", "reason": "Plan 330 has unchecked tasks."}"#.into(),
                 ),
             )]);

@@ -1,7 +1,7 @@
 use acp_thread::{
     SUBAGENT_SESSION_INFO_META_KEY, SubagentSessionInfo, verdict, verdict::VerdictReviewer,
 };
-use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::schema::v2 as acp;
 use agent_settings::AgentSettings;
 use anyhow::Result;
 use gpui::{App, SharedString, Task};
@@ -544,16 +544,21 @@ impl AgentTool for RequestVerdictTool {
                 SUBAGENT_SESSION_INFO_META_KEY.into(),
                 serde_json::json!(&session_info),
             )]));
-            if matches!(route, ReviewerRoute::Native | ReviewerRoute::Secondary(_)) {
-                event_stream.subagent_spawned(session_id.clone());
-                event_stream
-                    .update_fields_with_meta(acp::ToolCallUpdateFields::new(), meta.clone());
+            // The subagent session-info meta is what lets the panel render the
+            // reviewer as an expandable subagent tool call.
+            if matches!(route, ReviewerRoute::Native | ReviewerRoute::Secondary(_))
+                && let Some(meta) = meta.clone()
+            {
+                event_stream.update_fields(|update| update.meta(meta));
             }
 
-            event_stream.update_fields_with_meta(
-                acp::ToolCallUpdateFields::new().content(vec![output.clone().into()]),
-                meta,
-            );
+            event_stream.update_fields(|update| {
+                let update = update.content(vec![output.clone().into()]);
+                match meta {
+                    Some(meta) => update.meta(meta),
+                    None => update,
+                }
+            });
 
             Ok(RequestVerdictToolOutput::Success {
                 session_id,
@@ -592,10 +597,13 @@ impl AgentTool for RequestVerdictTool {
                 serde_json::json!(&session_info),
             )])
         });
-        event_stream.update_fields_with_meta(
-            acp::ToolCallUpdateFields::new().content(vec![content]),
-            meta,
-        );
+        event_stream.update_fields(|update| {
+            let update = update.content(vec![content]);
+            match meta {
+                Some(meta) => update.meta(meta),
+                None => update,
+            }
+        });
 
         Ok(())
     }

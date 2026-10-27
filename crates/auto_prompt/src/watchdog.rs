@@ -22,7 +22,6 @@
 //! "a `git log` returned 3 lines 30 minutes ago and nothing happened since"
 //! (halt) and "a `cargo test` is still streaming output" (continue).
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
@@ -119,7 +118,7 @@ Respond as JSON ONLY (no markdown fences, no prose outside the object):
 /// returns `Continue` — a flaky reasoning call should never cause us to kill
 /// a possibly-fine worker. The next watchdog window will try again.
 pub async fn reason_about_stuck_thread(
-    model: &Arc<dyn LanguageModel>,
+    model: &LanguageModel,
     context: &WatchdogContext,
     cx: &gpui::AsyncApp,
 ) -> anyhow::Result<WatchdogDecision> {
@@ -144,8 +143,7 @@ pub async fn reason_about_stuck_thread(
     };
 
     let completion_future = async {
-        let mut stream = model
-            .stream_completion(request, cx)
+        let mut stream = crate::stream_model_completion(model, request, cx)
             .await
             .context("watchdog: failed to start completion stream")?;
 

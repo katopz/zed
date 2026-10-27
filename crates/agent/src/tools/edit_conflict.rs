@@ -1,4 +1,4 @@
-use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::schema::v2 as acp;
 use collections::HashMap;
 use parking_lot::Mutex;
 use std::path::PathBuf;

@@ -182,7 +182,6 @@ pub struct AutoPromptContextSnapshot {
 enum SnapshotEntry {
     User { source: String },
     Assistant { chunk_sources: Vec<String> },
-    Plan { content_sources: Vec<String> },
     Tool(SnapshotToolCall),
 }
 
@@ -228,15 +227,6 @@ impl AutoPromptContextSnapshot {
                 }
                 SnapshotEntry::Assistant { chunk_sources } => {
                     push_assistant_chunks(&chunk_sources, &mut messages);
-                }
-                SnapshotEntry::Plan { content_sources } => {
-                    let content = content_sources.join("\n");
-                    if !content.is_empty() {
-                        messages.push(ContextMessage {
-                            role: ContextMessageRole::Plan,
-                            content,
-                        });
-                    }
                 }
                 SnapshotEntry::Tool(tool) => {
                     collect_modified_file(&tool, &mut modified_files);
@@ -433,11 +423,12 @@ impl AutoPromptContext {
                 }
                 AgentThreadEntry::ToolCall(tool) => {
                     used_tools = true;
-                    let is_edit = matches!(tool.kind, agent_client_protocol::schema::v1::ToolKind::Edit);
+                    let is_edit =
+                        matches!(tool.kind(), agent_client_protocol::schema::v2::ToolKind::Edit);
                     if collect_messages || is_edit {
                         entries.push(SnapshotEntry::Tool(SnapshotToolCall {
                             label: tool.label.read(cx).source().to_string(),
-                            status_label: tool_status_label(&tool.status),
+                            status_label: tool_status_label(&tool.status()),
                             is_edit,
                             raw_input_markdown: if collect_messages {
                                 tool.raw_input_markdown
@@ -459,16 +450,8 @@ impl AutoPromptContext {
                         }));
                     }
                 }
-                AgentThreadEntry::CompletedPlan(plan_entries) => {
-                    if collect_messages {
-                        let content_sources = plan_entries
-                            .iter()
-                            .map(|entry| entry.content.read(cx).source().to_string())
-                            .collect();
-                        entries.push(SnapshotEntry::Plan { content_sources });
-                    }
-                }
                 AgentThreadEntry::ContextCompaction(_) => {}
+                AgentThreadEntry::SessionMessage(_) => {}
                 AgentThreadEntry::Elicitation(_) => {}
                 AgentThreadEntry::AgentBoardNotification(_) => {}
             }
@@ -497,14 +480,17 @@ impl AutoPromptContext {
 
         let current_plan = thread
             .plan()
-            .entries
-            .iter()
-            .map(|entry| SnapshotPlanEntry {
-                content: entry.content.read(cx).source().to_string(),
-                status: plan_status_label(&entry.status),
-                priority: plan_priority_label(&entry.priority),
+            .map(|plan| {
+                plan.entries
+                    .iter()
+                    .map(|entry| SnapshotPlanEntry {
+                        content: entry.content.read(cx).source().to_string(),
+                        status: plan_status_label(&entry.source.status),
+                        priority: plan_priority_label(&entry.source.priority),
+                    })
+                    .collect()
             })
-            .collect();
+            .unwrap_or_default();
 
         AutoPromptContextSnapshot {
             collected_at,
@@ -700,7 +686,7 @@ fn assistant_chunk_sources(chunks: &[AssistantMessageChunk], cx: &App) -> Vec<St
         .iter()
         .filter_map(|chunk| match chunk {
             AssistantMessageChunk::Message { block, .. } => {
-                Some(block.to_markdown(cx).to_string())
+                Some(block.to_markdown(cx))
             }
             AssistantMessageChunk::Thought { .. } => None,
         })
@@ -866,23 +852,23 @@ fn tool_status_label(status: &ToolCallStatus) -> &'static str {
 }
 
 fn plan_status_label(
-    status: &agent_client_protocol::schema::v1::PlanEntryStatus,
+    status: &agent_client_protocol::schema::v2::PlanEntryStatus,
 ) -> &'static str {
     match status {
-        agent_client_protocol::schema::v1::PlanEntryStatus::Pending => "pending",
-        agent_client_protocol::schema::v1::PlanEntryStatus::InProgress => "in_progress",
-        agent_client_protocol::schema::v1::PlanEntryStatus::Completed => "completed",
+        agent_client_protocol::schema::v2::PlanEntryStatus::Pending => "pending",
+        agent_client_protocol::schema::v2::PlanEntryStatus::InProgress => "in_progress",
+        agent_client_protocol::schema::v2::PlanEntryStatus::Completed => "completed",
         _ => "unknown",
     }
 }
 
 fn plan_priority_label(
-    priority: &agent_client_protocol::schema::v1::PlanEntryPriority,
+    priority: &agent_client_protocol::schema::v2::PlanEntryPriority,
 ) -> &'static str {
     match priority {
-        agent_client_protocol::schema::v1::PlanEntryPriority::High => "high",
-        agent_client_protocol::schema::v1::PlanEntryPriority::Medium => "medium",
-        agent_client_protocol::schema::v1::PlanEntryPriority::Low => "low",
+        agent_client_protocol::schema::v2::PlanEntryPriority::High => "high",
+        agent_client_protocol::schema::v2::PlanEntryPriority::Medium => "medium",
+        agent_client_protocol::schema::v2::PlanEntryPriority::Low => "low",
         _ => "unknown",
     }
 }

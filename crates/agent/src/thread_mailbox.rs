@@ -1,12 +1,11 @@
 use acp_thread::{AcpThread, AcpThreadEvent, ThreadStatus};
-use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::schema::v2 as acp;
 use anyhow::{Context as _, Result, anyhow};
-use futures::future::BoxFuture;
-use gpui::{App, Context, Entity, SharedString, TaskExt as _};
+use gpui::{App, Context, Entity, SharedString, Task, TaskExt as _};
 use itertools::Itertools as _;
 use serde::{Deserialize, Serialize};
 
-use crate::{AgentMessageContent, NativeAgent, Thread};
+use crate::{AgentMessageContent, NativeAgent, NativeAgentConnection, Thread};
 
 const UNTITLED_THREAD: &str = "Untitled thread";
 
@@ -143,11 +142,39 @@ pub(crate) fn last_agent_message_text(thread: &Thread) -> Option<String> {
     (!content.is_empty()).then_some(content)
 }
 
-pub(crate) type PromptTurn = BoxFuture<'static, Result<Option<acp::PromptResponse>>>;
+/// Mailbox messages taken for an idle thread, ready to start its next turn.
+///
+/// Starting the turn goes through [`NativeAgentConnection`], which reads the
+/// `NativeAgent` entity, so it must happen after the `NativeAgent` update that
+/// produced this delivery has returned.
+pub(crate) struct MailboxDelivery {
+    acp_thread: Entity<AcpThread>,
+    prompt: String,
+}
+
+impl MailboxDelivery {
+    pub(crate) fn start(self, cx: &mut App) -> Task<Result<acp::StopReason>> {
+        let connection = self
+            .acp_thread
+            .read(cx)
+            .connection()
+            .clone()
+            .into_any()
+            .downcast::<NativeAgentConnection>();
+        match connection {
+            Ok(connection) => connection.send_and_wait_for_completion(
+                self.acp_thread,
+                vec![self.prompt.into()],
+                cx,
+            ),
+            Err(_) => Task::ready(Err(anyhow!("The target thread is not a native thread"))),
+        }
+    }
+}
 
 pub(crate) enum PostedMessage {
     Delivered {
-        turn: PromptTurn,
+        delivery: MailboxDelivery,
         thread: Entity<Thread>,
     },
     Queued {
@@ -178,9 +205,15 @@ impl NativeAgent {
                     (false, true) => ThreadListingKind::Subagent,
                     (false, false) => ThreadListingKind::Thread,
                 };
-                let status = match session.acp_thread.read(cx).status() {
-                    ThreadStatus::Idle => ThreadListingStatus::Idle,
-                    ThreadStatus::Generating => ThreadListingStatus::Generating,
+                let status = match session
+                    .acp_thread
+                    .upgrade()
+                    .map(|acp_thread| acp_thread.read(cx).status())
+                {
+                    None | Some(ThreadStatus::Idle) => ThreadListingStatus::Idle,
+                    Some(ThreadStatus::Generating | ThreadStatus::Unconfirmed) => {
+                        ThreadListingStatus::Generating
+                    }
                 };
                 ThreadListing {
                     session_id: session_id.clone(),
@@ -255,8 +288,8 @@ impl NativeAgent {
             });
 
         let posted = match self.deliver_mailbox(&target, cx) {
-            Some(turn) => PostedMessage::Delivered {
-                turn,
+            Some(delivery) => PostedMessage::Delivered {
+                delivery,
                 thread: target_thread,
             },
             None => PostedMessage::Queued {
@@ -266,25 +299,26 @@ impl NativeAgent {
         Ok((target, title, posted))
     }
 
-    /// Sends every pending message for `session_id` as one prompt, but only
-    /// while the thread is idle: `AcpThread::send` cancels a running turn.
+    /// Takes every pending message for `session_id` as one prompt, but only
+    /// while the thread is idle: a new native submission interrupts a running
+    /// turn.
     fn deliver_mailbox(
         &mut self,
         session_id: &acp::SessionId,
         cx: &mut Context<Self>,
-    ) -> Option<PromptTurn> {
-        let session = self.sessions.get(session_id)?;
-        if session.acp_thread.read(cx).status() != ThreadStatus::Idle {
+    ) -> Option<MailboxDelivery> {
+        let acp_thread = self.sessions.get(session_id)?.acp_thread.upgrade()?;
+        if acp_thread.read(cx).status() != ThreadStatus::Idle {
             return None;
         }
         let messages = self.mailboxes.remove(session_id)?;
         if messages.is_empty() {
             return None;
         }
-        let prompt = format_mailbox_prompt(&messages);
-        Some(session.acp_thread.update(cx, |acp_thread, cx| {
-            acp_thread.send(vec![prompt.into()], cx)
-        }))
+        Some(MailboxDelivery {
+            acp_thread,
+            prompt: format_mailbox_prompt(&messages),
+        })
     }
 
     pub(crate) fn handle_acp_thread_event_for_mailbox(
@@ -295,10 +329,10 @@ impl NativeAgent {
     ) {
         // A user cancel means "stop"; keep the mail until the next turn ends
         // rather than immediately restarting the thread behind their back.
-        let AcpThreadEvent::Stopped(stop_reason) = event else {
+        let AcpThreadEvent::Stopped { stop_reason, .. } = event else {
             return;
         };
-        if *stop_reason == acp::StopReason::Cancelled {
+        if matches!(stop_reason, Some(acp::StopReason::Cancelled)) {
             return;
         }
         let session_id = acp_thread.read(cx).session_id().clone();
@@ -309,9 +343,9 @@ impl NativeAgent {
         // `Stopped` event goes first; the idle check then leaves our mail for
         // the end of that turn instead of cancelling it.
         cx.spawn(async move |this, cx| {
-            let turn = this.update(cx, |this, cx| this.deliver_mailbox(&session_id, cx))?;
-            if let Some(turn) = turn {
-                turn.await?;
+            let delivery = this.update(cx, |this, cx| this.deliver_mailbox(&session_id, cx))?;
+            if let Some(delivery) = delivery {
+                cx.update(|cx| delivery.start(cx)).await?;
             }
             anyhow::Ok(())
         })

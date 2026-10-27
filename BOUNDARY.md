@@ -27,6 +27,10 @@ rig's agent sessions. Upstream base plus a local feature lane maintained on
   secondary reviewer, owner-gate decisions (plans 029, 014, 036)
 - thread/session ergonomics — continuation indicator, pin sidebar, resume toast,
   stream-cutoff summary-first, subagent retry (plans 007, 009, 011, 021, 032, 035)
+- Work Remote lane — `crates/agentd` (`zed-agentd`, std-only detachable ACP
+  mux + session journal, runs on the remote host) and `crates/work_remote`
+  (menu action + `DetachableRemoteAgents` toggle), hooked into upstream via
+  `agent_servers/src/acp/detachable.rs` (plan 037)
 - agent-infrastructure `.agents/skills/` (gpui-test, lint-creator,
   zed-cherry-pick) and the root `.rules`
 

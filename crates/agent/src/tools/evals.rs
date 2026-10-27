@@ -3,13 +3,7 @@ use futures::future::LocalBoxFuture;
 #[cfg(all(test, feature = "unit-eval"))]
 use gpui::TestAppContext;
 #[cfg(all(test, feature = "unit-eval"))]
-use http_client::StatusCode;
-#[cfg(all(test, feature = "unit-eval"))]
-use language_model::LanguageModelCompletionError;
-#[cfg(all(test, feature = "unit-eval"))]
-use std::fmt::Display;
-#[cfg(all(test, feature = "unit-eval"))]
-use std::time::Duration;
+use std::{fmt::Display, time::Duration};
 
 #[cfg(all(test, feature = "unit-eval"))]
 mod edit_file;
@@ -17,6 +11,14 @@ mod edit_file;
 mod terminal_tool;
 #[cfg(all(test, feature = "unit-eval"))]
 mod write_file;
+
+#[cfg(all(test, feature = "unit-eval"))]
+fn completion_retry_delay(error: &anyhow::Error, retry_attempt: usize) -> Option<Duration> {
+    error
+        .downcast_ref::<language_model::LanguageModelCompletionError>()?
+        .retry_delay(retry_attempt)
+        .map(crate::jitter_retry_delay)
+}
 
 #[cfg(all(test, feature = "unit-eval"))]
 fn run_gpui_eval<T>(
@@ -63,57 +65,27 @@ where
 async fn retry_on_rate_limit<R>(
     mut request: impl AsyncFnMut() -> anyhow::Result<R>,
 ) -> anyhow::Result<R> {
-    const MAX_RETRIES: usize = 20;
-    let mut attempt = 0;
+    const MAX_ATTEMPTS: usize = 20;
+    let mut completed_attempts = 0;
 
     loop {
-        attempt += 1;
         let response = request().await;
+        completed_attempts += 1;
 
-        if attempt >= MAX_RETRIES {
+        if completed_attempts >= MAX_ATTEMPTS {
             return response;
         }
 
-        let retry_delay = match &response {
-            Ok(_) => None,
-            Err(err) => match err.downcast_ref::<LanguageModelCompletionError>() {
-                Some(err) => match &err {
-                    LanguageModelCompletionError::RateLimitExceeded { retry_after, .. }
-                    | LanguageModelCompletionError::ServerOverloaded { retry_after, .. } => {
-                        Some(retry_after.unwrap_or(Duration::from_secs(5)))
-                    }
-                    LanguageModelCompletionError::UpstreamProviderError {
-                        status,
-                        retry_after,
-                        ..
-                    } => {
-                        let should_retry = matches!(
-                            *status,
-                            StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
-                        ) || status.as_u16() == 529;
+        let retry_attempt = completed_attempts;
+        let retry_delay = response
+            .as_ref()
+            .err()
+            .and_then(|error| completion_retry_delay(error, retry_attempt));
 
-                        if should_retry {
-                            Some(retry_after.unwrap_or(Duration::from_secs(5)))
-                        } else {
-                            None
-                        }
-                    }
-                    LanguageModelCompletionError::ApiReadResponseError { .. }
-                    | LanguageModelCompletionError::ApiInternalServerError { .. }
-                    | LanguageModelCompletionError::HttpSend { .. } => {
-                        Some(Duration::from_secs(2_u64.pow((attempt - 1) as u32).min(30)))
-                    }
-                    _ => None,
-                },
-                _ => None,
-            },
-        };
-
-        if let Some(retry_after) = retry_delay {
-            let jitter = retry_after.mul_f64(rand::random_range(0.0..1.0));
-            eprintln!("Attempt #{attempt}: Retry after {retry_after:?} + jitter of {jitter:?}");
+        if let Some(retry_delay) = retry_delay {
+            eprintln!("Retry attempt #{retry_attempt}: Retry after {retry_delay:?}");
             #[allow(clippy::disallowed_methods)]
-            async_io::Timer::after(retry_after + jitter).await;
+            async_io::Timer::after(retry_delay).await;
         } else {
             return response;
         }

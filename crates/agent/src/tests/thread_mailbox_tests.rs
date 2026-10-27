@@ -2,17 +2,37 @@ use super::*;
 use pretty_assertions::assert_eq;
 
 struct MailboxTestThread {
-    session_id: acp::SessionId,
+    session_id: acp_v2::SessionId,
     acp_thread: Entity<AcpThread>,
-    model: Arc<FakeLanguageModel>,
+    model: LanguageModel,
 }
 
-async fn setup_threads(
-    count: usize,
-    cx: &mut TestAppContext,
-) -> (Entity<NativeAgent>, Vec<MailboxTestThread>) {
-    init_test(cx);
-    cx.update(LanguageModelRegistry::test);
+struct MailboxTestSetup {
+    agent: Entity<NativeAgent>,
+    connection: Rc<NativeAgentConnection>,
+    fake: Arc<FakeLanguageModelProvider>,
+    threads: Vec<MailboxTestThread>,
+}
+
+impl MailboxTestSetup {
+    fn send(
+        &self,
+        thread: &MailboxTestThread,
+        message: &str,
+        cx: &mut TestAppContext,
+    ) -> Task<Result<acp_v2::StopReason>> {
+        cx.update(|cx| {
+            self.connection.send_and_wait_for_completion(
+                thread.acp_thread.clone(),
+                vec![message.into()],
+                cx,
+            )
+        })
+    }
+}
+
+async fn setup_threads(count: usize, cx: &mut TestAppContext) -> MailboxTestSetup {
+    let fake = init_test(cx);
 
     let fs = FakeFs::new(cx.executor());
     fs.insert_tree("/", json!({ "a": { "b.md": "Lorem" } }))
@@ -24,7 +44,7 @@ async fn setup_threads(
     let connection = Rc::new(NativeAgentConnection(agent.clone()));
 
     let mut threads = Vec::new();
-    for _ in 0..count {
+    for index in 0..count {
         let acp_thread = cx
             .update(|cx| {
                 connection
@@ -34,7 +54,9 @@ async fn setup_threads(
             .await
             .unwrap();
         let session_id = acp_thread.read_with(cx, |thread, _| thread.session_id().clone());
-        let model = Arc::new(FakeLanguageModel::default());
+        // Each thread gets its own model id so pending completions can be
+        // told apart per thread.
+        let model = fake.model(&format!("mailbox-{index}"));
         agent.update(cx, |agent, cx| {
             agent
                 .sessions
@@ -50,10 +72,15 @@ async fn setup_threads(
         });
     }
     cx.run_until_parked();
-    (agent, threads)
+    MailboxTestSetup {
+        agent,
+        connection,
+        fake,
+        threads,
+    }
 }
 
-fn message_request(to: &acp::SessionId, message: &str) -> ThreadMessageRequest {
+fn message_request(to: &acp_v2::SessionId, message: &str) -> ThreadMessageRequest {
     ThreadMessageRequest {
         to: to.to_string(),
         message: message.to_string(),
@@ -63,16 +90,15 @@ fn message_request(to: &acp::SessionId, message: &str) -> ThreadMessageRequest {
 
 #[gpui::test]
 async fn test_message_to_busy_thread_waits_for_turn_end(cx: &mut TestAppContext) {
-    let (agent, threads) = setup_threads(2, cx).await;
-    let [sender, recipient] = threads.as_slice() else {
+    let setup = setup_threads(2, cx).await;
+    let (agent, fake) = (&setup.agent, &setup.fake);
+    let [sender, recipient] = setup.threads.as_slice() else {
         panic!("expected two threads");
     };
 
-    let recipient_turn = recipient
-        .acp_thread
-        .update(cx, |thread, cx| thread.send_raw("Own work", cx));
+    let recipient_turn = setup.send(recipient, "Own work", cx);
     cx.run_until_parked();
-    assert_eq!(recipient.model.pending_completions().len(), 1);
+    assert_eq!(fake.pending_completions_for(&recipient.model).len(), 1);
 
     let posted = agent.update(cx, |agent, cx| {
         agent
@@ -101,14 +127,12 @@ async fn test_message_to_busy_thread_waits_for_turn_end(cx: &mut TestAppContext)
     assert_eq!(recipient_listing.queued_messages, 1);
 
     // The queued mail must not cancel the turn already in flight.
-    recipient
-        .model
-        .send_last_completion_stream_text_chunk("Done");
-    recipient.model.end_last_completion_stream();
-    recipient_turn.await.unwrap();
+    fake.send_last_text(&recipient.model, "Done");
+    fake.end_last(&recipient.model);
+    assert_eq!(recipient_turn.await.unwrap(), acp_v2::StopReason::EndTurn);
     cx.run_until_parked();
 
-    let pending = recipient.model.pending_completions();
+    let pending = fake.pending_completions_for(&recipient.model);
     assert_eq!(pending.len(), 1, "mail should start exactly one new turn");
     let prompt = pending[0].messages.last().unwrap().string_contents();
     assert!(prompt.contains("Please review"), "{prompt}");
@@ -121,14 +145,13 @@ async fn test_message_to_busy_thread_waits_for_turn_end(cx: &mut TestAppContext)
 
 #[gpui::test]
 async fn test_send_message_tool_waits_for_idle_reply(cx: &mut TestAppContext) {
-    let (_agent, threads) = setup_threads(2, cx).await;
-    let [sender, recipient] = threads.as_slice() else {
+    let setup = setup_threads(2, cx).await;
+    let fake = &setup.fake;
+    let [sender, recipient] = setup.threads.as_slice() else {
         panic!("expected two threads");
     };
 
-    let sender_turn = sender
-        .acp_thread
-        .update(cx, |thread, cx| thread.send_raw("Ask the other thread", cx));
+    let sender_turn = setup.send(sender, "Ask the other thread", cx);
     cx.run_until_parked();
 
     let tool_input = json!({
@@ -136,30 +159,27 @@ async fn test_send_message_tool_waits_for_idle_reply(cx: &mut TestAppContext) {
         "message": "ping",
         "wait_for_reply": true,
     });
-    sender
-        .model
-        .send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(
-            LanguageModelToolUse {
+    fake.send_last_event(
+        &sender.model,
+        LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
                 id: "send_1".into(),
                 name: SendMessageTool::NAME.into(),
                 raw_input: tool_input.to_string(),
                 input: language_model::LanguageModelToolUseInput::Json(tool_input),
                 is_input_complete: true,
                 thought_signature: None,
-            },
-        ));
-    sender.model.end_last_completion_stream();
+        }),
+    );
+    fake.end_last(&sender.model);
     cx.run_until_parked();
 
     // The idle recipient started a turn immediately.
-    assert_eq!(recipient.model.pending_completions().len(), 1);
-    recipient
-        .model
-        .send_last_completion_stream_text_chunk("pong");
-    recipient.model.end_last_completion_stream();
+    assert_eq!(fake.pending_completions_for(&recipient.model).len(), 1);
+    fake.send_last_text(&recipient.model, "pong");
+    fake.end_last(&recipient.model);
     cx.run_until_parked();
 
-    let follow_up = sender.model.pending_completions();
+    let follow_up = fake.pending_completions_for(&sender.model);
     assert_eq!(follow_up.len(), 1);
     let tool_result = follow_up[0]
         .messages
@@ -183,39 +203,37 @@ async fn test_send_message_tool_waits_for_idle_reply(cx: &mut TestAppContext) {
     );
     assert!(tool_result.contains("\"reply\":\"pong\""), "{tool_result}");
 
-    sender.model.end_last_completion_stream();
+    fake.end_last(&sender.model);
     sender_turn.await.unwrap();
 }
 
 #[gpui::test]
 async fn test_list_threads_tool_runs_during_turn(cx: &mut TestAppContext) {
-    let (agent, threads) = setup_threads(2, cx).await;
-    let [sender, recipient] = threads.as_slice() else {
+    let setup = setup_threads(2, cx).await;
+    let (agent, fake) = (&setup.agent, &setup.fake);
+    let [sender, recipient] = setup.threads.as_slice() else {
         panic!("expected two threads");
     };
 
-    let sender_turn = sender
-        .acp_thread
-        .update(cx, |thread, cx| thread.send_raw("List the threads", cx));
+    let sender_turn = setup.send(sender, "List the threads", cx);
     cx.run_until_parked();
 
     let tool_input = json!({});
-    sender
-        .model
-        .send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(
-            LanguageModelToolUse {
+    fake.send_last_event(
+        &sender.model,
+        LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
                 id: "list_1".into(),
                 name: ListThreadsTool::NAME.into(),
                 raw_input: tool_input.to_string(),
                 input: language_model::LanguageModelToolUseInput::Json(tool_input),
                 is_input_complete: true,
                 thought_signature: None,
-            },
-        ));
-    sender.model.end_last_completion_stream();
+        }),
+    );
+    fake.end_last(&sender.model);
     cx.run_until_parked();
 
-    let follow_up = sender.model.pending_completions();
+    let follow_up = fake.pending_completions_for(&sender.model);
     assert_eq!(follow_up.len(), 1);
     let tool_result = follow_up[0]
         .messages
@@ -243,15 +261,16 @@ async fn test_list_threads_tool_runs_during_turn(cx: &mut TestAppContext) {
         "{tool_result}"
     );
 
-    sender.model.end_last_completion_stream();
+    fake.end_last(&sender.model);
     sender_turn.await.unwrap();
     assert!(agent.read_with(cx, |agent, _| agent.mailboxes.is_empty()));
 }
 
 #[gpui::test]
 async fn test_thread_cannot_message_itself(cx: &mut TestAppContext) {
-    let (agent, threads) = setup_threads(1, cx).await;
-    let thread = &threads[0];
+    let setup = setup_threads(1, cx).await;
+    let agent = &setup.agent;
+    let thread = &setup.threads[0];
     let result = agent.update(cx, |agent, cx| {
         agent
             .post_thread_message(

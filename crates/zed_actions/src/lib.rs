@@ -254,7 +254,9 @@ pub mod dev {
             ToggleFpsOverlay,
             /// Resets the debug frame-time overlay's statistics, except for the
             /// total frame count.
-            ResetFrameOverlayStats
+            ResetFrameOverlayStats,
+            /// Opens the key context view for debugging keybindings.
+            OpenKeyContextView
         ]
     );
 }
@@ -822,6 +824,10 @@ actions!(
         OpenGitIntegrationOnboarding
     ]
 );
+actions!(
+    call_hierarchy,
+    [ShowIncomingCalls, ShowOutgoingCalls, ToggleDirection]
+);
 
 pub mod debug_panel {
     use gpui::actions;
@@ -866,7 +872,8 @@ pub struct WslConnectionOptions {
     pub user: Option<String>,
 }
 
-#[cfg(target_os = "windows")]
+// `debug_assertions` makes the actions visible for the docs preprocessor
+#[cfg(any(debug_assertions, target_os = "windows"))]
 pub mod wsl_actions {
     use gpui::Action;
     use schemars::JsonSchema;

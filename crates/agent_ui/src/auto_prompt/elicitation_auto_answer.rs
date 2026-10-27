@@ -20,7 +20,7 @@
 //! duplicate response.
 
 use acp_thread::{AcpThread, ElicitationEntryId};
-use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::schema::v2 as acp;
 use anyhow::Context as _;
 use futures::{StreamExt, future, pin_mut};
 use language_model::{
@@ -28,7 +28,6 @@ use language_model::{
     Role,
 };
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::ConversationView;
@@ -238,7 +237,7 @@ fn last_assistant_text(_thread: &AcpThread) -> String {
 }
 
 async fn call_answerer(
-    model: &Arc<dyn LanguageModel>,
+    model: &LanguageModel,
     question: &ElicitationQuestion,
     context: &str,
     cx: &gpui::AsyncApp,
@@ -277,8 +276,7 @@ async fn call_answerer(
     };
 
     let completion_future = async {
-        let mut stream = model
-            .stream_completion(request, cx)
+        let mut stream = auto_prompt::stream_model_completion(model, request, cx)
             .await
             .context("elicitation answerer: failed to start completion stream")?;
         let mut text_parts: Vec<String> = Vec::new();
@@ -345,8 +343,7 @@ pub fn arm_if_enabled(
     };
 
     let model = language_model::LanguageModelRegistry::read_global(cx)
-        .default_model()
-        .map(|configured| configured.model);
+        .default_model();
     let context = last_assistant_text(thread.read(cx));
     let countdown = Duration::from_secs(config.elicitation_countdown_secs.max(1));
     log::info!(

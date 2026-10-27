@@ -34,7 +34,7 @@ pub use context::{
 };
 pub use plan_registry::ActivePlanClaim;
 
-use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::schema::v2 as acp;
 use anyhow::Context as _;
 use futures::{StreamExt, future, pin_mut};
 use gpui::App;
@@ -521,7 +521,7 @@ pub enum AutoPromptDecision {
 /// Data needed for the async LLM call path.
 #[derive(Clone)]
 pub struct LlmCallData {
-    pub model: Arc<dyn LanguageModel>,
+    pub model: LanguageModel,
     pub system_prompt: String,
     pub context_json: String,
     pub project_root: Option<PathBuf>,
@@ -1023,7 +1023,7 @@ struct DecidePrecheckContext {
     config: AutoPromptConfig,
     stop_phase: StopPhase,
     verification_count: u32,
-    model: Arc<dyn LanguageModel>,
+    model: LanguageModel,
 }
 
 /// Cheap pre-checks that run on the main thread before any context file is
@@ -1176,7 +1176,7 @@ fn decide_precheck(
         );
         return DecidePrecheck::Decision(AutoPromptDecision::NoAction);
     };
-    let model = configured_model.model;
+    let model = configured_model;
     log::info!("[auto_prompt::decide] Using model: {:?}", model.id());
 
     let verification_count = VERIFICATION_COUNT.load(Ordering::Relaxed);
@@ -1243,7 +1243,7 @@ fn decide_precheck(
                     .iter()
                     .find_map(|entry| match entry {
                         acp_thread::AgentThreadEntry::UserMessage(message) => {
-                            Some(message.content.to_markdown(cx).to_string())
+                            Some(message.content.to_markdown(cx))
                         }
                         _ => None,
                     })
@@ -3424,7 +3424,7 @@ pub(crate) fn context_file_inputs(
     let work_dirs = thread.work_dirs().map(|pl| pl.paths().to_vec());
     let first_user_message = thread.entries().iter().find_map(|entry| {
         if let acp_thread::AgentThreadEntry::UserMessage(msg) = entry {
-            let content = msg.content.to_markdown(cx).to_string();
+            let content = msg.content.to_markdown(cx);
             if !content.is_empty() {
                 return Some(content);
             }
@@ -3740,8 +3740,23 @@ fn read_doc_files(work_dirs: &[std::path::PathBuf]) -> Vec<String> {
     doc_files
 }
 
+/// Streams a completion from `model` through the provider registered for it;
+/// `LanguageModel` is plain data, so requests go through its provider.
+pub async fn stream_model_completion(
+    model: &LanguageModel,
+    request: LanguageModelRequest,
+    cx: &gpui::AsyncApp,
+) -> Result<
+    language_model::LanguageModelCompletionStream,
+    language_model::LanguageModelCompletionError,
+> {
+    let provider =
+        cx.update(|cx| language_model::LanguageModelRegistry::read_global(cx).provider_for_model(model))?;
+    provider.stream_completion(model, request, cx).await
+}
+
 async fn call_language_model(
-    model: &Arc<dyn LanguageModel>,
+    model: &LanguageModel,
     system_prompt: &str,
     context_json: &str,
     cx: &gpui::AsyncApp,
@@ -3765,8 +3780,7 @@ async fn call_language_model(
     };
 
     let completion_future = async {
-        let mut stream = model
-            .stream_completion(request, cx)
+        let mut stream = crate::stream_model_completion(model, request, cx)
             .await
             .context("auto_prompt: failed to start completion stream")?;
 
@@ -5314,7 +5328,7 @@ mod tests {
         work_dirs: Option<Vec<PathBuf>>,
     ) -> LlmCallData {
         LlmCallData {
-            model: std::sync::Arc::new(language_model::fake_provider::FakeLanguageModel::default()),
+            model: language_model::fake_provider::FakeLanguageModelProvider::default().model("fake"),
             system_prompt: String::new(),
             context_json,
             project_root: None,
@@ -5745,72 +5759,95 @@ mod tests {
 
     // Only the most recent terminal tool call can be auth-"pending" — a stale
     // auth-shaped call deeper in the turn must not stop the chain.
+    /// Builds a fresh thread whose entries follow `script` — `None` is a user
+    /// message, `Some(command)` a terminal tool call — and returns
+    /// `latest_terminal_command` over its entries.
+    async fn latest_terminal_command_for_script(
+        script: &[Option<&str>],
+        project: &gpui::Entity<project::Project>,
+        cx: &mut gpui::TestAppContext,
+    ) -> Option<String> {
+        use acp_thread::AgentConnection as _;
+        use agent_client_protocol::schema::v1 as acp_v1;
+
+        let connection = std::rc::Rc::new(acp_thread::StubAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(
+                    project.clone(),
+                    util::path_list::PathList::new(&[std::path::Path::new("/test")]),
+                    cx,
+                )
+            })
+            .await
+            .expect("stub session");
+        thread.update(cx, |thread, cx| {
+            for (index, step) in script.iter().enumerate() {
+                match step {
+                    None => thread.push_user_content_block(None, "user".into(), cx),
+                    Some(command) => thread
+                        .upsert_tool_call(
+                            acp_v1::ToolCall::new(format!("tool-{index}"), "label")
+                                .name("terminal")
+                                .kind(acp_v1::ToolKind::Execute)
+                                .status(acp_v1::ToolCallStatus::Completed)
+                                .raw_input(serde_json::json!({ "command": command })),
+                            cx,
+                        )
+                        .expect("tool call upsert"),
+                }
+            }
+            latest_terminal_command(thread.entries())
+        })
+    }
+
     #[gpui::test]
     async fn latest_terminal_command_scopes_to_most_recent_terminal_call(
         cx: &mut gpui::TestAppContext,
     ) {
         cx.update(|cx| {
-            use gpui::AppContext as _;
-            let mut tool_call = |name: &str, command: Option<&str>| {
-                acp_thread::AgentThreadEntry::ToolCall(acp_thread::ToolCall {
-                    id: acp::ToolCallId::new("test"),
-                    label: cx.new(|cx| markdown::Markdown::new("label".into(), None, None, cx)),
-                    kind: acp::ToolKind::Execute,
-                    content: Vec::new(),
-                    status: acp_thread::ToolCallStatus::Completed,
-                    locations: Vec::new(),
-                    resolved_locations: Vec::new(),
-                    raw_input: command.map(|c| serde_json::json!({ "command": c })),
-                    raw_input_markdown: None,
-                    raw_output: None,
-                    tool_name: Some(name.to_string().into()),
-                    subagent_session_info: None,
-                    sandbox_authorization_details: None,
-                    sandbox_fallback_authorization_details: None,
-                    sandbox_not_applied: None,
-                })
-            };
-            let user = || {
-                acp_thread::AgentThreadEntry::UserMessage(acp_thread::UserMessage {
-                    protocol_id: None,
-                    client_id: None,
-                    is_optimistic: false,
-                    content: acp_thread::ContentBlock::Empty,
-                    chunks: Vec::new(),
-                    checkpoint: None,
-                    indented: false,
-                })
-            };
-
-            // Latest terminal call is a sync loop; an older auth-shaped call
-            // must not resurrect the guard.
-            let entries = vec![
-                user(),
-                tool_call("terminal", Some("gh auth login")),
-                tool_call("terminal", Some("for r in a b; do git -C $r fetch; done")),
-            ];
-            assert_eq!(
-                latest_terminal_command(&entries).as_deref(),
-                Some("for r in a b; do git -C $r fetch; done")
-            );
-            assert!(!is_interactive_auth_command(
-                &latest_terminal_command(&entries).unwrap()
-            ));
-
-            // Latest terminal call IS an auth flow → pending.
-            let entries = vec![
-                user(),
-                tool_call("terminal", Some("git push")),
-                tool_call("terminal", Some("gh auth login")),
-            ];
-            assert!(is_interactive_auth_command(
-                &latest_terminal_command(&entries).unwrap()
-            ));
-
-            // No terminal call since the last user message → None.
-            let entries = vec![tool_call("terminal", Some("gh auth login")), user()];
-            assert_eq!(latest_terminal_command(&entries), None);
+            let mut settings_store = settings::SettingsStore::test(cx);
+            settings_store.register_setting::<feature_flags::FeatureFlagsSettings>();
+            cx.set_global(settings_store);
         });
+        let fs = fs::FakeFs::new(cx.executor());
+        let project = project::Project::test(fs, [], cx).await;
+
+        // Latest terminal call is a sync loop; an older auth-shaped call
+        // must not resurrect the guard.
+        let command = latest_terminal_command_for_script(
+            &[
+                None,
+                Some("gh auth login"),
+                Some("for r in a b; do git -C $r fetch; done"),
+            ],
+            &project,
+            cx,
+        )
+        .await;
+        assert_eq!(
+            command.as_deref(),
+            Some("for r in a b; do git -C $r fetch; done")
+        );
+        assert!(!is_interactive_auth_command(
+            &command.expect("terminal command")
+        ));
+
+        // Latest terminal call IS an auth flow → pending.
+        let command = latest_terminal_command_for_script(
+            &[None, Some("git push"), Some("gh auth login")],
+            &project,
+            cx,
+        )
+        .await;
+        assert!(is_interactive_auth_command(
+            &command.expect("terminal command")
+        ));
+
+        // No terminal call since the last user message → None.
+        let command =
+            latest_terminal_command_for_script(&[Some("gh auth login"), None], &project, cx).await;
+        assert_eq!(command, None);
     }
 
     #[test]
@@ -9267,18 +9304,19 @@ Ready to execute Issue 024 (Hero → Avatar rename)?";
 
     fn cutoff_test_data(
         session: &str,
+        cx: &mut gpui::TestAppContext,
     ) -> (
         LlmCallData,
-        std::sync::Arc<language_model::fake_provider::FakeLanguageModel>,
+        std::sync::Arc<language_model::fake_provider::FakeLanguageModelProvider>,
     ) {
-        let fake = std::sync::Arc::new(language_model::fake_provider::FakeLanguageModel::default());
+        let fake = cx.update(language_model::LanguageModelRegistry::test);
         let mut data = overflow_test_data(
             session,
             Some(
                 "Same manifest, same cargo version, different result per invocation context. How?\n\n**The lockfile!** riir-ai's own",
             ),
         );
-        data.model = fake.clone();
+        data.model = fake.model("fake");
         data.cutoff_context_full = true;
         (data, fake)
     }
@@ -9287,7 +9325,7 @@ Ready to execute Issue 024 (Hero → Avatar rename)?";
     async fn cutoff_fork_uses_orchestrated_summary(cx: &mut gpui::TestAppContext) {
         let session = "cutoff-fork-success-test";
         clear_summary_for_session(session);
-        let (data, fake) = cutoff_test_data(session);
+        let (data, fake) = cutoff_test_data(session, cx);
 
         let summary_json = serde_json::json!({
             "confidence": 0.9,
@@ -9300,7 +9338,7 @@ Ready to execute Issue 024 (Hero → Avatar rename)?";
         let task = cx.spawn(async move |cx| cutoff_context_full_outcome(&data, &cx).await);
         cx.run_until_parked();
         assert_eq!(fake.completion_count(), 1, "one summary call expected");
-        fake.respond_to_last_pending_completion([LanguageModelCompletionEvent::Text(summary_json)]);
+        fake.respond_to_last_pending_completion(&fake.model("fake"), [LanguageModelCompletionEvent::Text(summary_json)]);
 
         match task.await {
             AutoPromptOutcome::Continue(action) => {
@@ -9330,17 +9368,17 @@ Ready to execute Issue 024 (Hero → Avatar rename)?";
     async fn cutoff_fork_falls_back_when_summary_unavailable(cx: &mut gpui::TestAppContext) {
         let session = "cutoff-fork-fallback-test";
         clear_summary_for_session(session);
-        let (data, fake) = cutoff_test_data(session);
+        let (data, fake) = cutoff_test_data(session, cx);
 
         let task = cx.spawn(async move |cx| cutoff_context_full_outcome(&data, &cx).await);
         cx.run_until_parked();
-        fake.respond_to_last_pending_completion([LanguageModelCompletionEvent::Text(
+        fake.respond_to_last_pending_completion(&fake.model("fake"), [LanguageModelCompletionEvent::Text(
             "this is not json".to_string(),
         )]);
         // Attempt 2 backs off 2s before retrying.
         cx.executor().advance_clock(Duration::from_millis(2_000));
         cx.run_until_parked();
-        fake.respond_to_last_pending_completion([LanguageModelCompletionEvent::Text(
+        fake.respond_to_last_pending_completion(&fake.model("fake"), [LanguageModelCompletionEvent::Text(
             "still not json".to_string(),
         )]);
 
@@ -9366,7 +9404,7 @@ Ready to execute Issue 024 (Hero → Avatar rename)?";
     async fn cutoff_fork_stops_on_terminal_summary(cx: &mut gpui::TestAppContext) {
         let session = "cutoff-fork-terminal-test";
         clear_summary_for_session(session);
-        let (data, fake) = cutoff_test_data(session);
+        let (data, fake) = cutoff_test_data(session, cx);
 
         let summary_json = serde_json::json!({
             "confidence": 0.9,
@@ -9378,7 +9416,7 @@ Ready to execute Issue 024 (Hero → Avatar rename)?";
 
         let task = cx.spawn(async move |cx| cutoff_context_full_outcome(&data, &cx).await);
         cx.run_until_parked();
-        fake.respond_to_last_pending_completion([LanguageModelCompletionEvent::Text(summary_json)]);
+        fake.respond_to_last_pending_completion(&fake.model("fake"), [LanguageModelCompletionEvent::Text(summary_json)]);
 
         match task.await {
             AutoPromptOutcome::Stopped { reason } => {

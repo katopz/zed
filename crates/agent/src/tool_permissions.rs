@@ -595,6 +595,7 @@ mod tests {
             profiles: Default::default(),
             notify_when_agent_waiting: NotifyWhenAgentWaiting::default(),
             play_sound_when_agent_done: PlaySoundWhenAgentDone::default(),
+            prevent_idle_sleep: true,
             single_file_review: false,
             claude_md_symlink: false,
             project_claude_md_symlink: false,
@@ -617,7 +618,12 @@ mod tests {
             auto_focus_new_thread: false,
             auto_allow_permissions_after_seconds: None,
             stream_idle_timeout_secs: agent_settings::DEFAULT_STREAM_IDLE_TIMEOUT_SECS,
-            sidebar_side: Default::default(),
+            max_idle_retained_threads: 5,
+            threads_sidebar: agent_settings::ThreadsSidebarSettings {
+                auto_open: true,
+                default_width: px(300.),
+                position: settings::SidebarDockPosition::Left,
+            },
             thinking_display: Default::default(),
         }
     }

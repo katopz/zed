@@ -15,7 +15,6 @@
 //! decision flow — per the user's explicit requirement that uncertain cases
 //! still reach the stop/summary path.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
@@ -509,7 +508,7 @@ pub(crate) async fn try_answer_pending_question(
 /// Kept local rather than reusing `call_language_model` so the system prompt
 /// and the user-turn wrapping stay cohesive with the answer shape.
 async fn call_answerer(
-    model: &Arc<dyn LanguageModel>,
+    model: &LanguageModel,
     context_window: &str,
     cx: &gpui::AsyncApp,
 ) -> anyhow::Result<String> {
@@ -541,8 +540,7 @@ async fn call_answerer(
     };
 
     let completion_future = async {
-        let mut stream = model
-            .stream_completion(request, cx)
+        let mut stream = crate::stream_model_completion(model, request, cx)
             .await
             .context("pending_question: failed to start completion stream")?;
 

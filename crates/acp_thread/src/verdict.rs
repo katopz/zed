@@ -11,8 +11,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::AcpThread;
-use agent_client_protocol::schema::v1 as acp;
+use crate::{AcpThread, AcpThreadEvent, SubmissionResponse};
+use agent_client_protocol::schema::v2 as acp;
+use futures::StreamExt as _;
 use gpui::{App, AsyncApp, Entity, Task, TaskExt as _};
 use project::Project;
 use util::path_list::PathList;
@@ -294,12 +295,40 @@ pub async fn reviewer_turn(
     cx: &AsyncApp,
 ) -> anyhow::Result<String> {
     let blocks = vec![acp::ContentBlock::Text(acp::TextContent::new(message))];
-    let send_future = cx.update(|cx| thread.update(cx, |thread, cx| thread.send(blocks, cx)));
+    // A receipt-driven submission resolves once the agent *accepts* the
+    // prompt, not when the turn ends, so the end of the turn is observed via
+    // the thread's events. Subscribe before sending so a fast turn can't stop
+    // before we start listening.
+    let (turn_end_sender, mut turn_end_receiver) = futures::channel::mpsc::unbounded::<()>();
+    let _subscription = cx.update(|cx| {
+        cx.subscribe(thread, move |_, event: &AcpThreadEvent, _| match event {
+            AcpThreadEvent::Stopped { .. }
+            | AcpThreadEvent::Error
+            | AcpThreadEvent::ConnectionLost => {
+                if turn_end_sender.unbounded_send(()).is_err() {
+                    log::debug!("verdict reviewer turn already resolved");
+                }
+            }
+            _ => {}
+        })
+    });
+    let submission = cx.update(|cx| thread.update(cx, |thread, cx| thread.send(blocks, cx)));
+    let turn_future = async move {
+        match submission.await? {
+            Some(SubmissionResponse::Accepted(_)) => {
+                if turn_end_receiver.next().await.is_none() {
+                    anyhow::bail!("verdict reviewer thread was released mid-turn");
+                }
+            }
+            Some(SubmissionResponse::LegacyCompleted(_)) | None => {}
+        }
+        anyhow::Ok(())
+    };
     let timeout_future = cx.background_executor().timer(timeout);
-    let send_future = std::pin::pin!(send_future);
+    let turn_future = std::pin::pin!(turn_future);
     let timeout_future = std::pin::pin!(timeout_future);
 
-    match futures::future::select(send_future, timeout_future).await {
+    match futures::future::select(turn_future, timeout_future).await {
         futures::future::Either::Left((result, _)) => {
             result?;
         }
@@ -551,11 +580,13 @@ mod tests {
             &self,
             _params: acp::PromptRequest,
             _cx: &mut App,
-        ) -> Task<anyhow::Result<acp::PromptResponse>> {
+        ) -> Task<anyhow::Result<agent_client_protocol::schema::v1::PromptResponse>> {
             Task::ready(Err(anyhow::anyhow!("not implemented in tests")))
         }
 
-        fn cancel(&self, _session_id: &acp::SessionId, _cx: &mut App) {}
+        fn cancel(&self, _session_id: &acp::SessionId, _cx: &mut App) -> anyhow::Result<()> {
+            Ok(())
+        }
 
         fn into_any(self: Rc<Self>) -> Rc<dyn std::any::Any> {
             self

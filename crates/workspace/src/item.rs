@@ -178,6 +178,7 @@ pub trait Item: Focusable + EventEmitter<Self::Event> + Render + Sized {
         let text = self.tab_content_text(params.detail.unwrap_or_default(), cx);
 
         Label::new(text)
+            .single_line()
             .color(params.text_color())
             .into_any_element()
     }
@@ -317,6 +318,7 @@ pub trait Item: Focusable + EventEmitter<Self::Event> + Render + Sized {
     fn can_save_as(&self, _: &App) -> bool {
         false
     }
+
     fn save(
         &mut self,
         _options: SaveOptions,
@@ -449,7 +451,6 @@ pub trait SerializableItem: Item {
         workspace: &mut Workspace,
         item_id: ItemId,
         closing: bool,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Task<Result<()>>>;
 
@@ -462,7 +463,6 @@ pub trait SerializableItemHandle: ItemHandle {
         &self,
         workspace: &mut Workspace,
         closing: bool,
-        window: &mut Window,
         cx: &mut App,
     ) -> Option<Task<Result<()>>>;
     fn should_serialize(&self, event: &dyn Any, cx: &App) -> bool;
@@ -480,11 +480,10 @@ where
         &self,
         workspace: &mut Workspace,
         closing: bool,
-        window: &mut Window,
         cx: &mut App,
     ) -> Option<Task<Result<()>>> {
         self.update(cx, |this, cx| {
-            this.serialize(workspace, cx.entity_id().as_u64(), closing, window, cx)
+            this.serialize(workspace, cx.entity_id().as_u64(), closing, cx)
         })
     }
 
@@ -1463,6 +1462,7 @@ pub mod test {
         InteractiveElement, IntoElement, ParentElement, Render, SharedString, Task, WeakEntity,
         Window,
     };
+    use language::Capability;
     use project::{Project, ProjectEntryId, ProjectPath, WorktreeId};
     use std::{any::Any, cell::Cell, sync::Arc};
     use util::rel_path::rel_path;
@@ -1481,9 +1481,11 @@ pub mod test {
         pub save_as_count: usize,
         pub reload_count: usize,
         pub is_dirty: bool,
+        pub save_error: Option<String>,
         pub buffer_kind: ItemBufferKind,
         pub has_conflict: bool,
         pub has_deleted_file: bool,
+        pub capability: Capability,
         pub project_items: Vec<Entity<TestProjectItem>>,
         pub nav_history: Option<ItemNavHistory>,
         pub tab_descriptions: Option<Vec<&'static str>>,
@@ -1572,8 +1574,10 @@ pub mod test {
                 save_as_count: 0,
                 reload_count: 0,
                 is_dirty: false,
+                save_error: None,
                 has_conflict: false,
                 has_deleted_file: false,
+                capability: Capability::ReadWrite,
                 project_items: Vec::new(),
                 buffer_kind: ItemBufferKind::Singleton,
                 nav_history: None,
@@ -1611,8 +1615,18 @@ pub mod test {
             self
         }
 
+        pub fn with_save_error(mut self, message: impl Into<String>) -> Self {
+            self.save_error = Some(message.into());
+            self
+        }
+
         pub fn with_conflict(mut self, has_conflict: bool) -> Self {
             self.has_conflict = has_conflict;
+            self
+        }
+
+        pub fn with_capability(mut self, capability: Capability) -> Self {
+            self.capability = capability;
             self
         }
 
@@ -1760,9 +1774,11 @@ pub mod test {
                     save_as_count: self.save_as_count,
                     reload_count: self.reload_count,
                     is_dirty: self.is_dirty,
+                    save_error: self.save_error.clone(),
                     buffer_kind: self.buffer_kind,
                     has_conflict: self.has_conflict,
                     has_deleted_file: self.has_deleted_file,
+                    capability: self.capability,
                     project_items: self.project_items.clone(),
                     nav_history: None,
                     tab_descriptions: None,
@@ -1803,6 +1819,10 @@ pub mod test {
             self.buffer_kind == ItemBufferKind::Singleton
         }
 
+        fn capability(&self, _: &App) -> Capability {
+            self.capability
+        }
+
         fn save(
             &mut self,
             _: SaveOptions,
@@ -1810,6 +1830,9 @@ pub mod test {
             _window: &mut Window,
             cx: &mut Context<Self>,
         ) -> Task<anyhow::Result<()>> {
+            if let Some(error) = &self.save_error {
+                return Task::ready(Err(anyhow::anyhow!("{error}")));
+            }
             self.save_count += 1;
             self.is_dirty = false;
             for item in &self.project_items {
@@ -1877,7 +1900,6 @@ pub mod test {
             _workspace: &mut Workspace,
             _item_id: ItemId,
             _closing: bool,
-            _window: &mut Window,
             _cx: &mut Context<Self>,
         ) -> Option<Task<anyhow::Result<()>>> {
             if let Some(serialize) = self.serialize.take() {

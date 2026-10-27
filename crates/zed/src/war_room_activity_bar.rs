@@ -525,7 +525,7 @@ fn init_app_state(cx: &mut App) -> Arc<AppState> {
     }
 
     // Real filesystem: the temp project lives on disk.
-    let fs: Arc<dyn Fs> = Arc::new(fs::RealFs::new(None, cx.background_executor().clone()));
+    let fs: Arc<dyn Fs> = fs::RealFs::new(None, cx.background_executor().clone());
     <dyn Fs>::set_global(fs.clone(), cx);
 
     let languages = Arc::new(language::LanguageRegistry::test(

@@ -96,7 +96,7 @@ fn main() {
 #[cfg(target_os = "macos")]
 use {
     acp_thread::{AgentConnection, StubAgentConnection},
-    agent_client_protocol::schema::v1 as acp,
+    agent_client_protocol::schema::v2 as acp_v2,
     agent_servers::{AgentServer, AgentServerDelegate},
     anyhow::{Context as _, Result},
     assets::Assets,
@@ -976,7 +976,7 @@ fn init_app_state(cx: &mut App) -> Arc<AppState> {
     }
 
     // Use the real filesystem instead of FakeFs so we can access actual files on disk
-    let fs: Arc<dyn Fs> = Arc::new(fs::RealFs::new(None, cx.background_executor().clone()));
+    let fs: Arc<dyn Fs> = fs::RealFs::new(None, cx.background_executor().clone());
     <dyn Fs>::set_global(fs.clone(), cx);
 
     let languages = Arc::new(language::LanguageRegistry::test(
@@ -2089,18 +2089,24 @@ fn run_agent_thread_view_test(
     cx.run_until_parked();
 
     // Collect the events from the tool execution
-    let mut tool_content: Vec<acp::ToolCallContent> = Vec::new();
-    let mut tool_locations: Vec<acp::ToolCallLocation> = Vec::new();
+    let mut tool_content: Vec<acp_v2::ToolCallContent> = Vec::new();
+    let mut tool_locations: Vec<acp_v2::ToolCallLocation> = Vec::new();
 
     while let Ok(event) = event_receiver.try_recv() {
-        if let Ok(agent::ThreadEvent::ToolCallUpdate(acp_thread::ToolCallUpdate::UpdateFields(
-            update,
-        ))) = event
+        if let Ok(agent::ThreadEvent::ToolCallUpdate(acp_thread::ToolCallUpdate::V2(update))) =
+            event
         {
-            if let Some(content) = update.fields.content {
-                tool_content.extend(content);
+            if let Some(content) = update.content.take() {
+                for content in content {
+                    let acp_v2::ToolCallContent::Content(content) = content else {
+                        anyhow::bail!(
+                            "ReadFileTool produced non-content output in the image fixture"
+                        );
+                    };
+                    tool_content.push(acp_v2::ToolCallContent::Content(content));
+                }
             }
-            if let Some(locations) = update.fields.locations {
+            if let Some(locations) = update.locations.take() {
                 tool_locations.extend(locations);
             }
         }
@@ -2112,16 +2118,14 @@ fn run_agent_thread_view_test(
 
     // Create stub connection with the real tool output
     let connection = StubAgentConnection::new();
-    connection.set_next_prompt_updates(vec![acp::SessionUpdate::ToolCall(
-        acp::ToolCall::new(
-            "read_file",
-            format!("Read file `{}/test-image.png`", worktree_name),
-        )
-        .kind(acp::ToolKind::Read)
-        .status(acp::ToolCallStatus::Completed)
+    let tool_call = acp_v2::ToolCallUpdate::new("read_file")
+        .title(format!("Read file `{}/test-image.png`", worktree_name))
+        .kind(acp_v2::ToolKind::Read)
+        .status(acp_v2::ToolCallStatus::Completed)
         .locations(tool_locations)
-        .content(tool_content),
-    )]);
+        .content(tool_content);
+    connection
+        .set_next_prompt_action(move |thread, cx| thread.upsert_local_tool_call(tool_call, cx));
 
     let stub_agent: Rc<dyn AgentServer> = Rc::new(StubAgentServer::new(connection));
 
@@ -2722,7 +2726,7 @@ fn run_multi_workspace_sidebar_visual_tests(
 
                 let task = thread_store.update(cx, |store, cx| {
                     store.save_thread(
-                        acp::SessionId::new(Arc::from(session_id)),
+                        acp_v2::SessionId::new(Arc::from(session_id)),
                         agent::DbThread {
                             title: title.to_string().into(),
                             messages: Vec::new(),

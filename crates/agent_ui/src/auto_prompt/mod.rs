@@ -1,6 +1,6 @@
 use acp_thread::{AgentThreadEntry, ThreadStatus, ToolCallStatus};
 use agent::ZED_AGENT_ID;
-use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::schema::v2 as acp;
 use agent_servers::CLAUDE_AGENT_ID;
 use gpui::Window;
 use language_model::LanguageModelRegistry;
@@ -423,7 +423,7 @@ pub(crate) fn last_assistant_snippet(
                 acp_thread::AssistantMessageChunk::Thought { block, .. } => block,
             };
             let text = block.to_markdown(cx);
-            (!text.is_empty()).then_some(text.to_string())
+            (!text.is_empty()).then_some(text)
         })
         .collect::<Vec<_>>()
         .join(" ");
@@ -803,7 +803,10 @@ pub(crate) fn dispatch_action_with_attempts(
         .and_then(|tv| tv.read(cx).as_native_thread(cx))
         .and_then(|native_thread| native_thread.read(cx).model().cloned())
     {
-        model.reset_key_session(cx);
+        match LanguageModelRegistry::read_global(cx).provider_for_model(&model) {
+            Ok(provider) => provider.reset_key_session(&model, cx),
+            Err(error) => log::warn!("[auto_prompt] cannot reset key session: {error}"),
+        }
     }
 
     let decision_prompt = auto_prompt::extract_decision_prompt(&action.next_prompt);
@@ -1035,15 +1038,18 @@ pub fn on_thread_stopped(
     conversation_view: &crate::ConversationView,
     thread: &gpui::Entity<acp_thread::AcpThread>,
     used_tools: bool,
-    stop_reason: &acp::StopReason,
+    stop_reason: &Option<acp::StopReason>,
     window: &mut Window,
     cx: &mut gpui::Context<crate::ConversationView>,
 ) -> Option<gpui::Task<()>> {
+    // An agent may go idle without reporting why; that is an ordinary turn
+    // end as far as continuation is concerned.
+    let stop_reason = stop_reason.clone().unwrap_or(acp::StopReason::EndTurn);
     run_auto_prompt(
         conversation_view,
         thread,
         used_tools,
-        stop_reason,
+        &stop_reason,
         None,
         window,
         cx,
@@ -1181,7 +1187,7 @@ fn run_auto_prompt(
     }
 
     let thread = thread.clone();
-    let stop_reason = *stop_reason;
+    let stop_reason = stop_reason.clone();
 
     Some(cx.spawn_in(window, async move |_view, cx| {
         // Manual click: static fast path. A click is an explicit "keep working
@@ -1983,7 +1989,7 @@ fn gather_watchdog_context(
             AgentThreadEntry::ToolCall(tool_call)
                 if last_tool_input.is_none()
                     && matches!(
-                        tool_call.status,
+                        tool_call.status(),
                         ToolCallStatus::Completed
                             | ToolCallStatus::Failed
                             | ToolCallStatus::InProgress
@@ -1997,7 +2003,7 @@ fn gather_watchdog_context(
             }
             AgentThreadEntry::ToolCall(_)
             | AgentThreadEntry::AssistantMessage(_)
-            | AgentThreadEntry::CompletedPlan(_)
+            | AgentThreadEntry::SessionMessage(_)
             | AgentThreadEntry::ContextCompaction(_)
             | AgentThreadEntry::Elicitation(_)
             | AgentThreadEntry::AgentBoardNotification(_) => {}
@@ -2062,8 +2068,7 @@ pub fn start_watchdog(
     }
 
     let registry = LanguageModelRegistry::read_global(cx);
-    let configured_model = registry.default_model()?;
-    let model = configured_model.model.clone();
+    let model = registry.default_model()?;
 
     // Claude Code authenticates itself outside Zed's LanguageModelRegistry, so
     // for a Claude-agent thread the watchdog's reasoning call necessarily uses
@@ -2181,6 +2186,20 @@ pub fn start_watchdog(
                         reason
                     );
 
+                    // Cancelling emits Stopped, whose handler drops `_watchdog_task`
+                    // — i.e. this very task — before the timeout notice is sent.
+                    // Park it where cancel_watchdog can't reach it.
+                    if let Err(error) = conversation_view.update(cx, |view, cx| {
+                        if let Some(active) = view.active_thread() {
+                            active.update(cx, |active, _cx| {
+                                active._watchdog_recovery_task = active._watchdog_task.take();
+                            });
+                        }
+                    }) {
+                        log::warn!("[auto_prompt::watchdog] Conversation view dropped: {error:#}");
+                        return;
+                    }
+
                     // Cancel the worker thread. This triggers Stopped(Cancelled),
                     // which on_thread_stopped treats as NoAction (resets iteration).
                     // We then dispatch a timeout prompt to the SAME thread so the
@@ -2198,7 +2217,9 @@ pub fn start_watchdog(
                     // Wait for the cancel to fully complete before injecting the
                     // timeout message — otherwise the new prompt may race with
                     // the in-flight cancellation.
-                    cancel_task.await;
+                    if let Err(error) = cancel_task.await {
+                        log::warn!("[auto_prompt::watchdog] Thread cancellation failed: {error:#}");
+                    }
 
                     // Build and dispatch the timeout-recovery prompt.
                     let timeout_prompt = format!(
