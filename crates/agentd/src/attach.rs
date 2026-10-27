@@ -28,7 +28,11 @@ pub fn attach(paths: &Paths, handshake: Handshake) -> Result<()> {
             match reader.read(&mut buffer) {
                 Ok(0) | Err(_) => break,
                 Ok(read) => {
-                    if stdout.write_all(&buffer[..read]).and_then(|()| stdout.flush()).is_err() {
+                    if stdout
+                        .write_all(&buffer[..read])
+                        .and_then(|()| stdout.flush())
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -67,7 +71,10 @@ fn connect_or_spawn(paths: &Paths) -> Result<UnixStream> {
         return Ok(stream);
     }
     std::fs::create_dir_all(&paths.root)?;
-    let log = OpenOptions::new().create(true).append(true).open(paths.log())?;
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(paths.log())?;
     let mut command = Command::new(std::env::current_exe()?);
     command
         .arg("serve")

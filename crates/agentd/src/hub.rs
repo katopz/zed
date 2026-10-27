@@ -22,12 +22,20 @@ enum InitState {
 }
 
 enum RequestKind {
-    NewSession { cwd: PathBuf },
-    LoadSession { session_id: String },
+    NewSession {
+        cwd: PathBuf,
+    },
+    LoadSession {
+        session_id: String,
+    },
     /// Re-establishes backend state for a journaled session after the backend
     /// restarted; the client was already answered from the journal.
-    RestoreSession { session_id: String },
-    Prompt { session_id: String },
+    RestoreSession {
+        session_id: String,
+    },
+    Prompt {
+        session_id: String,
+    },
     Other,
 }
 
@@ -178,7 +186,9 @@ impl<J: JournalStore> Hub<J> {
 
     fn is_live(&self, session: &SessionState) -> bool {
         match (session.generation, self.backends.get(&session.backend_key)) {
-            (Some(generation), Some(backend)) => backend.running && backend.generation == generation,
+            (Some(generation), Some(backend)) => {
+                backend.running && backend.generation == generation
+            }
             _ => false,
         }
     }
@@ -233,10 +243,15 @@ impl<J: JournalStore> Hub<J> {
         else {
             return;
         };
-        let method = message.get("method").and_then(Value::as_str).map(str::to_owned);
+        let method = message
+            .get("method")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         let id = message.get("id").cloned();
         match (method, id) {
-            (Some(method), Some(id)) => self.client_request(client, &backend_key, &method, id, message),
+            (Some(method), Some(id)) => {
+                self.client_request(client, &backend_key, &method, id, message)
+            }
             (Some(_), None) => self.send_to_backend(&backend_key, message),
             (None, Some(id)) => self.client_response(client, id, message),
             (None, None) => {}
@@ -282,7 +297,13 @@ impl<J: JournalStore> Hub<J> {
                     .and_then(Value::as_str)
                     .map(PathBuf::from)
                     .unwrap_or_default();
-                self.forward_request(client, backend_key, id, message, RequestKind::NewSession { cwd })
+                self.forward_request(
+                    client,
+                    backend_key,
+                    id,
+                    message,
+                    RequestKind::NewSession { cwd },
+                )
             }
             "session/prompt" => match session_id {
                 Some(session_id) => {
@@ -320,7 +341,9 @@ impl<J: JournalStore> Hub<J> {
                 backend.init = InitState::Waiting(vec![(client, id)]);
                 let backend_id = backend.next_id;
                 backend.next_id += 1;
-                backend.pending.insert(backend_id, PendingRequest::Initialize);
+                backend
+                    .pending
+                    .insert(backend_id, PendingRequest::Initialize);
                 let message = json!({
                     "jsonrpc": "2.0",
                     "id": backend_id,
@@ -540,7 +563,10 @@ impl<J: JournalStore> Hub<J> {
     }
 
     fn backend_message(&mut self, backend_key: &str, message: Value) {
-        let method = message.get("method").and_then(Value::as_str).map(str::to_owned);
+        let method = message
+            .get("method")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         let id = message.get("id").cloned();
         match (method, id) {
             (Some(method), Some(_)) => {
@@ -550,7 +576,12 @@ impl<J: JournalStore> Hub<J> {
                     .map(str::to_owned);
                 if method.starts_with("fs/") || method.starts_with("terminal/") {
                     // We told the backend the client lacks these capabilities.
-                    self.send_error(backend_key, &message, METHOD_NOT_FOUND, "unsupported by agentd");
+                    self.send_error(
+                        backend_key,
+                        &message,
+                        METHOD_NOT_FOUND,
+                        "unsupported by agentd",
+                    );
                 } else {
                     self.route_backend_request(backend_key, session_id, message);
                 }
@@ -630,7 +661,10 @@ impl<J: JournalStore> Hub<J> {
                         self.register_session(client, backend_key, PathBuf::new(), &result)
                     }
                     (RequestKind::RestoreSession { session_id }, _) => {
-                        let generation = self.backends.get(backend_key).map(|backend| backend.generation);
+                        let generation = self
+                            .backends
+                            .get(backend_key)
+                            .map(|backend| backend.generation);
                         if let Some(session) = self.sessions.get_mut(&session_id) {
                             session.restoring = false;
                             if result.is_some() {
@@ -682,11 +716,20 @@ impl<J: JournalStore> Hub<J> {
         }
     }
 
-    fn register_session(&mut self, client: ClientId, backend_key: &str, cwd: PathBuf, result: &Value) {
+    fn register_session(
+        &mut self,
+        client: ClientId,
+        backend_key: &str,
+        cwd: PathBuf,
+        result: &Value,
+    ) {
         let Some(session_id) = result.get("sessionId").and_then(Value::as_str) else {
             return;
         };
-        let generation = self.backends.get(backend_key).map(|backend| backend.generation);
+        let generation = self
+            .backends
+            .get(backend_key)
+            .map(|backend| backend.generation);
         let timestamp = now();
         let session = self
             .sessions
@@ -716,7 +759,12 @@ impl<J: JournalStore> Hub<J> {
 
     /// Hands a backend → client request to the most recently attached GUI, or
     /// applies the detached policy when nobody is watching.
-    fn route_backend_request(&mut self, backend_key: &str, session_id: Option<String>, message: Value) {
+    fn route_backend_request(
+        &mut self,
+        backend_key: &str,
+        session_id: Option<String>,
+        message: Value,
+    ) {
         let target = session_id.as_ref().and_then(|session_id| {
             self.sessions
                 .get(session_id)
@@ -748,7 +796,8 @@ impl<J: JournalStore> Hub<J> {
             .get(backend_key)
             .map(|backend| backend.detached_policy)
             .unwrap_or_default();
-        let is_permission = message.get("method").and_then(Value::as_str) == Some("session/request_permission");
+        let is_permission =
+            message.get("method").and_then(Value::as_str) == Some("session/request_permission");
         match (policy, is_permission, session_id) {
             (DetachedPolicy::Allow, true, _) => {
                 self.answer_permission(backend_key, &message, &["allow_once", "allow_always"])
@@ -760,7 +809,9 @@ impl<J: JournalStore> Hub<J> {
                 Some(session) => session.queued.push_back((backend_key.to_string(), message)),
                 None => self.send_error(backend_key, &message, INTERNAL_ERROR, "unknown session"),
             },
-            (_, _, None) => self.send_error(backend_key, &message, INTERNAL_ERROR, "no client attached"),
+            (_, _, None) => {
+                self.send_error(backend_key, &message, INTERNAL_ERROR, "no client attached")
+            }
         }
     }
 
@@ -797,9 +848,17 @@ impl<J: JournalStore> Hub<J> {
             InitState::Waiting(waiters) => waiters,
             _ => Vec::new(),
         };
-        let pending: Vec<PendingRequest> = backend.pending.drain().map(|(_, pending)| pending).collect();
+        let pending: Vec<PendingRequest> = backend
+            .pending
+            .drain()
+            .map(|(_, pending)| pending)
+            .collect();
         for (client, id) in waiters {
-            self.reply(client, id, Err((INTERNAL_ERROR, "agent process exited".into())));
+            self.reply(
+                client,
+                id,
+                Err((INTERNAL_ERROR, "agent process exited".into())),
+            );
         }
         for pending in pending {
             if let PendingRequest::Client {
@@ -880,13 +939,11 @@ fn self_sufficient_client_params(mut params: Value) -> Value {
     if !params.is_object() {
         params = json!({});
     }
-    let capabilities = params
-        .as_object_mut()
-        .map(|object| {
-            object
-                .entry("clientCapabilities")
-                .or_insert_with(|| Value::Object(Map::new()))
-        });
+    let capabilities = params.as_object_mut().map(|object| {
+        object
+            .entry("clientCapabilities")
+            .or_insert_with(|| Value::Object(Map::new()))
+    });
     if let Some(Value::Object(capabilities)) = capabilities {
         capabilities.insert(
             "fs".into(),
@@ -945,7 +1002,11 @@ mod tests {
         });
     }
 
-    fn from_client(hub: &mut Hub<MemoryJournal>, client: ClientId, message: Value) -> Vec<HubOutput> {
+    fn from_client(
+        hub: &mut Hub<MemoryJournal>,
+        client: ClientId,
+        message: Value,
+    ) -> Vec<HubOutput> {
         hub.handle(HubEvent::ClientMessage { client, message })
     }
 
@@ -984,16 +1045,28 @@ mod tests {
             client,
             json!({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"protocolVersion": 1, "clientCapabilities": {"terminal": true}}}),
         );
-        assert!(matches!(outputs[0], HubOutput::SpawnBackend { generation: 1, .. }));
+        assert!(matches!(
+            outputs[0],
+            HubOutput::SpawnBackend { generation: 1, .. }
+        ));
         let initialize = to_backend(&outputs)[0].clone();
-        assert_eq!(initialize["params"]["clientCapabilities"]["terminal"], json!(false));
+        assert_eq!(
+            initialize["params"]["clientCapabilities"]["terminal"],
+            json!(false)
+        );
         let outputs = from_backend(
             hub,
             json!({"jsonrpc": "2.0", "id": initialize["id"], "result": {"protocolVersion": 1, "agentCapabilities": {"loadSession": false, "sessionCapabilities": {"resume": {}}}}}),
         );
         let reply = to_client(&outputs, client)[0];
-        assert_eq!(reply["result"]["agentCapabilities"]["loadSession"], json!(true));
-        assert_eq!(reply["result"]["agentCapabilities"]["sessionCapabilities"], json!({"list": {}}));
+        assert_eq!(
+            reply["result"]["agentCapabilities"]["loadSession"],
+            json!(true)
+        );
+        assert_eq!(
+            reply["result"]["agentCapabilities"]["sessionCapabilities"],
+            json!({"list": {}})
+        );
 
         let outputs = from_client(
             hub,
@@ -1042,7 +1115,10 @@ mod tests {
             SECOND_GUI,
             json!({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {}}),
         );
-        assert!(to_backend(&outputs).is_empty(), "initialize answered from cache");
+        assert!(
+            to_backend(&outputs).is_empty(),
+            "initialize answered from cache"
+        );
 
         let outputs = from_client(
             &mut hub,
@@ -1060,11 +1136,17 @@ mod tests {
         );
         let replay = to_client(&outputs, SECOND_GUI);
         assert_eq!(replay.len(), 3);
-        assert_eq!(replay[0]["params"]["update"]["sessionUpdate"], "user_message_chunk");
+        assert_eq!(
+            replay[0]["params"]["update"]["sessionUpdate"],
+            "user_message_chunk"
+        );
         assert_eq!(replay[1]["params"]["update"]["content"]["text"], "Working");
         assert_eq!(replay[2]["id"], json!(2));
         assert_eq!(replay[2]["result"]["modes"]["currentModeId"], "code");
-        assert!(to_backend(&outputs).is_empty(), "live session needs no backend restore");
+        assert!(
+            to_backend(&outputs).is_empty(),
+            "live session needs no backend restore"
+        );
     }
 
     #[test]
@@ -1136,7 +1218,10 @@ mod tests {
             &mut hub,
             json!({"jsonrpc": "2.0", "id": 4, "method": "terminal/create", "params": {"sessionId": "s1"}}),
         );
-        assert_eq!(to_backend(&outputs)[0]["error"]["code"], json!(METHOD_NOT_FOUND));
+        assert_eq!(
+            to_backend(&outputs)[0]["error"]["code"],
+            json!(METHOD_NOT_FOUND)
+        );
     }
 
     #[test]
@@ -1155,7 +1240,10 @@ mod tests {
             GUI,
             json!({"jsonrpc": "2.0", "id": 10, "method": "initialize", "params": {}}),
         );
-        assert!(matches!(outputs[0], HubOutput::SpawnBackend { generation: 2, .. }));
+        assert!(matches!(
+            outputs[0],
+            HubOutput::SpawnBackend { generation: 2, .. }
+        ));
         let initialize_id = to_backend(&outputs)[0]["id"].clone();
         hub.handle(HubEvent::BackendMessage {
             backend_key: spec().key(),
@@ -1170,7 +1258,12 @@ mod tests {
         );
         let restore = to_backend(&outputs)[0].clone();
         assert_eq!(restore["method"], "session/load");
-        assert_eq!(to_client(&outputs, GUI).last().map(|reply| reply["id"].clone()), Some(json!(11)));
+        assert_eq!(
+            to_client(&outputs, GUI)
+                .last()
+                .map(|reply| reply["id"].clone()),
+            Some(json!(11))
+        );
 
         let replayed = hub.handle(HubEvent::BackendMessage {
             backend_key: spec().key(),

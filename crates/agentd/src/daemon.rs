@@ -61,8 +61,13 @@ pub fn serve(paths: &Paths) -> Result<()> {
     if socket.exists() {
         fs::remove_file(&socket)?;
     }
-    let listener = UnixListener::bind(&socket).with_context(|| format!("binding {}", socket.display()))?;
-    eprintln!("agentd: pid {} listening on {}", std::process::id(), socket.display());
+    let listener =
+        UnixListener::bind(&socket).with_context(|| format!("binding {}", socket.display()))?;
+    eprintln!(
+        "agentd: pid {} listening on {}",
+        std::process::id(),
+        socket.display()
+    );
 
     let (events, inbox) = mpsc::channel();
     thread::spawn({
@@ -99,7 +104,11 @@ fn accept_loop(listener: UnixListener, events: Sender<DaemonEvent>) {
     }
 }
 
-fn client_session(client: ClientId, stream: UnixStream, events: &Sender<DaemonEvent>) -> Result<()> {
+fn client_session(
+    client: ClientId,
+    stream: UnixStream,
+    events: &Sender<DaemonEvent>,
+) -> Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut first_line = String::new();
     reader.read_line(&mut first_line)?;
@@ -124,7 +133,10 @@ fn client_session(client: ClientId, stream: UnixStream, events: &Sender<DaemonEv
         match serde_json::from_str::<Value>(&line) {
             Ok(message) => {
                 if events
-                    .send(DaemonEvent::Hub(HubEvent::ClientMessage { client, message }))
+                    .send(DaemonEvent::Hub(HubEvent::ClientMessage {
+                        client,
+                        message,
+                    }))
                     .is_err()
                 {
                     break;
@@ -146,7 +158,11 @@ fn write_lines(mut stream: impl std::io::Write, outbox: Receiver<Value>) {
             }
         };
         line.push(b'\n');
-        if stream.write_all(&line).and_then(|()| stream.flush()).is_err() {
+        if stream
+            .write_all(&line)
+            .and_then(|()| stream.flush())
+            .is_err()
+        {
             break;
         }
     }

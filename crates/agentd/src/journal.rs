@@ -61,7 +61,9 @@ impl JournalStore for FileJournal {
                 .and_then(|bytes| Ok(serde_json::from_slice::<SessionRecord>(&bytes)?));
             match parsed {
                 Ok(record) => records.push(record),
-                Err(error) => eprintln!("agentd: skipping unreadable {}: {error:#}", path.display()),
+                Err(error) => {
+                    eprintln!("agentd: skipping unreadable {}: {error:#}", path.display())
+                }
             }
         }
         Ok(records)
@@ -220,7 +222,9 @@ mod tests {
         };
         journal.write_record(&record)?;
         journal.append_update("sess/1", &json!({"sessionUpdate": "plan"}))?;
-        let log = dir.path().join(format!("{}.jsonl", FileJournal::stem("sess/1")));
+        let log = dir
+            .path()
+            .join(format!("{}.jsonl", FileJournal::stem("sess/1")));
         let mut file = OpenOptions::new().append(true).open(log)?;
         file.write_all(b"{\"torn\":")?;
 
