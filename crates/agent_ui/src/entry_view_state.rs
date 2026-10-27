@@ -594,16 +594,11 @@ impl EntryViewState {
                 };
                 entry.sync(message);
             }
-            AgentThreadEntry::ContextCompaction(_) => {
+            // Board notifications are stateless display-only cards too; they share the stateless slot.
+            AgentThreadEntry::ContextCompaction(_)
+            | AgentThreadEntry::AgentBoardNotification(_) => {
                 if !matches!(self.entries.get(index), Some(Entry::ContextCompaction)) {
                     self.set_entry(index, Entry::ContextCompaction);
-                }
-            }
-            AgentThreadEntry::AgentBoardNotification(_) => {
-                // Stateless display-only card, but the vec is indexed densely
-                // 1:1 with thread entries, so it still needs its own slot.
-                if !matches!(self.entries.get(index), Some(Entry::AgentBoardNotification)) {
-                    self.set_entry(index, Entry::AgentBoardNotification);
                 }
             }
         };
@@ -653,8 +648,7 @@ impl EntryViewState {
                 | Entry::AssistantMessage { .. }
                 | Entry::SessionMessage { .. }
                 | Entry::Elicitation { .. }
-                | Entry::ContextCompaction
-                | Entry::AgentBoardNotification => {}
+                | Entry::ContextCompaction => {}
                 Entry::ToolCall(ToolCallEntry { content, .. }) => {
                     for view in content.values() {
                         if let Ok(diff_editor) = view.clone().downcast::<Editor>() {
@@ -739,7 +733,6 @@ pub enum Entry {
         focus_handle: FocusHandle,
     },
     ContextCompaction,
-    AgentBoardNotification,
 }
 
 impl Entry {
@@ -750,7 +743,7 @@ impl Entry {
             Self::SessionMessage { focus_handle } => Some(focus_handle.clone()),
             Self::ToolCall(tool_call) => Some(tool_call.focus_handle.clone()),
             Self::Elicitation { focus_handle } => Some(focus_handle.clone()),
-            Self::ContextCompaction | Self::AgentBoardNotification => None,
+            Self::ContextCompaction => None,
         }
     }
 
@@ -761,8 +754,7 @@ impl Entry {
             | Self::SessionMessage { .. }
             | Self::ToolCall(_)
             | Self::Elicitation { .. }
-            | Self::ContextCompaction
-            | Self::AgentBoardNotification => None,
+            | Self::ContextCompaction => None,
         }
     }
 
@@ -800,8 +792,7 @@ impl Entry {
             | Self::SessionMessage { .. }
             | Self::ToolCall(_)
             | Self::Elicitation { .. }
-            | Self::ContextCompaction
-            | Self::AgentBoardNotification => None,
+            | Self::ContextCompaction => None,
         }
     }
 
@@ -820,8 +811,7 @@ impl Entry {
             | Self::AssistantMessage(_)
             | Self::SessionMessage { .. }
             | Self::Elicitation { .. }
-            | Self::ContextCompaction
-            | Self::AgentBoardNotification => false,
+            | Self::ContextCompaction => false,
         }
     }
 }
@@ -840,7 +830,7 @@ impl Focusable for Entry {
             Self::SessionMessage { focus_handle } => focus_handle.clone(),
             Self::ToolCall(tool_call) => tool_call.focus_handle.clone(),
             Self::Elicitation { focus_handle } => focus_handle.clone(),
-            Self::ContextCompaction | Self::AgentBoardNotification => cx.focus_handle(),
+            Self::ContextCompaction => cx.focus_handle(),
         }
     }
 }
@@ -938,6 +928,7 @@ fn diff_editor_text_style_refinement(cx: &mut App) -> TextStyleRefinement {
 
 #[cfg(test)]
 mod tests {
+    mod fork_tests;
     use std::cell::Cell;
     use std::path::Path;
     use std::rc::Rc;
@@ -1190,91 +1181,6 @@ mod tests {
             assert!(matches!(
                 view_state.entry(1),
                 Some(Entry::AssistantMessage(_))
-            ));
-        });
-    }
-
-    #[gpui::test]
-    async fn test_board_notification_keeps_entry_slots_dense(cx: &mut TestAppContext) {
-        init_test(cx);
-
-        let fs = FakeFs::new(cx.executor());
-        fs.insert_tree("/project", json!({})).await;
-        let project = Project::test(fs, [Path::new(path!("/project"))], cx).await;
-
-        let (multi_workspace, cx) =
-            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
-        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
-
-        let connection = Rc::new(StubAgentConnection::new());
-        let thread = cx
-            .update(|_, cx| {
-                connection.clone().new_session(
-                    project.clone(),
-                    PathList::new(&[Path::new(path!("/project"))]),
-                    cx,
-                )
-            })
-            .await
-            .unwrap();
-        let session_id = thread.update(cx, |thread, _| thread.session_id().clone());
-
-        cx.update(|_, cx| {
-            connection.send_update(
-                session_id.clone(),
-                acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(
-                    acp_v1::ContentBlock::Text(acp_v1::TextContent::new("hello")),
-                )),
-                cx,
-            );
-        });
-        thread.update(cx, |thread, cx| {
-            thread.push_agent_board_notification("peer status update", cx)
-        });
-        let _response_task = thread.update(cx, |thread, cx| {
-            thread
-                .request_elicitation(
-                    acp_v2::CreateElicitationRequest::new(
-                        acp_v2::ElicitationFormMode::new(
-                            acp_v2::ElicitationSessionScope::new(session_id.clone()),
-                            acp_v2::ElicitationSchema::new().string("name", true),
-                        ),
-                        "Provide a name",
-                    ),
-                    cx,
-                )
-                .unwrap()
-        });
-        assert_eq!(thread.read_with(cx, |thread, _| thread.entries().len()), 3);
-
-        let view_state = cx.new(|_cx| {
-            EntryViewState::new(
-                workspace.downgrade(),
-                project.downgrade(),
-                None,
-                Arc::new(RwLock::new(SessionCapabilities::default())),
-                "Test Agent".into(),
-            )
-        });
-
-        view_state.update_in(cx, |view_state, window, cx| {
-            view_state.sync_entry(0, &thread, window, cx);
-            view_state.sync_entry(1, &thread, window, cx);
-            view_state.sync_entry(2, &thread, window, cx);
-        });
-
-        view_state.read_with(cx, |view_state, _cx| {
-            assert!(matches!(
-                view_state.entry(0),
-                Some(Entry::AssistantMessage(_))
-            ));
-            assert!(matches!(
-                view_state.entry(1),
-                Some(Entry::AgentBoardNotification)
-            ));
-            assert!(matches!(
-                view_state.entry(2),
-                Some(Entry::Elicitation { .. })
             ));
         });
     }

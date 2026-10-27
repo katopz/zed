@@ -20,7 +20,6 @@ use db::kvp::{Dismissable, KeyValueStore};
 use itertools::Itertools;
 use project::agent_server_store::AllAgentServersSettings;
 use project::{AgentId, ProjectItem};
-use prompt_store::BuiltInPrompt;
 use serde::{Deserialize, Serialize};
 
 use zed_actions::{
@@ -31,15 +30,14 @@ use zed_actions::{
         ResolveConflictsWithAgent, ReviewBranchDiff, SelectAgent,
     },
     assistant::{
-        FocusAgent, ManageSkills, OpenGlobalAgentsMdRules, OpenGlobalAutoPromptMd,
-        OpenProjectAgentsMdRules, OpenProjectAutoPromptMd, Toggle, ToggleFocus,
+        FocusAgent, ManageSkills, OpenGlobalAgentsMdRules, OpenProjectAgentsMdRules, Toggle,
+        ToggleFocus,
     },
 };
 
 use crate::ExpandMessageEditor;
 use crate::ManageProfiles;
 use crate::agent_connection_store::AgentConnectionStore;
-use crate::auto_prompt::{AutoPromptNewThread, ToggleAutoPrompt};
 use crate::completion_provider::{AgentContextSelection, AgentContextSource};
 use crate::terminal_thread_metadata_store::{
     TerminalThreadMetadata, TerminalThreadMetadataStore, compose_terminal_thread_title,
@@ -365,13 +363,7 @@ struct SerializedActiveThread {
 }
 
 pub fn init(cx: &mut App) {
-    cx.on_action(|action: &AutoPromptNewThread, _cx| {
-        log::warn!(
-            "[auto_prompt] GLOBAL on_action: AutoPromptNewThread reached App-level listener (from_session_id={:?})",
-            action.from_session_id
-        );
-    });
-
+    fork::init(cx);
     cx.observe_new(
         |workspace: &mut Workspace, _window, _cx: &mut Context<Workspace>| {
             workspace
@@ -406,118 +398,6 @@ pub fn init(cx: &mut App) {
                         }
                     },
                 )
-                .register_action(|workspace, action: &AutoPromptNewThread, window, cx| {
-                    log::info!(
-                        "[auto_prompt] AutoPromptNewThread action received in Workspace handler (from_session_id={:?})",
-                        action.from_session_id
-                    );
-                    if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
-                        workspace.focus_panel::<AgentPanel>(window, cx);
-
-                        let work_dirs = action
-                            .work_dirs
-                            .clone()
-                            .map(|dirs| PathList::new(&dirs));
-
-                        let from_session_id = action.from_session_id.clone();
-                        let from_title = action.from_title.clone();
-
-                        // Plan 023 B4: inline the summary as a ContentBlock
-                        // instead of ThreadSummary — the @thread mention made
-                        // the new thread re-summarize the old one with a full
-                        // LLM call even though the summary is already the last
-                        // assistant message. `set_continued_from` below
-                        // preserves the sidebar link.
-                        let initial_content = {
-                            let decision = action
-                                .decision_prompt
-                                .clone()
-                                .unwrap_or_else(|| action.next_prompt.clone());
-                            let prompt_summary = auto_prompt::build_prompt_summary(
-                                None,
-                                from_title.as_deref(),
-                                Some("context overflow: continuing in new thread with summary"),
-                                action.last_assistant_message.as_deref(),
-                                action.original_user_message.as_deref(),
-                                None,
-                            );
-                            let full_prompt = auto_prompt::with_first_prompt_context(
-                                decision,
-                                prompt_summary.as_deref(),
-                                from_title.as_deref(),
-                                action.last_assistant_message.as_deref(),
-                            );
-                            log::info!(
-                                "[auto_prompt] AutoPromptNewThread action: new thread via ContentBlock ({} chars)",
-                                full_prompt.len()
-                            );
-                            AgentInitialContent::ContentBlock {
-                                blocks: vec![acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
-                                    full_prompt,
-                                ))],
-                                auto_submit: true,
-                                auto_prompt_enabled: true,
-                                profile_id: action.profile_id.clone(),
-                            }
-                        };
-
-                        panel.update(cx, |panel, cx| {
-                            // Plan 023 B4: track continued-from from the action
-                            // directly (no longer derived from ThreadSummary).
-                            let continued_from = Some(from_session_id.clone());
-                            let new_thread_id = panel.external_thread(
-                                None,
-                                None,
-                                work_dirs,
-                                action.from_title.clone().map(Into::into),
-                                Some(initial_content),
-                                true,
-                                AgentThreadSource::AgentPanel,
-                                window,
-                                cx,
-                            );
-                            if let (Some(thread_id), Some(from_session_id)) =
-                                (new_thread_id, continued_from)
-                            {
-                                if let Some(store) = ThreadMetadataStore::try_global(cx) {
-                                    store.update(cx, |store, cx| {
-                                        store.set_continued_from(
-                                            thread_id,
-                                            from_session_id,
-                                            cx,
-                                        );
-                                    });
-                                }
-                            }
-                        });
-                    } else {
-                        log::warn!(
-                            "[auto_prompt] AutoPromptNewThread DROPPED: AgentPanel not found in workspace"
-                        );
-                    }
-                })
-                .register_action(|workspace, _: &ToggleAutoPrompt, _window, cx| {
-                    if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
-                        panel.update(cx, |panel, cx| {
-                            if let Some(tv) = panel.active_thread_view(cx) {
-                                let new_enabled = !tv.read(cx).fork.auto_prompt_enabled;
-                                tv.update(cx, |tv, cx| {
-                                    tv.fork.auto_prompt_enabled = new_enabled;
-                                    log::info!(
-                                        "auto_prompt: {}",
-                                        if tv.fork.auto_prompt_enabled {
-                                            "enabled"
-                                        } else {
-                                            "disabled"
-                                        }
-                                    );
-                                    cx.notify();
-                                });
-                                panel.auto_prompt_enabled = new_enabled;
-                            }
-                        });
-                    }
-                })
                 .register_action(|workspace, _: &ExpandMessageEditor, window, cx| {
                     if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
                         workspace.focus_panel::<AgentPanel>(window, cx);
@@ -557,12 +437,6 @@ pub fn init(cx: &mut App) {
                 })
                 .register_action(|workspace, _: &OpenProjectAgentsMdRules, window, cx| {
                     open_project_rules(workspace, window, cx);
-                })
-                .register_action(|workspace, _: &OpenGlobalAutoPromptMd, window, cx| {
-                    open_global_auto_prompt(workspace, window, cx);
-                })
-                .register_action(|workspace, _: &OpenProjectAutoPromptMd, window, cx| {
-                    open_project_auto_prompt(workspace, window, cx);
                 })
                 .register_action(|workspace, _: &Follow, window, cx| {
                     workspace.follow(CollaboratorId::Agent, window, cx);
@@ -1279,7 +1153,7 @@ pub struct AgentPanel {
     new_user_onboarding: Entity<AgentPanelOnboarding>,
     new_user_onboarding_upsell_dismissed: AtomicBool,
     selected_agent: Agent,
-    auto_prompt_enabled: bool,
+    fork: ForkAgentPanelState,
     _thread_view_subscription: Option<Subscription>,
     _active_thread_focus_subscription: Option<Subscription>,
     _base_view_observation: Option<Subscription>,
@@ -1289,18 +1163,6 @@ pub struct AgentPanel {
     _settings_subscription: Subscription,
     retained_thread_subscriptions: HashMap<ThreadId, Subscription>,
     last_context_source: Option<AgentContextSource>,
-
-    /// Background timer that drains peer-agent-state notifications from
-    /// `auto_prompt::peer_states` and injects them into the active agent
-    /// thread as `AgentBoardNotification` entries. Held to keep the task alive.
-    _notification_drain_task: Option<Task<()>>,
-
-    /// Plan 026: per-session tail fingerprint (entry count + hash of the last
-    /// entry's markdown) already mirrored to the web Threads tab. Streaming
-    /// entries update in place, so a plain count is not enough — the tail hash
-    /// catches in-place growth and re-sends the entry (the worker upserts by
-    /// `seq`, making re-sends idempotent).
-    thread_broadcast_tails: HashMap<acp_v2::SessionId, (usize, u64)>,
 
     is_active: bool,
 }
@@ -1652,14 +1514,6 @@ impl AgentPanel {
 
         let connection_store = cx.new(|cx| AgentConnectionStore::new(project.clone(), cx));
 
-        // Verdict ping-pong (proposal 001 phase 6): expose the panel's Claude
-        // Code connection to the `request_verdict` tool. Re-registered if a
-        // second panel spawns (last one wins); the reviewer re-resolves a
-        // live store at spawn time, so a stale registration after this panel
-        // drops is harmless.
-        acp_thread::verdict::set_reviewer(Some(crate::verdict_reviewer::ClaudeCodeReviewer::new(
-            connection_store.downgrade(),
-        )));
         let _project_subscription =
             cx.subscribe(&project, |this, _project, event, cx| match event {
                 project::Event::WorktreeAdded(_)
@@ -1724,7 +1578,7 @@ impl AgentPanel {
             new_user_onboarding: onboarding,
             thread_store,
             selected_agent: Agent::default(),
-            auto_prompt_enabled: true,
+            fork: ForkAgentPanelState::default(),
             _thread_view_subscription: None,
             _active_thread_focus_subscription: None,
             new_user_onboarding_upsell_dismissed: AtomicBool::new(OnboardingUpsell::dismissed(cx)),
@@ -1735,13 +1589,11 @@ impl AgentPanel {
             _settings_subscription,
             retained_thread_subscriptions: HashMap::default(),
             last_context_source: None,
-            _notification_drain_task: None,
-            thread_broadcast_tails: HashMap::default(),
             is_active: false,
         };
 
         panel.ensure_native_agent_connection(cx);
-        panel.start_notification_drain(cx);
+        panel.start_fork_tasks(cx);
         panel
     }
 
@@ -2069,7 +1921,7 @@ impl AgentPanel {
             AgentInitialContent::ContentBlock {
                 blocks,
                 auto_submit: false,
-                auto_prompt_enabled: self.auto_prompt_enabled,
+                auto_prompt_enabled: self.fork.auto_prompt_enabled,
                 profile_id: None,
             }
         });
@@ -3745,70 +3597,6 @@ impl AgentPanel {
         Some(thread_id)
     }
 
-    /// Insert a thread into `retained_threads` and run the standard cleanup
-    /// pass. This centralizes the post-insert hygiene that `retain_running_thread`
-    /// already does so the auto_prompt continuation path (`external_thread_background`)
-    /// and `create_thread_with_options` no longer bypass it — issue 006 found
-    /// those paths grew `retained_threads` without bound because they inserted
-    /// directly without invoking `cleanup_retained_threads`.
-    ///
-    /// `cleanup_retained_threads` enforces `max_idle_retained_threads` (default 5)
-    /// but skips any thread that is currently `Generating`, loading contents,
-    /// producing a title/summary, or has a queued message. As a backstop for
-    /// the runaway case where every retained thread is generating (so cleanup
-    /// would be a no-op), we still enforce a hard cap of
-    /// [`MAX_RETAINED_THREADS`] by evicting the oldest evictable thread — and
-    /// deliberately exceeding the cap when every thread is busy, since killing
-    /// active work is worse than a temporarily larger map (see
-    /// [`Self::is_thread_evictable`]).
-    fn insert_retained_thread(
-        &mut self,
-        thread_id: ThreadId,
-        view: Entity<ConversationView>,
-        cx: &mut Context<Self>,
-    ) {
-        // IndexMap preserves insertion order; remove + insert refreshes
-        // the thread's FIFO position when re-parking an already-present id.
-        self.remove_retained_thread(&thread_id);
-        self.retained_threads.insert(thread_id, view.clone());
-        self.observe_retained_thread(thread_id, view, cx);
-        self.cleanup_retained_threads(cx);
-
-        // Hard cap backstop: if every retained thread was mid-generation,
-        // `cleanup_retained_threads` could not evict any of them. Respect the
-        // invariant by evicting the single oldest EVICTABLE retained thread —
-        // never a busy one: evicting a Generating thread drops its
-        // ConversationView, which cancels the watchdog and auto_prompt tasks
-        // that are the only recovery paths for a wedged stream (issue 003).
-        // When no thread is evictable we deliberately exceed the cap — the cap
-        // exists to bound idle-thread memory (issue 006), not to kill work.
-        // The underlying agent-server thread keeps running and its metadata
-        // stays in `ThreadMetadataStore`, so the user can reopen it from the
-        // sidebar.
-        while self.retained_threads.len() > MAX_RETAINED_THREADS {
-            let Some(oldest_id) = self
-                .retained_threads
-                .iter()
-                .find(|(_id, view)| self.is_thread_evictable(view, cx))
-                .map(|(id, _)| *id)
-            else {
-                log::warn!(
-                    "[agent_panel] retained_threads ({}) all busy; exceeding hard cap of {} \
-                     instead of evicting active work",
-                    self.retained_threads.len(),
-                    MAX_RETAINED_THREADS
-                );
-                break;
-            };
-            self.remove_retained_thread(&oldest_id);
-            log::info!(
-                "[agent_panel] retained_threads exceeded hard cap of {MAX_RETAINED_THREADS} \
-                 (all idle slots taken); evicted oldest idle thread {oldest_id:?} \
-                 (metadata preserved in ThreadMetadataStore)"
-            );
-        }
-    }
-
     fn manage_skills(
         &mut self,
         _action: &ManageSkills,
@@ -4478,6 +4266,7 @@ impl AgentPanel {
                 self.draft_thread = None;
                 self._draft_editor_observation = None;
                 self.insert_retained_thread(thread_id, conversation_view, cx);
+                self.cleanup_retained_threads(cx);
             }
             return;
         }
@@ -4489,6 +4278,20 @@ impl AgentPanel {
         }
 
         self.insert_retained_thread(thread_id, conversation_view, cx);
+        self.cleanup_retained_threads(cx);
+    }
+
+    fn insert_retained_thread(
+        &mut self,
+        thread_id: ThreadId,
+        conversation_view: Entity<ConversationView>,
+        cx: &mut Context<Self>,
+    ) {
+        self.remove_retained_thread(&thread_id);
+        self.retained_threads
+            .insert(thread_id, conversation_view.clone());
+        self.observe_retained_thread(thread_id, conversation_view, cx);
+        self.enforce_retained_thread_cap(cx);
     }
 
     fn observe_retained_thread(
@@ -4779,7 +4582,7 @@ impl AgentPanel {
             .map(|blocks| AgentInitialContent::ContentBlock {
                 blocks,
                 auto_submit: false,
-                auto_prompt_enabled: self.auto_prompt_enabled,
+                auto_prompt_enabled: self.fork.auto_prompt_enabled,
                 profile_id: None,
             });
 
@@ -5100,7 +4903,7 @@ impl agent::SiblingThreadHost for AgentPanelSiblingHost {
                 ))],
                 auto_submit: true,
                 auto_prompt_enabled: panel
-                    .read_with(cx, |panel, _| panel.auto_prompt_enabled)
+                    .read_with(cx, |panel, _| panel.fork.auto_prompt_enabled)
                     .unwrap_or(true),
                 profile_id: None,
             };
@@ -5546,7 +5349,7 @@ impl AgentPanel {
         Some(AgentInitialContent::ContentBlock {
             blocks,
             auto_submit: false,
-            auto_prompt_enabled: self.auto_prompt_enabled,
+            auto_prompt_enabled: self.fork.auto_prompt_enabled,
             profile_id: None,
         })
     }
@@ -5909,7 +5712,8 @@ impl AgentPanel {
 
         let project_agents_md_path = project_agents_md_path(&self.project, true, cx);
 
-        let project_auto_prompt_md_path = project_auto_prompt_md_path(&self.project, true, cx);
+        let has_project_auto_prompt_md =
+            project_auto_prompt_md_path(&self.project, true, cx).is_some();
 
         let global_agents_md_loaded = UserAgentsMd::global(cx)
             .and_then(|md| md.content())
@@ -6054,60 +5858,14 @@ impl AgentPanel {
                                 }
                             }
 
-                            // Auto Prompt section
-                            {
-                                let workspace = workspace.clone();
-                                menu = menu.header("Auto Prompt").custom_entry(
-                                    |_window, _cx| {
-                                        h_flex()
-                                            .w_full()
-                                            .gap_1()
-                                            .child(Label::new("Open Global System Prompt"))
-                                            .child(
-                                                Label::new("(AUTO_PROMPT.md)")
-                                                    .color(Color::Muted)
-                                                    .size(LabelSize::Small),
-                                            )
-                                            .into_any_element()
-                                    },
-                                    move |window, cx| {
-                                        workspace
-                                            .update(cx, |workspace, cx| {
-                                                open_global_auto_prompt(workspace, window, cx);
-                                            })
-                                            .log_err();
-                                    },
-                                );
-                            }
-
-                            if project_auto_prompt_md_path.is_some() {
-                                let workspace = workspace.clone();
-                                menu = menu.custom_entry(
-                                    |_window, _cx| {
-                                        h_flex()
-                                            .w_full()
-                                            .gap_1()
-                                            .child(Label::new("Open Project System Prompt"))
-                                            .child(
-                                                Label::new("(AUTO_PROMPT.md)")
-                                                    .color(Color::Muted)
-                                                    .size(LabelSize::Small),
-                                            )
-                                            .into_any_element()
-                                    },
-                                    move |window, cx| {
-                                        workspace
-                                            .update(cx, |workspace, cx| {
-                                                open_project_auto_prompt(workspace, window, cx);
-                                            })
-                                            .log_err();
-                                    },
-                                );
-                            }
-
-                            menu = menu.separator();
-
-                            menu = menu.action("Profiles", Box::new(ManageProfiles::default()));
+                            menu = auto_prompt_menu_entries(
+                                menu,
+                                &workspace,
+                                has_project_auto_prompt_md,
+                            );
+                            menu = menu
+                                .separator()
+                                .action("Profiles", Box::new(ManageProfiles::default()));
                         }
 
                         menu = menu
