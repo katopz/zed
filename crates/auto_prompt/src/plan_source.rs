@@ -552,24 +552,34 @@ async fn cat_file_batch(repo_root: &Path, blobs: &[String]) -> HashMap<String, O
         let Ok(size) = size_str.parse::<u64>() else {
             continue;
         };
+        // A failed read leaves the stream misaligned, so every later header
+        // would fail the hash check; stop and let the caller report the rest
+        // as unreadable instead.
         let content = if size > MAX_PLAN_FILE_BYTES {
             // Must still consume the payload to keep the stream aligned.
-            read_and_discard(reader, size).await;
+            if read_and_discard(reader, size).await.is_none() {
+                log::warn!("[auto_prompt::plan_source] cat-file stream ended inside blob {blob}");
+                break;
+            }
             None
         } else {
             let mut bytes = vec![0u8; size as usize];
-            match reader.read_exact(&mut bytes).await {
-                // Invalid UTF-8 is skipped, matching the worktree reader's
-                // read_to_string behavior (binary strays in .plans/ such as
-                // screenshots must not pollute the dispatcher context).
-                Ok(()) => String::from_utf8(bytes).ok(),
-                Err(_) => None,
+            if let Err(err) = reader.read_exact(&mut bytes).await {
+                log::warn!("[auto_prompt::plan_source] cat-file read of blob {blob} failed: {err}");
+                break;
             }
+            // Invalid UTF-8 is skipped, matching the worktree reader's
+            // read_to_string behavior (binary strays in .plans/ such as
+            // screenshots must not pollute the dispatcher context).
+            String::from_utf8(bytes).ok()
         };
+        result.insert(blob.clone(), content);
         // Trailing newline after each payload.
         let mut newline = [0u8; 1];
-        let _ = reader.read_exact(&mut newline).await;
-        result.insert(blob.clone(), content);
+        if let Err(err) = reader.read_exact(&mut newline).await {
+            log::warn!("[auto_prompt::plan_source] cat-file stream ended after blob {blob}: {err}");
+            break;
+        }
     }
 
     if let Err(err) = child.status().await {

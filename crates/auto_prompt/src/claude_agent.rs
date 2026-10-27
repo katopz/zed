@@ -921,7 +921,7 @@ async fn judge_with_hidden_session(
         futures::future::Either::Right(_) => {
             log::warn!("[auto_prompt::claude] hidden session timed out after 180s");
             // Cancel the hidden turn so we don't leak a running session.
-            let _ = cx.update(|cx| {
+            cx.update(|cx| {
                 hidden_thread.update(cx, |t, cx| {
                     t.cancel(cx).detach();
                 })
