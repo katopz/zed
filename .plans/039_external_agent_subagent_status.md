@@ -40,5 +40,5 @@ new agent connections.
 - [x] `agent_servers::ExternalSubagents` global; `v1.rs` offers `subagents` when it or `acp-beta` is on (`offer_subagents` in `acp/external_subagents.rs`)
 - [x] `agent_ui` fork init mirrors the setting into the global and follows settings changes
 - [x] Tests: `subagents_follow_the_setting_without_acp_beta` (gate on/off, acp-beta alone); existing `client_capabilities_advertise_subagents_only_when_offered` and `v1_subagent_state_snapshots_drive_child_activity` cover the capability and the card's state path
-- [x] `./script/clippy` clean; agent_servers 191, agent_settings + settings_content pass. `settings` has one failure that predates this plan (`test_agent_profile_tool_schema`, `list_threads` since `4765075d04`) → `.issues/041`
+- [x] `./script/clippy` clean; agent_servers 191, agent_settings + settings_content pass. `settings` has one failure that predates this plan (`test_agent_profile_tool_schema`, `list_threads` since `4765075d04`) → `.issues/041`, fixed in `439944d821` (schema also lacked `send_message`, `request_verdict`)
 - [ ] Live check in the GUI with Claude Code background agents: awaiting a rebuild + Zed restart on this build (the running build predates it). Ask Claude Code to launch a background agent; expect a subagent card that spins while it runs and turns to a check when it finishes
