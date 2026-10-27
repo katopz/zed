@@ -437,6 +437,18 @@ pub(super) fn assistant_message_closes_turn(entries: &[AgentThreadEntry], entry_
         .all(|e| !matches!(e, AgentThreadEntry::AssistantMessage(_)))
 }
 
+pub(super) fn with_auto_allow_countdown(
+    label: SharedString,
+    conversation: &Conversation,
+    session_id: &acp_v2::SessionId,
+    tool_call_id: &acp_v2::ToolCallId,
+) -> SharedString {
+    match conversation.auto_allow_remaining_seconds(session_id, tool_call_id) {
+        Some(seconds) => format!("{label} · auto-allow in {seconds}s").into(),
+        None => label,
+    }
+}
+
 /// Fork follow-up work for one `retry_generation` call, run once the retried
 /// submission settles.
 pub(super) struct RetryHooks {
@@ -512,6 +524,191 @@ impl RetryHooks {
 }
 
 impl ThreadView {
+    pub(super) fn render_generating_retry_control(&self, cx: &Context<Self>) -> Vec<AnyElement> {
+        // Retry availability + elapsed-since-turn-start for the inline retry
+        // control. Unlike `elapsed_label` (gated by `show_stats` and
+        // STOPWATCH_THRESHOLD), this always shows when a retry is possible so
+        // the user can see how long the turn has been stuck.
+        let can_retry = self.thread.read(cx).can_retry(cx);
+        let retry_elapsed = self
+            .turn_fields
+            .turn_started_at
+            .map(|started_at| started_at.elapsed());
+        // Which key the in-flight turn picked, for multi-key providers (e.g.
+        // GLM with primary/secondary/tertiary slots). `None` for single-key
+        // providers, so nothing is appended to the retry label in that case.
+        let retry_key_label = self
+            .as_native_thread(cx)
+            .and_then(|thread| thread.read(cx).model())
+            .and_then(|model| {
+                LanguageModelRegistry::read_global(cx)
+                    .provider_for_model(model)
+                    .ok()?
+                    .last_used_key_label(model, cx)
+            });
+
+        // Push the retry control to the far right of the generating row so it
+        // sits "behind" (to the right of) the loading spinner, matching the
+        // subagent panel's stop/retry layout.
+        let mut elements = vec![div().flex_1().into_any_element()];
+        if can_retry {
+            elements.push(
+                ButtonLike::new("generating-retry")
+                    .style(ButtonStyle::Tinted(TintColor::Warning))
+                    .children(retry_elapsed.map(|elapsed| {
+                        let mut text = format_retries_elapsed(elapsed);
+                        if let Some(ref key) = retry_key_label {
+                            // e.g. "12s · K2" — the separator mirrors the
+                            // existing muted meta-label style.
+                            text.push_str(" \u{00b7} ");
+                            text.push_str(key);
+                        }
+                        Label::new(text).size(LabelSize::XSmall).color(Color::Muted)
+                    }))
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .child(
+                                Icon::new(IconName::RotateCw)
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Warning),
+                            )
+                            .child(
+                                Label::new("RETRY")
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Warning),
+                            ),
+                    )
+                    .tooltip(Tooltip::text("Retry generation"))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.retry_generation(window, cx);
+                    }))
+                    .into_any_element(),
+            );
+        }
+        elements
+    }
+
+    /// Verdict ping-pong (proposal 001): right-click a native agent thread's
+    /// message to send it for a reviewer verdict. Empty when the reviewer flow
+    /// is unavailable for this thread.
+    pub(super) fn verdict_menu_entries(
+        &self,
+        entity: &Entity<Self>,
+        entry_ix: usize,
+        markdown: Option<&Markdown>,
+        selected_text: Option<&SharedString>,
+        selected_markdown: Option<&SharedString>,
+        cx: &App,
+    ) -> Vec<ContextMenuEntry> {
+        // Any selected text rides along as the user addition.
+        let verdict_gate = AgentSettings::get_global(cx).fork.verdict_ping_pong
+            && !self.is_subagent()
+            && self.thread.read(cx).connection().agent_id().as_ref()
+                == agent::ZED_AGENT_ID.as_ref();
+        if !verdict_gate {
+            return Vec::new();
+        }
+        let verdict_ready = self.thread.read(cx).status() == ThreadStatus::Idle
+            && Self::get_agent_summary_content(self.thread.read(cx).entries(), entry_ix, cx)
+                .is_some();
+        let verdict_addition = markdown
+            .filter(|markdown| markdown.has_selection())
+            .and_then(|_| selected_text.or(selected_markdown))
+            .map(|text| text.to_string());
+
+        let verdict_entry = |label: SharedString, reviewer| {
+            ContextMenuEntry::new(label)
+                .disabled(!verdict_ready)
+                .handler({
+                    let entity = entity.clone();
+                    let verdict_addition = verdict_addition.clone();
+                    move |window, cx| {
+                        let addition = entity
+                            .read(cx)
+                            .selected_text_for_entry(entry_ix, cx)
+                            .or(verdict_addition.clone());
+                        entity.update(cx, |this, cx| {
+                            this.request_verdict(reviewer, addition, window, cx);
+                        });
+                    }
+                })
+        };
+        let primary_verdict_entry = verdict_entry(
+            Self::verdict_label(cx).into(),
+            agent::RequestedReviewer::Default,
+        );
+        let secondary_verdict_entry = Self::secondary_verdict_label(cx)
+            .map(|label| verdict_entry(label, agent::RequestedReviewer::Secondary));
+        std::iter::once(primary_verdict_entry)
+            .chain(secondary_verdict_entry)
+            .collect()
+    }
+
+    /// Recompute the cached sandbox status off the render path.
+    ///
+    /// Triggered by events (thread notified on grant changes, project worktree
+    /// events, settings edits), never from a render pass: rendering used to
+    /// call this inline, which updated the ThreadView *and* the Thread entity
+    /// from `AgentPanel::render` on every frame — a self-sustaining redraw
+    /// loop and the main-thread stall captured in the chronic `.spin` reports.
+    /// Repeated triggers while a refresh is in flight coalesce.
+    pub(super) fn refresh_sandbox_status(&mut self, cx: &mut Context<Self>) {
+        let Some(thread) = self.as_native_thread(cx) else {
+            return;
+        };
+        if self._sandbox_status_refresh_task.is_some() {
+            return;
+        }
+        self._sandbox_status_refresh_task = Some(cx.spawn(async move |this, cx| {
+            let refreshed =
+                thread.update(cx, |thread, cx| thread.refresh_verified_sandbox_status(cx));
+            this.update(cx, |this, cx| {
+                this._sandbox_status_refresh_task = None;
+                match refreshed {
+                    // Sandboxing unavailable: drop any stale status so the
+                    // chip hides.
+                    None => {
+                        if this.sandbox_status.take().is_some()
+                            | this.sandbox_status_key.take().is_some()
+                        {
+                            this.pending_sandbox_status_key = None;
+                            cx.notify();
+                        }
+                    }
+                    Some((key, SandboxStatusRefresh::Ready(status))) => {
+                        this.pending_sandbox_status_key = None;
+                        if this.sandbox_status_key.as_ref() != Some(&key) {
+                            this.sandbox_status = Some(status);
+                            this.sandbox_status_key = Some(key);
+                            cx.notify();
+                        }
+                    }
+                    Some((key, SandboxStatusRefresh::Pending(task))) => {
+                        this.sandbox_status = None;
+                        this.sandbox_status_key = None;
+                        this.pending_sandbox_status_key = Some(key.clone());
+                        cx.notify();
+                        this._sandbox_status_refresh_task =
+                            Some(cx.spawn(async move |this, cx| {
+                                let status = task.await;
+                                this.update(cx, |this, cx| {
+                                    if this.pending_sandbox_status_key.as_ref() == Some(&key) {
+                                        this.sandbox_status = Some(status);
+                                        this.sandbox_status_key = Some(key);
+                                        this.pending_sandbox_status_key = None;
+                                        cx.notify();
+                                    }
+                                })
+                                .ok();
+                            }));
+                    }
+                }
+            })
+            .ok();
+        }));
+    }
+
     pub(super) fn restart_parent_subagent_tool_call(&self, cx: &mut Context<Self>) {
         let Some(parent_session_id) = &self.parent_session_id else {
             return;

@@ -4079,6 +4079,7 @@ impl ThreadView {
         let thread = self.thread.read(cx);
         let action_log = thread.action_log();
         let telemetry = ActionLogTelemetry::from(thread);
+        let changed_buffers = action_log.read(cx).changed_buffers(cx).collect::<Vec<_>>();
         let plan = thread.plan().filter(|plan| !plan.is_empty());
         let has_plan = plan.is_some();
         let queue_is_empty = !self.has_queued_messages();
@@ -4098,29 +4099,6 @@ impl ThreadView {
             (generic, legacy) => generic.or(legacy),
         };
         let has_awaiting_permission = awaiting_permission.is_some();
-
-        // Defer the `changed_buffers` collect until after the cheap early-exit
-        // checks. `changed_buffers` calls `has_edits` on every tracked buffer,
-        // which builds a diff snapshot — moderately expensive per buffer, and
-        // this runs on every repaint during streaming.
-        //
-        // Fast path: when none of the other sections (plan, queue, permission)
-        // would render either, probe only the first changed buffer to decide
-        // the early return — avoid allocating a Vec just to check `is_empty()`.
-        let changed_buffers = if !has_plan && queue_is_empty && !has_awaiting_permission {
-            let mut iter = action_log.read(cx).changed_buffers(cx);
-            match iter.next() {
-                None => Vec::new(),
-                Some(first) => {
-                    let mut buffers = Vec::with_capacity(1);
-                    buffers.push(first);
-                    buffers.extend(iter);
-                    buffers
-                }
-            }
-        } else {
-            action_log.read(cx).changed_buffers(cx).collect::<Vec<_>>()
-        };
 
         if changed_buffers.is_empty() && !has_plan && queue_is_empty && !has_awaiting_permission {
             return None;
@@ -4822,8 +4800,6 @@ impl ThreadView {
                 conversation.pending_tool_call_for_session(&active_session_id, cx)?;
             thread.tool_call(&tool_call_id)?
         };
-        let auto_allow_remaining =
-            conversation.auto_allow_remaining_seconds(&active_session_id, &tool_call.id);
         let pending_count = conversation
             .permission_requests
             .get(&active_session_id)?
@@ -4862,10 +4838,8 @@ impl ThreadView {
         } else {
             "Awaiting Confirmation".into()
         };
-        let label: SharedString = match auto_allow_remaining {
-            Some(seconds) => format!("{label} · auto-allow in {seconds}s").into(),
-            None => label,
-        };
+        let label =
+            with_auto_allow_countdown(label, conversation, &active_session_id, &tool_call.id);
 
         let header = h_flex()
             .p_1p5()
@@ -6190,70 +6164,6 @@ impl ThreadView {
             .and_then(|thread| thread.read(cx).model())
             .map(|model| model.supports_fast_mode())
             .unwrap_or(false)
-    }
-
-    /// Recompute the cached sandbox status off the render path.
-    ///
-    /// Triggered by events (thread notified on grant changes, project worktree
-    /// events, settings edits), never from a render pass: rendering used to
-    /// call this inline, which updated the ThreadView *and* the Thread entity
-    /// from `AgentPanel::render` on every frame — a self-sustaining redraw
-    /// loop and the main-thread stall captured in the chronic `.spin` reports.
-    /// Repeated triggers while a refresh is in flight coalesce.
-    fn refresh_sandbox_status(&mut self, cx: &mut Context<Self>) {
-        let Some(thread) = self.as_native_thread(cx) else {
-            return;
-        };
-        if self._sandbox_status_refresh_task.is_some() {
-            return;
-        }
-        self._sandbox_status_refresh_task = Some(cx.spawn(async move |this, cx| {
-            let refreshed =
-                thread.update(cx, |thread, cx| thread.refresh_verified_sandbox_status(cx));
-            this.update(cx, |this, cx| {
-                this._sandbox_status_refresh_task = None;
-                match refreshed {
-                    // Sandboxing unavailable: drop any stale status so the
-                    // chip hides.
-                    None => {
-                        if this.sandbox_status.take().is_some()
-                            | this.sandbox_status_key.take().is_some()
-                        {
-                            this.pending_sandbox_status_key = None;
-                            cx.notify();
-                        }
-                    }
-                    Some((key, SandboxStatusRefresh::Ready(status))) => {
-                        this.pending_sandbox_status_key = None;
-                        if this.sandbox_status_key.as_ref() != Some(&key) {
-                            this.sandbox_status = Some(status);
-                            this.sandbox_status_key = Some(key);
-                            cx.notify();
-                        }
-                    }
-                    Some((key, SandboxStatusRefresh::Pending(task))) => {
-                        this.sandbox_status = None;
-                        this.sandbox_status_key = None;
-                        this.pending_sandbox_status_key = Some(key.clone());
-                        cx.notify();
-                        this._sandbox_status_refresh_task =
-                            Some(cx.spawn(async move |this, cx| {
-                                let status = task.await;
-                                this.update(cx, |this, cx| {
-                                    if this.pending_sandbox_status_key.as_ref() == Some(&key) {
-                                        this.sandbox_status = Some(status);
-                                        this.sandbox_status_key = Some(key);
-                                        this.pending_sandbox_status_key = None;
-                                        cx.notify();
-                                    }
-                                })
-                                .ok();
-                            }));
-                    }
-                }
-            })
-            .ok();
-        }));
     }
 
     fn render_fast_mode_control(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -8657,28 +8567,6 @@ impl ThreadView {
             IconName::ArrowDown
         };
 
-        // Retry availability + elapsed-since-turn-start for the inline retry
-        // control. Unlike `elapsed_label` (gated by `show_stats` and
-        // STOPWATCH_THRESHOLD), this always shows when a retry is possible so
-        // the user can see how long the turn has been stuck.
-        let can_retry = self.thread.read(cx).can_retry(cx);
-        let retry_elapsed = self
-            .turn_fields
-            .turn_started_at
-            .map(|started_at| started_at.elapsed());
-        // Which key the in-flight turn picked, for multi-key providers (e.g.
-        // GLM with primary/secondary/tertiary slots). `None` for single-key
-        // providers, so nothing is appended to the retry label in that case.
-        let retry_key_label = self
-            .as_native_thread(cx)
-            .and_then(|thread| thread.read(cx).model())
-            .and_then(|model| {
-                LanguageModelRegistry::read_global(cx)
-                    .provider_for_model(model)
-                    .ok()?
-                    .last_used_key_label(model, cx)
-            });
-
         h_flex()
             .id("generating-spinner")
             .py_2()
@@ -8734,44 +8622,7 @@ impl ThreadView {
                         ),
                 )
             })
-            // Push the retry control to the far right of the generating row so
-            // it sits "behind" (to the right of) the loading spinner, matching
-            // the subagent panel's stop/retry layout.
-            .child(div().flex_1())
-            .when(can_retry, |this| {
-                this.child(
-                    ButtonLike::new("generating-retry")
-                        .style(ButtonStyle::Tinted(TintColor::Warning))
-                        .children(retry_elapsed.map(|elapsed| {
-                            let mut text = format_retries_elapsed(elapsed);
-                            if let Some(ref key) = retry_key_label {
-                                // e.g. "12s · K2" — the separator mirrors the
-                                // existing muted meta-label style.
-                                text.push_str(" \u{00b7} ");
-                                text.push_str(key);
-                            }
-                            Label::new(text).size(LabelSize::XSmall).color(Color::Muted)
-                        }))
-                        .child(
-                            h_flex()
-                                .gap_1()
-                                .child(
-                                    Icon::new(IconName::RotateCw)
-                                        .size(IconSize::XSmall)
-                                        .color(Color::Warning),
-                                )
-                                .child(
-                                    Label::new("RETRY")
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Warning),
-                                ),
-                        )
-                        .tooltip(Tooltip::text("Retry generation"))
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.retry_generation(window, cx);
-                        })),
-                )
-            })
+            .children(self.render_generating_retry_control(cx))
             .into_any_element()
     }
 
@@ -8975,25 +8826,14 @@ impl ThreadView {
                     let selected_markdown = markdown
                         .and_then(|markdown| markdown.context_menu_selected_markdown().cloned());
 
-                    // Verdict ping-pong (proposal 001): right-click a native
-                    // agent thread's message to send it for a reviewer verdict.
-                    // Any selected text rides along as the user addition.
-                    let verdict_gate = AgentSettings::get_global(cx).fork.verdict_ping_pong
-                        && !this.is_subagent()
-                        && this.thread.read(cx).connection().agent_id().as_ref()
-                            == agent::ZED_AGENT_ID.as_ref();
-                    let verdict_ready = verdict_gate
-                        && this.thread.read(cx).status() == ThreadStatus::Idle
-                        && Self::get_agent_summary_content(
-                            this.thread.read(cx).entries(),
-                            entry_ix,
-                            cx,
-                        )
-                        .is_some();
-                    let verdict_addition = markdown
-                        .filter(|markdown| markdown.has_selection())
-                        .and_then(|_| selected_text.clone().or_else(|| selected_markdown.clone()))
-                        .map(|text| text.to_string());
+                    let verdict_entries = this.verdict_menu_entries(
+                        &entity,
+                        entry_ix,
+                        markdown,
+                        selected_text.as_ref(),
+                        selected_markdown.as_ref(),
+                        cx,
+                    );
 
                     let copy_this_agent_response =
                         ContextMenuEntry::new("Copy This Agent Response").handler({
@@ -9045,30 +8885,6 @@ impl ThreadView {
                             }
                         });
 
-                    let verdict_entry = |label: SharedString, reviewer| {
-                        ContextMenuEntry::new(label)
-                            .disabled(!verdict_ready)
-                            .handler({
-                                let entity = entity.clone();
-                                let verdict_addition = verdict_addition.clone();
-                                move |window, cx| {
-                                    let addition = entity
-                                        .read(cx)
-                                        .selected_text_for_entry(entry_ix, cx)
-                                        .or(verdict_addition.clone());
-                                    entity.update(cx, |this, cx| {
-                                        this.request_verdict(reviewer, addition, window, cx);
-                                    });
-                                }
-                            })
-                    };
-                    let primary_verdict_entry = verdict_entry(
-                        Self::verdict_label(cx).into(),
-                        agent::RequestedReviewer::Default,
-                    );
-                    let secondary_verdict_entry = Self::secondary_verdict_label(cx)
-                        .map(|label| verdict_entry(label, agent::RequestedReviewer::Secondary));
-
                     menu.when_some(focus, |menu, focus| menu.context(focus))
                         .when_some(context_menu_link, |menu, url| {
                             menu.entry("Copy Link", None, move |_, cx| {
@@ -9095,10 +8911,7 @@ impl ThreadView {
                             )
                         })
                         .item(copy_this_agent_response)
-                        .when(verdict_gate, |menu| {
-                            menu.item(primary_verdict_entry)
-                                .when_some(secondary_verdict_entry, |menu, entry| menu.item(entry))
-                        })
+                        .extend(verdict_entries)
                         .separator()
                         .item(scroll_item)
                         .item(open_thread_as_markdown)
