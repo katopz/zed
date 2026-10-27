@@ -18,6 +18,29 @@ static CLAUDE_MD_REL_PATH: LazyLock<Option<Arc<RelPath>>> = LazyLock::new(|| {
 });
 
 impl NativeAgent {
+    /// Upstream signature kept so upstream callers (and tests) merge
+    /// untouched; the fork threads `work_dirs` through
+    /// [`Self::open_thread_with_work_dirs`] so reloaded sessions keep them.
+    pub fn open_thread(
+        &mut self,
+        id: acp_v2::SessionId,
+        project: Entity<Project>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Entity<AcpThread>>> {
+        self.open_thread_with_work_dirs(id, project, None, cx)
+    }
+
+    /// Upstream signature kept so upstream callers (and tests) merge
+    /// untouched; see [`Self::register_session_with_work_dirs`].
+    pub(crate) fn register_session(
+        &mut self,
+        thread_handle: Entity<Thread>,
+        project_id: EntityId,
+        cx: &mut Context<Self>,
+    ) -> Entity<AcpThread> {
+        self.register_session_with_work_dirs(thread_handle, project_id, None, cx)
+    }
+
     pub(crate) async fn await_project_claude_md_link(
         worktree: &Entity<Worktree>,
         project: &Entity<Project>,
@@ -299,7 +322,7 @@ impl NativeThreadEnvironment {
                     .get(&parent_session_id)
                     .map(|s| s.project_id)
                     .context("parent session not found")?;
-                Ok(agent.register_session(subagent_thread.clone(), project_id, None, cx))
+                Ok(agent.register_session(subagent_thread.clone(), project_id, cx))
             })??;
         self.acp_thread
             .update(cx, |parent, cx| {

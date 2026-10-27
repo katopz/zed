@@ -894,10 +894,10 @@ impl NativeAgent {
             )
         });
 
-        self.register_session(thread, project_id, Some(work_dirs), cx)
+        self.register_session_with_work_dirs(thread, project_id, Some(work_dirs), cx)
     }
 
-    fn register_session(
+    fn register_session_with_work_dirs(
         &mut self,
         thread_handle: Entity<Thread>,
         project_id: EntityId,
@@ -1821,7 +1821,7 @@ impl NativeAgent {
         })
     }
 
-    pub fn open_thread(
+    pub fn open_thread_with_work_dirs(
         &mut self,
         id: acp_v2::SessionId,
         project: Entity<Project>,
@@ -1861,7 +1861,12 @@ impl NativeAgent {
                         .update(cx, |this, cx| {
                             let project_id = this.get_or_create_project_state(&project, cx);
                             this.pending_sessions.remove(&id);
-                            this.register_session(thread.clone(), project_id, work_dirs.clone(), cx)
+                            this.register_session_with_work_dirs(
+                                thread.clone(),
+                                project_id,
+                                work_dirs.clone(),
+                                cx,
+                            )
                         })
                         .map_err(Arc::new)?;
                     let events = thread.update(cx, |thread, cx| thread.replay(cx));
@@ -1895,7 +1900,7 @@ impl NativeAgent {
         project: Entity<Project>,
         cx: &mut Context<Self>,
     ) -> Task<Result<SharedString>> {
-        let thread = self.open_thread(id.clone(), project, None, cx);
+        let thread = self.open_thread(id.clone(), project, cx);
         cx.spawn(async move |this, cx| {
             let acp_thread = thread.await?;
             let result = this
@@ -3303,7 +3308,7 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
         cx: &mut App,
     ) -> Task<Result<Entity<acp_thread::AcpThread>>> {
         self.0.update(cx, |agent, cx| {
-            agent.open_thread(session_id, project, Some(work_dirs), cx)
+            agent.open_thread_with_work_dirs(session_id, project, Some(work_dirs), cx)
         })
     }
 
@@ -5172,7 +5177,7 @@ mod internal_tests {
             });
             let acp_thread = agent
                 .update(cx, |agent, cx| {
-                    agent.open_thread(session_id.clone(), project.clone(), None, cx)
+                    agent.open_thread(session_id.clone(), project.clone(), cx)
                 })
                 .await
                 .expect("reload failed command");
@@ -7757,7 +7762,7 @@ mod internal_tests {
         // Run the subagent through the production registration path.
         // This is what installs the `SkillTool` on the thread.
         let _subagent_acp = agent.update(cx, |agent, cx| {
-            agent.register_session(subagent_thread.clone(), parent_project_id, None, cx)
+            agent.register_session(subagent_thread.clone(), parent_project_id, cx)
         });
 
         // Verify the subagent thread has the `SkillTool` installed —
@@ -8686,7 +8691,7 @@ mod internal_tests {
         // Reload the thread and verify thinking_enabled is still true.
         let reloaded_acp_thread = agent
             .update(cx, |agent, cx| {
-                agent.open_thread(session_id.clone(), project.clone(), None, cx)
+                agent.open_thread(session_id.clone(), project.clone(), cx)
             })
             .await
             .unwrap();
@@ -8781,7 +8786,7 @@ mod internal_tests {
         // Reload the thread and verify the model was preserved.
         let reloaded_acp_thread = agent
             .update(cx, |agent, cx| {
-                agent.open_thread(session_id.clone(), project.clone(), None, cx)
+                agent.open_thread(session_id.clone(), project.clone(), cx)
             })
             .await
             .unwrap();
@@ -8887,7 +8892,7 @@ mod internal_tests {
 
         let reloaded_acp_thread = agent
             .update(cx, |agent, cx| {
-                agent.open_thread(session_id.clone(), project.clone(), None, cx)
+                agent.open_thread(session_id.clone(), project.clone(), cx)
             })
             .await
             .unwrap();
@@ -8940,7 +8945,7 @@ mod internal_tests {
 
         let reloaded_acp_thread = agent
             .update(cx, |agent, cx| {
-                agent.open_thread(session_id.clone(), project.clone(), None, cx)
+                agent.open_thread(session_id.clone(), project.clone(), cx)
             })
             .await
             .unwrap();
@@ -9152,7 +9157,7 @@ mod internal_tests {
         );
         let acp_thread = agent
             .update(cx, |agent, cx| {
-                agent.open_thread(session_id.clone(), project.clone(), None, cx)
+                agent.open_thread(session_id.clone(), project.clone(), cx)
             })
             .await
             .unwrap();
@@ -9265,7 +9270,7 @@ mod internal_tests {
         // Reopen and verify the draft prompt was saved.
         let reloaded = agent
             .update(cx, |agent, cx| {
-                agent.open_thread(session_id.clone(), project.clone(), None, cx)
+                agent.open_thread(session_id.clone(), project.clone(), cx)
             })
             .await
             .unwrap();
