@@ -1940,11 +1940,7 @@ pub async fn decide_with_llm(
         .as_ref()
         .is_some_and(|p| !p.trim().is_empty());
 
-    let is_synthetic_failure = response.confidence.unwrap_or(1.0) <= 0.3
-        && response.reason.as_ref().is_some_and(|r| {
-            let lower = r.to_ascii_lowercase();
-            lower.starts_with("model returned") || lower.starts_with("model stream")
-        });
+    let is_synthetic_failure = model_call::is_synthetic_failure(&response);
 
     log::info!(
         "[auto_prompt::decide_with_llm] Response received: confidence={:?}, has_next_prompt={:?}",

@@ -3055,8 +3055,6 @@ fn respond_verdict(
 }
 
 /// Fails all three lightweight retries (attempts 2 and 3 back off 4s and 8s).
-/// Only a synthetic "model…" reply counts as a failed attempt: an unparseable
-/// reply parses to a 0-confidence stop, which the retry loop accepts.
 fn fail_lightweight_retries(
     fake: &language_model::fake_provider::FakeLanguageModelProvider,
     cx: &mut gpui::TestAppContext,
@@ -3257,4 +3255,32 @@ async fn dispatch_failed_retries_after_api_error_back_off(cx: &mut gpui::TestApp
         }
         other => panic!("expected RetryAfterBackoff, got {other:?}"),
     }
+}
+
+#[gpui::test]
+async fn dispatch_unparseable_reply_takes_lightweight_retry(cx: &mut gpui::TestAppContext) {
+    // A garbled orchestrator reply is a failed call, not a decisive stop:
+    // it must reach the lightweight retry instead of ending the chain.
+    let (data, fake) = dispatch_test_data("dispatch-unparseable", "Refactored the parser.", cx);
+    let task = spawn_decide(data, cx);
+    respond_text(&fake, "not json");
+    cx.run_until_parked();
+    respond_verdict(&fake, 0.9, Some("Resume the parser work."), "retry ok");
+    let action = expect_continue(task.await.expect("decide"));
+    assert!(action.next_prompt.contains("Resume the parser work."));
+}
+
+#[gpui::test]
+async fn dispatch_unparseable_retry_reply_counts_as_failed_attempt(cx: &mut gpui::TestAppContext) {
+    let (data, fake) =
+        dispatch_test_data("dispatch-retry-unparseable", "Refactored the parser.", cx);
+    let task = spawn_decide(data, cx);
+    respond_verdict(&fake, 0.1, None, "model returned zero events");
+    cx.run_until_parked();
+    respond_text(&fake, "not json");
+    cx.executor().advance_clock(Duration::from_millis(4_000));
+    cx.run_until_parked();
+    respond_verdict(&fake, 0.9, Some("Resume the parser work."), "retry ok");
+    let action = expect_continue(task.await.expect("decide"));
+    assert!(action.next_prompt.contains("Resume the parser work."));
 }

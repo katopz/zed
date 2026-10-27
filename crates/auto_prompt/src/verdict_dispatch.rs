@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::model_call::call_language_model;
+use crate::model_call::{call_language_model, is_synthetic_failure};
 use crate::remaining_work::{
     PlanRepoFilter, auto_claim_plan, build_checkbox_verification_prompt,
     build_pre_stop_verification_prompt, detect_remaining_plan_tasks, detect_remaining_work,
@@ -260,7 +260,7 @@ impl Dispatch<'_> {
     }
 
     /// Returns the first usable lightweight-retry verdict; `None` when every
-    /// attempt errored or came back as a synthetic "model…" failure.
+    /// attempt errored or came back as a synthetic failure.
     async fn call_lightweight_retry(
         &self,
         context: &str,
@@ -283,12 +283,7 @@ impl Dispatch<'_> {
             .await
             {
                 Ok((_raw, parsed)) => {
-                    let is_retry_synthetic = parsed.confidence.unwrap_or(1.0) <= 0.3
-                        && parsed
-                            .reason
-                            .as_ref()
-                            .is_some_and(|r| r.to_ascii_lowercase().starts_with("model"));
-                    if is_retry_synthetic {
+                    if is_synthetic_failure(&parsed) {
                         log::warn!(
                             "auto_prompt: lightweight retry attempt {attempt} got synthetic failure, retrying"
                         );

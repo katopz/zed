@@ -192,6 +192,20 @@ pub(crate) async fn call_language_model(
     }
 }
 
+/// Whether `response` is a stop this module synthesized because the model
+/// produced nothing usable (empty or errored stream, unparseable JSON) rather
+/// than a real verdict. Matches the reasons written by `call_language_model`
+/// and `parse_response`.
+pub(crate) fn is_synthetic_failure(response: &AutoPromptResponse) -> bool {
+    response.confidence.unwrap_or(1.0) <= 0.3
+        && response.reason.as_deref().is_some_and(|reason| {
+            let lower = reason.to_ascii_lowercase();
+            lower.starts_with("model returned")
+                || lower.starts_with("model stream")
+                || lower.starts_with("unparseable response")
+        })
+}
+
 pub(crate) fn parse_response(text: &str) -> anyhow::Result<AutoPromptResponse> {
     let json_str = extract_json(text);
     match serde_json::from_str(json_str) {
@@ -411,5 +425,40 @@ mod tests {
             serde_json::from_str(&result).expect("should be valid JSON");
         assert_eq!(parsed["thread_summary"], "long summary here");
         assert_eq!(parsed["confidence"], 0.75);
+    }
+
+    fn response(confidence: f64, reason: &str) -> AutoPromptResponse {
+        AutoPromptResponse {
+            next_prompt: None,
+            reason: Some(reason.to_string()),
+            confidence: Some(confidence),
+            thread_summary: None,
+        }
+    }
+
+    #[test]
+    fn synthetic_failure_covers_every_synthesized_reason() {
+        let unparseable = parse_response("not json").expect("synthesized");
+        assert!(is_synthetic_failure(&unparseable));
+        for reason in [
+            "model returned zero events (0 total stream events)",
+            "Model returned 2 Thinking events but no Text output",
+            "model stream produced only errors (1)",
+        ] {
+            assert!(is_synthetic_failure(&response(0.0, reason)), "{reason}");
+        }
+    }
+
+    #[test]
+    fn synthetic_failure_ignores_real_verdicts() {
+        assert!(!is_synthetic_failure(&response(
+            0.1,
+            "Model is done, nothing left"
+        )));
+        assert!(!is_synthetic_failure(&response(
+            0.9,
+            "model returned zero events"
+        )));
+        assert!(!is_synthetic_failure(&response(0.1, "all tasks complete")));
     }
 }
