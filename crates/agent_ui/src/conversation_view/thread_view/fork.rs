@@ -437,7 +437,124 @@ pub(super) fn assistant_message_closes_turn(entries: &[AgentThreadEntry], entry_
         .all(|e| !matches!(e, AgentThreadEntry::AssistantMessage(_)))
 }
 
+/// Fork follow-up work for one `retry_generation` call, run once the retried
+/// submission settles.
+pub(super) struct RetryHooks {
+    turn_generation: Option<usize>,
+    // For retry-after-completion, the original send() future has already
+    // returned, so process_tool_result (which normally transitions the
+    // parent's tool_call to Completed/Failed) does not fire. Without this, the
+    // parent's tool_call stays InProgress forever — its loading spinner never
+    // clears and the stop button (which calls cancel, which returns early when
+    // there's no running_turn) cannot fix it.
+    parent_session_id: Option<acp_v2::SessionId>,
+    session_id: acp_v2::SessionId,
+    server_view: WeakEntity<ConversationView>,
+    subagent_thread: Entity<AcpThread>,
+}
+
+impl RetryHooks {
+    pub(super) fn on_retry_finished(
+        self,
+        thread_view: &mut ThreadView,
+        result: &anyhow::Result<Option<SubmissionResponse>>,
+        cx: &mut Context<ThreadView>,
+    ) {
+        // Stop the turn timer task set up by `start_retry_turn`. Without this,
+        // `_turn_timer_task` keeps notifying every second indefinitely after
+        // the retry completes.
+        if let Some(turn_generation) = self.turn_generation {
+            thread_view.stop_turn(turn_generation, cx);
+        }
+
+        let Some(parent_session_id) = &self.parent_session_id else {
+            return;
+        };
+        // An `Accepted` response means the retried turn is still running; its
+        // completion arrives through thread events.
+        let completion = match result {
+            Ok(Some(SubmissionResponse::LegacyCompleted(response))) => {
+                let is_end_turn = matches!(
+                    response.stop_reason,
+                    agent_client_protocol::schema::v1::StopReason::EndTurn
+                );
+                let output = if is_end_turn {
+                    self.subagent_thread
+                        .read(cx)
+                        .last_assistant_message_text(cx)
+                } else {
+                    None
+                };
+                Some((output, !is_end_turn))
+            }
+            Ok(Some(SubmissionResponse::Accepted(_))) => None,
+            Ok(None) | Err(_) => Some((None, true)),
+        };
+
+        if let Some((output, is_error)) = completion
+            && let Some(parent_view) = self
+                .server_view
+                .upgrade()
+                .and_then(|server_view| server_view.read(cx).thread_view(parent_session_id))
+        {
+            parent_view.update(cx, |parent_view, cx| {
+                parent_view.thread.update(cx, |parent_thread, cx| {
+                    parent_thread.complete_subagent_tool_call(
+                        &self.session_id,
+                        output,
+                        is_error,
+                        cx,
+                    );
+                });
+            });
+        }
+    }
+}
+
 impl ThreadView {
+    pub(super) fn restart_parent_subagent_tool_call(&self, cx: &mut Context<Self>) {
+        let Some(parent_session_id) = &self.parent_session_id else {
+            return;
+        };
+        let session_id = self.thread.read(cx).session_id().clone();
+        if let Some(parent_view) = self
+            .server_view
+            .upgrade()
+            .and_then(|server_view| server_view.read(cx).thread_view(parent_session_id))
+        {
+            parent_view.update(cx, |parent_view, cx| {
+                parent_view.thread.update(cx, |parent_thread, cx| {
+                    parent_thread.restart_subagent_tool_call(&session_id, cx);
+                });
+            });
+        }
+    }
+
+    /// Reset the turn stopwatch so the Retry button shows elapsed time from
+    /// THIS retry, not from the original turn that was retried. Threads with
+    /// reported activity drive the stopwatch from events.
+    pub(super) fn start_retry_turn(&mut self, cx: &mut Context<Self>) -> Option<usize> {
+        (!self.thread.read(cx).uses_reported_activity()).then(|| self.start_turn(cx))
+    }
+
+    /// Retries bypass `send_content` (the normal watchdog arming point), so
+    /// the watchdog is armed here.
+    pub(super) fn arm_retry_hooks(
+        &mut self,
+        turn_generation: Option<usize>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> RetryHooks {
+        self.arm_watchdog(window, cx);
+        RetryHooks {
+            turn_generation,
+            parent_session_id: self.parent_session_id.clone(),
+            session_id: self.session_id.clone(),
+            server_view: self.server_view.clone(),
+            subagent_thread: self.thread.clone(),
+        }
+    }
+
     pub(super) fn render_manual_auto_prompt_button(cx: &Context<Self>) -> IconButton {
         IconButton::new("manual-auto-prompt", IconName::Sparkle)
             .icon_size(IconSize::Small)

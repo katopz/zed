@@ -2834,97 +2834,23 @@ impl ThreadView {
             return;
         }
 
-        if let Some(parent_session_id) = &self.parent_session_id {
-            let my_session_id = thread.read(cx).session_id().clone();
-            if let Some(parent_view) = self
-                .server_view
-                .upgrade()
-                .and_then(|sv| sv.read(cx).thread_view(parent_session_id))
-            {
-                parent_view.update(cx, |parent_view, cx| {
-                    parent_view.thread.update(cx, |parent_thread, cx| {
-                        parent_thread.restart_subagent_tool_call(&my_session_id, cx);
-                    });
-                });
-            }
-        }
+        self.restart_parent_subagent_tool_call(cx);
 
         let task = thread.update(cx, |thread, cx| thread.retry(cx));
         let submission_id = task.id;
         self.current_submission = Some(submission_id);
-        // Reset the turn stopwatch so the Retry button shows elapsed time
-        // from THIS retry, not from the original turn that was retried.
-        // Threads with reported activity drive the stopwatch from events.
-        let turn_generation =
-            (!self.thread.read(cx).uses_reported_activity()).then(|| self.start_turn(cx));
+        let turn_generation = self.start_retry_turn(cx);
         cx.emit(AcpThreadViewEvent::Interacted);
         self.sync_generating_indicator(cx);
         cx.notify();
 
-        // Arm the watchdog for this retry generation. Retries bypass
-        // `send_content` (the normal arming point), so we arm explicitly here.
-        self.arm_watchdog(window, cx);
-
-        // Capture handles needed to update the parent's tool_call after the
-        // retry completes. For retry-after-completion, the original send()
-        // future has already returned, so process_tool_result (which normally
-        // transitions the parent's tool_call to Completed/Failed) does not fire.
-        // Without this, the parent's tool_call stays InProgress forever — its
-        // loading spinner never clears and the stop button (which calls cancel,
-        // which returns early when there's no running_turn) cannot fix it.
-        let parent_session_id = self.parent_session_id.clone();
-        let my_session_id = self.session_id.clone();
-        let server_view = self.server_view.clone();
-        let subagent_thread = self.thread.clone();
+        let retry_hooks = self.arm_retry_hooks(turn_generation, window, cx);
 
         cx.spawn(async move |this, cx| {
             let result = task.await;
 
             this.update(cx, |this, cx| {
-                // Stop the turn timer task set up by `start_turn` above.
-                // Without this, `_turn_timer_task` keeps notifying every
-                // second indefinitely after the retry completes.
-                if let Some(turn_generation) = turn_generation {
-                    this.stop_turn(turn_generation, cx);
-                }
-
-                if let Some(parent_session_id) = &parent_session_id {
-                    // An `Accepted` response means the retried turn is still
-                    // running; its completion arrives through thread events.
-                    let completion = match &result {
-                        Ok(Some(SubmissionResponse::LegacyCompleted(response))) => {
-                            let is_end_turn = matches!(
-                                response.stop_reason,
-                                agent_client_protocol::schema::v1::StopReason::EndTurn
-                            );
-                            let output = if is_end_turn {
-                                subagent_thread.read(cx).last_assistant_message_text(cx)
-                            } else {
-                                None
-                            };
-                            Some((output, !is_end_turn))
-                        }
-                        Ok(Some(SubmissionResponse::Accepted(_))) => None,
-                        Ok(None) | Err(_) => Some((None, true)),
-                    };
-
-                    if let Some((output, is_error)) = completion
-                        && let Some(parent_view) = server_view
-                            .upgrade()
-                            .and_then(|sv| sv.read(cx).thread_view(parent_session_id))
-                    {
-                        parent_view.update(cx, |parent_view, cx| {
-                            parent_view.thread.update(cx, |parent_thread, cx| {
-                                parent_thread.complete_subagent_tool_call(
-                                    &my_session_id,
-                                    output,
-                                    is_error,
-                                    cx,
-                                );
-                            });
-                        });
-                    }
-                }
+                retry_hooks.on_retry_finished(this, &result, cx);
 
                 if this.current_submission != Some(submission_id) {
                     return;
