@@ -64,7 +64,7 @@ start any external agent. Close M3 freely; reopen and pick the thread from histo
 
 ## Tasks
 
-- [x] P0 sync `upstream/main` (1038 commits) into `develop`; resolve 54 conflicted files
+- [x] P0 sync `upstream/main` (1038 commits) into `develop`; resolve 54 conflicted files — merge `f4e142ba98`, docs `9399fffcb6`
 - [x] P0 fix merge compile fallout (auto_prompt, thread_mailbox, multi-key health, verdict tools); post-merge test fixes: compaction idle-timeout assert reads the error chain, obsolete checkpoint test dropped (upstream `eee7501970` removed checkpoints), watchdog HALT keeps its own task alive across upstream's new cancel flow (`_watchdog_recovery_task`), `RealFs::new` double-Arc. Flake → `.issues/035`
 - [x] P1 `crates/agentd`: hub state machine + journal + daemon + attach + CLI
 - [x] P1 unit tests (9): detach mid-turn → journal → replay; permission wait/requeue/allow; fs/terminal reject; backend restart restore; stale generation
