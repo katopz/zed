@@ -3567,6 +3567,8 @@ pub struct AcpThread {
     pending_terminal_exit: HashMap<acp_v2::TerminalId, acp_v1::TerminalExitStatus>,
     had_error: bool,
     api_error: fork::TurnApiError,
+    /// Fork: the turn adopted from zed-agentd's turn state (`fork.rs`).
+    detached_turn: Option<u32>,
     local_execution_error: Option<Arc<anyhow::Error>>,
     /// The user's unsent prompt text, persisted so it can be restored when reloading the thread.
     draft_prompt: Option<Vec<acp_v2::ContentBlock>>,
@@ -3933,6 +3935,7 @@ impl AcpThread {
             pending_terminal_exit: HashMap::default(),
             had_error: false,
             api_error: fork::TurnApiError::default(),
+            detached_turn: None,
             local_execution_error: None,
             draft_prompt: None,
             draft_prompt_revision: 0,

@@ -1,9 +1,15 @@
 //! Fork-owned hook: when enabled, external agents in remote projects are started
 //! through `zed-agentd attach` on the host, so their turns survive the GUI
-//! disconnecting. Kept in its own file so the upstream transport only carries a
-//! one-call diff.
+//! disconnecting. Also mirrors agentd's turn state onto reattached threads.
+//! Kept in its own file so the upstream transport only carries one-call diffs.
 
-use gpui::{App, Global};
+use agent_client_protocol::JsonRpcNotification;
+use agent_client_protocol::schema::v2 as acp_v2;
+use gpui::{App, AsyncApp, Global};
+use serde::{Deserialize, Serialize};
+use util::ResultExt as _;
+
+use super::{ClientContext, session_thread};
 use remote::command::RemoteCommand;
 use util::paths::PathStyle;
 
@@ -66,6 +72,31 @@ fn wrap_with_shim(command: RemoteCommand) -> RemoteCommand {
     }
 }
 
+/// zed-agentd's extension notification for a turn this client did not start:
+/// `running: true` after a reattach while a detached turn is still in flight,
+/// `false` once it ends. The method must match `TURN_STATE_METHOD` in agentd's
+/// hub. Typed rather than a catch-all so the SDK's dynamic (session, MCP)
+/// handlers still see every other notification.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcNotification)]
+#[notification(method = "_zed-agentd/turn_state")]
+#[serde(rename_all = "camelCase")]
+pub(super) struct TurnState {
+    session_id: String,
+    running: bool,
+}
+
+pub(super) fn handle_turn_state(state: TurnState, cx: &mut AsyncApp, ctx: &ClientContext) {
+    let Some(thread) = session_thread(ctx, &acp_v2::SessionId::new(state.session_id)).log_err()
+    else {
+        return;
+    };
+    thread
+        .update(cx, |thread, cx| {
+            thread.set_detached_turn_running(state.running, cx)
+        })
+        .log_err();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -76,14 +107,25 @@ mod tests {
         let command = RemoteCommand {
             program: "/opt/agent".into(),
             args: vec!["--acp".into()],
-            env: HashMap::from_iter([("B_KEY".to_string(), "secret".to_string()), ("A_KEY".to_string(), "x".to_string())]),
+            env: HashMap::from_iter([
+                ("B_KEY".to_string(), "secret".to_string()),
+                ("A_KEY".to_string(), "x".to_string()),
+            ]),
             working_dir: Some("/work".into()),
         };
         let wrapped = wrap_with_shim(command);
         assert_eq!(wrapped.program, "sh");
         assert_eq!(
             wrapped.args[3..],
-            ["--pass-env", "A_KEY", "--pass-env", "B_KEY", "--", "/opt/agent", "--acp"]
+            [
+                "--pass-env",
+                "A_KEY",
+                "--pass-env",
+                "B_KEY",
+                "--",
+                "/opt/agent",
+                "--acp"
+            ]
         );
         assert!(!wrapped.args.iter().any(|arg| arg.contains("secret")));
         assert_eq!(wrapped.working_dir.as_deref(), Some("/work"));
@@ -96,7 +138,16 @@ mod tests {
     )]
     fn shim_falls_back_to_running_the_agent_directly() -> anyhow::Result<()> {
         let output = std::process::Command::new("sh")
-            .args(["-c", SHIM, "zed-agentd-shim", "--pass-env", "X", "--", "echo", "direct"])
+            .args([
+                "-c",
+                SHIM,
+                "zed-agentd-shim",
+                "--pass-env",
+                "X",
+                "--",
+                "echo",
+                "direct",
+            ])
             .env("PATH", "/usr/bin:/bin")
             .env("HOME", "/nonexistent")
             .output()?;

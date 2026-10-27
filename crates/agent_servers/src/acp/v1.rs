@@ -477,6 +477,21 @@ fn client_builder(
             on_notification!(handle_complete_elicitation),
             agent_client_protocol::on_receive_notification!(),
         )
+        // Fork (plan 037 P4): zed-agentd's turn state for reattached threads.
+        .on_receive_notification(
+            {
+                let dispatch_sender = dispatch_sender.clone();
+                async move |notification: super::detachable::TurnState, _connection| {
+                    enqueue_notification(
+                        &dispatch_sender,
+                        notification,
+                        super::detachable::handle_turn_state,
+                    );
+                    Ok(())
+                }
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
 }
 
 /// `offer_subagents` advertises the unstable subagents RFD, which Zed only offers v1 agents
@@ -7801,6 +7816,51 @@ exit 7
             }
         }
         panic!("SDK dispatch did not drain within bounded ticks");
+    }
+
+    /// Fork (plan 037 P4): zed-agentd's `_zed-agentd/turn_state` reaches the
+    /// typed handler and drives a reattached thread's status.
+    #[gpui::test]
+    async fn agentd_turn_state_marks_reattached_thread_running(cx: &mut gpui::TestAppContext) {
+        let (agent_sender, agent_receiver) = futures::channel::oneshot::channel();
+        let (connection, project, _, _, _, _, _keep_agent_alive) =
+            connect_fake_agent_with_handle(None, Some(agent_sender), cx).await;
+        let agent = agent_receiver.await.expect("fake agent handle");
+        let thread = cx
+            .update(|cx| {
+                connection.clone().load_session(
+                    acp_v2::SessionId::new("detached"),
+                    project,
+                    PathList::new(&[std::path::Path::new("/a")]),
+                    None,
+                    cx,
+                )
+            })
+            .await
+            .expect("load detached session");
+        let send = |running: bool| {
+            agent
+                .send_notification(
+                    agent_client_protocol::UntypedMessage::new(
+                        "_zed-agentd/turn_state",
+                        serde_json::json!({"sessionId": "detached", "running": running}),
+                    )
+                    .expect("turn state message"),
+                )
+                .expect("send turn state");
+        };
+        send(true);
+        cx.run_until_parked();
+        assert_eq!(
+            thread.read_with(cx, |thread, _| thread.status()),
+            acp_thread::ThreadStatus::Generating
+        );
+        send(false);
+        cx.run_until_parked();
+        assert_eq!(
+            thread.read_with(cx, |thread, _| thread.status()),
+            acp_thread::ThreadStatus::Idle
+        );
     }
 
     #[gpui::test]

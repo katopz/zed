@@ -16,7 +16,8 @@ cargo build -p eval_cli -p agentd
 python3 -I script/agentd-smoke/acp_smoke.py target/debug/eval-cli fake/m 18736
 # Same, through zed-agentd, plus a second client that lists and replays the session.
 SMOKE_AGENTD=target/debug/zed-agentd python3 -I script/agentd-smoke/acp_smoke.py target/debug/eval-cli fake/m 18737
-# Kill the client mid-turn; the turn finishes detached and replays on reattach. Prints PASS or FAIL.
+# Kill the client mid-turn; a client reattaching mid-turn is told the turn runs and when it ends;
+# the turn finishes detached and replays on a later reattach. Prints PASS or FAIL.
 python3 -I script/agentd-smoke/detach_smoke.py target/debug/eval-cli target/debug/zed-agentd 18738
 ```
 

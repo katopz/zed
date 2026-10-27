@@ -1,4 +1,6 @@
-"""Kills the GUI side mid-turn and checks the turn finished detached (.issues/036)."""
+"""Kills the GUI side mid-turn and checks the turn finished detached (.issues/036),
+that a client reattaching mid-turn is told it is running and when it ends
+(plan 037 P4), and that a later client replays it all."""
 import json
 import os
 import subprocess
@@ -46,6 +48,21 @@ class Gui:
             if message.get("method") == "session/update":
                 updates.append(message["params"]["update"])
 
+    def read_until_turn_state(self, running):
+        """Live updates up to agentd's `_zed-agentd/turn_state` with `running`."""
+        updates = []
+        while True:
+            message = json.loads(self.process.stdout.readline())
+            if message.get("method") == "session/update":
+                updates.append(message["params"]["update"])
+            elif message.get("method") == "_zed-agentd/turn_state":
+                assert message["params"] == {"sessionId": session_id, "running": running}, message
+                return updates
+
+
+def text_of(updates):
+    return "".join(u["content"].get("text", "") for u in updates if u["sessionUpdate"] == "agent_message_chunk")
+
 
 try:
     gui = Gui()
@@ -55,16 +72,25 @@ try:
         {"type": "text", "text": "Read hello.txt and reply with only the magic word."}]})
     time.sleep(1)
     gui.process.kill()
-    print("GUI killed mid-turn; waiting for the detached turn")
-    time.sleep(8)
+    print("GUI killed mid-turn")
+
+    # Reattach while the turn still runs: agentd must say so, then say when it ends.
+    gui = Gui()
+    gui.call("initialize", {"protocolVersion": 1, "clientCapabilities": {}})
+    gui.call("session/load", {"sessionId": session_id, "cwd": workdir, "mcpServers": []})
+    gui.read_until_turn_state(True)
+    live = gui.read_until_turn_state(False)
+    mid_turn_ok = text_of(live).strip() == "pineapple"
+    print("mid-turn reattach: running=true, then running=false after", repr(text_of(live)))
+    gui.process.kill()
 
     gui = Gui()
     gui.call("initialize", {"protocolVersion": 1, "clientCapabilities": {}})
     reply, updates = gui.call("session/load", {"sessionId": session_id, "cwd": workdir, "mcpServers": []})
-    text = "".join(u["content"].get("text", "") for u in updates if u["sessionUpdate"] == "agent_message_chunk")
+    text = text_of(updates)
     statuses = [u.get("status") for u in updates if u["sessionUpdate"] == "tool_call_update"]
     print("replay after reattach:", repr(text), "| last tool status:", statuses[-1:] if statuses else None)
-    print("PASS" if text.strip() == "pineapple" else "FAIL")
+    print("PASS" if mid_turn_ok and text.strip() == "pineapple" else "FAIL")
     gui.process.stdin.close()
     gui.process.wait(timeout=30)
 finally:

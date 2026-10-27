@@ -4,10 +4,10 @@
 
 use crate::{
     AcpThread, AcpThreadEvent, AgentBoardNotification, AgentThreadEntry, AssistantMessageChunk,
-    ToolCall, ToolCallStatus,
+    RunningTurn, ToolCall, ToolCallStatus,
 };
 use agent_client_protocol::schema::v2 as acp_v2;
-use gpui::{App, Context, SharedString};
+use gpui::{App, Context, SharedString, Task};
 use itertools::Itertools as _;
 
 impl AcpThread {
@@ -231,6 +231,62 @@ pub(crate) struct TurnApiError {
     message: Option<String>,
 }
 
+impl AcpThread {
+    /// Mirrors a turn that zed-agentd reports still running on the host after
+    /// this client reattached mid-turn (plan 037 P4). ACP v1 has no turn-state
+    /// update and this client never sent that turn's prompt, so without this
+    /// the thread looks idle while it streams and offers no Stop. Cancelling
+    /// the adopted turn goes through the normal `session/cancel` path.
+    pub fn set_detached_turn_running(&mut self, running: bool, cx: &mut Context<Self>) {
+        match running {
+            true => {
+                if self.running_turn.is_some() {
+                    return;
+                }
+                self.turn_id += 1;
+                self.detached_turn = Some(self.turn_id);
+                self.running_turn = Some(RunningTurn {
+                    id: self.turn_id,
+                    first_entry_index: self.entries.len().saturating_sub(1),
+                    // Nothing to await: the host owns the turn, and the
+                    // cancel path waits on this task.
+                    send_task: Task::ready(()),
+                });
+                self.set_foreground_state(
+                    acp_v2::StateUpdate::Running(acp_v2::RunningStateUpdate::new()),
+                    cx,
+                );
+                cx.emit(AcpThreadEvent::StatusChanged);
+            }
+            false => {
+                let Some(turn_id) = self.detached_turn.take() else {
+                    return;
+                };
+                // A cancel or a follow-up prompt has already replaced it.
+                if self
+                    .running_turn
+                    .as_ref()
+                    .is_none_or(|turn| turn.id != turn_id)
+                {
+                    return;
+                }
+                self.running_turn = None;
+                self.flush_streaming_text(cx);
+                self.set_foreground_state(
+                    acp_v2::StateUpdate::Idle(acp_v2::IdleStateUpdate::new()),
+                    cx,
+                );
+                cx.emit(AcpThreadEvent::StatusChanged);
+                cx.emit(AcpThreadEvent::Stopped {
+                    activity_generation: self.activity.generation(),
+                    activity_duration: self.activity.duration(),
+                    stop_reason: None,
+                });
+            }
+        }
+    }
+}
+
 /// Streaming reveal tick. Each tick drains pending text into the Markdown
 /// source, which triggers a background parse and `cx.refresh_windows()` —
 /// forcing every window to re-render. At upstream's 16ms (60fps) the repaint
@@ -303,5 +359,89 @@ impl AcpThread {
         {
             self.had_error = true;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{AcpThreadEvent, AgentConnection as _, StubAgentConnection, ThreadStatus};
+    use gpui::TestAppContext;
+    use project::{FakeFs, Project};
+    use settings::SettingsStore;
+    use std::{cell::RefCell, path::Path, rc::Rc};
+    use util::{path, path_list::PathList};
+
+    #[gpui::test]
+    async fn detached_turn_runs_until_ended_cancelled_or_replaced(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let mut settings_store = SettingsStore::test(cx);
+            settings_store.register_setting::<feature_flags::FeatureFlagsSettings>();
+            cx.set_global(settings_store);
+        });
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let connection = Rc::new(StubAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.clone().new_session(
+                    project,
+                    PathList::new(&[Path::new(path!("/test"))]),
+                    cx,
+                )
+            })
+            .await
+            .expect("stub session");
+        let stops = Rc::new(RefCell::new(0));
+        let _subscription = cx.update(|cx| {
+            let stops = stops.clone();
+            cx.subscribe(&thread, move |_, event, _| {
+                if matches!(event, AcpThreadEvent::Stopped { .. }) {
+                    *stops.borrow_mut() += 1;
+                }
+            })
+        });
+        let status = |cx: &mut TestAppContext| thread.read_with(cx, |thread, _| thread.status());
+        let set = |running: bool, cx: &mut TestAppContext| {
+            thread.update(cx, |thread, cx| {
+                thread.set_detached_turn_running(running, cx)
+            });
+        };
+
+        set(true, cx);
+        assert_eq!(status(cx), ThreadStatus::Generating);
+        set(false, cx);
+        assert_eq!(status(cx), ThreadStatus::Idle);
+        assert_eq!(*stops.borrow(), 1);
+        set(false, cx);
+        assert_eq!(*stops.borrow(), 1, "a second end is a no-op");
+
+        set(true, cx);
+        thread
+            .update(cx, |thread, cx| thread.cancel(cx))
+            .await
+            .expect("cancel resolves without the host's reply");
+        assert_eq!(status(cx), ThreadStatus::Idle);
+        assert_eq!(
+            connection.take_cancel_calls().len(),
+            1,
+            "Stop reaches the agent"
+        );
+        set(false, cx);
+        assert_eq!(
+            *stops.borrow(),
+            1,
+            "the late end of a cancelled turn is ignored"
+        );
+
+        set(true, cx);
+        let reply = connection.defer_next_prompt_response();
+        let _follow_up = thread.update(cx, |thread, cx| thread.send(vec!["next".into()], cx));
+        cx.run_until_parked();
+        set(false, cx);
+        assert_eq!(
+            status(cx),
+            ThreadStatus::Generating,
+            "the follow-up turn keeps running after the replaced one ends"
+        );
+        drop(reply);
     }
 }

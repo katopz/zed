@@ -14,6 +14,10 @@ use std::time::{Duration, SystemTime};
 const METHOD_NOT_FOUND: i64 = -32601;
 const INTERNAL_ERROR: i64 = -32603;
 const TITLE_MAX_CHARS: usize = 80;
+/// Extension notification telling a client about a turn it did not start
+/// (ACP v1 has no turn-state update). Read by the Zed fork's
+/// `agent_servers/src/acp/detachable.rs`; other clients ignore `_` methods.
+const TURN_STATE_METHOD: &str = "_zed-agentd/turn_state";
 
 enum InitState {
     NotStarted,
@@ -78,6 +82,9 @@ struct SessionState {
     generation: Option<u64>,
     restoring: bool,
     attached: Vec<ClientId>,
+    /// Clients told a turn is running that they did not start; each gets
+    /// `running: false` when it ends.
+    turn_watchers: Vec<ClientId>,
     queued: VecDeque<(String, Value)>,
     record: SessionRecord,
 }
@@ -103,6 +110,7 @@ impl<J: JournalStore> Hub<J> {
                             generation: None,
                             restoring: false,
                             attached: Vec::new(),
+                            turn_watchers: Vec::new(),
                             queued: VecDeque::new(),
                             record,
                         },
@@ -553,6 +561,42 @@ impl<J: JournalStore> Hub<J> {
             .unwrap_or_else(|| json!({}));
         self.reply(client, id, Ok(setup));
         self.attach(client, &session_id);
+        if self.prompt_in_flight(backend_key, &session_id)
+            && let Some(session) = self.sessions.get_mut(&session_id)
+        {
+            if !session.turn_watchers.contains(&client) {
+                session.turn_watchers.push(client);
+            }
+            self.output.push(HubOutput::ToClient {
+                client,
+                message: turn_state(&session_id, true),
+            });
+        }
+    }
+
+    fn prompt_in_flight(&self, backend_key: &str, session_id: &str) -> bool {
+        self.backends.get(backend_key).is_some_and(|backend| {
+            backend.pending.values().any(|pending| {
+                matches!(pending, PendingRequest::Client {
+                    kind: RequestKind::Prompt { session_id: prompt_session },
+                    ..
+                } if prompt_session == session_id)
+            })
+        })
+    }
+
+    fn end_detached_turn(&mut self, session_id: &str) {
+        let Some(session) = self.sessions.get_mut(session_id) else {
+            return;
+        };
+        for client in std::mem::take(&mut session.turn_watchers) {
+            if self.clients.contains_key(&client) {
+                self.output.push(HubOutput::ToClient {
+                    client,
+                    message: turn_state(session_id, false),
+                });
+            }
+        }
     }
 
     fn list_sessions(&self, backend_key: &str, params: &Value) -> Value {
@@ -759,6 +803,7 @@ impl<J: JournalStore> Hub<J> {
                                 eprintln!("agentd: journal record write failed: {error:#}");
                             }
                         }
+                        self.end_detached_turn(&session_id);
                     }
                     _ => {}
                 }
@@ -818,6 +863,7 @@ impl<J: JournalStore> Hub<J> {
                 generation,
                 restoring: false,
                 attached: Vec::new(),
+                turn_watchers: Vec::new(),
                 queued: VecDeque::new(),
                 record: SessionRecord {
                     session_id: session_id.to_string(),
@@ -946,11 +992,15 @@ impl<J: JournalStore> Hub<J> {
                 kind,
             } = pending
             {
-                if let RequestKind::RestoreSession { session_id } = kind {
-                    if let Some(session) = self.sessions.get_mut(&session_id) {
-                        session.restoring = false;
+                match kind {
+                    RequestKind::RestoreSession { session_id } => {
+                        if let Some(session) = self.sessions.get_mut(&session_id) {
+                            session.restoring = false;
+                        }
+                        continue;
                     }
-                    continue;
+                    RequestKind::Prompt { session_id } => self.end_detached_turn(&session_id),
+                    _ => {}
                 }
                 self.reply(
                     client,
@@ -995,6 +1045,14 @@ impl<J: JournalStore> Hub<J> {
 
 fn now() -> String {
     chrono::DateTime::<chrono::Utc>::from(SystemTime::now()).to_rfc3339()
+}
+
+fn turn_state(session_id: &str, running: bool) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "method": TURN_STATE_METHOD,
+        "params": { "sessionId": session_id, "running": running },
+    })
 }
 
 fn session_update(session_id: &str, update: Value) -> Value {
@@ -1225,6 +1283,114 @@ mod tests {
         assert!(
             to_backend(&outputs).is_empty(),
             "live session needs no backend restore"
+        );
+    }
+
+    #[test]
+    fn reattach_mid_turn_reports_the_detached_turn_running_until_it_ends() {
+        let mut hub = Hub::new(MemoryJournal::default());
+        connect(&mut hub, GUI, DetachedPolicy::Wait);
+        let session_id = start_session(&mut hub, GUI);
+        let outputs = from_client(
+            &mut hub,
+            GUI,
+            json!({"jsonrpc": "2.0", "id": 2, "method": "session/prompt", "params": {"sessionId": session_id, "prompt": [{"type": "text", "text": "long job"}]}}),
+        );
+        let prompt_id = to_backend(&outputs)[0]["id"].clone();
+        assert!(
+            to_client(&outputs, GUI)
+                .iter()
+                .all(|message| message["method"] != TURN_STATE_METHOD),
+            "the client that sent the prompt tracks its own turn"
+        );
+        hub.handle(HubEvent::ClientDisconnected { client: GUI });
+
+        connect(&mut hub, SECOND_GUI, DetachedPolicy::Wait);
+        from_client(
+            &mut hub,
+            SECOND_GUI,
+            json!({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {}}),
+        );
+        let outputs = from_client(
+            &mut hub,
+            SECOND_GUI,
+            json!({"jsonrpc": "2.0", "id": 1, "method": "session/load", "params": {"sessionId": "s1", "cwd": "/work", "mcpServers": []}}),
+        );
+        let messages = to_client(&outputs, SECOND_GUI);
+        let reply = messages
+            .iter()
+            .position(|message| message["id"] == json!(1))
+            .expect("load reply");
+        let running = messages
+            .iter()
+            .position(|message| message["method"] == TURN_STATE_METHOD)
+            .expect("turn state after reattach");
+        assert!(
+            running > reply,
+            "the client has the session before it hears the state"
+        );
+        assert_eq!(
+            messages[running]["params"],
+            json!({"sessionId": "s1", "running": true})
+        );
+
+        let outputs = from_backend(
+            &mut hub,
+            json!({"jsonrpc": "2.0", "id": prompt_id, "result": {"stopReason": "end_turn"}}),
+        );
+        assert_eq!(
+            to_client(&outputs, SECOND_GUI),
+            [&turn_state("s1", false)],
+            "the watcher hears the end; the prompt reply had nowhere to go"
+        );
+
+        let outputs = from_client(
+            &mut hub,
+            SECOND_GUI,
+            json!({"jsonrpc": "2.0", "id": 3, "method": "session/prompt", "params": {"sessionId": "s1", "prompt": [{"type": "text", "text": "next"}]}}),
+        );
+        let next_id = to_backend(&outputs)[0]["id"].clone();
+        let outputs = from_backend(
+            &mut hub,
+            json!({"jsonrpc": "2.0", "id": next_id, "result": {"stopReason": "end_turn"}}),
+        );
+        assert_eq!(
+            to_client(&outputs, SECOND_GUI).len(),
+            1,
+            "only the prompt reply; the watcher list was drained"
+        );
+    }
+
+    #[test]
+    fn backend_exit_ends_a_watched_detached_turn() {
+        let mut hub = Hub::new(MemoryJournal::default());
+        connect(&mut hub, GUI, DetachedPolicy::Wait);
+        let session_id = start_session(&mut hub, GUI);
+        from_client(
+            &mut hub,
+            GUI,
+            json!({"jsonrpc": "2.0", "id": 2, "method": "session/prompt", "params": {"sessionId": session_id, "prompt": [{"type": "text", "text": "long job"}]}}),
+        );
+        hub.handle(HubEvent::ClientDisconnected { client: GUI });
+        connect(&mut hub, SECOND_GUI, DetachedPolicy::Wait);
+        from_client(
+            &mut hub,
+            SECOND_GUI,
+            json!({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {}}),
+        );
+        from_client(
+            &mut hub,
+            SECOND_GUI,
+            json!({"jsonrpc": "2.0", "id": 1, "method": "session/load", "params": {"sessionId": "s1", "cwd": "/work", "mcpServers": []}}),
+        );
+        let outputs = hub.handle(HubEvent::BackendExited {
+            backend_key: spec().key(),
+            generation: 1,
+        });
+        assert_eq!(
+            to_client(&outputs, SECOND_GUI),
+            [&turn_state("s1", false)],
+            "a crashed turn must not leave the GUI generating forever"
         );
     }
 
