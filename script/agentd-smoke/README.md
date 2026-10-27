@@ -11,7 +11,8 @@ real Zed settings or agentd journal.
 ```sh
 cargo build -p eval_cli -p agentd
 # Direct: initialize, session/new, a read_file turn, a terminal turn with a permission round-trip,
-# and an edit_file turn that must arrive as a structured ACP diff.
+# an edit_file turn that must arrive as a structured ACP diff, and a model switch via
+# session/set_config_option that the next turn must use.
 python3 -I script/agentd-smoke/acp_smoke.py target/debug/eval-cli fake/m 18736
 # Same, through zed-agentd, plus a second client that lists and replays the session.
 SMOKE_AGENTD=target/debug/zed-agentd python3 -I script/agentd-smoke/acp_smoke.py target/debug/eval-cli fake/m 18737

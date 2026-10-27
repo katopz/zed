@@ -17,21 +17,24 @@ use std::str::FromStr as _;
 use std::sync::Arc;
 
 use acp_thread::{
-    AcpThread, AcpThreadEvent, AgentConnection as _, AgentThreadEntry, AssistantMessageChunk,
-    PermissionOptions, SelectedPermissionOutcome, ToolCall, ToolCallContent, ToolCallStatus,
+    AcpThread, AcpThreadEvent, AgentConnection as _, AgentModelList, AgentThreadEntry,
+    AssistantMessageChunk, PermissionOptions, SelectedPermissionOutcome, ToolCall, ToolCallContent,
+    ToolCallStatus,
 };
 use agent::{NativeAgent, NativeAgentConnection, Templates, ThreadStore};
 use agent_client_protocol::schema::v1 as acp_v1;
 use agent_client_protocol::schema::{ProtocolVersion, v2 as acp_v2};
 use agent_client_protocol::{Agent, Client, ConnectionTo, Responder, Stdio};
+use agent_settings::AgentSettings;
 use anyhow::{Context as _, Result};
 use futures::StreamExt as _;
 use futures::channel::mpsc;
 use gpui::{App, AppContext as _, AsyncApp, Entity, Subscription};
-use language_model::SelectedModel;
+use language_model::{LanguageModelRegistry, SelectedModel};
 use project::Project;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use settings::{LanguageModelSelection, Settings as _};
 use util::ResultExt as _;
 use util::path_list::PathList;
 
@@ -54,6 +57,10 @@ enum Command {
     Prompt {
         request: acp_v1::PromptRequest,
         responder: Responder<acp_v1::PromptResponse>,
+    },
+    SetConfigOption {
+        request: acp_v1::SetSessionConfigOptionRequest,
+        responder: Responder<acp_v1::SetSessionConfigOptionResponse>,
     },
     Cancel(acp_v1::CancelNotification),
 }
@@ -143,6 +150,23 @@ pub(crate) async fn serve(
                 })
                 .detach();
             }
+            Command::SetConfigOption { request, responder } => {
+                let state = sessions
+                    .borrow()
+                    .get(&request.session_id)
+                    .map(|session| session.state.clone());
+                let result = match state {
+                    Some(state) => set_config_option(&connection, &state, request, cx).await,
+                    None => Err(anyhow::anyhow!("unknown session {}", request.session_id)),
+                };
+                match result {
+                    Ok(options) => {
+                        responder.respond(acp_v1::SetSessionConfigOptionResponse::new(options))
+                    }
+                    Err(error) => responder.respond_with_error(internal_error(&error)),
+                }
+                .log_err();
+            }
             Command::Cancel(notification) => {
                 let thread = sessions
                     .borrow()
@@ -183,6 +207,15 @@ async fn serve_stdio(commands: mpsc::UnboundedSender<Command>) -> Result<()> {
             Ok(())
         }
     };
+    let set_config_option = {
+        let commands = commands.clone();
+        async move |request: acp_v1::SetSessionConfigOptionRequest,
+                    responder: Responder<acp_v1::SetSessionConfigOptionResponse>,
+                    _client: ConnectionTo<Client>| {
+            forward(&commands, Command::SetConfigOption { request, responder });
+            Ok(())
+        }
+    };
     let cancel = {
         let commands = commands.clone();
         async move |notification: acp_v1::CancelNotification, _client: ConnectionTo<Client>| {
@@ -207,6 +240,10 @@ async fn serve_stdio(commands: mpsc::UnboundedSender<Command>) -> Result<()> {
         )
         .on_receive_request(new_session, agent_client_protocol::on_receive_request!())
         .on_receive_request(prompt, agent_client_protocol::on_receive_request!())
+        .on_receive_request(
+            set_config_option,
+            agent_client_protocol::on_receive_request!(),
+        )
         .on_receive_notification(cancel, agent_client_protocol::on_receive_notification!())
         .connect_to(Stdio::new())
         .await
@@ -221,6 +258,9 @@ fn forward(commands: &mpsc::UnboundedSender<Command>, command: Command) {
                 responder.respond_with_error(acp_v1::ErrorCode::InternalError.into())
             }
             Command::Prompt { responder, .. } => {
+                responder.respond_with_error(acp_v1::ErrorCode::InternalError.into())
+            }
+            Command::SetConfigOption { responder, .. } => {
                 responder.respond_with_error(acp_v1::ErrorCode::InternalError.into())
             }
             Command::Cancel(_) => Ok(()),
@@ -250,8 +290,9 @@ async fn new_session(
         })
         .await
         .context("creating native agent session")?;
-    let session_id =
-        acp_v1::SessionId::new(thread.read_with(cx, |thread, _| thread.session_id().0.to_string()));
+    let native_session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+    let session_id = acp_v1::SessionId::new(native_session_id.0.to_string());
+    let config_options = model_config_options(connection, &native_session_id, cx).await;
     let state = Rc::new(RefCell::new(SessionState {
         session_id: session_id.clone(),
         client,
@@ -276,7 +317,120 @@ async fn new_session(
             _subscription: subscription,
         },
     );
-    Ok(acp_v1::NewSessionResponse::new(session_id))
+    Ok(acp_v1::NewSessionResponse::new(session_id).config_options(config_options))
+}
+
+const MODEL_CONFIG_ID: &str = "model";
+
+/// The native agent's model picker as an ACP select option; empty when the
+/// agent lists no models, so clients simply show no picker.
+async fn model_config_options(
+    connection: &Rc<NativeAgentConnection>,
+    session_id: &acp_v2::SessionId,
+    cx: &mut AsyncApp,
+) -> Vec<acp_v1::SessionConfigOption> {
+    let Some(selector) = connection.model_selector(session_id) else {
+        return Vec::new();
+    };
+    let (models, selected) =
+        cx.update(|cx| (selector.list_models(cx), selector.selected_model(cx)));
+    let (Some(models), Some(selected)) = (models.await.log_err(), selected.await.log_err()) else {
+        return Vec::new();
+    };
+    let models = match models {
+        AgentModelList::Flat(models) => models,
+        AgentModelList::Grouped(groups) => groups.into_values().flatten().collect(),
+    };
+    let options = models
+        .into_iter()
+        .map(|model| {
+            acp_v1::SessionConfigSelectOption::new(model.id.to_string(), model.name.to_string())
+                .description(model.description.map(|description| description.to_string()))
+        })
+        .collect::<Vec<_>>();
+    vec![
+        acp_v1::SessionConfigOption::select(
+            MODEL_CONFIG_ID,
+            "Model",
+            selected.id.to_string(),
+            options,
+        )
+        .category(acp_v1::SessionConfigOptionCategory::Model),
+    ]
+}
+
+/// Switches the session's model and announces the new options as a session
+/// update too, so zed-agentd journals it and a reattaching client sees the
+/// current model rather than the one from `session/new`.
+async fn set_config_option(
+    connection: &Rc<NativeAgentConnection>,
+    state: &Rc<RefCell<SessionState>>,
+    request: acp_v1::SetSessionConfigOptionRequest,
+    cx: &mut AsyncApp,
+) -> Result<Vec<acp_v1::SessionConfigOption>> {
+    let acp_v1::SessionConfigOptionValue::ValueId { value } = &request.value else {
+        anyhow::bail!("unsupported value for config option {}", request.config_id);
+    };
+    anyhow::ensure!(
+        request.config_id.0.as_ref() == MODEL_CONFIG_ID,
+        "unknown config option {}",
+        request.config_id
+    );
+    let session_id = acp_v2::SessionId::new(request.session_id.0.to_string());
+    cx.update(|cx| set_model(connection, &session_id, value.0.as_ref(), cx))?;
+    let options = model_config_options(connection, &session_id, cx).await;
+    let state = state.borrow();
+    state
+        .client
+        .send_notification(acp_v1::SessionNotification::new(
+            state.session_id.clone(),
+            acp_v1::SessionUpdate::ConfigOptionUpdate(acp_v1::ConfigOptionUpdate::new(
+                options.clone(),
+            )),
+        ))
+        .log_err();
+    Ok(options)
+}
+
+/// `NativeAgentModelSelector::select_model` minus its settings-file write: on
+/// this host that write would persist into the real settings file, and the
+/// reload replaces the in-memory provider settings `--acp` was started with.
+fn set_model(
+    connection: &NativeAgentConnection,
+    session_id: &acp_v2::SessionId,
+    model_id: &str,
+    cx: &mut App,
+) -> Result<()> {
+    let thread = connection
+        .thread(session_id, cx)
+        .with_context(|| format!("unknown session {session_id}"))?;
+    let model = LanguageModelRegistry::read_global(cx)
+        .available_models(cx)
+        .find(|model| format!("{}/{}", model.provider_id().0, model.id().0) == model_id)
+        .with_context(|| format!("unknown model {model_id}"))?;
+    let favorite = AgentSettings::get_global(cx)
+        .favorite_models
+        .iter()
+        .find(|favorite| {
+            favorite.provider.0 == model.provider_id().0.as_ref()
+                && favorite.model == model.id().0.as_ref()
+        })
+        .cloned();
+    let LanguageModelSelection {
+        enable_thinking,
+        effort,
+        speed,
+        ..
+    } = agent_settings::language_model_to_selection(&model, favorite.as_ref());
+    thread.update(cx, |thread, cx| {
+        thread.set_model(model, cx);
+        thread.set_thinking_effort(effort, cx);
+        thread.set_thinking_enabled(enable_thinking, cx);
+        if let Some(speed) = speed {
+            thread.set_speed(speed, cx);
+        }
+    });
+    Ok(())
 }
 
 async fn prompt(

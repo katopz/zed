@@ -16,6 +16,7 @@ path = "src/main.rs"
 acp_thread.workspace = true
 agent.workspace = true
 agent-client-protocol = { workspace = true, features = ["stdio"] }
+agent_settings.workspace = true
 agent_ui.workspace = true
 anyhow.workspace = true
 clap.workspace = true

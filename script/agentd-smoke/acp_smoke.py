@@ -19,9 +19,9 @@ home = tempfile.mkdtemp(prefix="z036-home-")
 # A throwaway HOME: "always allow" answers must never reach the real settings file.
 env = dict(os.environ, HOME=home, FAKE_API_KEY="test", ZED_OPENAI_COMPATIBLE_PROVIDERS=json.dumps({
     "fake": {"api_url": f"http://127.0.0.1:{port}/v1", "available_models": [{
-        "name": "m", "max_tokens": 32000,
+        "name": name, "max_tokens": 32000,
         "capabilities": {"tools": True, "images": False, "parallel_tool_calls": False,
-                         "prompt_cache_key": False}}]}}))
+                         "prompt_cache_key": False}} for name in ("m", "m2")]}}))
 agentd = os.environ.get("SMOKE_AGENTD")
 if agentd:
     env["ZED_AGENTD_HOME"] = tempfile.mkdtemp(prefix="z036-agentd-")
@@ -83,6 +83,9 @@ print("initialize:", reply.get("result") or reply.get("error"))
 reply, _, _ = request("session/new", {"cwd": workdir, "mcpServers": []})
 print("session/new:", reply.get("result") or reply.get("error"))
 session_id = reply["result"]["sessionId"]
+model_option = next(o for o in reply["result"].get("configOptions", []) if o["id"] == "model")
+print("model option:", model_option["category"], model_option["currentValue"],
+      [o["value"] for o in model_option["options"]])
 
 reply, updates, permissions = request("session/prompt", {"sessionId": session_id, "prompt": [
     {"type": "text", "text": "Read hello.txt with your read tool and reply with only the magic word."}]})
@@ -110,6 +113,17 @@ print("  structured diff:", bool(diffs), "| absolute path:", last_diff.get("path
       "| old/new:", repr(last_diff.get("oldText")), "->", repr(last_diff.get("newText")))
 print("  hello.txt:", repr(open(os.path.join(workdir, "hello.txt")).read()))
 
+reply, updates, _ = request("session/set_config_option", {"sessionId": session_id, "configId": "model", "value": "fake/m2"})
+current = [o["currentValue"] for o in reply["result"]["configOptions"] if o["id"] == "model"]
+announced = [u for u in updates if u["sessionUpdate"] == "config_option_update"]
+print("set model:", current, "| config_option_update sent:", bool(announced))
+model_log = os.path.join(tempfile.gettempdir(), "agentd-smoke-model.log")
+before = len(open(model_log).readlines())
+reply, updates, _ = request("session/prompt", {"sessionId": session_id, "prompt": [
+    {"type": "text", "text": "Read hello.txt with your read tool and reply with only the magic word."}]})
+models = {json.loads(line)["model"] for line in open(model_log).readlines()[before:]}
+print("prompt 4:", reply.get("result") or reply.get("error"), "| models requested:", sorted(models))
+
 agent.stdin.close()
 print("exit code:", agent.wait(timeout=60))
 if agentd:
@@ -123,6 +137,9 @@ if agentd:
     reply, updates, _ = request("session/load", {"sessionId": session_id, "cwd": workdir, "mcpServers": []})
     text, tools = summarize(updates)
     print("session/load:", "error" not in reply, "| replayed text:", text, "| tool updates:", len(tools))
+    replayed_models = [o["currentValue"] for u in updates if u["sessionUpdate"] == "config_option_update"
+                       for o in u["configOptions"] if o["id"] == "model"]
+    print("replayed current model:", replayed_models[-1:] or None)
     agent.stdin.close()
     agent.wait(timeout=60)
     subprocess.run([agentd, "stop"], env=env, capture_output=True)

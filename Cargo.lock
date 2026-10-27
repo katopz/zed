@@ -6108,6 +6108,7 @@ dependencies = [
  "acp_thread",
  "agent",
  "agent-client-protocol",
+ "agent_settings",
  "agent_ui",
  "anyhow",
  "clap",

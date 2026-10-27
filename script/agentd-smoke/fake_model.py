@@ -43,7 +43,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         events = plan(body)
-        log.write(json.dumps({"last": body.get("messages", [{}])[-1].get("role"),
+        log.write(json.dumps({"model": body.get("model"),
+                              "last": body.get("messages", [{}])[-1].get("role"),
                               "tools": bool(body.get("tools")), "events": len(events)}) + "\n")
         log.flush()
         self.send_response(200)
