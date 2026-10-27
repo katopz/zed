@@ -287,6 +287,15 @@ the prefix length can be increased to 6 or 8 chars.
       - Verify JWT signature (Web Crypto RSASSA-PKCS1-v1_5 / SHA-256), `iss`,
         `aud`, `exp`, `email_verified`.
       - Assert `login == ALLOWED_LOGIN` (env var, default `katopz`).
+      - Security fix `8c0670a31e` (issue 038, closed): `ae1501d9b9` had made a
+        blank `ALLOWED_LOGIN` allow every GitHub login, and the default room was
+        derivable from the public SSH key. Now blank fails closed (allow-all
+        needs `"*"`), the default room is derived from the secret key, and
+        injected web replies name their GitHub author. Worker tests cover 401
+        on `/reply` and WebSocket close 4001 for non-allowlisted logins. The
+        deferred browser and deploy checks here and in plans 013 and 024 stay
+        deferred with the retired stack; this fix was a precondition for
+        running them.
 - [x] The verification function `verifyGoogleToken(token, jwks, clientId, allowedEmail)`
       is pure (takes token + JWKS, returns email or null) so it's unit-testable
       with mock JWKS. Validated end-to-end with a self-signed RSA JWT in
