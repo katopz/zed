@@ -3750,8 +3750,9 @@ pub async fn stream_model_completion(
     language_model::LanguageModelCompletionStream,
     language_model::LanguageModelCompletionError,
 > {
-    let provider =
-        cx.update(|cx| language_model::LanguageModelRegistry::read_global(cx).provider_for_model(model))?;
+    let provider = cx.update(|cx| {
+        language_model::LanguageModelRegistry::read_global(cx).provider_for_model(model)
+    })?;
     provider.stream_completion(model, request, cx).await
 }
 
@@ -4588,7 +4589,26 @@ const DEFERRED_ITEM_MARKERS: &[&str] = &[
     "parked",
     "on hold",
     "[-]",
+    "blocked on",
+    "blocked until",
+    "blocked by",
+    "still blocked",
+    "waiting on",
+    "waiting for",
+    "needs you",
+    "needs the owner",
 ];
+
+/// Substring match that must start at a word boundary, so a negated form
+/// ("unblocked by", "disarmed") never reads as the marker itself.
+fn contains_marker(lower_line: &str, marker: &str) -> bool {
+    lower_line.match_indices(marker).any(|(index, _)| {
+        lower_line[..index]
+            .chars()
+            .next_back()
+            .is_none_or(|previous| !previous.is_alphanumeric())
+    })
+}
 
 /// True when every bullet/numbered item in the section carries a deferral
 /// marker (an actionable unchecked checkbox immediately disqualifies). A
@@ -4614,7 +4634,7 @@ fn section_all_deferred(section: &str) -> bool {
         let lower = line.to_lowercase();
         DEFERRED_ITEM_MARKERS
             .iter()
-            .any(|marker| lower.contains(marker))
+            .any(|marker| contains_marker(&lower, marker))
     })
 }
 
@@ -5328,7 +5348,8 @@ mod tests {
         work_dirs: Option<Vec<PathBuf>>,
     ) -> LlmCallData {
         LlmCallData {
-            model: language_model::fake_provider::FakeLanguageModelProvider::default().model("fake"),
+            model: language_model::fake_provider::FakeLanguageModelProvider::default()
+                .model("fake"),
             system_prompt: String::new(),
             context_json,
             project_root: None,
@@ -5578,6 +5599,34 @@ mod tests {
         // Non-summaries are never terminal.
         assert!(!summary_declares_terminal(Some("still working")));
         assert!(!summary_declares_terminal(None));
+    }
+
+    #[test]
+    fn summary_declares_terminal_on_blocked_and_waiting_items() {
+        // The stalled-loop shape: every item waits on the owner, on data, or on
+        // an external event, phrased without the plan-031 vocabulary.
+        let summary = "\
+## Summary\n\n\
+**(1) Original task:** Continue plan 037.\n\n\
+**(2) Accomplished:**\n\
+- Re-checked SSH; no changes.\n\n\
+**(3) What remains:**\n\
+- Plan 037 phase 3, the real M3 to M5 test: blocked on SSH, needs you to enable Remote Login.\n\
+- `.issues/016`: waiting on 9 more reviewed chains from real use.\n\
+- `.issues/023`: waiting for the next Z.AI limit hit in `Zed.log`.\n\
+- Plan 038's deferred item stays deferred.\n\n\
+**(4) Active plan state:** `.plans/037_x.md` in progress.";
+        assert!(summary_declares_terminal(Some(summary)));
+    }
+
+    #[test]
+    fn deferral_markers_match_only_at_word_starts() {
+        assert!(section_all_deferred("- Phase 3: still blocked on SSH."));
+        assert!(!section_all_deferred(
+            "- Phase 3 is now unblocked by the new key: run it."
+        ));
+        assert!(!section_all_deferred("- Re-enable the disarmed lever."));
+        assert!(section_all_deferred("- Lever re-armed for the next run."));
     }
 
     #[test]
@@ -9338,7 +9387,10 @@ Ready to execute Issue 024 (Hero → Avatar rename)?";
         let task = cx.spawn(async move |cx| cutoff_context_full_outcome(&data, &cx).await);
         cx.run_until_parked();
         assert_eq!(fake.completion_count(), 1, "one summary call expected");
-        fake.respond_to_last_pending_completion(&fake.model("fake"), [LanguageModelCompletionEvent::Text(summary_json)]);
+        fake.respond_to_last_pending_completion(
+            &fake.model("fake"),
+            [LanguageModelCompletionEvent::Text(summary_json)],
+        );
 
         match task.await {
             AutoPromptOutcome::Continue(action) => {
@@ -9372,15 +9424,21 @@ Ready to execute Issue 024 (Hero → Avatar rename)?";
 
         let task = cx.spawn(async move |cx| cutoff_context_full_outcome(&data, &cx).await);
         cx.run_until_parked();
-        fake.respond_to_last_pending_completion(&fake.model("fake"), [LanguageModelCompletionEvent::Text(
-            "this is not json".to_string(),
-        )]);
+        fake.respond_to_last_pending_completion(
+            &fake.model("fake"),
+            [LanguageModelCompletionEvent::Text(
+                "this is not json".to_string(),
+            )],
+        );
         // Attempt 2 backs off 2s before retrying.
         cx.executor().advance_clock(Duration::from_millis(2_000));
         cx.run_until_parked();
-        fake.respond_to_last_pending_completion(&fake.model("fake"), [LanguageModelCompletionEvent::Text(
-            "still not json".to_string(),
-        )]);
+        fake.respond_to_last_pending_completion(
+            &fake.model("fake"),
+            [LanguageModelCompletionEvent::Text(
+                "still not json".to_string(),
+            )],
+        );
 
         match task.await {
             AutoPromptOutcome::Continue(action) => {
@@ -9416,7 +9474,10 @@ Ready to execute Issue 024 (Hero → Avatar rename)?";
 
         let task = cx.spawn(async move |cx| cutoff_context_full_outcome(&data, &cx).await);
         cx.run_until_parked();
-        fake.respond_to_last_pending_completion(&fake.model("fake"), [LanguageModelCompletionEvent::Text(summary_json)]);
+        fake.respond_to_last_pending_completion(
+            &fake.model("fake"),
+            [LanguageModelCompletionEvent::Text(summary_json)],
+        );
 
         match task.await {
             AutoPromptOutcome::Stopped { reason } => {
