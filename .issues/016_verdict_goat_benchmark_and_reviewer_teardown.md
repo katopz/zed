@@ -1,6 +1,6 @@
 # Verdict ping-pong GOAT benchmark + reviewer session teardown
 
-Status: 2026-10-27 scorer re-run on the M3's fresh threads.db: verdict-ON 11/20 chains (rounds 1:2 2:5 3:4, 1 abort, reviewer claude_code), OFF 37 chains; post-hoc fix rate 0.0% in BOTH cohorts (metric has no signal on this data), ON costs 3.4x input / 4.6x output tokens (`.benchmarks/001`). GOAT verdict pending the >=20 ON cohort; if that also reads 0 vs 0, switch the gate to a blinded summary-quality sample. Earlier history: 2026-09-13 run 1/20 ON, baseline 6.3% over 16,578 OFF chains on the old host; PART 1 harness + Part 2 teardown shipped
+Status: 2026-10-27 (b) post-hoc metric shown structurally blind on auto-prompt chains (handoffs fill every post-summary slot), replaced in `script/verdict_scorer.py` by a mid-thread human correction rate + a cited-commit resolution rate. 12 ON vs 36 OFF chains: corrections 16.7% vs 22.2% hand-labelled (2 vs 4, noise), commits resolved 95.8% vs 94.2%, tokens 3.1x in / 4.2x out. NOT GOAT on current evidence; stays default-on (user-invoked only). Re-score at >= 20 ON chains, demote only if ON is worse (`.benchmarks/001`). Earlier: post-hoc 0.0% both cohorts at 11 ON; 2026-09-13 baseline 6.3% over 16,578 OFF chains on the old host; PART 1 harness + Part 2 teardown shipped
 
 ## Context
 
@@ -50,6 +50,9 @@ corrections by enough to pay for the extra tokens.
       `threads.db` via `LanguageModelToolResult.output`, so no schema change
       was needed and the join is by construction (`tool_name ==
       "request_verdict"`).
+- [x] Human correction rate + cited-commit resolution rate replace the
+      post-hoc metric, which auto-prompt handoffs blind (2026-10-27).
+- [ ] Re-score at >= 20 verdict-ON chains with the new measures.
 - [x] Scorer script: `script/verdict_scorer.py` (uv + zstandard). Reads
       `threads.db`, decompresses the zstd thread blobs, splits verdict-on/off
       cohorts, and reports post-hoc fix rate / rounds distribution / aborts /

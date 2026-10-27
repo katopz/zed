@@ -27,6 +27,7 @@ import argparse
 import json
 import re
 import sqlite3
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -41,7 +42,8 @@ CORRECTION_PATTERNS = [
     r"you missed",
     r"missed",
     r"actually",
-    r"\bfix\b",
+    # "shall we fix X?" proposes new work rather than correcting the last turn.
+    r"(?<!we )\bfix\b",
     r"\bfixed\b",
     r"wrong",
     r"didn'?t",
@@ -53,12 +55,32 @@ CORRECTION_PATTERNS = [
     r"revert",
     r"not quite",
     r"try again",
-    r"one more",
     r"almost",
+    r"\bstill\b",
 ]
 CORRECTION_RE = re.compile("|".join(CORRECTION_PATTERNS), re.IGNORECASE)
 
 SUMMARY_HEADING_RE = re.compile(r"^#{1,3}\s*summary\b", re.IGNORECASE | re.MULTILINE)
+
+# Auto-prompt chains open every continuation with a machine-written handoff, so
+# the post-summary metric never sees a human turn (2026-10-27: 0.0% in both
+# cohorts). Human corrections land mid-thread instead; these prefixes mark the
+# user-role messages Zed or a parent agent wrote, which must not be scored.
+MACHINE_MESSAGE_PREFIXES = (
+    "## 1. Thread Summary",
+    "Continuing from the previous session",
+    "Continue from where we left off",
+    "Stop what you are doing and provide",
+    "Your last response was cut off",
+    "<agent_message",
+    "## Summary",
+    "/",
+)
+# Subagent briefs and pasted agent output are long; human turns are not.
+MAX_HUMAN_MESSAGE_CHARS = 1000
+
+# Summaries cite commits as backticked hashes (`f426bb830d`).
+COMMIT_HASH_RE = re.compile(r"`([0-9a-f]{7,40})`")
 
 
 def default_metadata_db_candidates() -> list[Path]:
@@ -160,6 +182,58 @@ def user_message_text(msg: dict) -> str:
     return content_text(msg.get("content", []))
 
 
+def is_human_message(text: str) -> bool:
+    return (
+        bool(text)
+        and len(text) <= MAX_HUMAN_MESSAGE_CHARS
+        and not text.startswith(MACHINE_MESSAGE_PREFIXES)
+    )
+
+
+def default_repo_roots() -> list[Path]:
+    return [Path.home() / "git"]
+
+
+def resolve_commits(hashes: set[str], roots: list[Path]) -> set[str]:
+    """Return the subset of `hashes` that name a commit in any repo under `roots`.
+
+    A hash that resolves nowhere is "unresolved", not proof of a hallucination:
+    it may live only on another host or have been rewritten by a rebase and
+    garbage-collected. The rate is still comparable across cohorts.
+    """
+    if not hashes:
+        return set()
+    repos = [
+        child
+        for root in roots
+        if root.is_dir()
+        for child in sorted(root.iterdir())
+        if (child / ".git").exists()
+    ]
+    ordered = sorted(hashes)
+    resolved: set[str] = set()
+    for repo in repos:
+        pending = [commit for commit in ordered if commit not in resolved]
+        if not pending:
+            break
+        try:
+            output = subprocess.run(
+                ["git", "-C", str(repo), "cat-file", "--batch-check=%(objecttype)"],
+                input="".join(f"{commit}^{{commit}}\n" for commit in pending),
+                capture_output=True,
+                text=True,
+                timeout=60,
+            ).stdout.splitlines()
+        except (OSError, subprocess.SubprocessError) as error:
+            print(f"warning: commit lookup failed in {repo}: {error}", file=sys.stderr)
+            continue
+        # One output line per input line; misses read "<input> missing".
+        for commit, line in zip(pending, output):
+            if line == "commit":
+                resolved.add(commit)
+    return resolved
+
+
 @dataclass
 class VerdictCall:
     round: int | None
@@ -182,6 +256,9 @@ class ThreadScore:
     input_tokens: int = 0
     output_tokens: int = 0
     first_user_message: str = ""
+    human_messages: int = 0
+    human_corrections: list[str] = field(default_factory=list)
+    cited_commits: set[str] = field(default_factory=set)
 
     @property
     def verdict_on(self) -> bool:
@@ -269,8 +346,25 @@ def score_thread(thread_id: str, thread: dict) -> ThreadScore:
         if not isinstance(message, dict):
             continue
         agent = message.get("Agent")
-        if isinstance(agent, dict) and SUMMARY_HEADING_RE.search(agent_message_text(agent)):
+        if not isinstance(agent, dict):
+            continue
+        text = agent_message_text(agent)
+        if SUMMARY_HEADING_RE.search(text):
             final_summary_ix = ix
+            score.cited_commits.update(COMMIT_HASH_RE.findall(text))
+
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        user = message.get("User")
+        if not isinstance(user, dict):
+            continue
+        text = user_message_text(user).strip()
+        if not is_human_message(text):
+            continue
+        score.human_messages += 1
+        if CORRECTION_RE.search(text):
+            score.human_corrections.append(" ".join(text.split())[:120])
     if final_summary_ix is not None:
         score.has_summary = True
         for message in messages[final_summary_ix + 1 :]:
@@ -309,6 +403,10 @@ def cohort_stats(chains: list[dict]) -> dict:
     corrected = [c for c in with_summary if c["corrections"]]
     verdict_on = [c for c in chains if c["verdict_on"]]
     rounds = [c["rounds_used"] for c in verdict_on]
+    with_human = [c for c in chains if c["human_messages"]]
+    human_corrected = [c for c in with_human if c["human_corrections"]]
+    cited = sum(c["cited_commits"] for c in chains)
+    resolved = sum(c["resolved_commits"] for c in chains)
     return {
         "chains": len(chains),
         "chains_with_summary": len(with_summary),
@@ -325,6 +423,14 @@ def cohort_stats(chains: list[dict]) -> dict:
         "avg_chain_output_tokens": (
             sum(c["output_tokens"] for c in chains) / len(chains) if chains else None
         ),
+        "chains_with_human_turns": len(with_human),
+        "chains_with_human_corrections": len(human_corrected),
+        "human_correction_rate": (
+            len(human_corrected) / len(with_human) if with_human else None
+        ),
+        "cited_commits": cited,
+        "resolved_commits": resolved,
+        "commit_resolution_rate": (resolved / cited) if cited else None,
     }
 
 
@@ -345,6 +451,13 @@ def main() -> int:
         type=Path,
         help="Path to agent_ui's db.sqlite (sidebar_threads) for continuation "
         "linking (default: auto-detect)",
+    )
+    parser.add_argument(
+        "--repos-root",
+        type=Path,
+        action="append",
+        help="Directory whose child git repos resolve cited commit hashes "
+        "(repeatable; default: ~/git)",
     )
     parser.add_argument("--out", type=Path, help="Write JSON summary to this path")
     args = parser.parse_args()
@@ -403,6 +516,11 @@ def main() -> int:
         root = chain_root(score.thread_id, edges)
         chains.setdefault(root, []).append(score)
 
+    resolved_commits = resolve_commits(
+        {commit for score in scores for commit in score.cited_commits},
+        args.repos_root or default_repo_roots(),
+    )
+
     def chain_record(root: str, members: list[ThreadScore]) -> dict:
         # Descendants other than the root are continuations by construction.
         continuations = [m for m in members if m.thread_id != root]
@@ -413,6 +531,7 @@ def main() -> int:
         ]
         corrections = [c for m in members for c in m.corrections]
         corrections += [m.first_user_message for m in corrective_continuations]
+        cited_commits = {commit for m in members for commit in m.cited_commits}
         return {
             "root": root,
             "members": [m.thread_id for m in members],
@@ -426,6 +545,10 @@ def main() -> int:
             "reviewers": sorted({r for m in members for r in m.reviewers}),
             "input_tokens": sum(m.input_tokens for m in members),
             "output_tokens": sum(m.output_tokens for m in members),
+            "human_messages": sum(m.human_messages for m in members),
+            "human_corrections": [c for m in members for c in m.human_corrections],
+            "cited_commits": len(cited_commits),
+            "resolved_commits": len(cited_commits & resolved_commits),
         }
 
     chain_records = [chain_record(root, members) for root, members in chains.items()]
@@ -452,6 +575,9 @@ def main() -> int:
                 "reviewers": c["reviewers"],
                 "has_summary": c["has_summary"],
                 "corrections": c["corrections"],
+                "human_corrections": c["human_corrections"],
+                "cited_commits": c["cited_commits"],
+                "resolved_commits": c["resolved_commits"],
             }
             for c in chain_records
         ],
@@ -473,6 +599,19 @@ def main() -> int:
         print(f"{label}:")
         print(f"  chains={cohort['chains']} with_summary={cohort['chains_with_summary']}")
         print(f"  post-hoc fix rate: {rate_str} ({cohort['chains_with_corrections']} corrected)")
+        human_rate = cohort["human_correction_rate"]
+        print(
+            "  human correction rate: "
+            + (f"{human_rate:.1%}" if human_rate is not None else "n/a")
+            + f" ({cohort['chains_with_human_corrections']}"
+            + f"/{cohort['chains_with_human_turns']} chains with human turns)"
+        )
+        commit_rate = cohort["commit_resolution_rate"]
+        print(
+            "  cited commits resolved: "
+            + (f"{commit_rate:.1%}" if commit_rate is not None else "n/a")
+            + f" ({cohort['resolved_commits']}/{cohort['cited_commits']})"
+        )
         print(f"  rounds: {cohort['rounds_used_distribution']}")
         print(f"  aborts: {cohort['negotiation_aborts']}  reviewers: {cohort['reviewers']}")
         avg_in = cohort["avg_chain_input_tokens"]

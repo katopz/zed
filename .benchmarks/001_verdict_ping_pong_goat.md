@@ -1,6 +1,6 @@
 # Bench 001 — Verdict ping-pong GOAT (interim)
 
-**Status:** INTERIM — harness + baseline + FAILED-cohort instrumentation done; verdict-ON cohort still empty (0 chains). GOAT verdict deferred until >= 20 comparable tasks populate it (`.issues/016`).
+**Status:** INTERIM, 2026-10-27: 12 ON chains scored with the new human-correction and cited-commit measures; no quality gain beyond noise, 3.1x/4.2x tokens, NOT GOAT on current evidence, stays default-on (user-invoked only). Re-score at >= 20 ON chains.
 
 ## Setup
 
@@ -70,3 +70,50 @@ user-invoked, so it costs nothing until clicked. If the 20-chain run also
 shows 0 vs 0, the post-hoc keyword scorer is too weak to decide the gate and
 the next step is a blinded quality sample (rate N ON vs N OFF final
 summaries), not more waiting.
+
+## Re-run 2026-10-27 (b): metric replaced, scorer can now see corrections
+
+**Why the 0 vs 0 was structural:** the post-hoc metric only scores a user
+message that follows the final `## Summary`, or a continuation's first
+message. On an auto-prompt-driven host both positions are always filled by
+machine-written text (the `## 1. Thread Summary` handoff, the context-overflow
+summary prompt), and none of that text matches a correction pattern. The
+human corrections that do exist ("fix it", "still lock", "i still not see
+resource selector") land mid-thread after ordinary replies, where the metric
+never looked. Waiting for 20 ON chains would have kept reading 0 vs 0, so the
+fallback named above was taken now instead of after 8 more chains.
+
+**Scorer changes (`script/verdict_scorer.py`):**
+- *Human correction rate:* corrective human messages anywhere in the chain,
+  per chain with at least one human turn. A user-role message is human
+  unless it starts with a known machine prefix (handoff, overflow-summary
+  prompt, cutoff-resume prompt, `<agent_message` relay, slash command, pasted
+  `## Summary`) or exceeds 1000 chars (subagent briefs, pasted reports).
+  Patterns gained `\bstill\b`, lost `one more` (it reads as a new request),
+  and `fix` no longer matches after "we" ("shall we fix X?" proposes new work).
+- *Cited-commit resolution rate:* backticked hashes in summary messages,
+  resolved with `git cat-file --batch-check` against every repo under
+  `~/git` (`--repos-root` to override). An objective summary-quality check
+  that needs no LLM judge. Unresolved means not on this host (4090-only
+  repos, rebased and pruned), not proven hallucinated, but it is comparable
+  across cohorts.
+
+| cohort | chains | human correction rate (auto) | hand-labelled | cited commits resolved | avg chain tokens in / out |
+|---|---|---|---|---|---|
+| ON | 12 | 25.0% (3/12) | 16.7% (2/12) | 95.8% (250/261) | 3.81 M / 317 k |
+| OFF | 36 (18 with human turns) | 27.8% (5/18) | 22.2% (4/18) | 94.2% (179/190) | 1.23 M / 75 k |
+
+Hand labels drop one automatic hit per cohort: ON `6974c461` (a "we still…"
+context line in a new request) and OFF `beb62b26` (a pasted agent report).
+
+**Verdict: NOT GOAT on current evidence; feature stays default-on.**
+- Quality: ON is better on both measures but within noise: 2 vs 4 corrected
+  chains (25% relative, below the >= 30% bar even taken at face value) and
+  +1.6 pp commit resolution. No measurable quality gain.
+- Cost: ON chains use 3.1× input / 4.2× output tokens, over the <= 2× gate.
+  Partly confounded (verdict gets clicked on bigger tasks), so this bounds
+  the overhead from above rather than measuring it.
+- Default stays on because the gate was never about autonomous spend: the
+  feature runs only when the user clicks it, so "demote" would only hide a
+  button. Revisit at >= 20 ON chains with the two new measures; demote only
+  if ON is then *worse* on corrections or commit resolution.
