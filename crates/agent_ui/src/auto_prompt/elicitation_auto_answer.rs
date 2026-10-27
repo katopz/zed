@@ -322,7 +322,7 @@ pub fn arm_if_enabled(
         return;
     }
 
-    let auto_prompt_enabled = thread_view.read(cx).auto_prompt_enabled;
+    let auto_prompt_enabled = thread_view.read(cx).fork.auto_prompt_enabled;
     if !auto_prompt_enabled {
         log::debug!(
             "[auto_prompt::elicitation_auto_answer] skipping — auto-prompt disabled for this thread"

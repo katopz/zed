@@ -500,12 +500,12 @@ pub fn init(cx: &mut App) {
                     if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
                         panel.update(cx, |panel, cx| {
                             if let Some(tv) = panel.active_thread_view(cx) {
-                                let new_enabled = !tv.read(cx).auto_prompt_enabled;
+                                let new_enabled = !tv.read(cx).fork.auto_prompt_enabled;
                                 tv.update(cx, |tv, cx| {
-                                    tv.auto_prompt_enabled = new_enabled;
+                                    tv.fork.auto_prompt_enabled = new_enabled;
                                     log::info!(
                                         "auto_prompt: {}",
-                                        if tv.auto_prompt_enabled {
+                                        if tv.fork.auto_prompt_enabled {
                                             "enabled"
                                         } else {
                                             "disabled"

@@ -2146,8 +2146,8 @@ impl ConversationView {
                         // New entry = the worker produced output. Bump the
                         // watchdog activity counter so active streaming never
                         // triggers a false stuck-thread timeout.
-                        let next_gen = active.watchdog_activity_gen.get().wrapping_add(1);
-                        active.watchdog_activity_gen.set(next_gen);
+                        let next_gen = active.fork.watchdog_activity_gen.get().wrapping_add(1);
+                        active.fork.watchdog_activity_gen.set(next_gen);
                     });
                 }
                 // If this is a subagent entry, the parent thread is also
@@ -2174,8 +2174,8 @@ impl ConversationView {
                         active.auto_expand_streaming_thought(cx);
                         // Streaming update = the worker is active. Bump the
                         // watchdog activity counter.
-                        let next_gen = active.watchdog_activity_gen.get().wrapping_add(1);
-                        active.watchdog_activity_gen.set(next_gen);
+                        let next_gen = active.fork.watchdog_activity_gen.get().wrapping_add(1);
+                        active.fork.watchdog_activity_gen.set(next_gen);
                         active.sync_generating_indicator(cx);
                     });
                 }
@@ -2198,8 +2198,8 @@ impl ConversationView {
                 // Bump the parent's watchdog activity counter.
                 if let Some(tv) = self.thread_view(&session_id) {
                     tv.update(cx, |tv, _cx| {
-                        let next_gen = tv.watchdog_activity_gen.get().wrapping_add(1);
-                        tv.watchdog_activity_gen.set(next_gen);
+                        let next_gen = tv.fork.watchdog_activity_gen.get().wrapping_add(1);
+                        tv.fork.watchdog_activity_gen.set(next_gen);
                     });
                 }
                 if let Some(subagent) = thread.read(cx).subagent(subagent_session_id).cloned() {
@@ -2392,7 +2392,7 @@ impl ConversationView {
                     // same resolution principle as the elicitation arm above).
                     let auto_prompt_enabled = self
                         .thread_view(&session_id)
-                        .is_some_and(|tv| tv.read(cx).auto_prompt_enabled);
+                        .is_some_and(|tv| tv.read(cx).fork.auto_prompt_enabled);
                     if !auto_prompt_enabled {
                         // Every silent skip here is an undebuggable dead chain;
                         // always name the reason in the log.
@@ -2430,7 +2430,7 @@ impl ConversationView {
                                 // thread is focused (issue 018 follow-up).
                                 if let Some(stopped_view) = self.thread_view(&session_id) {
                                     stopped_view.update(cx, |active, cx| {
-                                        active._auto_prompt_task = Some(task);
+                                        active.fork._auto_prompt_task = Some(task);
                                         cx.notify();
                                     });
                                 }
@@ -2497,7 +2497,7 @@ impl ConversationView {
                     // the notification wording and whether the chain continues.
                     let auto_prompt_enabled = self
                         .thread_view(&session_id)
-                        .is_some_and(|tv| tv.read(cx).auto_prompt_enabled);
+                        .is_some_and(|tv| tv.read(cx).fork.auto_prompt_enabled);
                     let (notification, icon) = match (&session_limit, auto_prompt_enabled) {
                         (Some(limit), true) => (
                             format!(
@@ -2553,9 +2553,9 @@ impl ConversationView {
                         // queued entry was dispatched from this view.
                         if let Some(active) = self.active_thread() {
                             active.update(cx, |active, cx| {
-                                if active._auto_prompt_task.is_some() {
-                                    active._auto_prompt_task = None;
-                                    active.auto_prompt_state =
+                                if active.fork._auto_prompt_task.is_some() {
+                                    active.fork._auto_prompt_task = None;
+                                    active.fork.auto_prompt_state =
                                         crate::auto_prompt::AutoPromptState::Idle;
                                     cx.notify();
                                 }
@@ -2564,7 +2564,7 @@ impl ConversationView {
                     } else {
                         let auto_prompt_enabled = self
                             .thread_view(&session_id)
-                            .is_some_and(|tv| tv.read(cx).auto_prompt_enabled);
+                            .is_some_and(|tv| tv.read(cx).fork.auto_prompt_enabled);
                         let has_in_progress = thread.read(cx).has_in_progress_tool_calls();
                         if has_in_progress {
                             log::info!(
@@ -2576,7 +2576,7 @@ impl ConversationView {
                             // Error events can fire alongside Stopped (e.g. MaxTokens emits both).
                             let already_has_task = self
                                 .thread_view(&session_id)
-                                .is_some_and(|tv| tv.read(cx)._auto_prompt_task.is_some());
+                                .is_some_and(|tv| tv.read(cx).fork._auto_prompt_task.is_some());
                             if already_has_task {
                                 log::info!(
                                     "[auto_prompt] Error event: auto_prompt task already set by Stopped handler, not overriding"
@@ -2595,7 +2595,7 @@ impl ConversationView {
                                 // the Stopped path (issue 018 follow-up).
                                 if let Some(errored_view) = self.thread_view(&session_id) {
                                     errored_view.update(cx, |active, cx| {
-                                        active._auto_prompt_task = Some(task);
+                                        active.fork._auto_prompt_task = Some(task);
                                         cx.notify();
                                     });
                                 }
@@ -2738,8 +2738,8 @@ impl ConversationView {
         };
         if let Some(parent_tv) = self.thread_view(&parent_session_id) {
             parent_tv.update(cx, |tv, _cx| {
-                let next_gen = tv.watchdog_activity_gen.get().wrapping_add(1);
-                tv.watchdog_activity_gen.set(next_gen);
+                let next_gen = tv.fork.watchdog_activity_gen.get().wrapping_add(1);
+                tv.fork.watchdog_activity_gen.set(next_gen);
             });
         }
     }

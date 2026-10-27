@@ -676,7 +676,7 @@ async fn test_queued_message_takes_priority_over_auto_prompt(cx: &mut TestAppCon
 
     // Enable auto_prompt
     active_thread(&conversation_view, cx).update(cx, |thread, cx| {
-        thread.auto_prompt_enabled = true;
+        thread.fork.auto_prompt_enabled = true;
         cx.notify();
     });
 
@@ -726,7 +726,7 @@ async fn test_queued_message_takes_priority_over_auto_prompt(cx: &mut TestAppCon
 
     // Verify: no auto_prompt task was started
     let has_auto_prompt_task = active_thread(&conversation_view, cx)
-        .read_with(cx, |thread, _cx| thread._auto_prompt_task.is_some());
+        .read_with(cx, |thread, _cx| thread.fork._auto_prompt_task.is_some());
     assert!(
         !has_auto_prompt_task,
         "auto_prompt task should NOT have been created when queued message exists"
@@ -796,7 +796,7 @@ async fn test_direct_message_cancels_auto_prompt_task(cx: &mut TestAppContext) {
 
     // Enable auto_prompt
     active_thread(&conversation_view, cx).update(cx, |thread, cx| {
-        thread.auto_prompt_enabled = true;
+        thread.fork.auto_prompt_enabled = true;
         cx.notify();
     });
 
@@ -831,7 +831,7 @@ async fn test_direct_message_cancels_auto_prompt_task(cx: &mut TestAppContext) {
 
     // Verify: auto_prompt task was cancelled by the direct send
     let has_auto_prompt_task = active_thread(&conversation_view, cx)
-        .read_with(cx, |thread, _cx| thread._auto_prompt_task.is_some());
+        .read_with(cx, |thread, _cx| thread.fork._auto_prompt_task.is_some());
     assert!(
         !has_auto_prompt_task,
         "auto_prompt task should be cancelled after user sends a direct message"
@@ -840,7 +840,7 @@ async fn test_direct_message_cancels_auto_prompt_task(cx: &mut TestAppContext) {
     // Verify: auto_prompt state reset to Idle
     let is_idle = active_thread(&conversation_view, cx).read_with(cx, |thread, _cx| {
         matches!(
-            thread.auto_prompt_state,
+            thread.fork.auto_prompt_state,
             crate::auto_prompt::AutoPromptState::Idle
         )
     });
@@ -894,7 +894,7 @@ async fn test_watchdog_halts_stuck_thread(cx: &mut TestAppContext) {
 
     // Enable auto_prompt — the watchdog only arms when it is on.
     active_thread(&conversation_view, cx).update(cx, |view, cx| {
-        view.auto_prompt_enabled = true;
+        view.fork.auto_prompt_enabled = true;
         cx.notify();
     });
 
@@ -907,9 +907,12 @@ async fn test_watchdog_halts_stuck_thread(cx: &mut TestAppContext) {
     cx.run_until_parked();
 
     // Pre-timeout: thread is stuck Generating and the watchdog is armed.
-    let (status, watchdog_armed) = active_thread(&conversation_view, cx)
-        .read_with(cx, |view, cx| {
-            (view.thread.read(cx).status(), view._watchdog_task.is_some())
+    let (status, watchdog_armed) =
+        active_thread(&conversation_view, cx).read_with(cx, |view, cx| {
+            (
+                view.thread.read(cx).status(),
+                view.fork._watchdog_task.is_some(),
+            )
         });
     assert_eq!(status, acp_thread::ThreadStatus::Generating);
     assert!(watchdog_armed, "watchdog should be armed while generating");
@@ -984,7 +987,7 @@ async fn test_watchdog_resets_across_generations(cx: &mut TestAppContext) {
 
     // Enable auto_prompt so the watchdog arms.
     active_thread(&conversation_view, cx).update(cx, |view, cx| {
-        view.auto_prompt_enabled = true;
+        view.fork.auto_prompt_enabled = true;
         cx.notify();
     });
 
@@ -997,9 +1000,12 @@ async fn test_watchdog_resets_across_generations(cx: &mut TestAppContext) {
 
     // Generation 1 ran: thread is back to Idle and the watchdog was
     // cancelled by session_id via the Stopped handler.
-    let (status, watchdog_armed) = active_thread(&conversation_view, cx)
-        .read_with(cx, |view, cx| {
-            (view.thread.read(cx).status(), view._watchdog_task.is_some())
+    let (status, watchdog_armed) =
+        active_thread(&conversation_view, cx).read_with(cx, |view, cx| {
+            (
+                view.thread.read(cx).status(),
+                view.fork._watchdog_task.is_some(),
+            )
         });
     assert_eq!(
         status,
@@ -1023,9 +1029,12 @@ async fn test_watchdog_resets_across_generations(cx: &mut TestAppContext) {
     // a task from generation 1 whose `started_at` predated this send.
     // After the fix, `arm_watchdog` drops the stale task (already None here)
     // and creates a fresh one with `Instant::now()`.
-    let (status, watchdog_armed) = active_thread(&conversation_view, cx)
-        .read_with(cx, |view, cx| {
-            (view.thread.read(cx).status(), view._watchdog_task.is_some())
+    let (status, watchdog_armed) =
+        active_thread(&conversation_view, cx).read_with(cx, |view, cx| {
+            (
+                view.thread.read(cx).status(),
+                view.fork._watchdog_task.is_some(),
+            )
         });
     assert_eq!(
         status,
@@ -1066,7 +1075,7 @@ async fn test_watchdog_does_not_fire_during_active_stream(cx: &mut TestAppContex
     add_to_workspace(conversation_view.clone(), cx);
 
     active_thread(&conversation_view, cx).update(cx, |view, cx| {
-        view.auto_prompt_enabled = true;
+        view.fork.auto_prompt_enabled = true;
         cx.notify();
     });
 
@@ -1082,9 +1091,12 @@ async fn test_watchdog_does_not_fire_during_active_stream(cx: &mut TestAppContex
         .read_with(cx, |view, cx| view.thread.read(cx).session_id().clone());
 
     // Sanity: thread is generating, watchdog armed.
-    let (status, watchdog_armed) = active_thread(&conversation_view, cx)
-        .read_with(cx, |view, cx| {
-            (view.thread.read(cx).status(), view._watchdog_task.is_some())
+    let (status, watchdog_armed) =
+        active_thread(&conversation_view, cx).read_with(cx, |view, cx| {
+            (
+                view.thread.read(cx).status(),
+                view.fork._watchdog_task.is_some(),
+            )
         });
     assert_eq!(status, acp_thread::ThreadStatus::Generating);
     assert!(watchdog_armed);

@@ -801,21 +801,7 @@ pub struct ThreadView {
     pub token_limit_callout_dismissed: bool,
     pub last_token_limit_telemetry: Option<acp_thread::TokenUsageRatio>,
     thread_feedback: ThreadFeedbackState,
-    pub auto_prompt_enabled: bool,
-    pub auto_prompt_state: crate::auto_prompt::AutoPromptState,
-    pub _auto_prompt_task: Option<gpui::Task<()>>,
-    pub _auto_prompt_retry_data: Option<auto_prompt::LlmCallData>,
-    /// Stuck-thread watchdog task. Started when the thread enters Generating,
-    /// cancelled (dropped) when the thread stops. See `auto_prompt::start_watchdog`.
-    pub _watchdog_task: Option<gpui::Task<()>>,
-    /// A HALTed watchdog moves here so the Stopped it triggers can't cancel its own recovery.
-    pub _watchdog_recovery_task: Option<gpui::Task<()>>,
-    /// Shared watchdog activity generation counter. Incremented on every
-    /// send and every received entry update. The watchdog task captures the
-    /// value at sleep start and re-sleeps if it changed when it wakes —
-    /// meaning active streaming resets the stuck-thread clock without
-    /// depending on wall-clock time (which breaks under the mock test clock).
-    pub watchdog_activity_gen: Rc<Cell<u64>>,
+    pub fork: ForkThreadViewState,
     pub list_state: ListState,
     pub session_capabilities: SharedSessionCapabilities,
     pub expanded_tool_call_raw_inputs: HashSet<acp_v2::ToolCallId>,
@@ -862,26 +848,6 @@ pub struct ThreadView {
     pending_sandbox_status_key: Option<SandboxStatusKey>,
     pub multi_root_callout_dismissed: bool,
     pub generating_indicator_in_list: bool,
-    /// Whether the mouse is currently hovering over the conversation message
-    /// list. While generating, markdown bodies are non-interactive unless this
-    /// is true — saving the per-frame hit-testing / hover / selection cost on
-    /// large streamed bodies, while still allowing the user to select/copy text
-    /// by moving the mouse into the panel.
-    pub conversation_hovered: bool,
-    /// Whether the conversation list is currently being scrolled (via scroll
-    /// wheel or drag). While scrolling, markdown bodies are forced
-    /// non-interactive even if the mouse is over the panel — the user is
-    /// navigating, not selecting text, and skipping hit-testing during scroll
-    /// frames keeps them smooth.
-    pub is_scrolling: bool,
-    /// Debounce task that clears `is_scrolling` after a short period of no
-    /// scroll-wheel activity.
-    pub _scroll_clear_task: Option<Task<()>>,
-    /// 1s tick that re-renders the K1–K4 key-status chips while any slot is
-    /// backed off, so the drain ring + tooltip countdown stay live. Idle
-    /// otherwise (no chips in backoff → no task). See
-    /// `render_key_status_buttons`.
-    key_backoff_tick_task: Option<Task<()>>,
     pub skill_loading_issues: Vec<SkillLoadingIssue>,
     /// Issues the user has explicitly dismissed. Each entry is matched against
     /// emitted issues by full equality; when an issue no longer appears in the
@@ -1403,13 +1369,7 @@ impl ThreadView {
             token_limit_callout_dismissed: false,
             last_token_limit_telemetry: None,
             thread_feedback: Default::default(),
-            auto_prompt_enabled: should_auto_prompt,
-            auto_prompt_state: Default::default(),
-            _auto_prompt_task: None,
-            _auto_prompt_retry_data: None,
-            _watchdog_task: None,
-            _watchdog_recovery_task: None,
-            watchdog_activity_gen: Rc::new(Cell::new(0)),
+            fork: ForkThreadViewState::new(should_auto_prompt),
             expanded_tool_call_raw_inputs: HashSet::default(),
             collapsed_sandbox_authorization_details: HashSet::default(),
             collapsed_sandbox_network_details: HashSet::default(),
@@ -1446,10 +1406,6 @@ impl ThreadView {
             pending_sandbox_status_key: None,
             multi_root_callout_dismissed: false,
             generating_indicator_in_list: false,
-            conversation_hovered: false,
-            is_scrolling: false,
-            _scroll_clear_task: None,
-            key_backoff_tick_task: None,
             skill_loading_issues: Vec::new(),
             dismissed_skill_loading_issues: HashSet::default(),
             thread_search_bar: None,
@@ -2439,14 +2395,14 @@ impl ThreadView {
         // Bump the watchdog activity counter immediately on send — the
         // async task below may take time to resolve contents, and we don't
         // want a stale watchdog to fire during that gap.
-        let next_gen = self.watchdog_activity_gen.get().wrapping_add(1);
-        self.watchdog_activity_gen.set(next_gen);
+        let next_gen = self.fork.watchdog_activity_gen.get().wrapping_add(1);
+        self.fork.watchdog_activity_gen.set(next_gen);
 
         // Cancel any running auto_prompt task — user input takes priority.
-        if self._auto_prompt_task.is_some() {
+        if self.fork._auto_prompt_task.is_some() {
             log::info!("[auto_prompt] Cancelling auto_prompt: user message takes priority");
-            self._auto_prompt_task = None;
-            self.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;
+            self.fork._auto_prompt_task = None;
+            self.fork.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;
             let cancelled_session_id = self.thread.read(cx).session_id().to_string();
             auto_prompt::reset_iteration_with_session(&cancelled_session_id);
         }
@@ -13753,8 +13709,8 @@ impl Render for ThreadView {
             // non-interactive (cheap prepaint) while generating, and only
             // enable hit-testing/selection when the user is actually hovering.
             .on_hover(cx.listener(|this, hovered, _window, cx| {
-                if this.conversation_hovered != *hovered {
-                    this.conversation_hovered = *hovered;
+                if this.fork.conversation_hovered != *hovered {
+                    this.fork.conversation_hovered = *hovered;
                     cx.notify();
                 }
             }))
@@ -13762,14 +13718,14 @@ impl Render for ThreadView {
             // bodies non-interactive so scroll frames stay smooth. The flag is
             // cleared by a debounce task 200ms after the last scroll-wheel event.
             .on_scroll(cx.listener(|this, _event, _window, cx| {
-                let was_scrolling = this.is_scrolling;
-                this.is_scrolling = true;
-                this._scroll_clear_task = Some(cx.spawn(async move |this, cx| {
+                let was_scrolling = this.fork.is_scrolling;
+                this.fork.is_scrolling = true;
+                this.fork._scroll_clear_task = Some(cx.spawn(async move |this, cx| {
                     cx.background_executor()
                         .timer(Duration::from_millis(200))
                         .await;
                     let _ = this.update(cx, |this, cx| {
-                        this.is_scrolling = false;
+                        this.fork.is_scrolling = false;
                         cx.notify();
                     });
                 }));

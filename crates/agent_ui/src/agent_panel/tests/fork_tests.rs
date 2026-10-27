@@ -256,7 +256,7 @@ async fn test_loading_contents_thread_not_cleaned_up(cx: &mut TestAppContext) {
             .root_thread_view()
             .expect("thread B should be connected");
         thread_view.update(cx, |tv, _cx| {
-            tv._auto_prompt_task = None;
+            tv.fork._auto_prompt_task = None;
             tv.is_loading_contents = true;
         });
     });
@@ -381,7 +381,7 @@ async fn test_auto_prompt_task_thread_is_cleanable(cx: &mut TestAppContext) {
             .expect("thread B connected");
         thread_view.update(cx, |tv, cx| {
             tv.is_loading_contents = false;
-            tv._auto_prompt_task = Some(cx.background_executor().spawn(async {
+            tv.fork._auto_prompt_task = Some(cx.background_executor().spawn(async {
                 std::future::pending::<()>().await;
             }));
         });

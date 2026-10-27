@@ -472,6 +472,56 @@ pub(super) fn render_continue_subagent_button(
     )
 }
 
+/// Fork-owned `ThreadView` state, kept in one field so upstream additions to
+/// the struct and its constructor don't conflict with it.
+#[derive(Default)]
+pub struct ForkThreadViewState {
+    pub auto_prompt_enabled: bool,
+    pub auto_prompt_state: crate::auto_prompt::AutoPromptState,
+    pub _auto_prompt_task: Option<gpui::Task<()>>,
+    pub _auto_prompt_retry_data: Option<auto_prompt::LlmCallData>,
+    /// Stuck-thread watchdog task. Started when the thread enters Generating,
+    /// cancelled (dropped) when the thread stops. See `auto_prompt::start_watchdog`.
+    pub _watchdog_task: Option<gpui::Task<()>>,
+    /// A HALTed watchdog moves here so the Stopped it triggers can't cancel its own recovery.
+    pub _watchdog_recovery_task: Option<gpui::Task<()>>,
+    /// Shared watchdog activity generation counter. Incremented on every
+    /// send and every received entry update. The watchdog task captures the
+    /// value at sleep start and re-sleeps if it changed when it wakes —
+    /// meaning active streaming resets the stuck-thread clock without
+    /// depending on wall-clock time (which breaks under the mock test clock).
+    pub watchdog_activity_gen: Rc<Cell<u64>>,
+    /// Whether the mouse is currently hovering over the conversation message
+    /// list. While generating, markdown bodies are non-interactive unless this
+    /// is true — saving the per-frame hit-testing / hover / selection cost on
+    /// large streamed bodies, while still allowing the user to select/copy text
+    /// by moving the mouse into the panel.
+    pub conversation_hovered: bool,
+    /// Whether the conversation list is currently being scrolled (via scroll
+    /// wheel or drag). While scrolling, markdown bodies are forced
+    /// non-interactive even if the mouse is over the panel — the user is
+    /// navigating, not selecting text, and skipping hit-testing during scroll
+    /// frames keeps them smooth.
+    pub is_scrolling: bool,
+    /// Debounce task that clears `is_scrolling` after a short period of no
+    /// scroll-wheel activity.
+    pub _scroll_clear_task: Option<Task<()>>,
+    /// 1s tick that re-renders the K1–K4 key-status chips while any slot is
+    /// backed off, so the drain ring + tooltip countdown stay live. Idle
+    /// otherwise (no chips in backoff → no task). See
+    /// `render_key_status_buttons`.
+    pub key_backoff_tick_task: Option<Task<()>>,
+}
+
+impl ForkThreadViewState {
+    pub(super) fn new(auto_prompt_enabled: bool) -> Self {
+        Self {
+            auto_prompt_enabled,
+            ..Self::default()
+        }
+    }
+}
+
 /// Fork follow-up work for one `retry_generation` call, run once the retried
 /// submission settles.
 pub(super) struct RetryHooks {
@@ -932,9 +982,9 @@ impl ThreadView {
     /// stops normally — the watchdog is no longer needed and its timer should
     /// not fire on a thread that has already recovered.
     pub fn cancel_watchdog(&mut self) {
-        if self._watchdog_task.is_some() {
+        if self.fork._watchdog_task.is_some() {
             log::info!("[auto_prompt::watchdog] Cancelling watchdog: thread stopped normally");
-            self._watchdog_task = None;
+            self.fork._watchdog_task = None;
         }
     }
 
@@ -952,9 +1002,9 @@ impl ThreadView {
         // because a prior generation may have left one behind (e.g. the user
         // toggled auto_prompt off mid-generation). Without this, the stale task
         // survives with its old timer and fires false timeouts.
-        self._watchdog_task = None;
+        self.fork._watchdog_task = None;
 
-        if !self.auto_prompt_enabled {
+        if !self.fork.auto_prompt_enabled {
             return;
         }
         let Some(server) = self.server_view.upgrade() else {
@@ -963,11 +1013,11 @@ impl ThreadView {
         if let Some(task) = crate::auto_prompt::start_watchdog(
             self.thread.downgrade(),
             server.downgrade(),
-            self.watchdog_activity_gen.clone(),
+            self.fork.watchdog_activity_gen.clone(),
             window,
             cx,
         ) {
-            self._watchdog_task = Some(task);
+            self.fork._watchdog_task = Some(task);
         }
     }
 
@@ -1154,9 +1204,9 @@ impl ThreadView {
             .0
             .iter()
             .any(|status| key_slot_ring(status).is_some())
-            && self.key_backoff_tick_task.is_none()
+            && self.fork.key_backoff_tick_task.is_none()
         {
-            self.key_backoff_tick_task = Some(cx.spawn(async move |this, cx| {
+            self.fork.key_backoff_tick_task = Some(cx.spawn(async move |this, cx| {
                 let mut interval = Duration::from_secs(1);
                 loop {
                     cx.background_executor().timer(interval).await;
@@ -1193,7 +1243,7 @@ impl ThreadView {
                             // this the completed Task handle would sit in the
                             // field forever and block any respawn.
                             let _ = this.update(cx, |this, _| {
-                                this.key_backoff_tick_task = None;
+                                this.fork.key_backoff_tick_task = None;
                             });
                             break;
                         }
@@ -1389,18 +1439,18 @@ impl ThreadView {
     }
 
     pub(super) fn render_auto_prompt_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let enabled = self.auto_prompt_enabled;
+        let enabled = self.fork.auto_prompt_enabled;
 
         let is_processing = matches!(
-            self.auto_prompt_state,
+            self.fork.auto_prompt_state,
             crate::auto_prompt::AutoPromptState::Processing
         );
         let is_failed = matches!(
-            self.auto_prompt_state,
+            self.fork.auto_prompt_state,
             crate::auto_prompt::AutoPromptState::Failed(_)
         );
 
-        let failed_error_message = match &self.auto_prompt_state {
+        let failed_error_message = match &self.fork.auto_prompt_state {
             crate::auto_prompt::AutoPromptState::Failed(msg) => Some(msg.clone()),
             _ => None,
         };
@@ -1581,18 +1631,18 @@ impl ThreadView {
         cx: &mut Context<Self>,
     ) {
         let is_processing = matches!(
-            self.auto_prompt_state,
+            self.fork.auto_prompt_state,
             crate::auto_prompt::AutoPromptState::Processing
         );
         let is_failed = matches!(
-            self.auto_prompt_state,
+            self.fork.auto_prompt_state,
             crate::auto_prompt::AutoPromptState::Failed(_)
         );
 
         if is_processing {
             log::info!("[auto_prompt] Cancelling auto-prompt processing");
-            self._auto_prompt_task = None;
-            self.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;
+            self.fork._auto_prompt_task = None;
+            self.fork.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;
             let session_id = self.thread.read(cx).session_id().to_string();
             auto_prompt::reset_iteration_with_session(&session_id);
             cx.notify();
@@ -1600,15 +1650,15 @@ impl ThreadView {
         }
         if is_failed {
             log::info!("[auto_prompt] Manual retry triggered by user");
-            if let Some(retry_data) = self._auto_prompt_retry_data.take() {
+            if let Some(retry_data) = self.fork._auto_prompt_retry_data.take() {
                 let retry_data_for_restore = retry_data.clone();
                 auto_prompt::reset_llm_failure_count(); // Reset counter for fresh retry
-                self.auto_prompt_state = crate::auto_prompt::AutoPromptState::Processing;
+                self.fork.auto_prompt_state = crate::auto_prompt::AutoPromptState::Processing;
                 cx.notify();
 
                 let conversation_view = self.server_view.clone();
 
-                self._auto_prompt_task = Some(cx.spawn_in(window, async move |_this, cx| {
+                self.fork._auto_prompt_task = Some(cx.spawn_in(window, async move |_this, cx| {
                     let thread_weak = conversation_view
                         .update_in(cx, |cv, _window, _cx| {
                             cv.active_thread()
@@ -1631,7 +1681,7 @@ impl ThreadView {
                             if tv
                                 .read_with(cx, |tv, _| {
                                     !matches!(
-                                        tv.auto_prompt_state,
+                                        tv.fork.auto_prompt_state,
                                         crate::auto_prompt::AutoPromptState::Processing
                                     )
                                 })
@@ -1652,8 +1702,8 @@ impl ThreadView {
                             auto_prompt::reset_llm_failure_count();
                             if let Some(ref tv) = thread_weak {
                                 if let Err(err) = tv.update(cx, |tv, cx| {
-                                    tv.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;
-                                    tv._auto_prompt_retry_data = None;
+                                    tv.fork.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;
+                                    tv.fork._auto_prompt_retry_data = None;
                                     cx.notify();
                                 }) {
                                     log::warn!("[auto_prompt] failed to reset state after retry: {err}");
@@ -1676,8 +1726,8 @@ impl ThreadView {
                             auto_prompt::reset_llm_failure_count();
                             if let Some(ref tv) = thread_weak {
                                 if let Err(err) = tv.update(cx, |tv, cx| {
-                                    tv.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;
-                                    tv._auto_prompt_retry_data = None;
+                                    tv.fork.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;
+                                    tv.fork._auto_prompt_retry_data = None;
                                     cx.notify();
                                 }) {
                                     log::warn!("[auto_prompt] failed to reset state on retry stop: {err}");
@@ -1689,8 +1739,8 @@ impl ThreadView {
                             auto_prompt::reset_llm_failure_count();
                             if let Some(ref tv) = thread_weak {
                                 if let Err(err) = tv.update(cx, |tv, cx| {
-                                    tv.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;
-                                    tv._auto_prompt_retry_data = None;
+                                    tv.fork.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;
+                                    tv.fork._auto_prompt_retry_data = None;
                                     cx.notify();
                                 }) {
                                     log::warn!("[auto_prompt] failed to reset state on retry context overflow: {err}");
@@ -1716,8 +1766,8 @@ impl ThreadView {
                             auto_prompt::increment_llm_failure_count();
                             if let Some(ref tv) = thread_weak {
                                 if let Err(err) = tv.update(cx, |tv, cx| {
-                                    tv.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;
-                                    tv._auto_prompt_retry_data = None;
+                                    tv.fork.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;
+                                    tv.fork._auto_prompt_retry_data = None;
                                     cx.notify();
                                 }) {
                                     log::warn!("[auto_prompt] failed to reset state on retry after backoff: {err}");
@@ -1734,8 +1784,8 @@ impl ThreadView {
                             auto_prompt::reset_llm_failure_count();
                             if let Some(ref tv) = thread_weak {
                                 if let Err(err) = tv.update(cx, |tv, cx| {
-                                    tv.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;
-                                    tv._auto_prompt_retry_data = None;
+                                    tv.fork.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;
+                                    tv.fork._auto_prompt_retry_data = None;
                                     cx.notify();
                                 }) {
                                     log::warn!("[auto_prompt] failed to reset state on retry clarify: {err}");
@@ -1757,8 +1807,8 @@ impl ThreadView {
                             // Retry failed again - set back to Failed state and restore retry data
                             if let Some(ref tv) = thread_weak {
                                 if let Err(update_err) = tv.update(cx, |tv, cx| {
-                                    tv.auto_prompt_state = crate::auto_prompt::AutoPromptState::Failed(format!("{err:#}"));
-                                    tv._auto_prompt_retry_data = Some(retry_data_for_restore);
+                                    tv.fork.auto_prompt_state = crate::auto_prompt::AutoPromptState::Failed(format!("{err:#}"));
+                                    tv.fork._auto_prompt_retry_data = Some(retry_data_for_restore);
                                     cx.notify();
                                 }) {
                                     log::warn!("[auto_prompt] failed to set Failed state after retry: {update_err}");
@@ -1772,17 +1822,17 @@ impl ThreadView {
                 }));
             } else {
                 log::warn!("[auto_prompt] No retry data available, cannot retry");
-                self.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;
+                self.fork.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;
                 cx.notify();
             }
             return;
         }
 
-        let new_enabled = !self.auto_prompt_enabled;
-        self.auto_prompt_enabled = new_enabled;
+        let new_enabled = !self.fork.auto_prompt_enabled;
+        self.fork.auto_prompt_enabled = new_enabled;
         log::info!(
             "auto_prompt: {}",
-            if self.auto_prompt_enabled {
+            if self.fork.auto_prompt_enabled {
                 "enabled"
             } else {
                 "disabled"
@@ -2412,9 +2462,9 @@ impl ThreadView {
                     );
                     if let Some(tv) = thread_view_weak.upgrade() {
                         tv.update(cx, |tv, cx| {
-                            tv.auto_prompt_enabled = true;
+                            tv.fork.auto_prompt_enabled = true;
                             if let Some(task) = task {
-                                tv._auto_prompt_task = Some(task);
+                                tv.fork._auto_prompt_task = Some(task);
                             }
                             cx.notify();
                         });
@@ -2488,7 +2538,7 @@ impl ThreadView {
         cx: &App,
     ) -> MarkdownStyle {
         if self.thread.read(cx).status() == ThreadStatus::Generating
-            && (!self.conversation_hovered || self.is_scrolling)
+            && (!self.fork.conversation_hovered || self.fork.is_scrolling)
         {
             style.prevent_mouse_interaction = true;
         }

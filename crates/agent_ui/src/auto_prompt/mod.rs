@@ -1020,7 +1020,7 @@ fn is_cancelled(
 ) -> bool {
     thread_view
         .read_with(cx, |tv, _| {
-            !matches!(tv.auto_prompt_state, AutoPromptState::Processing)
+            !matches!(tv.fork.auto_prompt_state, AutoPromptState::Processing)
         })
         .unwrap_or(true)
 }
@@ -1181,7 +1181,7 @@ fn run_auto_prompt(
     // inner delay/LLM tasks, which already manage the state themselves).
     if let Some(active) = conversation_view.active_thread() {
         active.update(cx, |tv, cx| {
-            tv.auto_prompt_state = AutoPromptState::Processing;
+            tv.fork.auto_prompt_state = AutoPromptState::Processing;
             cx.notify();
         });
     }
@@ -1280,7 +1280,7 @@ fn run_auto_prompt(
                     .update_in(cx, |cv, _window, cx| {
                         cv.active_thread().map(|tv| {
                             tv.update(cx, |tv, cx| {
-                                tv.auto_prompt_state = AutoPromptState::Processing;
+                                tv.fork.auto_prompt_state = AutoPromptState::Processing;
                                 cx.notify();
                             });
                             tv.downgrade()
@@ -1304,7 +1304,7 @@ fn run_auto_prompt(
 
                 if let Some(ref tv) = thread_weak {
                     if let Err(err) = tv.update(cx, |tv, cx| {
-                        tv.auto_prompt_state = AutoPromptState::Idle;
+                        tv.fork.auto_prompt_state = AutoPromptState::Idle;
                         cx.notify();
                     }) {
                         log::warn!("[auto_prompt] failed to reset state after delay: {err}");
@@ -1370,7 +1370,7 @@ fn run_auto_prompt(
                     .update_in(cx, |cv, _window, cx| {
                         cv.active_thread().map(|tv| {
                             tv.update(cx, |tv, cx| {
-                                tv.auto_prompt_state = AutoPromptState::Processing;
+                                tv.fork.auto_prompt_state = AutoPromptState::Processing;
                                 cx.notify();
                             });
                             tv.downgrade()
@@ -1564,8 +1564,8 @@ fn run_auto_prompt(
                             if let Err(err) = tv.update(cx, |tv, cx| {
                                 // Clear the task BEFORE dispatch so send_content() doesn't
                                 // see a stale task and reset iteration/verification counters.
-                                tv._auto_prompt_task = None;
-                                tv.auto_prompt_state = AutoPromptState::Idle;
+                                tv.fork._auto_prompt_task = None;
+                                tv.fork.auto_prompt_state = AutoPromptState::Idle;
                                 cx.notify();
                             }) {
                                 log::warn!("[auto_prompt] failed to reset state before dispatch: {err}");
@@ -1593,8 +1593,8 @@ fn run_auto_prompt(
                         auto_prompt::reset_llm_failure_count();
                         if let Some(ref tv) = thread_weak {
                             if let Err(err) = tv.update(cx, |tv, cx| {
-                                tv._auto_prompt_task = None;
-                                tv.auto_prompt_state = AutoPromptState::Idle;
+                                tv.fork._auto_prompt_task = None;
+                                tv.fork.auto_prompt_state = AutoPromptState::Idle;
                                 cx.notify();
                             }) {
                                 log::warn!("[auto_prompt] failed to reset state before context overflow dispatch: {err}");
@@ -1646,8 +1646,8 @@ fn run_auto_prompt(
                         auto_prompt::reset_llm_failure_count();
                         if let Some(ref tv) = thread_weak {
                             if let Err(err) = tv.update(cx, |tv, cx| {
-                                tv._auto_prompt_task = None;
-                                tv.auto_prompt_state = AutoPromptState::Idle;
+                                tv.fork._auto_prompt_task = None;
+                                tv.fork.auto_prompt_state = AutoPromptState::Idle;
                                 cx.notify();
                             }) {
                                 log::warn!(
@@ -1697,7 +1697,7 @@ fn run_auto_prompt(
                         auto_prompt::reset_llm_failure_count();
                         if let Some(ref tv) = thread_weak {
                             if let Err(err) = tv.update(cx, |tv, cx| {
-                                tv.auto_prompt_state = AutoPromptState::Idle;
+                                tv.fork.auto_prompt_state = AutoPromptState::Idle;
                                 cx.notify();
                             }) {
                                 log::warn!("[auto_prompt] failed to reset state on stop: {err}");
@@ -1842,7 +1842,7 @@ fn run_auto_prompt(
                         auto_prompt::reset_llm_failure_count();
                         if let Some(ref tv) = thread_weak {
                             if let Err(err) = tv.update(cx, |tv, cx| {
-                                tv.auto_prompt_state = AutoPromptState::Idle;
+                                tv.fork.auto_prompt_state = AutoPromptState::Idle;
                                 cx.notify();
                             }) {
                                 log::warn!("[auto_prompt] failed to reset state on unexpected RetryAfterBackoff: {err}");
@@ -1863,8 +1863,8 @@ fn run_auto_prompt(
                             );
                             if let Some(ref tv) = thread_weak {
                                 if let Err(update_err) = tv.update(cx, |tv, cx| {
-                                    tv._auto_prompt_task = None;
-                                    tv.auto_prompt_state = AutoPromptState::Idle;
+                                    tv.fork._auto_prompt_task = None;
+                                    tv.fork.auto_prompt_state = AutoPromptState::Idle;
                                     cx.notify();
                                 }) {
                                     log::warn!(
@@ -1885,9 +1885,9 @@ fn run_auto_prompt(
 
                         if let Some(ref tv) = thread_weak {
                             if let Err(update_err) = tv.update(cx, |tv, cx| {
-                                tv.auto_prompt_state =
+                                tv.fork.auto_prompt_state =
                                     AutoPromptState::Failed(error_message.clone());
-                                tv._auto_prompt_retry_data = Some(data.clone());
+                                tv.fork._auto_prompt_retry_data = Some(data.clone());
                                 cx.notify();
                             }) {
                                 log::warn!(
@@ -1940,8 +1940,8 @@ fn run_auto_prompt(
 fn reset_auto_prompt_state(conversation_view: &crate::ConversationView, cx: &mut gpui::App) {
     if let Some(tv) = conversation_view.active_thread() {
         tv.update(cx, |tv, cx| {
-            tv.auto_prompt_state = AutoPromptState::Idle;
-            tv._auto_prompt_task = None;
+            tv.fork.auto_prompt_state = AutoPromptState::Idle;
+            tv.fork._auto_prompt_task = None;
             cx.notify();
         });
     }
@@ -2192,7 +2192,8 @@ pub fn start_watchdog(
                     if let Err(error) = conversation_view.update(cx, |view, cx| {
                         if let Some(active) = view.active_thread() {
                             active.update(cx, |active, _cx| {
-                                active._watchdog_recovery_task = active._watchdog_task.take();
+                                active.fork._watchdog_recovery_task =
+                                    active.fork._watchdog_task.take();
                             });
                         }
                     }) {
@@ -2264,7 +2265,7 @@ pub fn start_watchdog(
                         // interfere with the new generation's lifecycle.
                         if let Some(active) = view.active_thread() {
                             active.update(cx, |active, cx| {
-                                active._watchdog_task = None;
+                                active.fork._watchdog_task = None;
                                 cx.notify();
                             });
                         }
