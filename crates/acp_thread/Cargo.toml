@@ -53,7 +53,7 @@ text.workspace = true
 ui.workspace = true
 url.workspace = true
 util.workspace = true
-uuid.workspace = true
+uuid = { workspace = true, features = ["v7"] }
 watch.workspace = true
 urlencoding.workspace = true
 
