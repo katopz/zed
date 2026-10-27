@@ -71,6 +71,7 @@ start any external agent. Close M3 freely; reopen and pick the thread from histo
 - [x] P1 e2e smoke (fake ACP agent): GUI killed after `step0`, turn finished `step5` detached, 2nd GUI got list + full replay
 - [x] P2 `detachable.rs` hook + shim (fallback-tested) + `work_remote` crate + menu item
 - [ ] P3 real e2e: M3 Zed → M5 over Tailscale with Claude/Codex ACP; close M3 mid-turn; reopen; verify history + live stream
+  - BLOCKED (2026-10-27, access): tailnet macOS hosts `amo` (100.111.186.76) refuses ssh (Remote Login off) and `bmo` (100.100.117.44) rejects M3's key. Needs owner: enable Remote Login on the M5 + add M3's `~/.ssh/id_ed25519.pub` to its `authorized_keys`
 - [ ] P3 verify Zed's reconnect flow calls `session/load` (not only `session/list`) for external agents on window restore
 - [ ] P4 native Zed agent as a backend: `zed-agentd attach -- eval-cli --acp` (NativeAgent served over ACP stdio, headless gpui) so the fork's native agent also runs detached
 - [ ] P4 live turn-state on reattach: synthesize a "turn still running" indicator (ACP has no turn-ended notification; today replay just keeps streaming)
