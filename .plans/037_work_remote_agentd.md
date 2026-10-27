@@ -1,5 +1,5 @@
 # 037 — Work Remote: GUI on M3, agents + compute detached on M5 (zed-agentd)
-Status: in progress — P0 sync + compile fallout fixed, P1 daemon + P2 hook/menu implemented, journal bench GOAT (−92% append); P3 on-host e2e with real agent pending
+Status: in progress — P0 sync + compile fallout fixed, P1 daemon + P2 hook/menu implemented, journal bench GOAT (−92% append), P4 journal gc done; P3 on-host e2e still blocked on M5 SSH access (owner)
 
 ## Goal
 
@@ -76,7 +76,7 @@ start any external agent. Close M3 freely; reopen and pick the thread from histo
 - [ ] P4 native Zed agent as a backend: `zed-agentd attach -- eval-cli --acp` (NativeAgent served over ACP stdio, headless gpui) so the fork's native agent also runs detached
 - [ ] P4 live turn-state on reattach: synthesize a "turn still running" indicator (ACP has no turn-ended notification; today replay just keeps streaming)
 - [ ] P4 auto-deploy `zed-agentd` to host on Work Remote (reuse remote_server upload path) instead of manual `cargo install`
-- [ ] P4 `zed-agentd gc` — journal retention (size/age cap); must evict the cached append handle before unlinking a log (`.benchmarks/002`)
+- [x] P4 `zed-agentd gc` — journal retention (`f1fd59819f`): `gc [--max-age-days N] [--max-total-mb N]` (defaults 30 d / 1 GiB) via a `Gc` handshake, plus one run with the defaults at daemon start. Only idle sessions are evicted (not live, unattached, nothing queued or in flight); `FileJournal::remove_session` drops the cached append handle first, then unlinks log before record. 3 hub tests + 1 journal test; e2e smoke on the real binary (startup gc removed a year-old session, CLI size cap removed the rest, bad args exit 1). Not periodic: a daemon that runs for months only gcs on start or on demand
 - [-] Windows hosts — shim is POSIX `sh`; hook is a no-op on Windows paths (deferred, no Windows host in rig)
 
 ## Perf / benchmark gate
