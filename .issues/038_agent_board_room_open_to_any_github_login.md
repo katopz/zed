@@ -1,5 +1,5 @@
 # 038 — Agent board: any GitHub account can steer agents in a derivable room
-Status: open, latent — the board stack is disabled by default and OBSOLETE (issue 030), so no Zed client polls the worker today. Fix before any revival.
+Status: open, latent — no current exposure: the board stack is disabled by default and OBSOLETE (issue 030), and the worker URL `agent-board-worker.foxfox.workers.dev` returns Cloudflare 1042 / 404 like a nonexistent worker (checked 2026-10-27, so not deployed or its workers.dev route is off). Fix before any revival.
 
 ## Finding (2026-10-27)
 
