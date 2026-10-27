@@ -4,9 +4,9 @@ mod custom;
 #[cfg(any(test, feature = "test-support"))]
 pub mod e2e_tests;
 
+pub use acp::detachable::DetachableRemoteAgents;
 use client::ProxySettings;
 use collections::{HashMap, HashSet};
-pub use acp::detachable::DetachableRemoteAgents;
 pub use custom::*;
 use fs::Fs;
 use http_client::read_no_proxy_from_env;
