@@ -1848,21 +1848,10 @@ impl ThreadView {
         self.turn_fields._turn_timer_task = Some(cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
-                // Skip the notify while text is actively streaming: the Markdown
-                // background parser already calls `cx.refresh_windows()` on each
-                // parse completion (many times per second), which drives the
-                // elapsed/retry display repaints. This timer's `cx.notify()` is
-                // only useful when the turn is *blocked* (tool call running,
-                // awaiting confirmation) and no streaming repaints are happening.
-                let should_continue = this
-                    .update(cx, |this, cx| {
-                        let is_streaming = this.is_actively_streaming(cx);
-                        if !is_streaming {
-                            cx.notify();
-                        }
-                    })
-                    .is_ok();
-                if !should_continue {
+                if this
+                    .update(cx, |this, cx| this.notify_turn_timer(cx))
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -5515,27 +5504,12 @@ impl ThreadView {
                                                     )),
                                             ),
                                     )
-                                    .child(
-                                        IconButton::new("continue_subagent", IconName::RotateCw)
-                                            .icon_size(IconSize::Small)
-                                            .icon_color(Color::Warning)
-                                            .tooltip(Tooltip::text("Retry Subagent"))
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.retry_generation(window, cx);
-                                            })),
-                                    )
                                 })
-                                .when(is_done && is_canceled_or_failed, |this| {
-                                    this.child(
-                                        IconButton::new("continue_subagent", IconName::RotateCw)
-                                            .icon_size(IconSize::Small)
-                                            .icon_color(Color::Warning)
-                                            .tooltip(Tooltip::text("Continue Subagent"))
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.retry_generation(window, cx);
-                                            })),
-                                    )
-                                })
+                                .children(Self::render_subagent_titlebar_retry(
+                                    can_stop,
+                                    is_done && is_canceled_or_failed,
+                                    cx,
+                                ))
                                 .child(
                                     IconButton::new("minimize_subagent", IconName::Dash)
                                         .icon_size(IconSize::Small)
@@ -12371,26 +12345,11 @@ impl ThreadView {
                                 ),
                         )
                     })
-                    .when(is_failed_or_canceled && thread_view.is_some(), |buttons| {
-                        let subagent_view = thread_view.cloned();
-                        buttons.when_some(subagent_view, |this, subagent_view| {
-                            this.child(
-                                IconButton::new(
-                                    format!("continue-subagent-{}", entry_ix),
-                                    IconName::RotateCw,
-                                )
-                                .icon_size(IconSize::Small)
-                                .icon_color(Color::Warning)
-                                .tooltip(Tooltip::text("Continue Subagent"))
-                                .on_click(move |_, window, cx| {
-                                    telemetry::event!("Subagent Retried");
-                                    let _ = subagent_view.update(cx, |view, cx| {
-                                        view.retry_generation(window, cx);
-                                    });
-                                }),
-                            )
-                        })
-                    }),
+                    .children(render_continue_subagent_button(
+                        entry_ix,
+                        is_failed_or_canceled,
+                        thread_view,
+                    )),
             )
             .when_some(thread_view, |this, thread_view| {
                 let thread = &thread_view.read(cx).thread;

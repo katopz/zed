@@ -449,6 +449,29 @@ pub(super) fn with_auto_allow_countdown(
     }
 }
 
+pub(super) fn render_continue_subagent_button(
+    entry_ix: usize,
+    is_failed_or_canceled: bool,
+    subagent_view: Option<&Entity<ThreadView>>,
+) -> Option<IconButton> {
+    let subagent_view = subagent_view.filter(|_| is_failed_or_canceled)?.clone();
+    Some(
+        IconButton::new(
+            format!("continue-subagent-{}", entry_ix),
+            IconName::RotateCw,
+        )
+        .icon_size(IconSize::Small)
+        .icon_color(Color::Warning)
+        .tooltip(Tooltip::text("Continue Subagent"))
+        .on_click(move |_, window, cx| {
+            telemetry::event!("Subagent Retried");
+            subagent_view.update(cx, |view, cx| {
+                view.retry_generation(window, cx);
+            });
+        }),
+    )
+}
+
 /// Fork follow-up work for one `retry_generation` call, run once the retried
 /// submission settles.
 pub(super) struct RetryHooks {
@@ -524,6 +547,44 @@ impl RetryHooks {
 }
 
 impl ThreadView {
+    /// Skip the notify while text is actively streaming: the Markdown
+    /// background parser already calls `cx.refresh_windows()` on each parse
+    /// completion (many times per second), which drives the elapsed/retry
+    /// display repaints. The turn timer's notify is only useful when the turn
+    /// is *blocked* (tool call running, awaiting confirmation) and no
+    /// streaming repaints are happening.
+    pub(super) fn notify_turn_timer(&self, cx: &mut Context<Self>) {
+        if !self.is_actively_streaming(cx) {
+            cx.notify();
+        }
+    }
+
+    /// Retry beside the stop button of a running subagent, or Continue once it
+    /// ended canceled or failed.
+    pub(super) fn render_subagent_titlebar_retry(
+        can_stop: bool,
+        is_done_and_canceled_or_failed: bool,
+        cx: &Context<Self>,
+    ) -> Vec<IconButton> {
+        let button = |label: &'static str| {
+            IconButton::new("continue_subagent", IconName::RotateCw)
+                .icon_size(IconSize::Small)
+                .icon_color(Color::Warning)
+                .tooltip(Tooltip::text(label))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.retry_generation(window, cx);
+                }))
+        };
+        let mut buttons = Vec::new();
+        if can_stop {
+            buttons.push(button("Retry Subagent"));
+        }
+        if is_done_and_canceled_or_failed {
+            buttons.push(button("Continue Subagent"));
+        }
+        buttons
+    }
+
     pub(super) fn render_generating_retry_control(&self, cx: &Context<Self>) -> Vec<AnyElement> {
         // Retry availability + elapsed-since-turn-start for the inline retry
         // control. Unlike `elapsed_label` (gated by `show_stats` and
