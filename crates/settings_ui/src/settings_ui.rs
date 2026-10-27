@@ -7305,6 +7305,18 @@ pub mod test {
     #[gpui::test]
     fn test_llm_provider_authentication_and_settings_retry(cx: &mut gpui::TestAppContext) {
         let url = "https://settings-provider.example/v1";
+        // The fork's multi-key lane reads every key slot on each authentication.
+        let slot_urls = [
+            url.to_string(),
+            format!("{url}#secondary"),
+            format!("{url}#tertiary"),
+            format!("{url}#quaternary"),
+        ];
+        let slot_reads = |passes: usize| -> Vec<&str> {
+            (0..passes)
+                .flat_map(|_| slot_urls.iter().map(String::as_str))
+                .collect()
+        };
         let credentials = Arc::new(FakeCredentialsProvider::default());
         let release = credentials.defer_read(url);
         let provider = cx.update(|cx| {
@@ -7356,12 +7368,12 @@ pub mod test {
                 });
             });
             cx.run_until_parked();
-            credentials.assert_reads(&[url]);
+            credentials.assert_reads(&slot_reads(1));
         }
         cx.cx
             .update(|cx| open_settings_editor(Some("llm_providers"), None, None, cx));
         cx.run_until_parked();
-        credentials.assert_reads(&[url; 2]);
+        credentials.assert_reads(&slot_reads(2));
         settings_window.update(cx, |_, cx| cx.notify());
         cx.draw(
             point(px(0.), px(0.)),
@@ -7369,7 +7381,7 @@ pub mod test {
             |_, _| settings_window.clone().into_any_element(),
         );
         cx.run_until_parked();
-        credentials.assert_reads(&[url; 2]);
+        credentials.assert_reads(&slot_reads(2));
     }
 
     fn settings_window_with_items(
