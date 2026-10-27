@@ -22,6 +22,15 @@ struct Cli {
 }
 
 fn main() -> anyhow::Result<()> {
+    #[cfg(unix)]
+    if std::env::args().nth(1).as_deref() == Some(agentd::EMBEDDED_SUBCOMMAND) {
+        agentd::cli::main(
+            agentd::attach::SelfLauncher::embedded(agentd::EMBEDDED_SUBCOMMAND)?,
+            std::env::args().skip(2),
+        );
+        return Ok(());
+    }
+
     let cli = Cli::parse();
 
     if let Some(socket_path) = &cli.askpass {

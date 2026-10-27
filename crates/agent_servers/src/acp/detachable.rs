@@ -31,14 +31,24 @@ impl DetachableRemoteAgents {
     }
 }
 
-/// Uses `zed-agentd` when the host has it; otherwise execs the agent directly,
-/// so enabling this on a host without agentd degrades to stock behaviour.
-const SHIM: &str = r#"for candidate in "$(command -v zed-agentd 2>/dev/null)" "$HOME/.cargo/bin/zed-agentd" "$HOME/.local/bin/zed-agentd"; do
+/// Prefers the agentd embedded in the remote server that launched us (always
+/// version-matched, no install step), then an installed `zed-agentd`, and
+/// otherwise execs the agent directly, so a host without either degrades to
+/// stock behaviour.
+fn shim() -> String {
+    let embedded_env = agentd::EMBEDDED_BINARY_ENV;
+    let subcommand = agentd::EMBEDDED_SUBCOMMAND;
+    format!(
+        r#"embedded="${{{embedded_env}:-}}"
+if [ -n "$embedded" ] && [ -x "$embedded" ]; then exec "$embedded" {subcommand} attach "$@"; fi
+for candidate in "$(command -v zed-agentd 2>/dev/null)" "$HOME/.cargo/bin/zed-agentd" "$HOME/.local/bin/zed-agentd"; do
   if [ -n "$candidate" ] && [ -x "$candidate" ]; then exec "$candidate" attach "$@"; fi
 done
 while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done
 shift
-exec "$@""#;
+exec "$@""#
+    )
+}
 
 pub fn wrap(command: RemoteCommand, path_style: PathStyle, cx: &App) -> RemoteCommand {
     if !DetachableRemoteAgents::enabled(cx) || path_style != PathStyle::Unix {
@@ -50,11 +60,7 @@ pub fn wrap(command: RemoteCommand, path_style: PathStyle, cx: &App) -> RemoteCo
 fn wrap_with_shim(command: RemoteCommand) -> RemoteCommand {
     let mut env_names: Vec<&String> = command.env.keys().collect();
     env_names.sort();
-    let mut args = vec![
-        "-c".to_string(),
-        SHIM.to_string(),
-        "zed-agentd-shim".to_string(),
-    ];
+    let mut args = vec!["-c".to_string(), shim(), "zed-agentd-shim".to_string()];
     // Names only: the values reach the daemon through the bridge's own
     // environment instead of the host's process list.
     for name in env_names {
@@ -131,16 +137,16 @@ mod tests {
         assert_eq!(wrapped.working_dir.as_deref(), Some("/work"));
     }
 
-    #[test]
     #[allow(
         clippy::disallowed_methods,
         reason = "a synchronous test that runs a tiny shell script"
     )]
-    fn shim_falls_back_to_running_the_agent_directly() -> anyhow::Result<()> {
-        let output = std::process::Command::new("sh")
+    fn run_shim(embedded_agentd: Option<&std::path::Path>) -> anyhow::Result<String> {
+        let mut command = std::process::Command::new("sh");
+        command
             .args([
                 "-c",
-                SHIM,
+                &shim(),
                 "zed-agentd-shim",
                 "--pass-env",
                 "X",
@@ -150,8 +156,35 @@ mod tests {
             ])
             .env("PATH", "/usr/bin:/bin")
             .env("HOME", "/nonexistent")
-            .output()?;
-        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "direct");
+            .env_remove(agentd::EMBEDDED_BINARY_ENV);
+        if let Some(binary) = embedded_agentd {
+            command.env(agentd::EMBEDDED_BINARY_ENV, binary);
+        }
+        let output = command.output()?;
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    #[test]
+    fn shim_falls_back_to_running_the_agent_directly() -> anyhow::Result<()> {
+        assert_eq!(run_shim(None)?, "direct");
+        let missing = tempfile::tempdir()?.path().join("gone");
+        assert_eq!(run_shim(Some(&missing))?, "direct");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shim_prefers_the_agentd_embedded_in_the_remote_server() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir()?;
+        let server = dir.path().join("zed-remote-server");
+        std::fs::write(&server, "#!/bin/sh\necho \"$@\"\n")?;
+        std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755))?;
+        assert_eq!(
+            run_shim(Some(&server))?,
+            "agentd attach --pass-env X -- echo direct"
+        );
         Ok(())
     }
 }

@@ -1,8 +1,13 @@
 """Kills the GUI side mid-turn and checks the turn finished detached (.issues/036),
 that a client reattaching mid-turn is told it is running and when it ends
-(plan 037 P4), and that a later client replays it all."""
+(plan 037 P4), and that a later client replays it all.
+
+With SMOKE_VIA_REMOTE_SERVER=1 the second argument is the remote server binary:
+each client goes through `remote_server exec` like the GUI does, and attaches to
+the agentd embedded in that binary (plan 037 P4 auto-deploy)."""
 import json
 import os
+import struct
 import subprocess
 import sys
 import tempfile
@@ -22,13 +27,28 @@ env = dict(os.environ, HOME=tempfile.mkdtemp(prefix="z036-home-"), FAKE_API_KEY=
                    "name": "m", "max_tokens": 32000, "capabilities": {
                        "tools": True, "images": False, "parallel_tool_calls": False,
                        "prompt_cache_key": False}}]}}))
-command = [agentd, "attach", "--", eval_cli, "--acp", "--model", "fake/m"]
+agent = [eval_cli, "--acp", "--model", "fake/m"]
+via_server = os.environ.get("SMOKE_VIA_REMOTE_SERVER") == "1"
+if via_server:
+    agentd_cli = [agentd, "agentd"]
+    command = [agentd, "exec"]
+    # The GUI's shim takes this branch when `remote_server exec` exports its own path.
+    descriptor = json.dumps({"program": "sh", "args": [
+        "-c", 'exec "$ZED_AGENTD_REMOTE_SERVER" agentd attach "$@"', "shim", "--", *agent],
+        "env": {}, "working_dir": None}).encode()
+    preamble = struct.pack("<I", len(descriptor)) + descriptor
+else:
+    agentd_cli = [agentd]
+    command = [agentd, "attach", "--", *agent]
+    preamble = b""
 
 
 class Gui:
     def __init__(self):
         self.process = subprocess.Popen(command, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                         stderr=subprocess.DEVNULL, text=True, bufsize=1)
+        self.process.stdin.buffer.write(preamble)
+        self.process.stdin.buffer.flush()
         self.next_id = 0
 
     def send(self, method, params):
@@ -94,5 +114,5 @@ try:
     gui.process.stdin.close()
     gui.process.wait(timeout=30)
 finally:
-    subprocess.run([agentd, "stop"], env=env, capture_output=True)
+    subprocess.run([*agentd_cli, "stop"], env=env, capture_output=True)
     model.kill()

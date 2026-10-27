@@ -19,6 +19,9 @@ SMOKE_AGENTD=target/debug/zed-agentd python3 -I script/agentd-smoke/acp_smoke.py
 # Kill the client mid-turn; a client reattaching mid-turn is told the turn runs and when it ends;
 # the turn finishes detached and replays on a later reattach. Prints PASS or FAIL.
 python3 -I script/agentd-smoke/detach_smoke.py target/debug/eval-cli target/debug/zed-agentd 18738
+# Same, but every client goes through `remote_server exec` and the agentd embedded in the
+# remote server binary, the way Zed launches it on a host (cargo build -p remote_server first).
+SMOKE_VIA_REMOTE_SERVER=1 python3 -I script/agentd-smoke/detach_smoke.py target/debug/eval-cli target/debug/remote_server 18739
 ```
 
 The last argument is a free localhost port for the fake model.

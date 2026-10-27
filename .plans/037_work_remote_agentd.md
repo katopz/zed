@@ -1,5 +1,5 @@
 # 037 — Work Remote: GUI on M3, agents + compute detached on M5 (zed-agentd)
-Status: in progress — P0 sync + compile fallout fixed, P1 daemon + P2 hook/menu implemented, journal bench GOAT (−92% append), P4 journal gc + native agent backend (`eval-cli --acp`) + live turn-state on reattach done and smoke-verified locally; P3 on-host e2e still blocked on M5 SSH access (owner)
+Status: in progress — P0 sync + compile fallout fixed, P1 daemon + P2 hook/menu implemented, journal bench GOAT (−92% append), P4 journal gc + native agent backend (`eval-cli --acp`) + live turn-state on reattach + auto-deploy (agentd embedded in remote_server) done and smoke-verified locally; P3 on-host e2e still blocked on M5 SSH access (owner)
 
 ## Goal
 
@@ -54,9 +54,14 @@ Upstream-file touches (the whole conflict surface of this feature):
 
 ## Setup on M5
 
+Nothing to install when Zed uploads its own remote server (dev builds,
+`build-remote-server-binary`, `ZED_COPY_REMOTE_SERVER`): agentd is embedded in
+it. A downloaded stock server lacks it; then install it once:
+
 ```sh
 cargo install --path crates/agentd         # → ~/.cargo/bin/zed-agentd (shim also probes ~/.local/bin)
 zed-agentd status                          # sessions JSON (live/attached/queued)
+~/.zed_server/zed-remote-server-* agentd status   # same, via the embedded copy
 ```
 
 On M3: File → **Work Remote…** → pick the M5 host (Tailscale IP) → open project →
@@ -75,7 +80,7 @@ start any external agent. Close M3 freely; reopen and pick the thread from histo
 - [x] P3 verify Zed's reconnect flow calls `session/load` (not only `session/list`) for external agents on window restore — by code: `conversation_view.rs` (~L1420) calls `load_session` whenever the connection reports `supports_load_session()` (= the `loadSession` capability, `agent_servers/src/acp/v1.rs`), which zed-agentd always advertises; `resume_session` (no history) is only the fallback for agents without it. The live confirmation rides on the P3 e2e item
 - [x] P4 native Zed agent as a backend: `zed-agentd attach -- eval-cli --acp` (`c212b13be4`, harness `767ba226e9`); verified locally incl. kill-mid-turn detach + replay. Structured diffs + model switching over ACP done; follow-up (real-host run) in `.issues/036_native_agent_acp_stdio_server.md`
 - [x] P4 live turn-state on reattach: zed-agentd sends the extension notification `_zed-agentd/turn_state {sessionId, running}` — `true` right after a journal `session/load` while that session's prompt is still in flight, `false` to exactly those clients when the prompt answers or the backend exits (`turn_watchers`). The fork GUI takes it through a typed handler (`agent_servers/src/acp/detachable.rs`; not a catch-all, so the SDK's dynamic session/MCP handlers still see every other notification) and `AcpThread::set_detached_turn_running` (`acp_thread/src/fork.rs`) adopts it as a running turn: the thread shows Generating, Stop sends `session/cancel`, and a follow-up prompt replaces it. Other ACP clients ignore `_` methods. Tests: 2 hub tests, `detached_turn_runs_until_ended_cancelled_or_replaced`, `agentd_turn_state_marks_reattached_thread_running` (real v1 transport), and `detach_smoke.py` now reattaches mid-turn (running=true → live answer → running=false): PASS
-- [ ] P4 auto-deploy `zed-agentd` to host on Work Remote (reuse remote_server upload path) instead of manual `cargo install`
+- [x] P4 auto-deploy `zed-agentd` to host on Work Remote — by embedding, not a second upload: `remote_server` runs agentd as its `agentd` subcommand (dispatched in `main.rs` before clap; `agentd::cli` now holds the CLI, `SelfLauncher` makes the daemon re-run `<server> agentd serve`), and `remote_server exec` exports its own path as `ZED_AGENTD_REMOTE_SERVER` to what it starts. The shim prefers that embedded agentd (version-matched with the GUI, zero extra bytes over SSH), then an installed `zed-agentd`, then the bare agent. Upstream-file touches: `remote_server/src/main.rs` (+8), `server.rs` (+4), two `Cargo.toml` lines. Caveats: only when Zed uploads its own server (dev/`build-remote-server-binary`/`ZED_COPY_REMOTE_SERVER`; a zed.dev-downloaded stock server has no agentd → installed one or bare agent); a daemon started by an older server keeps serving newer bridges until `agentd stop` (handshake is unchanged JSON). Tests: `shim_prefers_the_agentd_embedded_in_the_remote_server`, fallback test extended to a stale env path; `SMOKE_VIA_REMOTE_SERVER=1 detach_smoke.py` (clients go through real `remote_server exec` → shim branch → embedded attach → daemon spawned as `remote_server agentd serve`): PASS; standalone smoke still PASS
 - [x] P4 `zed-agentd gc` — journal retention (`f1fd59819f`): `gc [--max-age-days N] [--max-total-mb N]` (defaults 30 d / 1 GiB) via a `Gc` handshake, plus one run with the defaults at daemon start. Only idle sessions are evicted (not live, unattached, nothing queued or in flight); `FileJournal::remove_session` drops the cached append handle first, then unlinks log before record. 3 hub tests + 1 journal test; e2e smoke on the real binary (startup gc removed a year-old session, CLI size cap removed the rest, bad args exit 1). Not periodic: a daemon that runs for months only gcs on start or on demand
 - [-] Windows hosts — shim is POSIX `sh`; hook is a no-op on Windows paths (deferred, no Windows host in rig)
 

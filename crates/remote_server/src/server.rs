@@ -164,7 +164,11 @@ fn execute_command() -> Result<()> {
         std::env::set_current_dir(working_dir)
             .with_context(|| format!("Failed to change directory to {working_dir}"))?;
     }
+    let embedded_agentd = std::env::current_exe().log_err();
     let error = exec_with_script_fallback(&descriptor, working_dir.as_deref(), |mut command| {
+        if let Some(binary) = &embedded_agentd {
+            command.env(agentd::EMBEDDED_BINARY_ENV, binary);
+        }
         command.exec()
     });
     Err(error).with_context(|| format!("Failed to execute {}", descriptor.program))
