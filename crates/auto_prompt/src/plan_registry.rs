@@ -297,7 +297,7 @@ pub fn format_claims_for_context(session_id: &str) -> Option<String> {
             .unwrap_or(&claim.plan_file);
         lines.push(format!(
             "- `{filename}` — claimed by session {} ({}s ago): {}",
-            &claim.session_id[..claim.session_id.len().min(8)],
+            &claim.session_id[..claim.session_id.floor_char_boundary(8)],
             claim.claimed_ago_secs,
             claim.task_summary,
         ));
@@ -496,5 +496,14 @@ mod tests {
             ctx.contains("should NOT be picked"),
             "context should include the instruction"
         );
+    }
+
+    #[test]
+    fn test_format_claims_for_context_multibyte_session_id() {
+        let _lock = setup();
+        // Byte 8 falls inside the second "é": a byte slice there panics.
+        try_claim(".plans/03_c.md", "sessiooé-é-7", "multibyte").ok();
+        let ctx = format_claims_for_context("sess_a").expect("claims");
+        assert!(ctx.contains("session sessioo "), "{ctx}");
     }
 }
