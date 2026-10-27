@@ -198,11 +198,7 @@ impl EditSessionContext {
     ///   / EACCES / network failures on remote projects) — without
     ///   propagation, the agent believes its write succeeded and moves
     ///   on, leaving the user with a phantom edit.
-    async fn ensure_buffer_saved(
-        &self,
-        buffer: &Entity<Buffer>,
-        cx: &mut AsyncApp,
-    ) -> Result<()> {
+    async fn ensure_buffer_saved(&self, buffer: &Entity<Buffer>, cx: &mut AsyncApp) -> Result<()> {
         let format_on_save_enabled = buffer.read_with(cx, |buffer, cx| {
             let settings = language_settings::LanguageSettings::for_buffer(buffer, cx);
             settings.format_on_save != FormatOnSave::Off
@@ -311,9 +307,7 @@ pub(crate) async fn run_session(
                 .await
             {
                 let (_new_text, diff) = session.compute_new_text_and_diff(cx).await;
-                let error = format!(
-                    "Failed to save buffer after edit: {save_error}"
-                );
+                let error = format!("Failed to save buffer after edit: {save_error}");
                 if !diff.is_empty() {
                     event_stream.update_fields(|update| update.content(vec![error.clone().into()]));
                 }

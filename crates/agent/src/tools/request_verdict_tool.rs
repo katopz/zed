@@ -218,9 +218,11 @@ fn resolve_requested_route(
         RequestedReviewer::Default => resolve_route(setting, provider),
         RequestedReviewer::Secondary => match secondary_model {
             Some(model) => Ok(ReviewerRoute::Secondary(model)),
-            None => Err("reviewer is secondary but agent.verdict_secondary_model is not set \
+            None => Err(
+                "reviewer is secondary but agent.verdict_secondary_model is not set \
                  — set it (e.g. a GLM model) or omit `reviewer`"
-                .to_string()),
+                    .to_string(),
+            ),
         },
     }
 }
@@ -244,7 +246,9 @@ fn error_output(
 fn route_label(route: &ReviewerRoute) -> String {
     match route {
         ReviewerRoute::Native => "native".to_string(),
-        ReviewerRoute::Secondary(model) => format!("secondary:{}/{}", model.provider.0, model.model),
+        ReviewerRoute::Secondary(model) => {
+            format!("secondary:{}/{}", model.provider.0, model.model)
+        }
         ReviewerRoute::External(label) => label.0.to_string(),
     }
 }
@@ -385,7 +389,9 @@ impl AgentTool for RequestVerdictTool {
                                 cx,
                             )
                         }
-                        .map_err(|err| error_output(None, err.to_string(), route_label(&route), None))
+                        .map_err(|err| {
+                            error_output(None, err.to_string(), route_label(&route), None)
+                        })
                     });
                     let subagent = match subagent {
                         Ok(subagent) => subagent,

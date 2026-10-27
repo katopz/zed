@@ -162,12 +162,12 @@ async fn test_send_message_tool_waits_for_idle_reply(cx: &mut TestAppContext) {
     fake.send_last_event(
         &sender.model,
         LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
-                id: "send_1".into(),
-                name: SendMessageTool::NAME.into(),
-                raw_input: tool_input.to_string(),
-                input: language_model::LanguageModelToolUseInput::Json(tool_input),
-                is_input_complete: true,
-                thought_signature: None,
+            id: "send_1".into(),
+            name: SendMessageTool::NAME.into(),
+            raw_input: tool_input.to_string(),
+            input: language_model::LanguageModelToolUseInput::Json(tool_input),
+            is_input_complete: true,
+            thought_signature: None,
         }),
     );
     fake.end_last(&sender.model);
@@ -222,12 +222,12 @@ async fn test_list_threads_tool_runs_during_turn(cx: &mut TestAppContext) {
     fake.send_last_event(
         &sender.model,
         LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
-                id: "list_1".into(),
-                name: ListThreadsTool::NAME.into(),
-                raw_input: tool_input.to_string(),
-                input: language_model::LanguageModelToolUseInput::Json(tool_input),
-                is_input_complete: true,
-                thought_signature: None,
+            id: "list_1".into(),
+            name: ListThreadsTool::NAME.into(),
+            raw_input: tool_input.to_string(),
+            input: language_model::LanguageModelToolUseInput::Json(tool_input),
+            is_input_complete: true,
+            thought_signature: None,
         }),
     );
     fake.end_last(&sender.model);

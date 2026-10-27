@@ -4308,7 +4308,11 @@ async fn test_title_request_strips_images_for_summary_model_without_image_suppor
     // summarization models whose endpoints reject image content parts.
     let fake = cx.update(LanguageModelRegistry::test);
     let model = fake.model("fake");
-    let request = crate::thread::build_thread_title_request(&acp_v2::SessionId::new("title-test"), &messages, None);
+    let request = crate::thread::build_thread_title_request(
+        &acp_v2::SessionId::new("title-test"),
+        &messages,
+        None,
+    );
 
     let title_task = cx.spawn({
         let model = model.clone();
@@ -4349,7 +4353,11 @@ async fn test_title_request_keeps_images_for_summary_model_with_image_support(
 
     let fake = cx.update(LanguageModelRegistry::test);
     let model = fake.update_model("fake", |model| model.supports_images = true);
-    let request = crate::thread::build_thread_title_request(&acp_v2::SessionId::new("title-test"), &messages, None);
+    let request = crate::thread::build_thread_title_request(
+        &acp_v2::SessionId::new("title-test"),
+        &messages,
+        None,
+    );
 
     let title_task = cx.spawn({
         let model = model.clone();

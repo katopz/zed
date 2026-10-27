@@ -72,11 +72,13 @@ impl AgentTool for ListThreadsTool {
         // `update`, so `list_threads` would re-read the leased entity and
         // panic. Defer to a later executor tick, after the lease is released.
         let environment = self.environment.clone();
-        cx.spawn(async move |cx| match cx.update(|cx| environment.list_threads(cx)) {
-            Ok(threads) => Ok(ListThreadsToolOutput::Success { threads }),
-            Err(error) => Err(ListThreadsToolOutput::Error {
-                error: error.to_string(),
-            }),
-        })
+        cx.spawn(
+            async move |cx| match cx.update(|cx| environment.list_threads(cx)) {
+                Ok(threads) => Ok(ListThreadsToolOutput::Success { threads }),
+                Err(error) => Err(ListThreadsToolOutput::Error {
+                    error: error.to_string(),
+                }),
+            },
+        )
     }
 }
