@@ -1,4 +1,5 @@
 # 001 — Agent Board (multi-device / multi-agent notepad + shared state)
+Status: done — 49/53 tasks checked, 4 deferred (`- [-]`)
 
 ## Goal
 A cross-device, cross-agent "notepad board" that mirrors the existing in-process

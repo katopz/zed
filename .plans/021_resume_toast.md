@@ -1,4 +1,5 @@
 # 021 — Resume toast when the scheduled dispatch fires (plan 020 follow-up)
+Status: done — 4/4 tasks checked
 
 ## Tasks
 - [x] `AutoPromptDelayReason` (`UsageLimitReset` | `Backoff`) carried on

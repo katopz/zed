@@ -1,4 +1,5 @@
 # OpenAI Compatible: Priority-first key rotation + per-slot enable/disable + status icons in editor footer
+Status: done — 15/15 tasks checked
 
 ## Goal
 

@@ -1,4 +1,5 @@
 # Plan 023: Unified context-overflow flow for native + Claude agents
+Status: done — 17/17 tasks checked
 
 ## Problem (user request, verbatim)
 

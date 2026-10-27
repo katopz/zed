@@ -1,4 +1,5 @@
 # 022 — Machete dep trim + upstream-merge test fallout repair
+Status: done — 8/8 tasks checked
 
 ## Goal
 

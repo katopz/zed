@@ -1,4 +1,5 @@
 # OpenAI Compatible: Dual API Key with Random Load Balancing
+Status: done — 12/12 tasks checked
 
 ## Goal
 Add a second API key input for `openai_compatible` providers so requests randomly pick

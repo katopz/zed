@@ -1,4 +1,5 @@
 # 015 — Agent Board Web UI (browser dashboard + WebSocket steering)
+Status: done — 37/46 tasks checked, 9 deferred (`- [-]`)
 
 > **OBSOLETE (2026-08-28, issue 030):** the war room + worker stack this
 > WebUI served is retired — Cloudflare worker + KV namespace deleted

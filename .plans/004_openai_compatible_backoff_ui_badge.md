@@ -1,4 +1,5 @@
 # OpenAI Compatible: Backoff Status Badge in ConfigurationView
+Status: done — 11/11 tasks checked
 
 ## Goal
 Surface per-key backoff state in the provider configuration view so users can

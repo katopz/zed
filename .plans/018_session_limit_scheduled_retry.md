@@ -1,4 +1,5 @@
 # 018 — Session limit: schedule auto_prompt retry at provider reset time
+Status: done — 9/9 tasks checked
 
 **Commit:** `0db4af571a` (develop)
 

@@ -1,4 +1,5 @@
 # OpenAI Compatible: Intra-Request Key Rotation (Retry on Failure)
+Status: done — 19/19 tasks checked
 
 ## Goal
 When a request fails on key A with a backoff-worthy error, retry the SAME user

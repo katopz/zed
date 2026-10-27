@@ -1,4 +1,5 @@
 # 014 — Claude auto_prompt: off-screen hidden-thread orchestrator
+Status: done — 36/36 tasks checked
 
 Moved from `.issues/014_claude_offscreen_orchestrator.md` — this is a feature,
 not a bug.

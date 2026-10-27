@@ -1,4 +1,5 @@
 # 025 — War Room UX fixes (8 operator reports)
+Status: done — 11/11 tasks checked
 
 ## Goal
 Fix the 8 issues reported against the war room panel + browser dashboard:

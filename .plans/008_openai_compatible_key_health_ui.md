@@ -1,4 +1,5 @@
 # OpenAI Compatible: Key Health UI (truncated, clear, check) + rate-limit rotation guard
+Status: done — 11/11 tasks checked
 
 ## Goal
 Three UX additions to the per-key cards in the OpenAI-compatible provider

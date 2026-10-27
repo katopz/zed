@@ -1,4 +1,5 @@
 # Thread Continuation Indicator
+Status: done — 10/10 tasks checked
 
 ## Problem
 When `auto_prompt` creates a new thread from a summary (ContextOverflow Phase 2),

@@ -1,4 +1,5 @@
 # Auto Prompt — Infinite Loop Prevention & Default Prompt Logic
+Status: done — design doc for the auto-prompt decision flow; chain counters per session since `.issues/037` (2026-10-27)
 
 ## Problem
 
@@ -90,11 +91,11 @@ AcpThreadEvent::Stopped
 
 ### CASE 5: Max Iterations
 
-**Trigger**: `iteration_count > max_iterations` (default: 20)
+**Trigger**: `idle_turns > max_iterations` (default: 20), where `idle_turns` counts consecutive turns of this session that made no progress (no edit/delete/move tool call, no command running `git commit`/`git push`). Applies to the Claude path too.
 
-**Action**: Hard stop. Reset iteration counter. No prompt, no LLM call.
+**Action**: Hard stop. Clear the session's chain state. No prompt, no LLM call.
 
-**Why**: The ultimate safety net. Even if all other checks fail, the chain cannot exceed 20 cycles. Configurable via `max_iterations`.
+**Why**: The safety net against a stuck chain. A chain that keeps landing work is never cut off; one that idles stops after 20 turns. Configurable via `max_iterations`. A second net stops the chain when a summary's next steps repeat unchanged `MAX_UNCHANGED_REPEATS` (2) times in a row.
 
 ## Stop Conditions Summary
 
@@ -105,19 +106,20 @@ AcpThreadEvent::Stopped
 | `confidence < 0.5` | Orchestration LLM | Reset counter, stop |
 | `should_continue: false`, no prompt | Orchestration LLM | Reset counter, stop |
 | `StopReason::Cancelled` | User | Skip (don't reset counter) |
-| `iteration > max_iterations` | System | Reset counter, stop |
+| `idle_turns > max_iterations` | System | Clear session chain, stop |
+| Same next steps 2 rounds running | System | Clear session chain, stop |
 | Empty prompt after cleanup | System | Reset counter, stop |
 | No prompt determined | System | Reset counter, stop |
 
 ## Iteration Counter & Chain Timeout
 
-The iteration counter is stored in a global `AtomicU32`. It increments on every `on_thread_stopped` call.
+Chain state lives in `crates/auto_prompt/src/chain.rs`, keyed by session id: turn count, no-progress streak, pre-stop verification attempts, orchestrator retry budget, and the next-steps fingerprint. It used to be one global `AtomicU32` that every thread incremented and any thread's stop reset, so with several agents in one window the cap never fired (`.issues/037`, fixed in `f426bb830d`, `a24bef122f`).
 
-**Chain timeout**: If more than 300 seconds (5 min) pass since the last iteration, the counter resets to 0. This means:
+**Chain timeout**: if more than 300 seconds (5 min) pass since the session's last turn, its chain starts over. This means:
 - User manually sends a message after a pause → fresh chain
 - Auto-prompt chain with long pauses → fresh chain each time
 
-**Counter reset**: The counter resets when the chain stops (any stop condition) or when max iterations is reached. This means the next user-initiated message starts a fresh chain.
+**Reset**: a session's chain state is cleared when its chain stops (any stop condition). Other sessions' counters are untouched.
 
 ## Configuration
 

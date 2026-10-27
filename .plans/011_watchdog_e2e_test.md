@@ -1,4 +1,5 @@
 # Plan 011: Watchdog E2E Test
+Status: done — 6/6 tasks checked
 
 - [x] Write E2E test for the stuck-thread watchdog
 - [x] Write regression test for watchdog timer reset across generations (issue 004)

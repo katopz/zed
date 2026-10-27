@@ -1,4 +1,5 @@
 # 026 — Web Threads tab (browser mirror of the agent thread panel)
+Status: done — 14/15 tasks checked, 1 deferred (`- [-]`)
 
 > **OBSOLETE (2026-08-28, issue 030):** the war room + worker stack is
 > retired (`AgentBoardConfig.enabled` defaults to false; Cloudflare worker

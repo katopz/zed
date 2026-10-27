@@ -1,4 +1,5 @@
 # Subagent Retry-After-Completion Fix
+Status: done — 4/4 tasks checked
 
 ## Problem
 

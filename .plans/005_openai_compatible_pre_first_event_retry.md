@@ -1,4 +1,5 @@
 # OpenAI Compatible: Pre-First-Event Stream Retry
+Status: done — 14/14 tasks checked
 
 ## Goal
 Extend intra-request key rotation to catch errors that surface as the first

@@ -1,4 +1,5 @@
 # Plan 05: Agent Edit Conflict Detection
+Status: done — 7/7 tasks checked
 
 ## Problem
 

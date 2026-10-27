@@ -1,4 +1,5 @@
 # Plan 011: Pin agent threads in the sidebar
+Status: done — 10/10 tasks checked
 
 ## Problem
 

@@ -1,4 +1,5 @@
 # 020 — Weekly/Opus limit error phrasing (plan 019 follow-up)
+Status: done — 8/8 tasks checked
 
 ## Context
 

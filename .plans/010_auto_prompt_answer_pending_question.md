@@ -1,4 +1,5 @@
 # Plan 010: auto_prompt should answer the agent's pending question, not stop+summarize
+Status: done — 6/6 tasks checked
 
 ## Problem
 

@@ -1,4 +1,5 @@
 # 026: Async auto-prompt decide + Windows NTFS warning once-per-thread
+Status: done — 13/13 tasks checked
 
 Operator reports (4):
 1. Manual auto-prompt button click freezes UI before "Processing..." shows.

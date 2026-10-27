@@ -1,4 +1,5 @@
 # Claude subscription usage rings (5-hour + weekly) beside the context ring
+Status: done — 10/10 tasks checked
 
 ## Goal
 Two extra circular-progress rings in the agent panel toolbar, immediately left

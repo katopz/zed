@@ -1,4 +1,5 @@
 # 019 — Weekly limit: schedule auto_prompt retry from the usage API
+Status: done — 6/6 tasks checked
 
 **Commit:** `6d7dbbce7a` (develop)
 

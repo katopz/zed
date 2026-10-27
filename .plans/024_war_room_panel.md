@@ -1,4 +1,5 @@
 # 024 — War Room Panel (conversational agent board in Zed)
+Status: done — 45/52 tasks checked, 7 deferred (`- [-]`)
 
 > **OBSOLETE (2026-08-28, issue 030):** the war room + worker stack is
 > retired (`AgentBoardConfig.enabled` defaults to false; Cloudflare worker

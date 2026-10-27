@@ -1,4 +1,5 @@
 # Plan 027: Key rotation rework + summary-first auto-prompt + auto-allow everywhere
+Status: done — 14/14 tasks checked
 
 ## Problem
 

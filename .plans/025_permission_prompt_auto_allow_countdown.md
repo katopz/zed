@@ -1,4 +1,5 @@
 # Plan 025: Auto-allow permission prompts after a countdown
+Status: done — 7/8 tasks checked, 1 deferred (`- [-]`)
 
 ## Problem
 
