@@ -3002,3 +3002,258 @@ async fn cutoff_fork_stops_on_terminal_summary(cx: &mut gpui::TestAppContext) {
     }
     clear_summary_for_session(session);
 }
+
+// Issue 040: characterization of `decide_with_llm`'s verdict dispatch (the
+// arms after the fast paths). Each test drives the real function against the
+// fake model and pins the outcome plus the number of model calls.
+
+const ACTION_ITEMS_MESSAGE: &str =
+    "Done with phase 1.\n\n## Action items\n\n- Fix bug A\n- Add tests for B";
+
+fn dispatch_test_data(
+    session: &str,
+    last_assistant_message: &str,
+    cx: &mut gpui::TestAppContext,
+) -> (
+    LlmCallData,
+    std::sync::Arc<language_model::fake_provider::FakeLanguageModelProvider>,
+) {
+    let fake = cx.update(language_model::LanguageModelRegistry::test);
+    let mut data = overflow_test_data(session, Some(last_assistant_message));
+    data.model = fake.model("fake");
+    data.context_exceeds_limit = false;
+    (data, fake)
+}
+
+fn respond_text(
+    fake: &language_model::fake_provider::FakeLanguageModelProvider,
+    text: impl Into<String>,
+) {
+    fake.respond_to_last_pending_completion(
+        &fake.model("fake"),
+        [LanguageModelCompletionEvent::Text(text.into())],
+    );
+}
+
+fn respond_verdict(
+    fake: &language_model::fake_provider::FakeLanguageModelProvider,
+    confidence: f64,
+    next_prompt: Option<&str>,
+    reason: &str,
+) {
+    respond_text(
+        fake,
+        serde_json::json!({
+            "confidence": confidence,
+            "next_prompt": next_prompt,
+            "reason": reason,
+            "thread_summary": null,
+        })
+        .to_string(),
+    );
+}
+
+/// Fails all three lightweight retries (attempts 2 and 3 back off 4s and 8s).
+/// Only a synthetic "model…" reply counts as a failed attempt: an unparseable
+/// reply parses to a 0-confidence stop, which the retry loop accepts.
+fn fail_lightweight_retries(
+    fake: &language_model::fake_provider::FakeLanguageModelProvider,
+    cx: &mut gpui::TestAppContext,
+) {
+    for delay_ms in [0, 4_000, 8_000] {
+        cx.executor().advance_clock(Duration::from_millis(delay_ms));
+        cx.run_until_parked();
+        respond_verdict(fake, 0.0, None, "model returned zero events");
+    }
+}
+
+fn spawn_decide(
+    data: LlmCallData,
+    cx: &mut gpui::TestAppContext,
+) -> gpui::Task<anyhow::Result<AutoPromptOutcome>> {
+    let task = cx.spawn(async move |cx| decide_with_llm(data, &cx).await);
+    cx.run_until_parked();
+    task
+}
+
+fn expect_continue(outcome: AutoPromptOutcome) -> AutoPromptAction {
+    match outcome {
+        AutoPromptOutcome::Continue(action) => action,
+        other => panic!("expected Continue, got {other:?}"),
+    }
+}
+
+fn expect_stopped(outcome: AutoPromptOutcome) -> String {
+    match outcome {
+        AutoPromptOutcome::Stopped { reason } => reason,
+        other => panic!("expected Stopped, got {other:?}"),
+    }
+}
+
+#[gpui::test]
+async fn dispatch_confident_verdict_continues_with_its_prompt(cx: &mut gpui::TestAppContext) {
+    let (data, fake) = dispatch_test_data("dispatch-continue", "Refactored the parser.", cx);
+    let task = spawn_decide(data, cx);
+    respond_verdict(
+        &fake,
+        0.9,
+        Some("Add the missing parser tests."),
+        "work left",
+    );
+    let action = expect_continue(task.await.expect("decide"));
+    assert!(action.next_prompt.contains("Add the missing parser tests."));
+}
+
+#[gpui::test]
+async fn dispatch_second_opinion_continues_with_extracted_work(cx: &mut gpui::TestAppContext) {
+    let (data, fake) = dispatch_test_data("dispatch-second-yes", ACTION_ITEMS_MESSAGE, cx);
+    let task = spawn_decide(data, cx);
+    respond_verdict(&fake, 0.1, None, "looks done");
+    cx.run_until_parked();
+    respond_verdict(&fake, 0.9, None, "real work");
+    let action = expect_continue(task.await.expect("decide"));
+    assert!(
+        action.next_prompt.contains("Fix bug A"),
+        "{}",
+        action.next_prompt
+    );
+}
+
+#[gpui::test]
+async fn dispatch_second_opinion_confirms_stop(cx: &mut gpui::TestAppContext) {
+    let (data, fake) = dispatch_test_data("dispatch-second-no", ACTION_ITEMS_MESSAGE, cx);
+    let task = spawn_decide(data, cx);
+    respond_verdict(&fake, 0.1, None, "looks done");
+    cx.run_until_parked();
+    respond_verdict(&fake, 0.1, None, "nothing actionable");
+    let reason = expect_stopped(task.await.expect("decide"));
+    assert!(
+        reason.starts_with("second opinion confirmed stop"),
+        "{reason}"
+    );
+    assert!(reason.contains("nothing actionable"), "{reason}");
+}
+
+#[gpui::test]
+async fn dispatch_decisive_stop_skips_verification(cx: &mut gpui::TestAppContext) {
+    let (data, fake) = dispatch_test_data("dispatch-decisive", "Refactored the parser.", cx);
+    let task = spawn_decide(data, cx);
+    respond_verdict(&fake, 0.05, None, "all done");
+    assert_eq!(expect_stopped(task.await.expect("decide")), "all done");
+}
+
+#[gpui::test]
+async fn dispatch_low_confidence_stops_when_verifications_exhausted(cx: &mut gpui::TestAppContext) {
+    let (data, fake) = dispatch_test_data("dispatch-max-verify", "Refactored the parser.", cx);
+    let task = spawn_decide(data, cx);
+    respond_verdict(&fake, 0.18, None, "probably done");
+    assert_eq!(
+        expect_stopped(task.await.expect("decide")),
+        "max verification attempts (0) exceeded"
+    );
+}
+
+#[gpui::test]
+async fn dispatch_low_confidence_dispatches_pre_stop_verification(cx: &mut gpui::TestAppContext) {
+    let (mut data, fake) =
+        dispatch_test_data("dispatch-verify-no-plans", "Refactored the parser.", cx);
+    data.max_verification_attempts = 3;
+    let task = spawn_decide(data, cx);
+    respond_verdict(&fake, 0.18, None, "probably done");
+    let action = expect_continue(task.await.expect("decide"));
+    assert!(
+        action.next_prompt.contains("PRE-STOP VERIFICATION"),
+        "{}",
+        action.next_prompt
+    );
+    assert_eq!(chain::verification_attempts("dispatch-verify-no-plans"), 1);
+}
+
+#[gpui::test]
+async fn dispatch_synthetic_failure_continues_from_lightweight_retry(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (data, fake) = dispatch_test_data("dispatch-retry-ok", "Refactored the parser.", cx);
+    let task = spawn_decide(data, cx);
+    respond_verdict(&fake, 0.1, None, "model returned zero events");
+    cx.run_until_parked();
+    respond_verdict(&fake, 0.9, Some("Resume the parser work."), "retry ok");
+    let action = expect_continue(task.await.expect("decide"));
+    assert!(action.next_prompt.contains("Resume the parser work."));
+}
+
+#[gpui::test]
+async fn dispatch_retry_stop_falls_back_to_remaining_work_safety_net(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (data, fake) = dispatch_test_data("dispatch-retry-stop-net", ACTION_ITEMS_MESSAGE, cx);
+    let task = spawn_decide(data, cx);
+    respond_verdict(&fake, 0.25, None, "model stream ended early");
+    cx.run_until_parked();
+    respond_verdict(&fake, 0.1, None, "retry says stop");
+    let action = expect_continue(task.await.expect("decide"));
+    assert!(
+        action.next_prompt.contains("Fix bug A"),
+        "{}",
+        action.next_prompt
+    );
+}
+
+#[gpui::test]
+async fn dispatch_retry_stop_accepted_when_no_safety_net(cx: &mut gpui::TestAppContext) {
+    let (data, fake) = dispatch_test_data("dispatch-retry-stop", "Refactored the parser.", cx);
+    let task = spawn_decide(data, cx);
+    respond_verdict(&fake, 0.1, None, "model returned zero events");
+    cx.run_until_parked();
+    respond_verdict(&fake, 0.1, None, "retry says stop");
+    assert_eq!(
+        expect_stopped(task.await.expect("decide")),
+        "retry says stop"
+    );
+}
+
+#[gpui::test]
+async fn dispatch_failed_retries_fall_back_to_remaining_work_safety_net(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (data, fake) = dispatch_test_data("dispatch-retry-fail-net", ACTION_ITEMS_MESSAGE, cx);
+    let task = spawn_decide(data, cx);
+    respond_verdict(&fake, 0.25, None, "model stream ended early");
+    fail_lightweight_retries(&fake, cx);
+    let action = expect_continue(task.await.expect("decide"));
+    assert!(
+        action.next_prompt.contains("Fix bug A"),
+        "{}",
+        action.next_prompt
+    );
+    assert_eq!(
+        fake.completion_count(),
+        0,
+        "no call beyond the three retries"
+    );
+}
+
+#[gpui::test]
+async fn dispatch_failed_retries_stop_when_no_safety_net(cx: &mut gpui::TestAppContext) {
+    let (data, fake) = dispatch_test_data("dispatch-retry-fail", "Refactored the parser.", cx);
+    let task = spawn_decide(data, cx);
+    respond_verdict(&fake, 0.1, None, "model returned zero events");
+    fail_lightweight_retries(&fake, cx);
+    let reason = expect_stopped(task.await.expect("decide"));
+    assert!(reason.starts_with("lightweight retry failed:"), "{reason}");
+}
+
+#[gpui::test]
+async fn dispatch_failed_retries_after_api_error_back_off(cx: &mut gpui::TestAppContext) {
+    let (mut data, fake) = dispatch_test_data("dispatch-retry-api-error", ACTION_ITEMS_MESSAGE, cx);
+    data.had_api_error = true;
+    let task = spawn_decide(data, cx);
+    respond_verdict(&fake, 0.25, None, "model stream ended early");
+    fail_lightweight_retries(&fake, cx);
+    match task.await.expect("decide") {
+        AutoPromptOutcome::RetryAfterBackoff { reason, .. } => {
+            assert!(reason.starts_with("source turn API error"), "{reason}")
+        }
+        other => panic!("expected RetryAfterBackoff, got {other:?}"),
+    }
+}
