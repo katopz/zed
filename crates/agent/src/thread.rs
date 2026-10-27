@@ -170,36 +170,9 @@ impl std::fmt::Display for PromptId {
 
 pub(crate) const MAX_RETRY_ATTEMPTS: u8 = 4;
 pub(crate) const BASE_RETRY_DELAY: Duration = Duration::from_secs(5);
-/// Delay between retries of a stream idle timeout. Longer than
-/// `BASE_RETRY_DELAY` because the provider hang that caused the silent
-/// stream typically outlasts a few seconds.
-const STREAM_IDLE_RETRY_DELAY: Duration = Duration::from_secs(30);
-/// Upper bound on a provider-supplied `retry_after` hint. Some providers
-/// send multi-hour values on transient 429s; honored raw, they pin the turn
-/// in a silent backoff with a stale retry callout for hours.
-pub(crate) const MAX_RETRY_AFTER: Duration = Duration::from_secs(2 * 60);
 
-fn retry_after_delay(retry_after: Duration) -> Duration {
-    retry_after.min(MAX_RETRY_AFTER)
-}
-
-/// Payload of the `LanguageModelCompletionError::Other` raised when a stream
-/// goes silent past `agent.stream_idle_timeout_secs`. Typed so the retry
-/// strategy can grant it a longer budget than other `Other(..)` errors
-/// without string matching.
-#[derive(Debug, thiserror::Error)]
-#[error("{message}")]
-pub(crate) struct StreamIdleTimeout {
-    message: String,
-}
-
-impl StreamIdleTimeout {
-    fn error(message: impl Into<String>) -> LanguageModelCompletionError {
-        LanguageModelCompletionError::Other(anyhow::Error::new(Self {
-            message: message.into(),
-        }))
-    }
-}
+mod fork;
+pub(crate) use fork::*;
 
 #[derive(Debug, Clone, PartialEq)]
 enum RetryStrategy {
@@ -2285,24 +2258,6 @@ impl Thread {
         self.messages.last().map(std::ops::Deref::deref)
     }
 
-    /// Read-only access to the full message history.
-    ///
-    /// Used by thread branching to fork a conversation into a new session
-    /// carrying real rendered history (separate user/assistant turns and tool
-    /// cards), as opposed to flattening the thread into a transcript.
-    pub fn messages(&self) -> &[Arc<Message>] {
-        &self.messages
-    }
-
-    /// Replace the message history, then replay must be driven separately by
-    /// the caller (see [`Thread::replay`]). Used by thread branching to seed a
-    /// freshly created session with a slice of another thread's messages.
-    pub fn set_messages(&mut self, messages: Vec<Arc<Message>>, cx: &mut Context<Self>) {
-        self.messages = messages;
-        self.clear_summary();
-        cx.notify();
-    }
-
     #[cfg(any(test, feature = "test-support"))]
     pub fn last_received_or_pending_message(&self) -> Option<Arc<Message>> {
         if let Some(message) = self.pending_message.clone() {
@@ -3028,25 +2983,6 @@ impl Thread {
             task,
         ));
         Ok(events_rx)
-    }
-
-    /// Build the idle-timeout future raced against stream events. Returns a
-    /// never-firing future when the timeout is disabled (`0`), so callers can
-    /// always include the arm in their `select!`.
-    fn stream_idle_timeout_future(
-        stream_idle_timeout_secs: u64,
-        cx: &mut AsyncApp,
-    ) -> futures::future::Fuse<
-        std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>,
-    > {
-        if stream_idle_timeout_secs > 0 {
-            cx.background_executor()
-                .timer(Duration::from_secs(stream_idle_timeout_secs))
-                .boxed()
-                .fuse()
-        } else {
-            futures::future::pending::<()>().boxed().fuse()
-        }
     }
 
     async fn run_turn_internal(
@@ -5441,106 +5377,6 @@ pub fn build_thread_title_request(
     request
 }
 
-/// Bounded retries for one-shot metadata calls (thread summary, thread
-/// title) after a failure.
-///
-/// These calls get none of the retry benefit the main conversation turn
-/// gets from user- and auto_prompt-level retry loops — each is a single
-/// `stream_completion` call with no caller-side retry of its own. Provider
-/// key rotation (`retry_stream`, in
-/// `language_models::provider::open_ai_compatible::health`) deliberately
-/// stops rotating within a single request on a rate limit — burning every
-/// remaining healthy key on one request would starve the *next* request —
-/// and expects that next request to land on a different, healthy key (the
-/// failed one is already marked unhealthy by then). Without an outer retry
-/// here, a summary/title generation that happens to land on the
-/// currently-rate-limited key just fails outright instead of getting that
-/// next request.
-const METADATA_GENERATION_MAX_RETRIES: u32 = 2;
-const METADATA_GENERATION_RETRY_DELAY: Duration = Duration::from_millis(500);
-
-const IMAGE_PLACEHOLDER: &str = "[image omitted: this model doesn't support images]";
-
-/// Metadata calls (thread summary/title), compaction, and main turns run
-/// against models that can differ from the one that accepted an image when it
-/// was added to the thread (summarization/compaction model selection, model
-/// switch mid-thread, refusal fallback). Replaying history that contains
-/// image parts to a model without image support gets the whole request
-/// rejected by the endpoint (e.g. GLM error 1210 `messages.content.type is
-/// invalid, allowed values: ['text']`), so image parts are replaced with text
-/// placeholders. Takes the request by value and only rewrites content when
-/// image parts are actually present, so the hot path pays a scan, not a copy.
-pub(crate) fn strip_unsupported_images(
-    model: &LanguageModel,
-    mut request: LanguageModelRequest,
-) -> LanguageModelRequest {
-    fn contains_image(message: &LanguageModelRequestMessage) -> bool {
-        message.content.iter().any(|content| match content {
-            MessageContent::Image(_) => true,
-            MessageContent::ToolResult(tool_result) => tool_result
-                .content
-                .iter()
-                .any(|part| matches!(part, LanguageModelToolResultContent::Image(_))),
-            _ => false,
-        })
-    }
-
-    if model.supports_images() || !request.messages.iter().any(contains_image) {
-        return request;
-    }
-
-    for message in &mut request.messages {
-        for content in &mut message.content {
-            match content {
-                MessageContent::Image(_) => {
-                    *content = MessageContent::Text(IMAGE_PLACEHOLDER.into())
-                }
-                MessageContent::ToolResult(tool_result) => {
-                    for part in &mut tool_result.content {
-                        if matches!(part, LanguageModelToolResultContent::Image(_)) {
-                            *part = LanguageModelToolResultContent::Text(IMAGE_PLACEHOLDER.into());
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    request
-}
-
-async fn stream_completion_with_retry(
-    model: &LanguageModel,
-    request: &LanguageModelRequest,
-    cx: &AsyncApp,
-) -> std::result::Result<
-    BoxStream<
-        'static,
-        std::result::Result<LanguageModelCompletionEvent, LanguageModelCompletionError>,
-    >,
-    LanguageModelCompletionError,
-> {
-    let provider =
-        cx.update(|cx| LanguageModelRegistry::read_global(cx).provider_for_model(model))?;
-    let request = &strip_unsupported_images(model, request.clone());
-    let mut attempt = 0;
-    loop {
-        match provider.stream_completion(model, request.clone(), cx).await {
-            Ok(stream) => return Ok(stream),
-            Err(err) if attempt < METADATA_GENERATION_MAX_RETRIES => {
-                attempt += 1;
-                log::warn!(
-                    "metadata generation call failed (attempt {attempt}/{METADATA_GENERATION_MAX_RETRIES}): {err:#}, retrying"
-                );
-                cx.background_executor()
-                    .timer(METADATA_GENERATION_RETRY_DELAY)
-                    .await;
-            }
-            Err(err) => return Err(err),
-        }
-    }
-}
-
 pub async fn stream_thread_title(
     model: LanguageModel,
     request: LanguageModelRequest,
@@ -7518,6 +7354,7 @@ fn convert_image(image_content: acp_v2::ImageContent) -> LanguageModelImage {
 
 #[cfg(test)]
 mod tests {
+    mod fork_tests;
     use super::*;
     use agent_client_protocol::schema::MaybeUndefined;
     use gpui::TestAppContext;
@@ -8894,246 +8731,6 @@ mod tests {
         fake.send_text(&compaction_model, &request, "summary");
         fake.end_stream(&compaction_model, &request);
         cx.run_until_parked();
-    }
-
-    /// A provider that accepts the request but never delivers SSE events must
-    /// not wedge the thread in `Generating` forever: the idle timeout in
-    /// `run_turn_internal` turns the dead stream into a retryable error, the
-    /// retry re-opens the stream, and once the extended idle-timeout retry
-    /// budget is exhausted the turn ends with the error instead of hanging
-    /// (issue 003).
-    #[gpui::test]
-    async fn test_stream_idle_timeout_recovers_hung_stream(cx: &mut TestAppContext) {
-        let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
-        let model = fake.model("fake");
-
-        cx.update(|cx| {
-            thread.update(cx, |thread, cx| {
-                thread.set_model(model.clone(), cx);
-            });
-        });
-
-        // The fake model's stream stays open but never yields events — the
-        // exact failure mode from issue 003.
-        let mut events = cx
-            .update(|cx| {
-                thread.update(cx, |thread, cx| {
-                    thread.send(ClientUserMessageId::new(), vec!["hello"], cx)
-                })
-            })
-            .unwrap();
-        cx.run_until_parked();
-
-        // Default `stream_idle_timeout_secs` is 120; idle timeouts retry up to
-        // 4 times with a 30s fixed delay, so the full cascade (5 attempts) needs
-        // ~720s of virtual time. Advance in chunks so each due timer's task
-        // runs before the next clock jump.
-        for _ in 0..14 {
-            cx.executor().advance_clock(Duration::from_secs(60));
-            cx.run_until_parked();
-        }
-
-        assert_eq!(
-            fake.pending_completions_for(&model).len(),
-            5,
-            "initial attempt plus four retries should have opened five streams"
-        );
-
-        let mut saw_idle_timeout_error = false;
-        while let Some(event) = events.next().await {
-            if let Err(error) = event {
-                assert!(
-                    format!("{error:#}").contains("stream idle timeout"),
-                    "unexpected turn error: {error:#}"
-                );
-                saw_idle_timeout_error = true;
-            }
-        }
-        assert!(
-            saw_idle_timeout_error,
-            "the turn must end with the idle-timeout error instead of wedging"
-        );
-
-        thread.read_with(cx, |thread, _| {
-            assert!(
-                thread.running_turn.is_none(),
-                "the turn must have finished, not stayed Generating forever"
-            );
-        });
-    }
-
-    /// A provider hang that outlasts the first attempt must recover
-    /// automatically, without surfacing an error or waiting for the user to
-    /// click retry: the idle timeout turns the dead stream into a retryable
-    /// error, and when a later retry's stream delivers events the turn simply
-    /// continues to completion.
-    #[gpui::test]
-    async fn test_stream_idle_timeout_recovers_mid_retry_cascade(cx: &mut TestAppContext) {
-        let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
-        let model = fake.model("fake");
-
-        cx.update(|cx| {
-            thread.update(cx, |thread, cx| {
-                thread.set_model(model.clone(), cx);
-            });
-        });
-
-        let mut events = cx
-            .update(|cx| {
-                thread.update(cx, |thread, cx| {
-                    thread.send(ClientUserMessageId::new(), vec!["hello"], cx)
-                })
-            })
-            .unwrap();
-        cx.run_until_parked();
-
-        // Two attempts hang; each burns the 120s idle timeout plus a 30s
-        // retry delay. Advance in 60s chunks until the third stream opens.
-        for _ in 0..10 {
-            if fake.pending_completions_for(&model).len() >= 3 {
-                break;
-            }
-            cx.executor().advance_clock(Duration::from_secs(60));
-            cx.run_until_parked();
-        }
-        assert_eq!(
-            fake.pending_completions_for(&model).len(),
-            3,
-            "two hung attempts plus the retry should have opened three streams"
-        );
-
-        // The provider recovers on the third attempt. The abandoned attempts'
-        // senders are still queued with identical requests, so respond via
-        // the last-entry helper rather than equality-based lookup.
-        fake.respond_to_last_pending_completion(
-            &model,
-            [LanguageModelCompletionEvent::Text(
-                "Recovered after retry.".into(),
-            )],
-        );
-        cx.run_until_parked();
-
-        let mut saw_recovered_text = false;
-        let mut ended_normally = false;
-        let mut saw_error = false;
-        while let Some(event) = events.next().await {
-            match event {
-                Ok(ThreadEvent::AgentText(text)) => {
-                    saw_recovered_text |= text.contains("Recovered after retry.");
-                }
-                Ok(ThreadEvent::Stop(_)) => ended_normally = true,
-                Err(error) => {
-                    saw_error = true;
-                    log::error!("unexpected turn error: {error:#}");
-                }
-                _ => {}
-            }
-        }
-        assert!(
-            saw_recovered_text,
-            "the recovered attempt's text must reach the event stream"
-        );
-        assert!(
-            ended_normally,
-            "the turn must end with a stop event instead of an error"
-        );
-        assert!(!saw_error, "no error may be surfaced when a retry recovers");
-
-        thread.read_with(cx, |thread, _| {
-            assert!(
-                thread.running_turn.is_none(),
-                "the turn must have finished cleanly"
-            );
-        });
-    }
-
-    /// A compaction stream that accepts the request but never delivers
-    /// events must not wedge the turn: the idle timeout in `stream_compaction`
-    /// turns it into a retryable error (initial + 4 retries against the
-    /// compaction model), then the turn ends with a visible error instead of
-    /// hanging forever (`.docs/009` follow-up to issue 003).
-    #[gpui::test]
-    async fn test_compaction_stream_idle_timeout_recovers_hung_stream(cx: &mut TestAppContext) {
-        let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
-        let thread_model = fake.model("fake");
-        let compaction_model = fake.model("compaction");
-        let old_user_message_id = ClientUserMessageId::new();
-
-        cx.update(|cx| {
-            thread.update(cx, |thread, cx| {
-                thread.set_model(thread_model.clone(), cx);
-                thread
-                    .messages
-                    .push(user_text_message(old_user_message_id.clone(), "old user"));
-                thread.messages.push(agent_text_message("old assistant"));
-                thread.request_token_usage.insert(
-                    old_user_message_id.clone(),
-                    TokenUsage {
-                        input_tokens: u64::MAX,
-                        ..Default::default()
-                    },
-                );
-            });
-            set_auto_compact_settings(
-                cx,
-                agent_settings::AutoCompactSettings {
-                    enabled: true,
-                    threshold: agent_settings::AutoCompactThreshold::Percentage(0.5),
-                },
-            );
-            set_registry_compaction_model(cx, Some(compaction_model.clone()));
-        });
-
-        // The compaction model's stream stays open but never yields events.
-        let mut events = cx
-            .update(|cx| {
-                thread.update(cx, |thread, cx| {
-                    thread.send(ClientUserMessageId::new(), vec!["new prompt"], cx)
-                })
-            })
-            .unwrap();
-        cx.run_until_parked();
-
-        // Five compaction attempts (initial + 4 retries) at 120s idle + 30s
-        // delay each (~720s virtual time total); advance in chunks so each
-        // due timer's task runs first.
-        for _ in 0..14 {
-            cx.executor().advance_clock(Duration::from_secs(60));
-            cx.run_until_parked();
-        }
-
-        assert_eq!(
-            fake.pending_completions_for(&compaction_model).len(),
-            5,
-            "initial compaction attempt plus four retries should have opened five streams"
-        );
-        assert_eq!(
-            fake.pending_completions_for(&thread_model).len(),
-            0,
-            "the main model must never be hit while compaction cannot complete"
-        );
-
-        let mut saw_idle_timeout_error = false;
-        while let Some(event) = events.next().await {
-            if let Err(error) = event {
-                assert!(
-                    format!("{error:#}").contains("stream idle timeout"),
-                    "unexpected turn error: {error:#}"
-                );
-                saw_idle_timeout_error = true;
-            }
-        }
-        assert!(
-            saw_idle_timeout_error,
-            "the turn must end with the compaction idle-timeout error instead of wedging"
-        );
-
-        thread.read_with(cx, |thread, _| {
-            assert!(
-                thread.running_turn.is_none(),
-                "the turn must have finished, not stayed Generating forever"
-            );
-        });
     }
 
     #[gpui::test]
