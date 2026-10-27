@@ -52,7 +52,7 @@ corrections by enough to pay for the extra tokens.
       "request_verdict"`).
 - [x] Human correction rate + cited-commit resolution rate replace the
       post-hoc metric, which auto-prompt handoffs blind (2026-10-27).
-- [ ] Re-score at >= 20 verdict-ON chains with the new measures.
+- [ ] Re-score at >= 20 verdict-ON chains with the new measures (13 ON / 36 OFF as of 2026-10-27, deferred until then).
 - [x] Scorer script: `script/verdict_scorer.py` (uv + zstandard). Reads
       `threads.db`, decompresses the zstd thread blobs, splits verdict-on/off
       cohorts, and reports post-hoc fix rate / rounds distribution / aborts /
