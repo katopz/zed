@@ -342,8 +342,7 @@ pub fn arm_if_enabled(
         return;
     };
 
-    let model = language_model::LanguageModelRegistry::read_global(cx)
-        .default_model();
+    let model = language_model::LanguageModelRegistry::read_global(cx).default_model();
     let context = last_assistant_text(thread.read(cx));
     let countdown = Duration::from_secs(config.elicitation_countdown_secs.max(1));
     log::info!(

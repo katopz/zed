@@ -140,8 +140,7 @@ async fn test_prompt_jump_bookends_scroll_to_ends(cx: &mut TestAppContext) {
     cx.run_until_parked();
 
     let thread_view = active_thread(&conversation_view, cx);
-    let entry_count =
-        thread_view.read_with(cx, |view, cx| view.thread.read(cx).entries().len());
+    let entry_count = thread_view.read_with(cx, |view, cx| view.thread.read(cx).entries().len());
     assert_eq!(
         entry_count, 4,
         "expected two user/assistant turns; got {entry_count} entries"
@@ -192,8 +191,7 @@ async fn test_prompt_jump_bookends_scroll_to_ends(cx: &mut TestAppContext) {
     thread_view.update(cx, |view, cx| {
         view.scroll_to_next_user_prompt(cx);
     });
-    let after_next =
-        thread_view.read_with(cx, |view, _cx| view.list_state.logical_scroll_top());
+    let after_next = thread_view.read_with(cx, |view, _cx| view.list_state.logical_scroll_top());
     assert_eq!(
         after_next.item_ix, 2,
         "scroll_to_next_user_prompt should land on the second user prompt (entry 2)"
@@ -202,8 +200,7 @@ async fn test_prompt_jump_bookends_scroll_to_ends(cx: &mut TestAppContext) {
     thread_view.update(cx, |view, cx| {
         view.scroll_to_prev_user_prompt(cx);
     });
-    let after_prev =
-        thread_view.read_with(cx, |view, _cx| view.list_state.logical_scroll_top());
+    let after_prev = thread_view.read_with(cx, |view, _cx| view.list_state.logical_scroll_top());
     assert_eq!(
         after_prev.item_ix, 0,
         "scroll_to_prev_user_prompt should return to the first user prompt (entry 0)"
@@ -243,8 +240,7 @@ async fn test_prompt_jump_strip_visible_with_single_prompt(cx: &mut TestAppConte
     cx.run_until_parked();
 
     let thread_view = active_thread(&conversation_view, cx);
-    let entry_count =
-        thread_view.read_with(cx, |view, cx| view.thread.read(cx).entries().len());
+    let entry_count = thread_view.read_with(cx, |view, cx| view.thread.read(cx).entries().len());
     assert_eq!(
         entry_count, 2,
         "expected one user/assistant turn; got {entry_count} entries"
@@ -356,9 +352,7 @@ async fn test_render_full_thread_view_smoke(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-async fn test_conversation_auto_allows_pending_tool_call_after_timeout(
-    cx: &mut TestAppContext,
-) {
+async fn test_conversation_auto_allows_pending_tool_call_after_timeout(cx: &mut TestAppContext) {
     init_test(cx);
     cx.update(|cx| {
         project::DisableAiSettings::register(cx);
@@ -454,9 +448,7 @@ fn request_test_tool_authorization_with(
 /// auto-answered too — the carve-out only remains for prompts with no
 /// allow option at all.
 #[gpui::test]
-async fn test_conversation_auto_allows_action_choice_with_allow_option(
-    cx: &mut TestAppContext,
-) {
+async fn test_conversation_auto_allows_action_choice_with_allow_option(cx: &mut TestAppContext) {
     init_test(cx);
     cx.update(|cx| {
         project::DisableAiSettings::register(cx);
@@ -523,9 +515,7 @@ async fn test_conversation_auto_allows_action_choice_with_allow_option(
 /// allow ("Run without sandbox once") — never Retry and never a persistent
 /// allow.
 #[gpui::test]
-async fn test_conversation_auto_allows_sandbox_fallback_with_once_allow(
-    cx: &mut TestAppContext,
-) {
+async fn test_conversation_auto_allows_sandbox_fallback_with_once_allow(cx: &mut TestAppContext) {
     init_test(cx);
     cx.update(|cx| {
         project::DisableAiSettings::register(cx);
@@ -566,16 +556,12 @@ async fn test_conversation_auto_allows_sandbox_fallback_with_once_allow(
                 acp_v2::PermissionOptionKind::RejectAlways,
             ),
             acp_v2::PermissionOption::new(
-                acp_v2::PermissionOptionId::new(
-                    acp_thread::SandboxPermission::AllowOnce.as_id(),
-                ),
+                acp_v2::PermissionOptionId::new(acp_thread::SandboxPermission::AllowOnce.as_id()),
                 "Run without sandbox once",
                 acp_v2::PermissionOptionKind::AllowOnce,
             ),
             acp_v2::PermissionOption::new(
-                acp_v2::PermissionOptionId::new(
-                    acp_thread::SandboxPermission::AllowAlways.as_id(),
-                ),
+                acp_v2::PermissionOptionId::new(acp_thread::SandboxPermission::AllowAlways.as_id()),
                 "Always run without sandbox",
                 acp_v2::PermissionOptionKind::AllowAlways,
             ),
@@ -656,10 +642,8 @@ async fn test_conversation_does_not_auto_allow_by_default(cx: &mut TestAppContex
     );
     assert_eq!(
         conversation.read_with(cx, |conversation, _| {
-            conversation.auto_allow_remaining_seconds(
-                &session_id,
-                &acp_v2::ToolCallId::new("tc-manual"),
-            )
+            conversation
+                .auto_allow_remaining_seconds(&session_id, &acp_v2::ToolCallId::new("tc-manual"))
         }),
         None
     );
@@ -701,8 +685,7 @@ async fn test_queued_message_takes_priority_over_auto_prompt(cx: &mut TestAppCon
     msg_editor.update_in(cx, |editor, window, cx| {
         editor.set_text("Start work", window, cx);
     });
-    active_thread(&conversation_view, cx)
-        .update_in(cx, |view, window, cx| view.send(window, cx));
+    active_thread(&conversation_view, cx).update_in(cx, |view, window, cx| view.send(window, cx));
 
     cx.run_until_parked();
 
@@ -760,7 +743,6 @@ async fn test_queued_message_takes_priority_over_auto_prompt(cx: &mut TestAppCon
 async fn test_manual_auto_prompt_dispatches_static_continuation(cx: &mut TestAppContext) {
     let fake = init_test(cx);
 
-
     let connection = StubAgentConnection::new();
     let (conversation_view, cx) =
         setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
@@ -769,8 +751,7 @@ async fn test_manual_auto_prompt_dispatches_static_continuation(cx: &mut TestApp
     message_editor(&conversation_view, cx).update_in(cx, |editor, window, cx| {
         editor.set_text("do work", window, cx);
     });
-    active_thread(&conversation_view, cx)
-        .update_in(cx, |view, window, cx| view.send(window, cx));
+    active_thread(&conversation_view, cx).update_in(cx, |view, window, cx| view.send(window, cx));
     cx.run_until_parked();
 
     let session_id = active_thread(&conversation_view, cx)
@@ -824,8 +805,7 @@ async fn test_direct_message_cancels_auto_prompt_task(cx: &mut TestAppContext) {
     msg_editor.update_in(cx, |editor, window, cx| {
         editor.set_text("Start work", window, cx);
     });
-    active_thread(&conversation_view, cx)
-        .update_in(cx, |view, window, cx| view.send(window, cx));
+    active_thread(&conversation_view, cx).update_in(cx, |view, window, cx| view.send(window, cx));
 
     cx.run_until_parked();
 
@@ -845,8 +825,7 @@ async fn test_direct_message_cancels_auto_prompt_task(cx: &mut TestAppContext) {
         ed.set_text("User direct message", window, cx);
     });
 
-    active_thread(&conversation_view, cx)
-        .update_in(cx, |view, window, cx| view.send(window, cx));
+    active_thread(&conversation_view, cx).update_in(cx, |view, window, cx| view.send(window, cx));
 
     cx.run_until_parked();
 
@@ -924,8 +903,7 @@ async fn test_watchdog_halts_stuck_thread(cx: &mut TestAppContext) {
     message_editor.update_in(cx, |editor, window, cx| {
         editor.set_text("do something", window, cx);
     });
-    active_thread(&conversation_view, cx)
-        .update_in(cx, |view, window, cx| view.send(window, cx));
+    active_thread(&conversation_view, cx).update_in(cx, |view, window, cx| view.send(window, cx));
     cx.run_until_parked();
 
     // Pre-timeout: thread is stuck Generating and the watchdog is armed.
@@ -1014,8 +992,7 @@ async fn test_watchdog_resets_across_generations(cx: &mut TestAppContext) {
     message_editor(&conversation_view, cx).update_in(cx, |editor, window, cx| {
         editor.set_text("first", window, cx);
     });
-    active_thread(&conversation_view, cx)
-        .update_in(cx, |view, window, cx| view.send(window, cx));
+    active_thread(&conversation_view, cx).update_in(cx, |view, window, cx| view.send(window, cx));
     cx.run_until_parked();
 
     // Generation 1 ran: thread is back to Idle and the watchdog was
@@ -1038,8 +1015,7 @@ async fn test_watchdog_resets_across_generations(cx: &mut TestAppContext) {
     message_editor(&conversation_view, cx).update_in(cx, |editor, window, cx| {
         editor.set_text("second", window, cx);
     });
-    active_thread(&conversation_view, cx)
-        .update_in(cx, |view, window, cx| view.send(window, cx));
+    active_thread(&conversation_view, cx).update_in(cx, |view, window, cx| view.send(window, cx));
     cx.run_until_parked();
 
     // While generating, the watchdog is armed again. With the pre-fix code,
@@ -1082,7 +1058,6 @@ async fn test_watchdog_does_not_fire_during_active_stream(cx: &mut TestAppContex
 
     let fake = init_test(cx);
 
-
     // Use a stub connection that we control: we'll feed it streaming
     // updates manually so the thread stays Generating with periodic output.
     let connection = StubAgentConnection::new();
@@ -1100,8 +1075,7 @@ async fn test_watchdog_does_not_fire_during_active_stream(cx: &mut TestAppContex
     message_editor.update_in(cx, |editor, window, cx| {
         editor.set_text("do something slowly", window, cx);
     });
-    active_thread(&conversation_view, cx)
-        .update_in(cx, |view, window, cx| view.send(window, cx));
+    active_thread(&conversation_view, cx).update_in(cx, |view, window, cx| view.send(window, cx));
     cx.run_until_parked();
 
     let session_id = active_thread(&conversation_view, cx)
@@ -1184,8 +1158,7 @@ async fn test_retry_generation_resets_turn_stopwatch(cx: &mut TestAppContext) {
     message_editor(&conversation_view, cx).update_in(cx, |editor, window, cx| {
         editor.set_text("first", window, cx);
     });
-    active_thread(&conversation_view, cx)
-        .update_in(cx, |view, window, cx| view.send(window, cx));
+    active_thread(&conversation_view, cx).update_in(cx, |view, window, cx| view.send(window, cx));
     cx.run_until_parked();
 
     let session_id = conversation_view.read_with(cx, |view, cx| {
