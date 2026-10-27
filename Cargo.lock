@@ -334,6 +334,7 @@ checksum = "9bbe69c878aef64a3d92041e256e75acdb1bf2ea8e55ef3313e69dbb2f5bd75a"
 dependencies = [
  "agent-client-protocol-derive",
  "agent-client-protocol-schema",
+ "blocking",
  "futures 0.3.34",
  "futures-concurrency",
  "rustc-hash 2.1.1",
@@ -6127,11 +6128,13 @@ dependencies = [
  "language_model",
  "language_models",
  "languages",
+ "log",
  "node_runtime",
  "paths",
  "project",
  "prompt_store",
  "release_channel",
+ "remote_connection",
  "reqwest_client",
  "serde",
  "serde_json",
@@ -6142,6 +6145,7 @@ dependencies = [
  "theme_settings",
  "util",
  "watch",
+ "workspace",
 ]
 
 [[package]]

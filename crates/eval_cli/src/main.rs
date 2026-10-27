@@ -29,6 +29,7 @@
 //! | 2    | Timeout |
 //! | 3    | Interrupted (SIGTERM/SIGINT) |
 
+mod acp_server;
 mod headless;
 
 use std::path::PathBuf;
@@ -105,6 +106,11 @@ struct Args {
     /// Enable or disable extended thinking. Defaults to model auto-detection if omitted.
     #[arg(long)]
     thinking: Option<bool>,
+
+    /// Serve the agent as an ACP agent over stdio instead of running one
+    /// instruction (for `zed-agentd attach -- eval-cli --acp`).
+    #[arg(long)]
+    acp: bool,
 }
 
 enum AgentOutcome {
@@ -176,10 +182,14 @@ fn main() {
     })
     .expect("failed to set signal handler");
 
-    let instruction = read_instruction(&args).unwrap_or_else(|e| {
-        eprintln!("Error reading instruction: {e}");
-        process::exit(EXIT_ERROR);
-    });
+    let instruction = if args.acp {
+        String::new()
+    } else {
+        read_instruction(&args).unwrap_or_else(|e| {
+            eprintln!("Error reading instruction: {e}");
+            process::exit(EXIT_ERROR);
+        })
+    };
 
     let workdir = args.workdir.canonicalize().unwrap_or_else(|e| {
         eprintln!("Invalid --workdir {:?}: {e}", args.workdir);
@@ -225,6 +235,7 @@ fn main() {
         let timeout = args.timeout;
         let thinking_override = args.thinking;
         let reasoning_effort = args.reasoning_effort.clone();
+        let serve_acp = args.acp;
 
         cx.spawn(async move |cx| {
             // Each settings change below is applied in its own `cx.update` call (rather than
@@ -261,6 +272,25 @@ fn main() {
                 })
             });
             futures::future::join_all(auth_tasks).await;
+
+            if serve_acp {
+                let model = acp_server::ModelOptions {
+                    model_name: &model_name,
+                    thinking_override,
+                    reasoning_effort: reasoning_effort.as_deref(),
+                    openai_compatible_providers_json: openai_compatible_providers_json.as_deref(),
+                    anthropic_available_models_json: anthropic_available_models_json.as_deref(),
+                };
+                let exit_code = match acp_server::serve(&app_state, model, cx).await {
+                    Ok(()) => EXIT_OK,
+                    Err(e) => {
+                        eprintln!("Error: {e:#}");
+                        EXIT_ERROR
+                    }
+                };
+                cx.update(|cx| cx.quit());
+                process::exit(exit_code);
+            }
 
             let start = Instant::now();
 
@@ -612,155 +642,25 @@ async fn run_agent(
         return (Err(e), RunStats::default());
     }
 
-    let setup_result: Result<()> = cx.update(|cx| {
-        let registry = LanguageModelRegistry::global(cx);
-        let model = find_available_model(&selected, cx)
-            .ok_or_else(|| model_not_found_error(model_name, cx))?;
-        let supports_thinking = model.supports_thinking();
-        let model_id = model.id().0.to_string();
-
-        registry.update(cx, |registry, cx| {
-            registry.set_default_model(Some(model), cx);
-        });
-
-        let enable_thinking = thinking_override.unwrap_or(supports_thinking);
-        let effort = if enable_thinking {
-            match reasoning_effort {
-                Some(level) => format!("\"{level}\""),
-                None => "\"high\"".to_string(),
-            }
-        } else {
-            "null".to_string()
-        };
-        let provider_id = selected.provider.0.to_string();
-        // set_user_settings replaces the whole user settings buffer, so the
-        // openai_compatible/anthropic blocks applied earlier (before model
-        // discovery) have to be folded back in here, or they would be dropped
-        // by this call.
-        let mut language_models_fields = Vec::new();
-        if let Some(providers_json) = openai_compatible_providers_json {
-            language_models_fields.push(format!(r#""openai_compatible": {providers_json}"#));
-        }
-        if let Some(models_json) = anthropic_available_models_json {
-            language_models_fields.push(format!(
-                r#""anthropic": {{"available_models": {models_json}}}"#
-            ));
-        }
-        let language_models_settings = format!("{{{}}}", language_models_fields.join(","));
-        // Disable specific tools (e.g. `fetch`/`search_web` on air-gapped
-        // benchmarks) the canonical way: via the agent profile. The model only
-        // sees a built-in tool when the active profile enables it (see
-        // Thread::enabled_tools), so we define a dedicated "eval" profile that
-        // mirrors the built-in "write" profile minus the disabled tools, and make
-        // it the default profile. A fresh profile key is NOT deep-merged against
-        // the defaults, so it can't inherit "write"'s tools — the full set is
-        // listed explicitly here. Keep WRITE_TOOLS in sync with the "write"
-        // profile in assets/settings/default.json.
-        let profile_field = {
-            let raw = std::env::var("ZED_EVAL_DISABLE_TOOLS").unwrap_or_default();
-            let disabled = raw
-                .split(',')
-                .map(|name| name.trim().to_string())
-                .filter(|name| !name.is_empty())
-                .collect::<std::collections::HashSet<String>>();
-            if disabled.is_empty() {
-                String::new()
-            } else {
-                const WRITE_TOOLS: &[&str] = &[
-                    "copy_path",
-                    "create_directory",
-                    "create_thread",
-                    "delete_path",
-                    "diagnostics",
-                    "apply_code_action",
-                    "edit_file",
-                    "write_file",
-                    "fetch",
-                    "find_path",
-                    "find_references",
-                    "get_code_actions",
-                    "go_to_definition",
-                    "list_agents_and_models",
-                    "list_directory",
-                    "move_path",
-                    "rename_symbol",
-                    "read_file",
-                    "grep",
-                    "skill",
-                    "spawn_agent",
-                    "request_verdict",
-                    "terminal",
-                    "search_web",
-                ];
-                let tools = WRITE_TOOLS
-                    .iter()
-                    .filter(|tool| !disabled.contains(**tool))
-                    .map(|tool| format!(r#""{tool}": true"#))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!(
-                    r#","default_profile": "eval", "profiles": {{"eval": {{"name": "Eval", "enable_all_context_servers": true, "tools": {{{tools}}}}}}}"#
-                )
-            }
-        };
-        SettingsStore::update_global(cx, |store, cx| {
-            let settings = format!(
-                r#"{{
-                    "language_models": {language_models_settings},
-                    "agent": {{
-                        "tool_permissions": {{"default": "allow"}},
-                        "default_model": {{
-                            "provider": "{provider_id}",
-                            "model": "{model_id}",
-                            "enable_thinking": {enable_thinking},
-                            "effort": {effort}
-                        }}{profile_field}
-                    }},
-                    "autosave": "off",
-                    "format_on_save": "off"
-                }}"
-                "#
-            );
-            store.set_user_settings(&settings, cx).result()
-        })
-        .context("updating agent settings")?;
-
-        anyhow::Ok(())
+    let setup_result = cx.update(|cx| {
+        configure_agent_settings(
+            &selected,
+            model_name,
+            thinking_override,
+            reasoning_effort,
+            openai_compatible_providers_json,
+            anthropic_available_models_json,
+            true,
+            cx,
+        )
     });
 
     if let Err(e) = setup_result {
         return (Err(e), RunStats::default());
     }
 
-    let project = cx.update(|cx| {
-        Project::local(
-            app_state.client.clone(),
-            app_state.node_runtime.clone(),
-            app_state.user_store.clone(),
-            app_state.languages.clone(),
-            app_state.fs.clone(),
-            None,
-            project::LocalProjectFlags {
-                init_worktree_trust: false,
-                ..Default::default()
-            },
-            cx,
-        )
-    });
-
-    let worktree = project.update(cx, |project, cx| project.create_worktree(workdir, true, cx));
-    let worktree = match worktree.await {
-        Ok(w) => w,
-        Err(e) => return (Err(e).context("creating worktree"), RunStats::default()),
-    };
-
-    let scan_result = worktree.update(cx, |tree, _cx| {
-        tree.as_local()
-            .context("expected local worktree")
-            .map(|local| local.scan_complete())
-    });
-    match scan_result {
-        Ok(future) => future.await,
+    let project = match open_local_project(app_state, workdir, cx).await {
+        Ok(project) => project,
         Err(e) => return (Err(e), RunStats::default()),
     };
 
@@ -952,6 +852,172 @@ async fn run_agent(
             tool_calls,
         },
     )
+}
+
+/// Selects the model and writes the agent settings both run modes share.
+fn configure_agent_settings(
+    selected: &SelectedModel,
+    model_name: &str,
+    thinking_override: Option<bool>,
+    reasoning_effort: Option<&str>,
+    openai_compatible_providers_json: Option<&str>,
+    anthropic_available_models_json: Option<&str>,
+    auto_allow_tools: bool,
+    cx: &mut gpui::App,
+) -> Result<()> {
+    let registry = LanguageModelRegistry::global(cx);
+    // Eval runs are unattended; ACP serving asks the client instead.
+    let tool_permissions = if auto_allow_tools {
+        r#""tool_permissions": {"default": "allow"},"#
+    } else {
+        ""
+    };
+    let model =
+        find_available_model(&selected, cx).ok_or_else(|| model_not_found_error(model_name, cx))?;
+    let supports_thinking = model.supports_thinking();
+    let model_id = model.id().0.to_string();
+
+    registry.update(cx, |registry, cx| {
+        registry.set_default_model(Some(model), cx);
+    });
+
+    let enable_thinking = thinking_override.unwrap_or(supports_thinking);
+    let effort = if enable_thinking {
+        match reasoning_effort {
+            Some(level) => format!("\"{level}\""),
+            None => "\"high\"".to_string(),
+        }
+    } else {
+        "null".to_string()
+    };
+    let provider_id = selected.provider.0.to_string();
+    // set_user_settings replaces the whole user settings buffer, so the
+    // openai_compatible/anthropic blocks applied earlier (before model
+    // discovery) have to be folded back in here, or they would be dropped
+    // by this call.
+    let mut language_models_fields = Vec::new();
+    if let Some(providers_json) = openai_compatible_providers_json {
+        language_models_fields.push(format!(r#""openai_compatible": {providers_json}"#));
+    }
+    if let Some(models_json) = anthropic_available_models_json {
+        language_models_fields.push(format!(
+            r#""anthropic": {{"available_models": {models_json}}}"#
+        ));
+    }
+    let language_models_settings = format!("{{{}}}", language_models_fields.join(","));
+    // Disable specific tools (e.g. `fetch`/`search_web` on air-gapped
+    // benchmarks) the canonical way: via the agent profile. The model only
+    // sees a built-in tool when the active profile enables it (see
+    // Thread::enabled_tools), so we define a dedicated "eval" profile that
+    // mirrors the built-in "write" profile minus the disabled tools, and make
+    // it the default profile. A fresh profile key is NOT deep-merged against
+    // the defaults, so it can't inherit "write"'s tools — the full set is
+    // listed explicitly here. Keep WRITE_TOOLS in sync with the "write"
+    // profile in assets/settings/default.json.
+    let profile_field = {
+        let raw = std::env::var("ZED_EVAL_DISABLE_TOOLS").unwrap_or_default();
+        let disabled = raw
+            .split(',')
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .collect::<std::collections::HashSet<String>>();
+        if disabled.is_empty() {
+            String::new()
+        } else {
+            const WRITE_TOOLS: &[&str] = &[
+                "copy_path",
+                "create_directory",
+                "create_thread",
+                "delete_path",
+                "diagnostics",
+                "apply_code_action",
+                "edit_file",
+                "write_file",
+                "fetch",
+                "find_path",
+                "find_references",
+                "get_code_actions",
+                "go_to_definition",
+                "list_agents_and_models",
+                "list_directory",
+                "move_path",
+                "rename_symbol",
+                "read_file",
+                "grep",
+                "skill",
+                "spawn_agent",
+                "request_verdict",
+                "terminal",
+                "search_web",
+            ];
+            let tools = WRITE_TOOLS
+                .iter()
+                .filter(|tool| !disabled.contains(**tool))
+                .map(|tool| format!(r#""{tool}": true"#))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                r#","default_profile": "eval", "profiles": {{"eval": {{"name": "Eval", "enable_all_context_servers": true, "tools": {{{tools}}}}}}}"#
+            )
+        }
+    };
+    SettingsStore::update_global(cx, |store, cx| {
+        let settings = format!(
+            r#"{{
+                "language_models": {language_models_settings},
+                "agent": {{
+                    {tool_permissions}
+                    "default_model": {{
+                        "provider": "{provider_id}",
+                        "model": "{model_id}",
+                        "enable_thinking": {enable_thinking},
+                        "effort": {effort}
+                    }}{profile_field}
+                }},
+                "autosave": "off",
+                "format_on_save": "off"
+            }}
+            "#
+        );
+        store.set_user_settings(&settings, cx).result()
+    })
+    .context("updating agent settings")?;
+
+    anyhow::Ok(())
+}
+
+/// A local project with one fully scanned worktree at `workdir`.
+async fn open_local_project(
+    app_state: &Arc<AgentCliAppState>,
+    workdir: &std::path::Path,
+    cx: &mut AsyncApp,
+) -> Result<Entity<Project>> {
+    let project = cx.update(|cx| {
+        Project::local(
+            app_state.client.clone(),
+            app_state.node_runtime.clone(),
+            app_state.user_store.clone(),
+            app_state.languages.clone(),
+            app_state.fs.clone(),
+            None,
+            project::LocalProjectFlags {
+                init_worktree_trust: false,
+                ..Default::default()
+            },
+            cx,
+        )
+    });
+    let worktree = project
+        .update(cx, |project, cx| project.create_worktree(workdir, true, cx))
+        .await
+        .context("creating worktree")?;
+    let scan = worktree.update(cx, |tree, _cx| {
+        tree.as_local()
+            .context("expected local worktree")
+            .map(|local| local.scan_complete())
+    })?;
+    scan.await;
+    Ok(project)
 }
 
 fn log_acp_thread_event(
