@@ -8987,13 +8987,13 @@ fn ai_page(cx: &App) -> SettingsPage {
                     organization_override: None,
                     json_path: Some("agent.claude_md_symlink"),
                     pick: |settings_content| {
-                        settings_content.agent.as_ref()?.claude_md_symlink.as_ref()
+                        settings_content.agent.as_ref()?.fork.claude_md_symlink.as_ref()
                     },
                     write: |settings_content, value, _| {
                         settings_content
                             .agent
                             .get_or_insert_default()
-                            .claude_md_symlink = value;
+                            .fork.claude_md_symlink = value;
                     },
                 }),
                 metadata: None,
@@ -9009,14 +9009,14 @@ fn ai_page(cx: &App) -> SettingsPage {
                         settings_content
                             .agent
                             .as_ref()?
-                            .project_claude_md_symlink
+                            .fork.project_claude_md_symlink
                             .as_ref()
                     },
                     write: |settings_content, value, _| {
                         settings_content
                             .agent
                             .get_or_insert_default()
-                            .project_claude_md_symlink = value;
+                            .fork.project_claude_md_symlink = value;
                     },
                 }),
                 metadata: None,

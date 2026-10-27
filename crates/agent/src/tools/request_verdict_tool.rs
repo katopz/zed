@@ -308,10 +308,10 @@ impl AgentTool for RequestVerdictTool {
                 cx.update(|cx| {
                     let settings = AgentSettings::get_global(cx);
                     (
-                        settings.verdict_ping_pong,
-                        settings.verdict_max_rounds,
-                        settings.verdict_reviewer.clone(),
-                        settings.verdict_secondary_model.clone(),
+                        settings.fork.verdict_ping_pong,
+                        settings.fork.verdict_max_rounds,
+                        settings.fork.verdict_reviewer.clone(),
+                        settings.fork.verdict_secondary_model.clone(),
                     )
                 });
 

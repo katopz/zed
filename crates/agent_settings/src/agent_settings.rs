@@ -1,5 +1,6 @@
 mod agent_profile;
 pub mod claude_md_symlink;
+mod fork;
 mod user_agents_md;
 
 use std::cmp::Ordering::{Equal, Greater, Less};
@@ -20,9 +21,11 @@ use settings::{
     DockPosition, DockSide, IntoGpui, LanguageModelParameters, LanguageModelSelection,
     NotifyWhenAgentWaiting, PlaySoundWhenAgentDone, RegisterSetting, Settings, SettingsContent,
     SettingsStore, SidebarDockPosition, SidebarSide, ThinkingBlockDisplay, ToolPermissionMode,
-    VerdictReviewerSetting, update_settings_file, update_settings_file_with_completion,
+    update_settings_file, update_settings_file_with_completion,
 };
 use util::ResultExt as _;
+
+pub use fork::*;
 
 pub use crate::agent_profile::*;
 pub use crate::user_agents_md::{UserAgentsMd, UserAgentsMdState, init as init_user_agents_md};
@@ -31,12 +34,6 @@ pub const SUMMARIZE_THREAD_PROMPT: &str = include_str!("prompts/summarize_thread
 pub const SUMMARIZE_THREAD_DETAILED_PROMPT: &str =
     include_str!("prompts/summarize_thread_detailed_prompt.txt");
 pub const COMPACTION_PROMPT: &str = include_str!("prompts/compaction_prompt.txt");
-
-/// Default for `AgentSettings::stream_idle_timeout_secs`.
-pub const DEFAULT_STREAM_IDLE_TIMEOUT_SECS: u64 = 120;
-
-/// Default for `AgentSettings::verdict_max_rounds` (proposal 001).
-pub const DEFAULT_VERDICT_MAX_ROUNDS: usize = 3;
 
 /// Bounds on the width of the threads list. They constrain the configured
 /// default as well as the width the user drags to, so that no width the sidebar
@@ -227,20 +224,6 @@ pub struct AgentSettings {
     pub max_content_width: Option<Pixels>,
     pub default_model: Option<LanguageModelSelection>,
     pub subagent_model: Option<LanguageModelSelection>,
-    /// Whether the `request_verdict` tool is registered for native agent
-    /// threads (verdict ping-pong, proposal 001). User-invoked only; set
-    /// false to opt out while the GOAT benchmark runs.
-    pub verdict_ping_pong: bool,
-    /// Model for the `request_verdict` reviewer subagent. `None` inherits the
-    /// parent thread's model.
-    pub verdict_model: Option<LanguageModelSelection>,
-    /// Hard cap on `request_verdict` rounds per negotiation.
-    pub verdict_max_rounds: usize,
-    /// Which backend provides the reviewer thread for `request_verdict`.
-    pub verdict_reviewer: VerdictReviewerSetting,
-    /// Model for the secondary verdict entry (`reviewer: "secondary"`).
-    /// `None` hides that entry.
-    pub verdict_secondary_model: Option<LanguageModelSelection>,
     pub inline_assistant_model: Option<LanguageModelSelection>,
     pub inline_assistant_use_streaming_tools: bool,
     pub commit_message_model: Option<LanguageModelSelection>,
@@ -257,8 +240,6 @@ pub struct AgentSettings {
     pub play_sound_when_agent_done: PlaySoundWhenAgentDone,
     pub prevent_idle_sleep: bool,
     pub single_file_review: bool,
-    pub claude_md_symlink: bool,
-    pub project_claude_md_symlink: bool,
     pub model_parameters: Vec<LanguageModelParameters>,
     pub auto_compact: AutoCompactSettings,
     pub enable_feedback: bool,
@@ -271,20 +252,10 @@ pub struct AgentSettings {
     pub message_editor_min_lines: usize,
     pub show_turn_stats: bool,
     pub show_merge_conflict_indicator: bool,
-    /// Whether auto_prompt should steal keyboard focus when it creates a new
-    /// background continuation thread. Default: false (don't steal focus).
-    pub auto_focus_new_thread: bool,
-    /// When set, tool permission prompts are automatically answered with the
-    /// least-privileged "allow" option after this many seconds. Default:
-    /// None (prompts wait indefinitely).
-    pub auto_allow_permissions_after_seconds: Option<u64>,
-    /// Maximum time to wait for a streamed completion event before treating
-    /// the stream as dead and retrying. 0 disables the timeout. Default: 120
-    /// seconds — long enough for time-to-first-token on very large contexts,
-    /// short enough that a wedged stream recovers without the watchdog.
-    pub stream_idle_timeout_secs: u64,
     pub tool_permissions: ToolPermissions,
     pub sandbox_permissions: SandboxPermissions,
+    /// Fork-only agent settings (plan 038).
+    pub fork: ForkAgentSettings,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -831,13 +802,6 @@ impl Settings for AgentSettings {
             flexible: agent.flexible.unwrap(),
             default_model: Some(agent.default_model.unwrap()),
             subagent_model: agent.subagent_model,
-            verdict_ping_pong: agent.verdict_ping_pong.unwrap_or(true),
-            verdict_model: agent.verdict_model,
-            verdict_max_rounds: agent
-                .verdict_max_rounds
-                .unwrap_or(DEFAULT_VERDICT_MAX_ROUNDS),
-            verdict_reviewer: agent.verdict_reviewer.unwrap_or_default(),
-            verdict_secondary_model: agent.verdict_secondary_model,
             inline_assistant_model: agent.inline_assistant_model,
             inline_assistant_use_streaming_tools: agent
                 .inline_assistant_use_streaming_tools
@@ -863,8 +827,6 @@ impl Settings for AgentSettings {
             play_sound_when_agent_done: agent.play_sound_when_agent_done.unwrap_or_default(),
             prevent_idle_sleep: agent.prevent_idle_sleep.unwrap(),
             single_file_review: agent.single_file_review.unwrap(),
-            claude_md_symlink: agent.claude_md_symlink.unwrap(),
-            project_claude_md_symlink: agent.project_claude_md_symlink.unwrap(),
             model_parameters: agent.model_parameters,
             auto_compact: {
                 let auto_compact = agent.auto_compact.unwrap();
@@ -888,13 +850,9 @@ impl Settings for AgentSettings {
             message_editor_min_lines: agent.message_editor_min_lines.unwrap(),
             show_turn_stats: agent.show_turn_stats.unwrap(),
             show_merge_conflict_indicator: agent.show_merge_conflict_indicator.unwrap(),
-            auto_focus_new_thread: agent.auto_focus_new_thread.unwrap_or(false),
-            auto_allow_permissions_after_seconds: agent.auto_allow_permissions_after_seconds,
-            stream_idle_timeout_secs: agent
-                .stream_idle_timeout_secs
-                .unwrap_or(DEFAULT_STREAM_IDLE_TIMEOUT_SECS),
             tool_permissions: compile_tool_permissions(agent.tool_permissions),
             sandbox_permissions: compile_sandbox_permissions(agent.sandbox_permissions),
+            fork: ForkAgentSettings::from_content(agent.fork),
         }
     }
 }
@@ -1456,10 +1414,10 @@ mod tests {
             "auto_allow_permissions_after_seconds": 30
         });
         let content: settings::AgentSettingsContent = serde_json::from_value(json).unwrap();
-        assert_eq!(content.auto_allow_permissions_after_seconds, Some(30));
+        assert_eq!(content.fork.auto_allow_permissions_after_seconds, Some(30));
 
         let empty: settings::AgentSettingsContent = serde_json::from_value(json!({})).unwrap();
-        assert_eq!(empty.auto_allow_permissions_after_seconds, None);
+        assert_eq!(empty.fork.auto_allow_permissions_after_seconds, None);
     }
 
     #[test]
@@ -1468,14 +1426,14 @@ mod tests {
             "stream_idle_timeout_secs": 45
         });
         let content: settings::AgentSettingsContent = serde_json::from_value(json).unwrap();
-        assert_eq!(content.stream_idle_timeout_secs, Some(45));
+        assert_eq!(content.fork.stream_idle_timeout_secs, Some(45));
 
         let disabled: settings::AgentSettingsContent =
             serde_json::from_value(json!({ "stream_idle_timeout_secs": 0 })).unwrap();
-        assert_eq!(disabled.stream_idle_timeout_secs, Some(0));
+        assert_eq!(disabled.fork.stream_idle_timeout_secs, Some(0));
 
         let empty: settings::AgentSettingsContent = serde_json::from_value(json!({})).unwrap();
-        assert_eq!(empty.stream_idle_timeout_secs, None);
+        assert_eq!(empty.fork.stream_idle_timeout_secs, None);
     }
 
     #[test]

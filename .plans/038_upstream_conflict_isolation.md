@@ -1,5 +1,5 @@
 # 038 — Isolate the fork lane from upstream files (shrink merge-conflict surface)
-Status: in progress — `script/fork-surface` shipped; acp_thread, agent, thread, thread_view, agent_panel, open_ai_compatible fork code extracted; surface 16,609 → 8,673 lines (130 files)
+Status: in progress — `script/fork-surface` shipped; acp_thread, agent, thread, thread_view, agent_panel, open_ai_compatible, agent tests fork code extracted + fork settings grouped; surface 16,609 → 8,565 lines (130 files)
 
 ## Why
 
@@ -41,5 +41,5 @@ to it. Pattern proven by plan 037 (`acp/detachable.rs`: 7 one-line upstream touc
 - [x] `agent/src/agent.rs` → `agent_fork.rs`: CLAUDE.md symlink (+ statics), `seed_history`, verdict subagent, peer-thread list/send (trait methods now one-line delegations), `running_successor_execution`; agent.rs fork lines 565 → 295 (remaining: struct fields, call-site seams, internal_tests regression tests)
 - [x] `acp_thread.rs` → fork `impl AcpThread` (board notification, bloat candidates, subagent retry completion, api-error/turn-id accessors) + `tool_call_bloat_label` moved to `acp_thread/src/fork.rs`; acp_thread.rs fork lines 409 → 216 (remaining: enum variant, struct fields, inline turn-truncation note, regression test that needs private `tests` helpers). Also fixed `acp_thread` standalone build: uuid `v7` feature was only satisfied via workspace unification
 - [x] `agent/src/tests/mod.rs` → `tests/fork_tests.rs` (8 fork-only tests); fork lines 496 → 2. Second `script/fork-split-items` pass over acp_thread/agent/thread moved 4 more items
-- [ ] Fork-only settings (`stream_idle_timeout_secs`, `verdict_max_rounds`, …) → one `fork: ForkAgentSettings` sub-struct so upstream settings structs get a single field
+- [x] Fork-only settings → `ForkAgentSettingsContent` (`settings_content/src/agent/fork.rs`, `#[serde(flatten)]` so JSON keys stay under `agent`) + `ForkAgentSettings` (`agent_settings/src/fork.rs`, `from_content`); upstream structs carry one `fork` field each, accessors read `settings.fork.<key>`. settings_content/agent.rs fork lines 93 → 6, agent_settings.rs 72 → 29. `claude_md_symlink` defaults now `unwrap_or` (no panic if default.json lacks the key)
 - [ ] Re-merge dry run against next upstream: target ≤ 15 conflicted files

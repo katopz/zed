@@ -874,7 +874,7 @@ pub(crate) fn dispatch_action_with_attempts(
             // defer entirely to the setting, so background chains never steal
             // focus unless the user has opted in.
             let focus = action.focus_new_thread
-                || agent_settings::AgentSettings::get_global(cx).auto_focus_new_thread;
+                || agent_settings::AgentSettings::get_global(cx).fork.auto_focus_new_thread;
             if focus {
                 workspace.focus_panel::<crate::AgentPanel>(window, cx);
             }

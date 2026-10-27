@@ -2332,7 +2332,7 @@ impl Thread {
 
         if self.depth() < MAX_SUBAGENT_DEPTH {
             self.add_tool(SpawnAgentTool::new(environment.clone()));
-            if AgentSettings::get_global(cx).verdict_ping_pong {
+            if AgentSettings::get_global(cx).fork.verdict_ping_pong {
                 self.add_tool(RequestVerdictTool::new(environment.clone()));
             }
         }
@@ -3119,7 +3119,7 @@ impl Thread {
             log::debug!("Calling model.stream_completion, attempt {}", attempt);
 
             let stream_idle_timeout_secs = this.read_with(cx, |_, cx| {
-                AgentSettings::get_global(cx).stream_idle_timeout_secs
+                AgentSettings::get_global(cx).fork.stream_idle_timeout_secs
             })?;
 
             let events = match provider {
@@ -3495,7 +3495,7 @@ impl Thread {
 
         log::debug!("Running compaction");
         let stream_idle_timeout_secs = this.read_with(cx, |_, cx| {
-            AgentSettings::get_global(cx).stream_idle_timeout_secs
+            AgentSettings::get_global(cx).fork.stream_idle_timeout_secs
         })?;
         let compaction_id = acp_thread::ContextCompactionId(Uuid::new_v4().to_string().into());
         event_stream.send_context_compaction(

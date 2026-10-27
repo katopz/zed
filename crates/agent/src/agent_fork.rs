@@ -29,7 +29,7 @@ impl NativeAgent {
         project: &Entity<Project>,
         cx: &App,
     ) -> Option<Task<()>> {
-        if !AgentSettings::get_global(cx).project_claude_md_symlink {
+        if !AgentSettings::get_global(cx).fork.project_claude_md_symlink {
             return None;
         }
 
@@ -107,7 +107,8 @@ impl NativeThreadEnvironment {
         model_override: Option<LanguageModelSelection>,
         cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>> {
-        let model = model_override.or_else(|| AgentSettings::get_global(cx).verdict_model.clone());
+        let model =
+            model_override.or_else(|| AgentSettings::get_global(cx).fork.verdict_model.clone());
         self.create_subagent_thread_inner(label, model, cx)
     }
 

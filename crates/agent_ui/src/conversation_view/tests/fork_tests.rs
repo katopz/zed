@@ -358,7 +358,7 @@ async fn test_conversation_auto_allows_pending_tool_call_after_timeout(cx: &mut 
         project::DisableAiSettings::register(cx);
         AgentSettings::register(cx);
         let mut settings = AgentSettings::get_global(cx).clone();
-        settings.auto_allow_permissions_after_seconds = Some(2);
+        settings.fork.auto_allow_permissions_after_seconds = Some(2);
         AgentSettings::override_global(settings, cx);
     });
 
@@ -454,7 +454,7 @@ async fn test_conversation_auto_allows_action_choice_with_allow_option(cx: &mut 
         project::DisableAiSettings::register(cx);
         AgentSettings::register(cx);
         let mut settings = AgentSettings::get_global(cx).clone();
-        settings.auto_allow_permissions_after_seconds = Some(2);
+        settings.fork.auto_allow_permissions_after_seconds = Some(2);
         AgentSettings::override_global(settings, cx);
     });
 
@@ -521,7 +521,7 @@ async fn test_conversation_auto_allows_sandbox_fallback_with_once_allow(cx: &mut
         project::DisableAiSettings::register(cx);
         AgentSettings::register(cx);
         let mut settings = AgentSettings::get_global(cx).clone();
-        settings.auto_allow_permissions_after_seconds = Some(2);
+        settings.fork.auto_allow_permissions_after_seconds = Some(2);
         AgentSettings::override_global(settings, cx);
     });
 

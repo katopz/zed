@@ -2128,13 +2128,13 @@ pub fn maintain_global_claude_md_symlink(fs: Arc<dyn fs::Fs>, cx: &mut App) {
         .detach();
     }
 
-    let mut was_enabled = AgentSettings::get_global(cx).claude_md_symlink;
+    let mut was_enabled = AgentSettings::get_global(cx).fork.claude_md_symlink;
     if was_enabled {
         link(fs.clone(), cx);
     }
 
     cx.observe_global::<SettingsStore>(move |cx| {
-        let is_enabled = AgentSettings::get_global(cx).claude_md_symlink;
+        let is_enabled = AgentSettings::get_global(cx).fork.claude_md_symlink;
         if is_enabled && !was_enabled {
             link(fs.clone(), cx);
         }

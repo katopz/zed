@@ -703,7 +703,7 @@ impl Conversation {
         cx: &mut Context<Self>,
     ) {
         let Some(seconds) = AgentSettings::try_get(cx)
-            .and_then(|settings| settings.auto_allow_permissions_after_seconds)
+            .and_then(|settings| settings.fork.auto_allow_permissions_after_seconds)
         else {
             return;
         };

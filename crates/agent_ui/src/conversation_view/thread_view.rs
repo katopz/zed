@@ -8233,7 +8233,7 @@ impl ThreadView {
         // Root views only (subagents can't spawn reviewers) of native agent
         // threads (external agents don't have `request_verdict`); set
         // agent.verdict_ping_pong = false to hide it.
-        let verdict_available = AgentSettings::get_global(cx).verdict_ping_pong
+        let verdict_available = AgentSettings::get_global(cx).fork.verdict_ping_pong
             && !self.is_subagent()
             && thread.read(cx).connection().agent_id().as_ref() == agent::ZED_AGENT_ID.as_ref()
             && copy_response_index.is_some_and(|response_index| {
@@ -9120,7 +9120,7 @@ impl ThreadView {
                     // Verdict ping-pong (proposal 001): right-click a native
                     // agent thread's message to send it for a reviewer verdict.
                     // Any selected text rides along as the user addition.
-                    let verdict_gate = AgentSettings::get_global(cx).verdict_ping_pong
+                    let verdict_gate = AgentSettings::get_global(cx).fork.verdict_ping_pong
                         && !this.is_subagent()
                         && this.thread.read(cx).connection().agent_id().as_ref()
                             == agent::ZED_AGENT_ID.as_ref();

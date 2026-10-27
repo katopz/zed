@@ -1001,7 +1001,7 @@ impl ThreadView {
     /// model when unset), so calling it "Claude" there would misrepresent
     /// the review.
     pub(super) fn verdict_label(cx: &App) -> &'static str {
-        match AgentSettings::get_global(cx).verdict_reviewer {
+        match AgentSettings::get_global(cx).fork.verdict_reviewer {
             VerdictReviewerSetting::ClaudeCode => "Verdict with Claude",
             VerdictReviewerSetting::Native => "Request Verdict",
         }
@@ -1011,6 +1011,7 @@ impl ThreadView {
     /// `agent.verdict_secondary_model` is unset (entry hidden).
     pub(super) fn secondary_verdict_label(cx: &App) -> Option<SharedString> {
         AgentSettings::get_global(cx)
+            .fork
             .verdict_secondary_model
             .as_ref()
             .map(|model| format!("Verdict with {}", model.provider.0).into())
@@ -1100,7 +1101,7 @@ impl ThreadView {
             return;
         }
 
-        let max_rounds = AgentSettings::get_global(cx).verdict_max_rounds;
+        let max_rounds = AgentSettings::get_global(cx).fork.verdict_max_rounds;
         let prompt = Self::verdict_request_prompt(max_rounds, reviewer, addition.as_deref());
         let contents_task = Task::ready(anyhow::Ok(Some((
             vec![acp_v2::ContentBlock::Text(acp_v2::TextContent::new(prompt))],
