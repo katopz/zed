@@ -313,6 +313,10 @@ farm session with sibling agents active):
   Documented in the three bridge extensions' READMEs ("Lighter alternative"):
   `zed-mcp-server-zai-web-search` `15aede2`, `-web-reader` `fe18b54`,
   `-zread` `ae75604`.
+  Agent side verified 2026-10-27: the installed claude-agent-acp adapter
+  (`mcpCapabilities {http, sse}`) given the same `McpServer::Http` that Zed
+  now sends accepted `session/new`, passed it to `claude` as `"type":"http"`,
+  and `claude` started no child processes (it was 3 node bridges per session).
 
 Analysis-issue archive note: the original `.issues/006` file (Jul 19 evidence
 tables, root-cause corrections, recommended-fix priorities) was absorbed into
