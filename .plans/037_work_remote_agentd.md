@@ -1,5 +1,5 @@
 # 037 — Work Remote: GUI on M3, agents + compute detached on M5 (zed-agentd)
-Status: in progress — P0 sync + compile fallout fixed, P1 daemon + P2 hook/menu implemented, journal bench GOAT (−92% append), P4 journal gc done; P3 on-host e2e still blocked on M5 SSH access (owner)
+Status: in progress — P0 sync + compile fallout fixed, P1 daemon + P2 hook/menu implemented, journal bench GOAT (−92% append), P4 journal gc + native agent backend (`eval-cli --acp`) done and smoke-verified locally; P3 on-host e2e still blocked on M5 SSH access (owner)
 
 ## Goal
 
@@ -73,7 +73,7 @@ start any external agent. Close M3 freely; reopen and pick the thread from histo
 - [ ] P3 real e2e: M3 Zed → M5 over Tailscale with Claude/Codex ACP; close M3 mid-turn; reopen; verify history + live stream
   - BLOCKED (2026-10-27, access): tailnet macOS hosts `amo` (100.111.186.76) refuses ssh (Remote Login off) and `bmo` (100.100.117.44) rejects M3's key. Needs owner: enable Remote Login on the M5 + add M3's `~/.ssh/id_ed25519.pub` to its `authorized_keys`
 - [ ] P3 verify Zed's reconnect flow calls `session/load` (not only `session/list`) for external agents on window restore
-- [ ] P4 native Zed agent as a backend: `zed-agentd attach -- eval-cli --acp` (NativeAgent served over ACP stdio, headless gpui) so the fork's native agent also runs detached — scoped in `.issues/036_native_agent_acp_stdio_server.md` (translate at the `AcpThread` layer; `eval_cli` already boots everything but the stdio server)
+- [x] P4 native Zed agent as a backend: `zed-agentd attach -- eval-cli --acp` (`c212b13be4`, harness `767ba226e9`); verified locally incl. kill-mid-turn detach + replay. Follow-ups (structured diffs, model switching over ACP, real-host run) in `.issues/036_native_agent_acp_stdio_server.md`
 - [ ] P4 live turn-state on reattach: synthesize a "turn still running" indicator (ACP has no turn-ended notification; today replay just keeps streaming)
 - [ ] P4 auto-deploy `zed-agentd` to host on Work Remote (reuse remote_server upload path) instead of manual `cargo install`
 - [x] P4 `zed-agentd gc` — journal retention (`f1fd59819f`): `gc [--max-age-days N] [--max-total-mb N]` (defaults 30 d / 1 GiB) via a `Gc` handshake, plus one run with the defaults at daemon start. Only idle sessions are evicted (not live, unattached, nothing queued or in flight); `FileJournal::remove_session` drops the cached append handle first, then unlinks log before record. 3 hub tests + 1 journal test; e2e smoke on the real binary (startup gc removed a year-old session, CLI size cap removed the rest, bad args exit 1). Not periodic: a daemon that runs for months only gcs on start or on demand
