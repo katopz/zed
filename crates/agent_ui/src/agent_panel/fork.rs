@@ -7,6 +7,10 @@ use prompt_store::BuiltInPrompt;
 use zed_actions::assistant::{OpenGlobalAutoPromptMd, OpenProjectAutoPromptMd};
 
 pub(super) fn init(cx: &mut App) {
+    sync_external_subagents(cx);
+    cx.observe_global::<SettingsStore>(sync_external_subagents)
+        .detach();
+
     cx.on_action(|action: &AutoPromptNewThread, _cx| {
         log::warn!(
             "[auto_prompt] GLOBAL on_action: AutoPromptNewThread reached App-level listener (from_session_id={:?})",
@@ -762,5 +766,15 @@ impl AgentPanel {
             return false;
         }
         true
+    }
+}
+
+/// Plan 039: mirrors `agent.external_subagents` into the `agent_servers` gate,
+/// which decides whether new external agent connections are offered the ACP
+/// subagents capability.
+fn sync_external_subagents(cx: &mut App) {
+    let enabled = AgentSettings::get_global(cx).fork.external_subagents;
+    if enabled != agent_servers::ExternalSubagents::enabled(cx) {
+        agent_servers::ExternalSubagents::set_enabled(enabled, cx);
     }
 }

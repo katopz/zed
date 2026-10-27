@@ -1289,6 +1289,10 @@
     // Symlink `CLAUDE.md` to `AGENTS.md` in the root of each project you open. Off
     // by default because it adds an untracked file to the repository.
     "project_claude_md_symlink": false,
+    // Offer external agents (Claude Code, etc.) the subagents capability, so the
+    // subagents they launch, including background agents, show in the thread as
+    // cards with a live status. Applies to agents started after a change.
+    "external_subagents": true,
     // Settings for automatic agent context compaction, which summarizes earlier
     // messages to free up room in the model's context window once it grows too
     // large.

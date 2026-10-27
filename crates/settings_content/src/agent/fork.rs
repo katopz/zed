@@ -97,6 +97,16 @@ pub struct ForkAgentSettingsContent {
     ///
     /// Default: 120
     pub stream_idle_timeout_secs: Option<u64>,
+
+    /// Whether external agents (ACP) are offered the subagents capability, so
+    /// subagents they launch, including Claude Code's background agents,
+    /// appear in the thread as cards with a live running / done status.
+    ///
+    /// Negotiated when an agent connection starts, so a change applies to
+    /// agents started afterwards.
+    ///
+    /// Default: true
+    pub external_subagents: Option<bool>,
 }
 
 /// Which backend provides the reviewer thread for the `request_verdict` tool.

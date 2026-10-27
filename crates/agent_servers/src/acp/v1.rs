@@ -23,7 +23,6 @@ use agent_client_protocol::{
 use anyhow::anyhow;
 use async_channel;
 use collections::HashMap;
-use feature_flags::{AcpBetaFeatureFlag, FeatureFlagAppExt as _};
 use futures::channel::mpsc;
 use futures::future::Shared;
 use futures::{Future, FutureExt as _};
@@ -494,8 +493,8 @@ fn client_builder(
         )
 }
 
-/// `offer_subagents` advertises the unstable subagents RFD, which Zed only offers v1 agents
-/// behind the `acp-beta` flag.
+/// `offer_subagents` advertises the unstable subagents RFD, which Zed offers v1 agents behind
+/// the `acp-beta` flag or the fork's `agent.external_subagents` setting.
 fn client_capabilities_for_agent(
     agent_id: &AgentId,
     offer_subagents: bool,
@@ -583,7 +582,7 @@ impl AcpConnection {
         let client_session_list: Rc<RefCell<Option<Rc<AcpSessionList>>>> =
             Rc::new(RefCell::new(None));
         let request_elicitations = cx.new(|_| ElicitationStore::default());
-        let offer_subagents = cx.update(|cx| cx.has_flag::<AcpBetaFeatureFlag>());
+        let offer_subagents = cx.update(|cx| super::external_subagents::offer_subagents(cx));
         let client_capabilities = client_capabilities_for_agent(&agent_id, offer_subagents);
 
         let accepts_subagent_updates = client_capabilities.subagents.is_some();

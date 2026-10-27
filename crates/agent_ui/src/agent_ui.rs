@@ -1140,6 +1140,7 @@ mod tests {
                 auto_focus_new_thread: false,
                 auto_allow_permissions_after_seconds: None,
                 stream_idle_timeout_secs: agent_settings::DEFAULT_STREAM_IDLE_TIMEOUT_SECS,
+                external_subagents: true,
             },
             max_idle_retained_threads: 5,
             threads_sidebar: agent_settings::ThreadsSidebarSettings {

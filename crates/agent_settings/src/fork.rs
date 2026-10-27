@@ -39,6 +39,8 @@ pub struct ForkAgentSettings {
     /// seconds — long enough for time-to-first-token on very large contexts,
     /// short enough that a wedged stream recovers without the watchdog.
     pub stream_idle_timeout_secs: u64,
+    /// Whether external agents are offered the ACP subagents capability.
+    pub external_subagents: bool,
 }
 
 impl ForkAgentSettings {
@@ -58,6 +60,7 @@ impl ForkAgentSettings {
             stream_idle_timeout_secs: content
                 .stream_idle_timeout_secs
                 .unwrap_or(DEFAULT_STREAM_IDLE_TIMEOUT_SECS),
+            external_subagents: content.external_subagents.unwrap_or(true),
         }
     }
 }
