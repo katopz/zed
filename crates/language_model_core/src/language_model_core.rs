@@ -536,6 +536,12 @@ pub fn parse_body_retry_hint(body: &str, now: chrono::DateTime<chrono::Local>) -
     use chrono::TimeZone as _;
     let reset = chrono::Local.from_local_datetime(&naive).single()?;
     let delta = reset.signed_duration_since(now);
+    // The raw timestamp is the evidence for which timezone the provider means
+    // (.issues/023 deferred item): compare it with the provider dashboard.
+    log::info!(
+        "body retry hint: reset at {timestamp:?} read as {reset} (now {now}), {}s",
+        delta.num_seconds()
+    );
     if delta <= chrono::TimeDelta::zero() {
         return None;
     }
