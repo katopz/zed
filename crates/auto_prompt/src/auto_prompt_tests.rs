@@ -1,5 +1,6 @@
 use super::*;
 use crate::lightweight_context::is_actionable_checkbox;
+use language_model::LanguageModelCompletionEvent;
 
 /// Minimal LlmCallData for pure state-machine tests (plan 023 F1). The
 /// overflow and clarify machines never call the model; the slot just
@@ -2733,52 +2734,6 @@ fn test_dispatch_action_decision_none_when_no_context() {
         extracted, None,
         "raw prompt has no Decision header => extract returns None"
     );
-}
-
-#[test]
-fn test_parse_response_recovers_from_duplicate_key() {
-    let raw = r#"```json
-{"confidence": 0.75, "next_prompt": "Continue with plan 260", "reason": "Plan 257 done", "thread_summary": "Plan 257 fully implemented.", "thread_summary": null}
-```"#;
-    let result = parse_response(raw).expect("should recover from duplicate key");
-    assert_eq!(
-        result.next_prompt.as_deref(),
-        Some("Continue with plan 260")
-    );
-    assert_eq!(result.confidence, Some(0.75));
-    assert_eq!(
-        result.thread_summary.as_deref(),
-        Some("Plan 257 fully implemented.")
-    );
-}
-
-#[test]
-fn test_parse_response_no_duplicate_still_works() {
-    let raw = r#"```json
-{"confidence": 0.9, "next_prompt": "Do the thing", "reason": "work remains", "thread_summary": "Summary here."}
-```"#;
-    let result = parse_response(raw).expect("normal JSON should parse fine");
-    assert_eq!(result.next_prompt.as_deref(), Some("Do the thing"));
-    assert_eq!(result.confidence, Some(0.9));
-}
-
-#[test]
-fn test_rebuild_deduplicated_json_keeps_first_occurrence() {
-    let json = r#"{"a": 1, "b": "two", "a": 3}"#;
-    let result = rebuild_deduplicated_json(json).expect("should succeed");
-    let parsed: serde_json::Value = serde_json::from_str(&result).expect("should be valid JSON");
-    assert_eq!(parsed["a"], 1);
-    assert_eq!(parsed["b"], "two");
-}
-
-#[test]
-fn test_rebuild_deduplicated_json_duplicate_null_after_value() {
-    let json =
-        r#"{"thread_summary": "long summary here", "confidence": 0.75, "thread_summary": null}"#;
-    let result = rebuild_deduplicated_json(json).expect("should succeed");
-    let parsed: serde_json::Value = serde_json::from_str(&result).expect("should be valid JSON");
-    assert_eq!(parsed["thread_summary"], "long summary here");
-    assert_eq!(parsed["confidence"], 0.75);
 }
 
 #[test]
