@@ -256,4 +256,4 @@ one appears, and worth an explicit timezone if Z.AI ever documents one.
 
 ## Watch item (explicit defer, promoted 2026-09-23)
 
-- [-] Confirm which timezone Z.AI's reset timestamp carries (UTC+8 / UTC / account-local) — the round-four prose note above, promoted to an explicit defer so the state machine sees it. Unblock: a captured raw 429 body in `~/Library/Logs/Zed/Zed.log`, or Z.AI documenting it. Until then the parse stays self-healing: a wrong timezone guess costs one probe cycle, never a stranded key.
+- [-] Confirm which timezone Z.AI's reset timestamp carries (UTC+8 / UTC / account-local) — the round-four prose note above, promoted to an explicit defer so the state machine sees it. Unblock: a captured raw 429 body in `~/Library/Logs/Zed/Zed.log`, or Z.AI documenting it. Since `0670cffb71` every parsed hint logs `body retry hint: reset at "<raw>" read as <local> (now <local>), <n>s`: grep `Zed.log` for it after the next 1308/1310 and compare with the Z.AI dashboard's reset time (2026-10-27 check: no raw body had been logged before this). Until then the parse stays self-healing: a wrong timezone guess costs one probe cycle, never a stranded key.
