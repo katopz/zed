@@ -746,8 +746,7 @@ pub fn evaluate_response(input: &EvaluationInput) -> EvaluationResult {
 
     if confidence >= threshold {
         // ── Confidence crosses threshold → continue ─────────────────
-        if has_prompt {
-            let prompt = input.next_prompt.as_ref().unwrap();
+        if let Some(prompt) = input.next_prompt.as_deref() {
             let cleaned = prompt
                 .replace("#ALL_PLAN_DONE", "")
                 .replace("#SKIP", "")
