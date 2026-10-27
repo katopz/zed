@@ -4,7 +4,8 @@
 Moves, into a child module file:
   * top-level `fn` / `const` / `static` items whose name does not exist upstream
   * whole trait impls (`impl Trait for Type`) whose header does not exist upstream
-  * methods of inherent impls (`impl Type {`) whose name does not exist upstream
+  * methods of inherent impls (`impl Type {`) whose name does not exist upstream,
+    or every method of an inherent impl whose header does not exist upstream
 
 Structs/enums stay (their private fields would become invisible to the parent),
 as do `mod tests` contents (use a dedicated test split for those). Moved items
@@ -24,6 +25,8 @@ import sys
 
 path, upstream_ref = sys.argv[1], sys.argv[2]
 module = sys.argv[3] if len(sys.argv) > 3 else "fork"
+if len(sys.argv) not in (3, 4) or not re.fullmatch(r"[a-z_][a-z0-9_]*", module):
+    sys.exit(__doc__)
 lines = open(path).read().split("\n")
 upstream = subprocess.run(
     ["git", "show", f"{upstream_ref}:{path}"], capture_output=True, text=True, check=True
@@ -42,7 +45,7 @@ def block_end(start):
     literals vs lifetimes, and line/block comments.
     """
     text = "\n".join(lines[start:])
-    depth, seen, position, length = 0, False, 0, len(text)
+    depth, nesting, seen, position, length = 0, 0, False, 0, len(text)
     while position < length:
         char = text[position]
         if text.startswith("//", position):
@@ -72,7 +75,11 @@ def block_end(start):
             seen = True
         elif char == "}":
             depth -= 1
-        elif char == ";" and depth == 0 and not seen:
+        elif char in "([":
+            nesting += 1
+        elif char in ")]":
+            nesting -= 1
+        elif char == ";" and depth == 0 and nesting == 0 and not seen:
             return start + text.count("\n", 0, position)
         if seen and depth == 0:
             return start + text.count("\n", 0, position)
@@ -145,7 +152,10 @@ while index < len(lines):
             start = leading_attrs(index, "")
             moved_top.append(lines[start:end + 1])
             drop.update(range(start, end + 1))
-        elif " for " not in header and header in upstream:
+        elif " for " not in header:
+            # A fork-only inherent impl moves whole; one that exists upstream
+            # only gives up its fork-only methods.
+            fork_only_impl = header not in upstream
             inner = index + 1
             while inner < end:
                 member = lines[inner]
@@ -153,7 +163,7 @@ while index < len(lines):
                 if member_match and member.startswith("    ") and not member.startswith("     "):
                     kind, name = member_match.groups()
                     member_end = block_end(inner)
-                    if not upstream_has_fn(kind, name):
+                    if fork_only_impl or not upstream_has_fn(kind, name):
                         start = leading_attrs(inner, "    ")
                         block = lines[start:member_end + 1]
                         signature = inner - start
@@ -163,6 +173,9 @@ while index < len(lines):
                     inner = member_end + 1
                 else:
                     inner += 1
+            if fork_only_impl:
+                drop.update(range(leading_attrs(index, ""), index + 1))
+                drop.add(end)
         index = end + 1
         continue
     index += 1

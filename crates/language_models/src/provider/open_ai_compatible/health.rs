@@ -519,7 +519,10 @@ impl PersistedKeyHealth {
             .backoff_total_secs
             .filter(|secs| *secs > 0.0)
             .map(Duration::from_secs_f64);
-        let last_limit_hit = match (self.last_limit_hit_at_unix_secs, self.last_limit_window_secs) {
+        let last_limit_hit = match (
+            self.last_limit_hit_at_unix_secs,
+            self.last_limit_window_secs,
+        ) {
             (Some(hit_at_unix), Some(window_secs)) if window_secs > 0.0 => {
                 DateTime::from_timestamp(hit_at_unix, 0).map(|hit_at| LimitHitRecord {
                     hit_at,
@@ -1137,7 +1140,12 @@ pub fn select_from_candidates(
         // going to be refused, so pick the slot closest to its stated reset.
         true => backed_off
             .into_iter()
-            .filter_map(|(key, slot)| health.get(slot).backoff_until.map(|until| (key, slot, until)))
+            .filter_map(|(key, slot)| {
+                health
+                    .get(slot)
+                    .backoff_until
+                    .map(|until| (key, slot, until))
+            })
             .min_by_key(|(_, _, until)| *until)
             .map(|(key, slot, _)| (key, slot)),
     };
@@ -1450,7 +1458,9 @@ mod tests {
         // `hit_at` is wall clock (not the monotonic `now` param), so assert
         // proximity to real time rather than equality. Rounding may place it
         // up to half a second in the future, hence the absolute skew.
-        let skew_ms = (Utc::now() - record.hit_at).num_milliseconds().unsigned_abs();
+        let skew_ms = (Utc::now() - record.hit_at)
+            .num_milliseconds()
+            .unsigned_abs();
         assert!(skew_ms < 5_000, "hit_at should be ~now, skew {skew_ms}ms");
     }
 
@@ -1518,8 +1528,14 @@ mod tests {
                 StatusCode::PAYLOAD_TOO_LARGE,
                 ProviderErrorCategory::PromptTooLarge { tokens: None },
             ),
-            rejection(StatusCode::BAD_REQUEST, ProviderErrorCategory::InvalidRequest),
-            rejection(StatusCode::NOT_FOUND, ProviderErrorCategory::EndpointNotFound),
+            rejection(
+                StatusCode::BAD_REQUEST,
+                ProviderErrorCategory::InvalidRequest,
+            ),
+            rejection(
+                StatusCode::NOT_FOUND,
+                ProviderErrorCategory::EndpointNotFound,
+            ),
             rejection(StatusCode::IM_A_TEAPOT, ProviderErrorCategory::Other),
         ] {
             assert_eq!(classify_error(&err), ErrorVerdict::Benign, "{err}");
@@ -1896,7 +1912,10 @@ mod tests {
     // without a real HTTP client.
     // ------------------------------------------------------------------
 
-    fn rejection(status: StatusCode, category: ProviderErrorCategory) -> LanguageModelCompletionError {
+    fn rejection(
+        status: StatusCode,
+        category: ProviderErrorCategory,
+    ) -> LanguageModelCompletionError {
         LanguageModelCompletionError::ProviderRejection {
             provider: provider_name(),
             status: Some(status),
@@ -1908,17 +1927,26 @@ mod tests {
     }
 
     fn rate_limit_err() -> LanguageModelCompletionError {
-        rejection(StatusCode::TOO_MANY_REQUESTS, ProviderErrorCategory::RateLimit)
+        rejection(
+            StatusCode::TOO_MANY_REQUESTS,
+            ProviderErrorCategory::RateLimit,
+        )
     }
 
     fn server_overloaded_err() -> LanguageModelCompletionError {
         // Backoff-worthy but NOT a rate limit: rotation should proceed.
-        rejection(StatusCode::SERVICE_UNAVAILABLE, ProviderErrorCategory::Overloaded)
+        rejection(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ProviderErrorCategory::Overloaded,
+        )
     }
 
     fn bad_request_err() -> LanguageModelCompletionError {
         // Non-backoff-worthy: should abort retry loop immediately.
-        rejection(StatusCode::BAD_REQUEST, ProviderErrorCategory::InvalidRequest)
+        rejection(
+            StatusCode::BAD_REQUEST,
+            ProviderErrorCategory::InvalidRequest,
+        )
     }
 
     #[test]
@@ -2879,7 +2907,10 @@ mod tests {
 
         for err in [
             rate_limit_err(),
-            rejection(StatusCode::UNAUTHORIZED, ProviderErrorCategory::Authentication),
+            rejection(
+                StatusCode::UNAUTHORIZED,
+                ProviderErrorCategory::Authentication,
+            ),
             rejection(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ProviderErrorCategory::InternalServer,

@@ -1,5 +1,5 @@
 # 038 — Isolate the fork lane from upstream files (shrink merge-conflict surface)
-Status: in progress — `script/fork-surface` shipped; acp_thread, agent, thread, thread_view, agent_panel fork code extracted; surface 16,609 → 10,794 lines (130 files)
+Status: in progress — `script/fork-surface` shipped; acp_thread, agent, thread, thread_view, agent_panel, open_ai_compatible fork code extracted; surface 16,609 → 9,166 lines (130 files)
 
 ## Why
 
@@ -32,7 +32,7 @@ to it. Pattern proven by plan 037 (`acp/detachable.rs`: 7 one-line upstream touc
 - [x] Script `script/fork-surface` — prints changed-lines-in-upstream-files vs merge-base (the metric above); record before/after per task
   - pre-sync (`origin/develop` vs `upstream/main`): 124 files / 16,995 lines (counts fork deletions of upstream files; excludes Cargo.lock)
   - post-sync (`--worktree`, vs upstream tip `6b985a8b26`): 129 files / 16,609 lines — the baseline every refactor below is measured against
-- [ ] `open_ai_compatible.rs` → move multi-key lane into `provider/open_ai_compatible/multi_key.rs` (health.rs already split); upstream file keeps a single `MultiKeyLane` field + delegating calls
+- [x] `open_ai_compatible.rs` → `open_ai_compatible/fork.rs` (fork-only `impl State` multi-key lane, 30 methods, + 10 free items) and `open_ai_compatible/tests/fork_tests.rs` (17 key-health/probe tests); open_ai_compatible.rs fork lines 2172 → 526 (remaining: `State`/`ConfigurationView` multi-slot fields + edits inside upstream fns). `MultiKeyLane` field consolidation stays a possible follow-up
 - [x] `thread_view.rs` → `thread_view/fork.rs` (20 fork-only free items/trait impls + 26 fork-only `ThreadView` methods), `thread_view/branch_boundary_tests.rs` (fork-only test module), `thread_view/tests/fork_tests.rs` (6 fork tests); seam = `mod fork; use fork::*;`. thread_view.rs fork lines 3361 → 885 (remaining: inline render fragments + struct fields inside upstream fns). Tool: `script/fork-split-items FILE upstream/main` (generic; reusable for the other files)
 - [x] `conversation_view.rs` fork tests (20 items, 1231 lines) → `conversation_view/tests/fork_tests.rs` via one `mod fork_tests;` seam — `efaac2e25b`; file surface 1893 → 285, total 16,241 → 14,800
 - [ ] `conversation_view.rs` → remaining auto-allow countdown + watchdog glue (285 lines) into `conversation_view/auto_allow.rs`
