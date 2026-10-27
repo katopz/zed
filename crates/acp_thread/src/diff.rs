@@ -7,7 +7,7 @@ use collections::{HashMap, HashSet};
 use gpui::{App, AppContext, AsyncApp, Context, Entity, SharedString, Subscription, Task};
 use itertools::Itertools;
 use language::{
-    Anchor, Buffer, Capability, LanguageRegistry, LineEnding, OffsetRangeExt as _, Point,
+    Anchor, Buffer, Capability, LanguageRegistry, LineEnding, OffsetRangeExt as _, Point, Rope,
     TextBuffer,
 };
 use markdown::Markdown;
@@ -389,6 +389,32 @@ impl Diff {
         }
     }
 
+    /// The original text, or `None` when the edit created the file.
+    pub fn old_text(&self) -> Option<&Arc<str>> {
+        match self {
+            Self::Finalized(FinalizedDiff {
+                base_text_exists: false,
+                ..
+            }) => None,
+            _ => Some(self.base_text()),
+        }
+    }
+
+    /// The whole file's text after the edit.
+    pub fn new_text(&self, cx: &App) -> String {
+        match self {
+            Self::Pending(PendingDiff { new_buffer, .. }) => new_buffer.read(cx).text(),
+            Self::Finalized(finalized) => match &finalized.state {
+                FinalizedDiffState::Resolved(ResolvedFinalized {
+                    final_text: Some(text),
+                    ..
+                }) => text.to_string(),
+                FinalizedDiffState::Resolved(resolved) => resolved.new_buffer.read(cx).text(),
+                FinalizedDiffState::Deferred(deferred) => deferred.new_text.clone(),
+            },
+        }
+    }
+
     pub fn file_path(&self, cx: &App) -> Option<String> {
         match self {
             Self::Pending(PendingDiff { new_buffer, .. }) => new_buffer
@@ -562,6 +588,7 @@ impl PendingDiff {
             .unwrap_or(MultiBuffer::DEFAULT_TITLE.into())
             .into();
         let replica_id = new_buffer.replica_id();
+        let final_text = new_buffer.as_rope().clone();
 
         // Replace the buffer in the multibuffer with the snapshot
         let buffer = cx.new(|cx| {
@@ -570,7 +597,7 @@ impl PendingDiff {
                 replica_id,
                 cx.entity_id().as_non_zero_u64().into(),
                 self.new_buffer.read(cx).line_ending(),
-                self.new_buffer.read(cx).as_rope().clone(),
+                final_text.clone(),
             );
             let mut buffer = Buffer::build(buffer, None, Capability::ReadWrite, cx);
             buffer.set_language(language, cx);
@@ -611,6 +638,7 @@ impl PendingDiff {
             base_text_exists: true,
             state: FinalizedDiffState::Resolved(ResolvedFinalized {
                 new_buffer: self.new_buffer.clone(),
+                final_text: Some(final_text),
                 multibuffer: self.multibuffer.clone(),
                 _update_diff: update_diff,
                 populated: Rc::new(Cell::new(true)),
@@ -692,7 +720,12 @@ struct DeferredSource {
 }
 
 struct ResolvedFinalized {
+    /// Still the live buffer when finalized from a pending diff, so later
+    /// edits to the file show up here.
     new_buffer: Entity<Buffer>,
+    /// The text when a pending diff was finalized; `None` when `new_buffer`
+    /// is owned by this diff.
+    final_text: Option<Rope>,
     multibuffer: Entity<MultiBuffer>,
     _update_diff: Task<Result<()>>,
     populated: Rc<Cell<bool>>,
@@ -803,6 +836,7 @@ fn build_finalized(
 
     ResolvedFinalized {
         new_buffer,
+        final_text: None,
         multibuffer,
         _update_diff: task,
         populated,
@@ -1204,6 +1238,38 @@ mod tests {
             }),
             ["HELLO!"]
         );
+    }
+
+    #[gpui::test]
+    async fn test_diff_texts_across_states(cx: &mut TestAppContext) {
+        let texts = |diff: &Entity<Diff>, cx: &mut TestAppContext| {
+            diff.read_with(cx, |diff, cx| {
+                (
+                    diff.old_text().map(|text| text.to_string()),
+                    diff.new_text(cx),
+                )
+            })
+        };
+        let buffer = cx.new(|cx| Buffer::local("hello!", cx));
+        let diff = cx.new(|cx| Diff::new(buffer.clone(), cx));
+        buffer.update(cx, |buffer, cx| buffer.set_text("HELLO!", cx));
+        cx.run_until_parked();
+        let pending = (Some("hello!".to_string()), "HELLO!".to_string());
+        assert_eq!(texts(&diff, cx), pending);
+
+        diff.update(cx, |diff, cx| diff.finalize(cx));
+        buffer.update(cx, |buffer, cx| buffer.set_text("later", cx));
+        cx.run_until_parked();
+        assert_eq!(texts(&diff, cx), pending, "finalized keeps the edit's text");
+
+        let languages =
+            cx.update(|cx| Arc::new(LanguageRegistry::test(cx.background_executor().clone())));
+        let created =
+            cx.new(|_| Diff::finalized("new.rs".into(), None, "added".into(), languages.clone()));
+        assert_eq!(texts(&created, cx), (None, "added".to_string()));
+        created.update(cx, |diff, cx| diff.multibuffer(cx));
+        cx.run_until_parked();
+        assert_eq!(texts(&created, cx), (None, "added".to_string()));
     }
 
     #[gpui::test]

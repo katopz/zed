@@ -98,6 +98,18 @@ print("  text:", text, "| tools:", tools, "| permissions:", permissions)
 out = os.path.join(workdir, "out.txt")
 print("  out.txt:", open(out).read() if os.path.exists(out) else None)
 
+reply, updates, permissions = request("session/prompt", {"sessionId": session_id, "prompt": [
+    {"type": "text", "text": "Edit hello.txt to replace pineapple with mango, then reply with only OK."}]})
+text, tools = summarize(updates)
+diffs = [content for u in updates if u["sessionUpdate"] in ("tool_call", "tool_call_update")
+         for content in u.get("content") or [] if content.get("type") == "diff"]
+print("prompt 3:", reply.get("result") or reply.get("error"))
+print("  text:", text, "| tools:", tools, "| permissions:", permissions)
+last_diff = diffs[-1] if diffs else {}
+print("  structured diff:", bool(diffs), "| absolute path:", last_diff.get("path") == os.path.join(workdir, "hello.txt"),
+      "| old/new:", repr(last_diff.get("oldText")), "->", repr(last_diff.get("newText")))
+print("  hello.txt:", repr(open(os.path.join(workdir, "hello.txt")).read()))
+
 agent.stdin.close()
 print("exit code:", agent.wait(timeout=60))
 if agentd:

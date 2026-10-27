@@ -11,13 +11,14 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::str::FromStr as _;
 use std::sync::Arc;
 
 use acp_thread::{
     AcpThread, AcpThreadEvent, AgentConnection as _, AgentThreadEntry, AssistantMessageChunk,
-    PermissionOptions, SelectedPermissionOutcome, ToolCall, ToolCallStatus,
+    PermissionOptions, SelectedPermissionOutcome, ToolCall, ToolCallContent, ToolCallStatus,
 };
 use agent::{NativeAgent, NativeAgentConnection, Templates, ThreadStore};
 use agent_client_protocol::schema::v1 as acp_v1;
@@ -28,6 +29,7 @@ use futures::StreamExt as _;
 use futures::channel::mpsc;
 use gpui::{App, AppContext as _, AsyncApp, Entity, Subscription};
 use language_model::SelectedModel;
+use project::Project;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use util::ResultExt as _;
@@ -498,14 +500,18 @@ impl UpdateCursor {
                                 || previous.content_len != current.content_len
                             {
                                 updates.push(acp_v1::SessionUpdate::ToolCallUpdate(
-                                    tool_call_update(call, cx),
+                                    tool_call_update(call, thread.project(), cx),
                                 ));
                                 previous.status = current.status;
                                 previous.content_len = current.content_len;
                             }
                         }
                         _ => {
-                            updates.push(acp_v1::SessionUpdate::ToolCall(tool_call(call, cx)));
+                            updates.push(acp_v1::SessionUpdate::ToolCall(tool_call(
+                                call,
+                                thread.project(),
+                                cx,
+                            )));
                             *sent = SentEntry::ToolCall(current);
                         }
                     }
@@ -545,13 +551,13 @@ impl UpdateCursor {
     }
 }
 
-fn tool_call(call: &ToolCall, cx: &App) -> acp_v1::ToolCall {
+fn tool_call(call: &ToolCall, project: &Entity<Project>, cx: &App) -> acp_v1::ToolCall {
     let mut tool_call = acp_v1::ToolCall::new(
         acp_v1::ToolCallId::new(call.id.0.to_string()),
         call.label.read(cx).source().to_string(),
     )
     .status(tool_status(call.status()))
-    .content(tool_content(call, cx));
+    .content(tool_content(call, project, cx));
     if let Some(kind) = via_json(call.kind()) {
         tool_call = tool_call.kind(kind);
     }
@@ -564,27 +570,55 @@ fn tool_call(call: &ToolCall, cx: &App) -> acp_v1::ToolCall {
     tool_call
 }
 
-fn tool_call_update(call: &ToolCall, cx: &App) -> acp_v1::ToolCallUpdate {
+fn tool_call_update(
+    call: &ToolCall,
+    project: &Entity<Project>,
+    cx: &App,
+) -> acp_v1::ToolCallUpdate {
     let mut fields = acp_v1::ToolCallUpdateFields::new()
         .status(tool_status(call.status()))
-        .content(tool_content(call, cx));
+        .content(tool_content(call, project, cx));
     if let Some(raw_output) = &call.raw_output {
         fields = fields.raw_output(raw_output.clone());
     }
     acp_v1::ToolCallUpdate::new(acp_v1::ToolCallId::new(call.id.0.to_string()), fields)
 }
 
-/// Content as markdown text: structured diffs need a new-text accessor on
-/// `acp_thread::Diff` (follow-up in .issues/036).
-fn tool_content(call: &ToolCall, cx: &App) -> Vec<acp_v1::ToolCallContent> {
+/// Edits go out as structured diffs; terminals and other content as markdown
+/// text, since the terminals live on this host, not the client's.
+fn tool_content(
+    call: &ToolCall,
+    project: &Entity<Project>,
+    cx: &App,
+) -> Vec<acp_v1::ToolCallContent> {
     call.content()
         .iter()
-        .map(|content| {
-            acp_v1::ToolCallContent::Content(acp_v1::Content::new(acp_v1::ContentBlock::Text(
-                acp_v1::TextContent::new(content.to_markdown(cx)),
-            )))
+        .map(|content| match content {
+            ToolCallContent::LegacyDiff { source, .. } => {
+                acp_v1::ToolCallContent::Diff(source.clone())
+            }
+            ToolCallContent::Diff(diff) => {
+                let diff = diff.read(cx);
+                let path = diff.file_path(cx).unwrap_or_default();
+                let path = absolute_path(project, &path, cx).unwrap_or_else(|| path.into());
+                acp_v1::ToolCallContent::Diff(
+                    acp_v1::Diff::new(path, diff.new_text(cx))
+                        .old_text(diff.old_text().map(|text| text.to_string())),
+                )
+            }
+            _ => acp_v1::ToolCallContent::Content(acp_v1::Content::new(
+                acp_v1::ContentBlock::Text(acp_v1::TextContent::new(content.to_markdown(cx))),
+            )),
         })
         .collect()
+}
+
+/// `acp_thread::Diff` paths are worktree-relative (or prefixed with the
+/// worktree name); ACP wants absolute ones.
+fn absolute_path(project: &Entity<Project>, path: &str, cx: &App) -> Option<PathBuf> {
+    let project = project.read(cx);
+    let project_path = project.find_project_path(path, cx)?;
+    project.absolute_path(&project_path, cx)
 }
 
 fn tool_status(status: ToolCallStatus) -> acp_v1::ToolCallStatus {
@@ -709,5 +743,25 @@ mod tests {
         );
         assert_eq!(update.fields.content.as_ref().map(Vec::len), Some(1));
         assert!(collect(cx).is_empty(), "tool call already up to date");
+
+        let diff =
+            acp_v1::Diff::new(util::path!("/project/a.rs"), "new").old_text("old".to_string());
+        send(
+            acp_v1::SessionUpdate::ToolCall(
+                acp_v1::ToolCall::new("t2", "Edit a.rs")
+                    .status(acp_v1::ToolCallStatus::Completed)
+                    .content(vec![acp_v1::ToolCallContent::Diff(diff.clone())]),
+            ),
+            cx,
+        );
+        let updates = collect(cx);
+        let [acp_v1::SessionUpdate::ToolCall(call)] = updates.as_slice() else {
+            panic!("expected one tool_call, got {updates:?}");
+        };
+        assert_eq!(
+            call.content,
+            vec![acp_v1::ToolCallContent::Diff(diff)],
+            "edits go out as structured diffs, not markdown"
+        );
     }
 }

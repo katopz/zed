@@ -27,7 +27,10 @@ def plan(body):
         return [chunk({"role": "assistant", "content": word[:3]}),
                 chunk({"content": word[3:]}), chunk({}, "stop")]
     text = json.dumps(last.get("content", ""))
-    if "hello.txt" in text:
+    if "Edit hello.txt" in text:
+        name, args = "edit_file", {"path": f"{root}/hello.txt", "edits": [
+            {"old_text": "pineapple", "new_text": "mango"}]}
+    elif "hello.txt" in text:
         name, args = "read_file", {"path": f"{root}/hello.txt"}
     else:
         name, args = "terminal", {"command": "printf done > out.txt", "cd": root}

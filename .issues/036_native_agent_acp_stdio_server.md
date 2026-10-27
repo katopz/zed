@@ -1,5 +1,5 @@
 # 036 — Serve Zed's native agent over ACP stdio (`eval-cli --acp`) for zed-agentd
-Status: MVP done (`c212b13be4`, harness `767ba226e9`) — `eval-cli --acp` serves the native agent, verified directly, through zed-agentd with reattach replay, and with the GUI killed mid-turn; open: structured diffs, model selection over ACP, real-host run (plan 037 P3)
+Status: MVP done (`c212b13be4`, harness `767ba226e9`) — `eval-cli --acp` serves the native agent, verified directly, through zed-agentd with reattach replay, and with the GUI killed mid-turn; structured diffs done (see Tasks); open: model selection over ACP, real-host run (plan 037 P3)
 
 ## Goal
 
@@ -42,5 +42,5 @@ cursor-diff code is local to the new module. B duplicates
 - [x] test: `cursor_sends_each_thread_change_exactly_once` (stub `AcpThread` fed v1 updates; the cursor re-emits each change once). The permission and transport paths are covered by the smoke below rather than an in-process test
 - [x] e2e (`script/agentd-smoke/`, fake OpenAI-compatible model): direct run (read_file turn, terminal turn with permission, file written); through zed-agentd (`loadSession`/`list` advertised, permission routed, second client lists + replays both turns); GUI killed 1 s into a 4 s turn → turn finished detached, replay shows the answer and `completed` tool. All PASS
 - [-] Native-agent `session/load` from threads.db — zed-agentd journal covers reattach; only needed without the daemon
-- [ ] Structured diffs: send edit results as v1 `ToolCallContent::Diff` instead of markdown; needs a new-text accessor on `acp_thread::Diff` (a fork seam in `acp_thread`)
+- [x] Structured diffs: edits go out as v1 `ToolCallContent::Diff` (absolute path via the thread's project, old/new text); `LegacyDiff` passes its source through; terminals stay markdown since they run on the host. Fork seam: `Diff::old_text` / `Diff::new_text` in `acp_thread/src/diff.rs`, plus a `final_text` rope snapshot in `ResolvedFinalized` (a pending diff's `new_buffer` stays the live buffer after finalize, so later edits to the file would otherwise leak into a finished tool call). Tests: `test_diff_texts_across_states`, cursor test, and an `edit_file` turn in `acp_smoke.py` (direct + through zed-agentd: PASS)
 - [ ] Run on the real host once plan 037 P3 has SSH: `zed-agentd attach -- eval-cli --acp --model <provider/model>` from the M3 GUI
