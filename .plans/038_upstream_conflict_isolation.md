@@ -1,5 +1,5 @@
 # 038 — Isolate the fork lane from upstream files (shrink merge-conflict surface)
-Status: in progress — `script/fork-surface` shipped; acp_thread + agent fork APIs extracted; surface 16,609 → ~16,160 lines
+Status: in progress — `script/fork-surface` shipped; acp_thread + agent fork APIs extracted; surface 16,609 → 16,241 lines (130 files)
 
 ## Why
 
