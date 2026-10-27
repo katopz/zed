@@ -21,9 +21,7 @@
 //! The continuation is scheduled at reset + margin (default 60s).
 //! See `.plans/018_session_limit_scheduled_retry.md`.
 
-use chrono::{
-    DateTime, Datelike, Local, NaiveDate, NaiveTime, TimeZone, Timelike, Utc, Weekday,
-};
+use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveTime, TimeZone, Timelike, Utc, Weekday};
 use gpui::App;
 use std::sync::Mutex;
 
@@ -196,7 +194,10 @@ fn exhausted_reset(window: Option<UsageWindowHint>) -> Option<DateTime<Utc>> {
 }
 
 fn max_exhausted_reset(windows: &[Option<UsageWindowHint>]) -> Option<DateTime<Utc>> {
-    windows.iter().filter_map(|window| exhausted_reset(*window)).max()
+    windows
+        .iter()
+        .filter_map(|window| exhausted_reset(*window))
+        .max()
 }
 
 /// Build a schedule from an exact absolute reset timestamp (usage API).
@@ -538,36 +539,30 @@ mod tests {
         let now = local(2026, 8, 18, 12, 0);
         assert!(build_session_limit("Error: connection refused", now, 60).is_none());
         assert!(build_session_limit("resets 1:20am but no guard phrase", now, 60).is_none());
-        assert!(build_session_limit(
-            "You've hit your session limit · resets 99:00am",
-            now,
-            60
-        )
-        .is_none());
-        assert!(build_session_limit(
-            "You've hit your session limit · resets 9:60am",
-            now,
-            60
-        )
-        .is_none());
-        assert!(build_session_limit(
-            "You've hit your session limit · resets 10:00",
-            now,
-            60
-        )
-        .is_none());
+        assert!(
+            build_session_limit("You've hit your session limit · resets 99:00am", now, 60)
+                .is_none()
+        );
+        assert!(
+            build_session_limit("You've hit your session limit · resets 9:60am", now, 60).is_none()
+        );
+        assert!(
+            build_session_limit("You've hit your session limit · resets 10:00", now, 60).is_none()
+        );
     }
 
     #[test]
     fn guard_phrase_must_precede_resets() {
         let now = local(2026, 8, 18, 12, 0);
         // "resets" appearing before "session limit" must not match.
-        assert!(build_session_limit(
-            "resets 1:20am (UTC) … unrelated, then: session limit",
-            now,
-            60
-        )
-        .is_none());
+        assert!(
+            build_session_limit(
+                "resets 1:20am (UTC) … unrelated, then: session limit",
+                now,
+                60
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -577,7 +572,9 @@ mod tests {
         assert!(looks_like_usage_limit(
             "You've hit your weekly limit · resets Mon 12:00am"
         ));
-        assert!(looks_like_usage_limit("You've hit your Opus limit · resets 3:45pm"));
+        assert!(looks_like_usage_limit(
+            "You've hit your Opus limit · resets 3:45pm"
+        ));
         assert!(!looks_like_usage_limit("connection refused"));
     }
 
@@ -586,7 +583,9 @@ mod tests {
         assert!(error_mentions_weekly(
             "You've hit your weekly limit · resets Mon 12:00am"
         ));
-        assert!(error_mentions_weekly("You've hit your Opus limit · resets 3:45pm"));
+        assert!(error_mentions_weekly(
+            "You've hit your Opus limit · resets 3:45pm"
+        ));
         assert!(!error_mentions_weekly(SAMPLE_ERROR));
     }
 
@@ -699,11 +698,9 @@ mod tests {
         *USAGE_HINT
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-        let limit = session_limit_from_error_text(
-            "You've hit your weekly limit · resets Mon 9:30am",
-            60,
-        )
-        .unwrap();
+        let limit =
+            session_limit_from_error_text("You've hit your weekly limit · resets Mon 9:30am", 60)
+                .unwrap();
         assert_eq!(limit.reset_at.weekday(), Weekday::Mon);
         assert!(limit.retry_display.ends_with("9:31am"));
 

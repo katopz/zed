@@ -122,10 +122,7 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            "{\"check\": true}"
-        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"check\": true}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -280,9 +280,7 @@ fn parse_decision(raw: &str) -> WatchdogDecision {
     let parsed: RawDecision = match serde_json::from_str(json_str) {
         Ok(d) => d,
         Err(err) => {
-            log::warn!(
-                "[auto_prompt::watchdog] failed to parse decision JSON: {err}\nraw: {raw}"
-            );
+            log::warn!("[auto_prompt::watchdog] failed to parse decision JSON: {err}\nraw: {raw}");
             return default_continue("unparseable reasoning response");
         }
     };
@@ -291,7 +289,12 @@ fn parse_decision(raw: &str) -> WatchdogDecision {
         .reason
         .unwrap_or_else(|| "(no reason provided)".to_string());
 
-    match parsed.action.as_deref().map(|s| s.trim().to_lowercase()).as_deref() {
+    match parsed
+        .action
+        .as_deref()
+        .map(|s| s.trim().to_lowercase())
+        .as_deref()
+    {
         Some("halt") | Some("stop") | Some("cancel") => WatchdogDecision::Halt { reason },
         Some("continue") | Some("wait") => WatchdogDecision::Continue { reason },
         Some(other) => {

@@ -187,9 +187,147 @@ fn command_lands_work(command: &str) -> bool {
     command.contains("git commit") || command.contains("git push")
 }
 
+/// Builds a stub-connection thread whose entries follow `steps`: `None` is a
+/// user message, `Some(tool_call)` an upserted tool call.
+#[cfg(test)]
+pub(crate) async fn stub_thread_from_steps(
+    steps: Vec<Option<agent_client_protocol::schema::v1::ToolCall>>,
+    project: &gpui::Entity<project::Project>,
+    cx: &mut gpui::TestAppContext,
+) -> gpui::Entity<acp_thread::AcpThread> {
+    use acp_thread::AgentConnection as _;
+
+    let connection = std::rc::Rc::new(acp_thread::StubAgentConnection::new());
+    let thread = cx
+        .update(|cx| {
+            connection.new_session(
+                project.clone(),
+                util::path_list::PathList::new(&[std::path::Path::new("/test")]),
+                cx,
+            )
+        })
+        .await
+        .expect("stub session");
+    thread.update(cx, |thread, cx| {
+        for step in steps {
+            match step {
+                None => thread.push_user_content_block(None, "user".into(), cx),
+                Some(tool_call) => thread
+                    .upsert_tool_call(tool_call, cx)
+                    .expect("tool call upsert"),
+            }
+        }
+    });
+    thread
+}
+
+#[cfg(test)]
+pub(crate) async fn test_project(cx: &mut gpui::TestAppContext) -> gpui::Entity<project::Project> {
+    cx.update(|cx| {
+        let mut settings_store = settings::SettingsStore::test(cx);
+        settings_store.register_setting::<feature_flags::FeatureFlagsSettings>();
+        cx.set_global(settings_store);
+    });
+    let fs = fs::FakeFs::new(cx.executor());
+    project::Project::test(fs, [], cx).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_client_protocol::schema::v1 as acp_v1;
+
+    fn tool(
+        id: &str,
+        kind: acp_v1::ToolKind,
+        input: serde_json::Value,
+    ) -> Option<acp_v1::ToolCall> {
+        Some(
+            acp_v1::ToolCall::new(id.to_string(), "label")
+                .kind(kind)
+                .status(acp_v1::ToolCallStatus::Completed)
+                .raw_input(input),
+        )
+    }
+
+    fn terminal(id: &str, command: &str) -> Option<acp_v1::ToolCall> {
+        tool(
+            id,
+            acp_v1::ToolKind::Execute,
+            serde_json::json!({ "command": command }),
+        )
+    }
+
+    async fn made_progress(
+        steps: Vec<Option<acp_v1::ToolCall>>,
+        project: &gpui::Entity<project::Project>,
+        cx: &mut gpui::TestAppContext,
+    ) -> bool {
+        stub_thread_from_steps(steps, project, cx)
+            .await
+            .read_with(cx, |thread, _| turn_made_progress(thread.entries()))
+    }
+
+    #[gpui::test]
+    async fn progress_reads_only_the_latest_turns_tool_calls(cx: &mut gpui::TestAppContext) {
+        let project = test_project(cx).await;
+        let path = serde_json::json!({ "path": "/test/a.rs" });
+
+        for kind in [
+            acp_v1::ToolKind::Edit,
+            acp_v1::ToolKind::Delete,
+            acp_v1::ToolKind::Move,
+        ] {
+            assert!(
+                made_progress(vec![None, tool("t", kind, path.clone())], &project, cx).await,
+                "{kind:?} must count as progress"
+            );
+        }
+        assert!(
+            made_progress(
+                vec![None, terminal("t", "cargo fmt && git commit -qm 'fix: x'")],
+                &project,
+                cx
+            )
+            .await
+        );
+        assert!(made_progress(vec![None, terminal("t", "git push -q")], &project, cx).await);
+
+        // Reading, searching and re-checking change nothing.
+        assert!(
+            !made_progress(
+                vec![
+                    None,
+                    tool("read", acp_v1::ToolKind::Read, path.clone()),
+                    tool(
+                        "search",
+                        acp_v1::ToolKind::Search,
+                        serde_json::json!({ "pattern": "git commit" })
+                    ),
+                    terminal("status", "git status --short && ./script/clippy"),
+                ],
+                &project,
+                cx
+            )
+            .await
+        );
+        // An edit from an earlier turn does not count for this one.
+        assert!(
+            !made_progress(
+                vec![
+                    None,
+                    tool("edit", acp_v1::ToolKind::Edit, path.clone()),
+                    None,
+                    terminal("log", "git log --oneline -3"),
+                ],
+                &project,
+                cx
+            )
+            .await
+        );
+        // A turn with no tool calls at all.
+        assert!(!made_progress(vec![None], &project, cx).await);
+    }
 
     #[test]
     fn idle_streak_counts_only_turns_without_progress_per_session() {

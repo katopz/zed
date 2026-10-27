@@ -249,8 +249,7 @@ impl AutoPromptContextSnapshot {
             join_trailing_assistant_messages(&trailing)
         };
 
-        let active_plan_claims =
-            crate::plan_registry::active_claims_for_others(&self.session_id);
+        let active_plan_claims = crate::plan_registry::active_claims_for_others(&self.session_id);
 
         let mut context = AutoPromptContext {
             current_datetime: self.collected_at,
@@ -346,7 +345,15 @@ impl AutoPromptContext {
         doc_files: Vec<String>,
         iteration_count: u32,
     ) -> Self {
-        Self::snapshot(thread, cx, stop_reason, plan_files, doc_files, iteration_count).finish()
+        Self::snapshot(
+            thread,
+            cx,
+            stop_reason,
+            plan_files,
+            doc_files,
+            iteration_count,
+        )
+        .finish()
     }
 
     /// Main-thread phase of [`Self::collect`]: resolves every `cx`-dependent
@@ -423,8 +430,10 @@ impl AutoPromptContext {
                 }
                 AgentThreadEntry::ToolCall(tool) => {
                     used_tools = true;
-                    let is_edit =
-                        matches!(tool.kind(), agent_client_protocol::schema::v2::ToolKind::Edit);
+                    let is_edit = matches!(
+                        tool.kind(),
+                        agent_client_protocol::schema::v2::ToolKind::Edit
+                    );
                     if collect_messages || is_edit {
                         entries.push(SnapshotEntry::Tool(SnapshotToolCall {
                             label: tool.label.read(cx).source().to_string(),
@@ -469,8 +478,7 @@ impl AutoPromptContext {
                 match entry {
                     AgentThreadEntry::AssistantMessage(msg) => {
                         in_trailing_run = true;
-                        trailing_assistant_chunks
-                            .extend(assistant_chunk_sources(&msg.chunks, cx));
+                        trailing_assistant_chunks.extend(assistant_chunk_sources(&msg.chunks, cx));
                     }
                     _ if in_trailing_run => break,
                     _ => {}
@@ -685,9 +693,7 @@ fn assistant_chunk_sources(chunks: &[AssistantMessageChunk], cx: &App) -> Vec<St
     chunks
         .iter()
         .filter_map(|chunk| match chunk {
-            AssistantMessageChunk::Message { block, .. } => {
-                Some(block.to_markdown(cx))
-            }
+            AssistantMessageChunk::Message { block, .. } => Some(block.to_markdown(cx)),
             AssistantMessageChunk::Thought { .. } => None,
         })
         .collect()
@@ -851,9 +857,7 @@ fn tool_status_label(status: &ToolCallStatus) -> &'static str {
     }
 }
 
-fn plan_status_label(
-    status: &agent_client_protocol::schema::v2::PlanEntryStatus,
-) -> &'static str {
+fn plan_status_label(status: &agent_client_protocol::schema::v2::PlanEntryStatus) -> &'static str {
     match status {
         agent_client_protocol::schema::v2::PlanEntryStatus::Pending => "pending",
         agent_client_protocol::schema::v2::PlanEntryStatus::InProgress => "in_progress",

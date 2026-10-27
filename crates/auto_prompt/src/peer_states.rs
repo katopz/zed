@@ -104,12 +104,7 @@ pub fn register_broadcaster(broadcaster: Option<Arc<dyn AgentStateBroadcaster>>)
 /// Broadcast an agent state to the board (fire-and-forget). No-op when no
 /// broadcaster is registered. Callers (auto_prompt) treat the no-op as a
 /// silent skip — the board is strictly additive.
-pub fn broadcast_state(
-    session_id: &str,
-    sub_agent_id: Option<&str>,
-    state_text: &str,
-    meta: &str,
-) {
+pub fn broadcast_state(session_id: &str, sub_agent_id: Option<&str>, state_text: &str, meta: &str) {
     let broadcaster = match BROADCASTER.read() {
         Ok(guard) => guard.clone(),
         Err(_) => None,
@@ -121,11 +116,7 @@ pub fn broadcast_state(
 
 /// Broadcast new thread-timeline entries for a session (fire-and-forget,
 /// Plan 026). Same no-op semantics as [`broadcast_state`].
-pub fn broadcast_thread_update(
-    session_id: &str,
-    title: Option<&str>,
-    entries: &[ThreadEntry],
-) {
+pub fn broadcast_thread_update(session_id: &str, title: Option<&str>, entries: &[ThreadEntry]) {
     let broadcaster = match BROADCASTER.read() {
         Ok(guard) => guard.clone(),
         Err(_) => None,
@@ -220,10 +211,7 @@ pub fn drain_unseen_notifications() -> Vec<String> {
     let Some(states) = states else {
         return Vec::new();
     };
-    let muted = MUTED
-        .read()
-        .map(|g| g.clone())
-        .unwrap_or_default();
+    let muted = MUTED.read().map(|g| g.clone()).unwrap_or_default();
 
     let (mut seen, mut notifications) = match NOTIFIED_SIGNATURES.write() {
         Ok(mut guard) => (std::mem::take(&mut *guard), Vec::new()),
@@ -374,10 +362,7 @@ mod tests {
     #[test]
     fn filters_muted_device() {
         let _lock = setup();
-        set_peer_states(
-            vec![state("dev-b", "desktop", "s2", "building")],
-            "dev-a",
-        );
+        set_peer_states(vec![state("dev-b", "desktop", "s2", "building")], "dev-a");
         set_muted(vec![PeerStateMute {
             device_id: Some("dev-b".to_string()),
             session_id: None,
@@ -428,10 +413,7 @@ mod tests {
     #[test]
     fn drain_detects_state_text_change() {
         let _lock = setup();
-        set_peer_states(
-            vec![state("dev-b", "desktop", "s2", "debugging")],
-            "dev-a",
-        );
+        set_peer_states(vec![state("dev-b", "desktop", "s2", "debugging")], "dev-a");
         let _ = drain_unseen_notifications();
 
         // Agent updates its state text → new notification fires.
@@ -452,10 +434,7 @@ mod tests {
             session_id: None,
             sub_agent_id: None,
         }]);
-        set_peer_states(
-            vec![state("dev-b", "desktop", "s2", "working")],
-            "dev-a",
-        );
+        set_peer_states(vec![state("dev-b", "desktop", "s2", "working")], "dev-a");
         let notifications = drain_unseen_notifications();
         assert!(notifications.is_empty(), "muted states should not notify");
     }
@@ -479,7 +458,10 @@ mod tests {
             sub_agent_id: None,
         }]);
         let ctx = unmuted_states_for_context().unwrap();
-        assert!(!ctx.contains("building"), "muted session excluded from context");
+        assert!(
+            !ctx.contains("building"),
+            "muted session excluded from context"
+        );
         assert!(ctx.contains("testing"), "unmuted session still in context");
     }
 
@@ -515,7 +497,10 @@ mod tests {
             sub_agent_id: Some("some-sub".to_string()),
         }]);
         let ctx = unmuted_states_for_context();
-        assert!(ctx.is_some(), "state with None sub_agent_id not muted by Some sub");
+        assert!(
+            ctx.is_some(),
+            "state with None sub_agent_id not muted by Some sub"
+        );
     }
 
     #[test]
@@ -543,10 +528,7 @@ mod tests {
     fn mute_all_none_wildcard_mutes_everything() {
         // All-None mute key = wildcard, mutes everything.
         let _lock = setup();
-        set_peer_states(
-            vec![state("dev-b", "desktop", "s1", "task-a")],
-            "dev-a",
-        );
+        set_peer_states(vec![state("dev-b", "desktop", "s1", "task-a")], "dev-a");
         set_muted(vec![PeerStateMute {
             device_id: None,
             session_id: None,
@@ -629,7 +611,11 @@ mod tests {
         let notifications = drain_unseen_notifications();
         assert_eq!(notifications.len(), 1);
         assert!(notifications[0].contains("live-notification"));
-        assert!(!notifications.iter().any(|n| n.contains("muted-notification")));
+        assert!(
+            !notifications
+                .iter()
+                .any(|n| n.contains("muted-notification"))
+        );
     }
 
     // ── Broadcaster forwarding tests (GOAT gate: "Both agents post + read") ──
@@ -647,15 +633,12 @@ mod tests {
             state_text: &str,
             meta: &str,
         ) {
-            self.calls
-                .lock()
-                .unwrap()
-                .push((
-                    session_id.to_string(),
-                    sub_agent_id.map(|s| s.to_string()),
-                    state_text.to_string(),
-                    meta.to_string(),
-                ));
+            self.calls.lock().unwrap().push((
+                session_id.to_string(),
+                sub_agent_id.map(|s| s.to_string()),
+                state_text.to_string(),
+                meta.to_string(),
+            ));
         }
     }
 
@@ -700,7 +683,11 @@ mod tests {
         broadcast_thread_update(
             "sess-1",
             Some("t"),
-            &[ThreadEntry { seq: 0, role: "user".into(), text: "hi".into() }],
+            &[ThreadEntry {
+                seq: 0,
+                role: "user".into(),
+                text: "hi".into(),
+            }],
         );
 
         // And a recording override receives the batch verbatim.
@@ -714,10 +701,11 @@ mod tests {
                 title: Option<&str>,
                 entries: &[ThreadEntry],
             ) {
-                self.0
-                    .lock()
-                    .unwrap()
-                    .push((session_id.to_string(), title.map(str::to_string), entries.to_vec()));
+                self.0.lock().unwrap().push((
+                    session_id.to_string(),
+                    title.map(str::to_string),
+                    entries.to_vec(),
+                ));
             }
         }
         let rec = Arc::new(Rec::default());
@@ -725,7 +713,11 @@ mod tests {
         broadcast_thread_update(
             "sess-2",
             Some("title"),
-            &[ThreadEntry { seq: 7, role: "assistant".into(), text: "done".into() }],
+            &[ThreadEntry {
+                seq: 7,
+                role: "assistant".into(),
+                text: "done".into(),
+            }],
         );
         let calls = rec.0.lock().unwrap();
         assert_eq!(calls.len(), 1);

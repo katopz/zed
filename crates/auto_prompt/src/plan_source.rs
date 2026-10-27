@@ -126,12 +126,13 @@ pub(crate) async fn origin_plan_files(
     let mut guard = SNAPSHOTS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    guard
-        .get_or_insert_with(HashMap::new)
-        .insert(work_dir.to_path_buf(), Snapshot {
+    guard.get_or_insert_with(HashMap::new).insert(
+        work_dir.to_path_buf(),
+        Snapshot {
             built_at_secs: now,
             files: Arc::clone(&files),
-        });
+        },
+    );
     files
 }
 
@@ -230,8 +231,7 @@ async fn build_origin_plan_files(
     // Resolve each file to (rel path, ref, blob).
     let mut resolved: Vec<(String, String, String)> = Vec::new();
     for rel_path in union_paths.iter().take(MAX_SNAPSHOT_FILES) {
-        resolved
-            .push(resolve_file_source(&repo_root, rel_path, &per_ref).await);
+        resolved.push(resolve_file_source(&repo_root, rel_path, &per_ref).await);
     }
 
     // Batch-read every chosen blob with a single `cat-file --batch`.
@@ -308,7 +308,9 @@ async fn resolve_file_source(
     let present: Vec<(&str, &str)> = per_ref
         .iter()
         .filter_map(|(ref_name, entries)| {
-            entries.get(rel_path).map(|blob| (ref_name.as_str(), blob.as_str()))
+            entries
+                .get(rel_path)
+                .map(|blob| (ref_name.as_str(), blob.as_str()))
         })
         .collect();
     let Some(&(first_ref, first_blob)) = present.first() else {
@@ -336,9 +338,7 @@ async fn resolve_file_source(
         }
     }
     match best {
-        Some((_, ref_name, blob)) => {
-            (rel_path.to_string(), ref_name.to_string(), blob.to_string())
-        }
+        Some((_, ref_name, blob)) => (rel_path.to_string(), ref_name.to_string(), blob.to_string()),
         None => (
             rel_path.to_string(),
             first_ref.to_string(),
@@ -436,8 +436,7 @@ async fn candidate_refs(repo_root: &Path) -> Vec<String> {
             refs.push(candidate.to_string());
         }
     }
-    if let Some(head) = git_output(repo_root, &["symbolic-ref", "refs/remotes/origin/HEAD"]).await
-    {
+    if let Some(head) = git_output(repo_root, &["symbolic-ref", "refs/remotes/origin/HEAD"]).await {
         // Output looks like `refs/remotes/origin/trunk`.
         if let Some(default) = head.trim().strip_prefix("refs/remotes/") {
             if !refs.iter().any(|r| r == default) {
@@ -490,10 +489,7 @@ async fn ls_tree_plan_blobs(
 
 /// Read many blobs with one `git cat-file --batch`. Returns blob hash →
 /// content; oversized or unreadable blobs map to `None`.
-async fn cat_file_batch(
-    repo_root: &Path,
-    blobs: &[String],
-) -> HashMap<String, Option<String>> {
+async fn cat_file_batch(repo_root: &Path, blobs: &[String]) -> HashMap<String, Option<String>> {
     let mut result = HashMap::with_capacity(blobs.len());
     if blobs.is_empty() {
         return result;
@@ -543,8 +539,7 @@ async fn cat_file_batch(
         }
         let header = header.trim_end();
         let mut parts = header.split_whitespace();
-        let (returned_hash, object_type, size_str) =
-            (parts.next(), parts.next(), parts.next());
+        let (returned_hash, object_type, size_str) = (parts.next(), parts.next(), parts.next());
         let (Some(returned_hash), Some(object_type), Some(size_str)) =
             (returned_hash, object_type, size_str)
         else {
@@ -585,10 +580,7 @@ async fn cat_file_batch(
 
 /// Consume `size` bytes from `reader`. Oversized plan blobs are skipped this
 /// way without buffering them; stream errors abort the read.
-async fn read_and_discard<R: AsyncRead + Unpin + ?Sized>(
-    reader: &mut R,
-    size: u64,
-) -> Option<()> {
+async fn read_and_discard<R: AsyncRead + Unpin + ?Sized>(reader: &mut R, size: u64) -> Option<()> {
     let mut remaining = size;
     let mut sink = [0u8; 8192];
     while remaining > 0 {
@@ -620,11 +612,7 @@ fn should_fetch(repo_root: &Path, now: f64) -> bool {
 /// hard timeout (via the gpui timer, since `smol::Timer` is disallowed in
 /// this workspace), failures logged and swallowed — the caller proceeds with
 /// local remote-tracking refs either way.
-async fn fetch_origin_refs(
-    repo_root: &Path,
-    executor: &gpui::BackgroundExecutor,
-    now: f64,
-) {
+async fn fetch_origin_refs(repo_root: &Path, executor: &gpui::BackgroundExecutor, now: f64) {
     if !should_fetch(repo_root, now) {
         return;
     }
@@ -633,7 +621,10 @@ async fn fetch_origin_refs(
         let mut command = git_command(repo_root, &["-c", "credential.helper="]);
         command
             .args(["fetch", "--quiet", "--no-tags", "origin"])
-            .env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes -o ConnectTimeout=5")
+            .env(
+                "GIT_SSH_COMMAND",
+                "ssh -o BatchMode=yes -o ConnectTimeout=5",
+            )
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -649,21 +640,19 @@ async fn fetch_origin_refs(
     let timer = executor.timer(Duration::from_secs_f64(FETCH_TIMEOUT_SECS));
     let wait = Box::pin(child.status());
     match select(wait, Box::pin(timer)).await {
-        Either::Left((status, _timer)) => {
-            match status {
-                Ok(status) if status.success() => log::info!(
-                    "[auto_prompt::plan_source] fetched origin for {}",
-                    repo_root.display()
-                ),
-                Ok(status) => log::warn!(
-                    "[auto_prompt::plan_source] git fetch failed for {} ({status})",
-                    repo_root.display()
-                ),
-                Err(err) => {
-                    log::warn!("[auto_prompt::plan_source] git fetch status failed: {err}")
-                }
+        Either::Left((status, _timer)) => match status {
+            Ok(status) if status.success() => log::info!(
+                "[auto_prompt::plan_source] fetched origin for {}",
+                repo_root.display()
+            ),
+            Ok(status) => log::warn!(
+                "[auto_prompt::plan_source] git fetch failed for {} ({status})",
+                repo_root.display()
+            ),
+            Err(err) => {
+                log::warn!("[auto_prompt::plan_source] git fetch status failed: {err}")
             }
-        }
+        },
         Either::Right(((), pending_status)) => {
             // Drop the status borrow before killing; then reap the child.
             drop(pending_status);
@@ -825,11 +814,8 @@ mod tests {
     /// Dirty the `feature` checkout: stale edit over 001 plus an untracked
     /// WIP file.
     fn dirty_checkout(fixture: &Fixture) {
-        std::fs::write(
-            fixture.work.join(".plans").join("001_a.md"),
-            "STALE LOCAL",
-        )
-        .expect("write stale");
+        std::fs::write(fixture.work.join(".plans").join("001_a.md"), "STALE LOCAL")
+            .expect("write stale");
         std::fs::write(
             fixture.work.join(".plans").join("003_local.md"),
             "untracked wip",
@@ -843,12 +829,7 @@ mod tests {
         let date = date.to_string();
         Box::pin(async move {
             git_ok(&work, &["add", "-A"], None).await;
-            git_ok(
-                &work,
-                &["commit", "-q", "-m", &message],
-                Some(&date),
-            )
-            .await;
+            git_ok(&work, &["commit", "-q", "-m", &message], Some(&date)).await;
         })
     }
 
@@ -903,9 +884,10 @@ mod tests {
 
         // Claim-key shape: absolute worktree paths under the work dir.
         for file in files.iter() {
-            assert!(file
-                .abs_path
-                .starts_with(fixture.work.to_str().expect("utf8 path")));
+            assert!(
+                file.abs_path
+                    .starts_with(fixture.work.to_str().expect("utf8 path"))
+            );
         }
     }
 
@@ -1006,7 +988,12 @@ mod tests {
                 "- [ ] 32K cooled-window cell\n- [x] 16K wash measured",
             )
             .expect("write issue");
-            commit_all(&fixture.work, "issue 771 lever", "2026-08-28T10:00:00+00:00").await;
+            commit_all(
+                &fixture.work,
+                "issue 771 lever",
+                "2026-08-28T10:00:00+00:00",
+            )
+            .await;
             git_ok(&fixture.work, &["push", "-q", "origin", "develop"], None).await;
         });
 

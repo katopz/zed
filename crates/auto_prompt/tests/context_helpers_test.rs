@@ -897,7 +897,10 @@ mod collect_from_thread {
             .spawn(async move { snapshot.finish() })
             .await;
         assert!(off_thread_context.messages.is_empty());
-        assert_eq!(off_thread_context.first_user_message.as_deref(), Some("First task"));
+        assert_eq!(
+            off_thread_context.first_user_message.as_deref(),
+            Some("First task")
+        );
         assert_eq!(
             off_thread_context.last_assistant_message(),
             Some("Answer one\nAnswer two")
@@ -948,17 +951,11 @@ mod collect_from_thread {
             off_thread_context.modified_files,
             sync_context.modified_files
         );
-        assert_eq!(
-            off_thread_context.current_plan,
-            sync_context.current_plan
-        );
+        assert_eq!(off_thread_context.current_plan, sync_context.current_plan);
         assert_eq!(
             off_thread_context.approximate_token_count,
             sync_context.approximate_token_count
         );
-        assert_eq!(
-            off_thread_context.entry_count,
-            sync_context.entry_count
-        );
+        assert_eq!(off_thread_context.entry_count, sync_context.entry_count);
     }
 }

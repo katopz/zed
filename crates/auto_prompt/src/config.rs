@@ -363,11 +363,10 @@ impl AutoPromptConfig {
             .map(|v| !matches!(v.as_str(), "0" | "false"))
             .unwrap_or_else(default_paused);
 
-        let max_concurrent_streams =
-            std::env::var("ZED_AUTO_PROMPT_MAX_CONCURRENT_STREAMS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or_else(default_max_concurrent_streams);
+        let max_concurrent_streams = std::env::var("ZED_AUTO_PROMPT_MAX_CONCURRENT_STREAMS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(default_max_concurrent_streams);
 
         Self {
             system_prompt,
@@ -443,10 +442,8 @@ mod tests {
 
     #[test]
     fn claude_context_overflow_explicit_override_wins() {
-        let config: AutoPromptConfig = serde_json::from_str(
-            r#"{"claude_context_overflow_tokens": 320000}"#,
-        )
-        .unwrap();
+        let config: AutoPromptConfig =
+            serde_json::from_str(r#"{"claude_context_overflow_tokens": 320000}"#).unwrap();
         assert_eq!(config.effective_claude_context_overflow_tokens(), 320_000);
 
         let zeroed: AutoPromptConfig =
@@ -462,10 +459,7 @@ mod tests {
         assert!(default_elicitation_auto_answer_enabled());
         assert_eq!(default_elicitation_countdown_secs(), 60);
         assert!(AutoPromptConfig::default().elicitation_auto_answer_enabled);
-        assert_eq!(
-            AutoPromptConfig::default().elicitation_countdown_secs,
-            60
-        );
+        assert_eq!(AutoPromptConfig::default().elicitation_countdown_secs, 60);
     }
 
     #[test]
@@ -486,10 +480,7 @@ mod tests {
         let config: AutoPromptConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(config.max_context_tokens, 200_000);
         assert_eq!(config.claude_context_overflow_tokens, 0);
-        assert_eq!(
-            config.effective_claude_context_overflow_tokens(),
-            200_000
-        );
+        assert_eq!(config.effective_claude_context_overflow_tokens(), 200_000);
         assert_eq!(
             config.housekeeping_command,
             Some("housekeeping".to_string())

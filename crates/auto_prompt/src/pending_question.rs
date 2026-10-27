@@ -26,8 +26,8 @@ use language_model::{
 use serde::Deserialize;
 
 use crate::{
-    AutoPromptOutcome, AutoPromptResponse, LlmCallData, with_first_prompt_context,
-    is_auto_prompt_summary_response,
+    AutoPromptOutcome, AutoPromptResponse, LlmCallData, is_auto_prompt_summary_response,
+    with_first_prompt_context,
 };
 
 // `AutoPromptAction` is constructed via `LlmCallData::make_continue_action` so
@@ -66,7 +66,9 @@ pub(crate) struct PendingQuestion {
 /// - no question-to-user pattern is found in the last 3 paragraphs.
 ///
 /// Pure and allocation-light — safe to call on every `decide_with_llm` entry.
-pub(crate) fn detect_pending_question(last_assistant_message: Option<&str>) -> Option<PendingQuestion> {
+pub(crate) fn detect_pending_question(
+    last_assistant_message: Option<&str>,
+) -> Option<PendingQuestion> {
     let msg = last_assistant_message?.trim();
     if msg.is_empty() {
         return None;
@@ -172,8 +174,10 @@ fn match_question_pattern(paragraph: &str) -> Option<&'static str> {
     // (which rarely use "you" + a trailing '?').
     let trimmed = paragraph.trim_end();
     if trimmed.ends_with('?') {
-        let has_second_person = lower.contains(" you ") || lower.contains("your ")
-            || lower.starts_with("you ") || lower.contains("\nyou ");
+        let has_second_person = lower.contains(" you ")
+            || lower.contains("your ")
+            || lower.starts_with("you ")
+            || lower.contains("\nyou ");
         if has_second_person {
             return Some("direct_question");
         }
@@ -208,7 +212,12 @@ fn looks_like_option_context(paragraph: &str) -> bool {
     }
     // ...or is a prose-introduced list ("Plan 335 Phase 2 is the remaining GOAT work:\n- T2.1...").
     // Detect by counting list-item line starts anywhere in the paragraph.
-    if paragraph.lines().filter(|line| is_list_item_line(line)).count() >= 2 {
+    if paragraph
+        .lines()
+        .filter(|line| is_list_item_line(line))
+        .count()
+        >= 2
+    {
         return true;
     }
     // Short label-style line ending with ':' ("My recommendation:", "Option A:").
@@ -258,7 +267,9 @@ pub(crate) fn mentions_decision_point(last_assistant_message: Option<&str>) -> b
         return false;
     }
     let scan_count = ANSWERER_CONTEXT_PARAGRAPHS.min(paragraphs.len());
-    let window = paragraphs[paragraphs.len() - scan_count..].join("\n\n").to_lowercase();
+    let window = paragraphs[paragraphs.len() - scan_count..]
+        .join("\n\n")
+        .to_lowercase();
 
     const DECISION_PATTERNS: &[&str] = &[
         "option a",
@@ -281,7 +292,10 @@ pub(crate) fn mentions_decision_point(last_assistant_message: Option<&str>) -> b
         "or should we",
         "or would you rather",
     ];
-    if DECISION_PATTERNS.iter().any(|needle| window.contains(needle)) {
+    if DECISION_PATTERNS
+        .iter()
+        .any(|needle| window.contains(needle))
+    {
         return true;
     }
     // "should i X or Y" deliberation the worker could settle itself.
@@ -677,9 +691,12 @@ Plan 335 Phase 2 is the remaining GOAT work (G2 perf bench + G4 gain fixture):
 - **T2.5** — Document in `.benchmarks/335_paired_loss_goat.md`
 
 Want me to continue with Phase 2 (G2 perf bench first, then the G4 A/B fixture), or pick up a different task?";
-        let pending = detect_pending_question(Some(msg)).expect("should detect the trailing permission question");
+        let pending = detect_pending_question(Some(msg))
+            .expect("should detect the trailing permission question");
         assert!(
-            pending.question_text.contains("Want me to continue with Phase 2"),
+            pending
+                .question_text
+                .contains("Want me to continue with Phase 2"),
             "question_text was: {}",
             pending.question_text
         );
@@ -766,7 +783,10 @@ All done now, committed on develop.";
         assert!(pending.question_text.contains("Want me to"));
         // Context window is capped to the last 3 paragraphs.
         let para_count = pending.context_window.split("\n\n").count();
-        assert!(para_count <= 4, "context window should be ≤ 4 paragraphs, got {para_count}");
+        assert!(
+            para_count <= 4,
+            "context window should be ≤ 4 paragraphs, got {para_count}"
+        );
     }
 
     // ── looks_like_option_context ─────────────────────────────────────────
@@ -873,7 +893,9 @@ All done now, committed on develop.";
         assert!(has_pros_cons_layout(Some(
             "Pros of A: fast.\n\nCons of A: fragile.",
         )));
-        assert!(has_pros_cons_layout(Some("pros: speed, drawbacks: latency")));
+        assert!(has_pros_cons_layout(Some(
+            "pros: speed, drawbacks: latency"
+        )));
         // "drawbacks" without "pros" is not a completed pros/cons layout.
         assert!(!has_pros_cons_layout(Some("drawbacks include latency")));
         assert!(!has_pros_cons_layout(Some("no analysis here")));

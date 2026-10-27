@@ -5822,51 +5822,31 @@ mod tests {
         project: &gpui::Entity<project::Project>,
         cx: &mut gpui::TestAppContext,
     ) -> Option<String> {
-        use acp_thread::AgentConnection as _;
         use agent_client_protocol::schema::v1 as acp_v1;
 
-        let connection = std::rc::Rc::new(acp_thread::StubAgentConnection::new());
-        let thread = cx
-            .update(|cx| {
-                connection.new_session(
-                    project.clone(),
-                    util::path_list::PathList::new(&[std::path::Path::new("/test")]),
-                    cx,
-                )
+        let steps = script
+            .iter()
+            .enumerate()
+            .map(|(index, step)| {
+                step.map(|command| {
+                    acp_v1::ToolCall::new(format!("tool-{index}"), "label")
+                        .name("terminal")
+                        .kind(acp_v1::ToolKind::Execute)
+                        .status(acp_v1::ToolCallStatus::Completed)
+                        .raw_input(serde_json::json!({ "command": command }))
+                })
             })
+            .collect();
+        chain::stub_thread_from_steps(steps, project, cx)
             .await
-            .expect("stub session");
-        thread.update(cx, |thread, cx| {
-            for (index, step) in script.iter().enumerate() {
-                match step {
-                    None => thread.push_user_content_block(None, "user".into(), cx),
-                    Some(command) => thread
-                        .upsert_tool_call(
-                            acp_v1::ToolCall::new(format!("tool-{index}"), "label")
-                                .name("terminal")
-                                .kind(acp_v1::ToolKind::Execute)
-                                .status(acp_v1::ToolCallStatus::Completed)
-                                .raw_input(serde_json::json!({ "command": command })),
-                            cx,
-                        )
-                        .expect("tool call upsert"),
-                }
-            }
-            latest_terminal_command(thread.entries())
-        })
+            .read_with(cx, |thread, _| latest_terminal_command(thread.entries()))
     }
 
     #[gpui::test]
     async fn latest_terminal_command_scopes_to_most_recent_terminal_call(
         cx: &mut gpui::TestAppContext,
     ) {
-        cx.update(|cx| {
-            let mut settings_store = settings::SettingsStore::test(cx);
-            settings_store.register_setting::<feature_flags::FeatureFlagsSettings>();
-            cx.set_global(settings_store);
-        });
-        let fs = fs::FakeFs::new(cx.executor());
-        let project = project::Project::test(fs, [], cx).await;
+        let project = chain::test_project(cx).await;
 
         // Latest terminal call is a sync loop; an older auth-shaped call
         // must not resurrect the guard.
