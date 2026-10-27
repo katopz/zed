@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Measures how much fork code lives inside upstream-owned files: the lines a
+# future upstream sync can conflict on (plan 038). Fork-added files are
+# excluded because upstream never touches them.
+#
+# Usage: script/fork-surface [--worktree] [FORK_REF] [UPSTREAM_REF] [TOP]
+#   --worktree    measure the working tree instead of FORK_REF (mid-merge)
+#   FORK_REF      default HEAD
+#   UPSTREAM_REF  default upstream/main
+#   TOP           number of files to list, default 20
+
+set -euo pipefail
+
+worktree=false
+if [[ "${1:-}" == "--worktree" ]]; then
+    worktree=true
+    shift
+fi
+
+fork_ref="${1:-HEAD}"
+upstream_ref="${2:-upstream/main}"
+top="${3:-20}"
+
+base="$(git merge-base "$fork_ref" "$upstream_ref")"
+
+# Mid-merge, the working tree already contains the upstream tip being merged,
+# so that tip (not the old merge-base) is the baseline.
+if [[ "$worktree" == true && -f "$(git rev-parse --git-dir)/MERGE_HEAD" && $# -lt 2 ]]; then
+    upstream_ref=MERGE_HEAD
+    base="$(git rev-parse MERGE_HEAD)"
+fi
+
+if [[ "$worktree" == true ]]; then
+    diff_args=("$base")
+else
+    diff_args=("$base" "$fork_ref")
+fi
+
+numstat="$(git diff --numstat --diff-filter=MD "${diff_args[@]}" -- . ':(exclude)Cargo.lock' \
+    | awk '$1 != "-" { print $1 + $2 "\t" $3 }' \
+    | sort -rn)"
+
+files="$(printf '%s\n' "$numstat" | grep -c . || true)"
+lines="$(printf '%s\n' "$numstat" | awk '{ sum += $1 } END { print sum + 0 }')"
+
+echo "base: $(git rev-parse --short "$base") ($upstream_ref vs $fork_ref)"
+echo "upstream files modified by fork: $files"
+echo "changed lines in upstream files: $lines"
+echo
+printf '%s\n' "$numstat" | head -n "$top"
