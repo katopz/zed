@@ -22,15 +22,22 @@ output="$(git merge-tree --write-tree --name-only --no-messages --merge-base="$s
 tree="$(printf '%s\n' "$output" | head -n 1)"
 
 per_file="$(printf '%s\n' "$output" | tail -n +2 | grep . | while read -r file; do
-    hunks="$(git cat-file -p "$tree:$file" 2>/dev/null | grep -c '^<<<<<<< ' || true)"
-    printf '%s\t%s\n' "$hunks" "$file"
+    counts="$(git cat-file -p "$tree:$file" 2>/dev/null | awk '
+        /^<<<<<<< / { hunks++; inside = 1; next }
+        /^>>>>>>> / { inside = 0; next }
+        inside && !/^=======/ { lines++ }
+        END { printf "%d\t%d", hunks, lines }')"
+    printf '%s\t%s\n' "$counts" "$file"
 done | sort -rn)"
 
 files="$(printf '%s\n' "$per_file" | grep -c . || true)"
 hunks="$(printf '%s\n' "$per_file" | awk '{ sum += $1 } END { print sum + 0 }')"
+lines="$(printf '%s\n' "$per_file" | awk '{ sum += $2 } END { print sum + 0 }')"
 
 echo "replay: $synced -> $old against $fork_ref"
 echo "conflicted files: $files"
 echo "conflict hunks: $hunks"
+echo "lines inside conflict regions: $lines"
 echo
+echo "hunks	lines	file"
 printf '%s\n' "$per_file" | head -n "$top"
