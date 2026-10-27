@@ -1,5 +1,5 @@
 # 038 — Isolate the fork lane from upstream files (shrink merge-conflict surface)
-Status: in progress — phases 1 + 2 (agent_ui / acp_thread / agent / thread seams) done; replay 177 → 158 hunks, lines inside conflict regions 12,073 → 5,852 (−52%); surface 16,609 → 7,286 lines; next: open_ai_compatible.rs inline seams (478 conflict lines, now the worst file)
+Status: in progress — phases 1, 2 and 2b (open_ai_compatible) done; replay 177 → 157 hunks, lines inside conflict regions 12,073 → 5,591 (−54%); remaining top regions are mostly upstream-only code adjacent to one-line seams (backward-replay noise); next: entry_view_state.rs / agent_panel.rs seams, Cargo.lock runbook
 
 ## Why
 
@@ -47,6 +47,7 @@ to it. Pattern proven by plan 037 (`acp/detachable.rs`: 7 one-line upstream touc
   - thread_view.rs (`2fb0ccef1c`, `4ef0a4f3e2`, `75f8a5a8e2`, `a5ab49c76c`, `57b3167e6a`): thread-control buttons, `RetryHooks` for `retry_generation`, sandbox refresh moved whole, retry control, verdict menu entries, auto-allow label, subagent retry buttons, turn-timer notify, 11 fields → `ForkThreadViewState` (one `fork` field). Dropped a no-op `changed_buffers` "fast path". Fork lines 730 → 319 added; replay 25 → 22 hunks
   - acp_thread / thread / agent (`7d59489515`, `e1edee10c9`, `bb3fcb1276`, `ca47e6b481`): `TurnApiError`, `ForkThreadEnvironment` supertrait, upstream-signature `open_thread`/`register_session` wrappers, fork `mod` lines grouped at top; replay 15/11/10 → 14/10/7 hunks, conflict-region lines 4,058 → 489
   - Totals: replay 166 → 158 hunks; lines inside conflict regions 9,520 → 5,852 (12,073 right after the sync); `fork-surface` 8,565 → 7,286
-- [ ] Phase 2b — `open_ai_compatible.rs` inline seams (7 hunks / 478 conflict lines, worst file now), `entry_view_state.rs` (6 hunks), `agent_panel.rs` (6)
+- [x] Phase 2b — `open_ai_compatible.rs` (`96d0671737`): fork `State::new` takes upstream's exact args so upstream's constructor call is verbatim; `State`/probe types/`ConfigurationView` → `fork.rs`; duplicated chat/responses key-rotation blocks → one generic `with_key_rotation`; `LanguageModelClient` key-slot methods → one-line delegations. File fork lines 311 → 108 added; replay conflict lines 478 → off the top list; 220 language_models tests pass
+- [ ] Phase 2c — `entry_view_state.rs` (6 hunks), `agent_panel.rs` (6 hunks / 62 lines). Note: conversation_view.rs's remaining 401 replay lines are upstream-added tests next to fork lines (backward-replay artifact), not fork code
 - [-] `agent.rs` `create_subagent_thread_inner` still duplicates upstream's `create_subagent_thread` body; de-duplicating needs upstream to expose a hook — deferred (no clean seam without copying upstream code)
 - [-] Cargo.lock conflicts — regenerate instead of merge (`git checkout --theirs Cargo.lock && cargo update -w`) during syncs; document in the sync runbook rather than refactor
