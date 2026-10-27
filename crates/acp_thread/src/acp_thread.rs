@@ -3565,19 +3565,7 @@ pub struct AcpThread {
     pending_terminal_output: HashMap<acp_v2::TerminalId, Vec<Vec<u8>>>,
     pending_terminal_exit: HashMap<acp_v2::TerminalId, acp_v1::TerminalExitStatus>,
     had_error: bool,
-    /// Narrower than `had_error`: true only when the completion request
-    /// itself failed (network/stream error from `run_turn`'s `Err` branch),
-    /// never for an individual failed tool call. `had_error` is set by any
-    /// tool call failing mid-turn — extremely common in normal agentic work
-    /// and unrelated to API availability — so code that reasons about actual
-    /// API exhaustion (e.g. auto_prompt's context-overflow backoff guard)
-    /// must check this field, not `had_error`.
-    had_api_error: bool,
-    /// Text of the last turn-level API error (`run_turn`'s `Err` branch),
-    /// e.g. Claude Code's `Internal error: You've hit your session limit ·
-    /// resets 1:20am (Asia/Bangkok): {"errorKind": "rate_limit"}`.
-    /// Cleared at the start of every turn, alongside `had_api_error`.
-    last_api_error: Option<String>,
+    api_error: fork::TurnApiError,
     local_execution_error: Option<Arc<anyhow::Error>>,
     /// The user's unsent prompt text, persisted so it can be restored when reloading the thread.
     draft_prompt: Option<Vec<acp_v2::ContentBlock>>,
@@ -3655,18 +3643,11 @@ struct StreamingTextBuffer {
 }
 
 impl StreamingTextBuffer {
-    /// The number of milliseconds between each timer tick. Each tick drains
-    /// pending text into the Markdown source, which triggers a background parse
-    /// and `cx.refresh_windows()` — forcing every window to re-render.
-    ///
-    /// At 16ms (60fps) the repaint churn from a single streaming response can
-    /// freeze the UI on long outputs. 300ms (~3fps) keeps the foreground
-    /// thread responsive so it can still pump the incoming HTTP stream.
-    const TASK_UPDATE_MS: u64 = 300;
-    /// The time in milliseconds to reveal the entire pending text. Set equal to
-    /// `TASK_UPDATE_MS` so buffered text drains in a single tick — text arrives
-    /// from the model in bursts and is flushed every `TASK_UPDATE_MS`.
-    const REVEAL_TARGET: f32 = 300.0;
+    /// The number of milliseconds between each timer tick, controlling how quickly
+    /// text is revealed.
+    const TASK_UPDATE_MS: u64 = fork::STREAMING_TASK_UPDATE_MS;
+    /// The time in milliseconds to reveal the entire pending text.
+    const REVEAL_TARGET: f32 = fork::STREAMING_REVEAL_TARGET_MS;
 
     fn reveal(&mut self, entries: &[AgentThreadEntry], max_bytes: usize, cx: &mut App) -> bool {
         let Some(content) = self.target.content(entries) else {
@@ -3950,8 +3931,7 @@ impl AcpThread {
             pending_terminal_output: HashMap::default(),
             pending_terminal_exit: HashMap::default(),
             had_error: false,
-            had_api_error: false,
-            last_api_error: None,
+            api_error: fork::TurnApiError::default(),
             local_execution_error: None,
             draft_prompt: None,
             draft_prompt_revision: 0,
@@ -5421,11 +5401,6 @@ impl AcpThread {
                 {
                     let text_len = text.text.len();
                     let source_index = content.append_deferred_text(text);
-                    // No EntryUpdated emit here: the text is only buffered, not yet
-                    // rendered. The reveal task's `markdown.append()` notifies and
-                    // refreshes windows when it lands. Emitting per chunk would
-                    // remeasure the list 100+ times/sec during fast streaming, a
-                    // major source of foreground-thread choke.
                     self.buffer_streaming_text(target, source_index, text_len, cx);
                     return;
                 }
@@ -5959,14 +5934,7 @@ impl AcpThread {
                 self.mark_error_if_tool_call_failed(index);
                 Ok(())
             }
-            ToolCallUpdate::V2(update) => {
-                let id = update.tool_call_id.clone();
-                self.upsert_local_tool_call(update, cx)?;
-                if let Some(index) = self.index_for_tool_call(&id) {
-                    self.mark_error_if_tool_call_failed(index);
-                }
-                Ok(())
-            }
+            ToolCallUpdate::V2(update) => self.upsert_local_tool_call_marking_failure(update, cx),
             ToolCallUpdate::UpdateDiff(update) => {
                 self.update_tool_call_content(update.id, ToolCallContent::Diff(update.diff), cx)
             }
@@ -7150,8 +7118,7 @@ impl AcpThread {
         };
         self.clear_completed_plan_entries(cx);
         self.had_error = false;
-        self.had_api_error = false;
-        self.last_api_error = None;
+        self.api_error = fork::TurnApiError::default();
         self.local_execution_error = None;
 
         let (tx, rx) = oneshot::channel();
@@ -7253,31 +7220,7 @@ impl AcpThread {
                                 is_same_turn,
                                 cx,
                             );
-                            // Toasts and the error banner are transient — without a
-                            // transcript entry a truncated turn leaves no trace once
-                            // they expire and the session reads as a silent stop.
-                            let usage_note = this
-                                .token_usage
-                                .as_ref()
-                                .map(|usage| {
-                                    format!(
-                                        " — {} output tokens used{}",
-                                        usage.output_tokens,
-                                        usage
-                                            .max_output_tokens
-                                            .map(|max| format!(" of {max}"))
-                                            .unwrap_or_default()
-                                    )
-                                })
-                                .unwrap_or_default();
-                            this.push_agent_board_notification(
-                                format!(
-                                    "Turn truncated: the model hit its output token limit{}. \
-                                     Continue the thread to resume where it stopped.",
-                                    usage_note
-                                ),
-                                cx,
-                            );
+                            this.push_turn_truncated_note(cx);
                             return Err(anyhow!(MaxOutputTokensError));
                         }
 
@@ -7328,11 +7271,7 @@ impl AcpThread {
                             this.cancel_pending_turn_entries(cx);
                         }
                         this.had_error = true;
-                        // The completion request itself failed (network, timeout, 5xx,
-                        // rate limit, etc.) — unlike a failed tool call, this is a real
-                        // signal about API availability.
-                        this.had_api_error = true;
-                        this.last_api_error = Some(format!("{e:#}"));
+                        this.record_turn_api_error(&e);
                         cx.emit(AcpThreadEvent::Error);
                         log::error!("Error in run turn: {:?}", e);
                         Err(e)
@@ -8268,6 +8207,7 @@ fn update_markdown_in_place(markdown: &Entity<Markdown>, text: &str, cx: &mut Ap
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod fork_tests;
     use anyhow::anyhow;
     use futures::stream::StreamExt as _;
     use futures::{channel::mpsc, future::LocalBoxFuture, select};
@@ -15284,93 +15224,6 @@ mod tests {
                 &thread.entries[1],
                 AgentThreadEntry::ToolCall(call) if call.status() == ToolCallStatus::Completed
             ));
-        });
-    }
-
-    /// Regression test for retry-after-completion: when a subagent's first turn
-    /// has already completed and the user retries it, the parent's tool_call is
-    /// set back to InProgress by `restart_subagent_tool_call`. Once the retry
-    /// finishes, `complete_subagent_tool_call` must transition it to Completed
-    /// and replace the content with the new output. Without this, the parent's
-    /// tool_call stays InProgress forever — the loading spinner never clears
-    /// and the stop button cannot fix it (cancel returns early when there is no
-    /// running_turn on the parent).
-    #[gpui::test]
-    async fn test_complete_subagent_tool_call(cx: &mut TestAppContext) {
-        init_test(cx);
-        let thread = new_test_thread(cx).await;
-        let subagent_session_id = acp_v2::SessionId::new("subagent-1");
-        let status_of = |thread: &AcpThread| {
-            thread
-                .tool_call_for_subagent(&subagent_session_id)
-                .expect("tool_call should exist for subagent")
-                .status()
-        };
-
-        thread.update(cx, |thread, cx| {
-            thread
-                .upsert_tool_call(
-                    acp_v1::ToolCall::new(acp_v1::ToolCallId::new("spawn_agent_1"), "Subagent")
-                        .kind(acp_v1::ToolKind::Other)
-                        .status(acp_v1::ToolCallStatus::Completed)
-                        .meta(acp_v1::Meta::from_iter([(
-                            SUBAGENT_SESSION_INFO_META_KEY.into(),
-                            json!({"session_id": "subagent-1", "message_start_index": 0}),
-                        )]))
-                        .raw_output(serde_json::Value::String("first output".into())),
-                    cx,
-                )
-                .expect("tool call");
-        });
-        thread.read_with(cx, |thread, _| {
-            assert_eq!(status_of(thread), ToolCallStatus::Completed);
-        });
-
-        // Simulate a retry: restart_subagent_tool_call sets it back to InProgress.
-        thread.update(cx, |thread, cx| {
-            thread.restart_subagent_tool_call(&subagent_session_id, cx);
-        });
-        thread.read_with(cx, |thread, _| {
-            assert_eq!(status_of(thread), ToolCallStatus::InProgress);
-        });
-
-        // Simulate the retry completing with a new output.
-        thread.update(cx, |thread, cx| {
-            thread.complete_subagent_tool_call(
-                &subagent_session_id,
-                Some("second output".to_string()),
-                false,
-                cx,
-            );
-        });
-        cx.run_until_parked();
-        thread.read_with(cx, |thread, cx| {
-            assert_eq!(status_of(thread), ToolCallStatus::Completed);
-            let tool_call = thread
-                .tool_call_for_subagent(&subagent_session_id)
-                .expect("tool_call should still exist");
-            assert_eq!(
-                tool_call.raw_output.as_ref(),
-                Some(&serde_json::Value::String("second output".into())),
-            );
-            let content_md = tool_call.to_markdown(cx);
-            assert!(
-                content_md.contains("second output"),
-                "rendered content should contain the new output, got: {content_md}"
-            );
-            assert!(
-                !content_md.contains("first output"),
-                "rendered content should NOT contain the old output, got: {content_md}"
-            );
-        });
-
-        // Verify the error case transitions to Failed.
-        thread.update(cx, |thread, cx| {
-            thread.restart_subagent_tool_call(&subagent_session_id, cx);
-            thread.complete_subagent_tool_call(&subagent_session_id, None, true, cx);
-        });
-        thread.read_with(cx, |thread, _| {
-            assert_eq!(status_of(thread), ToolCallStatus::Failed);
         });
     }
 

@@ -83,15 +83,50 @@ impl AcpThread {
 
     /// True only when the completion request itself failed (a genuine
     /// stream/network/API error), never for an individual failed tool call.
-    /// See the field doc on `had_api_error` for why this distinction matters.
+    /// See [`TurnApiError`] for why this distinction matters.
     pub fn had_api_error(&self) -> bool {
-        self.had_api_error
+        self.api_error.message.is_some()
     }
 
     /// Text of the last turn-level API error, if any. Only meaningful while
     /// `had_api_error()` is true (cleared at the start of every turn).
     pub fn last_api_error(&self) -> Option<&str> {
-        self.last_api_error.as_deref()
+        self.api_error.message.as_deref()
+    }
+
+    /// Called from `run_turn`'s `Err` branch: the completion request itself
+    /// failed (network, timeout, 5xx, rate limit, etc.) — unlike a failed tool
+    /// call, this is a real signal about API availability.
+    pub(crate) fn record_turn_api_error(&mut self, error: &anyhow::Error) {
+        self.api_error.message = Some(format!("{error:#}"));
+    }
+
+    /// Toasts and the error banner are transient — without a transcript entry
+    /// a turn truncated at the output token limit leaves no trace once they
+    /// expire and the session reads as a silent stop.
+    pub(crate) fn push_turn_truncated_note(&mut self, cx: &mut Context<Self>) {
+        let usage_note = self
+            .token_usage
+            .as_ref()
+            .map(|usage| {
+                format!(
+                    " — {} output tokens used{}",
+                    usage.output_tokens,
+                    usage
+                        .max_output_tokens
+                        .map(|max| format!(" of {max}"))
+                        .unwrap_or_default()
+                )
+            })
+            .unwrap_or_default();
+        self.push_agent_board_notification(
+            format!(
+                "Turn truncated: the model hit its output token limit{}. \
+                 Continue the thread to resume where it stopped.",
+                usage_note
+            ),
+            cx,
+        );
     }
 
     /// Push an agent-board notification into the thread. Called by `agent_ui`
@@ -178,6 +213,41 @@ impl AcpThread {
     }
 }
 
+/// Turn-level API error state of an [`AcpThread`], cleared at the start of
+/// every turn.
+///
+/// Narrower than `had_error`: set only when the completion request itself
+/// failed (network/stream error from `run_turn`'s `Err` branch), never for an
+/// individual failed tool call. `had_error` is set by any tool call failing
+/// mid-turn — extremely common in normal agentic work and unrelated to API
+/// availability — so code that reasons about actual API exhaustion (e.g.
+/// auto_prompt's context-overflow backoff guard) must check this, not
+/// `had_error`.
+#[derive(Debug, Default)]
+pub(crate) struct TurnApiError {
+    /// Text of the last turn-level API error, e.g. Claude Code's `Internal
+    /// error: You've hit your session limit · resets 1:20am (Asia/Bangkok):
+    /// {"errorKind": "rate_limit"}`.
+    message: Option<String>,
+}
+
+/// Streaming reveal tick. Each tick drains pending text into the Markdown
+/// source, which triggers a background parse and `cx.refresh_windows()` —
+/// forcing every window to re-render. At upstream's 16ms (60fps) the repaint
+/// churn from a single streaming response can freeze the UI on long outputs.
+/// 300ms (~3fps) keeps the foreground thread responsive so it can still pump
+/// the incoming HTTP stream.
+///
+/// `push_assistant_content_block_with_message_id` also skips upstream's per-chunk `EntryUpdated`
+/// emit: the text is only buffered, and the reveal task's `markdown.append()`
+/// notifies and refreshes windows when it lands. Emitting per chunk would
+/// remeasure the list 100+ times/sec during fast streaming.
+pub(crate) const STREAMING_TASK_UPDATE_MS: u64 = 300;
+
+/// Equal to [`STREAMING_TASK_UPDATE_MS`] so buffered text drains in a single
+/// tick — text arrives from the model in bursts and is flushed every tick.
+pub(crate) const STREAMING_REVEAL_TARGET_MS: f32 = 300.0;
+
 /// Short human-readable label naming a tool call in the bloat report: the
 /// tool name plus, when present, the first command/path argument so the
 /// report can say "avoid re-running terminal: cargo check …" instead of a
@@ -209,6 +279,21 @@ impl AcpThread {
         self.entries
             .iter()
             .any(|entry| matches!(entry, AgentThreadEntry::ToolCall(..)))
+    }
+
+    /// Upstream's `ToolCallUpdate::V2` arm plus failure marking, so
+    /// auto_prompt sees failed local tool calls.
+    pub(crate) fn upsert_local_tool_call_marking_failure(
+        &mut self,
+        update: acp_v2::ToolCallUpdate,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        let id = update.tool_call_id.clone();
+        self.upsert_local_tool_call(update, cx)?;
+        if let Some(index) = self.index_for_tool_call(&id) {
+            self.mark_error_if_tool_call_failed(index);
+        }
+        Ok(())
     }
 
     /// Lets auto_prompt back off instead of cycling when tool calls fail mid-turn.
