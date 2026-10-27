@@ -226,7 +226,7 @@ pub fn drain_unseen_notifications() -> Vec<String> {
         if !seen.contains(&sig) {
             seen.insert(sig.clone());
             let label = state.sub_agent_id.as_deref().unwrap_or("(main)");
-            let text = truncate_to_char_boundary(&state.state_text, 256);
+            let text = &state.state_text[..state.state_text.floor_char_boundary(256)];
             notifications.push(format!(
                 "[peer] {} / {}: {}",
                 state.device_name, label, text
@@ -249,20 +249,6 @@ fn format_signature(state: &PeerAgentState) -> String {
         state.sub_agent_id.as_deref().unwrap_or(""),
         state.state_text,
     )
-}
-
-/// Truncate a string to at most `max_bytes` bytes, rolling back to the
-/// previous UTF-8 char boundary if the cut point falls mid-character.
-/// Process-killing to slice without this check.
-fn truncate_to_char_boundary(s: &str, max_bytes: usize) -> &str {
-    if s.len() <= max_bytes {
-        return s;
-    }
-    let mut end = max_bytes;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
 }
 
 fn matches_mute(mute: &PeerStateMute, state: &PeerAgentState) -> bool {

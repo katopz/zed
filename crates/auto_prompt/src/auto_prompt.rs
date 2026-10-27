@@ -1773,7 +1773,8 @@ fn decide_with_context(
 /// Char-boundary-safe truncation (project rule: never slice a `&str` by byte
 /// index without a boundary check — summaries routinely contain em-dashes
 /// and CJK). This is the canonical truncation helper referenced by the repo
-/// `.rules` for log/preview truncation.
+/// `.rules` for log/preview truncation. The limit counts chars, not bytes; for
+/// a byte budget slice with `&text[..text.floor_char_boundary(max_bytes)]`.
 pub fn truncate_at_char_boundary(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
         return text.to_string();

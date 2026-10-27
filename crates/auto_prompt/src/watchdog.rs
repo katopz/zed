@@ -316,11 +316,7 @@ fn truncate_for_prompt(s: &str) -> String {
     if s.len() <= CONTEXT_BUDGET_CHARS {
         return s.to_string();
     }
-    let mut end = CONTEXT_BUDGET_CHARS;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    let mut truncated = s[..end].to_string();
+    let mut truncated = s[..s.floor_char_boundary(CONTEXT_BUDGET_CHARS)].to_string();
     truncated.push_str("\n…(truncated)");
     truncated
 }

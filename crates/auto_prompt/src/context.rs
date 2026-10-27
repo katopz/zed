@@ -721,13 +721,9 @@ fn push_assistant_chunks(chunk_sources: &[String], out: &mut Vec<ContextMessage>
 fn process_assistant_chunk(source: &str) -> String {
     let content = strip_code_blocks(source);
     if content.len() > MAX_ASSISTANT_CHUNK_BYTES {
-        let mut end = MAX_ASSISTANT_CHUNK_BYTES;
-        while !content.is_char_boundary(end) {
-            end -= 1;
-        }
         format!(
             "{}…\n[truncated: {} bytes total]",
-            &content[..end],
+            &content[..content.floor_char_boundary(MAX_ASSISTANT_CHUNK_BYTES)],
             content.len()
         )
     } else {
@@ -831,13 +827,9 @@ fn serialize_tool_call(tool: &SnapshotToolCall) -> String {
         if output_str.len() < MAX_TOOL_CONTENT_BYTES {
             parts.push(format!("Output: {output_str}"));
         } else {
-            let mut end = MAX_TOOL_CONTENT_BYTES;
-            while !output_str.is_char_boundary(end) {
-                end -= 1;
-            }
             parts.push(format!(
                 "Output: {}…\n[truncated: {} bytes total]",
-                &output_str[..end],
+                &output_str[..output_str.floor_char_boundary(MAX_TOOL_CONTENT_BYTES)],
                 output_str.len()
             ));
         }
