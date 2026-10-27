@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use smol::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
+use smol::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use util::command::{Child, Command, Stdio};
 
 /// Byte cap per plan file — parity with the worktree reader in
@@ -527,12 +527,26 @@ async fn cat_file_batch(repo_root: &Path, blobs: &[String]) -> HashMap<String, O
     }
     // stdin is dropped here — EOF tells git to exit after the last response.
 
-    let stdout = child.stdout.take();
-    let mut reader = stdout.map(|out| BufReader::with_capacity(256 * 1024, out));
+    if let Some(stdout) = child.stdout.take() {
+        let mut reader = BufReader::with_capacity(256 * 1024, stdout);
+        read_cat_file_stream(&mut reader, blobs, &mut result).await;
+    }
+
+    if let Err(err) = child.status().await {
+        log::warn!("[auto_prompt::plan_source] git cat-file status failed: {err}");
+    }
+    result
+}
+
+/// Parse `git cat-file --batch` output for `blobs`, in request order, into
+/// `result`. Missing objects and oversized blobs map to `None`; a failed read
+/// ends parsing, leaving later blobs absent.
+async fn read_cat_file_stream<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    blobs: &[String],
+    result: &mut HashMap<String, Option<String>>,
+) {
     for blob in blobs {
-        let Some(reader) = reader.as_mut() else {
-            break;
-        };
         let mut header = String::new();
         if reader.read_line(&mut header).await.unwrap_or(0) == 0 {
             break;
@@ -581,11 +595,6 @@ async fn cat_file_batch(repo_root: &Path, blobs: &[String]) -> HashMap<String, O
             break;
         }
     }
-
-    if let Err(err) = child.status().await {
-        log::warn!("[auto_prompt::plan_source] git cat-file status failed: {err}");
-    }
-    result
 }
 
 /// Consume `size` bytes from `reader`. Oversized plan blobs are skipped this
@@ -708,6 +717,42 @@ async fn git_output(repo: &Path, args: &[&str]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse_cat_file(stream: &[u8], blobs: &[&str]) -> HashMap<String, Option<String>> {
+        let blobs: Vec<String> = blobs.iter().map(|blob| blob.to_string()).collect();
+        let mut result = HashMap::new();
+        let mut reader = stream;
+        smol::block_on(read_cat_file_stream(&mut reader, &blobs, &mut result));
+        result
+    }
+
+    #[test]
+    fn cat_file_stream_reads_blobs_and_missing_objects_in_order() {
+        let stream = b"aaa blob 5\nfirst\nbbb missing\nccc blob 6\nsecond\n";
+        let result = parse_cat_file(stream, &["aaa", "bbb", "ccc"]);
+        assert_eq!(result.get("aaa"), Some(&Some("first".to_string())));
+        // A missing object has no payload, so it is simply absent.
+        assert_eq!(result.get("bbb"), None);
+        assert_eq!(result.get("ccc"), Some(&Some("second".to_string())));
+    }
+
+    #[test]
+    fn cat_file_stream_stops_at_a_truncated_payload() {
+        // The second payload is cut short: parsing must stop rather than read
+        // the rest of the stream out of step with the requested blobs.
+        let stream = b"aaa blob 5\nfirst\nbbb blob 50\nshort";
+        let result = parse_cat_file(stream, &["aaa", "bbb", "ccc"]);
+        assert_eq!(result.get("aaa"), Some(&Some("first".to_string())));
+        assert_eq!(result.get("bbb"), None);
+        assert_eq!(result.get("ccc"), None);
+    }
+
+    #[test]
+    fn cat_file_stream_keeps_a_blob_whose_trailing_newline_is_missing() {
+        let result = parse_cat_file(b"aaa blob 5\nfirst", &["aaa", "bbb"]);
+        assert_eq!(result.get("aaa"), Some(&Some("first".to_string())));
+        assert_eq!(result.get("bbb"), None);
+    }
     use futures::future::BoxFuture;
     use tempfile::TempDir;
 
