@@ -1,6 +1,6 @@
 # Verdict ping-pong GOAT benchmark + reviewer session teardown
 
-Status: 2026-09-13 scorer re-run (app bundle 2026-09-11 23:36 includes `19556c5841`): verdict-ON cohort 1/20 (mechanism healthy — rounds {'3': 1}, reviewer claude_code, 0 aborts); baseline refined to 6.3% post-hoc fix rate over 16,578 OFF chains (21,053 threads / 16,582 chains, 4,554 continuation links, 0 parse failures); 3 FAILED chains excluded (66.7% corrected — small-n noise). GOAT verdict still pending the >=20 ON cohort. PART 1 harness SHIPPED (persistence + scorer), Part 2 teardown FIXED (drain pattern); interim bench recorded 2026-09-09 (`.benchmarks/001_verdict_ping_pong_goat.md`): baseline 6.4% (460/7234 chains), FAILED cohort instrumented (2 spawn-aborts), ON cohort still 0 — the running app predates the stale-registration fix `19556c5841`, so live verdict attempts must wait for a rebuild + restart; remaining: accumulate the >= 20-task cohort post-restart, then record the GOAT verdict
+Status: 2026-10-27 scorer re-run on the M3's fresh threads.db: verdict-ON 11/20 chains (rounds 1:2 2:5 3:4, 1 abort, reviewer claude_code), OFF 37 chains; post-hoc fix rate 0.0% in BOTH cohorts (metric has no signal on this data), ON costs 3.4x input / 4.6x output tokens (`.benchmarks/001`). GOAT verdict pending the >=20 ON cohort; if that also reads 0 vs 0, switch the gate to a blinded summary-quality sample. Earlier history: 2026-09-13 run 1/20 ON, baseline 6.3% over 16,578 OFF chains on the old host; PART 1 harness + Part 2 teardown shipped
 
 ## Context
 

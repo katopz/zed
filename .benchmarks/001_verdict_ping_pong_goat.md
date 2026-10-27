@@ -46,3 +46,27 @@ No GOAT call is possible: the ON cohort is empty. The feature stays
 default-on (purely user-invoked, no autonomous cost). Next unit: after the
 user rebuilds/restarts, accumulate >= 10 verdict-on chains from real usage,
 re-run the scorer, and score the gate.
+
+## Re-run 2026-10-27 (M3, fresh `threads.db`)
+
+`uv run script/verdict_scorer.py`: 120 threads / 48 chains, 0 parse failures,
+77 continuation links. This machine's database is new (the 2026-09 runs read
+~21k threads on the old host), so the OFF baseline is small too.
+
+| cohort | chains | with summary | post-hoc fix rate | rounds | aborts | avg chain tokens in / out |
+|---|---|---|---|---|---|---|
+| ON | 11 | 11 | 0.0% | 1:2, 2:5, 3:4 | 1 | 4.08 M / 339 k |
+| OFF | 37 | 34 | 0.0% | — | 0 | 1.21 M / 73 k |
+| FAILED | 0 | — | — | — | — | — |
+
+Reading: the mechanism works (11 negotiations, 82% converge in 2-3 rounds,
+1 abort), but the primary metric has **no signal** here: 0 corrections in
+either cohort, so a relative reduction is undefined. The only measured
+difference is cost: an ON chain uses 3.4× the input and 4.6× the output
+tokens of an OFF chain. Still under the >= 20 ON chain threshold.
+
+Interim verdict: unchanged. Stays default-on because it is purely
+user-invoked, so it costs nothing until clicked. If the 20-chain run also
+shows 0 vs 0, the post-hoc keyword scorer is too weak to decide the gate and
+the next step is a blinded quality sample (rate N ON vs N OFF final
+summaries), not more waiting.
