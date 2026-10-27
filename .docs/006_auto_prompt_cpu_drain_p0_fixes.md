@@ -322,3 +322,22 @@ Analysis-issue archive note: the original `.issues/006` file (Jul 19 evidence
 tables, root-cause corrections, recommended-fix priorities) was absorbed into
 this doc and removed from `.issues/` per the noise-reduction rule; the raw
 evidence remains in git history (`git log --follow -- .issues/006_*`).
+
+## Stalled-chain loop (2026-10-27, `.issues/037` closed)
+
+A Claude thread whose remaining work all waited on the owner was re-dispatched
+for 10+ rounds with nothing to do. Three guards should have stopped it:
+
+- Terminal-summary check missed "blocked on / waiting on / needs you" wording:
+  markers added, matched at word starts (`cfb60f7b21`).
+- No no-progress detection: unchanged next steps for 2 repeats now stop the
+  same-thread fast path (`82c6ffc7d8`).
+- `max_iterations` never fired: the iteration, verification and chain-timeout
+  counters were process-wide atomics reset by any session's stop, and the
+  Claude path had no cap. `crates/auto_prompt/src/chain.rs` keeps them per
+  session, and the cap now counts consecutive turns without progress (no
+  edit/delete/move tool call, no `git commit`/`git push`), so it never cuts off
+  a productive chain (`f426bb830d`). The Claude decide path applies it too.
+
+Still global: `AUTO_PROMPT_LLM_FAILURE_COUNT` (orchestrator call failures).
+Low impact, since any session's success resetting it only delays a fallback.
