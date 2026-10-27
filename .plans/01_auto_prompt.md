@@ -183,11 +183,20 @@ The orchestration LLM must return JSON:
 
 ```
 crates/auto_prompt/src/
-├── auto_prompt.rs  # Core logic: decide(), decide_with_llm(), evaluate_response(),
-│                   # call_language_model(), Thinking fallback, same-thread threshold
-├── config.rs       # Loads ~/.config/zed/auto_prompt.json or env vars
-│                   # same_thread_token_threshold, max_llm_retries, etc.
-└── context.rs      # AutoPromptContext, AutoPromptResponse, plan/message serialization
+├── auto_prompt.rs       # Core logic: decide(), decide_with_llm(), evaluate_response(),
+│                        # Thinking fallback, same-thread threshold
+├── auto_prompt_tests.rs # Tests for auto_prompt.rs
+├── overflow.rs          # Context-overflow Phase 1/2, cut-off, max-tokens, output bloat
+├── remaining_work.rs    # Summary next-step parsing, deferred/blocked detection,
+│                        # pre-stop plan verification prompts
+├── model_call.rs        # call_language_model(), stream_model_completion(), parse_response()
+├── context_files.rs     # Plan and doc files read for the context
+├── config.rs            # Loads ~/.config/zed/auto_prompt.json or env vars
+│                        # same_thread_token_threshold, max_llm_retries, etc.
+└── context.rs           # AutoPromptContext, AutoPromptResponse, plan/message serialization
+
+Split out of a 9,477-line auto_prompt.rs in ee276f9065, 7933a90af4, 1584da69d0
+and b68a330247 (issue 039, a pure move).
 
 crates/agent_ui/src/auto_prompt/
 └── mod.rs          # UI integration: on_thread_stopped(), dispatch_action(),
