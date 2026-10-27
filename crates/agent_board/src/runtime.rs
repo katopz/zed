@@ -272,10 +272,11 @@ impl BoardRuntime {
                         "[agent_board] MCP server listening at {} (tools: get_agent_room, post_agent_board_message)",
                         server.socket_path().display()
                     );
-                    let _ = this.update(cx, |this, cx| {
+                    this.update(cx, |this, cx| {
                         this.mcp_server = Some(server);
                         cx.notify();
-                    });
+                    })
+                    .ok();
                 }
                 Err(error) => {
                     log::warn!("[agent_board] failed to start MCP server: {error:#}");
@@ -463,7 +464,7 @@ impl BoardRuntime {
                 .await;
             match result {
                 Ok(_) => {
-                    let _ = this.update(cx, |this, cx| this.force_refresh(cx));
+                    this.update(cx, |this, cx| this.force_refresh(cx)).ok();
                 }
                 Err(error) => {
                     log::warn!("[agent_board] post_message failed: {error:#}");
