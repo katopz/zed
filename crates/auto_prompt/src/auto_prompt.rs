@@ -40,17 +40,17 @@ pub use context::{
 pub use plan_registry::ActivePlanClaim;
 
 use agent_client_protocol::schema::v2 as acp;
-use gpui::App;
-use language_model::LanguageModel;
-use lightweight_context::{count_actionable_tasks, has_unchecked_items};
 pub use context_files::warm_plan_snapshots;
-pub use model_call::stream_model_completion;
-pub use overflow::with_bloat_section;
 use context_files::{
     ContextFileInputs, context_file_inputs, plan_inputs_without_message, read_doc_files,
     read_plan_files, read_plan_files_cached,
 };
+use gpui::App;
+use language_model::LanguageModel;
+use lightweight_context::{count_actionable_tasks, has_unchecked_items};
 use model_call::call_language_model;
+pub use model_call::stream_model_completion;
+pub use overflow::with_bloat_section;
 use overflow::{
     MAX_TOKENS_RESUME_PROMPT, api_unreachable_decision, context_overflow_outcome,
     cutoff_context_full_outcome, max_tokens_context_window_full, output_bloat_directive,
@@ -1783,7 +1783,6 @@ pub fn truncate_at_char_boundary(text: &str, max_chars: usize) -> String {
     }
     text.chars().take(max_chars).collect()
 }
-
 
 /// Build a one-shot pros/cons clarification request (plan 023 D, req 5).
 ///
