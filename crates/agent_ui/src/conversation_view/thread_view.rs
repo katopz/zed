@@ -8186,14 +8186,6 @@ impl ThreadView {
             return Empty.into_any_element();
         }
 
-        let manual_auto_prompt_button = IconButton::new("manual-auto-prompt", IconName::Sparkle)
-            .icon_size(IconSize::Small)
-            .icon_color(Color::Muted)
-            .tooltip(Tooltip::text("Auto Prompt"))
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.manual_auto_prompt(window, cx);
-            }));
-
         let copy_response_button = copy_response_index.map(|response_index| {
             IconButton::new(("copy_agent_response", entry_ix), IconName::Copy)
                 .icon_size(IconSize::Small)
@@ -8207,70 +8199,6 @@ impl ThreadView {
                     }
                 }))
         });
-
-        let copy_summary_button = copy_response_index
-            .filter(|&response_index| {
-                Self::get_agent_summary_content(thread.read(cx).entries(), response_index, cx)
-                    .is_some()
-            })
-            .map(|response_index| {
-                IconButton::new(("copy_agent_summary", entry_ix), IconName::TextSnippet)
-                    .icon_size(IconSize::Small)
-                    .icon_color(Color::Muted)
-                    .tooltip(Tooltip::text("Copy Summary"))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        let entries = this.thread.read(cx).entries();
-                        if let Some(text) =
-                            Self::get_agent_summary_content(entries, response_index, cx)
-                        {
-                            cx.write_to_clipboard(ClipboardItem::new_string(text));
-                        }
-                    }))
-            });
-
-        // Verdict ping-pong (proposal 001): sits right behind "Copy Summary"
-        // and only when that button does — a summary to review must exist.
-        // Root views only (subagents can't spawn reviewers) of native agent
-        // threads (external agents don't have `request_verdict`); set
-        // agent.verdict_ping_pong = false to hide it.
-        let verdict_available = AgentSettings::get_global(cx).fork.verdict_ping_pong
-            && !self.is_subagent()
-            && thread.read(cx).connection().agent_id().as_ref() == agent::ZED_AGENT_ID.as_ref()
-            && copy_response_index.is_some_and(|response_index| {
-                Self::get_agent_summary_content(thread.read(cx).entries(), response_index, cx)
-                    .is_some()
-            });
-        let verdict_button = verdict_available.then(|| {
-            IconButton::new(("request-verdict", entry_ix), IconName::Person)
-                .icon_size(IconSize::Small)
-                .icon_color(Color::Muted)
-                .disabled(is_generating)
-                .tooltip(Tooltip::text(Self::verdict_label(cx)))
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.handle_request_verdict_click(
-                        agent::RequestedReviewer::Default,
-                        window,
-                        cx,
-                    );
-                }))
-        });
-        let secondary_verdict_button = verdict_available
-            .then(|| Self::secondary_verdict_label(cx))
-            .flatten()
-            .map(|label| {
-                IconButton::new(("request-secondary-verdict", entry_ix), IconName::UserGroup)
-                    .icon_size(IconSize::Small)
-                    .icon_color(Color::Muted)
-                    .disabled(is_generating)
-                    .tooltip(Tooltip::text(label))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.handle_request_verdict_click(
-                            agent::RequestedReviewer::Secondary,
-                            window,
-                            cx,
-                        );
-                    }))
-            });
 
         let scroll_to_recent_user_prompt = IconButton::new(
             ("scroll_to_recent_user_prompt", entry_ix),
@@ -8411,11 +8339,15 @@ impl ThreadView {
                 },
             )
             .when_some(feedback_buttons, |this, buttons| this.child(buttons))
-            .when_some(copy_summary_button, |this, button| this.child(button))
-            .when_some(verdict_button, |this, button| this.child(button))
-            .when_some(secondary_verdict_button, |this, button| this.child(button))
+            .children(self.render_fork_summary_controls(
+                thread,
+                entry_ix,
+                copy_response_index,
+                is_generating,
+                cx,
+            ))
             .when_some(copy_response_button, |this, button| this.child(button))
-            .child(manual_auto_prompt_button)
+            .child(Self::render_manual_auto_prompt_button(cx))
             .child(scroll_to_recent_user_prompt)
             .when_some(scroll_to_top, |this, button| this.child(button))
             .into_any_element()

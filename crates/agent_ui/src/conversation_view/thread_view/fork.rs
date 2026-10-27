@@ -438,6 +438,95 @@ pub(super) fn assistant_message_closes_turn(entries: &[AgentThreadEntry], entry_
 }
 
 impl ThreadView {
+    pub(super) fn render_manual_auto_prompt_button(cx: &Context<Self>) -> IconButton {
+        IconButton::new("manual-auto-prompt", IconName::Sparkle)
+            .icon_size(IconSize::Small)
+            .icon_color(Color::Muted)
+            .tooltip(Tooltip::text("Auto Prompt"))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.manual_auto_prompt(window, cx);
+            }))
+    }
+
+    /// "Copy Summary" plus the verdict reviewer buttons, in render order.
+    pub(super) fn render_fork_summary_controls(
+        &self,
+        thread: &Entity<AcpThread>,
+        entry_ix: usize,
+        copy_response_index: Option<usize>,
+        is_generating: bool,
+        cx: &Context<Self>,
+    ) -> impl Iterator<Item = IconButton> {
+        let copy_summary_button = copy_response_index
+            .filter(|&response_index| {
+                Self::get_agent_summary_content(thread.read(cx).entries(), response_index, cx)
+                    .is_some()
+            })
+            .map(|response_index| {
+                IconButton::new(("copy_agent_summary", entry_ix), IconName::TextSnippet)
+                    .icon_size(IconSize::Small)
+                    .icon_color(Color::Muted)
+                    .tooltip(Tooltip::text("Copy Summary"))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let entries = this.thread.read(cx).entries();
+                        if let Some(text) =
+                            Self::get_agent_summary_content(entries, response_index, cx)
+                        {
+                            cx.write_to_clipboard(ClipboardItem::new_string(text));
+                        }
+                    }))
+            });
+
+        // Verdict ping-pong (proposal 001): sits right behind "Copy Summary"
+        // and only when that button does — a summary to review must exist.
+        // Root views only (subagents can't spawn reviewers) of native agent
+        // threads (external agents don't have `request_verdict`); set
+        // agent.verdict_ping_pong = false to hide it.
+        let verdict_available = AgentSettings::get_global(cx).fork.verdict_ping_pong
+            && !self.is_subagent()
+            && thread.read(cx).connection().agent_id().as_ref() == agent::ZED_AGENT_ID.as_ref()
+            && copy_response_index.is_some_and(|response_index| {
+                Self::get_agent_summary_content(thread.read(cx).entries(), response_index, cx)
+                    .is_some()
+            });
+        let verdict_button = verdict_available.then(|| {
+            IconButton::new(("request-verdict", entry_ix), IconName::Person)
+                .icon_size(IconSize::Small)
+                .icon_color(Color::Muted)
+                .disabled(is_generating)
+                .tooltip(Tooltip::text(Self::verdict_label(cx)))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.handle_request_verdict_click(
+                        agent::RequestedReviewer::Default,
+                        window,
+                        cx,
+                    );
+                }))
+        });
+        let secondary_verdict_button = verdict_available
+            .then(|| Self::secondary_verdict_label(cx))
+            .flatten()
+            .map(|label| {
+                IconButton::new(("request-secondary-verdict", entry_ix), IconName::UserGroup)
+                    .icon_size(IconSize::Small)
+                    .icon_color(Color::Muted)
+                    .disabled(is_generating)
+                    .tooltip(Tooltip::text(label))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.handle_request_verdict_click(
+                            agent::RequestedReviewer::Secondary,
+                            window,
+                            cx,
+                        );
+                    }))
+            });
+
+        copy_summary_button
+            .into_iter()
+            .chain(verdict_button)
+            .chain(secondary_verdict_button)
+    }
+
     /// Returns true when the model is actively streaming text into a markdown
     /// body. While this is the case, the Markdown background parser fires
     /// `cx.refresh_windows()` on each parse completion (many times per second),
