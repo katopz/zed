@@ -2,11 +2,10 @@ use crate::{
     ApplyCodeActionTool, AskUserTool, CodeActionStore, ContextServerRegistry, CopyPathTool,
     CreateDirectoryTool, CreateThreadTool, DbLanguageModel, DbThread, DeletePathTool,
     DiagnosticsTool, EditFileTool, FetchTool, FindPathTool, FindReferencesTool, GetCodeActionsTool,
-    GoToDefinitionTool, GrepTool, ListAgentsAndModelsTool, ListDirectoryTool, ListThreadsTool,
-    MovePathTool, ProjectSnapshot, ReadFileTool, RenameTool, RequestVerdictTool,
-    SandboxedTerminalTool, SendMessageTool, SpawnAgentTool, SystemPromptTemplate, Template,
-    Templates, TerminalTool, ThreadListing, ThreadMessageOutcome, ThreadMessageRequest,
-    ToolPermissionDecision, WebSearchTool, WriteFileTool, decide_permission_from_settings,
+    GoToDefinitionTool, GrepTool, ListAgentsAndModelsTool, ListDirectoryTool, MovePathTool,
+    ProjectSnapshot, ReadFileTool, RenameTool, SandboxedTerminalTool, SpawnAgentTool,
+    SystemPromptTemplate, Template, Templates, TerminalTool, ToolPermissionDecision, WebSearchTool,
+    WriteFileTool, decide_permission_from_settings,
 };
 use acp_thread::{AgentModelId, ClientUserMessageId, MentionUri, ProcessOutput};
 use action_log::ActionLog;
@@ -32,7 +31,7 @@ use futures::{
     FutureExt,
     channel::{mpsc, oneshot},
     future::Shared,
-    stream::{BoxStream, FuturesUnordered},
+    stream::FuturesUnordered,
 };
 use futures::{StreamExt, stream};
 use gpui::{
@@ -67,7 +66,6 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use util::path_list::PathList;
 use util::{ResultExt, debug_panic, markdown::MarkdownCodeBlock, paths::PathStyle};
 use uuid::Uuid;
 
@@ -315,13 +313,7 @@ impl UserMessage {
                     markdown.push_str(text);
                     markdown.push('\n');
                 }
-                UserMessageContent::Image(image) => {
-                    if let Some(uri) = &image.uri {
-                        let _ = writeln!(&mut markdown, "<image src=\"{}\" />", uri);
-                    } else {
-                        markdown.push_str("<image />\n");
-                    }
-                }
+                UserMessageContent::Image(image) => push_image_markdown(&mut markdown, image),
                 UserMessageContent::Mention { uri, content } => {
                     if !content.is_empty() {
                         let _ = writeln!(&mut markdown, "{}\n\n{}", uri.as_link(), content);
@@ -785,7 +777,7 @@ pub trait SubagentHandle {
     fn send(&self, message: String, cx: &AsyncApp) -> Task<Result<String>>;
 }
 
-pub trait ThreadEnvironment {
+pub trait ThreadEnvironment: ForkThreadEnvironment {
     fn create_terminal(
         &self,
         command: String,
@@ -802,34 +794,6 @@ pub trait ThreadEnvironment {
         model: Option<AgentModelId>,
         cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>>;
-
-    /// The project this thread works in, if the environment can provide it.
-    /// Used by the `request_verdict` tool to spawn external reviewer sessions
-    /// in the worker's project. Default: `None`.
-    fn project(&self, _cx: &App) -> Option<Entity<Project>> {
-        None
-    }
-
-    /// This thread's work directories, if the environment can provide them.
-    /// Passed to external reviewer sessions. Default: `None`.
-    fn work_dirs(&self, _cx: &App) -> Option<PathList> {
-        None
-    }
-
-    /// Creates a subagent for the `request_verdict` ping-pong (proposal 001),
-    /// pinned to `model_override` when given, else the configured
-    /// `verdict_model`. Environments that don't support verdict negotiations
-    /// reject the call.
-    fn create_verdict_subagent(
-        &self,
-        _label: String,
-        _model_override: Option<LanguageModelSelection>,
-        _cx: &mut App,
-    ) -> Result<Rc<dyn SubagentHandle>> {
-        Err(anyhow::anyhow!(
-            "Verdict subagents are not supported in this environment"
-        ))
-    }
 
     fn resume_subagent(
         &self,
@@ -862,28 +826,6 @@ pub trait ThreadEnvironment {
         Err(anyhow::anyhow!(
             "Listing available agents is not supported in this environment"
         ))
-    }
-
-    /// Lists live threads in this project that `send_message_to_thread` can reach.
-    fn list_threads(&self, cx: &mut App) -> Result<Vec<ThreadListing>> {
-        let _ = cx;
-        Err(anyhow::anyhow!(
-            "Listing threads is not supported in this environment"
-        ))
-    }
-
-    /// Delivers a message to another live thread: immediately when it is idle,
-    /// otherwise once its current turn ends.
-    fn send_message_to_thread(
-        &self,
-        request: ThreadMessageRequest,
-        cx: &mut AsyncApp,
-    ) -> Task<Result<ThreadMessageOutcome>> {
-        let _ = request;
-        let _ = cx;
-        Task::ready(Err(anyhow::anyhow!(
-            "Messaging other threads is not supported in this environment"
-        )))
     }
 }
 
@@ -2332,9 +2274,7 @@ impl Thread {
 
         if self.depth() < MAX_SUBAGENT_DEPTH {
             self.add_tool(SpawnAgentTool::new(environment.clone()));
-            if AgentSettings::get_global(cx).fork.verdict_ping_pong {
-                self.add_tool(RequestVerdictTool::new(environment.clone()));
-            }
+            self.add_verdict_tool(&environment, cx);
         }
 
         // Sibling-thread tools are exposed at every depth: a subagent should
@@ -2344,8 +2284,7 @@ impl Thread {
         // `Thread::enabled_tools`.
         self.add_tool(CreateThreadTool::new(environment.clone()));
         self.add_tool(ListAgentsAndModelsTool::new(environment.clone()));
-        self.add_tool(ListThreadsTool::new(environment.clone()));
-        self.add_tool(SendMessageTool::new(environment));
+        self.add_peer_thread_tools(environment);
     }
 
     pub fn add_tool<T: AgentTool>(&mut self, tool: T) {
@@ -2666,11 +2605,7 @@ impl Thread {
         cx: &mut Context<Self>,
     ) -> Result<mpsc::UnboundedReceiver<Result<ThreadEvent>>> {
         self.advance_prompt_id();
-        // A trailing Resume was never answered (the turn failed before any
-        // reply), so another one would only stack duplicate user turns.
-        if !matches!(self.messages.last().map(Arc::as_ref), Some(Message::Resume)) {
-            self.messages.push(Arc::new(Message::Resume));
-        }
+        self.push_resume_message();
         cx.notify();
 
         log::debug!("Total messages in thread: {}", self.messages.len());
@@ -3118,9 +3053,7 @@ impl Thread {
 
             log::debug!("Calling model.stream_completion, attempt {}", attempt);
 
-            let stream_idle_timeout_secs = this.read_with(cx, |_, cx| {
-                AgentSettings::get_global(cx).fork.stream_idle_timeout_secs
-            })?;
+            let stream_idle_timeout_secs = Self::stream_idle_timeout_secs(&this, cx)?;
 
             let events = match provider {
                 Ok(provider) => provider.stream_completion(&model, request, cx).await,
@@ -3137,14 +3070,8 @@ impl Thread {
             let mut had_refusal = false;
             loop {
                 // Race between getting the first event, tool completion, and cancellation.
-                // The idle timer guards against providers that accept the HTTP
-                // connection but then never deliver SSE events: without it,
-                // `events.next()` blocks forever and the thread wedges in
-                // `Generating` until the auto-prompt watchdog intervenes.
                 let mut stream_idle_timeout =
                     Self::stream_idle_timeout_future(stream_idle_timeout_secs, cx);
-                // Snapshot before the select: its tool branch mutably borrows
-                // `tool_results`, so the idle arm cannot read it directly.
                 let has_pending_tool_results = !tool_results.is_empty();
                 let first_event = futures::select_biased! {
                     _ = cancellation_rx.changed().fuse() => {
@@ -3155,24 +3082,17 @@ impl Thread {
                         continue;
                     }
                     event = events.next().fuse() => event,
-                    _ = stream_idle_timeout => {
-                        // A silent stream is legitimate while tool results are
-                        // still pending (the tool branch of this select fires
-                        // when they complete). Only treat the stream as dead
-                        // when there is nothing left to wait for.
-                        if !has_pending_tool_results {
-                            log::warn!(
-                                "No completion events for {}s with no pending tool results; \
-                                 treating the stream as dead and retrying (attempt {attempt})",
-                                stream_idle_timeout_secs
-                            );
-                            error = Some(StreamIdleTimeout::error(format!(
-                                "stream idle timeout: no events in {stream_idle_timeout_secs}s"
-                            )));
+                    _ = stream_idle_timeout => match StreamIdleTimeout::turn_error(
+                        has_pending_tool_results,
+                        stream_idle_timeout_secs,
+                        attempt,
+                    ) {
+                        Some(timeout_error) => {
+                            error = Some(timeout_error);
                             break;
                         }
-                        continue;
-                    }
+                        None => continue,
+                    },
                     tool_result = futures::StreamExt::select_next_some(&mut tool_results) => {
                         let (owning_message_ix, tool_result) = tool_result;
                         let is_error = tool_result.is_error;
@@ -3494,9 +3414,7 @@ impl Thread {
         }
 
         log::debug!("Running compaction");
-        let stream_idle_timeout_secs = this.read_with(cx, |_, cx| {
-            AgentSettings::get_global(cx).fork.stream_idle_timeout_secs
-        })?;
+        let stream_idle_timeout_secs = Self::stream_idle_timeout_secs(this, cx)?;
         let compaction_id = acp_thread::ContextCompactionId(Uuid::new_v4().to_string().into());
         event_stream.send_context_compaction(
             compaction_id.clone(),
@@ -3505,9 +3423,6 @@ impl Thread {
         let result: Result<ControlFlow<()>> = async {
             let provider =
                 cx.update(|cx| LanguageModelRegistry::read_global(cx).provider_for_model(&model))?;
-            // Created before the select because its request branch borrows `cx`;
-            // the timer guards the same provider failure mode as the main loop
-            // (connection accepted, then no events ever).
             let mut request_idle_timeout =
                 Self::stream_idle_timeout_future(stream_idle_timeout_secs, cx);
             let stream = futures::select_biased! {
@@ -3520,14 +3435,7 @@ impl Thread {
                 }
                 result = provider.stream_completion(&model, request, cx).fuse() => result,
                 _ = request_idle_timeout => {
-                    log::warn!(
-                        "Compaction stream request idle for {stream_idle_timeout_secs}s; \
-                         treating the stream as dead"
-                    );
-                    return Err(StreamIdleTimeout::error(format!(
-                        "stream idle timeout: no response in {stream_idle_timeout_secs}s"
-                    ))
-                    .into());
+                    return Err(StreamIdleTimeout::compaction_no_reply(stream_idle_timeout_secs));
                 }
             };
             let mut stream = stream?;
@@ -3546,14 +3454,7 @@ impl Thread {
                     }
                     event = stream.next().fuse() => event,
                     _ = event_idle_timeout => {
-                        log::warn!(
-                            "Compaction stream idle for {stream_idle_timeout_secs}s; \
-                             treating the stream as dead"
-                        );
-                        return Err(StreamIdleTimeout::error(format!(
-                            "stream idle timeout: no events in {stream_idle_timeout_secs}s"
-                        ))
-                        .into());
+                        return Err(StreamIdleTimeout::compaction_stalled(stream_idle_timeout_secs));
                     }
                 };
 
@@ -4991,18 +4892,7 @@ impl Thread {
             DataRetentionConsentRequired { .. } => None,
             // Retrying won't help until the thread picks another model.
             ModelUnavailable { .. } => None,
-            // A stream that goes silent past the idle timeout is a transient
-            // provider hang. The manual retry button reliably recovers these
-            // once the provider recovers, so keep the turn alive with a longer
-            // automatic budget (4 retries × 30s, on top of each attempt's own
-            // idle-timeout wait) instead of surfacing the error and waiting
-            // for the user to click retry.
-            Other(error) if error.downcast_ref::<StreamIdleTimeout>().is_some() => {
-                Some(RetryStrategy::FixedDelay {
-                    delay: STREAM_IDLE_RETRY_DELAY,
-                    max_attempts: MAX_RETRY_ATTEMPTS,
-                })
-            }
+            Other(error) if StreamIdleTimeout::is(error) => Some(STREAM_IDLE_RETRY_STRATEGY),
             // `Other` includes mid-stream mapping failures that can be caused by
             // a transient malformed or interrupted provider event.
             Other(..) => Some(RetryStrategy::FixedDelay {
@@ -6453,12 +6343,7 @@ impl ToolCallEventStream {
 
         let stream = self.stream.clone();
         let tool_call_id = self.tool_call_id.clone();
-        // Acknowledging records the thread-scoped flag so later commands in
-        // this thread skip the re-prompt.
-        let sandbox_grants = self.sandbox_grants.clone();
-        // For persisting the thread-scoped acknowledgment so it survives a
-        // reopen (same pattern as the other "for this thread" grants).
-        let thread = self.thread.clone();
+        let acknowledge = self.windows_fs_warning_acknowledger();
         cx.spawn(async move |cx| {
             let (response_tx, response_rx) = oneshot::channel();
             if let Err(error) =
@@ -6486,11 +6371,7 @@ impl ToolCallEventStream {
                 .map_err(|_| anyhow!("authorization channel closed"))?;
             ensure_tool_call_authorization_not_interrupted(&outcome)?;
             match acp_thread::SandboxPermission::from_id(outcome.option_id.0.as_ref()) {
-                Some(acp_thread::SandboxPermission::AllowOnce) => {
-                    sandbox_grants.borrow_mut().record_windows_fs_warning_ack();
-                    Self::persist_thread_grants(&thread, cx);
-                    Ok(())
-                }
+                Some(acp_thread::SandboxPermission::AllowOnce) => acknowledge(cx),
                 _ => Err(anyhow!("Windows-drive write aborted by user")),
             }
         })
@@ -7318,13 +7199,7 @@ impl From<UserMessageContent> for acp_v2::ContentBlock {
     fn from(content: UserMessageContent) -> Self {
         match content {
             UserMessageContent::Text(text) => text.into(),
-            UserMessageContent::Image(image) => {
-                let mut content = acp_v2::ImageContent::new(image.source, "image/png");
-                if let Some(uri) = image.uri {
-                    content = content.uri(uri);
-                }
-                acp_v2::ContentBlock::Image(content)
-            }
+            UserMessageContent::Image(image) => image_content_block(image),
             UserMessageContent::Mention { uri, content } => {
                 acp_v2::ContentBlock::Resource(acp_v2::EmbeddedResource::new(
                     acp_v2::EmbeddedResourceResource::TextResourceContents(

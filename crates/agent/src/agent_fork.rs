@@ -3,6 +3,7 @@
 //! sees the private types and fields it extends.
 
 use super::*;
+use agent_settings::{AgentSettings, claude_md_symlink};
 
 static AGENTS_MD_REL_PATH: LazyLock<Option<Arc<RelPath>>> = LazyLock::new(|| {
     RelPath::from_unix_str(claude_md_symlink::AGENTS_MD)
@@ -17,6 +18,30 @@ static CLAUDE_MD_REL_PATH: LazyLock<Option<Arc<RelPath>>> = LazyLock::new(|| {
 });
 
 impl NativeAgent {
+    pub(crate) async fn await_project_claude_md_link(
+        worktree: &Entity<Worktree>,
+        project: &Entity<Project>,
+        cx: &AsyncApp,
+    ) {
+        if let Some(link_task) = cx.update(|cx| Self::link_project_claude_md(worktree, project, cx))
+        {
+            link_task.await;
+        }
+    }
+
+    /// `thread.summary()` returns `None` when no summarization model is
+    /// available or streaming fails. In that case `thread_summary` falls back
+    /// to an empty summary rather than propagating an error: the caller
+    /// (thread mention) keeps the `@thread` link in the editor as a reference
+    /// even without expanded summary text.
+    pub(crate) fn empty_thread_summary(session_id: &acp_v2::SessionId) -> SharedString {
+        log::warn!(
+            "thread.summary returned None for session {session_id}; \
+             falling back to empty summary"
+        );
+        SharedString::default()
+    }
+
     /// Symlinks `CLAUDE.md` onto this worktree's `AGENTS.md`, so Claude Code
     /// reads the same project instructions the native agent does.
     ///
@@ -182,6 +207,30 @@ impl NativeThreadEnvironment {
 }
 
 impl NativeSubagentHandle {
+    /// Retrying a subagent interrupts its current native execution, which
+    /// resolves as `Cancelled`. Reporting that to the parent as "User
+    /// canceled" makes it give up prematurely, so follow the retry.
+    pub(crate) async fn follow_retried_executions(
+        mut response: Result<acp_v2::StopReason>,
+        acp_thread: &Entity<AcpThread>,
+        subagent_session_id: &acp_v2::SessionId,
+        cx: &AsyncApp,
+    ) -> Result<acp_v2::StopReason> {
+        while matches!(response, Ok(acp_v2::StopReason::Cancelled)) {
+            let successor = cx.update(|cx| {
+                Self::running_successor_execution(acp_thread, subagent_session_id, cx)
+            });
+            let Some(successor) = successor else {
+                break;
+            };
+            response = match successor.await {
+                Ok(result) => result.map_err(|error| anyhow!("{error:#}")),
+                Err(_) => Err(anyhow!("Subagent execution was dropped")),
+            };
+        }
+        response
+    }
+
     /// Returns the completion of a still-running native execution for the
     /// subagent session, i.e. a retry that replaced the execution whose
     /// completion already resolved. `None` means nothing replaced it, so the
@@ -269,5 +318,38 @@ impl NativeThreadEnvironment {
         );
 
         self.prompt_subagent(session_id, subagent_thread, acp_thread)
+    }
+}
+
+impl ForkThreadEnvironment for NativeThreadEnvironment {
+    fn create_verdict_subagent(
+        &self,
+        label: String,
+        model_override: Option<LanguageModelSelection>,
+        cx: &mut App,
+    ) -> Result<Rc<dyn SubagentHandle>> {
+        self.create_verdict_subagent_thread(label, model_override, cx)
+    }
+
+    fn project(&self, cx: &App) -> Option<Entity<Project>> {
+        Some(self.thread.upgrade()?.read(cx).project().clone())
+    }
+
+    fn work_dirs(&self, cx: &App) -> Option<PathList> {
+        // The native Thread itself doesn't carry work dirs; the parent's ACP
+        // wrapper (held by this environment) does — set at register_session.
+        self.acp_thread.upgrade()?.read(cx).work_dirs().cloned()
+    }
+
+    fn list_threads(&self, cx: &mut App) -> Result<Vec<ThreadListing>> {
+        self.list_peer_threads(cx)
+    }
+
+    fn send_message_to_thread(
+        &self,
+        request: ThreadMessageRequest,
+        cx: &mut AsyncApp,
+    ) -> Task<Result<ThreadMessageOutcome>> {
+        self.send_peer_message(request, cx)
     }
 }

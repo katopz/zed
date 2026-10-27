@@ -4,6 +4,10 @@
 use super::*;
 use pretty_assertions::assert_eq;
 
+impl crate::ForkThreadEnvironment for FakeThreadEnvironment {}
+
+impl crate::ForkThreadEnvironment for MultiTerminalEnvironment {}
+
 #[gpui::test]
 pub(super) async fn test_repeated_resume_after_failure_does_not_stack(cx: &mut TestAppContext) {
     let ThreadTest {
