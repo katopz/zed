@@ -3,13 +3,13 @@
 
 use crate::journal::{JournalStore, coalesce_chunks};
 use crate::types::{
-    BackendSpec, ClientId, DaemonStatus, DetachedPolicy, HubEvent, HubOutput, SessionRecord,
-    SessionStatus,
+    BackendSpec, ClientId, DaemonStatus, DetachedPolicy, GcReport, HubEvent, HubOutput,
+    RetentionPolicy, SessionRecord, SessionStatus,
 };
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 const METHOD_NOT_FOUND: i64 = -32601;
 const INTERNAL_ERROR: i64 = -32603;
@@ -176,6 +176,85 @@ impl<J: JournalStore> Hub<J> {
                 .collect(),
             sessions,
         }
+    }
+
+    /// Evicts idle sessions past the age cap, then the oldest idle sessions
+    /// until the update logs fit the size cap. Sessions that are live, attached,
+    /// queued or referenced by an in-flight request are never touched.
+    pub fn gc(&mut self, policy: RetentionPolicy, now: SystemTime) -> GcReport {
+        let max_age = Duration::from_secs(policy.max_age_days.saturating_mul(24 * 60 * 60));
+        let mut report = GcReport::default();
+        let mut candidates = Vec::new();
+        for (session_id, session) in &self.sessions {
+            let bytes = match self.journal.log_bytes(session_id) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    eprintln!("agentd: gc sizing {session_id}: {error:#}");
+                    0
+                }
+            };
+            report.kept_bytes += bytes;
+            if self.is_idle(session_id, session) {
+                let updated_at = chrono::DateTime::parse_from_rfc3339(&session.record.updated_at)
+                    .map(SystemTime::from)
+                    .unwrap_or(SystemTime::UNIX_EPOCH);
+                candidates.push((updated_at, session_id.clone(), bytes));
+            }
+        }
+        candidates.sort();
+
+        for (updated_at, session_id, bytes) in candidates {
+            let expired = now.duration_since(updated_at).unwrap_or_default() > max_age;
+            if !expired && report.kept_bytes <= policy.max_total_bytes {
+                // Oldest first, so every later candidate is newer and also kept.
+                break;
+            }
+            if let Err(error) = self.journal.remove_session(&session_id) {
+                eprintln!("agentd: gc removing {session_id}: {error:#}");
+                continue;
+            }
+            self.sessions.remove(&session_id);
+            report.kept_bytes -= bytes;
+            report.freed_bytes += bytes;
+            report.removed_sessions.push(session_id);
+        }
+        report.kept_sessions = self.sessions.len();
+        report
+    }
+
+    fn is_idle(&self, session_id: &str, session: &SessionState) -> bool {
+        if self.is_live(session)
+            || session.restoring
+            || !session.attached.is_empty()
+            || !session.queued.is_empty()
+        {
+            return false;
+        }
+        let in_flight = self.backends.values().any(|backend| {
+            backend.pending.values().any(|pending| match pending {
+                PendingRequest::Client {
+                    kind:
+                        RequestKind::LoadSession {
+                            session_id: pending_id,
+                        }
+                        | RequestKind::RestoreSession {
+                            session_id: pending_id,
+                        }
+                        | RequestKind::Prompt {
+                            session_id: pending_id,
+                        },
+                    ..
+                } => pending_id == session_id,
+                _ => false,
+            })
+        });
+        let forwarded = self.clients.values().any(|client| {
+            client
+                .forwarded
+                .values()
+                .any(|request| request.session_id.as_deref() == Some(session_id))
+        });
+        !in_flight && !forwarded
     }
 
     fn is_current(&self, backend_key: &str, generation: u64) -> bool {
@@ -1278,6 +1357,103 @@ mod tests {
         });
         assert!(done.is_empty(), "restore result is internal");
         assert!(hub.status().sessions[0].live);
+    }
+
+    fn journaled(sessions: &[(&str, &str, usize)]) -> MemoryJournal {
+        let mut journal = MemoryJournal::default();
+        for (session_id, updated_at, updates) in sessions {
+            journal
+                .write_record(&SessionRecord {
+                    session_id: session_id.to_string(),
+                    backend_key: spec().key(),
+                    cwd: "/work".into(),
+                    title: None,
+                    created_at: updated_at.to_string(),
+                    updated_at: updated_at.to_string(),
+                    setup: json!({}),
+                })
+                .ok();
+            for index in 0..*updates {
+                journal.append_update(session_id, &json!({"n": index})).ok();
+            }
+        }
+        journal
+    }
+
+    fn at(rfc3339: &str) -> SystemTime {
+        chrono::DateTime::parse_from_rfc3339(rfc3339)
+            .map(SystemTime::from)
+            .unwrap_or(SystemTime::UNIX_EPOCH)
+    }
+
+    fn session_ids(hub: &Hub<MemoryJournal>) -> Vec<String> {
+        let mut ids: Vec<String> = hub.sessions.keys().cloned().collect();
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn gc_evicts_idle_sessions_past_the_age_cap() {
+        let mut hub = Hub::new(journaled(&[
+            ("old", "2026-01-01T00:00:00Z", 3),
+            ("recent", "2026-03-25T00:00:00Z", 3),
+        ]));
+        let policy = RetentionPolicy {
+            max_age_days: 30,
+            max_total_bytes: u64::MAX,
+        };
+        let report = hub.gc(policy, at("2026-04-01T00:00:00Z"));
+        assert_eq!(report.removed_sessions, vec!["old".to_string()]);
+        assert!(report.freed_bytes > 0);
+        assert_eq!(report.kept_sessions, 1);
+        assert_eq!(session_ids(&hub), vec!["recent".to_string()]);
+        assert!(!hub.journal.records.contains_key("old"));
+        assert!(!hub.journal.logs.contains_key("old"));
+    }
+
+    #[test]
+    fn gc_evicts_oldest_idle_sessions_until_logs_fit_the_size_cap() {
+        let mut hub = Hub::new(journaled(&[
+            ("a", "2026-03-01T00:00:00Z", 10),
+            ("b", "2026-03-02T00:00:00Z", 10),
+            ("c", "2026-03-03T00:00:00Z", 10),
+        ]));
+        let per_session = hub.journal.log_bytes("a").unwrap_or_default();
+        let policy = RetentionPolicy {
+            max_age_days: 365,
+            max_total_bytes: per_session * 2,
+        };
+        let report = hub.gc(policy, at("2026-03-04T00:00:00Z"));
+        assert_eq!(report.removed_sessions, vec!["a".to_string()]);
+        assert_eq!(report.kept_bytes, per_session * 2);
+        assert_eq!(session_ids(&hub), vec!["b".to_string(), "c".to_string()]);
+    }
+
+    #[test]
+    fn gc_never_evicts_live_or_attached_sessions() {
+        let mut hub = Hub::new(MemoryJournal::default());
+        connect(&mut hub, GUI, DetachedPolicy::Wait);
+        let session_id = start_session(&mut hub, GUI);
+        let expire_everything = RetentionPolicy {
+            max_age_days: 0,
+            max_total_bytes: 0,
+        };
+        let far_future = at("2100-01-01T00:00:00Z");
+        assert!(
+            hub.gc(expire_everything, far_future)
+                .removed_sessions
+                .is_empty()
+        );
+
+        // Backend gone and GUI detached: the session is now journal-only and idle.
+        hub.handle(HubEvent::BackendExited {
+            backend_key: spec().key(),
+            generation: 1,
+        });
+        hub.handle(HubEvent::ClientDisconnected { client: GUI });
+        let report = hub.gc(expire_everything, far_future);
+        assert_eq!(report.removed_sessions, vec![session_id]);
+        assert!(hub.status().sessions.is_empty());
     }
 
     #[test]

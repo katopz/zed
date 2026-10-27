@@ -52,6 +52,37 @@ pub enum Handshake {
     },
     Status,
     Stop,
+    Gc {
+        #[serde(default)]
+        policy: RetentionPolicy,
+    },
+}
+
+/// Journal retention. Only idle sessions are ever evicted: not live in a
+/// backend, no client attached, nothing queued or in flight.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetentionPolicy {
+    /// Evict idle sessions not updated for this many days.
+    pub max_age_days: u64,
+    /// Then evict the oldest idle sessions until the update logs fit.
+    pub max_total_bytes: u64,
+}
+
+impl Default for RetentionPolicy {
+    fn default() -> Self {
+        Self {
+            max_age_days: 30,
+            max_total_bytes: 1024 * 1024 * 1024,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GcReport {
+    pub removed_sessions: Vec<String>,
+    pub freed_bytes: u64,
+    pub kept_sessions: usize,
+    pub kept_bytes: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

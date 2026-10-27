@@ -1,6 +1,8 @@
 use crate::hub::Hub;
 use crate::journal::FileJournal;
-use crate::types::{BackendSpec, ClientId, Handshake, HandshakeEnvelope, HubEvent, HubOutput};
+use crate::types::{
+    BackendSpec, ClientId, Handshake, HandshakeEnvelope, HubEvent, HubOutput, RetentionPolicy,
+};
 use anyhow::{Context as _, Result};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -11,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
+use std::time::SystemTime;
 
 /// On-disk layout. `ZED_AGENTD_HOME` overrides the default so tests and
 /// multiple daemons can coexist.
@@ -74,7 +77,16 @@ pub fn serve(paths: &Paths) -> Result<()> {
         let events = events.clone();
         move || accept_loop(listener, events)
     });
-    let hub = Hub::new(FileJournal::new(paths.sessions())?);
+    let mut hub = Hub::new(FileJournal::new(paths.sessions())?);
+    // Nothing is live yet, so every session past the default caps is idle.
+    let report = hub.gc(RetentionPolicy::default(), SystemTime::now());
+    if !report.removed_sessions.is_empty() {
+        eprintln!(
+            "agentd: gc removed {} sessions ({} bytes)",
+            report.removed_sessions.len(),
+            report.freed_bytes
+        );
+    }
     run_hub(hub, events, inbox, paths.log());
     if let Err(error) = fs::remove_file(&socket) {
         eprintln!("agentd: removing socket: {error}");
@@ -206,6 +218,15 @@ fn run_hub(
                             writer.send(status).ok();
                         }
                         Err(error) => eprintln!("agentd: status serialize failed: {error}"),
+                    }
+                    continue;
+                }
+                Handshake::Gc { policy } => {
+                    match serde_json::to_value(hub.gc(policy, SystemTime::now())) {
+                        Ok(report) => {
+                            writer.send(report).ok();
+                        }
+                        Err(error) => eprintln!("agentd: gc report serialize failed: {error}"),
                     }
                     continue;
                 }

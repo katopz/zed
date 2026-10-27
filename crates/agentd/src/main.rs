@@ -1,6 +1,6 @@
 use agentd::attach::{attach, query};
 use agentd::daemon::{Paths, serve};
-use agentd::types::{BackendSpec, DetachedPolicy, Handshake};
+use agentd::types::{BackendSpec, DetachedPolicy, Handshake, RetentionPolicy};
 use anyhow::{Context as _, Result, bail};
 use std::collections::BTreeMap;
 
@@ -12,6 +12,10 @@ USAGE:
   zed-agentd serve     run the daemon in the foreground (attach starts it automatically)
   zed-agentd status    print sessions as JSON
   zed-agentd stop      stop the daemon (running agents are terminated)
+  zed-agentd gc [--max-age-days N] [--max-total-mb N]
+                       remove idle sessions older than N days (default 30), then the
+                       oldest idle ones until update logs fit N MiB (default 1024);
+                       the daemon also runs this with the defaults when it starts
 
 State lives in $ZED_AGENTD_HOME (default ~/.local/share/zed-agentd).";
 
@@ -32,6 +36,10 @@ fn run() -> Result<()> {
             print!("{}", query(&paths, Handshake::Status)?);
             Ok(())
         }
+        Some("gc") => {
+            print!("{}", query(&paths, parse_gc(args.collect())?)?);
+            Ok(())
+        }
         Some("stop") => {
             print!("{}", query(&paths, Handshake::Stop)?);
             Ok(())
@@ -41,6 +49,25 @@ fn run() -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn parse_gc(args: Vec<String>) -> Result<Handshake> {
+    let mut policy = RetentionPolicy::default();
+    let mut rest = args.into_iter();
+    while let Some(arg) = rest.next() {
+        let value = rest
+            .next()
+            .with_context(|| format!("{arg} needs a number"))?;
+        let number: u64 = value
+            .parse()
+            .with_context(|| format!("{arg} needs a number, got {value:?}"))?;
+        match arg.as_str() {
+            "--max-age-days" => policy.max_age_days = number,
+            "--max-total-mb" => policy.max_total_bytes = number.saturating_mul(1024 * 1024),
+            other => bail!("unexpected argument {other:?}\n\n{USAGE}"),
+        }
+    }
+    Ok(Handshake::Gc { policy })
 }
 
 fn parse_attach(args: Vec<String>) -> Result<Handshake> {

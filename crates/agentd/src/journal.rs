@@ -12,6 +12,9 @@ pub trait JournalStore {
     fn write_record(&mut self, record: &SessionRecord) -> Result<()>;
     fn append_update(&mut self, session_id: &str, update: &Value) -> Result<()>;
     fn updates(&self, session_id: &str) -> Result<Vec<Value>>;
+    /// Size of the session's update log, the part that grows per token.
+    fn log_bytes(&self, session_id: &str) -> Result<u64>;
+    fn remove_session(&mut self, session_id: &str) -> Result<()>;
 }
 
 /// Bounds the descriptors a long-lived daemon holds for append handles.
@@ -124,6 +127,31 @@ impl JournalStore for FileJournal {
         }
         Ok(updates)
     }
+
+    fn log_bytes(&self, session_id: &str) -> Result<u64> {
+        match fs::metadata(self.log_path(session_id)) {
+            Ok(metadata) => Ok(metadata.len()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn remove_session(&mut self, session_id: &str) -> Result<()> {
+        // A cached append handle would keep writing into the unlinked inode.
+        self.open_logs.remove(session_id);
+        // Log before record: a crash in between leaves a record with an empty
+        // history, which the next gc still sees and removes, never an orphan log.
+        for path in [self.log_path(session_id), self.record_path(session_id)] {
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| format!("removing {}", path.display()));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Default)]
@@ -153,6 +181,23 @@ impl JournalStore for MemoryJournal {
 
     fn updates(&self, session_id: &str) -> Result<Vec<Value>> {
         Ok(self.logs.get(session_id).cloned().unwrap_or_default())
+    }
+
+    fn log_bytes(&self, session_id: &str) -> Result<u64> {
+        let Some(updates) = self.logs.get(session_id) else {
+            return Ok(0);
+        };
+        let mut bytes = 0;
+        for update in updates {
+            bytes += serde_json::to_vec(update)?.len() as u64 + 1;
+        }
+        Ok(bytes)
+    }
+
+    fn remove_session(&mut self, session_id: &str) -> Result<()> {
+        self.records.remove(session_id);
+        self.logs.remove(session_id);
+        Ok(())
     }
 }
 
@@ -230,6 +275,25 @@ mod tests {
 
         assert_eq!(journal.load_records()?, vec![record]);
         assert_eq!(journal.updates("sess/1")?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn file_journal_remove_session_drops_cached_handle() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut journal = FileJournal::new(dir.path().to_path_buf())?;
+        journal.append_update("s", &json!({"n": 0}))?;
+        assert!(journal.log_bytes("s")? > 0);
+        assert!(journal.open_logs.contains_key("s"));
+
+        journal.remove_session("s")?;
+        assert!(!journal.open_logs.contains_key("s"));
+        assert_eq!(journal.log_bytes("s")?, 0);
+
+        // A later append must land in a fresh, visible file.
+        journal.append_update("s", &json!({"n": 1}))?;
+        assert_eq!(journal.updates("s")?, vec![json!({"n": 1})]);
+        journal.remove_session("missing")?;
         Ok(())
     }
 
