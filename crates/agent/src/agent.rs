@@ -1,4 +1,6 @@
 mod agent_fork;
+mod thread_mailbox;
+
 mod db;
 mod legacy_thread;
 mod native_agent_server;
@@ -9,7 +11,6 @@ mod templates;
 #[cfg(test)]
 mod tests;
 mod thread;
-mod thread_mailbox;
 mod thread_store;
 mod tool_permissions;
 mod tools;

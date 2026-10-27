@@ -1,3 +1,6 @@
+mod fork;
+pub(crate) use fork::*;
+
 use crate::{
     ApplyCodeActionTool, AskUserTool, CodeActionStore, ContextServerRegistry, CopyPathTool,
     CreateDirectoryTool, CreateThreadTool, DbLanguageModel, DbThread, DeletePathTool,
@@ -168,9 +171,6 @@ impl std::fmt::Display for PromptId {
 
 pub(crate) const MAX_RETRY_ATTEMPTS: u8 = 4;
 pub(crate) const BASE_RETRY_DELAY: Duration = Duration::from_secs(5);
-
-mod fork;
-pub(crate) use fork::*;
 
 #[derive(Debug, Clone, PartialEq)]
 enum RetryStrategy {

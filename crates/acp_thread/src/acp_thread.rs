@@ -1,3 +1,6 @@
+mod fork;
+pub mod verdict;
+
 pub mod auth_methods;
 pub mod commands;
 pub mod compaction;
@@ -6,14 +9,12 @@ mod connection;
 pub mod content;
 mod diff;
 pub mod elicitation;
-mod fork;
 mod mention;
 pub mod notices;
 pub mod prompt_capabilities;
 pub mod subagents;
 mod submission;
 mod terminal;
-pub mod verdict;
 pub use ::terminal::HeadlessTerminal;
 use action_log::{ActionLog, ActionLogTelemetry};
 use agent_client_protocol::schema::{MaybeUndefined, v1 as acp_v1, v2 as acp_v2};
