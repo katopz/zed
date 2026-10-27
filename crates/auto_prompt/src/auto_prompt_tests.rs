@@ -1,6 +1,7 @@
 use super::*;
 use crate::lightweight_context::is_actionable_checkbox;
 use language_model::LanguageModelCompletionEvent;
+use std::time::Duration;
 
 /// Minimal LlmCallData for pure state-machine tests (plan 023 F1). The
 /// overflow and clarify machines never call the model; the slot just
