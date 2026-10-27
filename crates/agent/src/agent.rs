@@ -3670,63 +3670,6 @@ impl NativeThreadEnvironment {
         self.create_subagent_thread_inner(label, model, cx)
     }
 
-    fn create_subagent_thread_inner(
-        &self,
-        label: String,
-        model: Option<LanguageModelSelection>,
-        cx: &mut App,
-    ) -> Result<Rc<dyn SubagentHandle>> {
-        let Some(parent_thread_entity) = self.thread.upgrade() else {
-            anyhow::bail!("Parent thread no longer exists".to_string());
-        };
-        let parent_thread = parent_thread_entity.read(cx);
-        let current_depth = parent_thread.depth();
-        let parent_session_id = parent_thread.id().clone();
-
-        if current_depth >= MAX_SUBAGENT_DEPTH {
-            return Err(anyhow!(
-                "Maximum subagent depth ({}) reached",
-                MAX_SUBAGENT_DEPTH
-            ));
-        }
-
-        let subagent_thread: Entity<Thread> = cx.new(|cx| {
-            let mut thread = Thread::new_subagent(&parent_thread_entity, model.as_ref(), cx);
-            thread.set_title(label.into(), cx);
-            thread
-        });
-
-        let session_id = subagent_thread.read(cx).id().clone();
-
-        let acp_thread = self
-            .agent
-            .update(cx, |agent, cx| -> Result<Entity<AcpThread>> {
-                let project_id = agent
-                    .sessions
-                    .get(&parent_session_id)
-                    .map(|s| s.project_id)
-                    .context("parent session not found")?;
-                Ok(agent.register_session(subagent_thread.clone(), project_id, None, cx))
-            })??;
-        self.acp_thread
-            .update(cx, |parent, cx| {
-                parent.register_subagent(acp_thread.clone(), cx)
-            })
-            .context("Parent thread no longer exists")?;
-
-        let depth = current_depth + 1;
-
-        telemetry::event!(
-            "Subagent Started",
-            session = parent_thread_entity.read(cx).id().to_string(),
-            subagent_session = session_id.to_string(),
-            depth,
-            is_resumed = false,
-        );
-
-        self.prompt_subagent(session_id, subagent_thread, acp_thread)
-    }
-
     pub(crate) fn resume_subagent_thread(
         &self,
         session_id: acp_v2::SessionId,

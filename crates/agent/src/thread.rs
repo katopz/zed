@@ -6631,15 +6631,6 @@ impl ToolCallEventStream {
         self.sandbox_grants.borrow().fallback_granted_for_thread()
     }
 
-    /// Whether the user already acknowledged the Windows-drive (DrvFs)
-    /// sandbox-integrity warning for this thread; when true the terminal tool
-    /// skips the re-prompt for later commands in the thread.
-    pub(crate) fn windows_fs_warning_acknowledged(&self) -> bool {
-        self.sandbox_grants
-            .borrow()
-            .windows_fs_warning_acknowledged()
-    }
-
     /// Whether the user approved a model-requested `unsandboxed: true` escape
     /// for the rest of this thread. Like the fallback grant, this makes every
     /// command in the thread run without a sandbox.
@@ -7342,13 +7333,6 @@ impl From<UserMessageContent> for acp_v2::ContentBlock {
                 ))
             }
         }
-    }
-}
-
-fn convert_image(image_content: acp_v2::ImageContent) -> LanguageModelImage {
-    LanguageModelImage {
-        source: image_content.data.into(),
-        uri: image_content.uri,
     }
 }
 

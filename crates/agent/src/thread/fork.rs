@@ -173,3 +173,21 @@ pub(crate) async fn stream_completion_with_retry(
         }
     }
 }
+
+pub(super) fn convert_image(image_content: acp_v2::ImageContent) -> LanguageModelImage {
+    LanguageModelImage {
+        source: image_content.data.into(),
+        uri: image_content.uri,
+    }
+}
+
+impl ToolCallEventStream {
+    /// Whether the user already acknowledged the Windows-drive (DrvFs)
+    /// sandbox-integrity warning for this thread; when true the terminal tool
+    /// skips the re-prompt for later commands in the thread.
+    pub(crate) fn windows_fs_warning_acknowledged(&self) -> bool {
+        self.sandbox_grants
+            .borrow()
+            .windows_fs_warning_acknowledged()
+    }
+}

@@ -203,14 +203,33 @@ if moved_top or moved_methods:
         use_visibility = "pub(crate) "
     else:
         use_visibility = ""
-    seam = ["", f"mod {module};"]
-    if signatures:
+    # Re-runs append to an existing split, so only add the seam lines missing.
+    seam = []
+    if f"mod {module};" not in kept:
+        seam += ["", f"mod {module};"]
+    if signatures and not any(re.fullmatch(rf"(pub(\([^)]*\))? )?use {module}::\*;", line) for line in kept):
         seam.append(f"{use_visibility}use {module}::*;")
     kept[last_use_end + 1:last_use_end + 1] = seam
 open(path, "w").write("\n".join(kept))
 
 parent = os.path.basename(path)[:-3]
-out_dir = os.path.join(os.path.dirname(path), parent)
+
+
+def is_crate_root(file_path):
+    """Crate roots (lib.rs/main.rs/a `[lib] path`) and mod.rs keep child modules beside them."""
+    if parent in ("lib", "main", "mod"):
+        return True
+    directory = os.path.dirname(os.path.abspath(file_path))
+    while directory != os.path.dirname(directory):
+        manifest = os.path.join(directory, "Cargo.toml")
+        if os.path.exists(manifest):
+            relative = os.path.relpath(os.path.abspath(file_path), directory)
+            return re.search(rf'^path\s*=\s*"{re.escape(relative)}"', open(manifest).read(), re.M) is not None
+        directory = os.path.dirname(directory)
+    return False
+
+
+out_dir = os.path.dirname(path) if is_crate_root(path) else os.path.join(os.path.dirname(path), parent)
 os.makedirs(out_dir, exist_ok=True)
 for name, body in moved_mods:
     dedented = [line[4:] if line.startswith("    ") else line for line in body]
@@ -238,7 +257,11 @@ for header, blocks in moved_methods.items():
         out.extend(block)
     out.append("}")
     out.append("")
-open(os.path.join(out_dir, f"{module}.rs"), "w").write("\n".join(out).rstrip("\n") + "\n")
+out_path = os.path.join(out_dir, f"{module}.rs")
+if os.path.exists(out_path):
+    existing = open(out_path).read().rstrip("\n")
+    out = [existing, ""] + out[out.index("use super::*;") + 2:]
+open(out_path, "w").write("\n".join(out).rstrip("\n") + "\n")
 print(
     f"moved {len(moved_top)} top-level items and "
     f"{sum(len(b) for b in moved_methods.values())} methods into {out_dir}/{module}.rs"

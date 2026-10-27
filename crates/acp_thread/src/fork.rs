@@ -203,3 +203,20 @@ fn tool_call_bloat_label(tool_call: &ToolCall) -> String {
         format!("{name}: {truncated}…")
     }
 }
+
+impl AcpThread {
+    pub fn has_tool_calls(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| matches!(entry, AgentThreadEntry::ToolCall(..)))
+    }
+
+    /// Lets auto_prompt back off instead of cycling when tool calls fail mid-turn.
+    pub(super) fn mark_error_if_tool_call_failed(&mut self, index: usize) {
+        if let Some(AgentThreadEntry::ToolCall(call)) = self.entries.get(index)
+            && matches!(call.status(), ToolCallStatus::Failed)
+        {
+            self.had_error = true;
+        }
+    }
+}

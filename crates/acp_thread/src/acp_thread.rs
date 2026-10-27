@@ -4743,12 +4743,6 @@ impl AcpThread {
         false
     }
 
-    pub fn has_tool_calls(&self) -> bool {
-        self.entries
-            .iter()
-            .any(|entry| matches!(entry, AgentThreadEntry::ToolCall(..)))
-    }
-
     pub fn handle_session_update(
         &mut self,
         update: acp_v1::SessionUpdate,
@@ -6009,15 +6003,6 @@ impl AcpThread {
         self.push_entry(AgentThreadEntry::ToolCall(failed_tool_call), cx);
         self.had_error = true;
         Ok(None)
-    }
-
-    /// Lets auto_prompt back off instead of cycling when tool calls fail mid-turn.
-    fn mark_error_if_tool_call_failed(&mut self, index: usize) {
-        if let Some(AgentThreadEntry::ToolCall(call)) = self.entries.get(index)
-            && matches!(call.status(), ToolCallStatus::Failed)
-        {
-            self.had_error = true;
-        }
     }
 
     fn update_tool_call_content(
