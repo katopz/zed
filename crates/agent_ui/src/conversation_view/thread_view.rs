@@ -2395,8 +2395,7 @@ impl ThreadView {
         // Bump the watchdog activity counter immediately on send — the
         // async task below may take time to resolve contents, and we don't
         // want a stale watchdog to fire during that gap.
-        let next_gen = self.fork.watchdog_activity_gen.get().wrapping_add(1);
-        self.fork.watchdog_activity_gen.set(next_gen);
+        self.fork.bump_watchdog_activity();
 
         // Cancel any running auto_prompt task — user input takes priority.
         if self.fork._auto_prompt_task.is_some() {

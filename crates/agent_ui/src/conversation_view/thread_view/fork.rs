@@ -514,6 +514,11 @@ pub struct ForkThreadViewState {
 }
 
 impl ForkThreadViewState {
+    pub fn bump_watchdog_activity(&self) {
+        self.watchdog_activity_gen
+            .set(self.watchdog_activity_gen.get().wrapping_add(1));
+    }
+
     pub(super) fn new(auto_prompt_enabled: bool) -> Self {
         Self {
             auto_prompt_enabled,

@@ -117,6 +117,9 @@ mod thread_view;
 pub use message_queue::*;
 pub use thread_view::*;
 
+mod fork;
+use fork::*;
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum ThreadFeedback {
     Positive,
@@ -691,135 +694,6 @@ impl Conversation {
         cx.notify();
     }
 
-    /// Starts a per-request countdown that auto-allows this tool call once
-    /// `agent.auto_allow_permissions_after_seconds` elapses. No-op when the
-    /// setting is disabled (the default) or the setting type isn't registered
-    /// (e.g. in tests that never configure it). Only legacy tool-call
-    /// permission requests are eligible; generic requests stay with the user.
-    fn schedule_auto_allow(
-        &mut self,
-        session_id: acp_v2::SessionId,
-        request_id: PermissionRequestId,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(seconds) = AgentSettings::try_get(cx)
-            .and_then(|settings| settings.fork.auto_allow_permissions_after_seconds)
-        else {
-            return;
-        };
-        let key = (session_id, request_id);
-        // A duplicate request event for an id that's already counting down
-        // must not reset it or spawn a second ticking task.
-        if self.auto_allow_remaining.contains_key(&key) {
-            return;
-        }
-        let Some(tool_call_id) = self
-            .permission_request(&key.0, request_id, cx)
-            .and_then(PermissionRequest::legacy_tool_call_id)
-            .cloned()
-        else {
-            return;
-        };
-        self.auto_allow_remaining.insert(
-            key.clone(),
-            AutoAllowCountdown {
-                tool_call_id,
-                remaining_seconds: seconds.max(1),
-            },
-        );
-        cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor().timer(Duration::from_secs(1)).await;
-                let Some(remaining) = this
-                    .update(cx, |this, cx| {
-                        // Answered or canceled meanwhile: stop counting down.
-                        let countdown = this.auto_allow_remaining.get_mut(&key)?;
-                        countdown.remaining_seconds = countdown.remaining_seconds.saturating_sub(1);
-                        cx.notify();
-                        Some(countdown.remaining_seconds)
-                    })
-                    .ok()
-                    .flatten()
-                else {
-                    break;
-                };
-                if remaining == 0 {
-                    this.update(cx, |this, cx| {
-                        this.fire_auto_allow(&key.0, key.1, cx);
-                    })
-                    .log_err();
-                    break;
-                }
-            }
-        })
-        .detach();
-    }
-
-    /// Auto-answers a pending tool-authorization request with the
-    /// least-privileged allow option after the countdown (plan 025; extended
-    /// in plan 027 to EVERY prompt that offers an allow option):
-    /// - plain permission grants (terminal/edit/sandbox, windows fs warning),
-    /// - action-choice prompts with an allow option (e.g. save vs discard),
-    /// - the sandbox-fallback prompt ("Run without sandbox once" — retry and
-    ///   deny are never picked; unattended chains previously stalled here
-    /// forever).
-    /// Prompts that offer no allow option at all stay with the user.
-    fn fire_auto_allow(
-        &mut self,
-        session_id: &acp_v2::SessionId,
-        request_id: PermissionRequestId,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(countdown) = self
-            .auto_allow_remaining
-            .remove(&(session_id.clone(), request_id))
-        else {
-            return;
-        };
-        let Some(options) = self
-            .permission_request(session_id, request_id, cx)
-            .and_then(PermissionRequest::legacy_options)
-        else {
-            return;
-        };
-        // Prefer the one-shot allow ("Only this time" / "Allow once" /
-        // "Run without sandbox once"); only fall back to a persistent allow
-        // when nothing weaker is offered. `resolve_outcome_from_selection`
-        // handles both flat and dropdown option shapes and returns None when
-        // no allow option exists — those prompts are genuine decisions the
-        // user must make.
-        let outcome = resolve_outcome_from_selection(options, None, true).or_else(|| {
-            options
-                .first_option_of_kind(acp_v2::PermissionOptionKind::AllowAlways)
-                .map(|option| {
-                    SelectedPermissionOutcome::new(option.option_id.clone(), option.kind.clone())
-                })
-        });
-        let Some(outcome) = outcome else {
-            return;
-        };
-        log::info!(
-            "Auto-allowing tool call {} after `auto_allow_permissions_after_seconds`",
-            countdown.tool_call_id
-        );
-        self.authorize_permission_request(session_id.clone(), request_id, outcome, cx);
-    }
-
-    /// Seconds until the pending request for this tool call is auto-allowed,
-    /// if a countdown is running for it.
-    pub fn auto_allow_remaining_seconds(
-        &self,
-        session_id: &acp_v2::SessionId,
-        tool_call_id: &acp_v2::ToolCallId,
-    ) -> Option<u64> {
-        self.auto_allow_remaining
-            .iter()
-            .find(|((countdown_session_id, _), countdown)| {
-                countdown_session_id == session_id && &countdown.tool_call_id == tool_call_id
-            })
-            .map(|(_, countdown)| countdown.remaining_seconds)
-    }
-
     fn set_work_dirs(&mut self, work_dirs: PathList, cx: &mut Context<Self>) {
         for thread in self.threads.values() {
             thread.update(cx, |thread, cx| {
@@ -972,10 +846,6 @@ pub struct ConversationView {
 }
 
 impl ConversationView {
-    pub fn workspace(&self) -> WeakEntity<Workspace> {
-        self.workspace.clone()
-    }
-
     pub fn has_auth_methods(&self) -> bool {
         self.as_connected().map_or(false, |connected| {
             connected
@@ -2143,17 +2013,9 @@ impl ConversationView {
                         active.sync_elicitation_state_for_entry(index, window, cx);
                         active.sync_editor_mode(cx);
                         active.sync_generating_indicator(cx);
-                        // New entry = the worker produced output. Bump the
-                        // watchdog activity counter so active streaming never
-                        // triggers a false stuck-thread timeout.
-                        let next_gen = active.fork.watchdog_activity_gen.get().wrapping_add(1);
-                        active.fork.watchdog_activity_gen.set(next_gen);
                     });
                 }
-                // If this is a subagent entry, the parent thread is also
-                // active (it's waiting on the subagent). Bump its watchdog
-                // activity counter so it doesn't false-positive.
-                self.bump_parent_watchdog(&session_id, cx);
+                self.note_watchdog_activity(&session_id, cx);
             }
             AcpThreadEvent::EntryUpdated(index) => {
                 if let Some(active) = self.thread_view(&session_id) {
@@ -2172,15 +2034,10 @@ impl ConversationView {
                         }
                         active.sync_elicitation_state_for_entry(*index, window, cx);
                         active.auto_expand_streaming_thought(cx);
-                        // Streaming update = the worker is active. Bump the
-                        // watchdog activity counter.
-                        let next_gen = active.fork.watchdog_activity_gen.get().wrapping_add(1);
-                        active.fork.watchdog_activity_gen.set(next_gen);
                         active.sync_generating_indicator(cx);
                     });
                 }
-                // Subagent streaming = parent is also active.
-                self.bump_parent_watchdog(&session_id, cx);
+                self.note_watchdog_activity(&session_id, cx);
             }
             AcpThreadEvent::EntriesRemoved(range) => {
                 if let Some(active) = self.thread_view(&session_id) {
@@ -2194,14 +2051,7 @@ impl ConversationView {
                 }
             }
             AcpThreadEvent::SubagentSpawned(subagent_session_id) => {
-                // A subagent just started — the parent is actively working.
-                // Bump the parent's watchdog activity counter.
-                if let Some(tv) = self.thread_view(&session_id) {
-                    tv.update(cx, |tv, _cx| {
-                        let next_gen = tv.fork.watchdog_activity_gen.get().wrapping_add(1);
-                        tv.fork.watchdog_activity_gen.set(next_gen);
-                    });
-                }
+                self.bump_thread_watchdog(&session_id, cx);
                 if let Some(subagent) = thread.read(cx).subagent(subagent_session_id).cloned() {
                     self.add_subagent_thread_view(subagent, window, cx);
                 }
@@ -2385,58 +2235,15 @@ impl ConversationView {
                         cx,
                     );
 
-                    // Gate on the STOPPED thread's own toggle, not whatever
-                    // thread the user happens to be viewing: a background
-                    // thread's chain must not die silently because the
-                    // focused view has auto-prompt off (issue 018 follow-up;
-                    // same resolution principle as the elicitation arm above).
-                    let auto_prompt_enabled = self
-                        .thread_view(&session_id)
-                        .is_some_and(|tv| tv.read(cx).fork.auto_prompt_enabled);
-                    if !auto_prompt_enabled {
-                        // Every silent skip here is an undebuggable dead chain;
-                        // always name the reason in the log.
-                        log::warn!(
-                            "[auto_prompt] Stopped: chain skipped — auto-prompt disabled on this thread (session={:?}, stop_reason={:?})",
-                            session_id,
-                            stop_reason
-                        );
-                    }
-                    if auto_prompt_enabled {
-                        let has_in_progress = thread.read(cx).has_in_progress_tool_calls();
-                        if has_in_progress {
-                            log::warn!(
-                                "[auto_prompt] Stopped: chain skipped — tool calls still in progress (session={:?}, stop_reason={:?})",
-                                session_id,
-                                stop_reason
-                            );
-                        }
-                        if !has_in_progress {
-                            if let Some(task) = crate::auto_prompt::on_thread_stopped(
-                                self,
-                                &thread,
-                                used_tools,
-                                stop_reason,
-                                window,
-                                cx,
-                            ) {
-                                // The watchdog is armed inside send_content when
-                                // the next generation actually starts, not here —
-                                // arming at this point would start the timer during
-                                // the orchestration LLM call (before the worker
-                                // begins generating).
-                                // Store on the stopped thread's own view: the task
-                                // belongs to that thread's chain, not to whichever
-                                // thread is focused (issue 018 follow-up).
-                                if let Some(stopped_view) = self.thread_view(&session_id) {
-                                    stopped_view.update(cx, |active, cx| {
-                                        active.fork._auto_prompt_task = Some(task);
-                                        cx.notify();
-                                    });
-                                }
-                            }
-                        }
-                    }
+                    self.chain_auto_prompt(
+                        thread,
+                        &session_id,
+                        used_tools,
+                        stop_reason,
+                        AutoPromptChainTrigger::Stopped,
+                        window,
+                        cx,
+                    );
                 }
             }
             AcpThreadEvent::Refusal => {
@@ -2470,138 +2277,7 @@ impl ConversationView {
                     });
                 }
                 if !is_subagent {
-                    // Error = thread stopped. Always cancel the watchdog.
-                    crate::auto_prompt::cancel_watchdog_for_thread(self, &session_id, cx);
-
-                    // Session/weekly limit: when the error text carries a
-                    // reset time (parsed, or resolved from the usage-API hint)
-                    // and auto-prompt will schedule the retry, surface the
-                    // schedule instead of the generic error notification.
-                    let margin_secs = auto_prompt::load_config_cached()
-                        .map(|config| config.session_limit_margin_secs)
-                        .unwrap_or(auto_prompt::session_limit::DEFAULT_SESSION_LIMIT_MARGIN_SECS);
-                    let error_text = thread.read(cx).last_api_error().map(str::to_string);
-                    let session_limit = error_text.as_deref().and_then(|text| {
-                        auto_prompt::session_limit::session_limit_from_error_text(text, margin_secs)
-                    });
-                    let limit_kind = if error_text
-                        .as_deref()
-                        .is_some_and(auto_prompt::session_limit::error_mentions_weekly)
-                    {
-                        "Weekly"
-                    } else {
-                        "Session"
-                    };
-                    // Same session-scoped resolution as the Stopped path: the
-                    // errored (background) thread's own toggle decides both
-                    // the notification wording and whether the chain continues.
-                    let auto_prompt_enabled = self
-                        .thread_view(&session_id)
-                        .is_some_and(|tv| tv.read(cx).fork.auto_prompt_enabled);
-                    let (notification, icon) = match (&session_limit, auto_prompt_enabled) {
-                        (Some(limit), true) => (
-                            format!(
-                                "{limit_kind} limit reached — auto-continue scheduled at {}",
-                                limit.retry_display
-                            ),
-                            IconName::Info,
-                        ),
-                        (Some(_), false) => (
-                            format!("Agent stopped: {limit_kind} limit reached"),
-                            IconName::Warning,
-                        ),
-                        // Expired credentials: auto-prompt stops the chain
-                        // (`auto_prompt::auth_failure`) until re-login.
-                        (None, _)
-                            if error_text
-                                .as_deref()
-                                .is_some_and(auto_prompt::auth_failure::is_auth_error) =>
-                        {
-                            (
-                                "Agent stopped: authentication failed — sign in again".to_string(),
-                                IconName::Warning,
-                            )
-                        }
-                        // Unreachable API: auto-prompt retries the same thread
-                        // with backoff (`auto_prompt::api_unreachable`).
-                        (None, true)
-                            if error_text
-                                .as_deref()
-                                .is_some_and(auto_prompt::api_unreachable::is_network_error) =>
-                        {
-                            (
-                                "API unreachable — auto-retry scheduled with backoff".to_string(),
-                                IconName::Info,
-                            )
-                        }
-                        (None, _) => (
-                            "Agent stopped due to an error".to_string(),
-                            IconName::Warning,
-                        ),
-                    };
-                    self.notify_with_sound(notification, icon, window, cx);
-                    // Call auto-prompt for error events (e.g., rate limits)
-                    // Same pattern as Stopped handler: queued user messages take priority.
-                    let used_tools = thread.read(cx).used_tools_since_last_user_message();
-
-                    let sent_queued_message = self.send_queued_after_confirmed_idle(window, cx);
-
-                    if sent_queued_message {
-                        // Reset the QUEUED THREAD's chain state (the queue lives
-                        // on the root/active view that just auto-sent), matching
-                        // the pre-existing active-view resolution here — the
-                        // queued entry was dispatched from this view.
-                        if let Some(active) = self.active_thread() {
-                            active.update(cx, |active, cx| {
-                                if active.fork._auto_prompt_task.is_some() {
-                                    active.fork._auto_prompt_task = None;
-                                    active.fork.auto_prompt_state =
-                                        crate::auto_prompt::AutoPromptState::Idle;
-                                    cx.notify();
-                                }
-                            });
-                        }
-                    } else {
-                        let auto_prompt_enabled = self
-                            .thread_view(&session_id)
-                            .is_some_and(|tv| tv.read(cx).fork.auto_prompt_enabled);
-                        let has_in_progress = thread.read(cx).has_in_progress_tool_calls();
-                        if has_in_progress {
-                            log::info!(
-                                "[auto_prompt] Skipping error-path chaining: tools still in progress"
-                            );
-                        }
-                        if auto_prompt_enabled && !has_in_progress {
-                            // Don't override a task already set by the Stopped handler.
-                            // Error events can fire alongside Stopped (e.g. MaxTokens emits both).
-                            let already_has_task = self
-                                .thread_view(&session_id)
-                                .is_some_and(|tv| tv.read(cx).fork._auto_prompt_task.is_some());
-                            if already_has_task {
-                                log::info!(
-                                    "[auto_prompt] Error event: auto_prompt task already set by Stopped handler, not overriding"
-                                );
-                            } else if let Some(task) = crate::auto_prompt::on_thread_stopped(
-                                self,
-                                &thread,
-                                used_tools,
-                                &Some(acp_v2::StopReason::EndTurn),
-                                window,
-                                cx,
-                            ) {
-                                // The watchdog is armed inside send_content when
-                                // the next generation actually starts.
-                                // Store on the errored thread's own view, matching
-                                // the Stopped path (issue 018 follow-up).
-                                if let Some(errored_view) = self.thread_view(&session_id) {
-                                    errored_view.update(cx, |active, cx| {
-                                        active.fork._auto_prompt_task = Some(task);
-                                        cx.notify();
-                                    });
-                                }
-                            }
-                        }
-                    }
+                    self.handle_fork_thread_error(thread, &session_id, window, cx);
                 }
             }
             AcpThreadEvent::ConnectionLost => {
@@ -2717,31 +2393,6 @@ impl ConversationView {
             }
         }
         cx.notify();
-    }
-
-    /// Bump the parent thread's watchdog activity counter when a subagent
-    /// produces output. Without this, a long-running subagent call would
-    /// leave the parent thread with no `NewEntry`/`EntryUpdated` events,
-    /// causing the parent's watchdog to false-positive.
-    fn bump_parent_watchdog(&self, subagent_session_id: &acp_v2::SessionId, cx: &mut App) {
-        let Some(connected) = self.as_connected() else {
-            return;
-        };
-        // Find the subagent's parent session id, then bump that parent's
-        // watchdog activity counter.
-        let parent_session_id = connected
-            .threads
-            .get(subagent_session_id)
-            .and_then(|tv| tv.read(cx).thread.read(cx).parent_session_id().cloned());
-        let Some(parent_session_id) = parent_session_id else {
-            return;
-        };
-        if let Some(parent_tv) = self.thread_view(&parent_session_id) {
-            parent_tv.update(cx, |tv, _cx| {
-                let next_gen = tv.fork.watchdog_activity_gen.get().wrapping_add(1);
-                tv.fork.watchdog_activity_gen.set(next_gen);
-            });
-        }
     }
 
     fn schedule_draft_prompt_persist(&mut self, cx: &mut Context<Self>) {
