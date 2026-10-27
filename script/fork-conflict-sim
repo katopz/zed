@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Replays a past upstream sync against a fork commit, without touching the
+# working tree, and counts the conflicts it would produce (plan 038). The
+# changed-lines metric of script/fork-surface does not predict conflicts well:
+# whole fork-only items move cleanly, inline edits inside hot upstream
+# functions are what conflict.
+#
+# The replay runs the sync backwards (synced upstream tip -> older upstream
+# base) so it works on any fork commit that already contains the sync.
+#
+# Usage: script/fork-conflict-sim [FORK_REF] [SYNCED_UPSTREAM] [OLD_UPSTREAM] [TOP]
+#   defaults: HEAD 6b985a8b26 3f660a0a60 15  (the 2026-10 sync of 1038 commits)
+
+set -euo pipefail
+
+fork_ref="${1:-HEAD}"
+synced="${2:-6b985a8b26}"
+old="${3:-3f660a0a60}"
+top="${4:-15}"
+
+output="$(git merge-tree --write-tree --name-only --no-messages --merge-base="$synced" "$fork_ref" "$old" || true)"
+tree="$(printf '%s\n' "$output" | head -n 1)"
+
+per_file="$(printf '%s\n' "$output" | tail -n +2 | grep . | while read -r file; do
+    hunks="$(git cat-file -p "$tree:$file" 2>/dev/null | grep -c '^<<<<<<< ' || true)"
+    printf '%s\t%s\n' "$hunks" "$file"
+done | sort -rn)"
+
+files="$(printf '%s\n' "$per_file" | grep -c . || true)"
+hunks="$(printf '%s\n' "$per_file" | awk '{ sum += $1 } END { print sum + 0 }')"
+
+echo "replay: $synced -> $old against $fork_ref"
+echo "conflicted files: $files"
+echo "conflict hunks: $hunks"
+echo
+printf '%s\n' "$per_file" | head -n "$top"
