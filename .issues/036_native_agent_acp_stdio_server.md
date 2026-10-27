@@ -1,5 +1,5 @@
 # 036 — Serve Zed's native agent over ACP stdio (`eval-cli --acp`) for zed-agentd
-Status: MVP done (`c212b13be4`, harness `767ba226e9`) — `eval-cli --acp` serves the native agent, verified directly, through zed-agentd with reattach replay, and with the GUI killed mid-turn; structured diffs + model selection over ACP done (see Tasks); open: real-host run (plan 037 P3, blocked on M5 SSH)
+Status: MVP done (`c212b13be4`, harness `767ba226e9`) — `eval-cli --acp` serves the native agent, verified directly, through zed-agentd with reattach replay, and with the GUI killed mid-turn; structured diffs + model selection over ACP done (see Tasks); real-host run PASS on the 4090 WSL (`b3e8bd4583`); open: the GUI run with a real provider (plan 037 P3, owner)
 
 ## Goal
 
@@ -43,4 +43,5 @@ cursor-diff code is local to the new module. B duplicates
 - [x] e2e (`script/agentd-smoke/`, fake OpenAI-compatible model): direct run (read_file turn, terminal turn with permission, file written); through zed-agentd (`loadSession`/`list` advertised, permission routed, second client lists + replays both turns); GUI killed 1 s into a 4 s turn → turn finished detached, replay shows the answer and `completed` tool. All PASS
 - [-] Native-agent `session/load` from threads.db — zed-agentd journal covers reattach; only needed without the daemon
 - [x] Structured diffs: edits go out as v1 `ToolCallContent::Diff` (absolute path via the thread's project, old/new text); `LegacyDiff` passes its source through; terminals stay markdown since they run on the host. Fork seam: `Diff::old_text` / `Diff::new_text` in `acp_thread/src/diff.rs`, plus a `final_text` rope snapshot in `ResolvedFinalized` (a pending diff's `new_buffer` stays the live buffer after finalize, so later edits to the file would otherwise leak into a finished tool call). Tests: `test_diff_texts_across_states`, cursor test, and an `edit_file` turn in `acp_smoke.py` (direct + through zed-agentd: PASS)
-- [ ] Run on the real host once plan 037 P3 has SSH: `zed-agentd attach -- eval-cli --acp --model <provider/model>` from the M3 GUI
+- [x] Run on a real host (`b3e8bd4583`): `eval-cli --acp` under the zed-agentd embedded in `remote_server`, on the 4090's WSL over SSH from the M3, client killed mid-turn → detached finish, mid-turn reattach and replay: PASS 5/5 (fake model). A debug `eval-cli` off the checkout needs `--features util/debug-embed`, or it panics on its first asset load
+- [ ] From the M3 GUI with a real provider: `zed-agentd attach -- eval-cli --acp --model <provider/model>` (plan 037 P3 GUI item, owner click-through)
