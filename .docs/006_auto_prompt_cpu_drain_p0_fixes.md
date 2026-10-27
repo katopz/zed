@@ -310,6 +310,9 @@ farm session with sibling agents active):
   fleet that is heavy per instance. Rule for new MCP servers: if the server
   is a remote endpoint behind a stdio bridge, configure it as `url` +
   `headers` instead of installing the bridge.
+  Documented in the three bridge extensions' READMEs ("Lighter alternative"):
+  `zed-mcp-server-zai-web-search` `15aede2`, `-web-reader` `fe18b54`,
+  `-zread` `ae75604`.
 
 Analysis-issue archive note: the original `.issues/006` file (Jul 19 evidence
 tables, root-cause corrections, recommended-fix priorities) was absorbed into
