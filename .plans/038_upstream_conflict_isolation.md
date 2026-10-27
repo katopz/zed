@@ -1,5 +1,5 @@
 # 038 — Isolate the fork lane from upstream files (shrink merge-conflict surface)
-Status: in progress — `script/fork-surface` shipped; acp_thread + agent fork APIs extracted; surface 16,609 → 16,241 lines (130 files)
+Status: in progress — `script/fork-surface` shipped; acp_thread + agent fork APIs extracted; surface 16,609 → 14,800 lines (130 files)
 
 ## Why
 
@@ -34,7 +34,8 @@ to it. Pattern proven by plan 037 (`acp/detachable.rs`: 7 one-line upstream touc
   - post-sync (`--worktree`, vs upstream tip `6b985a8b26`): 129 files / 16,609 lines — the baseline every refactor below is measured against
 - [ ] `open_ai_compatible.rs` → move multi-key lane into `provider/open_ai_compatible/multi_key.rs` (health.rs already split); upstream file keeps a single `MultiKeyLane` field + delegating calls
 - [ ] `thread_view.rs` → extract fork renders (retry callout, key ring, usage countdown, board card) into `conversation_view/fork_render.rs`; thread_view calls `fork_render::*` at 4–5 seams
-- [ ] `conversation_view.rs` → auto-allow countdown + watchdog glue into `conversation_view/auto_allow.rs`
+- [x] `conversation_view.rs` fork tests (20 items, 1231 lines) → `conversation_view/tests/fork_tests.rs` via one `mod fork_tests;` seam — `efaac2e25b`; file surface 1893 → 285, total 16,241 → 14,800
+- [ ] `conversation_view.rs` → remaining auto-allow countdown + watchdog glue (285 lines) into `conversation_view/auto_allow.rs`
 - [ ] `agent_panel.rs` → retained-thread cap + war-room into `agent_panel_fork.rs`
 - [ ] `agent/src/thread.rs` → idle-timeout + retry-cap policies into `thread_fork_policy.rs` (pure fns, unit-tested)
 - [x] `agent/src/agent.rs` → `agent_fork.rs`: CLAUDE.md symlink (+ statics), `seed_history`, verdict subagent, peer-thread list/send (trait methods now one-line delegations), `running_successor_execution`; agent.rs fork lines 565 → 295 (remaining: struct fields, call-site seams, internal_tests regression tests)
