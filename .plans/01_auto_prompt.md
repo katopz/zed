@@ -190,6 +190,8 @@ crates/auto_prompt/src/
 ├── remaining_work.rs    # Summary next-step parsing, deferred/blocked detection,
 │                        # pre-stop plan verification prompts
 ├── model_call.rs        # call_language_model(), stream_model_completion(), parse_response()
+├── verdict_dispatch.rs  # EvaluationResult → outcome: second opinion, lightweight retry,
+│                        # safety nets, pre-stop verification
 ├── context_files.rs     # Plan and doc files read for the context
 ├── claude_agent.rs      # Claude Code continue/stop verdict (hidden orchestrator thread)
 ├── claude_agent/tests.rs # Tests for claude_agent.rs
@@ -200,6 +202,8 @@ crates/auto_prompt/src/
 Split out of a 9,477-line auto_prompt.rs in ee276f9065, 7933a90af4, 1584da69d0
 and b68a330247 (issue 039, a pure move).
 claude_agent.rs tests moved to claude_agent/tests.rs (2,353 → 1,260 lines).
+decide_with_llm's verdict dispatch moved to verdict_dispatch.rs in 7f75e43c1d
+(704 → 198 lines; issue 040), pinned first by characterization tests in aecc74fa32.
 
 crates/agent_ui/src/auto_prompt/
 └── mod.rs          # UI integration: on_thread_stopped(), dispatch_action(),
