@@ -17,6 +17,7 @@ mod pending_question;
 pub mod plan_registry;
 mod plan_source;
 pub mod session_limit;
+mod stall;
 pub mod watchdog;
 
 /// Test-harness hook: disables `plan_source`'s real git process spawns so
@@ -972,6 +973,17 @@ pub fn summary_continuation_fast_path(data: &LlmCallData) -> Option<AutoPromptOu
             });
         }
         Some(SummaryContinuation::Steps(steps)) => {
+            let repeats = stall::record_summary_steps(&data.session_id.to_string(), &steps);
+            if repeats >= stall::MAX_UNCHANGED_REPEATS {
+                log::warn!(
+                    "[auto_prompt] summary fast path: next steps unchanged for {repeats} summaries in a row — stopping the chain (no progress possible without the user)"
+                );
+                return Some(AutoPromptOutcome::Stopped {
+                    reason: format!(
+                        "no progress — the summary's next steps were unchanged for {repeats} summaries in a row"
+                    ),
+                });
+            }
             log::warn!(
                 "[auto_prompt] summary fast path: voluntary summary — continuing same-thread with the summary's next steps + fixed decision fallback (no orchestrator call)"
             );
@@ -3371,6 +3383,7 @@ pub fn reset_iteration() {
 pub fn reset_iteration_with_session(session_id: &str) {
     reset_iteration();
     clear_summary_for_session(session_id);
+    stall::clear_session(session_id);
     plan_registry::release_all_for_session(session_id);
 }
 
@@ -5546,6 +5559,43 @@ mod tests {
             }
             other => panic!("expected Continue, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn summary_fast_path_stops_when_next_steps_stop_changing() {
+        // The stalled-loop shape that slips past the terminal check: items read
+        // as actionable, but nothing changes between summaries.
+        let session = "summary-fast-path-stall-test";
+        clear_summary_for_session(session);
+        stall::clear_session(session);
+        let summary = "## Summary\n\nRe-checked; no change.\n\n## What Remains\n\n\
+                       - Run the real M3 to M5 test.\n\
+                       - Score the verdict cohort.";
+        let outcome = || {
+            let mut data = overflow_test_data(session, Some(summary));
+            data.context_exceeds_limit = false;
+            summary_continuation_fast_path(&data)
+        };
+        for round in 0..=stall::MAX_UNCHANGED_REPEATS {
+            let result = outcome();
+            if round < stall::MAX_UNCHANGED_REPEATS {
+                assert!(
+                    matches!(result, Some(AutoPromptOutcome::Continue(_))),
+                    "round {round}: {result:?}"
+                );
+            } else {
+                match result {
+                    Some(AutoPromptOutcome::Stopped { reason }) => {
+                        assert!(reason.contains("no progress"), "reason: {reason}");
+                    }
+                    other => panic!("expected Stopped, got {other:?}"),
+                }
+            }
+        }
+        // A stop clears the streak, so a later chain on this session starts fresh.
+        reset_iteration_with_session(session);
+        assert!(matches!(outcome(), Some(AutoPromptOutcome::Continue(_))));
+        reset_iteration_with_session(session);
     }
 
     #[test]
