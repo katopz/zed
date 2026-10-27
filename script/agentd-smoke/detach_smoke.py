@@ -4,9 +4,15 @@ that a client reattaching mid-turn is told it is running and when it ends
 
 With SMOKE_VIA_REMOTE_SERVER=1 the second argument is the remote server binary:
 each client goes through `remote_server exec` like the GUI does, and attaches to
-the agentd embedded in that binary (plan 037 P4 auto-deploy)."""
+the agentd embedded in that binary (plan 037 P4 auto-deploy).
+
+With SMOKE_SSH set as well (an ssh command prefix, e.g. "ssh my-host"), the
+binaries, the fake model and the project live on that host, and each client is
+a local ssh process running `remote_server exec` there. Killing a client then
+drops a real SSH connection, the way closing the GUI machine does (plan 037 P3)."""
 import json
 import os
+import shlex
 import struct
 import subprocess
 import sys
@@ -14,38 +20,90 @@ import tempfile
 import time
 
 eval_cli, agentd, port = sys.argv[1], sys.argv[2], sys.argv[3]
-workdir = tempfile.mkdtemp(prefix="z036-")
-with open(os.path.join(workdir, "hello.txt"), "w") as f:
-    f.write("magic word: pineapple\n")
-model = subprocess.Popen([sys.executable, "-I", os.path.join(os.path.dirname(os.path.abspath(__file__)), "fake_model.py"), port, os.path.basename(workdir)],
-                         env=dict(os.environ, FAKE_DELAY="4"),
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-env = dict(os.environ, HOME=tempfile.mkdtemp(prefix="z036-home-"), FAKE_API_KEY="test",
-           ZED_AGENTD_HOME=tempfile.mkdtemp(prefix="z036-agentd-"),
-           ZED_OPENAI_COMPATIBLE_PROVIDERS=json.dumps({"fake": {
-               "api_url": f"http://127.0.0.1:{port}/v1", "available_models": [{
-                   "name": "m", "max_tokens": 32000, "capabilities": {
-                       "tools": True, "images": False, "parallel_tool_calls": False,
-                       "prompt_cache_key": False}}]}}))
+fake_model_source = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fake_model.py")
+
+
+class LocalHost:
+    prefix = []
+
+    def mkdtemp(self, prefix):
+        return tempfile.mkdtemp(prefix=prefix)
+
+    def write(self, path, text):
+        with open(path, "w") as f:
+            f.write(text)
+
+    def popen(self, argv, env, **kwargs):
+        return subprocess.Popen(argv, env=dict(os.environ, **env), **kwargs)
+
+    def run(self, argv, env):
+        subprocess.run(argv, env=dict(os.environ, **env), capture_output=True)
+
+
+class SshHost:
+    def __init__(self, ssh):
+        self.prefix = shlex.split(ssh)
+
+    def shell(self, command, **kwargs):
+        return subprocess.run([*self.prefix, command], check=True, capture_output=True, text=True, **kwargs)
+
+    def mkdtemp(self, prefix):
+        return self.shell(f"mktemp -d /tmp/{prefix}XXXXXX").stdout.strip()
+
+    def write(self, path, text):
+        self.shell(f"cat > {shlex.quote(path)}", input=text)
+
+    def command(self, argv, env):
+        assignments = [f"{key}={value}" for key, value in env.items()]
+        return shlex.join(["env", *assignments, *argv])
+
+    def popen(self, argv, env, **kwargs):
+        return subprocess.Popen([*self.prefix, self.command(argv, env)], **kwargs)
+
+    def run(self, argv, env):
+        subprocess.run([*self.prefix, self.command(argv, env)], capture_output=True)
+
+
+ssh = os.environ.get("SMOKE_SSH")
+host = SshHost(ssh) if ssh else LocalHost()
+workdir = host.mkdtemp("z036-")
+host.write(os.path.join(workdir, "hello.txt"), "magic word: pineapple\n")
+tools = host.mkdtemp("z036-tools-")
+fake_model = os.path.join(tools, "fake_model.py")
+with open(fake_model_source) as f:
+    host.write(fake_model, f.read())
+model = host.popen(["python3" if ssh else sys.executable, "-I", fake_model, port, os.path.basename(workdir)], {"FAKE_DELAY": "4"},
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+test_env = {"HOME": host.mkdtemp("z036-home-"), "FAKE_API_KEY": "test",
+            "ZED_AGENTD_HOME": host.mkdtemp("z036-agentd-"),
+            "ZED_OPENAI_COMPATIBLE_PROVIDERS": json.dumps({"fake": {
+                "api_url": f"http://127.0.0.1:{port}/v1", "available_models": [{
+                    "name": "m", "max_tokens": 32000, "capabilities": {
+                        "tools": True, "images": False, "parallel_tool_calls": False,
+                        "prompt_cache_key": False}}]}})}
 agent = [eval_cli, "--acp", "--model", "fake/m"]
 via_server = os.environ.get("SMOKE_VIA_REMOTE_SERVER") == "1"
+assert via_server or not ssh, "SMOKE_SSH needs SMOKE_VIA_REMOTE_SERVER=1: the GUI reaches a host through remote_server exec"
 if via_server:
     agentd_cli = [agentd, "agentd"]
-    command = [agentd, "exec"]
+    command = [*host.prefix, shlex.join([agentd, "exec"])] if ssh else [agentd, "exec"]
     # The GUI's shim takes this branch when `remote_server exec` exports its own path.
+    # Over SSH the test environment travels in the descriptor, as the GUI's does.
     descriptor = json.dumps({"program": "sh", "args": [
         "-c", 'exec "$ZED_AGENTD_REMOTE_SERVER" agentd attach "$@"', "shim", "--", *agent],
-        "env": {}, "working_dir": None}).encode()
+        "env": test_env if ssh else {}, "working_dir": None}).encode()
     preamble = struct.pack("<I", len(descriptor)) + descriptor
 else:
     agentd_cli = [agentd]
     command = [agentd, "attach", "--", *agent]
     preamble = b""
-
+env = dict(os.environ, **test_env)
+# Over SSH the clients are local ssh processes; the test environment is on the host.
+client_env = dict(os.environ) if ssh else env
 
 class Gui:
     def __init__(self):
-        self.process = subprocess.Popen(command, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        self.process = subprocess.Popen(command, env=client_env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                         stderr=subprocess.DEVNULL, text=True, bufsize=1)
         self.process.stdin.buffer.write(preamble)
         self.process.stdin.buffer.flush()
@@ -64,6 +122,8 @@ class Gui:
         while True:
             message = json.loads(self.process.stdout.readline())
             if message.get("id") == request_id and "method" not in message:
+                if "error" in message:
+                    raise RuntimeError(f"{method} failed: {message['error']}")
                 return message, updates
             if message.get("method") == "session/update":
                 updates.append(message["params"]["update"])
@@ -114,5 +174,9 @@ try:
     gui.process.stdin.close()
     gui.process.wait(timeout=30)
 finally:
-    subprocess.run([*agentd_cli, "stop"], env=env, capture_output=True)
+    host.run([*agentd_cli, "stop"], test_env)
     model.kill()
+    if ssh:
+        # Killing the local ssh does not stop the model it started on the host.
+        host.run(["pkill", "-f", fake_model], {})
+        host.run(["rm", "-rf", workdir, tools, test_env["HOME"], test_env["ZED_AGENTD_HOME"]], {})

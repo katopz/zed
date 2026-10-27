@@ -25,3 +25,32 @@ SMOKE_VIA_REMOTE_SERVER=1 python3 -I script/agentd-smoke/detach_smoke.py target/
 ```
 
 The last argument is a free localhost port for the fake model.
+
+## On a real remote host over SSH (plan 037 P3)
+
+`SMOKE_SSH` (an ssh command prefix) runs the same detach check against a remote
+Linux host: the binaries, the fake model and the project live on the host, and
+each client is a local `ssh` process running `remote_server exec` there, so
+killing a client drops a real SSH connection. Build static Linux binaries the
+way Zed builds its dev remote server (needs `zig` and `cargo-zigbuild`); a debug
+`eval-cli` must embed its assets because the host has no checkout:
+
+```sh
+export RUSTFLAGS=" -C target-feature=+crt-static"
+cargo zigbuild -p remote_server --features debug-embed --target-dir target/remote_server --target x86_64-unknown-linux-musl
+cargo zigbuild -p eval_cli --features util/debug-embed --target-dir target/remote_server --target x86_64-unknown-linux-musl
+# Copy both binaries from target/remote_server/x86_64-unknown-linux-musl/debug/ to the host
+# (strip and xz them first over a slow link), then:
+SMOKE_VIA_REMOTE_SERVER=1 SMOKE_SSH="ssh my-host" \
+  python3 -I script/agentd-smoke/detach_smoke.py /path/on/host/eval-cli /path/on/host/remote_server 18740
+```
+
+A WSL distro on a Windows box works as the host without opening any port:
+run `wsl_sshd_setup.sh <your public key file>` inside the distro once, then
+reach it through the Windows host's own sshd:
+
+```
+Host my-wsl
+    User <wsl user>
+    ProxyCommand ssh <windows user>@<windows host> wsl -d Ubuntu -- /usr/sbin/sshd -i -f /home/<wsl user>/.zed-sshd/sshd_config
+```
