@@ -36,7 +36,6 @@ use std::time::Duration;
 
 use crate::{
     AutoPromptAction, AutoPromptDecision, AutoPromptDelayReason, AutoPromptOutcome, LlmCallData,
-    get_iteration,
 };
 
 /// Maximum chars of the last assistant message to send to the orchestration LLM.
@@ -284,6 +283,23 @@ pub fn decide_claude(
         if let Some(decision) = crate::api_unreachable_decision(thread, &config, cx) {
             return decision;
         }
+
+        // Runaway backstop, counted per session and only over turns that
+        // changed nothing, so it never cuts off a chain that keeps landing work.
+        let session_id_str = thread.read(cx).session_id().to_string();
+        let turn = crate::chain::record_turn(
+            &session_id_str,
+            crate::chain::turn_made_progress(thread.read(cx).entries()),
+        );
+        if turn.idle_turns > config.max_iterations {
+            log::warn!(
+                "[auto_prompt::claude] {} turns in a row without progress (max {}) — stopping chain",
+                turn.idle_turns,
+                config.max_iterations
+            );
+            crate::reset_iteration_with_session(&session_id_str);
+            return AutoPromptDecision::NoAction;
+        }
     }
 
     // Need a configured model to reason about the next step.
@@ -440,6 +456,7 @@ fn claude_context_overflow_decision(
     })
     .to_string();
 
+    let iteration_count = crate::chain::current_turn(&session_id.to_string());
     Some(AutoPromptDecision::NeedsLlmCall(LlmCallData {
         model: configured.clone(),
         // Unused by the overflow path (Phase 1/2 are deterministic and the
@@ -449,7 +466,7 @@ fn claude_context_overflow_decision(
         project_root: work_dirs.as_ref().and_then(|d| d.first().cloned()),
         session_id,
         title,
-        iteration_count: get_iteration(),
+        iteration_count,
         max_verification_attempts: 0,
         work_dirs,
         first_user_message: None,
@@ -488,7 +505,7 @@ fn claude_decision_needs_llm(
         return AutoPromptDecision::NoAction;
     };
 
-    let iteration_count = get_iteration();
+    let iteration_count = crate::chain::current_turn(&session_id.to_string());
     log::info!("[auto_prompt::claude] iteration {iteration_count}, handing to orchestration LLM");
 
     let context_json = serde_json::json!({
@@ -529,15 +546,14 @@ fn claude_decision_needs_llm(
 /// Async LLM call for the Claude path.
 /// Hidden-thread backend (`claude-hidden-orchestrator` feature): package a
 /// `NeedsLlmCall` decision that carries the worker's connection + project so
-/// Compute the stop lifecycle phase from the process-global verification
-/// counter, mirroring the native-agent path's logic. The hidden orchestrator
+/// Compute the stop lifecycle phase from the session's verification
+/// attempts, mirroring the native-agent path's logic. The hidden orchestrator
 /// needs this to apply the correct confidence threshold (Working: lenient,
 /// PreStop/Verified: strict) and to include it in the context JSON so the
 /// hidden session can see it.
 #[cfg(feature = "claude-hidden-orchestrator")]
-fn compute_claude_stop_phase() -> crate::context::StopPhase {
-    use std::sync::atomic::Ordering;
-    let verification_count = crate::VERIFICATION_COUNT.load(Ordering::Relaxed);
+fn compute_claude_stop_phase(session_id: &str) -> crate::context::StopPhase {
+    let verification_count = crate::chain::verification_attempts(session_id);
     let max = crate::AutoPromptConfig::load()
         .map(|c| c.max_verification_attempts)
         .unwrap_or(2);
@@ -589,7 +605,7 @@ fn claude_decision_hidden(
         return AutoPromptDecision::NoAction;
     };
 
-    let iteration_count = get_iteration();
+    let iteration_count = crate::chain::current_turn(&session_id.to_string());
     log::info!(
         "[auto_prompt::claude] iteration {iteration_count}, handing to HIDDEN Claude orchestrator"
     );
@@ -604,7 +620,7 @@ fn claude_decision_hidden(
     // Synchronous main-thread read: serves the prewarmed origin snapshot.
     let plan_files =
         crate::read_plan_files_cached(&crate::plan_inputs_without_message(&thread.read(cx)));
-    let stop_phase = compute_claude_stop_phase();
+    let stop_phase = compute_claude_stop_phase(&session_id.to_string());
 
     let context_json = serde_json::json!({
         "session_id": session_id.to_string(),

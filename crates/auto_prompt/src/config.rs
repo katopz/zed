@@ -16,7 +16,8 @@ pub struct AutoPromptConfig {
     #[serde(default)]
     pub system_prompt: Option<String>,
 
-    /// Maximum number of auto-prompt iterations before hard-stopping the loop.
+    /// Consecutive turns without progress (no edit, commit or push) before
+    /// the chain hard-stops. Counted per session; productive turns reset it.
     #[serde(default = "default_max_iterations")]
     pub max_iterations: u32,
 

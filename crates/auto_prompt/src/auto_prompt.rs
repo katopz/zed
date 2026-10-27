@@ -7,6 +7,7 @@
 
 pub mod api_unreachable;
 pub mod auth_failure;
+mod chain;
 pub mod claude_agent;
 mod config;
 pub mod context;
@@ -17,7 +18,6 @@ mod pending_question;
 pub mod plan_registry;
 mod plan_source;
 pub mod session_limit;
-mod stall;
 pub mod watchdog;
 
 /// Test-harness hook: disables `plan_source`'s real git process spawns so
@@ -46,20 +46,8 @@ use language_model::{
 use lightweight_context::{count_actionable_tasks, has_unchecked_items, is_actionable_checkbox};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
-
-/// Seconds of inactivity before an auto-prompt chain is considered stale.
-const CHAIN_TIMEOUT_SECS: u64 = 300;
-
-/// Iteration counter for the current auto-prompt chain.
-static AUTO_PROMPT_ITERATION: AtomicU32 = AtomicU32::new(0);
-
-/// UNIX timestamp of the last auto-prompt iteration.
-static LAST_ITERATION_SECS: AtomicU64 = AtomicU64::new(0);
-
-/// Pre-stop verification attempt counter for the current chain.
-static VERIFICATION_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// LLM orchestration call failure counter for the current chain.
 static AUTO_PROMPT_LLM_FAILURE_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -973,8 +961,8 @@ pub fn summary_continuation_fast_path(data: &LlmCallData) -> Option<AutoPromptOu
             });
         }
         Some(SummaryContinuation::Steps(steps)) => {
-            let repeats = stall::record_summary_steps(&data.session_id.to_string(), &steps);
-            if repeats >= stall::MAX_UNCHANGED_REPEATS {
+            let repeats = chain::record_summary_steps(&data.session_id.to_string(), &steps);
+            if repeats >= chain::MAX_UNCHANGED_REPEATS {
                 log::warn!(
                     "[auto_prompt] summary fast path: next steps unchanged for {repeats} summaries in a row — stopping the chain (no progress possible without the user)"
                 );
@@ -1060,7 +1048,7 @@ fn decide_precheck(
         serde_json::json!({
             "stop_reason": format!("{stop_reason:?}"),
             "used_tools": used_tools,
-            "iteration": AUTO_PROMPT_ITERATION.load(Ordering::Relaxed),
+            "iteration": chain::current_turn(&thread.read(cx).session_id().to_string()),
         }),
     );
 
@@ -1135,14 +1123,19 @@ fn decide_precheck(
 
     log::info!("[auto_prompt::decide] Stop reason: {:?}", stop_reason);
 
-    // Before `get_iteration()`: connectivity retries have their own bounded
+    // Before `chain::record_turn`: connectivity retries have their own bounded
     // budget and must not burn the chain's max-iterations runaway budget —
     // otherwise a short outage ends the chain a few retries in. Also before
     // any path that would call the dead API.
     if let Some(decision) = api_unreachable_decision(thread, &config, cx) {
         return DecidePrecheck::Decision(decision);
     }
-    let iteration_count = get_iteration();
+    let session_id_str = thread.read(cx).session_id().to_string();
+    let turn = chain::record_turn(
+        &session_id_str,
+        chain::turn_made_progress(thread.read(cx).entries()),
+    );
+    let iteration_count = turn.turn;
 
     // Rule-based check: if the last tool call was an interactive auth command
     // (browser login, device auth, etc.), the user is mid-flow — don't chain.
@@ -1156,23 +1149,23 @@ fn decide_precheck(
     }
 
     log::info!(
-        "[auto_prompt::decide] Current iteration: {}",
-        iteration_count
+        "[auto_prompt::decide] Current iteration: {iteration_count} ({} without progress)",
+        turn.idle_turns
     );
 
-    if iteration_count > config.max_iterations {
+    if turn.idle_turns > config.max_iterations {
         log::info!(
-            "[auto_prompt::decide] Max iterations ({}) reached, stopping chain",
+            "[auto_prompt::decide] {} turns in a row without progress (max {}), stopping chain",
+            turn.idle_turns,
             config.max_iterations
         );
-        let session_id_str = thread.read(cx).session_id().to_string();
-        clear_summary_for_session(&session_id_str);
         reset_iteration_with_session(&session_id_str);
         debug_log::write_log(
             "no_action",
             serde_json::json!({
                 "reason": "max_iterations",
                 "iteration": iteration_count,
+                "idle_turns": turn.idle_turns,
                 "max_iterations": config.max_iterations,
             }),
         );
@@ -1191,7 +1184,7 @@ fn decide_precheck(
     let model = configured_model;
     log::info!("[auto_prompt::decide] Using model: {:?}", model.id());
 
-    let verification_count = VERIFICATION_COUNT.load(Ordering::Relaxed);
+    let verification_count = chain::verification_attempts(&session_id_str);
     let stop_phase = if verification_count == 0 {
         StopPhase::Working
     } else if verification_count >= config.max_verification_attempts {
@@ -3163,7 +3156,8 @@ pub async fn decide_with_llm(
                             }
                         }
 
-                        let verification_count = VERIFICATION_COUNT.load(Ordering::Relaxed);
+                        let verification_count =
+                            chain::verification_attempts(&data.session_id.to_string());
                         let max_verifications = data.max_verification_attempts;
 
                         if verification_count >= max_verifications {
@@ -3179,7 +3173,7 @@ pub async fn decide_with_llm(
                             log::info!(
                                 "auto_prompt: WantsStop ('{reason}') — initiating pre-stop verification (attempt {attempt}/{max_verifications})"
                             );
-                            VERIFICATION_COUNT.fetch_add(1, Ordering::Relaxed);
+                            chain::record_verification_attempt(&data.session_id.to_string());
 
                             match build_pre_stop_verification_prompt(
                                 &data.context_json,
@@ -3370,8 +3364,6 @@ fn is_interactive_auth_command(command: &str) -> bool {
 }
 
 pub fn reset_iteration() {
-    AUTO_PROMPT_ITERATION.store(0, Ordering::Relaxed);
-    VERIFICATION_COUNT.store(0, Ordering::Relaxed);
     AUTO_PROMPT_LLM_FAILURE_COUNT.store(0, Ordering::Relaxed);
     // Summary state is now per-session in SUMMARY_REGISTRY and cleared
     // via clear_summary_for_session / reset_iteration_with_session.
@@ -3383,7 +3375,7 @@ pub fn reset_iteration() {
 pub fn reset_iteration_with_session(session_id: &str) {
     reset_iteration();
     clear_summary_for_session(session_id);
-    stall::clear_session(session_id);
+    chain::clear_session(session_id);
     plan_registry::release_all_for_session(session_id);
 }
 
@@ -3393,31 +3385,6 @@ pub fn increment_llm_failure_count() -> u32 {
 
 pub fn reset_llm_failure_count() {
     AUTO_PROMPT_LLM_FAILURE_COUNT.store(0, Ordering::Relaxed);
-}
-
-pub(crate) fn get_iteration() -> u32 {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    let last = LAST_ITERATION_SECS.load(Ordering::Relaxed);
-
-    if last > 0 && now.saturating_sub(last) > CHAIN_TIMEOUT_SECS {
-        log::info!(
-            "auto_prompt: chain timeout ({}s since last iteration), resetting",
-            now.saturating_sub(last)
-        );
-        AUTO_PROMPT_ITERATION.store(0, Ordering::Relaxed);
-        // Clear all stale summary states on chain timeout
-        with_summary_registry(|map| map.clear());
-    }
-
-    let iteration = AUTO_PROMPT_ITERATION.fetch_add(1, Ordering::Relaxed) + 1;
-    LAST_ITERATION_SECS.store(now, Ordering::Relaxed);
-
-    log::debug!("auto_prompt: iteration {iteration}");
-    iteration
 }
 
 /// Cheap inputs needed to read the `.plans/`/`.docs/` context files off the
@@ -5567,7 +5534,7 @@ mod tests {
         // as actionable, but nothing changes between summaries.
         let session = "summary-fast-path-stall-test";
         clear_summary_for_session(session);
-        stall::clear_session(session);
+        chain::clear_session(session);
         let summary = "## Summary\n\nRe-checked; no change.\n\n## What Remains\n\n\
                        - Run the real M3 to M5 test.\n\
                        - Score the verdict cohort.";
@@ -5576,9 +5543,9 @@ mod tests {
             data.context_exceeds_limit = false;
             summary_continuation_fast_path(&data)
         };
-        for round in 0..=stall::MAX_UNCHANGED_REPEATS {
+        for round in 0..=chain::MAX_UNCHANGED_REPEATS {
             let result = outcome();
-            if round < stall::MAX_UNCHANGED_REPEATS {
+            if round < chain::MAX_UNCHANGED_REPEATS {
                 assert!(
                     matches!(result, Some(AutoPromptOutcome::Continue(_))),
                     "round {round}: {result:?}"
