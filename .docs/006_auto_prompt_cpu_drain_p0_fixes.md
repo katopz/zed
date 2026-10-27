@@ -286,6 +286,30 @@ farm session with sibling agents active):
   keyed by resolved config, fork-on-write on config drift) filed as
   `.issues/020_context_server_per_project_duplication.md`. Not a CPU driver:
   the duplicates are idle remote-HTTP bridges; the tax is memory/footprint.
+- **Issue 020 closed (2026-10-27): fixed by configuration, registry declined.**
+  New evidence: the bigger tax was per *ACP agent session*, not per project.
+  Every Claude ACP session gets the MCP list in `session/new` and spawns its
+  own copies (6 sessions × 3 = 18 node processes, plus 6 under zed: ~1.2 GB).
+  Two of the three Z.AI servers (`web-reader`, `web-search`) are
+  `supergateway --streamableHttp` node bridges in front of remote Streamable
+  HTTP endpoints, which answer `initialize` directly with `Authorization:
+  Bearer <key>`. Fix: user `settings.json` declares them as `Http` context
+  servers under the same ids (`url` + `headers`; a settings entry wins over
+  the extension descriptor, `context_server_store.rs` `or_insert`), so tool
+  names are unchanged. Result: Zed's own fleet 6 → 2 processes immediately
+  (only `vision`, which is genuinely local); new Claude sessions get
+  `McpServer::Http` (claude-agent-acp advertises `mcpCapabilities.http`)
+  and spawn 1 instead of 3. Registry declined: (1) its key includes the
+  resolved working dir, but the measured duplicates had *different* cwds, so
+  it would not have deduplicated the case it was filed for, and dropping cwd
+  from the key silently changes cwd-dependent servers; (2) per-agent copies
+  are inherent to ACP (each agent owns its MCP connections) and a Zed-side
+  registry cannot touch them; (3) what is left is one ~50 MB `vision` per
+  extra project, not worth reshaping the high-churn upstream
+  `context_server_store.rs`. Re-open trigger: a local-only stdio server
+  fleet that is heavy per instance. Rule for new MCP servers: if the server
+  is a remote endpoint behind a stdio bridge, configure it as `url` +
+  `headers` instead of installing the bridge.
 
 Analysis-issue archive note: the original `.issues/006` file (Jul 19 evidence
 tables, root-cause corrections, recommended-fix priorities) was absorbed into
