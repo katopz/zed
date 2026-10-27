@@ -1,5 +1,5 @@
 # 038 — Isolate the fork lane from upstream files (shrink merge-conflict surface)
-Status: in progress — `script/fork-surface` shipped; acp_thread fork API extracted; surface 16,609 → 16,428 lines
+Status: in progress — `script/fork-surface` shipped; acp_thread + agent fork APIs extracted; surface 16,609 → ~16,160 lines
 
 ## Why
 
@@ -37,7 +37,7 @@ to it. Pattern proven by plan 037 (`acp/detachable.rs`: 7 one-line upstream touc
 - [ ] `conversation_view.rs` → auto-allow countdown + watchdog glue into `conversation_view/auto_allow.rs`
 - [ ] `agent_panel.rs` → retained-thread cap + war-room into `agent_panel_fork.rs`
 - [ ] `agent/src/thread.rs` → idle-timeout + retry-cap policies into `thread_fork_policy.rs` (pure fns, unit-tested)
-- [ ] `agent/src/agent.rs` → mailbox/verdict/seed_history into `agent_fork.rs` (impl blocks on NativeAgent in a separate file)
+- [x] `agent/src/agent.rs` → `agent_fork.rs`: CLAUDE.md symlink (+ statics), `seed_history`, verdict subagent, peer-thread list/send (trait methods now one-line delegations), `running_successor_execution`; agent.rs fork lines 565 → 295 (remaining: struct fields, call-site seams, internal_tests regression tests)
 - [x] `acp_thread.rs` → fork `impl AcpThread` (board notification, bloat candidates, subagent retry completion, api-error/turn-id accessors) + `tool_call_bloat_label` moved to `acp_thread/src/fork.rs`; acp_thread.rs fork lines 409 → 216 (remaining: enum variant, struct fields, inline turn-truncation note, regression test that needs private `tests` helpers). Also fixed `acp_thread` standalone build: uuid `v7` feature was only satisfied via workspace unification
 - [ ] Fork-only settings (`stream_idle_timeout_secs`, `verdict_max_rounds`, …) → one `fork: ForkAgentSettings` sub-struct so upstream settings structs get a single field
 - [ ] Re-merge dry run against next upstream: target ≤ 15 conflicted files

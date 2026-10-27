@@ -1,3 +1,4 @@
+mod agent_fork;
 mod db;
 mod legacy_thread;
 mod native_agent_server;
@@ -596,18 +597,6 @@ static RULES_FILE_REL_PATHS: LazyLock<Vec<Arc<RelPath>>> = LazyLock::new(|| {
                 .map(|path| path.into_arc())
         })
         .collect()
-});
-
-static AGENTS_MD_REL_PATH: LazyLock<Option<Arc<RelPath>>> = LazyLock::new(|| {
-    RelPath::from_unix_str(claude_md_symlink::AGENTS_MD)
-        .ok()
-        .map(|path| path.into_arc())
-});
-
-static CLAUDE_MD_REL_PATH: LazyLock<Option<Arc<RelPath>>> = LazyLock::new(|| {
-    RelPath::from_unix_str(claude_md_symlink::CLAUDE_MD)
-        .ok()
-        .map(|path| path.into_arc())
 });
 
 static AGENTS_PREFIX: LazyLock<Option<Arc<RelPath>>> = LazyLock::new(|| {
@@ -1482,47 +1471,6 @@ impl NativeAgent {
         })
     }
 
-    /// Symlinks `CLAUDE.md` onto this worktree's `AGENTS.md`, so Claude Code
-    /// reads the same project instructions the native agent does.
-    ///
-    /// Returns `None` — touching the filesystem not at all — unless the
-    /// worktree is local, has an `AGENTS.md`, and has no `CLAUDE.md` yet. The
-    /// entry lookups are in-memory, so the steady state after the link exists
-    /// costs nothing on the repeated project-context refreshes.
-    fn link_project_claude_md(
-        worktree: &Entity<Worktree>,
-        project: &Entity<Project>,
-        cx: &App,
-    ) -> Option<Task<()>> {
-        if !AgentSettings::get_global(cx).project_claude_md_symlink {
-            return None;
-        }
-
-        let fs = project.read(cx).fs().clone();
-        let worktree = worktree.read(cx);
-        // Remote worktrees don't live on the filesystem `fs` addresses.
-        worktree.as_local()?;
-
-        let has_agents_md = AGENTS_MD_REL_PATH
-            .as_ref()
-            .and_then(|path| worktree.entry_for_path(path))
-            .is_some_and(|entry| entry.is_file());
-        let has_claude_md = CLAUDE_MD_REL_PATH
-            .as_ref()
-            .and_then(|path| worktree.entry_for_path(path))
-            .is_some();
-        if !has_agents_md || has_claude_md {
-            return None;
-        }
-
-        let worktree_root = worktree.abs_path();
-        Some(cx.background_spawn(async move {
-            claude_md_symlink::link_project_claude_md(fs.as_ref(), &worktree_root)
-                .await
-                .log_err();
-        }))
-    }
-
     fn load_worktree_rules_file(
         worktree: Entity<Worktree>,
         project: Entity<Project>,
@@ -1918,12 +1866,7 @@ impl NativeAgent {
                         .update(cx, |this, cx| {
                             let project_id = this.get_or_create_project_state(&project, cx);
                             this.pending_sessions.remove(&id);
-                            this.register_session(
-                                thread.clone(),
-                                project_id,
-                                work_dirs.clone(),
-                                cx,
-                            )
+                            this.register_session(thread.clone(), project_id, work_dirs.clone(), cx)
                         })
                         .map_err(Arc::new)?;
                     let events = thread.update(cx, |thread, cx| thread.replay(cx));
@@ -2512,41 +2455,6 @@ impl NativeAgentConnection {
     ) -> Task<Result<Entity<Thread>>> {
         self.0
             .update(cx, |this, cx| this.load_thread(id, project, cx))
-    }
-
-    /// Seeds an already-created native session with `messages`, replaying that
-    /// history into the session's [`AcpThread`] as real rendered turns and tool
-    /// cards.
-    ///
-    /// This is the native-agent branch path for "Branch New Thread": the caller
-    /// creates a fresh, empty session through the normal panel wiring, then
-    /// calls this to fork another thread's message history into it. Unlike
-    /// flattening the conversation into a single composer message, the new
-    /// thread carries the original user/assistant message boundaries so tool
-    /// cards, thinking blocks, and per-message structure survive the fork.
-    ///
-    /// The returned task resolves once the replayed events have been drained
-    /// into the AcpThread.
-    pub fn seed_history(
-        &self,
-        session_id: &acp_v2::SessionId,
-        messages: Vec<Arc<Message>>,
-        cx: &mut App,
-    ) -> Task<Result<acp_v2::StopReason>> {
-        let Some((thread, acp_thread)) = self.0.update(cx, |agent, _cx| {
-            agent
-                .sessions
-                .get(session_id)
-                .map(|s| (s.thread.clone(), s.acp_thread.clone()))
-        }) else {
-            return Task::ready(Err(anyhow!("session not found for seed_history")));
-        };
-
-        let events = thread.update(cx, |thread, cx| {
-            thread.set_messages(messages, cx);
-            thread.replay(cx)
-        });
-        Self::handle_thread_events(events, acp_thread, None, cx)
     }
 
     pub fn send_and_wait_for_completion(
@@ -3762,21 +3670,6 @@ impl NativeThreadEnvironment {
         self.create_subagent_thread_inner(label, model, cx)
     }
 
-    /// Creates a subagent pinned to `model_override` (the secondary reviewer),
-    /// else the configured `verdict_model`, else the parent thread's model.
-    /// Used by the `request_verdict` tool so the reviewer can be a different
-    /// model than the worker.
-    pub(crate) fn create_verdict_subagent_thread(
-        &self,
-        label: String,
-        model_override: Option<LanguageModelSelection>,
-        cx: &mut App,
-    ) -> Result<Rc<dyn SubagentHandle>> {
-        let model =
-            model_override.or_else(|| AgentSettings::get_global(cx).verdict_model.clone());
-        self.create_subagent_thread_inner(label, model, cx)
-    }
-
     fn create_subagent_thread_inner(
         &self,
         label: String,
@@ -4060,18 +3953,7 @@ impl ThreadEnvironment for NativeThreadEnvironment {
     }
 
     fn list_threads(&self, cx: &mut App) -> Result<Vec<ThreadListing>> {
-        let requester = self
-            .thread
-            .upgrade()
-            .context("Thread no longer exists")?
-            .read(cx)
-            .id()
-            .clone();
-        self.agent
-            .upgrade()
-            .context("Agent no longer exists")?
-            .read(cx)
-            .list_threads(&requester, cx)
+        self.list_peer_threads(cx)
     }
 
     fn send_message_to_thread(
@@ -4079,52 +3961,7 @@ impl ThreadEnvironment for NativeThreadEnvironment {
         request: ThreadMessageRequest,
         cx: &mut AsyncApp,
     ) -> Task<Result<ThreadMessageOutcome>> {
-        let agent = self.agent.clone();
-        let sender_thread = self.thread.clone();
-        cx.spawn(async move |cx| {
-            let sender = sender_thread.read_with(cx, |thread, _| thread.id().clone())?;
-            let wait_for_reply = request.wait_for_reply;
-            let (session_id, title, posted) = agent.update(cx, |agent, cx| {
-                agent.post_thread_message(&sender, request, cx)
-            })??;
-
-            let delivery = match posted {
-                thread_mailbox::PostedMessage::Queued { position } => {
-                    ThreadMessageDelivery::Queued { position }
-                }
-                thread_mailbox::PostedMessage::Delivered { delivery, thread } => {
-                    let turn = cx.update(|cx| delivery.start(cx));
-                    // The turn runs detached so cancelling this tool call
-                    // never cancels the recipient's turn.
-                    let (response_tx, response_rx) = oneshot::channel();
-                    cx.spawn(async move |_| {
-                        response_tx.send(turn.await).ok();
-                    })
-                    .detach();
-
-                    let reply = if wait_for_reply {
-                        let response = response_rx
-                            .await
-                            .context("The target thread was dropped")??;
-                        if matches!(response, acp_v2::StopReason::Cancelled) {
-                            anyhow::bail!("The target thread's turn was cancelled");
-                        }
-                        thread.read_with(cx, |thread, _| {
-                            thread_mailbox::last_agent_message_text(thread)
-                        })
-                    } else {
-                        None
-                    };
-                    ThreadMessageDelivery::Delivered { reply }
-                }
-            };
-
-            Ok(ThreadMessageOutcome {
-                session_id,
-                title,
-                delivery,
-            })
-        })
+        self.send_peer_message(request, cx)
     }
 }
 
@@ -4275,32 +4112,6 @@ impl SubagentHandle for NativeSubagentHandle {
                 })
             }
         })
-    }
-}
-
-impl NativeSubagentHandle {
-    /// Returns the completion of a still-running native execution for the
-    /// subagent session, i.e. a retry that replaced the execution whose
-    /// completion already resolved. `None` means nothing replaced it, so the
-    /// cancellation was genuine.
-    fn running_successor_execution(
-        acp_thread: &Entity<AcpThread>,
-        session_id: &acp_v2::SessionId,
-        cx: &App,
-    ) -> Option<NativeCompletion> {
-        let connection = acp_thread
-            .read(cx)
-            .connection()
-            .clone()
-            .into_any()
-            .downcast::<NativeAgentConnection>()
-            .ok()?;
-        let execution = connection.0.read(cx).sessions.get(session_id)?.execution.as_ref()?;
-        execution
-            .completion
-            .peek()
-            .is_none()
-            .then(|| execution.completion.clone())
     }
 }
 
