@@ -818,7 +818,13 @@ impl AgentConfigOptionValue {
     pub fn as_bool(&self) -> Option<bool> {
         match self {
             Self::Boolean(value) => Some(*value),
-            Self::ValueId(_) => None,
+            // Agents expose toggles as an "on"/"off" select to clients without
+            // boolean config support, so older saved defaults hold those strings.
+            Self::ValueId(value) => match value.to_ascii_lowercase().as_str() {
+                "on" | "true" => Some(true),
+                "off" | "false" => Some(false),
+                _ => None,
+            },
         }
     }
 }
@@ -1196,6 +1202,13 @@ mod tests {
                 .expect("deserialize boolean"),
             AgentConfigOptionValue::Boolean(true)
         );
+    }
+
+    #[test]
+    fn agent_config_option_value_reads_legacy_on_off_strings_as_bool() {
+        assert_eq!(AgentConfigOptionValue::from("on").as_bool(), Some(true));
+        assert_eq!(AgentConfigOptionValue::from("Off").as_bool(), Some(false));
+        assert_eq!(AgentConfigOptionValue::from("manual").as_bool(), None);
     }
 
     #[test]

@@ -169,6 +169,8 @@ impl AcpConnectionDefaults {
     }
 }
 
+const DEFAULT_CONFIG_PROMPT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
 struct PendingAcpSession {
     thread: WeakEntity<AcpThread>,
     task: Shared<Task<Result<(), Arc<anyhow::Error>>>>,
@@ -822,7 +824,7 @@ impl AcpConnection {
         thread: &Entity<AcpThread>,
         session_modes: Option<Rc<RefCell<acp::SessionModeState>>>,
         config_options: Option<ConfigOptions>,
-        default_config_task: Option<Task<()>>,
+        default_config_task: Option<Shared<Task<()>>>,
         cx: &mut App,
     ) {
         let release_subscription = cx.observe_release(thread, {
@@ -1449,6 +1451,7 @@ impl AgentConnection for AcpConnection {
             let session_id = acp_v2::SessionId::new(response.session_id.0);
             let default_config_task = config_options.as_ref().map(|options| {
                 self.apply_default_config_options(&session_id, options, cx)
+                    .shared()
             });
 
             let action_log = cx.new(|_| ActionLog::new(project.clone()));
@@ -1671,7 +1674,18 @@ impl AgentConnection for AcpConnection {
         };
         let conn = self.connection.clone();
         let sessions = self.sessions.clone();
+        let pending_defaults = sessions
+            .borrow()
+            .get(&session_id)
+            .and_then(|session| session.default_config_task.clone());
+        let defaults_timeout = cx.background_executor().timer(DEFAULT_CONFIG_PROMPT_WAIT);
         cx.foreground_executor().spawn(async move {
+            // A prompt sent right after session creation (e.g. an auto-prompt handoff)
+            // would otherwise run on the agent's own model/effort, not the saved defaults.
+            // Bounded so an agent that never answers a config request can't wedge the turn.
+            if let Some(pending_defaults) = pending_defaults {
+                futures::future::select(pending_defaults, defaults_timeout).await;
+            }
             let result = conn.send_request(params).block_task().await;
 
             let mut suppress_abort_err = false;
@@ -6798,7 +6812,7 @@ mod tests {
             .borrow_mut()
             .get_mut(&session_id)
             .expect("registered session")
-            .default_config_task = Some(defaults);
+            .default_config_task = Some(defaults.shared());
         cx.run_until_parked();
         assert_eq!(requests.lock().expect("requests").len(), 1);
         drop(thread);
