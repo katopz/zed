@@ -105,3 +105,11 @@ would read worse than two-character labels.
 - macOS will prompt once for keychain access ("Zed wants to access key
   'Claude Code-credentials'"). Choosing *Always Allow* makes it silent; denying
   it falls through to the credentials file and then hides the rings.
+
+## Regression 2026-10-28 — rings vanished (stale keychain item)
+Two `Claude Code-credentials` keychain items can coexist (one per login
+account). The service-only `security find-generic-password -s` lookup returned
+the stale `seal1` item whose token expired 2026-10-26, so every poll 401'd and
+the rings stayed hidden (only the first failure logs at `warn`, and that line
+had rotated out of `Zed.log`). Fix: query `-a $USER` first — the account Claude
+Code writes — then fall back to service-only.

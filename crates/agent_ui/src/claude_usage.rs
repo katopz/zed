@@ -266,10 +266,27 @@ async fn read_access_token() -> Result<String> {
 
 #[cfg(target_os = "macos")]
 async fn read_token_from_keychain() -> Result<Option<String>> {
+    // Claude Code keys its item by the OS username. A stale item for another
+    // account can share the service name (e.g. after switching logins), and a
+    // service-only lookup returns whichever comes first — an expired token that
+    // 401s forever and hides the rings.
+    if let Ok(account) = std::env::var("USER")
+        && let Some(token) = read_keychain_item(&["-a", &account]).await?
+    {
+        return Ok(Some(token));
+    }
+    read_keychain_item(&[]).await
+}
+
+#[cfg(target_os = "macos")]
+async fn read_keychain_item(extra_args: &[&str]) -> Result<Option<String>> {
     // Claude Code stores its credentials as a generic password, which gpui's
     // `read_credentials` (internet passwords, keyed by server) cannot reach.
     let mut command = util::command::new_command("/usr/bin/security");
-    command.args(["find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"]);
+    command
+        .args(["find-generic-password", "-s", KEYCHAIN_SERVICE])
+        .args(extra_args)
+        .arg("-w");
     let output = command
         .output()
         .await
