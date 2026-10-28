@@ -83,6 +83,22 @@ pub(crate) enum SummaryContinuation {
     Terminal,
 }
 
+/// The keyword a worker emits (alone on a line) to end the auto-prompt chain.
+/// This is the worker's only deterministic channel to halt chaining when
+/// everything left is blocked, owner-gated, or waiting on the user — prose
+/// deferrals get reworded every round, which defeats repetition fingerprints
+/// and lets the chain re-prompt forever (`loop-bug`).
+pub(crate) const STOP_KEYWORD: &str = "<stop>";
+
+/// True when the message contains the stop keyword on a line of its own
+/// (case-insensitive, surrounding whitespace ignored). A line-anchored match
+/// keeps prose mentions — quoting or explaining the keyword — from stopping
+/// the chain by accident.
+pub(crate) fn message_requests_stop(text: &str) -> bool {
+    text.lines()
+        .any(|line| line.trim().eq_ignore_ascii_case(STOP_KEYWORD))
+}
+
 /// Nothing-left cues: phrases a summary uses to declare that no work remains.
 pub(crate) const NOTHING_LEFT_CUES: &[&str] = &[
     "nothing left",
@@ -219,8 +235,9 @@ pub(crate) fn housekeeping_continuation() -> String {
      2. Mine the next riir-clippy batch; search online to unblock any blocked task.\n\
      3. Re-run benchmarks if the working tree is dirty.\n\
      4. If no issues, plans, or proposals remain in this repo, look for unclaimed work \
-     in the other workspace repos — only where no other agent is active.\n\
-     5. If nothing actionable remains, stop cleanly; do not invent work."
+     in the other workspace repos — only where no other agent is active.\
+     \n5. If nothing actionable remains, stop cleanly: end your final message with a \
+     single line containing only `<stop>`; do not invent work."
         .to_string()
 }
 
@@ -897,6 +914,23 @@ pub(crate) fn build_checkbox_verification_prompt(context_json: &str) -> Option<S
 mod tests {
     use super::*;
     use crate::should_defer_after_retry_exhaustion;
+
+    #[test]
+    fn stop_keyword_matches_only_when_alone_on_a_line() {
+        assert!(message_requests_stop("<stop>"));
+        assert!(message_requests_stop("done for now\n<stop>"));
+        assert!(message_requests_stop("  <STOP>  "));
+        assert!(message_requests_stop("## Summary\nAll blocked.\n<stop>\n"));
+        // Prose mentions — quoting or explaining the keyword — must not stop
+        // the chain.
+        assert!(!message_requests_stop(
+            "say <stop> on its own line to halt the chain"
+        ));
+        assert!(!message_requests_stop("<stop>extra"));
+        assert!(!message_requests_stop("<stop\n>"));
+        assert!(!message_requests_stop(""));
+        assert!(!message_requests_stop("no stop here"));
+    }
 
     #[test]
     fn deferral_markers_match_only_at_word_starts() {

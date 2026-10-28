@@ -16,7 +16,7 @@ use std::time::Duration;
 
 /// Phase 1 request sent to the SAME thread — no `## 1/## 2/## 3` headers
 /// since the AI already has full conversation context. Raw instruction only.
-pub(crate) const CONTEXT_OVERFLOW_SUMMARY_PROMPT: &str = "Stop what you are doing and provide a concise summary of your progress. Include: (1) what was the original task, (2) what was accomplished, (3) what remains to be done, (4) the current state of any active plans (reference by filename). Be thorough — this summary will be used to continue in a fresh context.";
+pub(crate) const CONTEXT_OVERFLOW_SUMMARY_PROMPT: &str = "Stop what you are doing and provide a concise summary of your progress. Include: (1) what was the original task, (2) what was accomplished, (3) what remains to be done, (4) the current state of any active plans (reference by filename). Be thorough — this summary will be used to continue in a fresh context. If nothing remains to be done, end the summary with a single line containing only <stop> so the chain halts instead of continuing.";
 
 /// Same-thread continuation for a MaxTokens stop where the window still has
 /// room: the generation hit the model's OUTPUT cap, not the context window,
@@ -375,6 +375,9 @@ pub(crate) fn context_overflow_outcome(data: &LlmCallData) -> AutoPromptOutcome 
         // UI sends a "summarize" message to the current thread.
         let next_prompt = CONTEXT_OVERFLOW_SUMMARY_PROMPT.to_string();
         set_summary_state(&session_id_str, 1);
+        // The summarize request lands in the same thread, so the stop that
+        // follows it is a chained hop — keep the chain state alive across it.
+        chain::arm_continuation(&session_id_str);
         log::info!(
             "[auto_prompt::context_overflow] Returning ContextOverflow — requesting summary from AI (session={session_id_str})"
         );

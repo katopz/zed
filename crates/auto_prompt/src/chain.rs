@@ -8,7 +8,7 @@
 //! verification progress (`.issues/037`; `api_unreachable` fixed the same
 //! defect for its retry streaks).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash as _, Hasher as _};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -44,6 +44,34 @@ pub struct TurnCount {
 
 static CHAINS: Mutex<Option<HashMap<String, ChainState>>> = Mutex::new(None);
 
+/// Sessions a same-thread auto-prompt continuation was just dispatched to.
+/// The next finished turn on such a session counts as the same chain no
+/// matter how long the turn took: agentic turns routinely outlive
+/// `CHAIN_TIMEOUT_SECS`, and applying the timeout to chained hops resets
+/// the idle streak every round, so the runaway cap could never fire on a
+/// slow idle loop (`loop-bug`). One-shot: consumed by the next
+/// [`record_turn`].
+static CONTINUATION_ARMED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+fn with_continuation_armed<R>(f: impl FnOnce(&mut HashSet<String>) -> R) -> R {
+    let mut guard = CONTINUATION_ARMED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    f(guard.get_or_insert_with(HashSet::new))
+}
+
+/// Marks the session's next finished turn as auto-prompt-chained. Called
+/// when a continuation outcome targeting the same thread is built.
+pub fn arm_continuation(session_id: &str) {
+    with_continuation_armed(|armed| {
+        armed.insert(session_id.to_string());
+    });
+}
+
+fn take_armed_continuation(session_id: &str) -> bool {
+    with_continuation_armed(|armed| armed.remove(session_id))
+}
+
 fn with_chain<R>(session_id: &str, f: impl FnOnce(&mut ChainState) -> R) -> R {
     let mut guard = CHAINS
         .lock()
@@ -61,13 +89,36 @@ fn now_secs() -> u64 {
 
 /// Counts a finished turn for the session. A turn that made progress resets
 /// the idle streak, so the cap never cuts off a chain that keeps landing work.
+/// A turn following an auto-prompt continuation ([`arm_continuation`]) never
+/// counts as a chain timeout, however long the worker turn took.
 pub fn record_turn(session_id: &str, made_progress: bool) -> TurnCount {
-    record_turn_at(session_id, made_progress, now_secs())
+    let chained = take_armed_continuation(session_id);
+    record_turn_at_impl(session_id, made_progress, chained, now_secs())
 }
 
+/// Test seam for [`record_turn`]'s timeout behavior with a fixed clock.
+#[cfg(test)]
 fn record_turn_at(session_id: &str, made_progress: bool, now: u64) -> TurnCount {
+    record_turn_at_impl(session_id, made_progress, false, now)
+}
+
+/// Test seam for [`record_turn`]'s auto-chained hop behavior with a fixed
+/// clock.
+#[cfg(test)]
+fn record_turn_at_chained(session_id: &str, made_progress: bool, now: u64) -> TurnCount {
+    record_turn_at_impl(session_id, made_progress, true, now)
+}
+
+fn record_turn_at_impl(
+    session_id: &str,
+    made_progress: bool,
+    chained: bool,
+    now: u64,
+) -> TurnCount {
     with_chain(session_id, |chain| {
-        if chain.last_turn_secs > 0 && now.saturating_sub(chain.last_turn_secs) > CHAIN_TIMEOUT_SECS
+        if !chained
+            && chain.last_turn_secs > 0
+            && now.saturating_sub(chain.last_turn_secs) > CHAIN_TIMEOUT_SECS
         {
             log::info!(
                 "auto_prompt: chain timeout ({}s since the last turn), starting a new chain (session={session_id})",
@@ -157,6 +208,9 @@ pub fn clear_session(session_id: &str) {
     if let Some(chains) = guard.as_mut() {
         chains.remove(session_id);
     }
+    with_continuation_armed(|armed| {
+        armed.remove(session_id);
+    });
 }
 
 /// Whether the latest turn (entries after the last user message) changed
@@ -437,5 +491,49 @@ mod tests {
         assert!(command_lands_work("git pull --rebase -q && git push -q"));
         assert!(!command_lands_work("git status --short && git log -1"));
         assert!(!command_lands_work("ssh host true"));
+    }
+
+    #[test]
+    fn chained_hops_never_time_out_the_chain() {
+        let session = "chain-test-chained";
+        clear_session(session);
+        arm_continuation(session);
+        // First chained hop lands long after the timeout window: the idle
+        // streak must still start at 1, not restart a fresh chain.
+        let late = 1_000 + CHAIN_TIMEOUT_SECS + 1;
+        assert_eq!(
+            record_turn_at_chained(session, false, late),
+            TurnCount {
+                turn: 1,
+                idle_turns: 1
+            }
+        );
+        arm_continuation(session);
+        assert_eq!(
+            record_turn_at_chained(session, false, late + CHAIN_TIMEOUT_SECS + 1).idle_turns,
+            2,
+            "a second chained hop must keep accumulating the idle streak"
+        );
+        // An unchained turn after the timeout still resets — a manual session
+        // that went quiet is a new chain.
+        assert_eq!(
+            record_turn_at(session, false, late + 2 * CHAIN_TIMEOUT_SECS + 2),
+            TurnCount {
+                turn: 1,
+                idle_turns: 1
+            }
+        );
+        clear_session(session);
+    }
+
+    #[test]
+    fn armed_continuation_is_consumed_by_one_turn() {
+        let session = "chain-test-armed-consume";
+        clear_session(session);
+        assert!(!take_armed_continuation(session));
+        arm_continuation(session);
+        assert!(take_armed_continuation(session));
+        assert!(!take_armed_continuation(session));
+        clear_session(session);
     }
 }

@@ -228,6 +228,24 @@ pub fn decide_claude(
         return AutoPromptDecision::NoAction;
     }
 
+    // Worker-requested stop (`<stop>` keyword, loop-bug): an explicit stop
+    // keyword on its own line in the last assistant message ends the chain
+    // deterministically — ahead of the session-limit scheduler, connectivity
+    // retries and idle accounting. This is the worker's only channel to halt
+    // chaining when everything left is blocked or owner-gated.
+    if thread
+        .read(cx)
+        .last_assistant_message_text(cx)
+        .as_deref()
+        .is_some_and(crate::message_requests_stop)
+    {
+        log::warn!(
+            "[auto_prompt::claude] worker emitted the `{}` stop keyword — stopping chain",
+            crate::STOP_KEYWORD
+        );
+        return AutoPromptDecision::NoAction;
+    }
+
     // Session limit: the reset time is embedded in the turn error or the
     // synthetic message ("You've hit your session limit · resets 1:20am
     // (Asia/Bangkok)"). Schedule the continuation at reset + margin instead

@@ -270,6 +270,16 @@ sequenceDiagram
 
 If more than 300 seconds (`CHAIN_TIMEOUT_SECS`) pass between iterations, the chain is considered stale and the iteration counter resets on the next call. This prevents stale chains from accumulating.
 
+Exception: the turn that follows an auto-prompt continuation never counts as a timeout, however long it took. Agentic turns routinely outlive 300s, and applying the timeout to chained hops reset the idle streak every round — the runaway cap (`max_iterations`) could then never fire on a slow idle loop. Continuation builders arm `chain::arm_continuation` when they dispatch same-thread; the next `record_turn` consumes the flag and keeps the chain state.
+
+### Worker stop keyword (`<stop>`)
+
+A worker can halt its own auto-prompt chain deterministically by ending its final message with a line containing only `<stop>` (case-insensitive). `message_requests_stop` matches the keyword only when it is alone on a line, so quoting or explaining it in prose does not stop anything.
+
+The check runs ahead of everything else in both decision paths (`decide_precheck` for the native flow, `decide_claude` for Claude Code threads) — before session-limit scheduling, API-unreachable backoff, idle accounting and the summary fast paths — and once more in `decide_with_llm` as defense in depth. A keyword stop also reads as terminal to `summary_declares_terminal`, so the stop-time housekeeping hook is skipped: nothing new spins up behind an explicit stop.
+
+Continuation prompts teach the keyword (`CONTINUE_REMAINS_DECISION`, the housekeeping continuation, the overflow Phase 1 summarize request): "if everything that remains is blocked, owner-gated, or otherwise not executable now … end your final message with a single line containing only `<stop>`". This is the deterministic fix for re-prompt loops where the worker's prose deferrals get reworded every round and defeat the repetition caps.
+
 ### Stuck-thread watchdog
 
 **Problem**: All other timeouts in auto_prompt run *after* `on_thread_stopped` fires. If the worker LLM stream hangs (provider stall, rate-limit with empty body, ACP protocol dead-end), the thread stays in `Generating` forever and `on_thread_stopped` never fires. None of the existing timeouts can recover from this.

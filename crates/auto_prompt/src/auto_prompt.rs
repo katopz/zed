@@ -56,6 +56,7 @@ use overflow::{
     MAX_TOKENS_RESUME_PROMPT, api_unreachable_decision, context_overflow_outcome,
     cutoff_context_full_outcome, max_tokens_context_window_full, output_bloat_directive,
 };
+pub(crate) use remaining_work::{STOP_KEYWORD, message_requests_stop};
 use remaining_work::{
     SummaryContinuation, detect_remaining_work, extract_summary_next_steps,
     housekeeping_continuation, is_auto_prompt_summary_response, looks_like_voluntary_summary,
@@ -633,6 +634,12 @@ impl std::fmt::Debug for LlmCallData {
 impl LlmCallData {
     pub(crate) fn make_continue_action(&self, next_prompt: String) -> AutoPromptAction {
         let next_prompt = with_bloat_section(&next_prompt, self.bloat_directive.as_deref());
+        // The stop that follows this same-thread continuation must count as
+        // the same chain no matter how long the turn took — otherwise the
+        // chain-timeout reset wipes the idle streak every slow hop and the
+        // runaway cap never fires (`loop-bug`). New-thread forks consume this
+        // flag benignly: the forked session starts a fresh chain anyway.
+        chain::arm_continuation(&self.session_id.to_string());
         AutoPromptAction {
             from_session_id: self.session_id.clone(),
             from_title: self.title.clone(),
@@ -834,7 +841,7 @@ const DECISIVE_STOP_THRESHOLD: f64 = 0.15;
 /// new/same thread is continued with this instruction and the summary itself
 /// carries "what remains". The manual click dispatches this same directive
 /// directly, with no orchestrator call at all.
-pub const CONTINUE_REMAINS_DECISION: &str = "Continue remaining work with best perf/sec, prod-grade decisions (SOLID, DRY); file issues/plans as needed to ensure full coverage. If nothing remains, check other repos for unfinished tasks or do housekeeping (doc-sync, riir-clippy mining, code-smell hunt, online search to distill perf/sec or unblock deferred work).";
+pub const CONTINUE_REMAINS_DECISION: &str = "Continue remaining work with best perf/sec, prod-grade decisions (SOLID, DRY); file issues/plans as needed to ensure full coverage. If nothing remains, check other repos for unfinished tasks or do housekeeping (doc-sync, riir-clippy mining, code-smell hunt, online search to distill perf/sec or unblock deferred work). If everything that remains is blocked, owner-gated, or otherwise not executable now, do not loop on re-checking: end your final message with a single line containing only <stop> — auto-prompt halts the chain when it sees that keyword.";
 
 /// Returns true when the orchestration LLM is decisively stopping.
 /// A decisive stop has very low confidence and no prompt — the LLM is
@@ -1009,6 +1016,12 @@ pub fn summary_declares_terminal(last_assistant_message: Option<&str>) -> bool {
     else {
         return false;
     };
+    // A worker-requested stop (`<stop>` keyword, loop-bug) is terminal even
+    // without a `## Summary` heading: the stop-time housekeeping hook checks
+    // this function and must not spin up new work behind an explicit stop.
+    if message_requests_stop(text) {
+        return true;
+    }
     if !looks_like_voluntary_summary(text) {
         return false;
     }
@@ -1132,6 +1145,28 @@ fn decide_precheck(
 
     log::info!("[auto_prompt::decide] Stop reason: {:?}", stop_reason);
 
+    // Worker-requested stop (`<stop>` keyword, loop-bug): an explicit stop
+    // keyword on its own line in the last assistant message ends the chain
+    // deterministically — ahead of connectivity retries, idle accounting and
+    // every fast path. This is the worker's only channel to halt chaining
+    // when everything left is blocked or owner-gated; prose deferrals get
+    // reworded every round and defeat the repetition caps.
+    let last_assistant_message = thread.read(cx).last_assistant_message_text(cx);
+    if last_assistant_message
+        .as_deref()
+        .is_some_and(message_requests_stop)
+    {
+        log::warn!(
+            "[auto_prompt::decide] worker emitted the `{STOP_KEYWORD}` stop keyword — stopping chain (session={:?})",
+            thread.read(cx).session_id()
+        );
+        debug_log::write_log(
+            "no_action",
+            serde_json::json!({"reason": "worker_stop_keyword"}),
+        );
+        return DecidePrecheck::Decision(AutoPromptDecision::NoAction);
+    }
+
     // Before `chain::record_turn`: connectivity retries have their own bounded
     // budget and must not burn the chain's max-iterations runaway budget —
     // otherwise a short outage ends the chain a few retries in. Also before
@@ -1213,7 +1248,6 @@ fn decide_precheck(
     // Requires reported token usage: without it we can't classify over/under
     // limit cheaply, so fall through to the full pipeline (its chars/4
     // estimate keeps no-usage providers forking).
-    let last_assistant_message = thread.read(cx).last_assistant_message_text(cx);
     let usage = thread
         .read(cx)
         .token_usage()
@@ -1859,6 +1893,23 @@ pub async fn decide_with_llm(
             "[auto_prompt::decide_with_llm] MaxTokens + window full — orchestrating handoff summary then forking (session={session_id_str})"
         );
         return Ok(cutoff_context_full_outcome(&data, &cx).await);
+    }
+
+    // Worker-requested stop (`<stop>` keyword, loop-bug): defense in depth —
+    // decide_precheck / decide_claude already gate on this, but data can be
+    // constructed directly (tests, manual dispatches), so re-check before any
+    // fast path answers a stop request with a continuation.
+    if data
+        .last_assistant_message
+        .as_deref()
+        .is_some_and(message_requests_stop)
+    {
+        log::warn!(
+            "[auto_prompt::decide_with_llm] worker emitted the `{STOP_KEYWORD}` stop keyword — stopping chain (session={session_id_str})"
+        );
+        return Ok(AutoPromptOutcome::Stopped {
+            reason: format!("worker requested stop ({STOP_KEYWORD} keyword)"),
+        });
     }
 
     // ── Summary-first fast path (plan 027, tightened plan 031) ──────────

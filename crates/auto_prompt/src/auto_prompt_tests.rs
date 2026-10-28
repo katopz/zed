@@ -57,6 +57,23 @@ fn overflow_test_data_with(
 }
 
 #[test]
+fn summary_with_stop_keyword_is_terminal() {
+    // A worker-requested stop (`<stop>` on its own line) must read as
+    // terminal even without a `## Summary` heading, so the stop-time
+    // housekeeping hook is skipped too (loop-bug).
+    assert!(summary_declares_terminal(Some(
+        "## Summary\nEverything left is owner-gated.\n<stop>"
+    )));
+    assert!(summary_declares_terminal(Some(
+        "All work is blocked on the owner.\n<stop>"
+    )));
+    // Prose mentions of the keyword don't stop anything.
+    assert!(!summary_declares_terminal(Some(
+        "## Summary\nWork continues; say <stop> on its own line to halt."
+    )));
+}
+
+#[test]
 fn context_overflow_phase1_requests_summary() {
     let session = "overflow-phase1-test";
     clear_summary_for_session(session);
