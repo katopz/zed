@@ -1,5 +1,6 @@
 # 042 — Work Remote: run the built-in Zed Agent on the host
 Status: proposed — amo + bmo protocol e2e PASS (2026-10-27, below); option A chosen, not started
+**Claimed:** zed-m3-idle1029-wr042, 1793246151, expires 2026-10-31T04:30:00+00:00
 
 ## Goal
 
