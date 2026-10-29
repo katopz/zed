@@ -31,6 +31,12 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Work Remote's native agent (plan 042): serve Zed's built-in agent over
+    // ACP stdio, the same embedded-subcommand shape as `agentd` above.
+    if std::env::args().nth(1).as_deref() == Some(agent_acp_server::SUBCOMMAND) {
+        return agent_acp_server::main_from_args(std::env::args());
+    }
+
     let cli = Cli::parse();
 
     if let Some(socket_path) = &cli.askpass {

@@ -27,7 +27,10 @@ class LocalHost:
     prefix = []
 
     def mkdtemp(self, prefix):
-        return tempfile.mkdtemp(prefix=prefix)
+        # /tmp directly: macOS's default temp dir (/var/folders/...) is deep
+        # enough that the agentd socket path exceeds SUN_LEN (104) and attach
+        # refuses ("path must be shorter than SUN_LEN").
+        return tempfile.mkdtemp(prefix=f"/tmp/{prefix}")
 
     def write(self, path, text):
         with open(path, "w") as f:

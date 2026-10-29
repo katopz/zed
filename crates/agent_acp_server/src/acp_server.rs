@@ -38,7 +38,7 @@ use settings::{LanguageModelSelection, Settings as _};
 use util::ResultExt as _;
 use util::path_list::PathList;
 
-use crate::headless::AgentCliAppState;
+use crate::NativeAgentAppState;
 
 pub(crate) struct ModelOptions<'a> {
     pub model_name: &'a str,
@@ -79,14 +79,14 @@ struct SessionState {
 
 /// Serves until the client closes stdin.
 pub(crate) async fn serve(
-    app_state: &Arc<AgentCliAppState>,
+    app_state: &Arc<NativeAgentAppState>,
     model: ModelOptions<'_>,
     cx: &mut AsyncApp,
 ) -> Result<()> {
     let selected = SelectedModel::from_str(model.model_name).map_err(|e| anyhow::anyhow!("{e}"))?;
-    crate::wait_for_model(&selected, cx).await?;
+    crate::model_config::wait_for_model(&selected, cx).await?;
     cx.update(|cx| {
-        crate::configure_agent_settings(
+        crate::model_config::configure_agent_settings(
             &selected,
             model.model_name,
             model.thinking_override,
@@ -274,14 +274,14 @@ fn internal_error(error: &anyhow::Error) -> agent_client_protocol::Error {
 }
 
 async fn new_session(
-    app_state: &Arc<AgentCliAppState>,
+    app_state: &Arc<NativeAgentAppState>,
     connection: &Rc<NativeAgentConnection>,
     sessions: &Rc<RefCell<HashMap<acp_v1::SessionId, Session>>>,
     request: acp_v1::NewSessionRequest,
     client: ConnectionTo<Client>,
     cx: &mut AsyncApp,
 ) -> Result<acp_v1::NewSessionResponse> {
-    let project = crate::open_local_project(app_state, &request.cwd, cx).await?;
+    let project = crate::model_config::open_local_project(app_state, &request.cwd, cx).await?;
     let thread = cx
         .update(|cx| {
             connection

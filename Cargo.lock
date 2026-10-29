@@ -371,6 +371,50 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent_acp_server"
+version = "0.1.0"
+dependencies = [
+ "acp_thread",
+ "agent",
+ "agent-client-protocol",
+ "agent_settings",
+ "anyhow",
+ "clap",
+ "client",
+ "db",
+ "debug_adapter_extension",
+ "env_logger 0.11.8",
+ "extension",
+ "feature_flags",
+ "fs",
+ "futures 0.3.34",
+ "gpui",
+ "gpui_platform",
+ "gpui_tokio",
+ "language",
+ "language_extension",
+ "language_model",
+ "language_models",
+ "languages",
+ "log",
+ "node_runtime",
+ "paths",
+ "project",
+ "release_channel",
+ "remote_connection",
+ "reqwest_client",
+ "serde",
+ "serde_json",
+ "settings",
+ "shellexpand",
+ "theme",
+ "theme_settings",
+ "util",
+ "watch",
+ "workspace",
+]
+
+[[package]]
 name = "agent_board"
 version = "0.1.0"
 dependencies = [
@@ -6109,6 +6153,7 @@ dependencies = [
  "acp_thread",
  "agent",
  "agent-client-protocol",
+ "agent_acp_server",
  "agent_settings",
  "agent_ui",
  "anyhow",
@@ -15309,6 +15354,7 @@ dependencies = [
  "action_log",
  "agent",
  "agent-client-protocol",
+ "agent_acp_server",
  "agent_servers",
  "agentd",
  "anyhow",

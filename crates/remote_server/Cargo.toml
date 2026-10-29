@@ -75,6 +75,8 @@ thiserror.workspace = true
 rayon.workspace = true
 uuid = { workspace = true, features = ["v4"] }
 
+agent_acp_server.workspace = true
+
 [target.'cfg(unix)'.dependencies]
 agentd.workspace = true
 libc.workspace = true
