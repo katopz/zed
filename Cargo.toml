@@ -295,6 +295,7 @@ activity_indicator = { path = "crates/activity_indicator" }
 agent = { path = "crates/agent" }
 agent_servers = { path = "crates/agent_servers" }
 agent_settings = { path = "crates/agent_settings" }
+agent_mail = { path = "crates/agent_mail" }
 agent_skills = { path = "crates/agent_skills" }
 agent_board = { path = "crates/agent_board" }
 agent_ui = { path = "crates/agent_ui" }

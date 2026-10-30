@@ -283,3 +283,119 @@ async fn test_thread_cannot_message_itself(cx: &mut TestAppContext) {
     assert!(result.is_err());
     assert!(agent.read_with(cx, |agent, _| agent.mailboxes.is_empty()));
 }
+
+/// Enables agent-mail on `agent` against a fresh rig named `m3` in a temp dir,
+/// returning a second handle that plays the remote sender.
+fn enable_agent_mail(
+    agent: &Entity<NativeAgent>,
+    cx: &mut TestAppContext,
+) -> (tempfile::TempDir, ::agent_mail::Mailroom) {
+    let home = tempfile::tempdir().unwrap();
+    let sender = ::agent_mail::Mailroom::new(home.path().to_path_buf());
+    sender.init("m3").unwrap();
+    let mailroom = ::agent_mail::Mailroom::new(home.path().to_path_buf());
+    agent.update(cx, |agent, cx| {
+        agent.agent_mail = Some(agent_mail_bridge::AgentMailState::start(
+            mailroom,
+            "m3".into(),
+            cx,
+        ));
+    });
+    (home, sender)
+}
+
+fn mail_to(
+    sender: &::agent_mail::Mailroom,
+    session_id: &acp_v2::SessionId,
+    body: &str,
+) -> ::agent_mail::Envelope {
+    let to = ::agent_mail::Address::parse(&format!(
+        "{}@m3",
+        agent_mail_bridge::native_thread_mail_name(session_id)
+    ))
+    .unwrap();
+    let envelope = sender
+        .compose(&to, "zed-bb@m3", body.to_string(), None)
+        .unwrap();
+    sender.send(&envelope).unwrap();
+    envelope
+}
+
+#[gpui::test]
+async fn test_agent_mail_wakes_idle_thread_and_reply_goes_out(cx: &mut TestAppContext) {
+    let setup = setup_threads(1, cx).await;
+    let (agent, fake) = (&setup.agent, &setup.fake);
+    let thread = &setup.threads[0];
+    let (_home, sender) = enable_agent_mail(agent, cx);
+
+    let address = format!(
+        "{}@m3",
+        agent_mail_bridge::native_thread_mail_name(&thread.session_id)
+    );
+    let listings = agent.read_with(cx, |agent, cx| {
+        agent.list_threads(&thread.session_id, cx).unwrap()
+    });
+    assert_eq!(listings[0].mail_address.as_deref(), Some(address.as_str()));
+
+    mail_to(&sender, &thread.session_id, "ping from another machine");
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.run_until_parked();
+
+    let pending = fake.pending_completions_for(&thread.model);
+    assert_eq!(pending.len(), 1, "mail should wake the idle thread");
+    let prompt = pending[0].messages.last().unwrap().string_contents();
+    assert!(prompt.contains("ping from another machine"), "{prompt}");
+    assert!(prompt.contains("session_id=\"zed-bb@m3\""), "{prompt}");
+
+    let tool_input = json!({ "to": "zed-bb@m3", "message": "pong" });
+    fake.send_last_event(
+        &thread.model,
+        LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
+            id: "mail_1".into(),
+            name: SendMessageTool::NAME.into(),
+            raw_input: tool_input.to_string(),
+            input: language_model::LanguageModelToolUseInput::Json(tool_input),
+            is_input_complete: true,
+            thought_signature: None,
+        }),
+    );
+    fake.end_last(&thread.model);
+    cx.run_until_parked();
+
+    let replies = sender.claim(&["zed-bb".to_string()]).unwrap();
+    assert_eq!(replies.len(), 1);
+    assert_eq!(replies[0].body, "pong");
+    assert_eq!(replies[0].from, address);
+}
+
+#[gpui::test]
+async fn test_agent_mail_for_busy_thread_waits_for_turn_end(cx: &mut TestAppContext) {
+    let setup = setup_threads(1, cx).await;
+    let (agent, fake) = (&setup.agent, &setup.fake);
+    let thread = &setup.threads[0];
+    let (_home, sender) = enable_agent_mail(agent, cx);
+
+    let own_turn = setup.send(thread, "Own work", cx);
+    cx.run_until_parked();
+    mail_to(&sender, &thread.session_id, "status?");
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.run_until_parked();
+    assert_eq!(fake.pending_completions_for(&thread.model).len(), 1);
+    assert_eq!(
+        agent.read_with(cx, |agent, _| agent
+            .mailboxes
+            .get(&thread.session_id)
+            .map_or(0, Vec::len)),
+        1
+    );
+
+    fake.send_last_text(&thread.model, "Done");
+    fake.end_last(&thread.model);
+    assert_eq!(own_turn.await.unwrap(), acp_v2::StopReason::EndTurn);
+    cx.run_until_parked();
+
+    let pending = fake.pending_completions_for(&thread.model);
+    assert_eq!(pending.len(), 1, "mail should start exactly one new turn");
+    let prompt = pending[0].messages.last().unwrap().string_contents();
+    assert!(prompt.contains("status?"), "{prompt}");
+}

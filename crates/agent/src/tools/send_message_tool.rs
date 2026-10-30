@@ -13,8 +13,11 @@ use crate::{
 };
 
 /// Send a message to another live agent thread (a subagent, or a top-level thread
-/// such as one started with `create_thread`).
+/// such as one started with `create_thread`), or to an agent on another machine.
 ///
+/// - `to` may be `name@rig` (e.g. `zed-bb@m3`, `*@amo`) to reach an agent on another
+///   machine, or a Claude Code session, through agent-mail. It returns
+///   `delivery: "mailed"` and any reply arrives later as a new message.
 /// - Call `list_threads` first if you don't know the target's session_id.
 /// - The recipient sees the message wrapped with your thread's title and session_id,
 ///   so it can answer by calling `send_message` back to you.
@@ -27,7 +30,8 @@ use crate::{
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub struct SendMessageToolInput {
-    /// Session ID of the target thread, or its exact title (case-insensitive).
+    /// Session ID of the target thread, its exact title (case-insensitive), or an
+    /// agent-mail address `name@rig` for an agent on another machine.
     pub to: String,
     /// The message to deliver.
     pub message: String,

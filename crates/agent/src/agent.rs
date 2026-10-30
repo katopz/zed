@@ -1,4 +1,5 @@
 mod agent_fork;
+mod agent_mail_bridge;
 mod thread_mailbox;
 
 mod db;
@@ -559,6 +560,8 @@ pub struct NativeAgent {
     sibling_thread_host: Option<Rc<dyn SiblingThreadHost>>,
     /// `send_message` mail waiting for its target thread's turn to end.
     mailboxes: HashMap<acp_v2::SessionId, Vec<thread_mailbox::MailboxMessage>>,
+    /// Cross-machine mail (plan 043); `None` when agent-mail isn't set up here.
+    agent_mail: Option<agent_mail_bridge::AgentMailState>,
     fs: Arc<dyn Fs>,
     _subscriptions: Vec<Subscription>,
     /// Tracks the lifecycle of global skills directory observation. We
@@ -733,6 +736,7 @@ impl NativeAgent {
                 models: LanguageModels::new(cx),
                 sibling_thread_host: None,
                 mailboxes: HashMap::default(),
+                agent_mail: agent_mail_bridge::AgentMailState::start_if_installed(cx),
                 fs,
                 _subscriptions: subscriptions,
                 skills_state: SkillsState::default(),

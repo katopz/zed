@@ -42,6 +42,9 @@ pub struct ThreadListing {
     pub model: Option<String>,
     /// Messages waiting for the thread's current turn to end.
     pub queued_messages: usize,
+    /// Where agents on other machines can reach this thread (`agent-mail`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mail_address: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -62,6 +65,13 @@ pub enum ThreadMessageDelivery {
     },
     /// The target is mid-turn; the message is delivered when that turn ends.
     Queued { position: usize },
+    /// Sent through agent-mail to an agent on another machine (or a Claude
+    /// Code session); its reply, if any, arrives later as a new message.
+    Mailed {
+        id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        via: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,7 +101,8 @@ pub(crate) fn format_mailbox_prompt(messages: &[MailboxMessage]) -> String {
     }
     prompt.push_str(
         "These messages were sent by other agent threads, not the user. \
-         Reply with `send_message` (to: the sender's session_id) if a response is needed.",
+         Reply with `send_message` (to: the sender's session_id; a `name@rig` id \
+         is an agent on another machine) if a response is needed.",
     );
     prompt
 }
@@ -225,6 +236,7 @@ impl NativeAgent {
                         .model()
                         .map(|model| format!("{}/{}", model.provider_id().0, model.id().0)),
                     queued_messages: self.mailboxes.get(session_id).map_or(0, Vec::len),
+                    mail_address: self.agent_mail_address(session_id),
                 }
             })
             .collect::<Vec<_>>();
@@ -302,7 +314,7 @@ impl NativeAgent {
     /// Takes every pending message for `session_id` as one prompt, but only
     /// while the thread is idle: a new native submission interrupts a running
     /// turn.
-    fn deliver_mailbox(
+    pub(crate) fn deliver_mailbox(
         &mut self,
         session_id: &acp::SessionId,
         cx: &mut Context<Self>,

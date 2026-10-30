@@ -180,6 +180,9 @@ impl NativeThreadEnvironment {
         request: ThreadMessageRequest,
         cx: &mut AsyncApp,
     ) -> Task<Result<ThreadMessageOutcome>> {
+        if agent_mail_bridge::is_mail_address(&request.to) {
+            return self.send_agent_mail(request, cx);
+        }
         let agent = self.agent.clone();
         let sender_thread = self.thread.clone();
         cx.spawn(async move |cx| {
