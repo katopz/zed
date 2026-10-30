@@ -19,3 +19,14 @@ Verdict: SSH-over-Tailscale is GOAT for agent messaging (zero $, zero new
 ports, existing key auth); every path is ≥ 10× faster than the agent turns it
 connects. Possible wins, none needed now: a direct Tailscale path for m3
 (−150 ms), a persistent `ssh -M` on the 4090 under WSL (−800 ms).
+
+## Path check after Tailscale restart on m3 (2026-10-30)
+
+- m3 → 4090: now **direct** over LAN (`192.168.1.36:41641`, 4 ms ping).
+- m3 → amo/bmo: still DERP `sin` (65–80 ms ping, ~290 ms send). The m3 and the
+  amo/bmo pair are on different networks (public 27.145.156.100 vs
+  119.76.33.203; both happen to use 192.168.1.0/24). Both NATs are easy
+  (`MappingVariesByDestIP: false`, UDP ok) but neither router offers
+  UPnP/NAT-PMP/PCP (`PortMapping:` empty), so hole punching does not complete.
+  Fix if ever needed: enable UPnP or NAT-PMP on the amo/bmo router. Not worth
+  it for agent mail (sends stay < 0.3 s).
