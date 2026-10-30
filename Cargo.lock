@@ -450,6 +450,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent_mail"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "chrono",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "uuid",
+]
+
+[[package]]
 name = "agent_servers"
 version = "0.1.0"
 dependencies = [

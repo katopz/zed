@@ -33,6 +33,9 @@ rig's agent sessions. Upstream base plus a local feature lane maintained on
   and `crates/work_remote`
   (menu action + `DetachableRemoteAgents` toggle), hooked into upstream via
   `agent_servers/src/acp/detachable.rs` (plan 037)
+- cross-rig agent mail — `crates/agent_mail` (`agent-mail`, std-only CLI:
+  maildir inbox per agent, SSH-over-Tailscale delivery, Claude Code hooks for
+  inject + idle wake; no daemon, no port) (plan 043)
 - agent-infrastructure `.agents/skills/` (gpui-test, lint-creator,
   zed-cherry-pick) and the root `.rules`
 

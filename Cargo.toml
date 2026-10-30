@@ -13,6 +13,7 @@ members = [
     "crates/agent_skills",
     "crates/agent_ui",
     "crates/agentd",
+    "crates/agent_mail",
     "crates/agent_ui_benchmarks",
     "crates/ai_onboarding",
     "crates/anthropic",
