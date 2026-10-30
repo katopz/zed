@@ -1,5 +1,5 @@
 # 043 — Cross-rig agent mail (m3 ↔ amo/bmo ↔ 4090)
-Status: DONE (phase 1) — m3/amo/bmo/4090 send+receive verified; inbound to m3 + Zed native wake tracked in `.issues/044`
+Status: DONE (phase 1) — m3/amo/bmo/4090 send+receive verified; inbound to m3 + Zed native wake tracked in `.issues/044` — impl `5a9284e937`
 
 ## Goal
 
