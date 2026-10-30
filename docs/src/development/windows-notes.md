@@ -41,6 +41,10 @@ CXXFLAGS=/permissive cargo build --release
 > powershell -NoProfile -Command '$env:CXXFLAGS="/permissive"; cargo build --release'
 > ```
 
+On Windows, `script/dev-rebuild-windows.ps1` wraps all of this up (pull, build with
+the flag set correctly, verify the built exe embeds HEAD, and swap it into place
+while Zed is running).
+
 The remaining sections explain the two workarounds and how to set them up.
 
 ---

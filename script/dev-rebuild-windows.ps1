@@ -1,0 +1,91 @@
+# Pulls the latest develop, rebuilds the release binary with the MSVC workarounds
+# from docs/src/development/windows-notes.md, and swaps it into place on the Desktop.
+#
+# Traps this script handles (all hit in practice):
+# - Git Bash mangles `CXXFLAGS=/permissive` via MSYS path conversion; we set the
+#   env var natively in PowerShell.
+# - The running Zed locks its exe; Windows allows renaming a running image, so we
+#   rename the old binary instead of killing the process (it may host live agent
+#   sessions), then copy the fresh build in.
+# - Sibling agents keep uncommitted WIP in this checkout; if the tree is dirty or
+#   has local commits we abort instead of stashing away someone's work.
+#
+# Usage: powershell -NoProfile -File script/dev-rebuild-windows.ps1 [-SkipPull] [-SkipSwap] [-DestPath <path>]
+
+# script/ lives one level below the repo root.
+param(
+    [string]$RepoRoot = (Split-Path $PSScriptRoot -Parent),
+    [string]$DestPath = "$env:USERPROFILE\OneDrive\Desktop\zed.exe",
+    [switch]$SkipPull,
+    [switch]$SkipSwap
+)
+
+$ErrorActionPreference = "Stop"
+
+Set-Location $RepoRoot
+
+if (-not $SkipPull) {
+    git fetch origin
+    if ($LASTEXITCODE -ne 0) { throw "git fetch failed" }
+
+    $incoming = @(git rev-list HEAD..origin/develop)
+    if ($LASTEXITCODE -ne 0) { throw "git rev-list failed" }
+
+    $dirty = @(git status --porcelain)
+    if ($dirty.Count -gt 0) {
+        throw "Working tree is dirty ($($dirty.Count) paths) - aborting instead of touching possibly-shared WIP. Commit or clean manually, or run with -SkipPull."
+    }
+    if ($incoming.Count -gt 0) {
+        Write-Host "Pulling $($incoming.Count) new commit(s) from origin/develop..."
+        git merge --ff-only origin/develop
+        if ($LASTEXITCODE -ne 0) { throw "Fast-forward failed (local commits diverged?) - aborting." }
+    } else {
+        Write-Host "Already up to date."
+    }
+}
+
+$head = git rev-parse --short HEAD
+Write-Host "Building zed at $head (release, CXXFLAGS=/permissive)..."
+$env:CXXFLAGS = "/permissive"
+cargo build --release
+if ($LASTEXITCODE -ne 0) { throw "cargo build --release failed" }
+
+$built = Join-Path $RepoRoot "target\release\zed.exe"
+if (-not (Test-Path $built)) { throw "Build output missing: $built" }
+
+# The linker embeds the HEAD commit in ProductVersion; use it to prove the exe
+# on disk really is this build.
+$version = (Get-Item $built).VersionInfo.ProductVersion
+Write-Host "Built: $version"
+if ($version -notmatch [regex]::Escape($head)) {
+    throw "Built exe reports '$version' which does not contain HEAD '$head' - refusing to swap a stale binary."
+}
+
+if (-not $SkipSwap) {
+    $destDir = Split-Path $DestPath -Parent
+    $destName = Split-Path $DestPath -Leaf
+
+    $running = Get-Process zed -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $DestPath }
+    if ($running) {
+        $stamp = Get-Date -Format "yyyyMMdd"
+        $old = Join-Path $destDir "zed.exe.prev-$stamp"
+        Write-Host "Zed is running from $DestPath - renaming it to '$(Split-Path $old -Leaf)' (safe while running) and copying the new build in. Restart Zed to pick it up."
+        Move-Item $DestPath $old -Force
+    }
+
+    Copy-Item $built $DestPath -Force
+
+    # Prune swap backups, keep the newest one for rollback.
+    Get-ChildItem $destDir -Filter "zed.exe.prev-*" |
+        Sort-Object LastWriteTime -Descending |
+        Select-Object -Skip 1 |
+        ForEach-Object {
+            Write-Host "Pruning old backup: $($_.Name)"
+            Remove-Item $_.FullName -Force
+        }
+
+    $newVersion = (Get-Item $DestPath).VersionInfo.ProductVersion
+    Write-Host "Deployed: $DestPath ($newVersion)"
+}
+
+Write-Host "Done."
