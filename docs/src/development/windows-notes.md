@@ -43,7 +43,27 @@ CXXFLAGS=/permissive cargo build --release
 
 On Windows, `script/dev-rebuild-windows.ps1` wraps all of this up (pull, build with
 the flag set correctly, verify the built exe embeds HEAD, and swap it into place
-while Zed is running).
+while Zed is running). It also archives each deployed build's PDB to
+`target/release/pdb-archive/<sha>.pdb` — keep it if you need to symbolize a crash
+from that build.
+
+## Analyzing Local Crash Dumps
+
+Windows writes `%LOCALAPPDATA%\CrashDumps\zed.exe.<pid>.dmp` for hard crashes
+(Rust panics are logged to `%LOCALAPPDATA%\Zed\logs\Zed.log` instead — no dump
+means look there first, and check the Application event log, source `Application
+Error`, for the exception code and faulting module).
+
+Symbolize a dump with cdb (ships with WinDbg, `winget install Microsoft.WinDbg`):
+
+```bat
+cdb -z %LOCALAPPDATA%\CrashDumps\zed.exe.<pid>.dmp -c ".symfix; !analyze -v; q"
+```
+
+The dump is only symbolizable with the exact build's PDB. Point cdb at it with
+`-y <path-to-pdb-dir>`; without it you still get the exception record, faulting
+instruction, and stack classification (e.g. `INVALID_POINTER_WRITE`), but frames
+resolve to `zed+<offset>` only.
 
 The remaining sections explain the two workarounds and how to set them up.
 
