@@ -31,6 +31,16 @@ or
 CXXFLAGS=/permissive cargo build --release
 ```
 
+> Warning: in Git Bash / MSYS shells, do **not** use the `CXXFLAGS=/permissive cargo ...`
+> prefix form. MSYS path conversion rewrites `/permissive` into an MSYS-root path
+> (e.g. `C:/Program Files/Git/permissive`), which `cl.exe` then receives as two
+> broken arguments and the `webrtc-sys` build fails. In Git Bash, export the
+> variable through `cmd` or PowerShell instead:
+>
+> ```bash
+> powershell -NoProfile -Command '$env:CXXFLAGS="/permissive"; cargo build --release'
+> ```
+
 The remaining sections explain the two workarounds and how to set them up.
 
 ---
