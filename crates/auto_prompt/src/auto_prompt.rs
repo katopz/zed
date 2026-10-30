@@ -2227,6 +2227,13 @@ pub fn reset_iteration_with_session(session_id: &str) {
     plan_registry::release_all_for_session(session_id);
 }
 
+/// Withdraw a Phase 1 summarize request that was decided but never sent.
+/// Leaving `summary_state == 1` behind would make the next stop treat the
+/// agent's ordinary reply as the requested summary and fork on it.
+pub fn abandon_summary_request(session_id: &str) {
+    clear_summary_for_session(session_id);
+}
+
 pub fn increment_llm_failure_count(session_id: &str) -> u32 {
     chain::record_llm_failure(session_id)
 }

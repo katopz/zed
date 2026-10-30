@@ -1025,6 +1025,72 @@ fn is_cancelled(
         .unwrap_or(true)
 }
 
+/// The thread as it was when the turn that triggered an automatic decision
+/// stopped. Deciding takes seconds (plan-snapshot git fetches, the
+/// orchestrator call, backoff delays), and an ACP agent can start a new turn
+/// on its own meanwhile — Claude Code resumes when a background task exits or
+/// a hook wakes it. Dispatching the stale decision then lands mid-turn, e.g.
+/// "Stop what you are doing and summarize" right after a test run.
+#[derive(Clone, Copy)]
+pub(crate) struct StoppedTurn {
+    activity_generation: u64,
+    entry_count: usize,
+}
+
+impl StoppedTurn {
+    pub(crate) fn capture(thread: &acp_thread::AcpThread) -> Self {
+        Self {
+            activity_generation: thread.activity_generation(),
+            entry_count: thread.entries().len(),
+        }
+    }
+
+    /// The generation only advances for agents that report their activity,
+    /// and an agent may stream a resumed turn's output without reporting it,
+    /// so new conversation entries count as a resume too. Board notifications
+    /// and session messages are appended by Zed, not the agent.
+    pub(crate) fn agent_resumed(&self, thread: &acp_thread::AcpThread) -> bool {
+        thread.status() == ThreadStatus::Generating
+            || thread.activity_generation() != self.activity_generation
+            || thread
+                .entries()
+                .get(self.entry_count..)
+                .is_some_and(|new_entries| {
+                    new_entries.iter().any(|entry| {
+                        matches!(
+                            entry,
+                            AgentThreadEntry::UserMessage(_)
+                                | AgentThreadEntry::AssistantMessage(_)
+                                | AgentThreadEntry::ToolCall(_)
+                        )
+                    })
+                })
+    }
+}
+
+/// Returns `true` (after logging) when the decision must be dropped because
+/// the agent resumed since the triggering stop. Its next stop re-runs the
+/// decision against the current state.
+fn abandon_stale_decision(
+    stopped_turn: Option<StoppedTurn>,
+    thread: &gpui::Entity<acp_thread::AcpThread>,
+    cx: &gpui::App,
+) -> bool {
+    let Some(stopped_turn) = stopped_turn else {
+        return false;
+    };
+    let thread = thread.read(cx);
+    if !stopped_turn.agent_resumed(thread) {
+        return false;
+    }
+    log::warn!(
+        "[auto_prompt] agent resumed while the decision was pending — dropping it (session={}, status={:?})",
+        thread.session_id(),
+        thread.status()
+    );
+    true
+}
+
 /// Entry point — called from `ConversationView::handle_thread_event`
 /// when `AcpThreadEvent::Stopped` fires.
 ///
@@ -1186,6 +1252,8 @@ fn run_auto_prompt(
         });
     }
 
+    // A manual click is explicit intent and dispatches immediately.
+    let stopped_turn = (!is_manual).then(|| StoppedTurn::capture(thread.read(cx)));
     let thread = thread.clone();
     let stop_reason = stop_reason.clone();
 
@@ -1253,6 +1321,9 @@ fn run_auto_prompt(
                 );
                 let _ = _view.update_in(cx, |_view, window, cx| {
                     reset_auto_prompt_state(_view, cx);
+                    if abandon_stale_decision(stopped_turn, &thread, cx) {
+                        return;
+                    }
                     dispatch_action(action, _view, window, cx);
                 });
             }
@@ -1312,6 +1383,9 @@ fn run_auto_prompt(
                 }
 
                     match _view.update_in(cx, |_view, window, cx| {
+                        if abandon_stale_decision(stopped_turn, &thread, cx) {
+                            return;
+                        }
                         // Mirror the "limit reached — auto-continue scheduled at …"
                         // notification: when the scheduled retry finally fires, tell
                         // the user the chain is resuming.
@@ -1552,6 +1626,25 @@ fn run_auto_prompt(
                         log::info!("[auto_prompt] Cancelled during LLM call, discarding result");
                         return;
                     }
+                }
+
+                let resumed = cx
+                    .update(|_window, cx| abandon_stale_decision(stopped_turn, &thread, cx))
+                    .unwrap_or(false);
+                if resumed {
+                    if matches!(result, Ok(auto_prompt::AutoPromptOutcome::ContextOverflow(_))) {
+                        auto_prompt::abandon_summary_request(&data.session_id.to_string());
+                    }
+                    if let Some(ref tv) = thread_weak {
+                        if let Err(err) = tv.update(cx, |tv, cx| {
+                            tv.fork._auto_prompt_task = None;
+                            tv.fork.auto_prompt_state = AutoPromptState::Idle;
+                            cx.notify();
+                        }) {
+                            log::warn!("[auto_prompt] failed to reset state after dropping stale decision: {err}");
+                        }
+                    }
+                    return;
                 }
 
                 log::info!("[auto_prompt] ASYNC TASK: LLM call completed");

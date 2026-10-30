@@ -850,6 +850,68 @@ async fn test_direct_message_cancels_auto_prompt_task(cx: &mut TestAppContext) {
     );
 }
 
+/// An ACP agent can resume on its own while auto_prompt is still deciding
+/// (Claude Code wakes when a background task exits); the stale decision must
+/// then be dropped instead of landing mid-turn. Covers both resume signals:
+/// streamed output with no state report, and a new turn.
+#[gpui::test]
+async fn test_stopped_turn_detects_agent_resume(cx: &mut TestAppContext) {
+    init_test(cx);
+
+    let connection = StubAgentConnection::new();
+    let (conversation_view, cx) =
+        setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+    add_to_workspace(conversation_view.clone(), cx);
+
+    message_editor(&conversation_view, cx).update_in(cx, |editor, window, cx| {
+        editor.set_text("do work", window, cx);
+    });
+    active_thread(&conversation_view, cx).update_in(cx, |view, window, cx| view.send(window, cx));
+    cx.run_until_parked();
+
+    let (thread, session_id) = active_thread(&conversation_view, cx).read_with(cx, |view, cx| {
+        (view.thread.clone(), view.thread.read(cx).session_id().clone())
+    });
+    cx.update(|_, _cx| {
+        connection.end_turn(session_id.clone(), acp_v1::StopReason::EndTurn);
+    });
+    cx.run_until_parked();
+
+    let stopped_turn =
+        thread.read_with(cx, |thread, _| crate::auto_prompt::StoppedTurn::capture(thread));
+    assert!(
+        !thread.read_with(cx, |thread, _| stopped_turn.agent_resumed(thread)),
+        "an idle thread with no new entries has not resumed"
+    );
+
+    cx.update(|_, cx| {
+        connection.send_update(
+            session_id.clone(),
+            acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(
+                "running the tests".into(),
+            )),
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    assert!(
+        thread.read_with(cx, |thread, _| stopped_turn.agent_resumed(thread)),
+        "agent output after the stop is a resume"
+    );
+
+    let stopped_turn =
+        thread.read_with(cx, |thread, _| crate::auto_prompt::StoppedTurn::capture(thread));
+    message_editor(&conversation_view, cx).update_in(cx, |editor, window, cx| {
+        editor.set_text("next turn", window, cx);
+    });
+    active_thread(&conversation_view, cx).update_in(cx, |view, window, cx| view.send(window, cx));
+    cx.run_until_parked();
+    assert!(
+        thread.read_with(cx, |thread, _| stopped_turn.agent_resumed(thread)),
+        "a new turn after the stop is a resume"
+    );
+}
+
 /// Override the watchdog config for THIS test's app only. The env-var
 /// route is process-global: tests running in parallel threads of one
 /// binary race their config loads against a sibling's `set_var` and arm
