@@ -53,6 +53,7 @@ cannot recur.
       transient, no action
 - [-] Observe first restart on the real-LiveKit msvc build — owner-gated (user
       must restart Zed); if a fresh dump appears, symbolize with
-      `pdb-archive/655bc14343.pdb`
+      `pdb-archive/655bc14343.pdb`. Post-restart health check (one line):
+      `powershell -NoProfile -Command "(Get-Process zed).Id; (Get-Item \"$env:USERPROFILE\OneDrive\Desktop\zed.exe\").VersionInfo.ProductVersion; Get-ChildItem \"$env:LOCALAPPDATA\CrashDumps\" -Filter 'zed*' | Sort LastWriteTime -Desc | Select -First 2 Name,LastWriteTime"`
 - [-] If restart shows RAM ballooning + freezes, check Zed.log for LSP
       notification loops first (upstream #57477 pattern) before suspecting LiveKit
