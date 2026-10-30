@@ -223,6 +223,8 @@ def resolve_commits(hashes: set[str], roots: list[Path]) -> set[str]:
                 capture_output=True,
                 text=True,
                 timeout=60,
+                encoding="utf-8",
+                errors="replace",
             ).stdout.splitlines()
         except (OSError, subprocess.SubprocessError) as error:
             print(f"warning: commit lookup failed in {repo}: {error}", file=sys.stderr)

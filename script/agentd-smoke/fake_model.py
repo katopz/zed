@@ -7,7 +7,7 @@ import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 root = sys.argv[2]  # worktree root name, e.g. z036-abc
-log = open(os.path.join(tempfile.gettempdir(), "agentd-smoke-model.log"), "w")
+log = open(os.path.join(tempfile.gettempdir(), "agentd-smoke-model.log"), "w", encoding="utf-8")
 
 
 def chunk(delta, finish=None):

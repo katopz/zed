@@ -33,7 +33,7 @@ class LocalHost:
         return tempfile.mkdtemp(prefix=f"/tmp/{prefix}")
 
     def write(self, path, text):
-        with open(path, "w") as f:
+        with open(path, "w", encoding="utf-8") as f:
             f.write(text)
 
     def popen(self, argv, env, **kwargs):
@@ -48,7 +48,8 @@ class SshHost:
         self.prefix = shlex.split(ssh)
 
     def shell(self, command, **kwargs):
-        return subprocess.run([*self.prefix, command], check=True, capture_output=True, text=True, **kwargs)
+        return subprocess.run([*self.prefix, command], check=True, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", **kwargs)
 
     def mkdtemp(self, prefix):
         return self.shell(f"mktemp -d /tmp/{prefix}XXXXXX").stdout.strip()
@@ -73,7 +74,7 @@ workdir = host.mkdtemp("z036-")
 host.write(os.path.join(workdir, "hello.txt"), "magic word: pineapple\n")
 tools = host.mkdtemp("z036-tools-")
 fake_model = os.path.join(tools, "fake_model.py")
-with open(fake_model_source) as f:
+with open(fake_model_source, encoding="utf-8") as f:
     host.write(fake_model, f.read())
 model = host.popen(["python3" if ssh else sys.executable, "-I", fake_model, port, os.path.basename(workdir)], {"FAKE_DELAY": "4"},
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -107,7 +108,7 @@ client_env = dict(os.environ) if ssh else env
 class Gui:
     def __init__(self):
         self.process = subprocess.Popen(command, env=client_env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                        stderr=subprocess.DEVNULL, text=True, bufsize=1)
+                                        stderr=subprocess.DEVNULL, text=True, bufsize=1, encoding="utf-8", errors="replace")
         self.process.stdin.buffer.write(preamble)
         self.process.stdin.buffer.flush()
         self.next_id = 0

@@ -10,9 +10,10 @@ binary, model, port = sys.argv[1], sys.argv[2], sys.argv[3]
 workdir = tempfile.mkdtemp(prefix="z036-")
 model_server = subprocess.Popen([sys.executable, "-I", os.path.join(os.path.dirname(os.path.abspath(__file__)), "fake_model.py"), port,
                                  os.path.basename(workdir)],
+                                env={**os.environ, "PYTHONIOENCODING": "utf-8"},
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 atexit.register(model_server.kill)
-with open(os.path.join(workdir, "hello.txt"), "w") as f:
+with open(os.path.join(workdir, "hello.txt"), "w", encoding="utf-8") as f:
     f.write("magic word: pineapple\n")
 
 home = tempfile.mkdtemp(prefix="z036-home-")
@@ -33,9 +34,11 @@ agent = subprocess.Popen(
     env=env,
     stdin=subprocess.PIPE,
     stdout=subprocess.PIPE,
-    stderr=open(os.path.join(tempfile.gettempdir(), "agentd-smoke-agent.err"), "w"),
+    stderr=open(os.path.join(tempfile.gettempdir(), "agentd-smoke-agent.err"), "w", encoding="utf-8"),
     text=True,
     bufsize=1,
+    encoding="utf-8",
+    errors="replace",
 )
 next_id = 0
 
@@ -99,7 +102,7 @@ text, tools = summarize(updates)
 print("prompt 2:", reply.get("result") or reply.get("error"))
 print("  text:", text, "| tools:", tools, "| permissions:", permissions)
 out = os.path.join(workdir, "out.txt")
-print("  out.txt:", open(out).read() if os.path.exists(out) else None)
+print("  out.txt:", open(out, encoding="utf-8").read() if os.path.exists(out) else None)
 
 reply, updates, permissions = request("session/prompt", {"sessionId": session_id, "prompt": [
     {"type": "text", "text": "Edit hello.txt to replace pineapple with mango, then reply with only OK."}]})
@@ -111,17 +114,17 @@ print("  text:", text, "| tools:", tools, "| permissions:", permissions)
 last_diff = diffs[-1] if diffs else {}
 print("  structured diff:", bool(diffs), "| absolute path:", last_diff.get("path") == os.path.join(workdir, "hello.txt"),
       "| old/new:", repr(last_diff.get("oldText")), "->", repr(last_diff.get("newText")))
-print("  hello.txt:", repr(open(os.path.join(workdir, "hello.txt")).read()))
+print("  hello.txt:", repr(open(os.path.join(workdir, "hello.txt"), encoding="utf-8").read()))
 
 reply, updates, _ = request("session/set_config_option", {"sessionId": session_id, "configId": "model", "value": "fake/m2"})
 current = [o["currentValue"] for o in reply["result"]["configOptions"] if o["id"] == "model"]
 announced = [u for u in updates if u["sessionUpdate"] == "config_option_update"]
 print("set model:", current, "| config_option_update sent:", bool(announced))
 model_log = os.path.join(tempfile.gettempdir(), "agentd-smoke-model.log")
-before = len(open(model_log).readlines())
+before = len(open(model_log, encoding="utf-8").readlines())
 reply, updates, _ = request("session/prompt", {"sessionId": session_id, "prompt": [
     {"type": "text", "text": "Read hello.txt with your read tool and reply with only the magic word."}]})
-models = {json.loads(line)["model"] for line in open(model_log).readlines()[before:]}
+models = {json.loads(line)["model"] for line in open(model_log, encoding="utf-8").readlines()[before:]}
 print("prompt 4:", reply.get("result") or reply.get("error"), "| models requested:", sorted(models))
 
 agent.stdin.close()
@@ -129,7 +132,7 @@ print("exit code:", agent.wait(timeout=60))
 if agentd:
     # Second GUI: reattach through the daemon and replay the journaled session.
     agent = subprocess.Popen(command, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                             stderr=open(os.path.join(tempfile.gettempdir(), "agentd-smoke-agent2.err"), "w"), text=True, bufsize=1)
+                             stderr=open(os.path.join(tempfile.gettempdir(), "agentd-smoke-agent2.err"), "w", encoding="utf-8"), text=True, bufsize=1, encoding="utf-8", errors="replace")
     reply, _, _ = request("initialize", {"protocolVersion": 1, "clientCapabilities": {}})
     print("reattach initialize loadSession:", reply["result"]["agentCapabilities"].get("loadSession"))
     reply, _, _ = request("session/list", {})
