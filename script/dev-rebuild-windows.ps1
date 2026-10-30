@@ -82,8 +82,11 @@ if (-not $SkipSwap) {
     $running = Get-Process zed -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $DestPath }
     $backup = $null
     if ($running) {
-        $stamp = Get-Date -Format "yyyyMMdd"
-        $backup = Join-Path $destDir "zed.exe.prev-$stamp"
+        # Stamp with the running binary's own HEAD (from its ProductVersion) so
+        # same-day reruns can't overwrite the only rollback copy.
+        $runningVersion = (Get-Item $DestPath).VersionInfo.ProductVersion
+        $runningHead = if ($runningVersion -match '\+dev\.([0-9a-f]{10})') { $Matches[1] } else { Get-Date -Format "yyyyMMdd" }
+        $backup = Join-Path $destDir "zed.exe.prev-$runningHead"
         Write-Host "Zed is running from $DestPath - renaming it to '$(Split-Path $backup -Leaf)' (safe while running) and copying the new build in. Restart Zed to pick it up."
         Move-Item $DestPath $backup -Force
     }
