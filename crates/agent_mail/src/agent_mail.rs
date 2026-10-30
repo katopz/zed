@@ -355,7 +355,7 @@ impl Mailroom {
             "-o",
             "BatchMode=yes",
             "-o",
-            "ConnectTimeout=4",
+            "ConnectTimeout=10",
             "-o",
             "StrictHostKeyChecking=accept-new",
         ]);

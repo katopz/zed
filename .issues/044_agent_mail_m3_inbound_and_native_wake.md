@@ -1,13 +1,5 @@
-# 044 — agent-mail: inbound to m3 + waking idle Zed native threads
-Status: OPEN — plan 043 follow-ups; m3 inbound waits on the owner (Remote Login)
-
-## m3 inbound (owner decision)
-Every link works except `* → m3`: macOS Remote Login is off on the m3
-(`ssh kat@100.125.16.103` times out). Enable with System Settings → General →
-Sharing → Remote Login (or `sudo systemsetup -setremotelogin on`), then append
-the amo/bmo/4090 public keys to `~/.ssh/authorized_keys` on the m3. Until then
-m3 agents can send but replies must be read on the other rig, or the other agent
-replies by a rig the m3 can poll.
+# 044 — agent-mail: 4090 AGENTS.md + waking idle Zed native threads
+Status: OPEN — plan 043 follow-ups; m3 inbound DONE 2026-10-30 (see plan 043)
 
 ## 4090 Zed AGENTS.md
 `%APPDATA%\Zed\AGENTS.md` is held open by the running Zed on the 4090, so the
