@@ -80,14 +80,25 @@ if (-not $SkipSwap) {
     }
 
     $running = Get-Process zed -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $DestPath }
+    $backup = $null
     if ($running) {
         $stamp = Get-Date -Format "yyyyMMdd"
-        $old = Join-Path $destDir "zed.exe.prev-$stamp"
-        Write-Host "Zed is running from $DestPath - renaming it to '$(Split-Path $old -Leaf)' (safe while running) and copying the new build in. Restart Zed to pick it up."
-        Move-Item $DestPath $old -Force
+        $backup = Join-Path $destDir "zed.exe.prev-$stamp"
+        Write-Host "Zed is running from $DestPath - renaming it to '$(Split-Path $backup -Leaf)' (safe while running) and copying the new build in. Restart Zed to pick it up."
+        Move-Item $DestPath $backup -Force
     }
 
-    Copy-Item $built $DestPath -Force
+    try {
+        Copy-Item $built $DestPath -Force
+    } catch {
+        # OneDrive sync locks are a real risk on the Desktop path; a partial copy
+        # here would leave a broken exe. Roll back to the backup we just made.
+        if ($backup -and (Test-Path $backup)) {
+            Move-Item $backup $DestPath -Force
+            Write-Host "Copy failed; restored the previous binary."
+        }
+        throw
+    }
 
     # Prune swap backups, keep the newest one for rollback.
     Get-ChildItem $destDir -Filter "zed.exe.prev-*" |
