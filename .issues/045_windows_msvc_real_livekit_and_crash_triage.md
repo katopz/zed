@@ -44,6 +44,16 @@ return chain) — memory-corruption class, FFI/native-webrtc suspect. Binary and
 its PDB are gone; unsymbolizable. Post-fix builds archive PDBs, so this dead end
 cannot recur.
 
+## Upstream drift (measured 2026-10-30 20:15Z)
+
+Fork is **54 commits behind** zed/zed main (merge-base `ec86047d67`, Oct 27).
+Notable for this box: `9cb5f90e3c` synthetic WM_MOUSEMOVE suppression (Windows
+input), `f0210f1621` UAX #14 line breaking, `7f9a39a9c0` livekit-rust-sdks bump
+(will churn Cargo.lock → webrtc-sys recompile → needs the PowerShell
+CXXFLAGS wrapper; livekit_client cfg already upstream-aligned), `2daea4d488`
+auto-compaction repeat fix, `2580a00264` gpui frame pacing. Sync is a curated
+sibling operation — not executed unilaterally here.
+
 ## Follow-ups
 
 - [x] Align livekit_client cfg with upstream (fix msvc build + real client)
