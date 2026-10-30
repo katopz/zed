@@ -1,5 +1,5 @@
 # 043 — Cross-rig agent mail (m3 ↔ amo/bmo ↔ 4090)
-Status: DONE — phase 1 full mesh incl. inbound to m3; phase 2 Zed native wake `e791be01ff`; one staged 4090 doc copy left — impl `5a9284e937`
+Status: DONE — phase 1 full mesh incl. inbound to m3; phase 2 Zed native wake `e791be01ff`; all rigs' agent docs current — impl `5a9284e937`
 
 ## Goal
 
@@ -51,4 +51,4 @@ Delivery to the receiving agent (no daemon, files only):
 - [x] latency bench `.benchmarks/003_agent_mail_cross_rig_latency.md`
 - [x] phase 2 (`e791be01ff`, was `.issues/044`): each live native session has an inbox `zed-<first 8 of session id>`; a NativeAgent poller (500 ms) claims mail and posts it through the plan 035 mailbox (idle → new turn, busy → after the turn ends). `send_message` to a `name@rig` address goes out via agent-mail (`delivery: "mailed"`), so replying to the sender id in the mail prompt crosses machines; `list_threads` shows `mail_address`. Gate: on only where `~/.agent-mail/rigs.json` exists (off in tests unless a test opts in); also runs in the Work Remote host agent. Upstream-file touch: 4 lines in `agent.rs`. Tests: `test_agent_mail_wakes_idle_thread_and_reply_goes_out`, `test_agent_mail_for_busy_thread_waits_for_turn_end` + the 6 existing mailbox tests pass; clippy `-p agent -p agent_mail -p agent_ui` clean. Takes effect in the GUI after the next Zed Dev rebuild
 - [x] agent instructions updated on every rig: native agents get mail automatically and send with `send_message` to `name@rig`. On m3, `~/.claude/CLAUDE.md` and `~/.config/zed/AGENTS.md` are kept identical by a sync, so the section had been appended twice; deduplicated
-- [ ] 4090 `%APPDATA%\Zed\AGENTS.md`: its Zed is running again, so the updated copy is staged at `C:\Users\katop\agent-mail-build\AGENTS.md.with-mail`; copy it over when Zed there is closed
+- [x] 4090 `%APPDATA%\Zed\AGENTS.md` updated once its Zed was closed (verified: one section, UTF-8 intact)
