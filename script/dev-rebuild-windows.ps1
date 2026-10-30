@@ -65,6 +65,20 @@ if (-not $SkipSwap) {
     $destDir = Split-Path $DestPath -Parent
     $destName = Split-Path $DestPath -Leaf
 
+    # Archive the PDB next to the build so crash dumps of a deployed exe stay
+    # symbolizable; the next build would otherwise overwrite target/release/zed.pdb.
+    # Keep only the newest archive, matching the exe backup policy.
+    $pdb = Join-Path $RepoRoot "target\release\zed.pdb"
+    $pdbArchiveDir = Join-Path $RepoRoot "target\release\pdb-archive"
+    if (Test-Path $pdb) {
+        New-Item -ItemType Directory -Force -Path $pdbArchiveDir | Out-Null
+        Copy-Item $pdb (Join-Path $pdbArchiveDir "$head.pdb") -Force
+        Get-ChildItem $pdbArchiveDir -Filter "*.pdb" |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -Skip 2 |
+            ForEach-Object { Remove-Item $_.FullName -Force }
+    }
+
     $running = Get-Process zed -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $DestPath }
     if ($running) {
         $stamp = Get-Date -Format "yyyyMMdd"
