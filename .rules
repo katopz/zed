@@ -27,7 +27,11 @@
       }
   });
   ```
-* Don't hand-roll a `while !s.is_char_boundary(end) { end -= 1 }` loop: `str::floor_char_boundary` does it. `auto_prompt::truncate_at_char_boundary` limits by chars, not bytes, so passing it a byte budget returns up to 4x that many bytes.
+* Don't hand-roll a `while !s.is_char_boundary(end) { end -= 1 }` loop: `str::floor_char_boundary` does it. `auto_prompt::truncate_at_char_boundary` limits by chars, not bytes, so passing a byte budget returns up to 4x that many bytes.
+
+# Ending an auto-prompt chain
+
+* When everything left is blocked, owner-gated, or waiting on the user, end the final message with `<stop>` alone on its own line — that is the worker's only deterministic halt channel (`remaining_work::STOP_KEYWORD`, checked in `decide_precheck`/`decide_with_llm`/`decide_claude`/`summary_declares_terminal`). Prose like "Holding." or "waiting on the user" does NOT stop the chain: the orchestrator LLM rewords it into a fresh continuation and the thread re-prompts forever (the `loop-bug`, 2026-10-30: ten identical continuation rounds). Sleeping instead of stopping is wrong too — it holds the thread busy until the 30-minute watchdog halts it with a cancellation.
 * Multi-key language-model providers must honor `LanguageModel::reset_key_session()` on new-thread creation so stale per-key backoff is re-probed (see `open_ai_compatible.rs`).
 
 # Timers in tests

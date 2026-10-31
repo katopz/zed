@@ -54,6 +54,17 @@ CXXFLAGS wrapper; livekit_client cfg already upstream-aligned), `2daea4d488`
 auto-compaction repeat fix, `2580a00264` gpui frame pacing. Sync is a curated
 sibling operation — not executed unilaterally here.
 
+## The continuation loop (found 2026-10-30 20:16Z)
+
+The ten identical "Continuing from the previous session's summary" rounds were
+the `loop-bug` class from `remaining_work.rs`: the worker (this agent) ended
+every holding message with prose ("Holding.") instead of the deterministic
+`<stop>` keyword — so the orchestrator LLM kept rewording the open-ended
+summary into fresh continuations. Root cause + fix recorded in `.rules`
+("Ending an auto-prompt chain"): end blocked/waiting turns with `<stop>` alone
+on its own line. No code change needed — the keyword gate already exists in
+decide_precheck / decide_with_llm / decide_claude / summary_declares_terminal.
+
 ## Follow-ups
 
 - [x] Align livekit_client cfg with upstream (fix msvc build + real client)
