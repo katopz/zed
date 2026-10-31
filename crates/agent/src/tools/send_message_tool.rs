@@ -18,6 +18,9 @@ use crate::{
 /// - `to` may be `name@rig` (e.g. `zed-bb@m3`, `*@amo`) to reach an agent on another
 ///   machine, or a Claude Code session, through agent-mail. It returns
 ///   `delivery: "mailed"` and any reply arrives later as a new message.
+/// - `deliver_at` schedules agent-mail for later. To wake yourself at a time (check a
+///   long job, read results), send to your own `mail_address` (see `list_threads`) with
+///   `deliver_at` and end your turn, instead of sleeping or polling in a loop.
 /// - Call `list_threads` first if you don't know the target's session_id.
 /// - The recipient sees the message wrapped with your thread's title and session_id,
 ///   so it can answer by calling `send_message` back to you.
@@ -38,6 +41,10 @@ pub struct SendMessageToolInput {
     /// Wait for the target's reply when it is idle. Defaults to false.
     #[serde(default)]
     pub wait_for_reply: bool,
+    /// Deliver later instead of now: a delay (`30m`, `8h`, `2d`), a local clock time
+    /// (`23:45`), or an RFC 3339 timestamp. Only for `name@rig` targets.
+    #[serde(default)]
+    pub deliver_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,6 +114,7 @@ impl AgentTool for SendMessageTool {
                 to: input.to,
                 message: input.message,
                 wait_for_reply: input.wait_for_reply,
+                deliver_at: input.deliver_at,
             };
             match self.environment.send_message_to_thread(request, cx).await {
                 Ok(outcome) => Ok(SendMessageToolOutput::Success(outcome)),

@@ -85,6 +85,7 @@ fn message_request(to: &acp_v2::SessionId, message: &str) -> ThreadMessageReques
         to: to.to_string(),
         message: message.to_string(),
         wait_for_reply: false,
+        deliver_at: None,
     }
 }
 
@@ -398,4 +399,65 @@ async fn test_agent_mail_for_busy_thread_waits_for_turn_end(cx: &mut TestAppCont
     assert_eq!(pending.len(), 1, "mail should start exactly one new turn");
     let prompt = pending[0].messages.last().unwrap().string_contents();
     assert!(prompt.contains("status?"), "{prompt}");
+}
+
+#[gpui::test]
+async fn test_thread_schedules_its_own_wake_up(cx: &mut TestAppContext) {
+    let setup = setup_threads(1, cx).await;
+    let (agent, fake) = (&setup.agent, &setup.fake);
+    let thread = &setup.threads[0];
+    let (home, _sender) = enable_agent_mail(agent, cx);
+    let name = agent_mail_bridge::native_thread_mail_name(&thread.session_id);
+
+    let turn = setup.send(thread, "Start the long job, then check it later", cx);
+    cx.run_until_parked();
+    let tool_input = json!({
+        "to": format!("{name}@m3"),
+        "message": "check the long job",
+        "deliver_at": "8h",
+    });
+    fake.send_last_event(
+        &thread.model,
+        LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
+            id: "wake_1".into(),
+            name: SendMessageTool::NAME.into(),
+            raw_input: tool_input.to_string(),
+            input: language_model::LanguageModelToolUseInput::Json(tool_input),
+            is_input_complete: true,
+            thought_signature: None,
+        }),
+    );
+    fake.end_last(&thread.model);
+    cx.run_until_parked();
+    fake.send_last_text(&thread.model, "Scheduled; going idle.");
+    fake.end_last(&thread.model);
+    assert_eq!(turn.await.unwrap(), acp_v2::StopReason::EndTurn);
+
+    // Idle and not yet due: polling must not wake the thread.
+    cx.executor().advance_clock(Duration::from_secs(2));
+    cx.run_until_parked();
+    assert!(fake.pending_completions_for(&thread.model).is_empty());
+
+    // The due time arrives (simulated by back-dating the parked file).
+    let later = home.path().join("inbox").join(&name).join("later");
+    let parked = std::fs::read_dir(&later)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let file_name = parked.file_name().unwrap().to_str().unwrap().to_string();
+    let (_, rest) = file_name.split_once('_').unwrap();
+    std::fs::rename(&parked, later.join(format!("1_{rest}"))).unwrap();
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.run_until_parked();
+
+    let pending = fake.pending_completions_for(&thread.model);
+    assert_eq!(
+        pending.len(),
+        1,
+        "the scheduled mail should wake the thread"
+    );
+    let prompt = pending[0].messages.last().unwrap().string_contents();
+    assert!(prompt.contains("check the long job"), "{prompt}");
 }

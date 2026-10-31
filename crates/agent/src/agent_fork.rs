@@ -183,6 +183,12 @@ impl NativeThreadEnvironment {
         if agent_mail_bridge::is_mail_address(&request.to) {
             return self.send_agent_mail(request, cx);
         }
+        if request.deliver_at.is_some() {
+            return Task::ready(Err(anyhow!(
+                "`deliver_at` needs a `name@rig` target; to wake yourself, send to your own \
+                 `mail_address` from `list_threads`"
+            )));
+        }
         let agent = self.agent.clone();
         let sender_thread = self.thread.clone();
         cx.spawn(async move |cx| {

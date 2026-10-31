@@ -187,18 +187,26 @@ impl NativeThreadEnvironment {
                 )?;
             let to = Address::parse(request.to.trim())?;
             let from = native_thread_mail_name(&sender);
+            let deliver_at = request
+                .deliver_at
+                .as_deref()
+                .map(|when| ::agent_mail::parse_when(when, chrono::Local::now()))
+                .transpose()?;
             let report = cx
                 .background_spawn(async move {
-                    let envelope = mailroom.compose(&to, &from, request.message, None)?;
+                    let mut envelope = mailroom.compose(&to, &from, request.message, None)?;
+                    envelope.deliver_at = deliver_at.map(|at| at.to_rfc3339());
                     mailroom.send(&envelope)
                 })
                 .await?;
+            let deliver_at = deliver_at.map(|at| at.to_rfc3339());
             Ok(ThreadMessageOutcome {
                 session_id: acp_v2::SessionId::new(report.to.clone()),
                 title: report.to.into(),
                 delivery: ThreadMessageDelivery::Mailed {
                     id: report.id,
                     via: report.via,
+                    deliver_at,
                 },
             })
         })

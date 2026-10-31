@@ -53,6 +53,8 @@ pub struct ThreadMessageRequest {
     pub to: String,
     pub message: String,
     pub wait_for_reply: bool,
+    /// Schedule agent-mail for later (`30m`, `8h`, `23:45`, RFC 3339).
+    pub deliver_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,6 +73,9 @@ pub enum ThreadMessageDelivery {
         id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         via: Option<String>,
+        /// When scheduled mail lands (and wakes the recipient).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        deliver_at: Option<String>,
     },
 }
 

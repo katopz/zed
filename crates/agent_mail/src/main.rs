@@ -6,10 +6,14 @@ const USAGE: &str = "\
 agent-mail — message coding agents on other machines (and this one) over SSH
 
 USAGE:
-  agent-mail send <name@rig | *@rig> [--from NAME] [--reply-to ID] [MESSAGE...]
-                       MESSAGE defaults to stdin; `*@rig` = first free agent there
+  agent-mail send <name@rig | *@rig> [--from NAME] [--reply-to ID] [--at WHEN] [MESSAGE...]
+                       MESSAGE defaults to stdin; `*@rig` = first free agent there.
+                       --at schedules it (30m, 8h, 2d, 23:45, or RFC 3339): it lands, and
+                       wakes the recipient, only then. Send to yourself for a timed wake-up
+                       instead of a sleep loop.
   agent-mail recv [--as NAME]...   claim and print your mail (also the rig-wide `*` box)
   agent-mail peek [--as NAME]...   print pending mail without claiming it
+  agent-mail scheduled [--as NAME]...  print your scheduled (not yet due) mail
   agent-mail whoami                your address (Claude session name, or $AGENT_MAIL_NAME)
   agent-mail rigs                  list rigs and time an SSH round trip to each
   agent-mail init <rig>            name this rig in ~/.agent-mail/rigs.json
@@ -34,7 +38,7 @@ fn run(args: Vec<String>) -> Result<i32> {
     let mut args = args.into_iter();
     match args.next().as_deref() {
         Some("send") => send(&room, args.collect()),
-        Some(command @ ("recv" | "peek")) => {
+        Some(command @ ("recv" | "peek" | "scheduled")) => {
             let mut names = vec![agent_mail::ANY_NAME.to_string()];
             let mut explicit = Vec::new();
             while let Some(arg) = args.next() {
@@ -53,6 +57,7 @@ fn run(args: Vec<String>) -> Result<i32> {
             }
             let mail = match command {
                 "recv" => room.claim(&names)?,
+                "scheduled" => room.scheduled(&names)?,
                 _ => room.peek(&names)?,
             };
             match mail.is_empty() {
@@ -119,11 +124,16 @@ fn send(room: &Mailroom, args: Vec<String>) -> Result<i32> {
     let to = Address::parse(&args.next().context("send needs a recipient")?)?;
     let mut from = None;
     let mut reply_to = None;
+    let mut deliver_at = None;
     let mut words = Vec::new();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--from" => from = Some(args.next().context("--from needs a name")?),
             "--reply-to" => reply_to = Some(args.next().context("--reply-to needs an id")?),
+            "--at" => {
+                let when = args.next().context("--at needs a time (30m, 8h, 23:45)")?;
+                deliver_at = Some(agent_mail::parse_when(&when, chrono::Local::now())?);
+            }
             _ => words.push(arg),
         }
     }
@@ -142,15 +152,22 @@ fn send(room: &Mailroom, args: Vec<String>) -> Result<i32> {
         Some(from) => from,
         None => room.whoami()?,
     };
-    let envelope = room.compose(&to, &from, body, reply_to)?;
+    let mut envelope = room.compose(&to, &from, body, reply_to)?;
+    envelope.deliver_at = deliver_at.map(|at| at.to_rfc3339());
     let report = room.send(&envelope)?;
     println!(
-        "sent {} to {}{} in {} ms",
+        "sent {} to {}{}{} in {} ms",
         report.id,
         report.to,
         report
             .via
             .map(|via| format!(" via {via}"))
+            .unwrap_or_default(),
+        deliver_at
+            .map(|at| format!(
+                ", delivered at {}",
+                at.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M %Z")
+            ))
             .unwrap_or_default(),
         report.elapsed.as_millis()
     );

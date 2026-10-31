@@ -24,7 +24,9 @@ pub const MAX_BODY_BYTES: usize = 16 * 1024;
 const MAX_NAME_LEN: usize = 64;
 const CLAIMED_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const WAIT_POLL: Duration = Duration::from_millis(500);
-const WAIT_MAX: Duration = Duration::from_secs(24 * 60 * 60);
+// Long enough to sleep through a multi-day scheduled wake; the waiter also
+// exits as soon as its session dies.
+const WAIT_MAX: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const SSH_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,6 +37,9 @@ pub struct Envelope {
     pub sent_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<String>,
+    /// RFC 3339; set for scheduled mail, which stays out of the inbox until then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deliver_at: Option<String>,
     pub body: String,
 }
 
@@ -183,22 +188,76 @@ impl Mailroom {
     }
 
     /// Atomic maildir delivery: readers only ever see complete files in `new/`.
+    /// Scheduled mail waits in `later/<due unix ms>_<id>.json` instead; every
+    /// inbox scan promotes what is due, so whatever already polls the inbox
+    /// (the Claude waiter hook, Zed's poller) delivers it on time without a
+    /// scheduler process.
     pub fn deliver(&self, envelope: &Envelope) -> Result<()> {
         let address = Address::parse(&envelope.to)?;
         validate_name(&envelope.id)?;
+        let due = envelope
+            .deliver_at
+            .as_deref()
+            .map(|at| {
+                chrono::DateTime::parse_from_rfc3339(at)
+                    .with_context(|| format!("invalid deliver_at {at:?}"))
+            })
+            .transpose()?
+            .filter(|due| *due > chrono::Utc::now());
         let inbox = self.inbox(&address.name);
-        for sub in ["tmp", "new", "cur"] {
+        for sub in ["tmp", "new", "cur", "later"] {
             fs::create_dir_all(inbox.join(sub))?;
         }
         let file_name = format!("{}.json", envelope.id);
         let staged = inbox.join("tmp").join(&file_name);
         fs::write(&staged, serde_json::to_vec(envelope)?)?;
-        fs::rename(&staged, inbox.join("new").join(&file_name))?;
+        let target = match due {
+            Some(due) => inbox
+                .join("later")
+                .join(format!("{}_{file_name}", due.timestamp_millis())),
+            None => inbox.join("new").join(&file_name),
+        };
+        fs::rename(&staged, target)?;
         prune_claimed(&inbox.join("cur"));
         Ok(())
     }
 
+    /// Moves scheduled mail whose time has come from `later/` into `new/`.
+    fn promote_due(&self, names: &[String]) {
+        let now = chrono::Utc::now().timestamp_millis();
+        for name in names {
+            let inbox = self.inbox(name);
+            let Ok(entries) = fs::read_dir(inbox.join("later")) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let file_name = entry.file_name();
+                let Some((due, rest)) = file_name.to_str().and_then(|name| name.split_once('_'))
+                else {
+                    continue;
+                };
+                if due.parse::<i64>().is_ok_and(|due| due <= now) {
+                    // A concurrent poller may win this rename; either way it lands once.
+                    fs::rename(entry.path(), inbox.join("new").join(rest)).ok();
+                }
+            }
+        }
+    }
+
+    /// Scheduled mail not yet due, soonest first.
+    pub fn scheduled(&self, names: &[String]) -> Result<Vec<Envelope>> {
+        let mut files: Vec<PathBuf> = names
+            .iter()
+            .filter_map(|name| fs::read_dir(self.inbox(name).join("later")).ok())
+            .flatten()
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .collect();
+        files.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+        files.iter().map(|path| read_envelope(path)).collect()
+    }
+
     fn pending_files(&self, names: &[String]) -> Vec<PathBuf> {
+        self.promote_due(names);
         let mut files: Vec<PathBuf> = names
             .iter()
             .filter_map(|name| fs::read_dir(self.inbox(name).join("new")).ok())
@@ -273,6 +332,7 @@ impl Mailroom {
             to: to.display_with(&rigs.self_rig),
             sent_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             reply_to,
+            deliver_at: None,
             body,
         })
     }
@@ -516,12 +576,57 @@ pub fn render(mail: &[Envelope], self_name: Option<&str>) -> String {
             .as_deref()
             .map(|id| format!(" reply_to=\"{id}\""))
             .unwrap_or_default();
+        let scheduled = envelope
+            .deliver_at
+            .as_deref()
+            .map(|at| format!(" scheduled_for=\"{at}\""))
+            .unwrap_or_default();
         text.push_str(&format!(
-            "<agent_mail from=\"{}\" to=\"{}\" id=\"{}\" sent_at=\"{}\"{reply_to}>\n{}\n</agent_mail>\n",
+            "<agent_mail from=\"{}\" to=\"{}\" id=\"{}\" sent_at=\"{}\"{reply_to}{scheduled}>\n{}\n</agent_mail>\n",
             envelope.from, envelope.to, envelope.id, envelope.sent_at, envelope.body
         ));
     }
     text
+}
+
+/// When to deliver scheduled mail: a delay (`90s`, `30m`, `8h`, `2d`), a local
+/// clock time (`23:45`, the next one to come), or an RFC 3339 timestamp.
+pub fn parse_when(
+    text: &str,
+    now: chrono::DateTime<chrono::Local>,
+) -> Result<chrono::DateTime<chrono::Utc>> {
+    let text = text.trim();
+    if let Ok(at) = chrono::DateTime::parse_from_rfc3339(text) {
+        return Ok(at.with_timezone(&chrono::Utc));
+    }
+    if let Ok(time) = chrono::NaiveTime::parse_from_str(text, "%H:%M") {
+        let today = now
+            .date_naive()
+            .and_time(time)
+            .and_local_timezone(chrono::Local)
+            .earliest()
+            .context("that local time does not exist today")?;
+        let at = match today > now {
+            true => today,
+            false => today + chrono::Duration::days(1),
+        };
+        return Ok(at.with_timezone(&chrono::Utc));
+    }
+    let split = text
+        .find(|character: char| !character.is_ascii_digit())
+        .with_context(|| format!("{text:?}: add a unit, e.g. {text}m"))?;
+    let (amount, unit) = text.split_at(split);
+    let amount: i64 = amount
+        .parse()
+        .with_context(|| format!("invalid time {text:?}: use 30m, 8h, 23:45 or RFC 3339"))?;
+    let delay = match unit {
+        "s" => chrono::Duration::seconds(amount),
+        "m" => chrono::Duration::minutes(amount),
+        "h" => chrono::Duration::hours(amount),
+        "d" => chrono::Duration::days(amount),
+        _ => bail!("invalid time {text:?}: use 30m, 8h, 23:45 or RFC 3339"),
+    };
+    Ok((now + delay).with_timezone(&chrono::Utc))
 }
 
 pub fn decode_payload(payload: &str) -> Result<Envelope> {
@@ -706,6 +811,85 @@ mod tests {
             room.compose(&to, "y", "a".repeat(MAX_BODY_BYTES + 1), None)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn scheduled_mail_waits_until_due() {
+        let dir = tempfile::tempdir().unwrap();
+        let room = mailroom(dir.path(), "m3");
+        let names = vec!["sleeper".to_string()];
+        let to = Address::parse("sleeper").unwrap();
+
+        let mut later = room.compose(&to, "me", "wake up".into(), None).unwrap();
+        later.deliver_at = Some((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339());
+        room.send(&later).unwrap();
+        assert!(!room.has_mail(&names));
+        assert!(room.claim(&names).unwrap().is_empty());
+        assert_eq!(room.scheduled(&names).unwrap(), vec![later.clone()]);
+
+        let mut due = room.compose(&to, "me", "now".into(), None).unwrap();
+        due.deliver_at = Some((chrono::Utc::now() - chrono::Duration::seconds(1)).to_rfc3339());
+        room.send(&due).unwrap();
+        assert_eq!(room.claim(&names).unwrap(), vec![due]);
+
+        // Time passes: rewrite the parked file's due stamp into the past.
+        let later_dir = dir.path().join("inbox/sleeper/later");
+        let parked = fs::read_dir(&later_dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let rest = parked
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split_once('_')
+            .unwrap()
+            .1
+            .to_string();
+        fs::rename(&parked, later_dir.join(format!("1_{rest}"))).unwrap();
+        assert_eq!(room.claim(&names).unwrap(), vec![later]);
+        assert!(room.scheduled(&names).unwrap().is_empty());
+    }
+
+    #[test]
+    fn parses_delays_clock_times_and_timestamps() {
+        use chrono::TimeZone as _;
+        let now = chrono::Local
+            .with_ymd_and_hms(2026, 10, 31, 15, 30, 0)
+            .unwrap();
+        let utc = |local: chrono::DateTime<chrono::Local>| local.with_timezone(&chrono::Utc);
+        assert_eq!(
+            parse_when("90s", now).unwrap(),
+            utc(now + chrono::Duration::seconds(90))
+        );
+        assert_eq!(
+            parse_when("8h", now).unwrap(),
+            utc(now + chrono::Duration::hours(8))
+        );
+        assert_eq!(
+            parse_when("23:45", now).unwrap(),
+            utc(chrono::Local
+                .with_ymd_and_hms(2026, 10, 31, 23, 45, 0)
+                .unwrap())
+        );
+        assert_eq!(
+            parse_when("09:00", now).unwrap(),
+            utc(chrono::Local
+                .with_ymd_and_hms(2026, 11, 1, 9, 0, 0)
+                .unwrap())
+        );
+        assert_eq!(
+            parse_when("2026-11-01T00:00:00Z", now)
+                .unwrap()
+                .to_rfc3339(),
+            "2026-11-01T00:00:00+00:00"
+        );
+        for bad in ["soon", "5", "5w", ""] {
+            assert!(parse_when(bad, now).is_err(), "{bad}");
+        }
     }
 
     #[test]
