@@ -1,5 +1,5 @@
 # 048 — amo as rig orchestrator: zero-token watchdog + exception-driven LLM
-Status: PROPOSED — 2026-10-31; awaiting owner picks (orchestrator runtime, nudge scope); builds on plan 047
+Status: IN PROGRESS — owner picks recorded 2026-10-31 (A, every agent, riir-*/seal-*/katgpt-rs); W1 being built
 
 ## Goal
 amo (always on, builder) becomes the orchestrator instead of m3/the owner:
@@ -53,17 +53,12 @@ Target ≤ 1.5k tokens per incident; the whole fleet is never dumped.
   `.plans`/`.issues` across repos (reuse the claim lease: the orchestrator
   suggests, the agent claims).
 
-## Runtime choices (owner)
-- [ ] Orchestrator runtime:
-  - **A. fresh `claude -p` per incident on amo** (recommended): bounded context
-    every time; needs the Claude CLI + `claude setup-token` on amo (amo has
-    only Zed's bundled agent today; SSH sessions cannot read the keychain).
-  - B. one long-lived Claude session on amo woken by mail: zero setup, but its
-    context grows per incident (relies on auto-compaction).
-  - C. a pinned Zed native thread on amo with a cheap model (e.g. GLM): woken by
-    the plan-043 native poller; needs a stable mail alias for that thread.
-- [ ] Nudge scope: all agents on all rigs, or only agents on autonomous lanes?
-- [ ] Which repos count for drift (proposed: zed, katgpt-rs, riir-ai, riir-train, riir-infer)?
+## Owner decisions (2026-10-31)
+- [x] Runtime **A**: a fresh `claude -p` per incident on amo (needs the Claude CLI + `claude setup-token` on amo once; until then digests land in the `orchestrator@amo` mailbox).
+- [x] Nudge scope: **every agent** on every rig.
+- [x] Drift repos: **`riir-*`, `seal-*`, `katgpt-rs`** under `~/git` (`E:/git` on the 4090).
+- [x] **Event trigger on thread start** (owner idea): the Stop hook saves each session's last paragraph locally (no mail, no tokens); the SessionStart hook sends ONE event to the orchestrator rig carrying the previous thread's last paragraph from the same folder, which is the handoff summary. auto_prompt's end + new thread therefore yields one event, not two.
+- [x] **Interval configurable, default 10 min**: launchd fires every 60 s and on new events (`WatchPaths` on the `_watch` inbox, launchd's 10 s throttle debounces bursts); the tick exits in milliseconds unless the interval (read at runtime from `~/.agent-mail/watch.json`) elapsed or an event arrived. A Zed setting writes that file on the orchestrator rig.
 
 ## Lessons applied
 - launchd runs with a bare environment (the `cargo: command not found` swap
