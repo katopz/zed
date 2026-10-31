@@ -1,5 +1,5 @@
 # 043 — Cross-rig agent mail (m3 ↔ amo/bmo ↔ 4090)
-Status: DONE — phase 1 full mesh incl. inbound to m3; phase 2 Zed native wake `e791be01ff`; scheduled wakes added; one staged 4090 doc copy — impl `5a9284e937`
+Status: DONE — phase 1 full mesh incl. inbound to m3; phase 2 Zed native wake `e791be01ff`; scheduled wakes added; all rigs' agent docs current — impl `5a9284e937`
 
 ## Goal
 
@@ -54,5 +54,5 @@ Delivery to the receiving agent (no daemon, files only):
 - [x] 4090 `%APPDATA%\Zed\AGENTS.md` updated once its Zed was closed (verified: one section, UTF-8 intact)
 - [x] scheduled mail / timed wake-ups (replaces `sleep` loops and launchd one-shots): `agent-mail send <to> --at 30m|8h|23:45|RFC3339`, native `send_message` `deliver_at`. Mail waits in `inbox/<name>/later/<due ms>_<id>.json`; every inbox scan promotes what is due, so the existing pollers (Claude waiter hook, Zed native poller) deliver it on time: no scheduler process, survives reboots, works cross-rig (`deliver_at` travels in the envelope). Waiter lifetime + hook timeout raised 24 h → 7 days on all rigs. `agent-mail scheduled` lists pending wakes. Tests: `scheduled_mail_waits_until_due`, `parses_delays_clock_times_and_timestamps`, `test_thread_schedules_its_own_wake_up`. Real e2e: m3 → `*@amo --at 1m` stayed in `scheduled` (inbox empty) until due, then woke a live Claude session on amo (katgpt-rs-3c), whose reply woke this session
 - [x] deploy trap found: `scp` over an existing macOS binary in place keeps the kernel's cached code signature for that inode, so the new binary is SIGKILLed on launch (ssh reported exit 255, no stderr). Deploy = `scp` to `agent-mail.new` then `mv -f` (new inode). amo + bmo redeployed that way
-- [ ] 4090 Zed `AGENTS.md` timed-wake line: staged at `C:\Users\katop\agent-mail-build\AGENTS.md.with-mail` (its Zed holds the file); copy when Zed there is closed
+- [x] 4090 Zed `AGENTS.md` timed-wake line applied once its Zed was closed (verified: one section, line present once)
 
