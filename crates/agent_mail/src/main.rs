@@ -22,6 +22,13 @@ USAGE:
                                    what every rig is busy with: heavy processes (riir-ai's
                                    contender rules), agents, load, memory, disk, power, GPU,
                                    and whether it is QUIET enough for a benchmark
+  agent-mail rig run <RIG|auto> [--shared|--exclusive] [--key K] [--title T] [--cores N]
+                [--mem GB] [--gpu-mem GB] [--needs cuda,metal] [--timeout 2h]
+                [--worktree repo@sha] [--cwd DIR] [--notify name@rig] -- <command>
+                                   queue a job: shared jobs run when resources fit, an
+                                   exclusive one waits for a quiet empty rig; mail on
+                                   start/poison/end; same --key twice = one run (amo referees)
+  agent-mail rig cancel <RIG> <ID> | rig log <RIG> <ID> [LINES]
   agent-mail rig watch [--once|--force]   orchestrator watchdog tick (zero tokens unless an
                                    incident is new); --install writes the launchd job,
                                    --interval MIN sets the tick interval (default 10)
@@ -156,6 +163,77 @@ fn run(args: Vec<String>) -> Result<i32> {
                 }
                 Ok(0)
             }
+            Some("run") => rig_run(&room, args.collect()),
+            Some("enqueue") => {
+                let spec: agent_mail::jobs::JobSpec =
+                    agent_mail::jobs::decode(&args.next().context("enqueue needs a payload")?)?;
+                room.enqueue_job(&spec)?;
+                println!("queued {}", spec.id);
+                Ok(0)
+            }
+            Some("kick") => {
+                room.kick_until_drained()?;
+                Ok(0)
+            }
+            Some("exec") => {
+                room.execute_job(&args.next().context("exec needs a job id")?)?;
+                Ok(0)
+            }
+            Some(command @ ("cancel" | "log")) => {
+                let target = args.next().context("which rig?")?;
+                let id = args.next().context("which job id?")?;
+                let lines: usize = args.next().and_then(|n| n.parse().ok()).unwrap_or(40);
+                let rigs = room.rigs()?;
+                let remote = match command {
+                    "cancel" => format!("rig cancel-local {id}"),
+                    _ => format!("rig log-local {id} {lines}"),
+                };
+                match target == rigs.self_rig {
+                    true => println!(
+                        "{}",
+                        match command {
+                            "cancel" => room.cancel_job(&id)?,
+                            _ => room.job_log(&id, lines)?,
+                        }
+                    ),
+                    false => {
+                        let rig = rigs.rigs.get(&target).context("unknown rig")?;
+                        let command =
+                            format!("{} {remote}", rig.bin.as_deref().unwrap_or("agent-mail"));
+                        let target_ssh = rig.ssh.first().context("rig has no ssh target")?;
+                        for line in room.ssh_lines(target_ssh, &command, END_MARKER)? {
+                            println!("{line}");
+                        }
+                    }
+                }
+                Ok(0)
+            }
+            Some("cancel-local") => {
+                println!("{}", room.cancel_job(&args.next().context("job id")?)?);
+                println!("{END_MARKER}");
+                Ok(0)
+            }
+            Some("log-local") => {
+                let id = args.next().context("job id")?;
+                let lines: usize = args.next().and_then(|n| n.parse().ok()).unwrap_or(40);
+                println!("{}", room.job_log(&id, lines)?);
+                println!("{END_MARKER}");
+                Ok(0)
+            }
+            Some("key-claim") => {
+                let claim: agent_mail::jobs::KeyClaim =
+                    agent_mail::jobs::decode(&args.next().context("key-claim needs a payload")?)?;
+                println!("{}", serde_json::to_string(&room.claim_key(&claim)?)?);
+                println!("{}", agent_mail::jobs::KEY_VERDICT_END);
+                Ok(0)
+            }
+            Some("key-release") => {
+                let (key, summary): (String, String) =
+                    agent_mail::jobs::decode(&args.next().context("key-release needs a payload")?)?;
+                room.release_key(&key, &summary)?;
+                println!("released");
+                Ok(0)
+            }
             Some("watch") => {
                 let mut force = false;
                 for arg in args.by_ref() {
@@ -223,6 +301,157 @@ fn run(args: Vec<String>) -> Result<i32> {
             Ok(0)
         }
     }
+}
+
+const END_MARKER: &str = "agent-mail-end";
+
+fn rig_run(room: &Mailroom, args: Vec<String>) -> Result<i32> {
+    use agent_mail::jobs::{JobSpec, KeyClaim, KeyOutcome, Lane, Needs};
+    let mut args = args.into_iter();
+    let target = args.next().context("rig run needs a rig name or `auto`")?;
+    let mut lane = Lane::Shared;
+    let mut needs = Needs {
+        cores: 1.0,
+        mem_gb: 1.0,
+        ..Needs::default()
+    };
+    let (mut key, mut title, mut cwd, mut notify, mut timeout, mut worktree) =
+        (None, None, None, None, None, None);
+    let mut argv = Vec::new();
+    while let Some(arg) = args.next() {
+        let mut value = |name: &str| args.next().with_context(|| format!("{name} needs a value"));
+        match arg.as_str() {
+            "--shared" => lane = Lane::Shared,
+            "--exclusive" => lane = Lane::Exclusive,
+            "--key" => key = Some(value("--key")?),
+            "--title" => title = Some(value("--title")?),
+            "--cwd" => cwd = Some(value("--cwd")?),
+            "--notify" => notify = Some(value("--notify")?),
+            "--worktree" => worktree = Some(value("--worktree")?),
+            "--timeout" => {
+                timeout = Some(agent_mail::jobs::parse_duration(&value("--timeout")?)?.as_secs())
+            }
+            "--cores" => {
+                needs.cores = value("--cores")?
+                    .parse()
+                    .context("--cores needs a number")?
+            }
+            "--mem" => needs.mem_gb = value("--mem")?.parse().context("--mem needs GB")?,
+            "--gpu-mem" => {
+                needs.gpu_mem_gb = value("--gpu-mem")?.parse().context("--gpu-mem needs GB")?
+            }
+            "--needs" => {
+                needs.caps = value("--needs")?
+                    .split(',')
+                    .map(|cap| cap.trim().to_string())
+                    .filter(|cap| !cap.is_empty())
+                    .collect()
+            }
+            "--" => {
+                argv.extend(args.by_ref());
+                break;
+            }
+            other => bail!("unexpected argument {other:?} (put the command after `--`)"),
+        }
+    }
+    anyhow::ensure!(
+        !argv.is_empty(),
+        "no command: `agent-mail rig run <rig|auto> [options] -- <command>`"
+    );
+    let rigs = room.rigs()?;
+    let notify = notify.or_else(|| {
+        room.whoami()
+            .ok()
+            .map(|name| format!("{name}@{}", rigs.self_rig))
+    });
+    let rig_name = match target.as_str() {
+        "auto" => {
+            let results = agent_mail::rig::status(room, &[])?;
+            agent_mail::jobs::pick_rig(&results, &rigs, &needs, lane)?
+        }
+        name => name.to_string(),
+    };
+    let rig = rigs
+        .rigs
+        .get(&rig_name)
+        .with_context(|| format!("unknown rig {rig_name:?}"))?;
+    anyhow::ensure!(
+        rig.accepts_jobs,
+        "rig {rig_name} takes no jobs (owner rule)"
+    );
+    let missing: Vec<&String> = needs
+        .caps
+        .iter()
+        .filter(|cap| !rig.caps.contains(cap))
+        .collect();
+    anyhow::ensure!(missing.is_empty(), "rig {rig_name} lacks {missing:?}");
+    let spec = JobSpec {
+        id: uuid::Uuid::now_v7().to_string(),
+        lane,
+        title: title.unwrap_or_else(|| argv.join(" ").chars().take(80).collect()),
+        argv,
+        cwd,
+        needs,
+        key: key.clone(),
+        notify: notify.clone(),
+        timeout_secs: timeout,
+        worktree,
+        submitted_at: chrono::Utc::now().to_rfc3339(),
+    };
+    if let Some(key) = &key {
+        let claim = KeyClaim {
+            key: key.clone(),
+            rig: rig_name.clone(),
+            id: spec.id.clone(),
+            notify: notify.clone(),
+        };
+        match room.claim_key_remote(&claim) {
+            Ok(KeyOutcome::Duplicate { rig, id }) => {
+                println!(
+                    "DUPLICATE: key `{key}` is already job {id} on {rig}; not starting another. \
+                     You are subscribed: its result mail comes to {}.",
+                    notify.as_deref().unwrap_or("(no address)")
+                );
+                return Ok(0);
+            }
+            Ok(KeyOutcome::Claimed) => {}
+            Err(error) => {
+                eprintln!("DEDUP-DEGRADED (orchestrator unreachable, key not checked): {error:#}")
+            }
+        }
+    }
+    let queued = match rig_name == rigs.self_rig {
+        true => room.enqueue_job(&spec),
+        false => {
+            let command = format!(
+                "{} rig enqueue {}",
+                rig.bin.as_deref().unwrap_or("agent-mail"),
+                agent_mail::jobs::encode_spec(&spec)?
+            );
+            let mut result = Err(anyhow::anyhow!("rig {rig_name} has no ssh target"));
+            for target_ssh in &rig.ssh {
+                result = room.ssh_lines(target_ssh, &command, "queued ").map(|_| ());
+                if result.is_ok() {
+                    break;
+                }
+            }
+            result
+        }
+    };
+    if let Err(error) = queued {
+        if let Some(key) = &key {
+            room.release_key_after_failed_enqueue(key);
+        }
+        return Err(error.context(format!("could not queue on {rig_name}")));
+    }
+    println!(
+        "queued job {} on {rig_name} ({:?} lane). Mail to {} when it starts and ends; \
+         `agent-mail rig status {rig_name}` shows it.",
+        spec.id,
+        spec.lane,
+        notify.as_deref().unwrap_or("(nobody: pass --notify)")
+    );
+    Ok(0)
 }
 
 fn send(room: &Mailroom, args: Vec<String>) -> Result<i32> {

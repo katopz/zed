@@ -994,6 +994,8 @@ mod tests {
             repos: Vec::new(),
             watch_last_tick: None,
             owner_mail: 0,
+            running: Vec::new(),
+            queued: Vec::new(),
         }
     }
 

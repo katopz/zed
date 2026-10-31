@@ -70,6 +70,11 @@ pub struct RigProbe {
     /// Orchestrator escalations waiting for the owner on this rig.
     #[serde(default)]
     pub owner_mail: usize,
+    /// Managed jobs (`rig run`) running and waiting here.
+    #[serde(default)]
+    pub running: Vec<crate::jobs::JobLine>,
+    #[serde(default)]
+    pub queued: Vec<crate::jobs::JobLine>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -120,6 +125,8 @@ pub struct Contender {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProcessRow {
     pub pid: u32,
+    /// Lets a managed job tell its own descendants from intruders.
+    pub parent: Option<u32>,
     /// Binary basename; for interpreter-hosted runs, the script basename.
     pub name: String,
     /// Per-core percent (100 = one full core), as `ps` reports it.
@@ -295,19 +302,21 @@ pub fn cputime_minutes(time: &str) -> f64 {
     days * 24.0 * 60.0 + minutes
 }
 
-/// Parses `ps -axo pid=,pcpu=,rss=,time=,args=` (RSS in KiB).
+/// Parses `ps -axo pid=,ppid=,pcpu=,rss=,time=,args=` (RSS in KiB).
 pub fn parse_ps(output: &str) -> Vec<ProcessRow> {
     output
         .lines()
         .filter_map(|line| {
             let mut fields = line.split_whitespace();
             let pid = fields.next()?.parse().ok()?;
+            let parent = fields.next()?.parse().ok();
             let cpu_pct = fields.next()?.parse().ok()?;
             let rss_kib: u64 = fields.next()?.parse().ok()?;
             let time = fields.next()?;
             let command = fields.collect::<Vec<_>>().join(" ");
             Some(ProcessRow {
                 pid,
+                parent,
                 name: process_identity(&command)?,
                 cpu_pct,
                 rss_bytes: rss_kib * 1024,
@@ -348,20 +357,54 @@ fn vocabulary_dir() -> Option<PathBuf> {
     .find(|dir| dir.join("contender_names.txt").exists())
 }
 
-/// Probes this rig.
-pub fn probe(mailroom: &Mailroom) -> RigProbe {
-    let rig = mailroom
-        .rigs()
-        .map(|rigs| rigs.self_rig)
-        .unwrap_or_else(|_| "unknown".into());
+/// Heavy work on this rig that is not one of `exclude_trees` (managed jobs:
+/// each pid and all its descendants are excluded), plus everything else that
+/// decides whether the rig is quiet.
+pub struct Contention {
+    pub contenders: Vec<Contender>,
+    pub blind: Option<String>,
+    pub power: Option<String>,
+    pub cpu_speed_limit: Option<u32>,
+    pub not_quiet_because: Vec<String>,
+    mem_total_gb: Option<f64>,
+    mem_free_gb: Option<f64>,
+    disk_free_gb: Option<f64>,
+}
+
+impl Contention {
+    pub fn quiet(&self) -> bool {
+        self.not_quiet_because.is_empty()
+    }
+}
+
+/// `root` and every process descending from it.
+pub fn descendants(rows: &[ProcessRow], roots: &[u32]) -> std::collections::HashSet<u32> {
+    let mut tree: std::collections::HashSet<u32> = roots.iter().copied().collect();
+    loop {
+        let before = tree.len();
+        for row in rows {
+            if row.parent.is_some_and(|parent| tree.contains(&parent)) {
+                tree.insert(row.pid);
+            }
+        }
+        if tree.len() == before {
+            return tree;
+        }
+    }
+}
+
+pub fn contention(exclude_trees: &[u32]) -> Contention {
     let processes = process_table();
+    let mut roots = exclude_trees.to_vec();
+    roots.push(std::process::id());
+    let excluded = descendants(&processes.rows, &roots);
     let (contenders, blind) = match vocabulary_dir().map(|dir| Vocabulary::load(&dir)) {
         Some(Ok(vocabulary)) => {
             let limits = Thresholds::from_env();
             let mut contenders: Vec<Contender> = processes
                 .rows
                 .iter()
-                .filter(|row| row.pid != std::process::id())
+                .filter(|row| !excluded.contains(&row.pid))
                 .filter_map(|row| {
                     let arm = classify(row, &vocabulary, &limits)?;
                     Some(Contender {
@@ -380,7 +423,7 @@ pub fn probe(mailroom: &Mailroom) -> RigProbe {
             for contender in contenders.iter_mut().take(MAX_CWD_LOOKUPS) {
                 contender.cwd = process_cwd(contender.pid);
             }
-            (contenders, processes.blind)
+            (contenders, processes.blind.clone())
         }
         Some(Err(error)) => (Vec::new(), Some(format!("{error:#}"))),
         None => (
@@ -402,20 +445,43 @@ pub fn probe(mailroom: &Mailroom) -> RigProbe {
     {
         not_quiet_because.push("on battery".into());
     }
-    if cpu_speed_limit.is_some_and(|limit| limit < 100) {
-        not_quiet_because.push(format!("throttled to {}%", cpu_speed_limit.unwrap_or(0)));
+    if let Some(limit) = cpu_speed_limit.filter(|limit| *limit < 100) {
+        not_quiet_because.push(format!("throttled to {limit}%"));
     }
+    Contention {
+        contenders,
+        blind,
+        power,
+        cpu_speed_limit,
+        not_quiet_because,
+        mem_total_gb: processes.mem_total_gb,
+        mem_free_gb: processes.mem_free_gb,
+        disk_free_gb: processes.disk_free_gb,
+    }
+}
+
+/// Probes this rig. Managed jobs are reported as jobs, not as contenders.
+pub fn probe(mailroom: &Mailroom) -> RigProbe {
+    let rig = mailroom
+        .rigs()
+        .map(|rigs| rigs.self_rig)
+        .unwrap_or_else(|_| "unknown".into());
+    // Reap-on-touch: every probe (each `rig status`, each watchdog tick)
+    // finishes dead jobs and starts whatever can run now.
+    mailroom.schedule_jobs().ok();
+    let jobs = mailroom.job_summary();
+    let contention = contention(&jobs.managed_pids);
     RigProbe {
         rig,
         os: std::env::consts::OS.into(),
         at: chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
         cores: std::thread::available_parallelism().map_or(0, |cores| cores.get()),
         load1: load_average(),
-        mem_total_gb: processes.mem_total_gb.or_else(memory_total_gb),
-        mem_free_gb: processes.mem_free_gb.or_else(memory_free_gb),
-        disk_free_gb: processes.disk_free_gb.or_else(disk_free_gb),
-        power,
-        cpu_speed_limit,
+        mem_total_gb: contention.mem_total_gb.or_else(memory_total_gb),
+        mem_free_gb: contention.mem_free_gb.or_else(memory_free_gb),
+        disk_free_gb: contention.disk_free_gb.or_else(disk_free_gb),
+        power: contention.power,
+        cpu_speed_limit: contention.cpu_speed_limit,
         gpus: gpus(),
         agents: claude_agents(mailroom),
         repos: repo_heads(),
@@ -428,15 +494,17 @@ pub fn probe(mailroom: &Mailroom) -> RigProbe {
             .filter(|rigs| rigs.orchestrator.as_deref() == Some(rigs.self_rig.as_str()))
             .and_then(|_| mailroom.watch_last_tick())
             .map(|at| at.to_rfc3339()),
-        quiet: not_quiet_because.is_empty(),
-        not_quiet_because,
-        contenders,
-        blind,
+        quiet: contention.not_quiet_because.is_empty(),
+        not_quiet_because: contention.not_quiet_because,
+        contenders: contention.contenders,
+        blind: contention.blind,
         outbox: mailroom
             .outbox_status()
             .into_iter()
             .map(|(rig, count, _)| (rig, count))
             .collect(),
+        running: jobs.running,
+        queued: jobs.queued,
     }
 }
 
@@ -451,7 +519,7 @@ struct ProcessTable {
 
 #[cfg(unix)]
 fn process_table() -> ProcessTable {
-    match run("ps", &["-axo", "pid=,pcpu=,rss=,time=,args="]) {
+    match run("ps", &["-axo", "pid=,ppid=,pcpu=,rss=,time=,args="]) {
         Some(output) => ProcessTable {
             rows: parse_ps(&output),
             ..ProcessTable::default()
@@ -493,6 +561,7 @@ fn process_table() -> ProcessTable {
                 .unwrap_or_else(|| process.name().to_string_lossy().into_owned());
             ProcessRow {
                 pid: process.pid().as_u32(),
+                parent: process.parent().map(|parent| parent.as_u32()),
                 name: name
                     .strip_suffix(".exe")
                     .map(str::to_string)
@@ -544,7 +613,7 @@ fn process_cwd(_pid: u32) -> Option<String> {
     None
 }
 
-fn load_average() -> Option<f64> {
+pub(crate) fn load_average() -> Option<f64> {
     if cfg!(target_os = "macos") {
         let text = run("sysctl", &["-n", "vm.loadavg"])?;
         return text
@@ -570,7 +639,7 @@ fn memory_total_gb() -> Option<f64> {
     meminfo_kib("MemTotal:").map(|kib| kib * 1024.0 / GIB)
 }
 
-fn memory_free_gb() -> Option<f64> {
+pub(crate) fn memory_free_gb() -> Option<f64> {
     if cfg!(target_os = "macos") {
         let text = run("vm_stat", &[])?;
         let page_size: f64 = text
@@ -646,7 +715,7 @@ fn power_and_thermal() -> (Option<String>, Option<u32>) {
     (power, speed_limit)
 }
 
-fn gpus() -> Vec<Gpu> {
+pub(crate) fn gpus() -> Vec<Gpu> {
     let Some(output) = run(
         "nvidia-smi",
         &[
@@ -960,6 +1029,12 @@ pub fn render(results: &[(String, Result<RigProbe>, Duration)], rigs: &crate::Ri
                 ));
             }
         }
+        for job in &probe.running {
+            out.push_str(&format!("      job    RUNNING {}\n", job.text));
+        }
+        for job in &probe.queued {
+            out.push_str(&format!("      job    queued  {}\n", job.text));
+        }
         for agent in &probe.agents {
             out.push_str(&format!(
                 "      agent  {} [{}] {}\n",
@@ -994,6 +1069,7 @@ mod tests {
     fn row(name: &str, cpu_pct: f64, rss_gb: f64, cputime_min: f64) -> ProcessRow {
         ProcessRow {
             pid: 1,
+            parent: None,
             name: name.into(),
             cpu_pct,
             rss_bytes: (rss_gb * GIB) as u64,
@@ -1090,8 +1166,8 @@ mod tests {
     #[test]
     fn parses_ps_rows_and_cpu_time() {
         let rows = parse_ps(
-            "  101  230.5  4194304  12:34.56 /usr/bin/cargo build --release\n\
-             202   0.0     1024   1-02:03:04 /sbin/launchd\n\
+            "  101  1  230.5  4194304  12:34.56 /usr/bin/cargo build --release\n\
+             202  1   0.0     1024   1-02:03:04 /sbin/launchd\n\
              garbage line\n",
         );
         assert_eq!(rows.len(), 2);

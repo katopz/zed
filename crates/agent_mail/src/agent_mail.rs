@@ -6,6 +6,7 @@
 //! is the SSH key auth the rigs already have. Receiving is a cheap directory
 //! scan, done by Claude Code hooks or by `agent-mail recv`.
 
+pub mod jobs;
 pub mod rig;
 pub mod watch;
 
@@ -110,6 +111,9 @@ pub struct Rig {
     /// `false` keeps every job off this rig (an orchestrator laptop).
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub accepts_jobs: bool,
+    /// What jobs may require of it (`cuda`, `metal`, `zed`, ...).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub caps: Vec<String>,
 }
 
 impl Default for Rig {
@@ -119,6 +123,7 @@ impl Default for Rig {
             bin: None,
             role: None,
             accepts_jobs: true,
+            caps: Vec::new(),
         }
     }
 }
@@ -662,6 +667,16 @@ impl Mailroom {
             .recv_timeout(Duration::from_secs(1))
             .unwrap_or_default();
         bail!("exit {:?}: {}", status.code(), stderr.trim())
+    }
+
+    /// Runs `remote_command` on `target` and returns its output lines before `marker`.
+    pub fn ssh_lines(
+        &self,
+        target: &str,
+        remote_command: &str,
+        marker: &str,
+    ) -> Result<Vec<String>> {
+        self.ssh(target, remote_command, marker)
     }
 
     /// This agent's mailbox name: `$AGENT_MAIL_NAME`, else the Claude Code
