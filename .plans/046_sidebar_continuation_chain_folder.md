@@ -29,4 +29,4 @@ threads. Show each chain as one folder-like group instead.
 - [x] folded head status/notification rollup (`chain_status`)
 - [x] tests: `test_continuation_chain_folds_under_newest_thread`, `test_folded_chain_surfaces_the_most_urgent_status`; all 163 sidebar tests pass; clippy `-p sidebar -p ui -p agent_ui` clean
 - [x] release DMG (`script/bundle-mac`); Metal Toolchain component installed on m3 (`xcodebuild -downloadComponent MetalToolchain`) so release shaders precompile
-- [-] persist fold state across restarts (session-only today; add if wanted)
+- [-] persist fold state across restarts (session-only today) — **owner-gated**: build only if the owner asks (recorded 2026-11-01 after an orchestrator nudge; no agent should pick this up on its own)

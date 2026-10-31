@@ -545,10 +545,7 @@ pub fn detect(
             let Some(idle) = agent.idle_minutes else {
                 continue;
             };
-            let asks_owner = agent
-                .last_paragraph
-                .as_deref()
-                .is_some_and(|paragraph| paragraph.trim_end().ends_with('?'));
+            let asks_owner = agent.last_paragraph.as_deref().is_some_and(waits_on_owner);
             let stalled = agent.status == "idle"
                 && idle * 60_000.0 >= interval_ms as f64
                 && !asks_owner
@@ -662,6 +659,31 @@ pub fn detect(
         });
     }
     incidents
+}
+
+/// Parked on the owner: a question, or the parked/awaiting wording session
+/// summaries use. Nudging these agents only spends their tokens.
+pub fn waits_on_owner(paragraph: &str) -> bool {
+    let text = paragraph.trim_end();
+    if text.ends_with('?') {
+        return true;
+    }
+    let lower = text.to_lowercase();
+    [
+        "awaiting",
+        "waiting on you",
+        "waiting on the owner",
+        "waits on the owner",
+        "owner-gated",
+        "owner gated",
+        "owner decision",
+        "your call",
+        "your decision",
+        "parked",
+        "needs you",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
 }
 
 fn mailroom_now_ms() -> i64 {
@@ -1125,6 +1147,16 @@ mod tests {
             .find(|incident| incident.fingerprint.starts_with("drift"))
             .unwrap();
         assert_eq!(drift.min_ticks, DRIFT_TICKS);
+    }
+
+    #[test]
+    fn owner_waiting_wording_is_not_a_stall() {
+        assert!(waits_on_owner("Should I proceed?"));
+        assert!(waits_on_owner(
+            "- `.plans/046`: done, one deferred item waiting on you."
+        ));
+        assert!(waits_on_owner("Plan 037: GUI test awaiting you."));
+        assert!(!waits_on_owner("Done: shipped c911487602; next is P1."));
     }
 
     #[test]
