@@ -458,8 +458,10 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "libc",
+ "regex",
  "serde",
  "serde_json",
+ "sysinfo 0.39.6",
  "tempfile",
  "uuid",
 ]

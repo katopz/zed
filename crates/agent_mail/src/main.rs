@@ -18,6 +18,11 @@ USAGE:
   agent-mail rigs                  list rigs and time an SSH round trip to each
   agent-mail init <rig>            name this rig in ~/.agent-mail/rigs.json
   agent-mail claude-hook [--wait]  Claude Code hook (PostToolUse/UserPromptSubmit; --wait for async Stop)
+  agent-mail rig status [RIG...] [--json]
+                                   what every rig is busy with: heavy processes (riir-ai's
+                                   contender rules), agents, load, memory, disk, power, GPU,
+                                   and whether it is QUIET enough for a benchmark
+  agent-mail flush                 retry mail parked for unreachable rigs now
   agent-mail deliver <payload>     receiving side of a remote send (run over SSH)
   agent-mail version
 
@@ -108,6 +113,62 @@ fn run(args: Vec<String>) -> Result<i32> {
             println!("delivered {}", envelope.id);
             Ok(0)
         }
+        Some("rig") => match args.next().as_deref() {
+            Some("probe") => {
+                let probe = agent_mail::rig::probe(&room);
+                println!("{}", serde_json::to_string(&probe)?);
+                println!("{}", agent_mail::rig::PROBE_END);
+                Ok(0)
+            }
+            Some("status") => {
+                let mut json = false;
+                let mut only = Vec::new();
+                for arg in args {
+                    match arg.as_str() {
+                        "--json" => json = true,
+                        "all" => {}
+                        rig => only.push(rig.to_string()),
+                    }
+                }
+                room.flush_outbox();
+                let results = agent_mail::rig::status(&room, &only)?;
+                match json {
+                    true => {
+                        let rows: Vec<serde_json::Value> = results
+                            .iter()
+                            .map(|(rig, outcome, elapsed)| match outcome {
+                                Ok(probe) => serde_json::json!({
+                                    "rig": rig, "online": true,
+                                    "elapsed_ms": elapsed.as_millis(), "probe": probe,
+                                }),
+                                Err(error) => serde_json::json!({
+                                    "rig": rig, "online": false,
+                                    "elapsed_ms": elapsed.as_millis(), "error": format!("{error:#}"),
+                                }),
+                            })
+                            .collect();
+                        println!("{}", serde_json::to_string_pretty(&rows)?);
+                    }
+                    false => print!("{}", agent_mail::rig::render(&results, &room.rigs()?)),
+                }
+                Ok(0)
+            }
+            _ => bail!("usage: agent-mail rig status [RIG...|all] [--json]"),
+        },
+        Some("flush") => {
+            let report = room.flush_outbox();
+            println!(
+                "outbox: {} delivered, {} still waiting",
+                report.delivered, report.pending
+            );
+            for (rig, count, oldest) in room.outbox_status() {
+                println!(
+                    "  {rig}: {count} waiting (oldest sent {})",
+                    oldest.unwrap_or_default()
+                );
+            }
+            Ok(0)
+        }
         Some("version") => {
             println!("agent-mail {}", env!("CARGO_PKG_VERSION"));
             Ok(0)
@@ -155,6 +216,16 @@ fn send(room: &Mailroom, args: Vec<String>) -> Result<i32> {
     let mut envelope = room.compose(&to, &from, body, reply_to)?;
     envelope.deliver_at = deliver_at.map(|at| at.to_rfc3339());
     let report = room.send(&envelope)?;
+    if let Some(reason) = &report.queued {
+        println!(
+            "QUEUED {} for {}: rig unreachable, parked in the outbox and retried automatically \
+             (`agent-mail flush` to retry now)\n  {}",
+            report.id,
+            report.to,
+            reason.replace('\n', "\n  ")
+        );
+        return Ok(0);
+    }
     println!(
         "sent {} to {}{}{} in {} ms",
         report.id,

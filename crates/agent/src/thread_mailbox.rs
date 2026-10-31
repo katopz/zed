@@ -76,6 +76,10 @@ pub enum ThreadMessageDelivery {
         /// When scheduled mail lands (and wakes the recipient).
         #[serde(skip_serializing_if = "Option::is_none")]
         deliver_at: Option<String>,
+        /// The rig was unreachable: the mail waits in the outbox and is
+        /// retried automatically; this is why it could not go now.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        queued: Option<String>,
     },
 }
 

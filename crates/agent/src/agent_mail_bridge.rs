@@ -9,6 +9,7 @@ use ::agent_mail::{Address, Envelope, Mailroom};
 /// Same cadence as the Claude Code waiter hook: a directory listing per live
 /// session, cheap enough to run continuously.
 const MAIL_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const OUTBOX_FLUSH_TICKS: u32 = 120;
 
 pub(crate) struct AgentMailState {
     mailroom: Arc<Mailroom>,
@@ -37,8 +38,16 @@ impl AgentMailState {
         let poller = cx.spawn({
             let mailroom = mailroom.clone();
             async move |this, cx| {
+                let mut ticks: u32 = 0;
                 loop {
                     cx.background_executor().timer(MAIL_POLL_INTERVAL).await;
+                    ticks = ticks.wrapping_add(1);
+                    // Retry mail parked for unreachable rigs about once a minute.
+                    if ticks.is_multiple_of(OUTBOX_FLUSH_TICKS) {
+                        let mailroom = mailroom.clone();
+                        cx.background_spawn(async move { mailroom.flush_outbox() })
+                            .detach();
+                    }
                     let Ok(inboxes) = this.read_with(cx, |agent, _| {
                         agent
                             .sessions
@@ -207,6 +216,7 @@ impl NativeThreadEnvironment {
                     id: report.id,
                     via: report.via,
                     deliver_at,
+                    queued: report.queued,
                 },
             })
         })

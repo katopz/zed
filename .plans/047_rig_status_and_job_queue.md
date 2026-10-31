@@ -1,5 +1,5 @@
 # 047 — Rig status + job queue (shared / exclusive lanes) on agent-mail
-Status: PROPOSED — design + verdict written 2026-10-31; awaiting owner answers on the open questions before P1
+Status: IN PROGRESS — P0 DONE (outbox + `rig status`, deployed on all 4 rigs); P1 (queue) next
 
 ## Problem
 
@@ -57,8 +57,9 @@ cwd + status; Work Remote sessions via `agentd status`), quiet verdict
 seen, never an error that hides the others.
 
 ### `agent-mail rig run <rig|auto> --shared|--exclusive [--key K] [--needs cuda,metal,zed] [--at WHEN] [--timeout D] [--worktree <repo>@<sha>] -- <cmd>`
-- **Shared** lane: runs now if the rig's shared slot cap allows (amo 2,
-  bmo 2, 4090 1, m3 1: owner to confirm) and no exclusive job holds or waits.
+- **Shared** lane: runs now if the rig's free resources cover the job's declared
+  needs (cores, RAM, GPU memory) after subtracting running managed jobs' reservations,
+  and no exclusive job holds or waits; otherwise it queues.
 - **Exclusive** lane ("quiet"): waits until no managed job runs AND the quiet
   probe passes (no unmanaged contenders for N s, power admissible, not
   thermally throttled), then holds the rig alone. **Writer-preferring**: once
@@ -68,11 +69,11 @@ seen, never an error that hides the others.
   15 s. A contender appearing marks the job `POISONED` with the offender (pid,
   name, cwd, who started it if managed), and mails the submitter
   immediately, so results are *labelled* and not silently lost. Default policy:
-  keep running + label (owner to confirm vs abort + requeue).
+  keep running + label; the submitter decides (owner decision).
 - `--worktree repo@sha` runs in a fresh `git worktree` + per-job
   `CARGO_TARGET_DIR`, so a job never builds a sibling agent's dirty tree and is
   reproducible.
-- `auto` picks a rig by `--needs` + role + queue depth; never m3 unless asked.
+- `auto` picks a rig by `--needs` + role + free resources + queue depth; never m3 (owner decision: m3 takes no jobs, ever).
 - `--at` composes with plan 043 scheduled mail (queue at a time).
 
 ### No daemon: self-propagating queue + reap-on-touch
@@ -121,19 +122,27 @@ tail, log path on the rig). Submitter + subscribers receive each one.
 7. **Cooldown between quiet jobs** (thermal recovery) should be a per-rig
    setting, so back-to-back benchmarks don't measure each other's heat.
 
-## Open questions (owner)
-- [ ] amo as dedup arbiter: OK?
-- [ ] Poison policy default: keep running + label (recommended) vs abort + auto-requeue?
-- [ ] Shared slot caps per rig (proposed amo 2, bmo 2, 4090 1, m3 1)?
-- [ ] Should m3 ever accept jobs (only when plugged in + `--allow-m3`)?
+## Owner decisions (2026-10-31)
+- [x] amo is the dedup arbiter.
+- [x] Poison policy: **label and report back; the submitting agent decides** (no auto-abort, no auto-requeue).
+- [x] No fixed slot caps: admission is **resource-based**. A job declares what it needs (cores, RAM, GPU memory); the rig admits it if its free resources minus what running managed jobs reserved cover it, else it queues.
+- [x] **m3 never takes jobs** (owner's rig, runs hot). m3 is orchestrator only: `rig status` reports it, `rig run` refuses it, `auto` never picks it.
 
 ## Tasks
-- [ ] P0 outbox: store-and-forward for unreachable rigs (fixes m3-offline replies) + test
-- [ ] P0 `rig status [rig|all] [--json]`: fan-out, sessions, contenders (riir-ai vocab files), power/thermal, GPU, disk; offline rigs reported, not fatal
+- [x] P0 outbox: an unreachable rig parks mail in `outbox/<rig>/<next try ms>_<attempts>_<id>.json` (send returns `QUEUED` + reason instead of failing; an unknown rig is still an error). Retried with backoff 30 s → 15 min by `agent-mail flush`, every `rig status`, each idle Claude waiter (every 60 s) and the Zed native poller (every ~60 s); one failure per rig postpones the rest without trying them; rename into `sending/` is the claim and `deliver` drops an id it already holds (at-least-once, no duplicates). Native `send_message` reports `queued`. Tests: `unreachable_rig_parks_mail_and_flush_retries_it`, `unknown_rig_is_an_error_not_parked`, `redelivered_id_is_dropped`
+- [x] P0 `agent-mail rig status [RIG...] [--json]` (`crates/agent_mail/src/rig.rs`): parallel SSH fan-out of `rig probe`; contenders by a faithful port of riir-ai `perf_rematch.sh::classify_contenders` (name → gpu-class → resource with editor bound → sustained; same env knobs; same argv identity incl. wrappers/interpreters) reading `riir-ai/scripts/contender_*.txt` at runtime (missing vocabulary = BLIND, never quiet); cwd per contender (lsof / /proc); Claude agents from `~/.claude/sessions`; load, memory, disk, macOS power + CPU speed limit, `nvidia-smi` GPUs; outbox backlog; roles + `accepts_jobs` (m3 `false`) in `rigs.json`; same-named workers collapse to one line. Windows samples natively via `sysinfo` (closes the `ps -W` no-CPU blind spot riir-ai has there; PowerShell+WMI took ~3.3 s, sysinfo ~0.5 s; pinned `>=0.33,<0.39` on the 4090, whose rustc 1.93 cannot build 0.39). Tests: `classifies_like_riir_ai_perf_rematch`, `identity_skips_wrappers_and_names_interpreted_scripts`, `parses_ps_rows_and_cpu_time`, `missing_vocabulary_is_blind_not_quiet`
 - [ ] P1 leases + queue + `rig run --shared|--exclusive` with writer-preferring exclusive lane; executor (setsid / schtasks); reap-on-touch; lifecycle mail
 - [ ] P1 quiet probe + poison sampling (15 s) + `POISONED` label
 - [ ] P2 job keys + amo arbiter (`O_EXCL`) + subscribe-on-duplicate; `DEDUP-DEGRADED` fallback
 - [ ] P2 `--needs` + role-aware `auto` rig pick; `--worktree repo@sha` + per-job target dir; `--timeout`; cooldown
 - [ ] P3 agent docs (CLAUDE.md / AGENTS.md on all rigs): heavy work via `rig run`, check `rig status` first
-- [ ] bench: `rig status all` p50 < 1.5 s across 4 rigs (parallel fan-out); hook tick overhead unchanged (< 1 ms added)
+- [x] bench: `rig status` over 4 rigs 0.53 s / 1.67 s / ~0.55 s wall (4090 dominates; its probe 0.40-0.60 s). Target < 1.5 s met except one 4090 outlier; hook path untouched (the outbox flush runs on the waiter's side thread, not the per-tool-call hook)
 - [ ] e2e: exclusive bench on bmo + a shared build queued behind it (must wait); injected contender → `POISONED` mail; duplicate key from two agents → one run, two subscribers
+- [x] P3 (partial) agent docs: `rig status` line added to CLAUDE.md / Zed AGENTS.md on every rig
+
+## P0 findings (first real run, 2026-10-31)
+- m3 was BUSY with an agent's `flashmemory_decode_gate` (Bonsai-27B, 17.7 GB, `/tmp/i1117_128k`) although m3 takes no jobs; P1 `rig run` must refuse m3, but only agent docs can stop hand-started work there.
+- amo: `cargo test -p seal-view` in worktree `seal-remake-wt068` plus a katgpt-rs build (31 rustc workers, collapsed in the human view).
+- 4090: `cargo test -p riir-train-gpu --test plan474_*` at 0% CPU: the NAME arm still counts it (riir-ai rule: an idle cargo is about to compile).
+- bmo: QUIET, the natural benchmark runner.
+

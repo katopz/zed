@@ -6,6 +6,8 @@
 //! is the SSH key auth the rigs already have. Receiving is a cheap directory
 //! scan, done by Claude Code hooks or by `agent-mail recv`.
 
+pub mod rig;
+
 use anyhow::{Context as _, Result, anyhow, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -28,6 +30,11 @@ const WAIT_POLL: Duration = Duration::from_millis(500);
 // exits as soon as its session dies.
 const WAIT_MAX: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const SSH_TIMEOUT: Duration = Duration::from_secs(20);
+const OUTBOX_FIRST_RETRY: Duration = Duration::from_secs(30);
+const OUTBOX_MAX_RETRY: Duration = Duration::from_secs(15 * 60);
+const OUTBOX_FLUSH_EVERY: Duration = Duration::from_secs(60);
+/// A `sending/` claim older than this belongs to a flusher that died mid-send.
+const STALE_SEND: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Envelope {
@@ -89,13 +96,38 @@ pub fn validate_name(name: &str) -> Result<&str> {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Rig {
     /// SSH destinations, tried in order (put the LAN address before Tailscale).
     pub ssh: Vec<String>,
     /// `agent-mail` path on that rig; non-interactive SSH often lacks ~/.cargo/bin on PATH.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bin: Option<String>,
+    /// What the rig is for (shown by `rig status`), e.g. `builder`, `runner`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// `false` keeps every job off this rig (an orchestrator laptop).
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub accepts_jobs: bool,
+}
+
+impl Default for Rig {
+    fn default() -> Self {
+        Self {
+            ssh: Vec::new(),
+            bin: None,
+            role: None,
+            accepts_jobs: true,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -111,7 +143,16 @@ pub struct SendReport {
     pub id: String,
     pub to: String,
     pub via: Option<String>,
+    /// Set when the rig was unreachable: the message waits in the outbox and
+    /// is retried by [`Mailroom::flush_outbox`]; this is why it could not go now.
+    pub queued: Option<String>,
     pub elapsed: Duration,
+}
+
+#[derive(Debug, Default)]
+pub struct FlushReport {
+    pub delivered: usize,
+    pub pending: usize,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -209,6 +250,21 @@ impl Mailroom {
             fs::create_dir_all(inbox.join(sub))?;
         }
         let file_name = format!("{}.json", envelope.id);
+        // Outbox retries are at-least-once (a send can land just before its
+        // connection drops), so a redelivered id is dropped here.
+        let already_held = inbox.join("new").join(&file_name).exists()
+            || inbox.join("cur").join(&file_name).exists()
+            || fs::read_dir(inbox.join("later")).is_ok_and(|entries| {
+                entries.flatten().any(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.ends_with(&format!("_{file_name}")))
+                })
+            });
+        if already_held {
+            return Ok(());
+        }
         let staged = inbox.join("tmp").join(&file_name);
         fs::write(&staged, serde_json::to_vec(envelope)?)?;
         let target = match due {
@@ -342,16 +398,35 @@ impl Mailroom {
         let rigs = self.rigs()?;
         let address = Address::parse(&envelope.to)?;
         let rig_name = address.rig.as_deref().unwrap_or(&rigs.self_rig);
-        let report = |via| SendReport {
+        let report = |via, queued| SendReport {
             id: envelope.id.clone(),
             to: envelope.to.clone(),
             via,
+            queued,
             elapsed: started.elapsed(),
         };
         if rig_name == rigs.self_rig {
             self.deliver(envelope)?;
-            return Ok(report(None));
+            return Ok(report(None, None));
         }
+        if !rigs.rigs.contains_key(rig_name) {
+            bail!(
+                "unknown rig {rig_name:?}; known: {} (edit {})",
+                rigs.rigs.keys().cloned().collect::<Vec<_>>().join(", "),
+                self.rigs_path().display()
+            );
+        }
+        match self.send_remote(&rigs, rig_name, envelope) {
+            Ok(target) => Ok(report(Some(target), None)),
+            Err(error) => {
+                let reason = format!("{error:#}");
+                self.park_in_outbox(rig_name, envelope, 0)?;
+                Ok(report(None, Some(reason)))
+            }
+        }
+    }
+
+    fn send_remote(&self, rigs: &Rigs, rig_name: &str, envelope: &Envelope) -> Result<String> {
         let rig = rigs.rigs.get(rig_name).with_context(|| {
             format!(
                 "unknown rig {rig_name:?}; known: {} (edit {})",
@@ -371,7 +446,7 @@ impl Mailroom {
                 &remote_command,
                 &format!("delivered {}", envelope.id),
             ) {
-                Ok(()) => return Ok(report(Some(target.clone()))),
+                Ok(_) => return Ok(target.clone()),
                 Err(error) => failures.push(format!("{target}: {error:#}")),
             }
         }
@@ -379,6 +454,109 @@ impl Mailroom {
             "could not reach rig {rig_name:?}:\n  {}",
             failures.join("\n  ")
         ))
+    }
+
+    fn outbox(&self) -> PathBuf {
+        self.home.join("outbox")
+    }
+
+    /// Parks `envelope` for `rig` as `outbox/<rig>/<next try ms>_<attempts>_<id>.json`.
+    fn park_in_outbox(&self, rig: &str, envelope: &Envelope, attempts: u32) -> Result<()> {
+        let dir = self.outbox().join(validate_name(rig)?);
+        fs::create_dir_all(&dir)?;
+        let backoff = OUTBOX_FIRST_RETRY
+            .saturating_mul(1 << attempts.min(10))
+            .min(OUTBOX_MAX_RETRY);
+        let next = chrono::Utc::now().timestamp_millis()
+            + i64::try_from(backoff.as_millis()).unwrap_or(i64::MAX);
+        let staged = dir.join(format!(".{}.tmp", envelope.id));
+        fs::write(&staged, serde_json::to_vec(envelope)?)?;
+        fs::rename(
+            &staged,
+            dir.join(format!("{next}_{attempts}_{}.json", envelope.id)),
+        )?;
+        Ok(())
+    }
+
+    /// Messages still waiting for their rig: `(rig, count, oldest sent_at)`.
+    pub fn outbox_status(&self) -> Vec<(String, usize, Option<String>)> {
+        let Ok(rigs) = fs::read_dir(self.outbox()) else {
+            return Vec::new();
+        };
+        rigs.flatten()
+            .filter_map(|rig| {
+                let name = rig.file_name().to_str()?.to_string();
+                let files = outbox_files(&rig.path());
+                let oldest = files
+                    .iter()
+                    .filter_map(|(_, _, path)| read_envelope(path).ok())
+                    .map(|envelope| envelope.sent_at)
+                    .min();
+                (!files.is_empty()).then_some((name, files.len(), oldest))
+            })
+            .collect()
+    }
+
+    /// Retries parked mail whose backoff has elapsed. One failure per rig
+    /// postpones the rest of that rig's mail without trying it, so an offline
+    /// rig costs one connect timeout per flush, not one per message. The
+    /// rename into `sending/` is the claim: concurrent flushers never both
+    /// send a message, and `deliver` drops an id it already holds.
+    pub fn flush_outbox(&self) -> FlushReport {
+        let mut report = FlushReport::default();
+        let Ok(rig_dirs) = fs::read_dir(self.outbox()) else {
+            return report;
+        };
+        let Ok(rigs) = self.rigs() else {
+            return report;
+        };
+        let now = chrono::Utc::now().timestamp_millis();
+        for rig_dir in rig_dirs.flatten() {
+            let Some(rig) = rig_dir.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            let sending = rig_dir.path().join("sending");
+            recover_stale_sends(&sending, &rig_dir.path());
+            let mut rig_down = None;
+            for (due, attempts, path) in outbox_files(&rig_dir.path()) {
+                if due > now {
+                    report.pending += 1;
+                    continue;
+                }
+                let Some(file_name) = path.file_name() else {
+                    continue;
+                };
+                if fs::create_dir_all(&sending).is_err() {
+                    continue;
+                }
+                let claimed = sending.join(file_name);
+                if fs::rename(&path, &claimed).is_err() {
+                    continue;
+                }
+                let Ok(envelope) = read_envelope(&claimed) else {
+                    fs::remove_file(&claimed).ok();
+                    continue;
+                };
+                let outcome = match &rig_down {
+                    Some(reason) => Err(anyhow!("{reason}")),
+                    None => self.send_remote(&rigs, &rig, &envelope),
+                };
+                match outcome {
+                    Ok(_) => {
+                        fs::remove_file(&claimed).ok();
+                        report.delivered += 1;
+                    }
+                    Err(error) => {
+                        rig_down.get_or_insert_with(|| format!("{error:#}"));
+                        if self.park_in_outbox(&rig, &envelope, attempts + 1).is_ok() {
+                            fs::remove_file(&claimed).ok();
+                        }
+                        report.pending += 1;
+                    }
+                }
+            }
+        }
+        report
     }
 
     /// Pings every rig by running `<bin> version` there.
@@ -394,7 +572,7 @@ impl Mailroom {
                 let started = Instant::now();
                 let outcome = self
                     .ssh(target, &command, "agent-mail ")
-                    .map(|()| started.elapsed());
+                    .map(|_| started.elapsed());
                 results.push((name.clone(), target.clone(), outcome));
             }
         }
@@ -407,7 +585,13 @@ impl Mailroom {
     /// with `marker`. Success is the marker, not the exit status: Windows'
     /// OpenSSH client run inside an sshd session (an agent in a Zed remote
     /// window on the 4090) delivers but never exits, so it is killed instead.
-    fn ssh(&self, target: &str, remote_command: &str, marker: &str) -> Result<()> {
+    /// Returns the stdout lines printed before the marker line.
+    pub(crate) fn ssh(
+        &self,
+        target: &str,
+        remote_command: &str,
+        marker: &str,
+    ) -> Result<Vec<String>> {
         let mut command = Command::new("ssh");
         // accept-new only trusts a rig's first-seen host key (Tailscale already
         // authenticates the node); a changed key is still rejected.
@@ -442,11 +626,15 @@ impl Mailroom {
         let (marker_sender, marker_receiver) = mpsc::channel();
         let marker = marker.to_string();
         std::thread::spawn(move || {
-            let found = BufReader::new(stdout)
-                .lines()
-                .map_while(|line| line.ok())
-                .any(|line| line.starts_with(&marker));
-            marker_sender.send(found).ok();
+            let mut before = Vec::new();
+            for line in BufReader::new(stdout).lines().map_while(|line| line.ok()) {
+                if line.starts_with(&marker) {
+                    marker_sender.send(Some(before)).ok();
+                    return;
+                }
+                before.push(line);
+            }
+            marker_sender.send(None).ok();
         });
         let (stderr_sender, stderr_receiver) = mpsc::channel();
         std::thread::spawn(move || {
@@ -454,11 +642,11 @@ impl Mailroom {
             BufReader::new(stderr).read_to_string(&mut text).ok();
             stderr_sender.send(text).ok();
         });
-        let found = marker_receiver.recv_timeout(SSH_TIMEOUT).unwrap_or(false);
+        let found = marker_receiver.recv_timeout(SSH_TIMEOUT).ok().flatten();
         child.kill().ok();
         let status = child.wait()?;
-        if found {
-            return Ok(());
+        if let Some(lines) = found {
+            return Ok(lines);
         }
         let stderr = stderr_receiver
             .recv_timeout(Duration::from_secs(1))
@@ -533,6 +721,15 @@ impl Mailroom {
         // A newer waiter for the same session replaces this one.
         let token = uuid::Uuid::now_v7().to_string();
         fs::write(&lock, &token)?;
+        // Idle sessions are the rig's steady heartbeat, so their waiters also
+        // retry mail parked for unreachable rigs (e.g. replies to a closed m3).
+        let flusher = Mailroom::new(self.home.clone());
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(OUTBOX_FLUSH_EVERY);
+                flusher.flush_outbox();
+            }
+        });
         let started = Instant::now();
         let outcome = loop {
             let still_ours = fs::read_to_string(&lock).is_ok_and(|current| current == token);
@@ -636,6 +833,46 @@ pub fn decode_payload(payload: &str) -> Result<Envelope> {
     serde_json::from_slice(&bytes).context("payload is not an envelope")
 }
 
+/// `(due ms, attempts, path)` for each parked message in a rig's outbox dir.
+fn outbox_files(dir: &Path) -> Vec<(i64, u32, PathBuf)> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut files: Vec<(i64, u32, PathBuf)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_str()?.to_string();
+            let mut parts = name.splitn(3, '_');
+            let due = parts.next()?.parse().ok()?;
+            let attempts = parts.next()?.parse().ok()?;
+            parts
+                .next()?
+                .ends_with(".json")
+                .then_some((due, attempts, entry.path()))
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+fn recover_stale_sends(sending: &Path, rig_dir: &Path) {
+    let Ok(entries) = fs::read_dir(sending) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let stale = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age > STALE_SEND);
+        if stale {
+            fs::rename(entry.path(), rig_dir.join(entry.file_name())).ok();
+        }
+    }
+}
+
 fn read_envelope(path: &Path) -> Result<Envelope> {
     let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))
@@ -717,7 +954,7 @@ fn find_claude_session(session_id: &str) -> Result<Option<ClaudeSession>> {
 }
 
 #[cfg(unix)]
-fn process_alive(pid: u32) -> bool {
+pub(crate) fn process_alive(pid: u32) -> bool {
     let Ok(pid) = libc::pid_t::try_from(pid) else {
         return false;
     };
@@ -727,7 +964,7 @@ fn process_alive(pid: u32) -> bool {
 }
 
 #[cfg(not(unix))]
-fn process_alive(_pid: u32) -> bool {
+pub(crate) fn process_alive(_pid: u32) -> bool {
     true
 }
 
@@ -890,6 +1127,85 @@ mod tests {
         for bad in ["soon", "5", "5w", ""] {
             assert!(parse_when(bad, now).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn unreachable_rig_parks_mail_and_flush_retries_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let room = mailroom(dir.path(), "bmo");
+        // A rig whose only "ssh" target can never connect.
+        let mut rigs = room.rigs().unwrap();
+        rigs.rigs.insert(
+            "m3".into(),
+            Rig {
+                ssh: vec!["nobody@127.0.0.1".into()],
+                bin: Some("/nonexistent/agent-mail".into()),
+                ..Rig::default()
+            },
+        );
+        fs::write(
+            dir.path().join("rigs.json"),
+            serde_json::to_string(&rigs).unwrap(),
+        )
+        .unwrap();
+
+        let envelope = room
+            .compose(
+                &Address::parse("zed-bb@m3").unwrap(),
+                "job",
+                "done".into(),
+                None,
+            )
+            .unwrap();
+        let report = room.send(&envelope).unwrap();
+        assert!(report.queued.is_some());
+        assert_eq!(room.outbox_status()[0].1, 1);
+
+        // Not due yet: a flush must not try (or lose) it.
+        let flushed = room.flush_outbox();
+        assert_eq!((flushed.delivered, flushed.pending), (0, 1));
+
+        // Due now and still unreachable: retried, re-parked with a longer backoff.
+        let rig_dir = dir.path().join("outbox/m3");
+        let parked = outbox_files(&rig_dir).remove(0).2;
+        let name = parked.file_name().unwrap().to_str().unwrap().to_string();
+        let (_, rest) = name.split_once('_').unwrap();
+        fs::rename(&parked, rig_dir.join(format!("1_{rest}"))).unwrap();
+        let flushed = room.flush_outbox();
+        assert_eq!((flushed.delivered, flushed.pending), (0, 1));
+        let (due, attempts, _) = outbox_files(&rig_dir).remove(0);
+        assert_eq!(attempts, 1);
+        assert!(due > chrono::Utc::now().timestamp_millis());
+    }
+
+    #[test]
+    fn unknown_rig_is_an_error_not_parked() {
+        let dir = tempfile::tempdir().unwrap();
+        let room = mailroom(dir.path(), "m3");
+        let envelope = room
+            .compose(
+                &Address::parse("x@nowhere").unwrap(),
+                "y",
+                "hi".into(),
+                None,
+            )
+            .unwrap();
+        assert!(room.send(&envelope).is_err());
+        assert!(room.outbox_status().is_empty());
+    }
+
+    #[test]
+    fn redelivered_id_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let room = mailroom(dir.path(), "m3");
+        let names = vec!["x".to_string()];
+        let envelope = room
+            .compose(&Address::parse("x").unwrap(), "y", "once".into(), None)
+            .unwrap();
+        room.deliver(&envelope).unwrap();
+        assert_eq!(room.claim(&names).unwrap().len(), 1);
+        room.deliver(&envelope).unwrap();
+        assert!(room.claim(&names).unwrap().is_empty());
     }
 
     #[test]
