@@ -1,5 +1,5 @@
 # 048 — amo as rig orchestrator: zero-token watchdog + exception-driven LLM
-Status: IN PROGRESS — W1 DONE and live on amo (launchd, runtime A via Zed's bundled Claude Code, sonnet); W2 backlog scan next
+Status: DONE — W1 + W2 live on amo (launchd, runtime A via Zed's bundled Claude Code, sonnet, lean context ~$0.006/run)
 
 ## Goal
 amo (always on, builder) becomes the orchestrator instead of m3/the owner:
@@ -71,7 +71,7 @@ Target ≤ 1.5k tokens per incident; the whole fleet is never dumped.
 - [x] W1 transcript tail: last assistant text from the last 128 KiB of `~/.claude/projects/<cwd>/<session>.jsonl`, last paragraph (extended to ≥ 80 chars), capped 400 chars on a char boundary; per agent in `rig probe`, plus Stop-hook save + SessionStart handoff event (one event per new thread, carrying the previous thread's paragraph from the same folder)
 - [x] W1 launchd on amo (`rig watch --install`): StartInterval 60 + WatchPaths on the `_watch` inbox + ThrottleInterval 10 + AbandonProcessGroup (without it launchd killed the spawned orchestrator with the job: found live) + absolute PATH/HOME; `rig status` shows `orchestrator last watchdog tick N min ago` / `STALE`; interval via `agent-mail rig watch --interval N` and Zed setting `agent_mail_watch_interval_minutes` (pushed to the orchestrator rig over SSH on change; null leaves amo's default 10)
 - [x] W2 digest + runtime A: `orchestrator_command` in amo's `~/.agent-mail/watch.json` = Zed's bundled Claude Code 2.1.312 (`claude -p --model sonnet --strict-mcp-config --disable-slash-commands --allowedTools 'Bash(agent-mail send:*)'`), digest on stdin, cwd `~/.agent-mail/watch`, `AGENT_MAIL_ORCHESTRATOR=1` makes its own hooks stand down (no self-trigger loop). Dry run first (no tools): good judgement (mailed 3 actionable agents, skipped done/owner-waiting/m3 ones), $0.091, 12.8 s, 1,412 output tokens; ~19k cached input is global CLAUDE.md + tool schemas
-- [ ] W2 backlog scan for "assign other work" (unclaimed items, claim-lease aware)
+- [x] W2 backlog scan: when a stalled-agent incident wakes the orchestrator, the digest gains up to 8 unclaimed items (first `- [ ]` of each `.plans`/`.issues` file in `riir-*`/`seal-*`/`katgpt-rs` whose status is not DONE/CLOSED/… and with no live `**Claimed:**` lease, newest file first, ≤ 160 chars each); the orchestrator suggests one, the agent claims it. Zero cost when nobody is idle. Test: `backlog_skips_done_and_claimed_items`
 - [x] bench: quiet tick 0 tokens, exits in ms; full tick 1.9 s (4-rig probe); digest for 7 incidents 2,633 chars (~660 tokens) — under the 1.5k target; LLM run ~$0.09 with sonnet, dominated by fixed context (owner CLAUDE.md), not the digest
 
 ## Live-run findings (2026-10-31, fixed in the follow-up commit)
@@ -81,4 +81,5 @@ Target ≤ 1.5k tokens per incident; the whole fleet is never dumped.
 - [x] Escalations to `owner@m3` were invisible: `rig status` now shows `owner N escalation(s) waiting` (`agent-mail recv --as owner`).
 - [x] The orchestrator read "no jobs on m3" as "never nudge m3 agents"; the digest now says: never start jobs on m3, but agents already there may be nudged (owner chose "every agent").
 - [x] Handoff trigger verified live: a simulated SessionStart on m3 reached amo's watchdog within seconds (launchd WatchPaths) carrying the previous thread's last paragraph.
+- [x] Lean orchestrator context (measured on amo, one-word prompt): default flags 29.9k input tokens / $0.053; `--tools Bash` 13.3k / $0.045; plus `CLAUDE_CODE_DISABLE_CLAUDE_MDS=1` + `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` (new `orchestrator_env` in `watch.json`) **3.8k / $0.0062, 8.5× cheaper**, and no reflexive `## Summary` (4 output tokens). Safe because the digest carries every instruction the orchestrator needs
 

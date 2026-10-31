@@ -35,6 +35,8 @@ const ESCALATE_AFTER_ROUNDS: u32 = 3;
 /// difference between rigs is normal.
 const DRIFT_TICKS: u32 = 6;
 const TICK_LOCK_STALE: Duration = Duration::from_secs(10 * 60);
+const BACKLOG_ITEMS: usize = 8;
+const BACKLOG_ITEM_CHARS: usize = 160;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WatchConfig {
@@ -47,6 +49,11 @@ pub struct WatchConfig {
     /// `claude -p ...`). Without it, digests are mailed to `orchestrator@<this rig>`.
     #[serde(default)]
     pub orchestrator_command: Option<Vec<String>>,
+    /// Extra environment for the orchestrator, e.g. Claude Code's
+    /// `CLAUDE_CODE_DISABLE_CLAUDE_MDS=1`: the digest carries every
+    /// instruction, so the owner's global CLAUDE.md is pure token cost there.
+    #[serde(default)]
+    pub orchestrator_env: BTreeMap<String, String>,
 }
 
 fn default_interval() -> u64 {
@@ -63,6 +70,7 @@ impl Default for WatchConfig {
             interval_minutes: default_interval(),
             cooldown_minutes: default_cooldown(),
             orchestrator_command: None,
+            orchestrator_env: BTreeMap::new(),
         }
     }
 }
@@ -418,7 +426,23 @@ pub fn tick(mailroom: &Mailroom, force: bool) -> Result<TickReport> {
     fs::write(&state_path, serde_json::to_vec_pretty(&state)?)?;
 
     if !to_wake.is_empty() {
-        let digest = digest(&to_wake, &results, &rigs.self_rig);
+        let mut digest = digest(&to_wake, &results, &rigs.self_rig);
+        // Work to hand out, only when someone is idle: zero cost otherwise.
+        if to_wake
+            .iter()
+            .any(|incident| incident.fingerprint.starts_with("stalled:"))
+        {
+            let items = backlog(&repo_roots(), chrono::Utc::now());
+            if !items.is_empty() {
+                digest.push_str(
+                    "\n## Backlog (unclaimed `- [ ]` items, newest plans first; suggest one to an idle \
+                     agent in the same repo, it claims it with the `**Claimed:**` lease)\n",
+                );
+                for item in items {
+                    digest.push_str(&format!("- {item}\n"));
+                }
+            }
+        }
         fs::write(dir.join("last_digest.md"), &digest).ok();
         deliver_digest(mailroom, &config, &rigs.self_rig, digest)?;
         report.woke = to_wake.len();
@@ -667,6 +691,124 @@ fn summarize_contenders(probe: &RigProbe) -> String {
     }
 }
 
+fn repo_roots() -> Vec<PathBuf> {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    home.map(|home| PathBuf::from(home).join("git"))
+        .into_iter()
+        .chain([PathBuf::from("E:/git")])
+        .filter(|root| root.is_dir())
+        .collect()
+}
+
+/// Unclaimed open work: the first `- [ ]` of each `.plans`/`.issues` file in
+/// the tracked repos whose status is not done and that carries no live
+/// `**Claimed:**` lease, newest file first.
+pub fn backlog(roots: &[PathBuf], now: chrono::DateTime<chrono::Utc>) -> Vec<String> {
+    let mut found: Vec<(std::time::SystemTime, String)> = Vec::new();
+    for root in roots {
+        let Ok(repos) = fs::read_dir(root) else {
+            continue;
+        };
+        for repo in repos.flatten() {
+            let Some(repo_name) = repo.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            if !(repo_name.starts_with("riir-")
+                || repo_name.starts_with("seal-")
+                || repo_name == "katgpt-rs")
+            {
+                continue;
+            }
+            for folder in [".plans", ".issues"] {
+                let Ok(files) = fs::read_dir(repo.path().join(folder)) else {
+                    continue;
+                };
+                for file in files.flatten() {
+                    let path = file.path();
+                    if path.extension().is_none_or(|extension| extension != "md") {
+                        continue;
+                    }
+                    let Ok(text) = fs::read_to_string(&path) else {
+                        continue;
+                    };
+                    let Some(item) = open_item(&text, now) else {
+                        continue;
+                    };
+                    let modified = file
+                        .metadata()
+                        .and_then(|metadata| metadata.modified())
+                        .unwrap_or(std::time::UNIX_EPOCH);
+                    let line = format!(
+                        "{repo_name}/{folder}/{}: {item}",
+                        file.file_name().to_string_lossy()
+                    );
+                    found.push((modified, truncate(&line, BACKLOG_ITEM_CHARS)));
+                }
+            }
+        }
+    }
+    found.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+    found
+        .into_iter()
+        .take(BACKLOG_ITEMS)
+        .map(|(_, line)| line)
+        .collect()
+}
+
+/// The first open task of a plan/issue that is still open and unclaimed.
+pub fn open_item(text: &str, now: chrono::DateTime<chrono::Utc>) -> Option<String> {
+    let status = text
+        .lines()
+        .take(4)
+        .find(|line| line.trim_start().to_ascii_lowercase().starts_with("status"))
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    let finished = [
+        "DONE",
+        "CLOSED",
+        "COMPLETE",
+        "SUPERSEDED",
+        "OBSOLETE",
+        "WONTFIX",
+    ];
+    if finished.iter().any(|word| {
+        status
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .take(4)
+            .any(|token| token == *word)
+    }) {
+        return None;
+    }
+    let lease_closed = text.contains("**Lease closed:**");
+    let live_claim = !lease_closed
+        && text.lines().any(|line| {
+            line.trim_start().starts_with("**Claimed:**")
+                && line
+                    .split("expires ")
+                    .nth(1)
+                    .and_then(|rest| rest.split_whitespace().next())
+                    .and_then(|at| {
+                        chrono::DateTime::parse_from_rfc3339(at.trim_end_matches([',', '.'])).ok()
+                    })
+                    .is_some_and(|expires| expires > now)
+        });
+    if live_claim {
+        return None;
+    }
+    text.lines()
+        .map(str::trim_start)
+        .find_map(|line| line.strip_prefix("- [ ]"))
+        .map(|task| task.trim().to_string())
+        .filter(|task| !task.is_empty())
+}
+
+fn truncate(text: &str, max_chars: usize) -> String {
+    match text.char_indices().nth(max_chars) {
+        Some((end, _)) => format!("{}…", &text[..end]),
+        None => text.to_string(),
+    }
+}
+
 /// Makes the same command on two machines compare equal: home directories
 /// and the toolchain path prefix are dropped.
 pub fn normalize_command(command: &str) -> String {
@@ -754,6 +896,7 @@ fn deliver_digest(
                 // agent-mail hooks to stand down, so it never triggers the
                 // watchdog that started it.
                 .env(ORCHESTRATOR_ENV, "1")
+                .envs(&config.orchestrator_env)
                 .stdin(std::process::Stdio::piped())
                 .stdout(log.try_clone()?)
                 .stderr(log)
@@ -1018,6 +1161,62 @@ mod tests {
         assert!(previous.paragraph.contains("9df6737acf"));
         assert!(room.previous_paragraph("new-session", "/w/other").is_none());
         assert!(room.previous_paragraph("old-session", "/w/zed").is_none());
+    }
+
+    #[test]
+    fn backlog_skips_done_and_claimed_items() {
+        let now = chrono::Utc::now();
+        let future = (now + chrono::Duration::hours(5)).to_rfc3339();
+        let past = (now - chrono::Duration::hours(5)).to_rfc3339();
+        assert_eq!(
+            open_item(
+                "# P\nStatus: IN PROGRESS\n- [x] a\n- [-] b\n- [ ] c next\n",
+                now
+            )
+            .as_deref(),
+            Some("c next")
+        );
+        assert_eq!(
+            open_item("# P\nStatus: DONE — 9df\n- [ ] stale\n", now),
+            None
+        );
+        assert_eq!(
+            open_item(
+                &format!("# P\nStatus: open\n**Claimed:** s, 1, expires {future}\n- [ ] x\n"),
+                now
+            ),
+            None,
+            "a live lease hides the item"
+        );
+        assert_eq!(
+            open_item(
+                &format!("# P\nStatus: open\n**Claimed:** s, 1, expires {past}\n- [ ] x\n"),
+                now
+            )
+            .as_deref(),
+            Some("x"),
+            "an expired lease does not"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let plans = dir.path().join("riir-ai/.plans");
+        fs::create_dir_all(&plans).unwrap();
+        fs::write(
+            plans.join("001_a.md"),
+            "# A\nStatus: open\n- [ ] do the thing\n",
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join("other/.plans")).unwrap();
+        fs::write(
+            dir.path().join("other/.plans/001.md"),
+            "Status: open\n- [ ] untracked repo\n",
+        )
+        .unwrap();
+        let items = backlog(&[dir.path().to_path_buf()], now);
+        assert_eq!(
+            items,
+            vec!["riir-ai/.plans/001_a.md: do the thing".to_string()]
+        );
     }
 
     #[test]
