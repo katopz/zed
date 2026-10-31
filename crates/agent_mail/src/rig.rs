@@ -20,6 +20,8 @@ use std::time::{Duration, Instant};
 pub const PROBE_END: &str = "agent-mail-probe-end";
 const MAX_CWD_LOOKUPS: usize = 6;
 const MAX_COMMAND_CHARS: usize = 120;
+/// Where orchestrator escalations for the owner land (`owner@m3`).
+pub const OWNER_INBOX: &str = "owner";
 /// Same-named contenders at or above this count render as one summary line.
 const COLLAPSE_AT: usize = 3;
 /// Beyond three default intervals without a tick, orchestration is down.
@@ -65,6 +67,9 @@ pub struct RigProbe {
     /// Set on the orchestrator rig: when its watchdog last ran a full tick.
     #[serde(default)]
     pub watch_last_tick: Option<String>,
+    /// Orchestrator escalations waiting for the owner on this rig.
+    #[serde(default)]
+    pub owner_mail: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -414,6 +419,9 @@ pub fn probe(mailroom: &Mailroom) -> RigProbe {
         gpus: gpus(),
         agents: claude_agents(mailroom),
         repos: repo_heads(),
+        owner_mail: mailroom
+            .peek(&[OWNER_INBOX.to_string()])
+            .map_or(0, |mail| mail.len()),
         watch_last_tick: mailroom
             .rigs()
             .ok()
@@ -961,6 +969,12 @@ pub fn render(results: &[(String, Result<RigProbe>, Duration)], rigs: &crate::Ri
         for (target, count) in &probe.outbox {
             out.push_str(&format!(
                 "      outbox {count} message(s) waiting for {target}\n"
+            ));
+        }
+        if probe.owner_mail > 0 {
+            out.push_str(&format!(
+                "      owner  {} escalation(s) waiting: `agent-mail recv --as {OWNER_INBOX}`\n",
+                probe.owner_mail
             ));
         }
         if rigs.orchestrator.as_deref() == Some(name.as_str()) {

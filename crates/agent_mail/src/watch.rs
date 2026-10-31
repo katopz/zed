@@ -33,7 +33,7 @@ const DIGEST_MAX_CHARS: usize = 6000;
 const ESCALATE_AFTER_ROUNDS: u32 = 3;
 /// Drift must persist this many ticks: agents push all day, so a passing
 /// difference between rigs is normal.
-const DRIFT_TICKS: u32 = 3;
+const DRIFT_TICKS: u32 = 6;
 const TICK_LOCK_STALE: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -393,7 +393,6 @@ pub fn tick(mailroom: &Mailroom, force: bool) -> Result<TickReport> {
                 ..IncidentState::default()
             });
         entry.ticks += 1;
-        let changed = entry.detail != incident.detail;
         entry.detail = incident.detail.clone();
         if entry.ticks < incident.min_ticks {
             continue;
@@ -403,8 +402,9 @@ pub fn tick(mailroom: &Mailroom, force: bool) -> Result<TickReport> {
         if entry.rounds > ESCALATE_AFTER_ROUNDS {
             continue;
         }
-        let cooled = now - entry.last_woke_ms >= cooldown_ms;
-        if entry.rounds > 0 && !(changed || cooled) {
+        // Details drift every tick (idle minutes, heads), so only a new
+        // fingerprint wakes immediately; a known one waits out its cooldown.
+        if entry.rounds > 0 && now - entry.last_woke_ms < cooldown_ms {
             continue;
         }
         entry.rounds += 1;
@@ -433,7 +433,7 @@ pub fn tick(mailroom: &Mailroom, force: bool) -> Result<TickReport> {
                 .collect::<Vec<_>>()
                 .join("\n")
         );
-        if let Ok(to) = Address::parse("owner@m3")
+        if let Ok(to) = Address::parse(&format!("{}@m3", rig::OWNER_INBOX))
             && let Ok(envelope) = mailroom.compose(&to, "orchestrator", body, None)
         {
             mailroom.send(&envelope).ok();
@@ -569,7 +569,9 @@ pub fn detect(
         }
     }
 
-    // Drift: one repo + branch at different commits on different rigs.
+    // Drift: one repo + branch at different commits on different rigs. One
+    // aggregate incident: agents push all day, so per-repo incidents would
+    // flood the orchestrator with noise it cannot fix by mail.
     let mut heads: BTreeMap<(String, String), BTreeMap<String, String>> = BTreeMap::new();
     for (name, probe) in &online {
         for repo in &probe.repos {
@@ -579,24 +581,35 @@ pub fn detect(
                 .insert((*name).clone(), repo.head.clone());
         }
     }
-    for ((repo, branch), by_rig) in heads {
-        let mut distinct: Vec<&String> = by_rig.values().collect();
-        distinct.sort();
-        distinct.dedup();
-        if distinct.len() > 1 {
-            incidents.push(Incident {
-                fingerprint: format!("drift:{repo}:{branch}"),
-                detail: format!(
-                    "{repo} ({branch}) differs across rigs: {}",
-                    by_rig
-                        .iter()
-                        .map(|(rig, head)| format!("{rig} {}", short(head)))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-                min_ticks: DRIFT_TICKS,
-            });
-        }
+    let drifted: Vec<String> = heads
+        .into_iter()
+        .filter(|(_, by_rig)| {
+            let mut distinct: Vec<&String> = by_rig.values().collect();
+            distinct.sort();
+            distinct.dedup();
+            distinct.len() > 1
+        })
+        .map(|((repo, branch), by_rig)| {
+            format!(
+                "{repo}@{branch} ({})",
+                by_rig
+                    .iter()
+                    .map(|(rig, head)| format!("{rig} {}", short(head)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
+        .collect();
+    if !drifted.is_empty() {
+        incidents.push(Incident {
+            fingerprint: "drift".into(),
+            detail: format!(
+                "{} repo checkout(s) differ across rigs (pull/push needed): {}",
+                drifted.len(),
+                drifted.join("; ")
+            ),
+            min_ticks: DRIFT_TICKS,
+        });
     }
 
     for event in events {
@@ -688,8 +701,10 @@ pub fn digest(
 ) -> String {
     let mut text = format!(
         "You are the rig orchestrator on {self_rig}. Resolve these incidents by mailing the agents \
-         involved with `agent-mail send <agent>@<rig> \"...\"` (advisory: they decide; never kill \
-         processes or edit repos; never assign work to m3; skip agents waiting on the owner). \
+         involved: one Bash call per mail, exactly `agent-mail send <agent>@<rig> \"<one-line \
+         message>\"`, no `&&` chains or heredocs. Advisory only: they decide; never kill \
+         processes or edit repos; never start or move jobs onto m3 (agents already running \
+         there may still be nudged about their own work); skip agents waiting on the owner. \
          Then end your turn.\n\n## Incidents\n"
     );
     for incident in incidents {
@@ -835,6 +850,7 @@ mod tests {
             outbox: Vec::new(),
             repos: Vec::new(),
             watch_last_tick: None,
+            owner_mail: 0,
         }
     }
 
@@ -952,7 +968,7 @@ mod tests {
             fingerprints.contains(&"duplicate:cargo test -p seal-view"),
             "{fingerprints:?}"
         );
-        assert!(fingerprints.contains(&"drift:katgpt-rs:develop"));
+        assert!(fingerprints.contains(&"drift"));
         assert!(fingerprints.contains(&"stalled:amo:katgpt-rs-30"));
         assert!(
             !fingerprints.iter().any(|f| f.contains("asks")),

@@ -73,3 +73,12 @@ Target ≤ 1.5k tokens per incident; the whole fleet is never dumped.
 - [x] W2 digest + runtime A: `orchestrator_command` in amo's `~/.agent-mail/watch.json` = Zed's bundled Claude Code 2.1.312 (`claude -p --model sonnet --strict-mcp-config --disable-slash-commands --allowedTools 'Bash(agent-mail send:*)'`), digest on stdin, cwd `~/.agent-mail/watch`, `AGENT_MAIL_ORCHESTRATOR=1` makes its own hooks stand down (no self-trigger loop). Dry run first (no tools): good judgement (mailed 3 actionable agents, skipped done/owner-waiting/m3 ones), $0.091, 12.8 s, 1,412 output tokens; ~19k cached input is global CLAUDE.md + tool schemas
 - [ ] W2 backlog scan for "assign other work" (unclaimed items, claim-lease aware)
 - [x] bench: quiet tick 0 tokens, exits in ms; full tick 1.9 s (4-rig probe); digest for 7 incidents 2,633 chars (~660 tokens) — under the 1.5k target; LLM run ~$0.09 with sonnet, dominated by fixed context (owner CLAUDE.md), not the digest
+
+## Live-run findings (2026-10-31, fixed in the follow-up commit)
+- [x] A changed incident detail bypassed the cooldown; stalled agents' idle minutes change every tick, so 6 incidents escalated within 5 min. Now only a NEW fingerprint wakes immediately; known ones wait their 30 min cooldown.
+- [x] Per-repo drift flooded the digest (27 incidents at once). Now ONE aggregate `drift` incident, persisting 6 ticks (~1 h) before it counts.
+- [x] `--allowedTools 'Bash(agent-mail send:*)'` was denied in print mode (nothing sent, $0.07). Now `Bash(agent-mail:*)` + the digest demands one plain `agent-mail send` per Bash call (no `&&`, no heredoc). Live re-run: $0.062, 0 permission denials, 2 actionable agents mailed (katgpt-rs-49: Plan 069 P3; katgpt-rs-e3: report after 123 min idle), owner-waiting/m3 sessions skipped.
+- [x] Escalations to `owner@m3` were invisible: `rig status` now shows `owner N escalation(s) waiting` (`agent-mail recv --as owner`).
+- [x] The orchestrator read "no jobs on m3" as "never nudge m3 agents"; the digest now says: never start jobs on m3, but agents already there may be nudged (owner chose "every agent").
+- [x] Handoff trigger verified live: a simulated SessionStart on m3 reached amo's watchdog within seconds (launchd WatchPaths) carrying the previous thread's last paragraph.
+
