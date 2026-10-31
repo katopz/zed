@@ -16293,3 +16293,125 @@ fn sidebar_painted_background_at(position: Point<Pixels>, cx: &mut VisualTestCon
         u32::from(Rgba::from(color))
     })
 }
+
+#[gpui::test]
+async fn test_continuation_chain_folds_under_newest_thread(cx: &mut TestAppContext) {
+    let project = init_test_project("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+    // Thread 1 → Thread 2 → Thread 4 is one summary-handoff chain; Thread 3 is
+    // unrelated. Thread N+1 is newer than Thread N.
+    save_n_test_threads(4, &project, cx).await;
+    let thread_id_of = |session: &str, cx: &mut gpui::VisualTestContext| {
+        cx.update(|_, cx| {
+            ThreadMetadataStore::global(cx)
+                .read(cx)
+                .entry_by_session(&acp::SessionId::new(Arc::from(session)))
+                .map(|metadata| metadata.thread_id)
+                .expect("saved thread")
+        })
+    };
+    for (continuation, source) in [("thread-1", "thread-0"), ("thread-3", "thread-1")] {
+        let thread_id = thread_id_of(continuation, cx);
+        cx.update(|_, cx| {
+            ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.set_continued_from(thread_id, acp::SessionId::new(Arc::from(source)), cx)
+            });
+        });
+    }
+    cx.run_until_parked();
+
+    // Folded: the chain sits where its newest thread sorts, headed by it.
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec!["v [my-project]", "  Thread 4", "  Thread 3"]
+    );
+    let root = thread_id_of("thread-0", cx);
+    let head_role = sidebar.read_with(cx, |sidebar, _| {
+        sidebar
+            .contents
+            .continuation_rows
+            .get(&thread_id_of_sync(sidebar, "thread-3"))
+            .cloned()
+    });
+    assert_eq!(
+        head_role,
+        Some(continuation_chains::ContinuationRow::Head {
+            root,
+            earlier: vec![thread_id_of("thread-1", cx), root],
+            expanded: false,
+        })
+    );
+
+    // Unfolded: older threads follow the head, newest first.
+    sidebar.update_in(cx, |sidebar, _window, cx| {
+        sidebar.continuation_chain_expanded.insert(root, true);
+        sidebar.update_entries(cx);
+    });
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec![
+            "v [my-project]",
+            "  Thread 4",
+            "  Thread 2",
+            "  Thread 1",
+            "  Thread 3",
+        ]
+    );
+    sidebar.read_with(cx, |sidebar, _| {
+        let child = thread_id_of_sync(sidebar, "thread-1");
+        assert_eq!(
+            sidebar.contents.continuation_rows.get(&child),
+            Some(&continuation_chains::ContinuationRow::Child)
+        );
+    });
+}
+
+fn thread_id_of_sync(sidebar: &Sidebar, session: &str) -> ThreadId {
+    sidebar
+        .contents
+        .entries
+        .iter()
+        .chain(
+            sidebar
+                .contents
+                .hidden_chain_threads
+                .values()
+                .map(|thread| ListEntry::Thread(thread.clone()))
+                .collect::<Vec<_>>()
+                .iter(),
+        )
+        .find_map(|entry| match entry {
+            ListEntry::Thread(thread)
+                if thread.metadata.session_id.as_ref().map(|id| id.0.as_ref()) == Some(session) =>
+            {
+                Some(thread.metadata.thread_id)
+            }
+            _ => None,
+        })
+        .expect("thread row")
+}
+
+#[test]
+fn test_folded_chain_surfaces_the_most_urgent_status() {
+    use continuation_chains::chain_status;
+    assert_eq!(
+        chain_status(
+            AgentThreadStatus::Completed,
+            [AgentThreadStatus::Running, AgentThreadStatus::Error]
+        ),
+        AgentThreadStatus::Running
+    );
+    assert_eq!(
+        chain_status(
+            AgentThreadStatus::Running,
+            [AgentThreadStatus::WaitingForConfirmation]
+        ),
+        AgentThreadStatus::WaitingForConfirmation
+    );
+    assert_eq!(
+        chain_status(AgentThreadStatus::Running, [AgentThreadStatus::Completed]),
+        AgentThreadStatus::Running
+    );
+}

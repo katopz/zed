@@ -1,3 +1,5 @@
+mod continuation_chains;
+use continuation_chains::ChainLayout;
 mod thread_switcher;
 
 use acp_thread::ThreadStatus;
@@ -59,8 +61,8 @@ use theme::{ActiveTheme, CLIENT_SIDE_DECORATION_ROUNDING};
 use ui::{
     AgentThreadStatus, CommonAnimationExt, ContextMenu, ContextMenuEntry, Divider, GradientFade,
     HighlightedLabel, KeyBinding, PopoverMenu, PopoverMenuHandle, ProjectEmptyState, ScrollAxes,
-    Scrollbars, Tab, ThreadContinuationDirection, ThreadItem, ThreadItemWorktreeInfo, TintColor,
-    Tooltip, WithScrollbar, prelude::*, render_modifiers, right_click_menu,
+    Scrollbars, Tab, ThreadItem, ThreadItemWorktreeInfo, TintColor, Tooltip, WithScrollbar,
+    prelude::*, render_modifiers, right_click_menu,
 };
 use unicode_segmentation::UnicodeSegmentation as _;
 use util::ResultExt as _;
@@ -518,6 +520,9 @@ struct SidebarContents {
     notified_terminals: HashSet<TerminalId>,
     project_header_indices: Vec<usize>,
     has_open_projects: bool,
+    continuation_rows: HashMap<ThreadId, continuation_chains::ContinuationRow>,
+    /// Threads folded inside a collapsed continuation chain.
+    hidden_chain_threads: HashMap<ThreadId, Arc<ThreadEntry>>,
 }
 
 /// Identity-and-layout key for a [`ListEntry`] used to preserve measured list items
@@ -807,6 +812,8 @@ pub struct Sidebar {
     /// Threads in the database-backed regeneration path need their own loading
     /// state because they do not have a live `agent::Thread` to report it.
     regenerating_titles: HashSet<ThreadId>,
+    /// Continuation chains the user folded or unfolded, keyed by chain root.
+    continuation_chain_expanded: HashMap<ThreadId, bool>,
     /// Starting a rename must seed the current title into the title editor,
     /// so this prevents that BufferEdited event from being interpreted as user input.
     suppress_next_rename_edit: bool,
@@ -973,6 +980,7 @@ impl Sidebar {
             hovered_thread_index: None,
             rename_target: None,
             regenerating_titles: HashSet::new(),
+            continuation_chain_expanded: HashMap::new(),
             suppress_next_rename_edit: false,
 
             thread_last_accessed: HashMap::new(),
@@ -1443,6 +1451,12 @@ impl Sidebar {
         let mut project_header_indices: Vec<usize> = Vec::new();
         let mut seen_thread_ids: HashSet<agent_ui::ThreadId> = HashSet::new();
         let mut seen_terminal_ids: HashSet<TerminalId> = HashSet::new();
+        let mut continuation_rows = HashMap::new();
+        let mut hidden_chain_threads = HashMap::new();
+        let active_thread_id = match self.active_entry.as_ref() {
+            Some(ActiveEntry::Thread { thread_id, .. }) => Some(*thread_id),
+            _ => None,
+        };
 
         let has_open_projects = workspaces
             .iter()
@@ -1679,46 +1693,46 @@ impl Sidebar {
                 let mut worktree_info_cache: Vec<(WorktreePaths, Arc<[ThreadItemWorktreeInfo]>)> =
                     Vec::new();
 
-                let mut make_thread_entry =
-                    |row: ThreadMetadata, workspace: ThreadEntryWorkspace| -> Arc<ThreadEntry> {
-                        let (icon, icon_from_external_svg) = resolve_agent_icon(&row.agent_id);
-                        let worktree_infos = match worktree_info_cache
-                            .iter()
-                            .find(|(paths, _)| paths == &row.worktree_paths)
-                        {
-                            Some((_, infos)) => infos.clone(),
-                            None => {
-                                let infos: Arc<[ThreadItemWorktreeInfo]> =
-                                    worktree_info_from_thread_paths(
-                                        &row.worktree_paths,
-                                        &branch_by_path,
-                                    )
-                                    .into();
-                                worktree_info_cache
-                                    .push((row.worktree_paths.clone(), infos.clone()));
-                                infos
-                            }
-                        };
-                        let worktrees = worktree_infos.to_vec();
-                        // Start drafts as `WithContent`; the post-processing
-                        // pass below downgrades them to `Empty` if no draft
-                        // label can be derived.
-                        let draft = row.is_draft().then_some(DraftKind::WithContent);
-                        Arc::new(ThreadEntry {
-                            metadata: row,
-                            icon,
-                            icon_from_external_svg,
-                            status: AgentThreadStatus::default(),
-                            workspace,
-                            is_live: false,
-                            is_background: false,
-                            is_title_generating: false,
-                            draft,
-                            highlight_positions: Vec::new(),
-                            worktrees,
-                            diff_stats: DiffStats::default(),
-                        })
+                let mut make_thread_entry = |row: ThreadMetadata,
+                                             workspace: ThreadEntryWorkspace|
+                 -> Arc<ThreadEntry> {
+                    let (icon, icon_from_external_svg) = resolve_agent_icon(&row.agent_id);
+                    let worktree_infos = match worktree_info_cache
+                        .iter()
+                        .find(|(paths, _)| paths == &row.worktree_paths)
+                    {
+                        Some((_, infos)) => infos.clone(),
+                        None => {
+                            let infos: Arc<[ThreadItemWorktreeInfo]> =
+                                worktree_info_from_thread_paths(
+                                    &row.worktree_paths,
+                                    &branch_by_path,
+                                )
+                                .into();
+                            worktree_info_cache.push((row.worktree_paths.clone(), infos.clone()));
+                            infos
+                        }
                     };
+                    let worktrees = worktree_infos.to_vec();
+                    // Start drafts as `WithContent`; the post-processing
+                    // pass below downgrades them to `Empty` if no draft
+                    // label can be derived.
+                    let draft = row.is_draft().then_some(DraftKind::WithContent);
+                    Arc::new(ThreadEntry {
+                        metadata: row,
+                        icon,
+                        icon_from_external_svg,
+                        status: AgentThreadStatus::default(),
+                        workspace,
+                        is_live: false,
+                        is_background: false,
+                        is_title_generating: false,
+                        draft,
+                        highlight_positions: Vec::new(),
+                        worktrees,
+                        diff_stats: DiffStats::default(),
+                    })
+                };
 
                 // Main code path: one query per group via main_worktree_paths.
                 // The main_worktree_paths column is set on all new threads and
@@ -1969,21 +1983,19 @@ impl Sidebar {
                 store
                     .entries_for_main_worktree_path(group_key.path_list(), group_host.as_ref())
                     .any(|metadata| {
-                        passes_weekly_filter(metadata)
-                            && {
+                        passes_weekly_filter(metadata) && {
+                            let workspace = resolve_workspace(metadata.folder_paths());
+                            thread_metadata_would_render_sidebar_row(metadata, &workspace, cx)
+                        }
+                    })
+                    || store
+                        .entries_for_path(group_key.path_list(), group_host.as_ref())
+                        .any(|metadata| {
+                            passes_weekly_filter(metadata) && {
                                 let workspace = resolve_workspace(metadata.folder_paths());
                                 thread_metadata_would_render_sidebar_row(metadata, &workspace, cx)
                             }
-                    })
-                || store
-                    .entries_for_path(group_key.path_list(), group_host.as_ref())
-                    .any(|metadata| {
-                        passes_weekly_filter(metadata)
-                            && {
-                                let workspace = resolve_workspace(metadata.folder_paths());
-                                thread_metadata_would_render_sidebar_row(metadata, &workspace, cx)
-                            }
-                    })
+                        })
             };
             let has_threads = has_visible_rows || has_stored_thread_rows;
 
@@ -2074,6 +2086,14 @@ impl Sidebar {
                     matched_threads,
                     &mut current_session_ids,
                     &mut current_thread_ids,
+                    ChainLayout {
+                        expanded: &self.continuation_chain_expanded,
+                        active: active_thread_id,
+                        // Search results show every match, folded or not.
+                        force_expanded: true,
+                        rows: &mut continuation_rows,
+                        hidden: &mut hidden_chain_threads,
+                    },
                 );
             } else {
                 let has_terminal_notifications = terminals
@@ -2124,6 +2144,13 @@ impl Sidebar {
                     threads,
                     &mut current_session_ids,
                     &mut current_thread_ids,
+                    ChainLayout {
+                        expanded: &self.continuation_chain_expanded,
+                        active: active_thread_id,
+                        force_expanded: false,
+                        rows: &mut continuation_rows,
+                        hidden: &mut hidden_chain_threads,
+                    },
                 );
             }
         }
@@ -2143,6 +2170,8 @@ impl Sidebar {
             notified_terminals,
             project_header_indices,
             has_open_projects,
+            continuation_rows,
+            hidden_chain_threads,
         };
     }
 
@@ -4202,44 +4231,6 @@ impl Sidebar {
         self.activate_thread_in_other_window(metadata, workspace, target_window, cx);
     }
 
-    /// Activate a thread by its [`ThreadId`], used by the continuation chip
-    /// (`from`/`to`) click handler. Looks up the entry in the current contents
-    /// and routes through the normal activation path.
-    fn activate_thread_by_id(
-        &mut self,
-        thread_id: ThreadId,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let entry = self.contents.entries.iter().find_map(|entry| {
-            match entry {
-                ListEntry::Thread(t) if t.metadata.thread_id == thread_id => Some(t.clone()),
-                _ => None,
-            }
-        });
-        let Some(thread) = entry else {
-            return;
-        };
-        let metadata = thread.metadata.clone();
-        match &thread.workspace {
-            ThreadEntryWorkspace::Open(workspace) => {
-                self.activate_thread(metadata, workspace, false, window, cx);
-            }
-            ThreadEntryWorkspace::Closed {
-                folder_paths,
-                project_group_key,
-            } => {
-                self.open_workspace_and_activate_thread(
-                    metadata,
-                    folder_paths.clone(),
-                    project_group_key,
-                    window,
-                    cx,
-                );
-            }
-        }
-    }
-
     fn open_workspace_and_activate_thread(
         &mut self,
         metadata: ThreadMetadata,
@@ -6067,6 +6058,7 @@ impl Sidebar {
         threads: Vec<Arc<ThreadEntry>>,
         current_session_ids: &mut HashSet<acp::SessionId>,
         current_thread_ids: &mut HashSet<agent_ui::ThreadId>,
+        chains: ChainLayout,
     ) {
         fn display_time(entry: &ListEntry) -> DateTime<Utc> {
             match entry {
@@ -6087,7 +6079,7 @@ impl Sidebar {
             }
         };
 
-        let row_entries = terminals
+        let row_entries: Vec<ListEntry> = terminals
             .into_iter()
             .map(ListEntry::Terminal)
             .chain(threads.into_iter().map(ListEntry::Thread))
@@ -6097,9 +6089,24 @@ impl Sidebar {
                 pinned(right)
                     .cmp(&pinned(left))
                     .then_with(|| display_time(right).cmp(&display_time(left)))
-            });
+            })
+            .collect();
+        let grouped = continuation_chains::group_continuation_chains(
+            row_entries,
+            chains.expanded,
+            chains.active,
+            chains.force_expanded,
+        );
+        chains.rows.extend(grouped.roles);
+        for thread in grouped.hidden {
+            if let Some(session_id) = &thread.metadata.session_id {
+                current_session_ids.insert(session_id.clone());
+            }
+            current_thread_ids.insert(thread.metadata.thread_id);
+            chains.hidden.insert(thread.metadata.thread_id, thread);
+        }
 
-        for entry in row_entries {
+        for entry in grouped.visible {
             if let ListEntry::Thread(thread) = &entry {
                 if let Some(session_id) = &thread.metadata.session_id {
                     current_session_ids.insert(session_id.clone());
@@ -6556,33 +6563,35 @@ impl Sidebar {
                 .regenerating_titles
                 .contains(&thread.metadata.thread_id);
 
-        // Continuation indicators. A thread can show up to two chips:
-        // `from` (it was continued from another thread) and `to` (another
-        // thread continues from it). These are independent — a thread in the
-        // middle of a continuation chain shows both.
-        let (continuation_from, continuation_to) = ThreadMetadataStore::try_global(cx)
-            .map(|store| {
-                let store = store.read(cx);
-
-                // Forward: this thread was continued from `from_session_id`.
-                let from = thread
-                    .metadata
-                    .continued_from_session_id
-                    .as_ref()
-                    .and_then(|from_session_id| {
-                        store.entry_by_session(from_session_id).map(|m| m.thread_id)
-                    });
-
-                // Reverse: find the thread that continues from us.
-                let to = thread
-                    .metadata
-                    .session_id
-                    .as_ref()
-                    .and_then(|session_id| store.find_continuation_of(session_id).map(|(id, _)| id));
-
-                (from, to)
-            })
-            .unwrap_or_default();
+        let continuation = self
+            .contents
+            .continuation_rows
+            .get(&thread.metadata.thread_id)
+            .cloned();
+        // A folded chain shows its head's title, but surfaces work (and
+        // notifications) happening in the threads folded under it.
+        let (status, has_notification) = match &continuation {
+            Some(continuation_chains::ContinuationRow::Head {
+                earlier,
+                expanded: false,
+                ..
+            }) => {
+                let hidden = earlier
+                    .iter()
+                    .filter_map(|id| self.contents.hidden_chain_threads.get(id));
+                (
+                    continuation_chains::chain_status(
+                        thread.status,
+                        hidden.clone().map(|child| child.status),
+                    ),
+                    has_notification
+                        || hidden.into_iter().any(|child| {
+                            self.contents.is_thread_notified(&child.metadata.thread_id)
+                        }),
+                )
+            }
+            _ => (thread.status, has_notification),
+        };
 
         let thread_item = ThreadItem::new(id, title.clone())
             .base_bg(sidebar_bg)
@@ -6590,7 +6599,7 @@ impl Sidebar {
             .when(is_draft, |this| {
                 this.icon_color(Color::Custom(cx.theme().colors().icon_muted.opacity(0.2)))
             })
-            .status(thread.status)
+            .status(status)
             .is_remote(is_remote)
             .when_some(icon_svg, |this, svg| {
                 this.custom_icon_from_external_svg(svg)
@@ -6609,25 +6618,20 @@ impl Sidebar {
             .selected(is_selected)
             .focused(is_focused)
             .hovered(is_hovered)
-            .when_some(continuation_from, |this, target_thread_id| {
-                let weak = cx.weak_entity();
-                this.continuation(ThreadContinuationDirection::From, move |window, cx| {
-                    if let Some(sidebar) = weak.upgrade() {
-                        sidebar.update(cx, |sidebar, cx| {
-                            sidebar.activate_thread_by_id(target_thread_id, window, cx);
-                        });
-                    }
-                })
-            })
-            .when_some(continuation_to, |this, target_thread_id| {
-                let weak = cx.weak_entity();
-                this.continuation(ThreadContinuationDirection::To, move |window, cx| {
-                    if let Some(sidebar) = weak.upgrade() {
-                        sidebar.update(cx, |sidebar, cx| {
-                            sidebar.activate_thread_by_id(target_thread_id, window, cx);
-                        });
-                    }
-                })
+            .when_some(continuation, |this, continuation| match continuation {
+                continuation_chains::ContinuationRow::Head {
+                    root,
+                    earlier,
+                    expanded,
+                } => this.continuation_folder(
+                    earlier.len(),
+                    expanded,
+                    cx.listener(move |this, _, _window, cx| {
+                        this.continuation_chain_expanded.insert(root, !expanded);
+                        this.update_entries(cx);
+                    }),
+                ),
+                continuation_chains::ContinuationRow::Child => this.continuation_child(true),
             })
             .on_hover(cx.listener(move |this, is_hovered: &bool, _window, cx| {
                 if *is_hovered {
@@ -6642,18 +6646,29 @@ impl Sidebar {
             })
             .when(is_hovered && !is_renaming, |this| {
                 let is_pinned = thread.metadata.pinned;
-                let pin_button = IconButton::new(("pin-thread", ix), if is_pinned {
-                    IconName::Unpin
-                } else {
-                    IconName::Pin
-                })
+                let pin_button = IconButton::new(
+                    ("pin-thread", ix),
+                    if is_pinned {
+                        IconName::Unpin
+                    } else {
+                        IconName::Pin
+                    },
+                )
                 .icon_size(IconSize::Small)
-                .icon_color(if is_pinned { Color::Accent } else { Color::Muted })
+                .icon_color(if is_pinned {
+                    Color::Accent
+                } else {
+                    Color::Muted
+                })
                 .tooltip({
                     let focus_handle = focus_handle.clone();
                     move |_window, cx| {
                         Tooltip::for_action_in(
-                            if is_pinned { "Unpin Thread" } else { "Pin Thread" },
+                            if is_pinned {
+                                "Unpin Thread"
+                            } else {
+                                "Pin Thread"
+                            },
                             &PinSelectedThread,
                             &focus_handle,
                             cx,
@@ -6769,17 +6784,20 @@ impl Sidebar {
                         .when_some(contextual_action, |this, action| this.child(action)),
                 )
             })
-            .when(!is_hovered && thread.metadata.pinned && !is_renaming, |this| {
-                // Persistent pin indicator: when the row isn't hovered, show an
-                // accent pin icon so the pinned state is visible at a glance.
-                this.action_slot(
-                    div().child(
-                        Icon::new(IconName::Pin)
-                            .size(IconSize::Small)
-                            .color(Color::Accent),
-                    ),
-                )
-            })
+            .when(
+                !is_hovered && thread.metadata.pinned && !is_renaming,
+                |this| {
+                    // Persistent pin indicator: when the row isn't hovered, show an
+                    // accent pin icon so the pinned state is visible at a glance.
+                    this.action_slot(
+                        div().child(
+                            Icon::new(IconName::Pin)
+                                .size(IconSize::Small)
+                                .color(Color::Accent),
+                        ),
+                    )
+                },
+            )
             .on_click({
                 let thread_workspace = thread_workspace.clone();
                 cx.listener(move |this, _, window, cx| {
@@ -6845,7 +6863,11 @@ impl Sidebar {
                         .is_some_and(|metadata| metadata.pinned);
                     ContextMenu::build(_window, cx, move |mut menu, _window, _cx| {
                         menu = menu.entry(
-                            if is_pinned { "Unpin Thread" } else { "Pin Thread" },
+                            if is_pinned {
+                                "Unpin Thread"
+                            } else {
+                                "Pin Thread"
+                            },
                             None,
                             {
                                 let sidebar = sidebar.clone();
