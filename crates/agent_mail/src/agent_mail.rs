@@ -7,6 +7,7 @@
 //! scan, done by Claude Code hooks or by `agent-mail recv`.
 
 pub mod rig;
+pub mod watch;
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use base64::Engine as _;
@@ -136,6 +137,9 @@ pub struct Rigs {
     pub self_rig: String,
     #[serde(default)]
     pub rigs: BTreeMap<String, Rig>,
+    /// The rig whose watchdog orchestrates the others (plan 048).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestrator: Option<String>,
 }
 
 #[derive(Debug)]
@@ -166,6 +170,12 @@ pub struct HookOutcome {
 struct HookInput {
     session_id: Option<String>,
     hook_event_name: Option<String>,
+    #[serde(default)]
+    transcript_path: Option<PathBuf>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
 }
 
 pub struct Mailroom {
@@ -673,6 +683,9 @@ impl Mailroom {
     /// the running turn. With `wait` (an async + asyncRewake `Stop` hook), it
     /// blocks until mail arrives and exits 2, which wakes the idle session.
     pub fn claude_hook(&self, input: &str, wait: bool) -> Result<HookOutcome> {
+        if std::env::var_os(watch::ORCHESTRATOR_ENV).is_some() {
+            return Ok(HookOutcome::default());
+        }
         let input: HookInput = serde_json::from_str(input).context("parsing hook input")?;
         let session = input
             .session_id
@@ -707,6 +720,26 @@ impl Mailroom {
                 stdout: Some(stdout.to_string()),
                 ..HookOutcome::default()
             });
+        }
+        // The async hooks double as the orchestrator's sensors (plan 048): a
+        // Stop remembers this session's last paragraph, a SessionStart sends
+        // one handoff event carrying the previous thread's.
+        if let (Some(session_id), Some(cwd)) = (input.session_id.as_deref(), input.cwd.as_deref()) {
+            let event_session = self_name.unwrap_or(session_id).to_string();
+            match (input.hook_event_name.as_deref(), &input.transcript_path) {
+                (Some("Stop"), Some(transcript)) => {
+                    self.save_last_paragraph(&event_session, cwd, transcript)
+                }
+                (Some("SessionStart"), _) => {
+                    let sensor = Mailroom::new(self.home.clone());
+                    let cwd = cwd.to_string();
+                    let source = input.source.clone();
+                    std::thread::spawn(move || {
+                        sensor.send_handoff_event(&event_session, &cwd, source)
+                    });
+                }
+                _ => {}
+            }
         }
         let waiter_key = session
             .as_ref()

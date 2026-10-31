@@ -1293,6 +1293,10 @@
     // subagents they launch, including background agents, show in the thread as
     // cards with a live status. Applies to agents started after a change.
     "external_subagents": true,
+    // Minutes between watchdog ticks on the agent-mail orchestrator rig (the rig
+    // named `orchestrator` in ~/.agent-mail/rigs.json). Applied to that rig when
+    // changed; null leaves its own setting (10 minutes) alone.
+    "agent_mail_watch_interval_minutes": null,
     // Settings for automatic agent context compaction, which summarizes earlier
     // messages to free up room in the model's context window once it grows too
     // large.

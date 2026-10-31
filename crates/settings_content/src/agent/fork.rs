@@ -107,6 +107,12 @@ pub struct ForkAgentSettingsContent {
     ///
     /// Default: true
     pub external_subagents: Option<bool>,
+    /// Minutes between orchestrator watchdog ticks on the `agent-mail`
+    /// orchestrator rig (plan 048). Applied to that rig whenever it changes;
+    /// unset leaves the rig's own setting (default 10) alone.
+    ///
+    /// Default: null
+    pub agent_mail_watch_interval_minutes: Option<u64>,
 }
 
 /// Which backend provides the reviewer thread for the `request_verdict` tool.

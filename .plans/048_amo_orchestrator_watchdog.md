@@ -1,5 +1,5 @@
 # 048 — amo as rig orchestrator: zero-token watchdog + exception-driven LLM
-Status: IN PROGRESS — owner picks recorded 2026-10-31 (A, every agent, riir-*/seal-*/katgpt-rs); W1 being built
+Status: IN PROGRESS — W1 DONE and live on amo (launchd, runtime A via Zed's bundled Claude Code, sonnet); W2 backlog scan next
 
 ## Goal
 amo (always on, builder) becomes the orchestrator instead of m3/the owner:
@@ -67,9 +67,9 @@ Target ≤ 1.5k tokens per incident; the whole fleet is never dumped.
   down = no orchestration, never silent).
 
 ## Tasks
-- [ ] W1 `rig watch --once`: tick, diff vs `~/.agent-mail/watch/last.json`, rules, fingerprints, cooldown
-- [ ] W1 transcript tail: last assistant paragraph per Claude session (bounded read from file end)
-- [ ] W1 launchd plist on amo (StartInterval 300, absolute paths); "orchestrator stale" in `rig status`
-- [ ] W2 digest + wake the orchestrator (runtime per owner pick); escalation after 3 rounds
+- [x] W1 `agent-mail rig watch --once` (`crates/agent_mail/src/watch.rs`): exits in ms unless the interval elapsed or a handoff event arrived; tick lock; rules (offline except no-jobs rigs, blind, no-jobs-rig-busy, outbox backlog, stalled agent = idle ≥ interval with nothing scheduled and not asking the owner, duplicate command across rigs with homes/toolchain normalized, drift = repo+branch HEAD differs persisting 3 ticks, handoff events); fingerprints + 30 min cooldown; 3 rounds → one escalation mail to `owner@m3`, then silent until the incident clears (a stuck problem must not keep waking large-context agents)
+- [x] W1 transcript tail: last assistant text from the last 128 KiB of `~/.claude/projects/<cwd>/<session>.jsonl`, last paragraph (extended to ≥ 80 chars), capped 400 chars on a char boundary; per agent in `rig probe`, plus Stop-hook save + SessionStart handoff event (one event per new thread, carrying the previous thread's paragraph from the same folder)
+- [x] W1 launchd on amo (`rig watch --install`): StartInterval 60 + WatchPaths on the `_watch` inbox + ThrottleInterval 10 + AbandonProcessGroup (without it launchd killed the spawned orchestrator with the job: found live) + absolute PATH/HOME; `rig status` shows `orchestrator last watchdog tick N min ago` / `STALE`; interval via `agent-mail rig watch --interval N` and Zed setting `agent_mail_watch_interval_minutes` (pushed to the orchestrator rig over SSH on change; null leaves amo's default 10)
+- [x] W2 digest + runtime A: `orchestrator_command` in amo's `~/.agent-mail/watch.json` = Zed's bundled Claude Code 2.1.312 (`claude -p --model sonnet --strict-mcp-config --disable-slash-commands --allowedTools 'Bash(agent-mail send:*)'`), digest on stdin, cwd `~/.agent-mail/watch`, `AGENT_MAIL_ORCHESTRATOR=1` makes its own hooks stand down (no self-trigger loop). Dry run first (no tools): good judgement (mailed 3 actionable agents, skipped done/owner-waiting/m3 ones), $0.091, 12.8 s, 1,412 output tokens; ~19k cached input is global CLAUDE.md + tool schemas
 - [ ] W2 backlog scan for "assign other work" (unclaimed items, claim-lease aware)
-- [ ] bench: watchdog tick wall time + tokens per incident; target 0 tokens on quiet ticks, ≤ 1.5k per incident
+- [x] bench: quiet tick 0 tokens, exits in ms; full tick 1.9 s (4-rig probe); digest for 7 incidents 2,633 chars (~660 tokens) — under the 1.5k target; LLM run ~$0.09 with sonnet, dominated by fixed context (owner CLAUDE.md), not the digest

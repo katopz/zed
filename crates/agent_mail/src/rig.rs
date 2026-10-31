@@ -22,6 +22,8 @@ const MAX_CWD_LOOKUPS: usize = 6;
 const MAX_COMMAND_CHARS: usize = 120;
 /// Same-named contenders at or above this count render as one summary line.
 const COLLAPSE_AT: usize = 3;
+/// Beyond three default intervals without a tick, orchestration is down.
+const STALE_ORCHESTRATOR_MINUTES: i64 = 30;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RigProbe {
@@ -57,6 +59,19 @@ pub struct RigProbe {
     pub not_quiet_because: Vec<String>,
     #[serde(default)]
     pub outbox: Vec<(String, usize)>,
+    /// HEAD of each tracked repo (`riir-*`, `seal-*`, `katgpt-rs`), for drift.
+    #[serde(default)]
+    pub repos: Vec<RepoHead>,
+    /// Set on the orchestrator rig: when its watchdog last ran a full tick.
+    #[serde(default)]
+    pub watch_last_tick: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RepoHead {
+    pub name: String,
+    pub branch: String,
+    pub head: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,6 +87,14 @@ pub struct Agent {
     pub name: String,
     pub status: String,
     pub cwd: String,
+    #[serde(default)]
+    pub idle_minutes: Option<f64>,
+    /// Last paragraph of its last message (capped), read from its transcript.
+    #[serde(default)]
+    pub last_paragraph: Option<String>,
+    /// A scheduled agent-mail wake is pending for it.
+    #[serde(default)]
+    pub wake_scheduled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -389,7 +412,14 @@ pub fn probe(mailroom: &Mailroom) -> RigProbe {
         power,
         cpu_speed_limit,
         gpus: gpus(),
-        agents: claude_agents(),
+        agents: claude_agents(mailroom),
+        repos: repo_heads(),
+        watch_last_tick: mailroom
+            .rigs()
+            .ok()
+            .filter(|rigs| rigs.orchestrator.as_deref() == Some(rigs.self_rig.as_str()))
+            .and_then(|_| mailroom.watch_last_tick())
+            .map(|at| at.to_rfc3339()),
         quiet: not_quiet_because.is_empty(),
         not_quiet_because,
         contenders,
@@ -638,12 +668,16 @@ fn gpus() -> Vec<Gpu> {
 #[derive(Deserialize)]
 struct SessionFile {
     pid: u32,
+    #[serde(rename = "sessionId")]
+    session_id: Option<String>,
     name: Option<String>,
     status: Option<String>,
     cwd: Option<String>,
+    #[serde(rename = "statusUpdatedAt")]
+    status_updated_at: Option<i64>,
 }
 
-fn claude_agents() -> Vec<Agent> {
+fn claude_agents(mailroom: &Mailroom) -> Vec<Agent> {
     let Some(home) = std::env::var_os("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
         .or_else(|| {
@@ -664,16 +698,93 @@ fn claude_agents() -> Vec<Agent> {
             serde_json::from_slice::<SessionFile>(&fs::read(entry.path()).ok()?).ok()
         })
         .filter(|session| process_alive(session.pid))
-        .map(|session| Agent {
-            name: session
+        .map(|session| {
+            let name = session
                 .name
-                .unwrap_or_else(|| format!("pid {}", session.pid)),
-            status: session.status.unwrap_or_else(|| "?".into()),
-            cwd: session.cwd.unwrap_or_default(),
+                .unwrap_or_else(|| format!("pid {}", session.pid));
+            let cwd = session.cwd.unwrap_or_default();
+            let last_paragraph = session.session_id.as_deref().and_then(|id| {
+                crate::watch::last_paragraph(&crate::watch::transcript_path(&home, &cwd, id))
+            });
+            Agent {
+                wake_scheduled: mailroom
+                    .scheduled(std::slice::from_ref(&name))
+                    .is_ok_and(|mail| !mail.is_empty()),
+                idle_minutes: session.status_updated_at.map(|at| {
+                    (chrono::Utc::now().timestamp_millis() - at).max(0) as f64 / 60_000.0
+                }),
+                status: session.status.unwrap_or_else(|| "?".into()),
+                last_paragraph,
+                name,
+                cwd,
+            }
         })
         .collect();
     agents.sort_by(|a, b| a.name.cmp(&b.name));
     agents
+}
+
+/// Owner-chosen drift set (plan 048): `riir-*`, `seal-*`, `katgpt-rs`.
+fn tracked_repo(name: &str) -> bool {
+    name.starts_with("riir-") || name.starts_with("seal-") || name == "katgpt-rs"
+}
+
+/// Reads HEADs straight from `.git` (no `git` process per repo). Worktrees
+/// (`.git` is a file) are skipped: they are per-agent scratch, not drift.
+fn repo_heads() -> Vec<RepoHead> {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    let roots = home
+        .map(|home| PathBuf::from(home).join("git"))
+        .into_iter()
+        .chain([PathBuf::from("E:/git")]);
+    let mut heads = Vec::new();
+    for root in roots {
+        let Ok(entries) = fs::read_dir(&root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            if !tracked_repo(&name) {
+                continue;
+            }
+            let git = entry.path().join(".git");
+            if !git.is_dir() {
+                continue;
+            }
+            if let Some((branch, head)) = read_head(&git) {
+                heads.push(RepoHead { name, branch, head });
+            }
+        }
+    }
+    heads.sort_by(|a, b| a.name.cmp(&b.name));
+    heads
+}
+
+fn read_head(git: &Path) -> Option<(String, String)> {
+    let head = fs::read_to_string(git.join("HEAD")).ok()?;
+    let head = head.trim();
+    let Some(reference) = head.strip_prefix("ref: ") else {
+        return Some(("HEAD".into(), head.to_string()));
+    };
+    let branch = reference
+        .strip_prefix("refs/heads/")
+        .unwrap_or(reference)
+        .to_string();
+    let loose = fs::read_to_string(git.join(reference))
+        .ok()
+        .map(|sha| sha.trim().to_string());
+    let sha = loose.or_else(|| {
+        fs::read_to_string(git.join("packed-refs"))
+            .ok()?
+            .lines()
+            .find_map(|line| {
+                let (sha, name) = line.split_once(' ')?;
+                (name == reference).then(|| sha.to_string())
+            })
+    })?;
+    Some((branch, sha))
 }
 
 /// Probes every rig in parallel: this one directly, the rest over SSH.
@@ -732,6 +843,20 @@ fn probe_remote(mailroom: &Mailroom, rigs: &crate::Rigs, name: &str) -> Result<R
         }
     }
     bail!("offline: {}", failures.join("; "))
+}
+
+fn orchestrator_line(last_tick: Option<&str>) -> String {
+    let last = last_tick.and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok());
+    match last {
+        Some(at) => {
+            let age = chrono::Utc::now().signed_duration_since(at).num_minutes();
+            match age > STALE_ORCHESTRATOR_MINUTES {
+                true => format!("STALE: last watchdog tick {age} min ago"),
+                false => format!("last watchdog tick {age} min ago"),
+            }
+        }
+        None => "STALE: the watchdog has never run".into(),
+    }
 }
 
 /// Human-readable report, one block per rig.
@@ -836,6 +961,12 @@ pub fn render(results: &[(String, Result<RigProbe>, Duration)], rigs: &crate::Ri
         for (target, count) in &probe.outbox {
             out.push_str(&format!(
                 "      outbox {count} message(s) waiting for {target}\n"
+            ));
+        }
+        if rigs.orchestrator.as_deref() == Some(name.as_str()) {
+            out.push_str(&format!(
+                "      orchestrator {}\n",
+                orchestrator_line(probe.watch_last_tick.as_deref())
             ));
         }
     }

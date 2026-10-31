@@ -41,6 +41,8 @@ pub struct ForkAgentSettings {
     pub stream_idle_timeout_secs: u64,
     /// Whether external agents are offered the ACP subagents capability.
     pub external_subagents: bool,
+    /// Watchdog interval pushed to the agent-mail orchestrator rig (plan 048).
+    pub agent_mail_watch_interval_minutes: Option<u64>,
 }
 
 impl ForkAgentSettings {
@@ -61,6 +63,7 @@ impl ForkAgentSettings {
                 .stream_idle_timeout_secs
                 .unwrap_or(DEFAULT_STREAM_IDLE_TIMEOUT_SECS),
             external_subagents: content.external_subagents.unwrap_or(true),
+            agent_mail_watch_interval_minutes: content.agent_mail_watch_interval_minutes,
         }
     }
 }

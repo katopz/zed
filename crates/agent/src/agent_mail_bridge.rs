@@ -5,6 +5,8 @@
 
 use super::*;
 use ::agent_mail::{Address, Envelope, Mailroom};
+use agent_settings::AgentSettings;
+use settings::{Settings as _, SettingsStore};
 
 /// Same cadence as the Claude Code waiter hook: a directory listing per live
 /// session, cheap enough to run continuously.
@@ -14,7 +16,9 @@ const OUTBOX_FLUSH_TICKS: u32 = 120;
 pub(crate) struct AgentMailState {
     mailroom: Arc<Mailroom>,
     self_rig: String,
+    applied_watch_interval: Option<u64>,
     _poller: Task<()>,
+    _settings: Subscription,
 }
 
 impl AgentMailState {
@@ -85,11 +89,38 @@ impl AgentMailState {
                 }
             }
         });
-        Self {
+        let settings = cx.observe_global::<SettingsStore>(|agent, cx| {
+            if let Some(state) = agent.agent_mail.as_mut() {
+                state.apply_watch_interval(cx);
+            }
+        });
+        let mut state = Self {
             mailroom,
             self_rig,
+            applied_watch_interval: None,
             _poller: poller,
+            _settings: settings,
+        };
+        state.apply_watch_interval(cx);
+        state
+    }
+
+    /// Pushes `agent_mail_watch_interval_minutes` to the orchestrator rig
+    /// when it is set and differs from what this Zed last applied.
+    fn apply_watch_interval(&mut self, cx: &mut Context<NativeAgent>) {
+        let Some(minutes) = AgentSettings::get_global(cx)
+            .fork
+            .agent_mail_watch_interval_minutes
+        else {
+            return;
+        };
+        if self.applied_watch_interval == Some(minutes) {
+            return;
         }
+        self.applied_watch_interval = Some(minutes);
+        let mailroom = self.mailroom.clone();
+        cx.background_spawn(async move { mailroom.set_orchestrator_interval(minutes) })
+            .detach_and_log_err(cx);
     }
 }
 

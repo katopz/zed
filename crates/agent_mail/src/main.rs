@@ -22,6 +22,9 @@ USAGE:
                                    what every rig is busy with: heavy processes (riir-ai's
                                    contender rules), agents, load, memory, disk, power, GPU,
                                    and whether it is QUIET enough for a benchmark
+  agent-mail rig watch [--once|--force]   orchestrator watchdog tick (zero tokens unless an
+                                   incident is new); --install writes the launchd job,
+                                   --interval MIN sets the tick interval (default 10)
   agent-mail flush                 retry mail parked for unreachable rigs now
   agent-mail deliver <payload>     receiving side of a remote send (run over SSH)
   agent-mail version
@@ -153,7 +156,49 @@ fn run(args: Vec<String>) -> Result<i32> {
                 }
                 Ok(0)
             }
-            _ => bail!("usage: agent-mail rig status [RIG...|all] [--json]"),
+            Some("watch") => {
+                let mut force = false;
+                for arg in args.by_ref() {
+                    match arg.as_str() {
+                        "--once" => {}
+                        "--force" => force = true,
+                        "--install" => {
+                            let path = agent_mail::watch::install_launchd(&room)?;
+                            println!(
+                                "wrote {}\nload it with: launchctl bootstrap gui/$(id -u) {}",
+                                path.display(),
+                                path.display()
+                            );
+                            return Ok(0);
+                        }
+                        "--interval" => {
+                            let minutes: u64 = args
+                                .next()
+                                .context("--interval needs minutes")?
+                                .parse()
+                                .context("--interval needs whole minutes")?;
+                            println!("wrote {}", room.set_watch_interval(minutes)?.display());
+                            return Ok(0);
+                        }
+                        other => bail!("unexpected argument {other:?}"),
+                    }
+                }
+                let report = agent_mail::watch::tick(&room, force)?;
+                if report.ran {
+                    println!(
+                        "{} tick: {} event(s), {} incident(s), {} sent to the orchestrator, {} escalated",
+                        chrono::Local::now().format("%Y-%m-%d %H:%M"),
+                        report.events,
+                        report.incidents,
+                        report.woke,
+                        report.escalated
+                    );
+                }
+                Ok(0)
+            }
+            _ => bail!(
+                "usage: agent-mail rig status [RIG...|all] [--json] | rig watch [--once|--force|--install|--interval MIN]"
+            ),
         },
         Some("flush") => {
             let report = room.flush_outbox();
