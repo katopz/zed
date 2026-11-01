@@ -13,7 +13,6 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 /// Printed after the probe's JSON line; the SSH reader stops there.
@@ -333,7 +332,7 @@ pub fn parse_ps(output: &str) -> Vec<ProcessRow> {
 // agent-mail is a runtime-free std binary; the smol-preferring lint targets async gpui code.
 #[allow(clippy::disallowed_methods)]
 fn run(program: &str, args: &[&str]) -> Option<String> {
-    let output = Command::new(program).args(args).output().ok()?;
+    let output = crate::command(program).args(args).output().ok()?;
     output
         .status
         .success()

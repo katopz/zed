@@ -45,6 +45,23 @@ const OUTBOX_FLUSH_EVERY: Duration = Duration::from_secs(60);
 /// A `sending/` claim older than this belongs to a flusher that died mid-send.
 const STALE_SEND: Duration = Duration::from_secs(5 * 60);
 
+/// A `Command` that never opens a console window. Zed (a GUI app) calls into
+/// this crate for rig probes, and on Windows every console child of a GUI
+/// process (ssh, tasklist, git, ...) otherwise flashes its own window.
+// agent-mail is a runtime-free std binary; the smol-preferring lint targets async gpui code.
+#[allow(clippy::disallowed_methods)]
+pub(crate) fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    #[allow(unused_mut)]
+    let mut command = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Envelope {
     pub id: String,
@@ -736,7 +753,7 @@ impl Mailroom {
         remote_command: &str,
         marker: &str,
     ) -> Result<Vec<String>> {
-        let mut command = Command::new("ssh");
+        let mut command = command("ssh");
         // accept-new only trusts a rig's first-seen host key (Tailscale already
         // authenticates the node); a changed key is still rejected.
         command.args([

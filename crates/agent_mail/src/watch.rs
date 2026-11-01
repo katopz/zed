@@ -942,7 +942,7 @@ fn deliver_digest(
         Some([program, args @ ..]) => {
             use std::io::Write as _;
             let log = fs::File::create(mailroom.watch_dir().join("orchestrator.log"))?;
-            let mut child = std::process::Command::new(program)
+            let mut child = crate::command(program)
                 .args(args)
                 .current_dir(mailroom.watch_dir())
                 // The orchestrator is itself a Claude session: this tells its

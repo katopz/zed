@@ -470,7 +470,7 @@ impl Mailroom {
             // a one-shot scheduled task outlives the session.
             let task = format!("agent-mail-{label}");
             let action = format!("\"{}\" {}", binary.display(), args.join(" "));
-            let created = Command::new("schtasks")
+            let created = crate::command("schtasks")
                 .args([
                     "/create", "/tn", &task, "/tr", &action, "/sc", "once", "/st", "00:00", "/f",
                 ])
@@ -478,7 +478,7 @@ impl Mailroom {
                 .stderr(Stdio::null())
                 .status()?;
             anyhow::ensure!(created.success(), "schtasks /create failed");
-            Command::new("schtasks")
+            crate::command("schtasks")
                 .args(["/run", "/tn", &task])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -486,7 +486,7 @@ impl Mailroom {
             return Ok(());
         }
         let log = fs::File::create(logs.join(format!("{label}.executor.log")))?;
-        let mut command = Command::new(binary);
+        let mut command = crate::command(binary);
         command
             .args(args)
             .stdin(Stdio::null())
@@ -625,7 +625,7 @@ impl Mailroom {
         }
         self.finish(record, outcome.0, outcome.1, &record_path);
         if cfg!(windows) {
-            Command::new("schtasks")
+            crate::command("schtasks")
                 .args(["/delete", "/tn", &format!("agent-mail-{id}"), "/f"])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -722,7 +722,7 @@ impl Mailroom {
         .with_context(|| format!("repo {repo} not found under ~/git"))?;
         let worktree = std::env::temp_dir().join("agent-mail-jobs").join(&spec.id);
         fs::create_dir_all(worktree.parent().context("temp dir")?)?;
-        let status = Command::new("git")
+        let status = crate::command("git")
             .arg("-C")
             .arg(&repo_path)
             .args(["worktree", "add", "--detach"])
@@ -758,7 +758,7 @@ impl Mailroom {
         };
         // Run inside the source repo: outside it git refuses, and the
         // worktree stays registered after its folder is gone.
-        Command::new("git")
+        crate::command("git")
             .arg("-C")
             .arg(&worktree.repo)
             .args(["worktree", "remove", "--force"])
@@ -769,7 +769,7 @@ impl Mailroom {
             .ok();
         fs::remove_dir_all(&worktree.path).ok();
         fs::remove_dir_all(worktree.path.with_extension("target")).ok();
-        Command::new("git")
+        crate::command("git")
             .arg("-C")
             .arg(&worktree.repo)
             .args(["worktree", "prune"])
@@ -1087,7 +1087,7 @@ fn shell_command(argv: &[String]) -> Command {
     match argv {
         [single] if single.contains(char::is_whitespace) => shell(single),
         _ => {
-            let mut command = Command::new(&argv[0]);
+            let mut command = crate::command(&argv[0]);
             command.args(&argv[1..]);
             command
         }
@@ -1100,14 +1100,14 @@ fn shell(line: &str) -> Command {
     // cmd.exe parses its own command line and does not understand the \"
     // escaping `arg` applies, which mangled quoted paths ("%USERPROFILE%\…"),
     // so the line is passed through untouched.
-    let mut command = Command::new("cmd");
+    let mut command = crate::command("cmd");
     command.raw_arg("/S /C \"").raw_arg(line).raw_arg("\"");
     command
 }
 
 #[cfg(not(windows))]
 fn shell(line: &str) -> Command {
-    let mut command = Command::new("sh");
+    let mut command = crate::command("sh");
     command.arg("-c").arg(line);
     command
 }
@@ -1132,7 +1132,7 @@ fn kill_tree(pid: u32) {
     }
     #[cfg(windows)]
     {
-        Command::new("taskkill")
+        crate::command("taskkill")
             .args(["/T", "/F", "/PID", &pid.to_string()])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
