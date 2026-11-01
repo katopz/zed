@@ -105,6 +105,9 @@ pub struct Agent {
     /// A scheduled agent-mail wake is pending for it.
     #[serde(default)]
     pub wake_scheduled: bool,
+    /// Zed's auto_prompt manages this thread's continuation (plan 050).
+    #[serde(default)]
+    pub auto_prompt: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -813,6 +816,10 @@ fn claude_agents(mailroom: &Mailroom) -> Vec<Agent> {
                 crate::watch::last_paragraph(&crate::watch::transcript_path(&home, &cwd, id))
             });
             Agent {
+                auto_prompt: session
+                    .session_id
+                    .as_deref()
+                    .is_some_and(|id| mailroom.auto_prompt_owns(id)),
                 wake_scheduled: mailroom
                     .scheduled(std::slice::from_ref(&name))
                     .is_ok_and(|mail| !mail.is_empty()),
@@ -925,10 +932,101 @@ pub fn status(
             })
         })
         .collect();
-    Ok(handles
+    let results: Vec<(String, Result<RigProbe>, Duration)> = handles
         .into_iter()
         .filter_map(|handle| handle.join().ok())
-        .collect())
+        .collect();
+    if only.is_empty() {
+        write_fleet_cache(mailroom, &results, &rigs);
+    }
+    Ok(results)
+}
+
+#[derive(Serialize, Deserialize)]
+struct FleetCache {
+    at: String,
+    summary: String,
+}
+
+/// One line per rig, for an LLM's context: role, state, what it is busy with,
+/// managed jobs. Written by every full `rig status` (the panel, the badge, the
+/// watchdog), so readers like auto_prompt's decider cost no extra requests.
+pub fn fleet_summary(
+    results: &[(String, Result<RigProbe>, Duration)],
+    rigs: &crate::Rigs,
+) -> String {
+    let mut lines = Vec::new();
+    let mut sorted: Vec<&(String, Result<RigProbe>, Duration)> = results.iter().collect();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    for (name, outcome, _) in sorted {
+        let rig = rigs.rigs.get(name);
+        let role = rig.and_then(|rig| rig.role.clone()).unwrap_or_default();
+        let no_jobs = match rig.is_some_and(|rig| !rig.accepts_jobs) {
+            true => ", takes no jobs",
+            false => "",
+        };
+        let line = match outcome {
+            Err(_) => format!("- {name} ({role}{no_jobs}): offline"),
+            Ok(probe) => {
+                let mut busy: Vec<String> = Vec::new();
+                for contender in &probe.contenders {
+                    if contender.name != "rustc" && !busy.contains(&contender.name) {
+                        busy.push(contender.name.clone());
+                    }
+                }
+                busy.truncate(3);
+                let jobs: Vec<String> = probe
+                    .running
+                    .iter()
+                    .map(|job| truncate_chars(&job.text, 60))
+                    .collect();
+                format!(
+                    "- {name} ({role}{no_jobs}): {}{}{}",
+                    match probe.quiet {
+                        true => "QUIET".to_string(),
+                        false => format!("BUSY ({})", probe.not_quiet_because.join(", ")),
+                    },
+                    match busy.is_empty() {
+                        true => String::new(),
+                        false => format!("; heavy: {}", busy.join(", ")),
+                    },
+                    match jobs.is_empty() {
+                        true => String::new(),
+                        false => format!("; jobs: {}", jobs.join(" | ")),
+                    }
+                )
+            }
+        };
+        lines.push(line);
+    }
+    lines.join("\n")
+}
+
+fn write_fleet_cache(
+    mailroom: &Mailroom,
+    results: &[(String, Result<RigProbe>, Duration)],
+    rigs: &crate::Rigs,
+) {
+    let cache = FleetCache {
+        at: chrono::Utc::now().to_rfc3339(),
+        summary: fleet_summary(results, rigs),
+    };
+    let path = mailroom.home().join("fleet-cache.json");
+    if let Ok(bytes) = serde_json::to_vec(&cache) {
+        let staged = path.with_extension("tmp");
+        if fs::write(&staged, bytes).is_ok() {
+            fs::rename(&staged, &path).ok();
+        }
+    }
+}
+
+/// The cached fleet summary, if some view refreshed it within `max_age`.
+pub fn cached_fleet_summary(mailroom: &Mailroom, max_age: chrono::Duration) -> Option<String> {
+    let cache: FleetCache =
+        serde_json::from_slice(&fs::read(mailroom.home().join("fleet-cache.json")).ok()?).ok()?;
+    let at = chrono::DateTime::parse_from_rfc3339(&cache.at).ok()?;
+    (chrono::Utc::now().signed_duration_since(at) <= max_age && !cache.summary.is_empty())
+        .then_some(cache.summary)
 }
 
 fn probe_remote(mailroom: &Mailroom, rigs: &crate::Rigs, name: &str) -> Result<RigProbe> {
@@ -1221,6 +1319,46 @@ mod tests {
         assert!(
             Vocabulary::load(dir.path()).is_ok(),
             "the exemption list is optional"
+        );
+    }
+
+    #[test]
+    fn fleet_summary_is_one_line_per_rig_and_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        let room = Mailroom::new(dir.path().to_path_buf());
+        room.init("amo").unwrap();
+        let rigs: crate::Rigs = serde_json::from_str(
+            r#"{"self":"amo","rigs":{"bmo":{"ssh":[],"role":"runner"},"m3":{"ssh":[],"role":"orchestrator","accepts_jobs":false}}}"#,
+        )
+        .unwrap();
+        let bmo: RigProbe = serde_json::from_str(
+            r#"{"rig":"bmo","os":"macos","at":"","cores":30,"quiet":false,"not_quiet_because":["1 contender(s)"],
+                "contenders":[{"pid":1,"name":"bench_809","cpu_pct":90.0,"rss_gb":8.0,"arm":"name"}],
+                "running":[{"id":"x","text":"0e6ffdbe Shared 9 min · zed release build"}]}"#,
+        )
+        .unwrap();
+        let results = vec![
+            ("bmo".to_string(), Ok(bmo), Duration::ZERO),
+            (
+                "m3".to_string(),
+                Err(anyhow::anyhow!("down")),
+                Duration::ZERO,
+            ),
+        ];
+        let summary = fleet_summary(&results, &rigs);
+        assert_eq!(
+            summary,
+            "- bmo (runner): BUSY (1 contender(s)); heavy: bench_809; jobs: 0e6ffdbe Shared 9 min · zed release build\n- m3 (orchestrator, takes no jobs): offline"
+        );
+        write_fleet_cache(&room, &results, &rigs);
+        assert_eq!(
+            cached_fleet_summary(&room, chrono::Duration::minutes(5)),
+            Some(summary)
+        );
+        assert_eq!(
+            cached_fleet_summary(&room, chrono::Duration::seconds(-1)),
+            None,
+            "stale cache is ignored"
         );
     }
 }

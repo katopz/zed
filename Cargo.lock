@@ -558,6 +558,7 @@ dependencies = [
  "action_log",
  "agent",
  "agent-client-protocol",
+ "agent_mail",
  "agent_servers",
  "agent_settings",
  "agent_skills",
@@ -1503,6 +1504,7 @@ version = "0.1.0"
 dependencies = [
  "acp_thread",
  "agent-client-protocol",
+ "agent_mail",
  "anyhow",
  "chrono",
  "env_logger 0.11.8",
@@ -15847,6 +15849,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rig_panel"
+version = "0.1.0"
+dependencies = [
+ "agent_mail",
+ "gpui",
+ "serde_json",
+ "ui",
+ "workspace",
+]
+
+[[package]]
 name = "ring"
 version = "0.17.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -23237,6 +23250,7 @@ dependencies = [
  "remote_server",
  "repl",
  "reqwest_client",
+ "rig_panel",
  "rope",
  "sandbox",
  "search",

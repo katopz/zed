@@ -21,6 +21,7 @@ default = ["claude-hidden-orchestrator"]
 claude-hidden-orchestrator = []
 
 [dependencies]
+agent_mail.workspace = true
 acp_thread.workspace = true
 agent-client-protocol.workspace = true
 anyhow.workspace = true

@@ -195,10 +195,40 @@ pub fn drain_web_replies() -> Vec<PendingWebReply> {
     }
 }
 
-/// Read the latest unmuted peer states as a formatted context string.
-/// Returns `None` when there are no visible peers (so the caller can omit the
-/// field entirely and save tokens).
+/// Read the latest unmuted peer states as a formatted context string, plus
+/// the agent-mail fleet view (plan 050) when one is cached. Returns `None`
+/// when there is nothing to show (so the caller can omit the field entirely
+/// and save tokens).
 pub fn unmuted_states_for_context() -> Option<String> {
+    match (board_states_for_context(), fleet_context()) {
+        (None, None) => None,
+        (Some(board), None) => Some(board),
+        (None, Some(fleet)) => Some(fleet),
+        (Some(board), Some(fleet)) => Some(format!("{board}\n{fleet}")),
+    }
+}
+
+/// How recent the cached fleet view must be to reach the decider.
+const FLEET_CONTEXT_MAX_AGE_MINUTES: i64 = 5;
+
+/// What every rig is busy with, from the summary agent-mail caches whenever
+/// any view (the Rigs panel, its badge, the orchestrator) runs `rig status`.
+/// Reading the cache costs no request, so a decision never fans out to rigs.
+fn fleet_context() -> Option<String> {
+    if cfg!(test) {
+        return None;
+    }
+    let mailroom = agent_mail::Mailroom::from_env().ok()?;
+    let summary = agent_mail::rig::cached_fleet_summary(
+        &mailroom,
+        chrono::Duration::minutes(FLEET_CONTEXT_MAX_AGE_MINUTES),
+    )?;
+    Some(format!(
+        "Rigs (agent-mail fleet; heavy or timing-sensitive work goes through `agent-mail rig run`, never on a BUSY rig or on m3):\n{summary}\n"
+    ))
+}
+
+fn board_states_for_context() -> Option<String> {
     let states = PEER_STATES.read().ok()?.clone()?;
     if states.is_empty() {
         return None;

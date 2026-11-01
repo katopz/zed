@@ -36,6 +36,9 @@ const ESCALATE_AFTER_ROUNDS: u32 = 3;
 const DRIFT_TICKS: u32 = 6;
 const TICK_LOCK_STALE: Duration = Duration::from_secs(10 * 60);
 const BACKLOG_ITEMS: usize = 8;
+/// A thread auto_prompt touched this recently is auto_prompt's to continue
+/// (plan 050): the orchestrator does not also nudge it.
+const AUTO_PROMPT_OWNS_FOR: Duration = Duration::from_secs(6 * 60 * 60);
 const BACKLOG_ITEM_CHARS: usize = 160;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -294,6 +297,16 @@ impl Mailroom {
         Ok(path)
     }
 
+    /// Whether auto_prompt manages `session_id` (see [`mark_auto_prompt_owned`]).
+    pub fn auto_prompt_owns(&self, session_id: &str) -> bool {
+        validate_name(session_id).is_ok()
+            && fs::metadata(self.home().join("auto_prompt").join(session_id))
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age < AUTO_PROMPT_OWNS_FOR)
+    }
+
     /// Sets the watchdog interval on the orchestrator rig, wherever it is.
     pub fn set_orchestrator_interval(&self, minutes: u64) -> Result<()> {
         let rigs = self.rigs()?;
@@ -327,6 +340,23 @@ impl Mailroom {
         let state: WatchState =
             serde_json::from_slice(&fs::read(self.watch_dir().join("state.json")).ok()?).ok()?;
         chrono::DateTime::from_timestamp_millis(state.last_tick_ms)
+    }
+}
+
+/// Called by Zed's auto_prompt whenever it handles a stopped thread that has
+/// auto_prompt on: for the next few hours that thread's continuation is
+/// auto_prompt's, and the orchestrator watchdog leaves it alone (no double
+/// nudges, no double token spend). A no-op where agent-mail is not set up.
+pub fn mark_auto_prompt_owned(session_id: &str) {
+    let Ok(mailroom) = Mailroom::from_env() else {
+        return;
+    };
+    if mailroom.rigs().is_err() || validate_name(session_id).is_err() {
+        return;
+    }
+    let dir = mailroom.home().join("auto_prompt");
+    if fs::create_dir_all(&dir).is_ok() {
+        fs::write(dir.join(session_id), chrono::Utc::now().to_rfc3339()).ok();
     }
 }
 
@@ -549,7 +579,8 @@ pub fn detect(
             let stalled = agent.status == "idle"
                 && idle * 60_000.0 >= interval_ms as f64
                 && !asks_owner
-                && !agent.wake_scheduled;
+                && !agent.wake_scheduled
+                && !agent.auto_prompt;
             if stalled {
                 incidents.push(Incident {
                     fingerprint: format!("stalled:{name}:{}", agent.name),
@@ -1102,6 +1133,16 @@ mod tests {
             idle_minutes: Some(25.0),
             last_paragraph: Some("Done; nothing left.".into()),
             wake_scheduled: false,
+            auto_prompt: false,
+        });
+        amo.agents.push(Agent {
+            name: "chained".into(),
+            status: "idle".into(),
+            cwd: String::new(),
+            idle_minutes: Some(25.0),
+            last_paragraph: Some("Done; nothing left.".into()),
+            wake_scheduled: false,
+            auto_prompt: true,
         });
         amo.agents.push(Agent {
             name: "asks".into(),
@@ -1110,6 +1151,7 @@ mod tests {
             idle_minutes: Some(25.0),
             last_paragraph: Some("Should I proceed?".into()),
             wake_scheduled: false,
+            auto_prompt: false,
         });
         let mut bmo = probe("bmo");
         bmo.contenders

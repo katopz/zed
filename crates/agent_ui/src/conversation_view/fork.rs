@@ -169,6 +169,9 @@ impl ConversationView {
             );
             return;
         }
+        // This thread's continuation is auto_prompt's: tell the agent-mail
+        // orchestrator not to also nudge it (plan 050). A tiny local file write.
+        agent_mail::watch::mark_auto_prompt_owned(session_id.0.as_ref());
         if thread.read(cx).has_in_progress_tool_calls() {
             log::warn!(
                 "[auto_prompt] {trigger:?}: chain skipped — tool calls still in progress (session={session_id:?}, stop_reason={stop_reason:?})"
