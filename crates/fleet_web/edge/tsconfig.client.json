@@ -1,0 +1,6 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "lib": ["es2023", "dom", "dom.iterable"], "types": [] },
+  "include": ["src/client/**/*.tsx", "src/views/rigs.tsx", "src/views/format.ts", "src/types.ts"],
+  "exclude": []
+}

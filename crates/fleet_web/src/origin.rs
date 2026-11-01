@@ -10,11 +10,14 @@ use agent_mail::rig::{self, RigProbe};
 use anyhow::Result;
 use serde::Serialize;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Matches the edge cache TTL: a tab refreshing every 15 s costs one probe round.
 const FLEET_TTL: Duration = Duration::from_secs(15);
+/// The refresher stops probing once nobody has asked for this long.
+const FLEET_IDLE_SECONDS: i64 = 120;
 const WORKERS: usize = 4;
 
 #[derive(Serialize)]
@@ -47,7 +50,12 @@ pub struct Origin {
     mailroom: Mailroom,
     web_home: PathBuf,
     key: OriginKey,
-    fleet: Mutex<Option<(Instant, Arc<Vec<u8>>)>>,
+    /// Served immediately, even when stale: an offline rig's SSH timeout must
+    /// never stall a page. The refresher thread in `serve` keeps it fresh.
+    fleet: Mutex<Option<Arc<Vec<u8>>>>,
+    /// Single flight: concurrent cold misses wait for one probe round.
+    probing: Mutex<()>,
+    last_fleet_request: AtomicI64,
 }
 
 pub struct Response {
@@ -77,6 +85,8 @@ impl Origin {
             web_home,
             key,
             fleet: Mutex::new(None),
+            probing: Mutex::new(()),
+            last_fleet_request: AtomicI64::new(0),
         }
     }
 
@@ -109,17 +119,31 @@ impl Origin {
     }
 
     fn fleet(&self) -> Result<Arc<Vec<u8>>> {
-        // Held across the probe on purpose: concurrent misses wait for one probe
-        // round instead of each fanning out SSH to every rig.
-        let mut memo = self
+        self.last_fleet_request
+            .store(chrono::Utc::now().timestamp(), Ordering::Relaxed);
+        if let Some(body) = self.cached_fleet()? {
+            return Ok(body);
+        }
+        self.probe_fleet()
+    }
+
+    fn cached_fleet(&self) -> Result<Option<Arc<Vec<u8>>>> {
+        Ok(self
             .fleet
             .lock()
-            .map_err(|_| anyhow::anyhow!("fleet memo poisoned"))?;
-        if let Some((at, body)) = memo.as_ref()
-            && at.elapsed() < FLEET_TTL
-        {
-            return Ok(body.clone());
-        }
+            .map_err(|_| anyhow::anyhow!("fleet memo poisoned"))?
+            .clone())
+    }
+
+    fn wants_fleet(&self, now: i64) -> bool {
+        now - self.last_fleet_request.load(Ordering::Relaxed) < FLEET_IDLE_SECONDS
+    }
+
+    fn probe_fleet(&self) -> Result<Arc<Vec<u8>>> {
+        let _probing = self
+            .probing
+            .lock()
+            .map_err(|_| anyhow::anyhow!("probe lock poisoned"))?;
         let rigs = self.mailroom.rigs()?;
         let mut results = rig::status(&self.mailroom, &[])?;
         results.sort_by(|a, b| a.0.cmp(&b.0));
@@ -146,7 +170,10 @@ impl Origin {
                 .collect(),
         };
         let body = Arc::new(serde_json::to_vec(&fleet)?);
-        *memo = Some((Instant::now(), body.clone()));
+        *self
+            .fleet
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fleet memo poisoned"))? = Some(body.clone());
         Ok(body)
     }
 
@@ -192,6 +219,22 @@ pub fn serve(origin: Origin, bind: &str) -> Result<()> {
         Arc::new(tiny_http::Server::http(bind).map_err(|error| anyhow::anyhow!("{error}"))?);
     let origin = Arc::new(origin);
     eprintln!("fleet-web origin on http://{bind}");
+    std::thread::spawn({
+        let origin = origin.clone();
+        move || {
+            if let Err(error) = origin.probe_fleet() {
+                eprintln!("fleet-web: warm-up probe failed: {error:#}");
+            }
+            loop {
+                std::thread::sleep(FLEET_TTL);
+                if origin.wants_fleet(chrono::Utc::now().timestamp())
+                    && let Err(error) = origin.probe_fleet()
+                {
+                    eprintln!("fleet-web: fleet refresh failed: {error:#}");
+                }
+            }
+        }
+    });
     let workers: Vec<_> = (0..WORKERS)
         .map(|_| {
             let server = server.clone();
@@ -227,9 +270,8 @@ fn respond(origin: &Origin, request: tiny_http::Request) {
         chrono::Utc::now().timestamp(),
     );
     let content_type = tiny_http::Header::from_bytes("content-type", "application/json").ok();
-    let cache = tiny_http::Header::from_bytes("cache-control", "private, no-store").ok();
     let mut reply = tiny_http::Response::from_data(response.body).with_status_code(response.status);
-    for header in [content_type, cache].into_iter().flatten() {
+    if let Some(header) = content_type {
         reply.add_header(header);
     }
     if let Err(error) = request.respond(reply) {
@@ -307,6 +349,28 @@ mod tests {
         assert_eq!(signed(&origin, "/api/threads/..%2F/abc-1", now).status, 400);
         assert_eq!(signed(&origin, "/api/threads/m3/..", now).status, 400);
         assert_eq!(signed(&origin, "/etc/passwd", now).status, 404);
+        Ok(())
+    }
+
+    #[test]
+    fn refresher_probes_only_while_someone_watches() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let origin = origin(dir.path())?;
+        let now = chrono::Utc::now().timestamp();
+        assert!(!origin.wants_fleet(now), "no viewer yet, no probes");
+        *origin
+            .fleet
+            .lock()
+            .map_err(|_| anyhow::anyhow!("poisoned"))? =
+            Some(Arc::new(b"{\"stale\":true}".to_vec()));
+        let body = origin.fleet()?;
+        assert_eq!(
+            body.as_slice(),
+            b"{\"stale\":true}",
+            "stale memo served without probing"
+        );
+        assert!(origin.wants_fleet(now));
+        assert!(!origin.wants_fleet(now + FLEET_IDLE_SECONDS));
         Ok(())
     }
 }

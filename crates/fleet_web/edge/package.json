@@ -1,0 +1,27 @@
+{
+  "name": "fleet-web-edge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.client.json",
+    "test": "node --test 'test/*.test.ts'",
+    "start": "fastly compute serve",
+    "fake-origin": "node scripts/fake_origin.mjs",
+    "local-secrets": "node scripts/local_secrets.mjs",
+    "check": "npm run typecheck && npm test"
+  },
+  "dependencies": {
+    "@fastly/js-compute": "^4.0.1",
+    "@noble/hashes": "^2.4.0",
+    "@preact/signals": "^2.11.4",
+    "marked": "^18.1.2",
+    "preact": "^11.1.1",
+    "preact-render-to-string": "^6.8.2"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2",
+    "typescript": "^7.0.2"
+  }
+}

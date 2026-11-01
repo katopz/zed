@@ -1,0 +1,32 @@
+# Fastly Compute manifest for fleet-web (plan 051). `service_id` is filled
+# in by the first `fastly compute publish`.
+authors = ["katopz"]
+description = "Fleet web: GitHub-gated fleet + thread viewer (plan 051)"
+language = "javascript"
+manifest_version = 3
+name = "fleet-web"
+
+[scripts]
+build = "npm run build"
+post_init = "npm install"
+
+[local_server]
+
+[local_server.backends.origin]
+url = "http://127.0.0.1:8787"
+
+[local_server.backends.github]
+url = "https://github.com"
+override_host = "github.com"
+
+[local_server.backends.github_api]
+url = "https://api.github.com"
+override_host = "api.github.com"
+
+[local_server.config_stores.fleet_web_config]
+file = "local/config.json"
+format = "json"
+
+[local_server.secret_stores.fleet_web_secrets]
+file = "local/secrets.json"
+format = "json"
