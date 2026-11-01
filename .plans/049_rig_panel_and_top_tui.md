@@ -1,5 +1,5 @@
 # 049 — See the rigs: Zed "Rigs" panel + `agent-mail top` terminal UI
-Status: IN PROGRESS — T1 + T2 done (`agent-mail top`, `rig status --watch`, probe cache) and live on m3/amo/bmo; T3 Zed panel next
+Status: DONE (code) — T1-T4 `a548ca70fd` + `f3288b32b5`; panel click-through waits on the owner's Zed Dev rebuild (bundle building)
 
 ## Owner notes (2026-11-01)
 - The war room (plan 024) was retired for a messy UI and request amplification
@@ -48,7 +48,7 @@ no web/Cloudflare surface (the retired war room, plan 024, died of that).
 ## Tasks
 - [x] T1 shared model in the lib: `rig::cached_probe` (a probe younger than 10 s is reused, so any number of viewers costs ≤ 1 real probe per rig per 10 s: the war-room lesson), `Mailroom::mailbox_summary` (read-only: viewers never claim agents' mail), `Mailroom::job_on_rig` (log/cancel locally or over SSH)
 - [x] T2 `agent-mail top [SECS]` (`crates/agent_mail/src/tui.rs`, ratatui 0.30 crossterm-only behind the default `tui` feature): Rigs tab (rig list QUIET/BUSY/OFFLINE, state + heavy work + agents + escalations, jobs list, live log of the selected running job) and Mail tab (inbox counts, pending + broadcasts, full message); keys q, 1/2, Tab, ↑↓/jk, Enter, c (confirm y), r; fetches on a background thread so SSH never freezes the screen; fleet every 15 s (min 5), log every 3 s only while shown. Plus `agent-mail rig status --watch [SECS]`, a plain redraw loop with a mail digest for minimal terminals. Tests: 2 `TestBackend` render tests (incl. a 12×5 terminal and CJK/em-dash text). Real-terminal check: pty run on m3 and on bmo over `ssh -tt` both rendered every rig + panes, `q` exited clean. 4090: builds + tests pass; install waits for its running job (the executor holds `agent-mail.exe`)
-- [ ] T3 Zed Rigs panel: tree, job log buffer, agent/thread links, mailbox, actions
-- [ ] T4 status-bar badge
-- [ ] bench: `top` idle CPU < 1%; panel refresh off when hidden
-- [ ] e2e: run a job on the 4090 and bmo, watch it in both views, cancel from each
+- [x] T3 `crates/rig_panel` (`a548ca70fd`): dock panel (right, `Server` icon) registered only where `~/.agent-mail/rigs.json` exists; rig tree with Disclosure (state, facts, not-quiet reasons, jobs, heavy work grouped, agents, outbox, escalations); click a job → live log tail (40 lines, buffer font) with a confirmed cancel; read-only Mail section (inbox counts, pending + broadcasts, click to expand); polls only while active via `Panel::set_active` (fleet 15 s, log 3 s). Agent→thread jump not done: the probe has Claude session names, not Zed thread ids (follow-up if wanted). `cargo clippy -p zed -p rig_panel` clean
+- [x] T4 `RigBadge` status item: "N busy · N offline · N jobs · N for you", refreshes once a minute, click opens the panel. Test: `badge_counts_busy_offline_jobs_and_escalations`
+- [x] bench: `agent-mail top` 0.35% of one core over 60 s (incl. 4 fleet refreshes) < 1%; panel polling stops in `set_active(false)` (task dropped)
+- [-] e2e in the GUI panel: owner click-through after the Zed Dev rebuild. Terminal view e2e done (pty on m3 + bmo over ssh -tt); live adoption seen: another agent's `rig run --exclusive` job `21dee646` on bmo shows in `rig status` / the fleet cache
