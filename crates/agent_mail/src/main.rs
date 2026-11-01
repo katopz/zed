@@ -19,7 +19,8 @@ USAGE:
   agent-mail rigs                  list rigs and time an SSH round trip to each
   agent-mail init <rig>            name this rig in ~/.agent-mail/rigs.json
   agent-mail claude-hook [--wait]  Claude Code hook (PostToolUse/UserPromptSubmit; --wait for async Stop)
-  agent-mail rig status [RIG...] [--json]
+  agent-mail top [SECS]            terminal UI: rigs, jobs, live job log, mail (read-only)
+  agent-mail rig status [RIG...] [--json] [--watch [SECS]]
                                    what every rig is busy with: heavy processes (riir-ai's
                                    contender rules), agents, load, memory, disk, power, GPU,
                                    and whether it is QUIET enough for a benchmark
@@ -137,21 +138,67 @@ fn run(args: Vec<String>) -> Result<i32> {
             println!("delivered {}", envelope.id);
             Ok(0)
         }
+        Some("top") => {
+            let every: u64 = args.next().and_then(|n| n.parse().ok()).unwrap_or(15);
+            #[cfg(feature = "tui")]
+            agent_mail::tui::run(&room, std::time::Duration::from_secs(every.max(5)))?;
+            #[cfg(not(feature = "tui"))]
+            bail!("built without the `tui` feature; use `agent-mail rig status --watch {every}`");
+            Ok(0)
+        }
         Some("rig") => match args.next().as_deref() {
             Some("probe") => {
-                let probe = agent_mail::rig::probe(&room);
+                let probe = agent_mail::rig::cached_probe(&room);
                 println!("{}", serde_json::to_string(&probe)?);
                 println!("{}", agent_mail::rig::PROBE_END);
                 Ok(0)
             }
             Some("status") => {
                 let mut json = false;
+                let mut watch: Option<u64> = None;
                 let mut only = Vec::new();
-                for arg in args {
+                let mut args = args.peekable();
+                while let Some(arg) = args.next() {
                     match arg.as_str() {
                         "--json" => json = true,
+                        "--watch" => {
+                            watch = Some(
+                                args.next_if(|next| next.parse::<u64>().is_ok())
+                                    .and_then(|next| next.parse().ok())
+                                    .unwrap_or(15),
+                            )
+                        }
                         "all" => {}
                         rig => only.push(rig.to_string()),
+                    }
+                }
+                if let Some(every) = watch {
+                    // Plain redraw loop for terminals where `top` is too much.
+                    loop {
+                        let results = agent_mail::rig::status(&room, &only)?;
+                        let mail = room.mailbox_summary(5);
+                        print!("\x1b[2J\x1b[H");
+                        println!(
+                            "agent-mail rig status · {} · every {every} s (Ctrl-C to stop)\n",
+                            chrono::Local::now().format("%H:%M:%S")
+                        );
+                        print!("{}", agent_mail::rig::render(&results, &room.rigs()?));
+                        println!("\nmail on {}:", room.rigs()?.self_rig);
+                        for inbox in &mail.inboxes {
+                            println!(
+                                "  {:<20} {} new, {} scheduled",
+                                inbox.name, inbox.pending, inbox.scheduled
+                            );
+                        }
+                        for envelope in mail.broadcasts.iter().take(3) {
+                            println!(
+                                "  broadcast {} {}: {}",
+                                envelope.sent_at.get(11..16).unwrap_or(""),
+                                envelope.from,
+                                envelope.body.lines().next().unwrap_or("")
+                            );
+                        }
+                        std::thread::sleep(std::time::Duration::from_secs(every.max(5)));
                     }
                 }
                 room.flush_outbox();
@@ -197,29 +244,11 @@ fn run(args: Vec<String>) -> Result<i32> {
                 let target = args.next().context("which rig?")?;
                 let id = args.next().context("which job id?")?;
                 let lines: usize = args.next().and_then(|n| n.parse().ok()).unwrap_or(40);
-                let rigs = room.rigs()?;
-                let remote = match command {
-                    "cancel" => format!("rig cancel-local {id}"),
-                    _ => format!("rig log-local {id} {lines}"),
+                let action = match command {
+                    "cancel" => agent_mail::jobs::JobAction::Cancel,
+                    _ => agent_mail::jobs::JobAction::Log(lines),
                 };
-                match target == rigs.self_rig {
-                    true => println!(
-                        "{}",
-                        match command {
-                            "cancel" => room.cancel_job(&id)?,
-                            _ => room.job_log(&id, lines)?,
-                        }
-                    ),
-                    false => {
-                        let rig = rigs.rigs.get(&target).context("unknown rig")?;
-                        let command =
-                            format!("{} {remote}", rig.bin.as_deref().unwrap_or("agent-mail"));
-                        let target_ssh = rig.ssh.first().context("rig has no ssh target")?;
-                        for line in room.ssh_lines(target_ssh, &command, END_MARKER)? {
-                            println!("{line}");
-                        }
-                    }
-                }
+                println!("{}", room.job_on_rig(&target, &id, action)?);
                 Ok(0)
             }
             Some("cancel-local") => {
@@ -317,7 +346,7 @@ fn run(args: Vec<String>) -> Result<i32> {
     }
 }
 
-const END_MARKER: &str = "agent-mail-end";
+use agent_mail::jobs::END_MARKER;
 
 fn rig_run(room: &Mailroom, args: Vec<String>) -> Result<i32> {
     use agent_mail::jobs::{JobSpec, KeyClaim, KeyOutcome, Lane, Needs};

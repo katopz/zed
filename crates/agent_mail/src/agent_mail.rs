@@ -8,6 +8,8 @@
 
 pub mod jobs;
 pub mod rig;
+#[cfg(feature = "tui")]
+pub mod tui;
 pub mod watch;
 
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -171,6 +173,24 @@ pub struct FlushReport {
     pub pending: usize,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct InboxCount {
+    pub name: String,
+    pub pending: usize,
+    pub scheduled: usize,
+}
+
+/// Read-only view of a rig's mail for the terminal UI and the Zed panel.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MailboxSummary {
+    pub inboxes: Vec<InboxCount>,
+    /// Newest pending (unclaimed) messages across inboxes.
+    pub pending: Vec<Envelope>,
+    /// Newest broadcasts (`all@rig`).
+    pub broadcasts: Vec<Envelope>,
+    pub outbox: Vec<(String, usize)>,
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct HookOutcome {
     pub stdout: Option<String>,
@@ -302,6 +322,54 @@ impl Mailroom {
             prune_claimed(&inbox.join("new"));
         }
         Ok(())
+    }
+
+    /// What is waiting in this rig's mailboxes, read-only: viewers (the
+    /// terminal UI, the Zed panel) must never claim mail meant for agents.
+    pub fn mailbox_summary(&self, recent: usize) -> MailboxSummary {
+        let mut inboxes = Vec::new();
+        let mut latest = Vec::new();
+        if let Ok(entries) = fs::read_dir(self.home.join("inbox")) {
+            for entry in entries.flatten() {
+                let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                    continue;
+                };
+                if name == ALL_NAME {
+                    continue;
+                }
+                let names = [name.clone()];
+                let pending = self.peek(&names).unwrap_or_default();
+                let scheduled = self.scheduled(&names).map_or(0, |mail| mail.len());
+                if !pending.is_empty() || scheduled > 0 {
+                    inboxes.push(InboxCount {
+                        name: name.clone(),
+                        pending: pending.len(),
+                        scheduled,
+                    });
+                }
+                latest.extend(pending);
+            }
+        }
+        inboxes.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut broadcasts: Vec<Envelope> = self
+            .pending_files(&[ALL_NAME.to_string()])
+            .iter()
+            .filter_map(|path| read_envelope(path).ok())
+            .collect();
+        broadcasts.sort_by(|a, b| b.sent_at.cmp(&a.sent_at));
+        broadcasts.truncate(recent);
+        latest.sort_by(|a, b| b.sent_at.cmp(&a.sent_at));
+        latest.truncate(recent);
+        MailboxSummary {
+            inboxes,
+            pending: latest,
+            broadcasts,
+            outbox: self
+                .outbox_status()
+                .into_iter()
+                .map(|(rig, count, _)| (rig, count))
+                .collect(),
+        }
     }
 
     /// Broadcasts `reader` has not seen yet, oldest first, plus the newest

@@ -460,6 +460,35 @@ pub fn contention(exclude_trees: &[u32]) -> Contention {
     }
 }
 
+/// A probe younger than this is reused: any number of viewers (terminal UIs,
+/// Zed panels, the watchdog) on any rig cost at most one real probe per rig
+/// per window. The retired war room died of per-view read amplification.
+const PROBE_CACHE_FOR: Duration = Duration::from_secs(10);
+
+pub fn cached_probe(mailroom: &Mailroom) -> RigProbe {
+    let path = mailroom.home().join("probe-cache.json");
+    let fresh = fs::metadata(&path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age < PROBE_CACHE_FOR);
+    if fresh
+        && let Some(probe) = fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<RigProbe>(&bytes).ok())
+    {
+        return probe;
+    }
+    let probe = probe(mailroom);
+    if let Ok(bytes) = serde_json::to_vec(&probe) {
+        let staged = path.with_extension("tmp");
+        if fs::write(&staged, bytes).is_ok() {
+            fs::rename(&staged, &path).ok();
+        }
+    }
+    probe
+}
+
 /// Probes this rig. Managed jobs are reported as jobs, not as contenders.
 pub fn probe(mailroom: &Mailroom) -> RigProbe {
     let rig = mailroom
@@ -889,7 +918,7 @@ pub fn status(
                 let mailroom = Mailroom::new(home);
                 let started = Instant::now();
                 let outcome = match name == rigs.self_rig {
-                    true => Ok(probe(&mailroom)),
+                    true => Ok(cached_probe(&mailroom)),
                     false => probe_remote(&mailroom, &rigs, &name),
                 };
                 (name, outcome, started.elapsed())

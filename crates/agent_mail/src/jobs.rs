@@ -23,6 +23,14 @@ use std::time::{Duration, Instant};
 const POISON_PROBE_EVERY: Duration = Duration::from_secs(15);
 /// Ends the orchestrator's key verdict output over SSH.
 pub const KEY_VERDICT_END: &str = "key-verdict-end";
+/// Ends `rig log-local` / `rig cancel-local` output over SSH.
+pub const END_MARKER: &str = "agent-mail-end";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobAction {
+    Log(usize),
+    Cancel,
+}
 const WAIT_POLL: Duration = Duration::from_secs(1);
 const KICK_EVERY: Duration = Duration::from_secs(20);
 /// Memory a shared job must leave free for everything else on the rig.
@@ -798,6 +806,35 @@ impl Mailroom {
             .with_context(|| format!("no log for job {id}"))?;
         let all: Vec<&str> = text.lines().collect();
         Ok(all[all.len().saturating_sub(lines)..].join("\n"))
+    }
+
+    /// `rig log` / `rig cancel` against any rig: locally, or over SSH.
+    pub fn job_on_rig(&self, rig_name: &str, id: &str, action: JobAction) -> Result<String> {
+        let rigs = self.rigs()?;
+        if rig_name == rigs.self_rig {
+            return match action {
+                JobAction::Log(lines) => self.job_log(id, lines),
+                JobAction::Cancel => self.cancel_job(id),
+            };
+        }
+        validate_name(id)?;
+        let rig = rigs
+            .rigs
+            .get(rig_name)
+            .with_context(|| format!("unknown rig {rig_name:?}"))?;
+        let remote = match action {
+            JobAction::Log(lines) => format!("rig log-local {id} {lines}"),
+            JobAction::Cancel => format!("rig cancel-local {id}"),
+        };
+        let command = format!("{} {remote}", rig.bin.as_deref().unwrap_or("agent-mail"));
+        let mut failures = Vec::new();
+        for target in &rig.ssh {
+            match self.ssh(target, &command, END_MARKER) {
+                Ok(lines) => return Ok(lines.join("\n")),
+                Err(error) => failures.push(format!("{target}: {error:#}")),
+            }
+        }
+        Err(anyhow!("{rig_name} unreachable: {}", failures.join("; ")))
     }
 
     /// Running and queued jobs, for `rig status`.

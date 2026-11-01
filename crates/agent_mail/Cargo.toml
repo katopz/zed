@@ -15,8 +15,14 @@ path = "src/agent_mail.rs"
 name = "agent-mail"
 path = "src/main.rs"
 
+[features]
+default = ["tui"]
+# `agent-mail top`, the terminal UI for rigs without an IDE (bmo).
+tui = ["dep:ratatui"]
+
 [dependencies]
 anyhow.workspace = true
+ratatui = { version = "0.30", optional = true, default-features = false, features = ["crossterm", "layout-cache"] }
 base64.workspace = true
 regex = { workspace = true, features = ["unicode"] }
 chrono = { workspace = true, features = ["clock"] }
