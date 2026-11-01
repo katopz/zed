@@ -413,16 +413,6 @@ fn claude_tokens_exceed_overflow(effective_tokens: Option<u64>, threshold: usize
     effective_tokens.is_some_and(|tokens| tokens as usize > threshold)
 }
 
-/// Effective context tokens for the Claude overflow gate.
-///
-/// ACP `UsageUpdate` populates `used_tokens` ("tokens currently in context"
-/// — what Claude Code reports), while `input_tokens` is only set from
-/// stop-response usage behind the `acp-beta` feature flag. Take the max of
-/// the two so the gate fires no matter which field the agent populates.
-fn claude_effective_context_tokens(usage: &acp_thread::TokenUsage) -> u64 {
-    usage.input_tokens.max(usage.used_tokens)
-}
-
 /// Claude context-overflow parity gate (plan 023 A3, req 1).
 ///
 /// Returns `Some(NeedsLlmCall { context_exceeds_limit: true })` when the
@@ -444,7 +434,7 @@ fn claude_context_overflow_decision(
     let thread_ref = thread.read(cx);
     let effective_tokens = thread_ref
         .token_usage()
-        .map(claude_effective_context_tokens);
+        .map(acp_thread::TokenUsage::context_tokens);
     if !claude_tokens_exceed_overflow(effective_tokens, threshold) {
         return None;
     }

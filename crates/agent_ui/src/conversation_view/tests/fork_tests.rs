@@ -783,6 +783,60 @@ async fn test_manual_auto_prompt_dispatches_static_continuation(cx: &mut TestApp
     );
 }
 
+/// A manual click on a Claude Code thread past the overflow gate must fork
+/// into a new thread, like the native agent. Claude only reports
+/// `used_tokens` (ACP `UsageUpdate`), so the gate must read that field —
+/// reading `input_tokens` (always 0 for Claude) kept the thread looping in
+/// place at 320k+.
+#[gpui::test]
+async fn test_manual_auto_prompt_forks_claude_thread_above_overflow_gate(cx: &mut TestAppContext) {
+    init_test(cx);
+
+    let connection =
+        StubAgentConnection::new().with_agent_id(AgentId::new(agent_servers::CLAUDE_AGENT_ID));
+    let (conversation_view, cx) =
+        setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+    add_to_workspace(conversation_view.clone(), cx);
+
+    message_editor(&conversation_view, cx).update_in(cx, |editor, window, cx| {
+        editor.set_text("do work", window, cx);
+    });
+    active_thread(&conversation_view, cx).update_in(cx, |view, window, cx| view.send(window, cx));
+    cx.run_until_parked();
+
+    let session_id = active_thread(&conversation_view, cx)
+        .read_with(cx, |thread, cx| thread.thread.read(cx).session_id().clone());
+    cx.update(|_, _cx| {
+        connection.end_turn(session_id.clone(), acp_v1::StopReason::EndTurn);
+    });
+    cx.run_until_parked();
+
+    let overflow_gate =
+        auto_prompt::AutoPromptConfig::default().effective_claude_context_overflow_tokens() as u64;
+    active_thread(&conversation_view, cx).update(cx, |view, cx| {
+        view.thread.update(cx, |thread, cx| {
+            thread.update_usage(
+                acp_v2::UsageUpdate::new(overflow_gate + 1, overflow_gate * 2),
+                cx,
+            );
+        });
+    });
+
+    active_thread(&conversation_view, cx)
+        .update_in(cx, |view, window, cx| view.manual_auto_prompt(window, cx));
+    cx.run_until_parked();
+
+    let markdown = conversation_view.read_with(cx, |view, cx| {
+        view.thread_view(&session_id)
+            .map(|thread_view| thread_view.read(cx).thread.read(cx).to_markdown(cx))
+            .unwrap_or_default()
+    });
+    assert!(
+        !markdown.contains("Continue remaining work"),
+        "a Claude thread above the overflow gate must not continue in place; got: {markdown}"
+    );
+}
+
 /// When a user sends a direct message while auto_prompt is processing,
 /// the auto_prompt task should be cancelled.
 #[gpui::test]

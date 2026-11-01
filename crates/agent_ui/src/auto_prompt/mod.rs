@@ -598,23 +598,24 @@ pub(crate) fn dispatch_action_with_attempts(
     cx: &mut gpui::Context<crate::ConversationView>,
     stream_cap_attempts: u32,
 ) -> bool {
-    let is_native_agent = conversation_view
+    let active_agent_id = conversation_view
         .active_thread()
-        .is_some_and(|tv| tv.read(cx).thread.read(cx).connection().agent_id() == *ZED_AGENT_ID);
+        .map(|tv| tv.read(cx).thread.read(cx).connection().agent_id());
+    let is_native_agent = active_agent_id.as_ref() == Some(&*ZED_AGENT_ID);
+    let is_claude_agent =
+        active_agent_id.is_some_and(|agent_id| agent_id.as_ref() == CLAUDE_AGENT_ID);
 
     // Sample the machine in the background so the NEXT continuation prompt
     // carries fresh CPU/RAM/power numbers (see start_context_block).
     let dispatching_view_id = cx.entity().entity_id();
     let start_context = start_context_block(conversation_view, dispatching_view_id, window, cx);
 
-    let max_context_tokens = auto_prompt::load_config_cached()
-        .map(|config| config.max_context_tokens)
-        .unwrap_or_else(|_| auto_prompt::default_max_context_tokens());
-
-    let same_thread_threshold = match auto_prompt::load_config_cached()
-        .map(|config| config.same_thread_token_threshold)
-        .unwrap_or(0)
-    {
+    let config = auto_prompt::load_config_cached().unwrap_or_default();
+    let same_thread_threshold = match config.same_thread_token_threshold {
+        // Claude follows its own overflow gate (`claude_context_overflow_tokens`,
+        // defaulting to `max_context_tokens`) so a manual click forks at the
+        // same point the automatic chain does.
+        _ if is_claude_agent => config.effective_claude_context_overflow_tokens(),
         // Explicit positive override from config/env.
         threshold if threshold > 0 => threshold,
         // Plan 023 C1: auto mode resolves to the overflow gate
@@ -622,7 +623,7 @@ pub(crate) fn dispatch_action_with_attempts(
         // continues same-thread (req 4); above it the Phase 1/2 machinery
         // owns forking. The old 50%-of-max-input heuristic forked native
         // threads at ~100k even when the context was fine.
-        _ => max_context_tokens,
+        _ => config.max_context_tokens,
     };
 
     // Use actual API-reported tokens when available; fall back to the
@@ -635,10 +636,14 @@ pub(crate) fn dispatch_action_with_attempts(
         .unwrap_or(action.approximate_token_count);
     let exceeds_same_thread = effective_tokens > same_thread_threshold;
 
-    let use_new_thread = action.force_new_thread || (is_native_agent && exceeds_same_thread);
+    // Claude Code compacts on its own, but past the overflow gate its turns
+    // stall near the model ceiling — fork like the native agent does. Other
+    // ACP agents keep relying on same-thread history.
+    let use_new_thread =
+        action.force_new_thread || ((is_native_agent || is_claude_agent) && exceeds_same_thread);
 
     log::info!(
-        "[auto_prompt] dispatch_action: is_native_agent={}, actual={:?}, approx={}, effective={effective_tokens}, threshold={same_thread_threshold}, use_new_thread={use_new_thread}, force_new_thread={}",
+        "[auto_prompt] dispatch_action: is_native_agent={}, is_claude_agent={is_claude_agent}, actual={:?}, approx={}, effective={effective_tokens}, threshold={same_thread_threshold}, use_new_thread={use_new_thread}, force_new_thread={}",
         is_native_agent,
         action.actual_input_tokens,
         action.approximate_token_count,

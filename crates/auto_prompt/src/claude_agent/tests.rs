@@ -1039,22 +1039,19 @@ fn usage(input_tokens: u64, used_tokens: u64) -> acp_thread::TokenUsage {
 // must read the populated field.
 #[test]
 fn claude_effective_tokens_reads_used_tokens_when_input_is_zero() {
-    assert_eq!(claude_effective_context_tokens(&usage(0, 210_000)), 210_000);
+    assert_eq!(usage(0, 210_000).context_tokens(), 210_000);
 }
 
 #[test]
 fn claude_effective_tokens_reads_input_tokens_when_larger() {
-    assert_eq!(
-        claude_effective_context_tokens(&usage(230_000, 50_000)),
-        230_000
-    );
+    assert_eq!(usage(230_000, 50_000).context_tokens(), 230_000);
 }
 
 #[test]
 fn claude_effective_tokens_gate_fires_from_used_tokens() {
     // The exact reported bug: 200k+ context, input_tokens never set.
     assert!(claude_tokens_exceed_overflow(
-        Some(claude_effective_context_tokens(&usage(0, 200_001))),
+        Some(usage(0, 200_001).context_tokens()),
         200_000
     ));
 }

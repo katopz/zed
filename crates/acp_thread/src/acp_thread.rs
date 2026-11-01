@@ -3460,6 +3460,13 @@ pub struct SessionCost {
 pub const TOKEN_USAGE_WARNING_THRESHOLD: f32 = 0.8;
 
 impl TokenUsage {
+    /// Tokens currently in the context window, whichever field the agent
+    /// populates: ACP `UsageUpdate` (Claude Code) only sets `used_tokens`,
+    /// while `input_tokens` stays 0 unless stop-response usage is reported.
+    pub fn context_tokens(&self) -> u64 {
+        self.input_tokens.max(self.used_tokens)
+    }
+
     pub fn ratio(&self) -> TokenUsageRatio {
         #[cfg(debug_assertions)]
         let warning_threshold: f32 = std::env::var("ZED_THREAD_WARNING_THRESHOLD")

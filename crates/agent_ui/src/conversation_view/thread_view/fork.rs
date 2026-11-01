@@ -2384,7 +2384,9 @@ impl ThreadView {
 
     pub(crate) fn manual_auto_prompt(&self, window: &mut Window, cx: &mut Context<Self>) {
         let thread = self.thread.read(cx);
-        let actual_input_tokens = thread.token_usage().map(|u| u.input_tokens);
+        let actual_input_tokens = thread
+            .token_usage()
+            .map(acp_thread::TokenUsage::context_tokens);
         let session_id = thread.session_id().clone();
         let title = thread.title().map(|t| t.to_string());
         let work_dirs = thread.work_dirs().map(|pl| pl.paths().to_vec());
