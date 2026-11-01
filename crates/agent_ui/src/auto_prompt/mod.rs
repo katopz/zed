@@ -325,6 +325,10 @@ pub enum AutoPromptState {
     Idle,
     /// Auto-prompt is waiting for LLM decision or dispatching.
     Processing,
+    /// The turn ended while a command the agent detached into the background
+    /// still runs; the chain resumes once that work and the agent's own
+    /// follow-up turn are done.
+    WaitingForBackground,
     /// Auto-prompt failed with an error. Contains the error message for display.
     Failed(String),
 }

@@ -870,15 +870,19 @@ async fn test_stopped_turn_detects_agent_resume(cx: &mut TestAppContext) {
     cx.run_until_parked();
 
     let (thread, session_id) = active_thread(&conversation_view, cx).read_with(cx, |view, cx| {
-        (view.thread.clone(), view.thread.read(cx).session_id().clone())
+        (
+            view.thread.clone(),
+            view.thread.read(cx).session_id().clone(),
+        )
     });
     cx.update(|_, _cx| {
         connection.end_turn(session_id.clone(), acp_v1::StopReason::EndTurn);
     });
     cx.run_until_parked();
 
-    let stopped_turn =
-        thread.read_with(cx, |thread, _| crate::auto_prompt::StoppedTurn::capture(thread));
+    let stopped_turn = thread.read_with(cx, |thread, _| {
+        crate::auto_prompt::StoppedTurn::capture(thread)
+    });
     assert!(
         !thread.read_with(cx, |thread, _| stopped_turn.agent_resumed(thread)),
         "an idle thread with no new entries has not resumed"
@@ -899,8 +903,9 @@ async fn test_stopped_turn_detects_agent_resume(cx: &mut TestAppContext) {
         "agent output after the stop is a resume"
     );
 
-    let stopped_turn =
-        thread.read_with(cx, |thread, _| crate::auto_prompt::StoppedTurn::capture(thread));
+    let stopped_turn = thread.read_with(cx, |thread, _| {
+        crate::auto_prompt::StoppedTurn::capture(thread)
+    });
     message_editor(&conversation_view, cx).update_in(cx, |editor, window, cx| {
         editor.set_text("next turn", window, cx);
     });
@@ -909,6 +914,93 @@ async fn test_stopped_turn_detects_agent_resume(cx: &mut TestAppContext) {
     assert!(
         thread.read_with(cx, |thread, _| stopped_turn.agent_resumed(thread)),
         "a new turn after the stop is a resume"
+    );
+}
+
+/// A turn that ends only to wait for a command the agent detached into the
+/// background ("Waiting for the wasm build.") must not be continued while that
+/// command runs: auto-prompt shows it is waiting, and continues once the
+/// command has ended and the agent has gone quiet.
+#[gpui::test]
+async fn test_auto_prompt_waits_for_background_terminal(cx: &mut TestAppContext) {
+    init_test(cx);
+
+    let connection = StubAgentConnection::new();
+    let (conversation_view, cx) =
+        setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+    add_to_workspace(conversation_view.clone(), cx);
+    active_thread(&conversation_view, cx).update(cx, |view, cx| {
+        view.fork.auto_prompt_enabled = true;
+        cx.notify();
+    });
+
+    message_editor(&conversation_view, cx).update_in(cx, |editor, window, cx| {
+        editor.set_text("build the wasm", window, cx);
+    });
+    active_thread(&conversation_view, cx).update_in(cx, |view, window, cx| view.send(window, cx));
+    cx.run_until_parked();
+
+    let (thread, session_id) = active_thread(&conversation_view, cx).read_with(cx, |view, cx| {
+        (
+            view.thread.clone(),
+            view.thread.read(cx).session_id().clone(),
+        )
+    });
+    let terminal_id = acp_v2::TerminalId::new("wasm-build");
+    thread
+        .update(cx, |thread, cx| {
+            thread.upsert_wire_tool_call(
+                acp_v2::ToolCallUpdate::new("wasm-build-tool")
+                    .kind(acp_v2::ToolKind::Execute)
+                    .status(acp_v2::ToolCallStatus::Completed)
+                    .content(vec![acp_v2::ToolCallContent::Terminal(
+                        acp_v2::Terminal::new(terminal_id.clone()),
+                    )]),
+                cx,
+            )
+        })
+        .expect("backgrounded tool call");
+    cx.update(|_, _cx| {
+        connection.end_turn(session_id, acp_v1::StopReason::EndTurn);
+    });
+    cx.run_until_parked();
+
+    let auto_prompt_state = |cx: &mut VisualTestContext| {
+        active_thread(&conversation_view, cx)
+            .read_with(cx, |view, _| view.fork.auto_prompt_state.clone())
+    };
+    for _ in 0..30 {
+        cx.executor().advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+    }
+    assert_eq!(
+        auto_prompt_state(cx),
+        crate::auto_prompt::AutoPromptState::WaitingForBackground,
+        "the chain must wait while the background command runs"
+    );
+
+    thread
+        .update(cx, |thread, cx| {
+            thread.upsert_display_terminal(
+                terminal_id,
+                acp_thread::DisplayTerminalPatch {
+                    exit_status: agent_client_protocol::schema::MaybeUndefined::Value(
+                        acp_v2::TerminalExitStatus::new(),
+                    ),
+                    ..Default::default()
+                },
+                cx,
+            )
+        })
+        .expect("background command ends");
+    for _ in 0..20 {
+        cx.executor().advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+    }
+    assert_ne!(
+        auto_prompt_state(cx),
+        crate::auto_prompt::AutoPromptState::WaitingForBackground,
+        "the chain continues once the command ended and the agent is quiet"
     );
 }
 

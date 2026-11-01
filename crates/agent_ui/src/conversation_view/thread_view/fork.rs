@@ -1454,6 +1454,10 @@ impl ThreadView {
             self.fork.auto_prompt_state,
             crate::auto_prompt::AutoPromptState::Failed(_)
         );
+        let is_waiting = matches!(
+            self.fork.auto_prompt_state,
+            crate::auto_prompt::AutoPromptState::WaitingForBackground
+        );
 
         let failed_error_message = match &self.fork.auto_prompt_state {
             crate::auto_prompt::AutoPromptState::Failed(msg) => Some(msg.clone()),
@@ -1462,6 +1466,11 @@ impl ThreadView {
 
         let (tooltip_text, icon_color) = if is_processing {
             ("Auto-Prompt: Processing…", Color::Accent)
+        } else if is_waiting {
+            (
+                "Auto-Prompt: waiting for the agent's background task — click to stop waiting",
+                Color::Accent,
+            )
         } else if is_failed {
             ("Auto-Prompt: Failed — click to retry", Color::Error)
         } else if enabled {
@@ -1485,20 +1494,31 @@ impl ThreadView {
         // The processing state gets a visible text label (not just a tooltip) because
         // it's the one state where the button is also a cancel target — users need to
         // see at a glance that something is running and clickable, not discover it on hover.
-        if is_processing {
-            Button::new("auto-prompt-toggle", "Processing…")
-                .start_icon(
-                    Icon::new(IconName::Sparkle)
-                        .size(IconSize::XSmall)
-                        .color(icon_color),
-                )
-                .label_size(LabelSize::XSmall)
-                .color(icon_color)
-                .tooltip(build_tooltip)
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.handle_auto_prompt_toggle_click(window, cx);
-                }))
-                .into_any_element()
+        if is_processing || is_waiting {
+            Button::new(
+                "auto-prompt-toggle",
+                if is_waiting {
+                    "Waiting for background task…"
+                } else {
+                    "Processing…"
+                },
+            )
+            .start_icon(
+                Icon::new(if is_waiting {
+                    IconName::Clock
+                } else {
+                    IconName::Sparkle
+                })
+                .size(IconSize::XSmall)
+                .color(icon_color),
+            )
+            .label_size(LabelSize::XSmall)
+            .color(icon_color)
+            .tooltip(build_tooltip)
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.handle_auto_prompt_toggle_click(window, cx);
+            }))
+            .into_any_element()
         } else {
             IconButton::new("auto-prompt-toggle", IconName::Sparkle)
                 .icon_size(IconSize::Small)
@@ -1638,6 +1658,7 @@ impl ThreadView {
         let is_processing = matches!(
             self.fork.auto_prompt_state,
             crate::auto_prompt::AutoPromptState::Processing
+                | crate::auto_prompt::AutoPromptState::WaitingForBackground
         );
         let is_failed = matches!(
             self.fork.auto_prompt_state,

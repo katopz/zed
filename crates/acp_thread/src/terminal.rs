@@ -710,6 +710,11 @@ impl Terminal {
             .meta(status.meta)
     }
 
+    /// An agent-owned display terminal that has not reported its exit yet.
+    pub fn is_display_running(&self) -> bool {
+        self.display_state().is_some() && self.output.is_none()
+    }
+
     pub fn display_state(&self) -> Option<&DisplayTerminalState> {
         match &self.execution {
             TerminalExecution::Display(state) => Some(state),

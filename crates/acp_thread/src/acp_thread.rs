@@ -4711,6 +4711,19 @@ impl AcpThread {
         false
     }
 
+    /// A finished tool call whose display terminal is still open: the agent
+    /// detached the command into the background (Claude Code's
+    /// `run_in_background`), and the agent sends the terminal's exit only
+    /// when that command ends, after which it usually resumes on its own.
+    pub fn has_running_background_terminals(&self, cx: &App) -> bool {
+        self.entries.iter().any(|entry| match entry {
+            AgentThreadEntry::ToolCall(call) if call.status() == ToolCallStatus::Completed => call
+                .terminals()
+                .any(|terminal| terminal.read(cx).is_display_running()),
+            _ => false,
+        })
+    }
+
     pub fn used_tools_since_last_user_message(&self) -> bool {
         for entry in self.entries.iter().rev() {
             match entry {
@@ -10394,6 +10407,58 @@ mod tests {
             assert_eq!(output.content, lower.read(cx).get_content());
             assert_eq!(output.original_content_len, output.content.len());
             assert_eq!(output.content_line_count, lower.read(cx).total_lines());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_background_terminal_runs_until_its_exit(cx: &mut TestAppContext) {
+        init_test(cx);
+        let thread = new_test_thread(cx).await;
+        let terminal_id = acp_v2::TerminalId::new("background-build");
+        let tool_call = |status| {
+            acp_v2::ToolCallUpdate::new("background-tool")
+                .kind(acp_v2::ToolKind::Execute)
+                .status(status)
+                .content(vec![acp_v2::ToolCallContent::Terminal(
+                    acp_v2::Terminal::new(terminal_id.clone()),
+                )])
+        };
+        thread
+            .update(cx, |thread, cx| {
+                thread.upsert_wire_tool_call(tool_call(acp_v2::ToolCallStatus::InProgress), cx)
+            })
+            .expect("tool call");
+        thread.read_with(cx, |thread, cx| {
+            assert!(
+                !thread.has_running_background_terminals(cx),
+                "a running foreground command is not background work"
+            );
+        });
+
+        // The command detached: the call completes while its terminal stays open.
+        thread
+            .update(cx, |thread, cx| {
+                thread.upsert_wire_tool_call(tool_call(acp_v2::ToolCallStatus::Completed), cx)
+            })
+            .expect("tool call completes");
+        thread.read_with(cx, |thread, cx| {
+            assert!(thread.has_running_background_terminals(cx));
+        });
+
+        thread
+            .update(cx, |thread, cx| {
+                thread.upsert_display_terminal(
+                    terminal_id.clone(),
+                    DisplayTerminalPatch {
+                        exit_status: MaybeUndefined::Value(acp_v2::TerminalExitStatus::new()),
+                        ..Default::default()
+                    },
+                    cx,
+                )
+            })
+            .expect("terminal exits");
+        thread.read_with(cx, |thread, cx| {
+            assert!(!thread.has_running_background_terminals(cx));
         });
     }
 

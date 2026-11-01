@@ -12,6 +12,14 @@ pub(super) enum AutoPromptChainTrigger {
     Error,
 }
 
+const BACKGROUND_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// After its background command ends, the agent usually starts a turn of its
+/// own; this much silence (30 s) means that turn is over.
+const BACKGROUND_SETTLE_POLLS: u32 = 15;
+/// A command that never reports its exit (e.g. its exit was lost with the
+/// agent's process) must not hold the chain forever: give up after 2 hours.
+const BACKGROUND_MAX_POLLS: u32 = 3600;
+
 impl Conversation {
     /// Starts a per-request countdown that auto-allows this tool call once
     /// `agent.auto_allow_permissions_after_seconds` elapses. No-op when the
@@ -178,6 +186,26 @@ impl ConversationView {
             );
             return;
         }
+        // A command the agent detached into the background still runs, and the
+        // turn ended only to wait for it ("Waiting for the wasm build."). The
+        // agent resumes on its own when it ends, so continuing now would
+        // interrupt that wait with a premature decision.
+        if trigger == AutoPromptChainTrigger::Stopped
+            && matches!(stop_reason, None | Some(acp_v2::StopReason::EndTurn))
+            && thread.read(cx).has_running_background_terminals(cx)
+        {
+            log::info!(
+                "[auto_prompt] background task still running — waiting before continuing (session={session_id:?})"
+            );
+            let task = self.wait_for_background_work(thread, &thread_view, window, cx);
+            thread_view.update(cx, |thread_view, cx| {
+                thread_view.fork.auto_prompt_state =
+                    crate::auto_prompt::AutoPromptState::WaitingForBackground;
+                thread_view.fork._auto_prompt_task = Some(task);
+                cx.notify();
+            });
+            return;
+        }
         if trigger == AutoPromptChainTrigger::Error
             && thread_view.read(cx).fork._auto_prompt_task.is_some()
         {
@@ -200,6 +228,104 @@ impl ConversationView {
                 cx.notify();
             });
         }
+    }
+
+    /// Waits until the thread's background commands have ended and the
+    /// agent's own follow-up turn has gone quiet, then hands the thread back
+    /// to [`Self::chain_auto_prompt`]. A v1 connection reports no activity for
+    /// a turn the agent starts by itself, so its end is the point where no
+    /// output has arrived for [`BACKGROUND_SETTLE_POLLS`] polls. A connection
+    /// that reports activity emits `Stopped` for that turn instead, which
+    /// chains on its own, so the wait ends as soon as the thread generates.
+    fn wait_for_background_work(
+        &self,
+        thread: &Entity<AcpThread>,
+        thread_view: &Entity<ThreadView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<()> {
+        let thread = thread.downgrade();
+        let thread_view = thread_view.downgrade();
+        let activity = thread_view
+            .upgrade()
+            .map(|thread_view| thread_view.read(cx).fork.watchdog_activity_gen.clone());
+        cx.spawn_in(window, async move |conversation_view, cx| {
+            let Some(activity) = activity else {
+                return;
+            };
+            let mut last_activity = activity.get();
+            let mut quiet_polls = 0;
+            for _ in 0..BACKGROUND_MAX_POLLS {
+                cx.background_executor()
+                    .timer(BACKGROUND_POLL_INTERVAL)
+                    .await;
+                let Ok((generating, busy)) = thread.read_with(cx, |thread, cx| {
+                    (
+                        thread.status() == ThreadStatus::Generating,
+                        thread.has_in_progress_tool_calls()
+                            || thread.has_running_background_terminals(cx),
+                    )
+                }) else {
+                    return;
+                };
+                if generating {
+                    log::info!(
+                        "[auto_prompt] agent resumed after its background task — its stop continues the chain"
+                    );
+                    quiet_polls = BACKGROUND_SETTLE_POLLS;
+                    break;
+                }
+                if busy || activity.get() != last_activity {
+                    last_activity = activity.get();
+                    quiet_polls = 0;
+                    continue;
+                }
+                quiet_polls += 1;
+                if quiet_polls < BACKGROUND_SETTLE_POLLS {
+                    continue;
+                }
+                conversation_view
+                    .update_in(cx, |conversation_view, window, cx| {
+                        let Some(thread) = thread.upgrade() else {
+                            return;
+                        };
+                        let session_id = thread.read(cx).session_id().clone();
+                        let used_tools = thread.read(cx).used_tools_since_last_user_message();
+                        log::info!(
+                            "[auto_prompt] background work done and the agent is quiet — continuing the chain (session={session_id:?})"
+                        );
+                        if let Some(thread_view) = thread_view.upgrade() {
+                            thread_view.update(cx, |thread_view, cx| {
+                                thread_view.fork.auto_prompt_state =
+                                    crate::auto_prompt::AutoPromptState::Idle;
+                                cx.notify();
+                            });
+                        }
+                        conversation_view.chain_auto_prompt(
+                            &thread,
+                            &session_id,
+                            used_tools,
+                            &Some(acp_v2::StopReason::EndTurn),
+                            AutoPromptChainTrigger::Stopped,
+                            window,
+                            cx,
+                        );
+                    })
+                    .log_err();
+                return;
+            }
+            if quiet_polls < BACKGROUND_SETTLE_POLLS {
+                log::warn!(
+                    "[auto_prompt] stopped waiting for the background task — continue manually when it is done"
+                );
+            }
+            thread_view
+                .update(cx, |thread_view, cx| {
+                    thread_view.fork.auto_prompt_state = crate::auto_prompt::AutoPromptState::Idle;
+                    cx.notify();
+                })
+                .log_err();
+        })
     }
 
     /// Error = thread stopped: cancel the watchdog, notify (surfacing a
