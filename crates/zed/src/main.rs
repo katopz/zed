@@ -832,6 +832,7 @@ fn main() {
         git_ui::init(cx);
         feedback::init(cx);
         agent_board::init(app_state.client.http_client(), cx);
+        rig_panel::init(cx);
         markdown_preview::init(cx);
         tabular_data_preview::init(cx);
         svg_preview::init(cx);

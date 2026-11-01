@@ -1,0 +1,22 @@
+[package]
+name = "rig_panel"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/rig_panel.rs"
+doctest = false
+
+[dependencies]
+agent_mail.workspace = true
+gpui.workspace = true
+ui.workspace = true
+workspace.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
