@@ -6,8 +6,9 @@ const USAGE: &str = "\
 agent-mail — message coding agents on other machines (and this one) over SSH
 
 USAGE:
-  agent-mail send <name@rig | *@rig> [--from NAME] [--reply-to ID] [--at WHEN] [MESSAGE...]
-                       MESSAGE defaults to stdin; `*@rig` = first free agent there.
+  agent-mail send <name@rig | *@rig | all@rig> [--from NAME] [--reply-to ID] [--at WHEN] [MESSAGE...]
+                       MESSAGE defaults to stdin; `*@rig` = first free agent there (ONE agent);
+                       `all@rig` = broadcast, every agent on that rig gets a copy.
                        --at schedules it (30m, 8h, 2d, 23:45, or RFC 3339): it lands, and
                        wakes the recipient, only then. Send to yourself for a timed wake-up
                        instead of a sleep loop.
@@ -70,11 +71,24 @@ fn run(args: Vec<String>) -> Result<i32> {
             for name in explicit {
                 names.push(agent_mail::validate_name(&name)?.to_string());
             }
-            let mail = match command {
+            let reader = self_name.clone().or_else(|| {
+                names
+                    .iter()
+                    .find(|name| name.as_str() != agent_mail::ANY_NAME)
+                    .cloned()
+            });
+            let mut mail = match command {
                 "recv" => room.claim(&names)?,
                 "scheduled" => room.scheduled(&names)?,
                 _ => room.peek(&names)?,
             };
+            if let Some(reader) = &reader {
+                match command {
+                    "recv" => mail.extend(room.take_broadcasts(reader)),
+                    "peek" => mail.extend(room.peek_broadcasts(reader)),
+                    _ => {}
+                }
+            }
             match mail.is_empty() {
                 true => println!("no mail"),
                 false => print!("{}", render(&mail, self_name.as_deref())),

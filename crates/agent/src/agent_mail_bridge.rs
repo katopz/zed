@@ -148,13 +148,16 @@ fn claim_inboxes(
     inboxes
         .into_iter()
         .filter_map(|(session_id, name)| {
+            let reader = name.clone();
             let names = [name];
-            if !mailroom.has_mail(&names) {
+            if !mailroom.has_mail(&names) && !mailroom.has_broadcast(&reader) {
                 return None;
             }
             match mailroom.claim(&names) {
-                Ok(mail) if !mail.is_empty() => Some((session_id, mail)),
-                Ok(_) => None,
+                Ok(mut mail) => {
+                    mail.extend(mailroom.take_broadcasts(&reader));
+                    (!mail.is_empty()).then_some((session_id, mail))
+                }
                 Err(error) => {
                     log::error!("agent-mail: claiming mail for {session_id} failed: {error:#}");
                     None

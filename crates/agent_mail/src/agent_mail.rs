@@ -24,6 +24,11 @@ use std::time::{Duration, Instant, SystemTime};
 
 /// Inbox shared by every agent on a rig: `*@rig` goes here, first claimer wins.
 pub const ANY_NAME: &str = "_any";
+/// Broadcast inbox: `all@rig` reaches every agent on the rig. Never claimed;
+/// each reader keeps its own cursor, so each agent sees each broadcast once.
+pub const ALL_NAME: &str = "_all";
+/// A reader with no cursor yet (a new session) still sees broadcasts this recent.
+const BROADCAST_LOOKBACK: chrono::Duration = chrono::Duration::minutes(10);
 pub const MAX_BODY_BYTES: usize = 16 * 1024;
 const MAX_NAME_LEN: usize = 64;
 const CLAIMED_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
@@ -67,6 +72,7 @@ impl Address {
         };
         let name = match name {
             "" | "*" => ANY_NAME.to_string(),
+            "all" => ALL_NAME.to_string(),
             name => validate_name(name)?.to_string(),
         };
         let rig = rig.map(validate_name).transpose()?.map(str::to_string);
@@ -76,6 +82,7 @@ impl Address {
     pub fn display_with(&self, self_rig: &str) -> String {
         let name = match self.name.as_str() {
             ANY_NAME => "*",
+            ALL_NAME => "all",
             name => name,
         };
         format!("{name}@{}", self.rig.as_deref().unwrap_or(self_rig))
@@ -290,7 +297,61 @@ impl Mailroom {
         };
         fs::rename(&staged, target)?;
         prune_claimed(&inbox.join("cur"));
+        if address.name == ALL_NAME {
+            // Broadcasts stay in new/ (never claimed), so age them out here.
+            prune_claimed(&inbox.join("new"));
+        }
         Ok(())
+    }
+
+    /// Broadcasts `reader` has not seen yet, oldest first, plus the newest
+    /// `sent_at` among them (the cursor to store once they are delivered).
+    fn unseen_broadcasts(&self, reader: &str) -> (Vec<Envelope>, Option<String>) {
+        let inbox = self.inbox(ALL_NAME);
+        let cursor = fs::read_to_string(inbox.join("seen").join(reader))
+            .ok()
+            .map(|cursor| cursor.trim().to_string())
+            .unwrap_or_else(|| {
+                (chrono::Utc::now() - BROADCAST_LOOKBACK)
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+            });
+        let mut unseen: Vec<Envelope> = self
+            .pending_files(&[ALL_NAME.to_string()])
+            .iter()
+            .filter_map(|path| read_envelope(path).ok())
+            .filter(|envelope| envelope.sent_at > cursor)
+            .collect();
+        unseen.sort_by(|a, b| a.sent_at.cmp(&b.sent_at));
+        let newest = unseen.last().map(|envelope| envelope.sent_at.clone());
+        let own = format!("{reader}@");
+        unseen.retain(|envelope| !envelope.from.starts_with(&own));
+        (unseen, newest)
+    }
+
+    pub fn peek_broadcasts(&self, reader: &str) -> Vec<Envelope> {
+        match validate_name(reader) {
+            Ok(reader) => self.unseen_broadcasts(reader).0,
+            Err(_) => Vec::new(),
+        }
+    }
+
+    pub fn has_broadcast(&self, reader: &str) -> bool {
+        !self.peek_broadcasts(reader).is_empty()
+    }
+
+    /// Returns `reader`'s unseen broadcasts and advances its cursor past them.
+    pub fn take_broadcasts(&self, reader: &str) -> Vec<Envelope> {
+        let Ok(reader) = validate_name(reader) else {
+            return Vec::new();
+        };
+        let (unseen, newest) = self.unseen_broadcasts(reader);
+        if let Some(newest) = newest {
+            let seen = self.inbox(ALL_NAME).join("seen");
+            if fs::create_dir_all(&seen).is_ok() {
+                fs::write(seen.join(reader), newest).ok();
+            }
+        }
+        unseen
     }
 
     /// Moves scheduled mail whose time has come from `later/` into `new/`.
@@ -718,8 +779,13 @@ impl Mailroom {
             names.push(id.to_string());
         }
         let self_name = session.as_ref().map(|session| session.name.as_str());
+        let reader = self_name
+            .map(str::to_string)
+            .or_else(|| input.session_id.clone())
+            .unwrap_or_else(|| ANY_NAME.to_string());
         if !wait {
-            let mail = self.claim(&names)?;
+            let mut mail = self.claim(&names)?;
+            mail.extend(self.take_broadcasts(&reader));
             if mail.is_empty() {
                 return Ok(HookOutcome::default());
             }
@@ -787,8 +853,9 @@ impl Mailroom {
             if !still_ours || !session_alive || started.elapsed() > WAIT_MAX {
                 break HookOutcome::default();
             }
-            if self.has_mail(&names) {
-                let mail = self.claim(&names)?;
+            if self.has_mail(&names) || self.has_broadcast(&reader) {
+                let mut mail = self.claim(&names)?;
+                mail.extend(self.take_broadcasts(&reader));
                 if !mail.is_empty() {
                     break HookOutcome {
                         stderr: Some(render(&mail, self_name)),
@@ -1254,6 +1321,75 @@ mod tests {
         assert_eq!(room.claim(&names).unwrap().len(), 1);
         room.deliver(&envelope).unwrap();
         assert!(room.claim(&names).unwrap().is_empty());
+    }
+
+    #[test]
+    fn broadcast_reaches_every_reader_once_but_not_its_sender() {
+        let dir = tempfile::tempdir().unwrap();
+        let room = mailroom(dir.path(), "m3");
+        let to = Address::parse("all@m3").unwrap();
+        assert_eq!(to.display_with("m3"), "all@m3");
+        let envelope = room
+            .compose(&to, "g10-audit", "HEADS-UP".into(), None)
+            .unwrap();
+        room.send(&envelope).unwrap();
+
+        assert_eq!(room.take_broadcasts("zed-bb"), vec![envelope.clone()]);
+        assert!(room.take_broadcasts("zed-bb").is_empty(), "once per reader");
+        assert_eq!(
+            room.take_broadcasts("seal-lane"),
+            vec![envelope.clone()],
+            "every reader"
+        );
+        assert!(
+            room.take_broadcasts("g10-audit").is_empty(),
+            "not the sender"
+        );
+        // Broadcasts are never claimed: the shared `*` box stays empty.
+        assert!(room.claim(&[ANY_NAME.to_string()]).unwrap().is_empty());
+
+        // A reader whose cursor predates nothing sees only recent broadcasts.
+        let mut old = room.compose(&to, "x", "stale".into(), None).unwrap();
+        old.sent_at = (chrono::Utc::now() - chrono::Duration::hours(2))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        room.deliver(&old).unwrap();
+        let fresh_reader = room.take_broadcasts("new-session");
+        assert_eq!(
+            fresh_reader,
+            vec![envelope],
+            "the 2 h old one is out of the lookback"
+        );
+    }
+
+    #[test]
+    fn hook_delivers_broadcasts_with_direct_mail() {
+        let dir = tempfile::tempdir().unwrap();
+        let room = mailroom(dir.path(), "m3");
+        room.send(
+            &room
+                .compose(
+                    &Address::parse("all").unwrap(),
+                    "peer@amo",
+                    "to everyone".into(),
+                    None,
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        let outcome = room
+            .claude_hook(
+                r#"{"session_id":"s9","hook_event_name":"PostToolUse"}"#,
+                false,
+            )
+            .unwrap();
+        assert!(outcome.stdout.unwrap().contains("to everyone"));
+        let again = room
+            .claude_hook(
+                r#"{"session_id":"s9","hook_event_name":"PostToolUse"}"#,
+                false,
+            )
+            .unwrap();
+        assert_eq!(again, HookOutcome::default());
     }
 
     #[test]
