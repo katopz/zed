@@ -1,32 +1,40 @@
-# Fastly Compute manifest for fleet-web (plan 051). `service_id` is filled
-# in by the first `fastly compute publish`.
+# This file describes a Fastly Compute package. To learn more visit:
+# https://www.fastly.com/documentation/reference/compute/fastly-toml
+
 authors = ["katopz"]
 description = "Fleet web: GitHub-gated fleet + thread viewer (plan 051)"
 language = "javascript"
 manifest_version = 3
 name = "fleet-web"
-
-[scripts]
-build = "npm run build"
-post_init = "npm install"
+service_id = "4mM9Fp0M7wsQonO0mXJvNE"
 
 [local_server]
 
-[local_server.backends.origin]
-url = "http://127.0.0.1:8787"
+  [local_server.backends]
 
-[local_server.backends.github]
-url = "https://github.com"
-override_host = "github.com"
+    [local_server.backends.github]
+      override_host = "github.com"
+      url = "https://github.com"
 
-[local_server.backends.github_api]
-url = "https://api.github.com"
-override_host = "api.github.com"
+    [local_server.backends.github_api]
+      override_host = "api.github.com"
+      url = "https://api.github.com"
 
-[local_server.config_stores.fleet_web_config]
-file = "local/config.json"
-format = "json"
+    [local_server.backends.origin]
+      url = "http://127.0.0.1:8787"
 
-[local_server.secret_stores.fleet_web_secrets]
-file = "local/secrets.json"
-format = "json"
+  [local_server.config_stores]
+
+    [local_server.config_stores.fleet_web_config]
+      file = "local/config.json"
+      format = "json"
+
+  [local_server.secret_stores]
+
+    [local_server.secret_stores.fleet_web_secrets]
+      file = "local/secrets.json"
+      format = "json"
+
+[scripts]
+  build = "npm run build"
+  post_init = "npm install"
