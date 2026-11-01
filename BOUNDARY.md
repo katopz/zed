@@ -36,6 +36,11 @@ rig's agent sessions. Upstream base plus a local feature lane maintained on
 - cross-rig agent mail — `crates/agent_mail` (`agent-mail`, std-only CLI:
   maildir inbox per agent, SSH-over-Tailscale delivery, Claude Code hooks for
   inject + idle wake; no daemon, no port) (plan 043)
+- fleet web — `crates/fleet_web` (`fleet-web`: read-only origin serving rig
+  status/queues + Zed thread history mirrored by `fleet-web publish`, blake3-signed
+  requests only) and `crates/fleet_web/edge` (Fastly Compute app: GitHub login,
+  Preact + signals SSR, short edge cache; no Fastly storage — the account has no
+  KV) (plan 051)
 - agent-infrastructure `.agents/skills/` (gpui-test, lint-creator,
   zed-cherry-pick) and the root `.rules`
 

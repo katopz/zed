@@ -60,6 +60,12 @@ impl Connection {
         )
     }
 
+    /// For readers in another process (e.g. exporters of the threads database):
+    /// they must never create, migrate, or write a database Zed owns.
+    pub fn open_read_only(uri: &str) -> Result<Self> {
+        Self::open_with_flags(uri, true, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX)
+    }
+
     /// Attempts to open the database at uri. If it fails, a shared memory db will be opened
     /// instead.
     pub fn open_file(uri: &str) -> Self {

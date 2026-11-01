@@ -1,0 +1,33 @@
+[package]
+name = "fleet_web"
+version = "0.1.0"
+publish.workspace = true
+edition.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/fleet_web.rs"
+
+[[bin]]
+name = "fleet-web"
+path = "src/main.rs"
+
+[dependencies]
+agent_mail.workspace = true
+anyhow.workspace = true
+blake3.workspace = true
+chrono = { workspace = true, features = ["clock"] }
+hex.workspace = true
+rand.workspace = true
+regex.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sqlez.workspace = true
+tiny_http.workspace = true
+zstd.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

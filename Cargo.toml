@@ -86,6 +86,7 @@ members = [
     "crates/feature_flags",
     "crates/feature_flags_macros",
     "crates/feedback",
+    "crates/fleet_web",
     "crates/file_content",
     "crates/file_finder",
     "crates/file_icons",
@@ -365,6 +366,7 @@ extensions_ui = { path = "crates/extensions_ui" }
 feature_flags = { path = "crates/feature_flags" }
 feature_flags_macros = { path = "crates/feature_flags_macros" }
 feedback = { path = "crates/feedback" }
+fleet_web = { path = "crates/fleet_web" }
 file_content = { path = "crates/file_content" }
 file_finder = { path = "crates/file_finder" }
 file_icons = { path = "crates/file_icons" }
