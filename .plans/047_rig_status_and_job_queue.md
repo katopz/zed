@@ -152,3 +152,7 @@ tail, log path on the rig). Submitter + subscribers receive each one.
 - 4090: `cargo test -p riir-train-gpu --test plan474_*` at 0% CPU: the NAME arm still counts it (riir-ai rule: an idle cargo is about to compile).
 - bmo: QUIET, the natural benchmark runner.
 
+## Post-ship fixes (2026-11-01)
+- [x] Windows job commands with quoted paths failed: `cmd /C` received Rust's `\"` argument escaping, so `copy … "%USERPROFILE%\OneDrive\Desktop\zed.exe"` died with "filename syntax is incorrect" after an 80 min build (the build itself succeeded; the 4090 exe was installed by hand). Now `cmd /S /C "<line>"` via `raw_arg`. Verified on the 4090: the same quoted path resolves (`QUOTING-OK`).
+- [x] Job mail to a resumed Claude session was lost: session names are per process (`zed-bb` resumed as `zed-77`), so a job's `--notify zed-bb@m3` sat unread. The session id survives a resume, so agent-mail now records every name a session id has had (`~/.agent-mail/aliases/<session id>`) and the hook and `recv` read all of them. Verified live: the two stranded `zed-bb` job mails reached `zed-77`. Test: `resumed_session_still_reads_mail_sent_to_its_old_name`.
+

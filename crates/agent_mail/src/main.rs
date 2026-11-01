@@ -69,6 +69,15 @@ fn run(args: Vec<String>) -> Result<i32> {
                 false => None,
             };
             names.extend(self_name.iter().cloned());
+            if let (Some(name), Ok(session_id)) =
+                (&self_name, std::env::var("CLAUDE_CODE_SESSION_ID"))
+            {
+                for alias in room.session_aliases(&session_id, Some(name)) {
+                    if !names.contains(&alias) {
+                        names.push(alias);
+                    }
+                }
+            }
             for name in explicit {
                 names.push(agent_mail::validate_name(&name)?.to_string());
             }

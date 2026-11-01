@@ -1085,28 +1085,31 @@ fn key_file_name(key: &str) -> String {
 
 fn shell_command(argv: &[String]) -> Command {
     match argv {
-        [single] if single.contains(char::is_whitespace) => {
-            let mut command = match cfg!(windows) {
-                true => {
-                    let mut command = Command::new("cmd");
-                    command.arg("/C");
-                    command
-                }
-                false => {
-                    let mut command = Command::new("sh");
-                    command.arg("-c");
-                    command
-                }
-            };
-            command.arg(single);
-            command
-        }
+        [single] if single.contains(char::is_whitespace) => shell(single),
         _ => {
             let mut command = Command::new(&argv[0]);
             command.args(&argv[1..]);
             command
         }
     }
+}
+
+#[cfg(windows)]
+fn shell(line: &str) -> Command {
+    use std::os::windows::process::CommandExt as _;
+    // cmd.exe parses its own command line and does not understand the \"
+    // escaping `arg` applies, which mangled quoted paths ("%USERPROFILE%\…"),
+    // so the line is passed through untouched.
+    let mut command = Command::new("cmd");
+    command.raw_arg("/S /C \"").raw_arg(line).raw_arg("\"");
+    command
+}
+
+#[cfg(not(windows))]
+fn shell(line: &str) -> Command {
+    let mut command = Command::new("sh");
+    command.arg("-c").arg(line);
+    command
 }
 
 // agent-mail is a runtime-free std binary; the smol-preferring lint targets async gpui code.

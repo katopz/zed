@@ -808,6 +808,34 @@ impl Mailroom {
         self.ssh(target, remote_command, marker)
     }
 
+    /// Every name the Claude session `session_id` has had, recording
+    /// `current` the first time it is seen. Session names are per process
+    /// (a resume gets a new one); the session id survives the resume.
+    pub fn session_aliases(&self, session_id: &str, current: Option<&str>) -> Vec<String> {
+        if validate_name(session_id).is_err() {
+            return Vec::new();
+        }
+        let path = self.home.join("aliases").join(session_id);
+        let mut names: Vec<String> = fs::read_to_string(&path)
+            .map(|text| {
+                text.lines()
+                    .map(str::trim)
+                    .filter(|name| validate_name(name).is_ok())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(current) = current.filter(|name| validate_name(name).is_ok())
+            && !names.iter().any(|name| name == current)
+        {
+            names.push(current.to_string());
+            if fs::create_dir_all(self.home.join("aliases")).is_ok() {
+                fs::write(&path, names.join("\n") + "\n").ok();
+            }
+        }
+        names
+    }
+
     /// This agent's mailbox name: `$AGENT_MAIL_NAME`, else the Claude Code
     /// session name of `$CLAUDE_PID`.
     pub fn whoami(&self) -> Result<String> {
@@ -845,6 +873,15 @@ impl Mailroom {
             .filter(|id| validate_name(id).is_ok())
         {
             names.push(id.to_string());
+            // A resumed session gets a new name but keeps its id: mail sent
+            // to any earlier name (e.g. a job's --notify) still reaches it.
+            for alias in
+                self.session_aliases(id, session.as_ref().map(|session| session.name.as_str()))
+            {
+                if !names.contains(&alias) {
+                    names.push(alias);
+                }
+            }
         }
         let self_name = session.as_ref().map(|session| session.name.as_str());
         let reader = self_name
@@ -1458,6 +1495,40 @@ mod tests {
             )
             .unwrap();
         assert_eq!(again, HookOutcome::default());
+    }
+
+    #[test]
+    fn resumed_session_still_reads_mail_sent_to_its_old_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let room = mailroom(dir.path(), "m3");
+        assert_eq!(
+            room.session_aliases("89d491c7", Some("zed-bb")),
+            vec!["zed-bb"]
+        );
+        // A job notifies the old name while the session is away.
+        room.send(
+            &room
+                .compose(
+                    &Address::parse("zed-bb").unwrap(),
+                    "jobs",
+                    "job DONE".into(),
+                    None,
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        // Resumed with a new name, same id: the hook reads both inboxes.
+        assert_eq!(
+            room.session_aliases("89d491c7", Some("zed-77")),
+            vec!["zed-bb", "zed-77"]
+        );
+        let outcome = room
+            .claude_hook(
+                r#"{"session_id":"89d491c7","hook_event_name":"PostToolUse"}"#,
+                false,
+            )
+            .unwrap();
+        assert!(outcome.stdout.unwrap().contains("job DONE"));
     }
 
     #[test]
