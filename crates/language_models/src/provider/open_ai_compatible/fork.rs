@@ -145,6 +145,35 @@ impl OpenAiCompatibleLanguageModelProvider {
 }
 
 impl OpenAiCompatibleLanguageModelProvider {
+    /// Every configured key under its env var name, plus this provider's
+    /// definition, so a headless host builds the same provider (same id, so
+    /// the same env var names) and rotates the same keys. Custom headers are
+    /// left out: they can't be serialized and may carry credentials of their
+    /// own, so a host that needs them configures them in its own settings.
+    pub(super) fn host_environment_entries(&self, cx: &App) -> Vec<(String, String)> {
+        let state = self.state.read(cx);
+        let mut environment: Vec<(String, String)> = [
+            &state.api_key_state,
+            &state.api_key_state_2,
+            &state.api_key_state_3,
+            &state.api_key_state_4,
+        ]
+        .into_iter()
+        .filter_map(ApiKeyState::host_env)
+        .collect();
+        let definition = serde_json::json!({
+            state.id.as_ref(): {
+                "api_url": state.settings.api_url,
+                "available_models": state.settings.available_models,
+            }
+        });
+        environment.push((
+            language_model::OPENAI_COMPATIBLE_PROVIDERS_ENV.to_string(),
+            definition.to_string(),
+        ));
+        environment
+    }
+
     pub(super) fn key_slot_status_summary(&self, cx: &App) -> ModelKeySlotStatusSummary {
         // Only meaningful for providers with at least one key configured. We
         // still return the summary (with `has_key: false` slots) when zero keys

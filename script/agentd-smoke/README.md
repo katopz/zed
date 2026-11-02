@@ -22,6 +22,9 @@ python3 -I script/agentd-smoke/detach_smoke.py target/debug/eval-cli target/debu
 # Same, but every client goes through `remote_server exec` and the agentd embedded in the
 # remote server binary, the way Zed launches it on a host (cargo build -p remote_server first).
 SMOKE_VIA_REMOTE_SERVER=1 python3 -I script/agentd-smoke/detach_smoke.py target/debug/eval-cli target/debug/remote_server 18739
+# Same, but the backend is the GUI's "Zed Agent (host)" launch (plan 042): the remote server's own
+# `agent-acp`, model by environment, env names passed like the GUI's shim (eval-cli is unused).
+SMOKE_VIA_REMOTE_SERVER=1 SMOKE_HOST_AGENT=1 python3 -I script/agentd-smoke/detach_smoke.py unused target/debug/remote_server 18741
 ```
 
 The last argument is a free localhost port for the fake model.

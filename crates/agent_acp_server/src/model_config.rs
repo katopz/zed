@@ -14,13 +14,12 @@ use std::time::{Duration, Instant};
 
 use crate::NativeAgentAppState;
 
-/// Name of the env var carrying a JSON object to merge into
-/// `language_models.openai_compatible` user settings before model discovery, in
-/// the same shape as Zed's `openai_compatible` settings key (provider id ->
-/// `{ "api_url": ..., "available_models": [...] }`). Lets zed-eval route the
-/// agent itself through an OpenAI-compatible endpoint (e.g. Baseten) that isn't
-/// one of Zed's built-in providers, without hardcoding it into eval-cli.
-pub const OPENAI_COMPATIBLE_PROVIDERS_ENV: &str = "ZED_OPENAI_COMPATIBLE_PROVIDERS";
+/// Merged into `language_models.openai_compatible` user settings before model
+/// discovery (provider id -> `{ "api_url": ..., "available_models": [...] }`).
+/// Lets zed-eval route the agent through an OpenAI-compatible endpoint (e.g.
+/// Baseten) that isn't one of Zed's built-in providers, and lets the Work Remote
+/// GUI hand the host its selected provider.
+pub use language_model::OPENAI_COMPATIBLE_PROVIDERS_ENV;
 
 pub fn openai_compatible_providers_override() -> Option<String> {
     let raw = std::env::var(OPENAI_COMPATIBLE_PROVIDERS_ENV).ok()?;

@@ -90,6 +90,13 @@ impl ApiKeyState {
         &self.env_var.name
     }
 
+    /// The loaded key under the env var name a headless instance reads it
+    /// from, whether it came from that variable or the keychain.
+    pub fn host_env(&self) -> Option<(String, String)> {
+        let key = self.key(&self.url)?;
+        Some((self.env_var.name.to_string(), key.to_string()))
+    }
+
     pub fn is_from_env_var(&self) -> bool {
         match &self.load_status {
             LoadStatus::Loaded(ApiKey {

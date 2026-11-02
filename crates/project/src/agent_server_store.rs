@@ -138,6 +138,12 @@ pub trait ExternalAgentServer {
 
     fn set_loading_status_tx(&mut self, _tx: watch::Sender<Option<String>>) {}
 
+    /// Agents the client adds itself (not listed by the remote host) must
+    /// survive the host's `ExternalAgentsUpdated` refresh.
+    fn survives_remote_refresh(&self) -> bool {
+        false
+    }
+
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
 }
@@ -730,7 +736,12 @@ impl AgentServerStore {
             let mut loading_status_txs = HashMap::default();
             let mut metadata = HashMap::default();
 
+            let mut client_entries = Vec::new();
             for (name, mut entry) in previous_entries.drain() {
+                if entry.server.survives_remote_refresh() {
+                    client_entries.push((name, entry));
+                    continue;
+                }
                 if let Some(tx) = entry.server.take_new_version_available_tx() {
                     new_version_available_txs.insert(name.clone(), tx);
                 }
@@ -780,6 +791,9 @@ impl AgentServerStore {
                     )
                 })
                 .collect();
+            for (name, entry) in client_entries {
+                this.external_agents.entry(name).or_insert(entry);
+            }
             cx.emit(AgentServersUpdated);
             Ok(())
         })

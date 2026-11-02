@@ -371,7 +371,7 @@ mod tests {
     use feature_flags::FeatureFlagAppExt as _;
     use gpui::{AppContext as _, AsyncApp, BorrowAppContext as _};
     use http_client::FakeHttpClient;
-    use language_model::IconOrSvg;
+    use language_model::{IconOrSvg, LanguageModelClient as _, LanguageModelProvider as _};
     use release_channel::AppVersion;
     use std::future::Future;
     use std::pin::Pin;
@@ -571,5 +571,59 @@ mod tests {
             Vec::new(),
             "removing all entries should unregister the provider"
         );
+    }
+
+    #[gpui::test]
+    async fn test_compatible_provider_host_environment(cx: &mut gpui::TestAppContext) {
+        let provider = cx.update(|cx| {
+            let (_client, credentials_provider) = init_test(cx);
+            let content = serde_json::json!({
+                "language_models": {
+                    "openai_compatible": {
+                        "my-gateway": {
+                            "api_url": "https://example.com/v1",
+                            "available_models": [{ "name": "m1", "max_tokens": 1000 }],
+                        }
+                    }
+                }
+            })
+            .to_string();
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store
+                    .set_user_settings(&content, cx)
+                    .expect("failed to parse test settings");
+            });
+            OpenAiCompatibleLanguageModelProvider::new(
+                "my-gateway".into(),
+                FakeHttpClient::with_404_response(),
+                credentials_provider,
+                cx,
+            )
+        });
+        cx.update(|cx| provider.set_api_key(Some("key-one".into()), cx))
+            .await
+            .expect("storing the key");
+
+        let environment = cx.update(|cx| {
+            let model = provider
+                .provided_models(cx)
+                .into_iter()
+                .next()
+                .expect("the configured model");
+            provider.host_environment(&model, cx)
+        });
+        let environment: HashMap<String, String> = environment.into_iter().collect();
+        assert_eq!(
+            environment.get("MY_GATEWAY_API_KEY").map(String::as_str),
+            Some("key-one")
+        );
+        let definition: serde_json::Value = serde_json::from_str(
+            environment
+                .get(language_model::OPENAI_COMPATIBLE_PROVIDERS_ENV)
+                .expect("provider definition"),
+        )
+        .expect("definition is JSON");
+        assert_eq!(definition["my-gateway"]["api_url"], "https://example.com/v1");
+        assert_eq!(definition["my-gateway"]["available_models"][0]["name"], "m1");
     }
 }

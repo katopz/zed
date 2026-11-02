@@ -165,14 +165,15 @@ pub fn boot_app(cx: &mut App) -> Arc<NativeAgentAppState> {
 
 /// `remote_server agent-acp` — the subcommand name. Dispatched before clap in
 /// `remote_server/src/main.rs`, the same way as the embedded `agentd`.
-pub const SUBCOMMAND: &str = "agent-acp";
+pub const SUBCOMMAND: &str = agentd::NATIVE_AGENT_SUBCOMMAND;
 
 /// Arguments of the [`SUBCOMMAND`] entry point.
 #[derive(clap::Parser, Debug)]
 #[command(name = SUBCOMMAND, about = "Serve Zed's native agent over ACP stdio")]
 pub struct ServerArgs {
-    /// Language model to serve, in `provider/model` format.
-    #[arg(long, default_value = "anthropic/claude-sonnet-4-6-latest")]
+    /// Language model to serve, in `provider/model` format (the Work Remote GUI
+    /// passes it by environment, see [`agentd::NATIVE_AGENT_MODEL_ENV`]).
+    #[arg(long, env = agentd::NATIVE_AGENT_MODEL_ENV, default_value = "anthropic/claude-sonnet-4-6-latest")]
     pub model: String,
 
     /// Enable or disable extended thinking. Defaults to model auto-detection

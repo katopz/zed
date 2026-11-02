@@ -16,5 +16,6 @@ agent_servers.workspace = true
 db.workspace = true
 gpui.workspace = true
 log.workspace = true
+project.workspace = true
 workspace.workspace = true
 zed_actions.workspace = true

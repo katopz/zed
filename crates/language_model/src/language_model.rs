@@ -480,6 +480,10 @@ impl Default for IconOrSvg {
 }
 
 /// Sends requests to a provider's models.
+/// Env var a headless agent reads OpenAI-compatible provider definitions from:
+/// a JSON object shaped like the `language_models.openai_compatible` setting.
+pub const OPENAI_COMPATIBLE_PROVIDERS_ENV: &str = "ZED_OPENAI_COMPATIBLE_PROVIDERS";
+
 pub trait LanguageModelClient: 'static {
     /// Streams a completion of `request` from `model`, which must be one of
     /// this provider's models.
@@ -626,6 +630,13 @@ pub trait LanguageModelClient: 'static {
     /// The API key used to serve `model`, if this provider uses one.
     fn api_key(&self, _model: &LanguageModel, _cx: &App) -> Option<String> {
         None
+    }
+
+    /// Environment variables that let a headless agent on another machine (a
+    /// Work Remote host) reach `model` the way this client does. Values are
+    /// secrets: callers must pass them by environment, never argv.
+    fn host_environment(&self, _model: &LanguageModel, _cx: &App) -> Vec<(String, String)> {
+        Vec::new()
     }
 
     /// Short label identifying which key the most recent (or in-flight) request

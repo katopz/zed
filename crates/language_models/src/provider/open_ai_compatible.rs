@@ -381,6 +381,10 @@ impl LanguageModelClient for OpenAiCompatibleLanguageModelProvider {
     fn reset_key_session(&self, _model: &LanguageModel, cx: &App) {
         self.reprobe_all_keys(cx);
     }
+
+    fn host_environment(&self, _model: &LanguageModel, cx: &App) -> Vec<(String, String)> {
+        self.host_environment_entries(cx)
+    }
 }
 
 fn default_thinking_reasoning_effort(model: &AvailableModel) -> Option<open_ai::ReasoningEffort> {

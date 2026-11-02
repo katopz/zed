@@ -67,6 +67,10 @@ fn wrap_with_shim(command: RemoteCommand) -> RemoteCommand {
         args.push("--pass-env".to_string());
         args.push(name.clone());
     }
+    // The daemon may predate this bridge, so hand the backend the server path
+    // explicitly; the host Zed Agent (`host_agent.rs`) execs through it.
+    args.push("--pass-env".to_string());
+    args.push(agentd::EMBEDDED_BINARY_ENV.to_string());
     args.push("--".to_string());
     args.push(command.program);
     args.extend(command.args);
@@ -128,6 +132,8 @@ mod tests {
                 "A_KEY",
                 "--pass-env",
                 "B_KEY",
+                "--pass-env",
+                agentd::EMBEDDED_BINARY_ENV,
                 "--",
                 "/opt/agent",
                 "--acp"

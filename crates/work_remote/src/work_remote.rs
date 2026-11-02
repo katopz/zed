@@ -4,6 +4,7 @@
 use agent_servers::DetachableRemoteAgents;
 use db::kvp::GlobalKeyValueStore;
 use gpui::{App, AppContext as _, TaskExt as _, actions};
+use project::Project;
 use workspace::Workspace;
 
 actions!(
@@ -27,6 +28,13 @@ pub fn init(cx: &mut App) {
         }
     };
     DetachableRemoteAgents::set_enabled(enabled, cx);
+
+    cx.observe_new(|project: &mut Project, _window, cx| {
+        if DetachableRemoteAgents::enabled(cx) {
+            agent_servers::register_host_agent(project, cx);
+        }
+    })
+    .detach();
 
     cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
         workspace

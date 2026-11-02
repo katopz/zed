@@ -86,15 +86,29 @@ test_env = {"HOME": host.mkdtemp("z036-home-"), "FAKE_API_KEY": "test",
                         "tools": True, "images": False, "parallel_tool_calls": False,
                         "prompt_cache_key": False}}]}})}
 agent = [eval_cli, "--acp", "--model", "fake/m"]
+# SMOKE_HOST_AGENT=1: the backend is the GUI's "Zed Agent (host)" launch
+# (crates/agent_servers/src/acp/host_agent.rs `launch_script`, kept in sync by
+# hand): the remote server's own `agent-acp`, model by environment.
+host_agent = os.environ.get("SMOKE_HOST_AGENT") == "1"
+if host_agent:
+    test_env["ZED_AGENT_ACP_MODEL"] = "fake/m"
+    agent = ["sh", "-c", 'server="${ZED_AGENTD_REMOTE_SERVER:-}"\n'
+             'if [ -z "$server" ] || [ ! -x "$server" ]; then\n'
+             '  echo "Zed Agent (host) needs the remote server built by this Zed; this host runs one without it" >&2\n'
+             '  exit 1\nfi\nexec "$server" agent-acp "$@"', "zed-agent-host"]
 via_server = os.environ.get("SMOKE_VIA_REMOTE_SERVER") == "1"
+assert via_server or not host_agent, "SMOKE_HOST_AGENT needs SMOKE_VIA_REMOTE_SERVER=1: agent-acp is a remote server subcommand"
 assert via_server or not ssh, "SMOKE_SSH needs SMOKE_VIA_REMOTE_SERVER=1: the GUI reaches a host through remote_server exec"
 if via_server:
     agentd_cli = [agentd, "agentd"]
     command = [*host.prefix, shlex.join([agentd, "exec"])] if ssh else [agentd, "exec"]
     # The GUI's shim takes this branch when `remote_server exec` exports its own path.
     # Over SSH the test environment travels in the descriptor, as the GUI's does.
+    # Env names are passed like the GUI's `wrap_with_shim` does.
+    pass_env = [arg for name in [*sorted(test_env), "ZED_AGENTD_REMOTE_SERVER"]
+                for arg in ("--pass-env", name)] if host_agent else []
     descriptor = json.dumps({"program": "sh", "args": [
-        "-c", 'exec "$ZED_AGENTD_REMOTE_SERVER" agentd attach "$@"', "shim", "--", *agent],
+        "-c", 'exec "$ZED_AGENTD_REMOTE_SERVER" agentd attach "$@"', "shim", *pass_env, "--", *agent],
         "env": test_env if ssh else {}, "working_dir": None}).encode()
     preamble = struct.pack("<I", len(descriptor)) + descriptor
 else:

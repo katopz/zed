@@ -372,6 +372,10 @@ impl LanguageModelProvider for OpenRouterLanguageModelProvider {
 }
 
 impl LanguageModelClient for OpenRouterLanguageModelProvider {
+    fn host_environment(&self, _model: &LanguageModel, cx: &App) -> Vec<(String, String)> {
+        self.state.read(cx).api_key_state.host_env().into_iter().collect()
+    }
+
     fn stream_completion(
         &self,
         model: &LanguageModel,

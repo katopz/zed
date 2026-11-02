@@ -379,6 +379,7 @@ dependencies = [
  "agent",
  "agent-client-protocol",
  "agent_settings",
+ "agentd",
  "anyhow",
  "clap",
  "client",
@@ -22631,6 +22632,7 @@ dependencies = [
  "db",
  "gpui",
  "log",
+ "project",
  "workspace",
  "zed_actions",
 ]

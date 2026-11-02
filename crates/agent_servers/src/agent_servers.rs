@@ -5,6 +5,7 @@ mod custom;
 pub mod e2e_tests;
 
 pub use acp::detachable::DetachableRemoteAgents;
+pub use acp::host_agent::{HOST_AGENT_ID, register as register_host_agent};
 pub use acp::external_subagents::ExternalSubagents;
 use client::ProxySettings;
 use collections::{HashMap, HashSet};

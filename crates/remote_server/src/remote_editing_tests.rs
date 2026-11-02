@@ -5013,6 +5013,80 @@ async fn test_remote_external_agent_server(
     );
 }
 
+#[gpui::test]
+async fn test_host_zed_agent_survives_host_agent_list_refresh(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    let fs = FakeFs::new(server_cx.executor());
+    fs.insert_tree(path!("/project"), json!({})).await;
+    let (project, _headless_project) = init_test(&fs, cx, server_cx).await;
+    cx.update(|cx| {
+        LanguageModelRegistry::test(cx);
+    });
+    project.update(cx, |project, cx| {
+        agent_servers::register_host_agent(project, cx)
+    });
+
+    server_cx.update_global::<SettingsStore, _>(|settings_store, cx| {
+        settings_store
+            .set_server_settings(
+                &json!({
+                    "agent_servers": {
+                        "foo": { "type": "custom", "command": "foo-cli" }
+                    }
+                })
+                .to_string(),
+                cx,
+            )
+            .unwrap();
+    });
+    server_cx.run_until_parked();
+    cx.run_until_parked();
+
+    let mut names = project.update(cx, |project, cx| {
+        project
+            .agent_server_store()
+            .read(cx)
+            .external_agents()
+            .map(|name| name.to_string())
+            .collect::<Vec<_>>()
+    });
+    names.sort();
+    pretty_assertions::assert_eq!(names, ["foo", agent_servers::HOST_AGENT_ID]);
+
+    let expected_model = cx.update(|cx| {
+        let model = LanguageModelRegistry::read_global(cx)
+            .default_model()
+            .expect("the test registry sets a default model");
+        format!("{}/{}", model.provider_id.0, model.id.0)
+    });
+    let command = project
+        .update(cx, |project, cx| {
+            project.agent_server_store().update(cx, |store, cx| {
+                store
+                    .get_external_agent(&agent_servers::HOST_AGENT_ID.into())
+                    .expect("host agent registered")
+                    .get_command(vec![], HashMap::default(), &mut cx.to_async())
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(command.path, PathBuf::from("sh"));
+    assert_eq!(command.args.first().map(String::as_str), Some("-c"));
+    assert_eq!(
+        command.args.get(2).map(String::as_str),
+        Some(agent_servers::HOST_AGENT_ID)
+    );
+    assert_eq!(
+        command
+            .env
+            .as_ref()
+            .and_then(|env| env.get(agentd::NATIVE_AGENT_MODEL_ENV)),
+        Some(&expected_model)
+    );
+}
+
 #[cfg(not(windows))]
 #[gpui::test]
 async fn test_remote_external_agent_receives_env_over_stdin(
