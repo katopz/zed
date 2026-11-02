@@ -1,5 +1,5 @@
 # 051 — Fleet web: thread history + rig queues on the web (Fastly edge, GitHub login)
-Status: DEPLOYED, waiting on the owner — `84b6d9bcf2` (origin) + `39a402bbe0` (edge); live at https://locally-discrete-pony.edgecompute.app and fails closed until gate (a) the OAuth App and (b) Funnel on amo are done
+Status: DEPLOYED + origin live on amo, waiting on the owner — `84b6d9bcf2` (origin) + `39a402bbe0` (edge); live at https://locally-discrete-pony.edgecompute.app and fails closed until gate (a) the OAuth App and (b) Funnel on amo are done
 
 ## Owner ask (2026-11-01)
 See every thread's history the way Zed shows it, plus each rig's queue and
@@ -58,7 +58,7 @@ refreshes the fleet every 15 s only while the tab is visible.
 - [x] T8 bench (m3, 556 threads, release): first full publish 3.7 s, 206 MB of view JSON, peak RSS 897 MB (one 11.9 MB-zstd thread parsed as a single `Value`); no-change re-publish ≈ 0 s; no `.env` key from zed/seal-remake appears in any exported file
 - [ ] Owner gate (a): create a GitHub OAuth App — Homepage `https://locally-discrete-pony.edgecompute.app`, callback `https://locally-discrete-pony.edgecompute.app/auth/callback` — then: `fastly config-store-entry create --store-id=DpahiNurZX266W5VQKZu16 --key=github_client_id --value=<id>` and `printf %s '<secret>' | fastly secret-store-entry create --store-id=EDiS0ObzSIH3MTJ2X0s3Sq --name=github_client_secret --stdin` (or hand them to an agent)
 - [ ] Owner gate (b): tailnet admin → enable HTTPS certificates + Funnel (`CertDomains` is empty today)
-- [ ] amo origin install (amo + bmo were offline 2026-11-01): `cargo install --path crates/fleet_web`, copy m3's `~/.agent-mail/web/origin.key` to amo (it is the key the edge holds), `fleet-web serve` as a launchd job, `tailscale funnel --bg 8787`
-- [ ] Publishers: `fleet-web publish --every 120` as a launchd job on m3 (and amo; the 4090 if it runs Zed threads)
+- [x] amo origin install (2026-11-02): `cargo install` via `rig run amo --shared --worktree` (job `6fb9ee70`, 30 s build); m3's origin key copied (sha256 matches the edge's); launchd `dev.agent-mail.fleet-web` (KeepAlive, 127.0.0.1:8787) is running; signed check from m3 using the edge's own blake3 code: `/api/fleet` 200 (15 KB, all rigs), unsigned 401
+- [x] Publisher on m3: launchd `dev.agent-mail.fleet-web-publish` (every 120 s, nice 10, low-priority IO). The first ship of 580 threads (230 MB) to amo took 496 s (~0.4 MB/s, likely a relayed Tailscale path); incrementals are 5 threads in under 15 s. The 4090/amo publishers can be added if they hold Zed threads
 - [-] Stream-parse very large threads to cut the 897 MB first-export peak (only the initial export and edits of that one thread hit it)
 - [-] Later: Claude Code transcripts as threads too; Cloudflare backend adapter
