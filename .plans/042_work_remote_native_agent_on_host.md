@@ -1,6 +1,6 @@
 # 042 — Work Remote: run the built-in Zed Agent on the host
 Status: IN EXECUTION — option A landed server-side 2026-10-29 (task 1 map + the `agent_acp_server` crate + `remote_server agent-acp`; both detach-smoke postures PASS; tasks 2–3 GUI-side next; task 4 needs a human at the GUI)
-**Claimed:** zed-m3-idle1029-wr042, 1793246151, expires 2026-10-31T04:30:00+00:00
+**Claimed:** zed-4a@m3, 2026-11-02T03:25Z, expires 2026-11-03T03:25:00+00:00
 
 ## Goal
 
