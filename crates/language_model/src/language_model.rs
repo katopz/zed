@@ -106,7 +106,9 @@ pub struct ModelKeySlotStatus {
     pub is_backed_off: bool,
     pub backoff_remaining: Duration,
     /// The full backoff window (`Some` only while backed off), so the UI can
-    /// render a proportional drain ring (remaining / total).
+    /// render a proportional drain ring (remaining / total). The provider's
+    /// stated quota window when the 429 body declared one (e.g. Z.AI's "for 5
+    /// hour"), else the upstream reset hint.
     pub backoff_total: Option<Duration>,
     pub consecutive_failures: u32,
     /// Wall-clock moment of the last upstream-attested limit hit (the 429 the

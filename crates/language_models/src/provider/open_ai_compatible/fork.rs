@@ -34,8 +34,14 @@ pub enum KeyProbeResult {
     /// The upstream returned a rate-limit error (429). `retry_after` is the
     /// upstream-provided reset hint when one could be extracted (the
     /// `retry-after` header or a reset timestamp parsed from the error body),
-    /// so the backoff can end exactly when the quota resets.
-    RateLimit { retry_after: Option<Duration> },
+    /// so the backoff can end exactly when the quota resets. `limit_window` is
+    /// the quota cycle stated in the same body (see
+    /// `parse_body_limit_window`) — the constant ring denominator, unlike the
+    /// shrinking delta.
+    RateLimit {
+        retry_after: Option<Duration>,
+        limit_window: Option<Duration>,
+    },
     /// Any other error; the message is surfaced as a tooltip.
     Err(SharedString),
 }
@@ -258,9 +264,12 @@ impl OpenAiCompatibleLanguageModelProvider {
                 // * Any other error is genuinely ambiguous and changes nothing.
                 match &result {
                     KeyProbeResult::Ok => record_key_success(&key_health, slot),
-                    KeyProbeResult::RateLimit { retry_after } => {
+                    KeyProbeResult::RateLimit {
+                        retry_after,
+                        limit_window,
+                    } => {
                         let mut health = key_health.lock();
-                        health.record_rate_limit(slot, Instant::now(), *retry_after);
+                        health.record_rate_limit(slot, Instant::now(), *retry_after, *limit_window);
                     }
                     KeyProbeResult::Err(_) => {}
                 }
@@ -536,6 +545,7 @@ pub(super) async fn run_key_probe(
                     match language_model::parse_body_retry_hint(&message, chrono::Local::now()) {
                         Some(retry_after) => KeyProbeResult::RateLimit {
                             retry_after: Some(retry_after),
+                            limit_window: language_model::parse_body_limit_window(&message),
                         },
                         None => KeyProbeResult::Err(capped_first_line(&message).into()),
                     }
@@ -558,8 +568,12 @@ pub(super) fn classify_probe_error(err: open_ai::RequestError) -> KeyProbeResult
         LanguageModelCompletionError::ProviderRejection {
             category: ProviderErrorCategory::RateLimit,
             retry_after,
+            message,
             ..
-        } => KeyProbeResult::RateLimit { retry_after },
+        } => KeyProbeResult::RateLimit {
+            retry_after,
+            limit_window: language_model::parse_body_limit_window(&message),
+        },
         _ => KeyProbeResult::Err(capped_first_line(&raw).into()),
     }
 }
@@ -935,15 +949,18 @@ impl State {
     /// slot is backed off for exactly that long, so rotation skips the key
     /// until the quota actually resets rather than until the exponential guess
     /// expires; with `None` the local schedule supplies the unknown duration.
-    /// Mirrors `clear_slot_backoff`'s persistence behavior.
+    /// `limit_window` (the stated quota cycle) becomes the ring denominator;
+    /// see `KeyHealthTracker::record_rate_limit`. Mirrors
+    /// `clear_slot_backoff`'s persistence behavior.
     pub(super) fn record_slot_rate_limit(
         &self,
         slot: KeySlot,
         retry_after: Option<Duration>,
+        limit_window: Option<Duration>,
         cx: &App,
     ) {
         let mut tracker = self.key_health.lock();
-        tracker.record_rate_limit(slot, Instant::now(), retry_after);
+        tracker.record_rate_limit(slot, Instant::now(), retry_after, limit_window);
         drop(tracker);
         self.schedule_persist_key_health(cx);
     }
@@ -1549,10 +1566,13 @@ impl ConfigurationView {
                         this.state
                             .update(cx, |state, cx| state.clear_slot_backoff(slot, cx));
                     }
-                    KeyProbeResult::RateLimit { retry_after } => {
-                        let retry_after = *retry_after;
+                    KeyProbeResult::RateLimit {
+                        retry_after,
+                        limit_window,
+                    } => {
+                        let (retry_after, limit_window) = (*retry_after, *limit_window);
                         this.state.update(cx, |state, cx| {
-                            state.record_slot_rate_limit(slot, retry_after, cx)
+                            state.record_slot_rate_limit(slot, retry_after, limit_window, cx)
                         });
                     }
                     KeyProbeResult::Err(_) => {}
@@ -1617,7 +1637,7 @@ impl ConfigurationView {
                 (Some(KeyProbeResult::Ok), false) => {
                     ("check(ok)".to_string(), Color::Success, None)
                 }
-                (Some(KeyProbeResult::RateLimit { retry_after }), false) => {
+                (Some(KeyProbeResult::RateLimit { retry_after, .. }), false) => {
                     let tooltip = match retry_after {
                         Some(retry_after) => format!(
                             "Upstream rate-limited this key (429). Retry in {}.",

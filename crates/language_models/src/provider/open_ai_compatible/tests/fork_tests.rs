@@ -269,7 +269,10 @@ fn classify_probe_error_recognizes_rate_limit_status() {
     };
     assert_eq!(
         classify_probe_error(err),
-        KeyProbeResult::RateLimit { retry_after: None }
+        KeyProbeResult::RateLimit {
+            retry_after: None,
+            limit_window: None
+        }
     );
 }
 
@@ -285,11 +288,17 @@ fn classify_probe_error_extracts_reset_hint_from_zai_body() {
         headers: Box::new(http_client::http::HeaderMap::new()),
     };
     match classify_probe_error(err) {
-        KeyProbeResult::RateLimit { retry_after } => {
+        KeyProbeResult::RateLimit {
+            retry_after,
+            limit_window,
+        } => {
             assert!(
                 retry_after.is_some(),
                 "reset hint from body should populate retry_after"
             );
+            // The weekly/monthly 1310 body states no cycle length, so the
+            // window stays None and the hint remains the ring denominator.
+            assert_eq!(limit_window, None);
         }
         other => panic!("expected RateLimit, got {other:?}"),
     }
@@ -305,7 +314,13 @@ fn classify_probe_error_ignores_past_reset_hint() {
     };
     assert_eq!(
         classify_probe_error(err),
-        KeyProbeResult::RateLimit { retry_after: None }
+        KeyProbeResult::RateLimit {
+            retry_after: None,
+            // The 1308 body still names its cycle even though the reset
+            // instant already passed; harmless — record_rate_limit consumes
+            // the window only alongside a retry hint.
+            limit_window: Some(Duration::from_secs(5 * 3600))
+        }
     );
 }
 
@@ -325,9 +340,33 @@ fn classify_probe_error_rate_limit_header_populates_retry_after() {
     assert_eq!(
         classify_probe_error(err),
         KeyProbeResult::RateLimit {
-            retry_after: Some(Duration::from_secs(17))
+            retry_after: Some(Duration::from_secs(17)),
+            limit_window: None
         }
     );
+}
+
+#[test]
+fn classify_probe_error_parses_the_quota_window_from_the_body() {
+    // Z.AI's 1308 coding-plan body states both the reset instant and the
+    // cycle length ("for 5 hour"); the window must ride along as the ring
+    // denominator, not just the shrinking time-to-reset delta.
+    let err = open_ai::RequestError::HttpResponseError {
+        provider: "test".to_string(),
+        status_code: http_client::http::StatusCode::TOO_MANY_REQUESTS,
+        body: r#"{"error":{"code":"1308","message":"Usage limit reached for 5 hour. Your limit will reset at 2099-01-01 00:00:00"}}"#.to_string(),
+        headers: Box::new(http_client::http::HeaderMap::new()),
+    };
+    match classify_probe_error(err) {
+        KeyProbeResult::RateLimit {
+            retry_after,
+            limit_window,
+        } => {
+            assert!(retry_after.is_some());
+            assert_eq!(limit_window, Some(Duration::from_secs(5 * 3600)));
+        }
+        other => panic!("expected RateLimit, got {other:?}"),
+    }
 }
 
 #[test]

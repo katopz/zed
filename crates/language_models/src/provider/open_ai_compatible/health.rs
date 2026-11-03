@@ -85,7 +85,12 @@ pub struct KeyHealth {
     pub backoff_until: Option<Instant>,
     /// The full backoff window set alongside `backoff_until`. The UI drains a
     /// countdown ring as `remaining / total` — without the total, a draining
-    /// ring can't be proportional. `None` when the slot is not backed off.
+    /// ring can't be proportional. When the 429 body states the provider's
+    /// quota window (e.g. Z.AI's "limit reached for 5 hour"), that constant
+    /// cycle is the total, not the shrinking time-to-reset delta — every re-429
+    /// during the wait re-reads the delta against a later `now`, which kept a
+    /// hint-derived total pinned at `remaining ≈ total` (a permanently near-full
+    /// ring). `None` when the slot is not backed off.
     pub backoff_total: Option<Duration>,
     /// True when the current window came from an upstream reset hint (a
     /// `retry-after` header or a timestamp parsed out of the 429 body) rather
@@ -127,7 +132,8 @@ pub struct SlotHealthStatus {
     pub is_backed_off: bool,
     pub backoff_remaining: Duration,
     /// The full backoff window (`Some` only while `is_backed_off`), so the UI
-    /// can render a proportional drain ring (remaining / total).
+    /// can render a proportional drain ring (remaining / total). The provider's
+    /// stated quota window when the 429 body declared one, else the reset hint.
     pub backoff_total: Option<Duration>,
     pub consecutive_failures: u32,
     /// User-controlled on/off toggle. `false` excludes the slot from rotation
@@ -282,7 +288,15 @@ impl KeyHealthTracker {
             return;
         }
         health.backoff_until = Some(now + candidate);
-        health.backoff_total = Some(candidate);
+        // Same no-shrink rule as `backoff_until` above, but for the ring
+        // denominator: a total already pinned to an upstream quota window must
+        // survive a local blip's shorter candidate, or the drain ring would
+        // clamp to full for the rest of the real window.
+        health.backoff_total = Some(
+            health
+                .backoff_total
+                .map_or(candidate, |total| total.max(candidate)),
+        );
         health.backoff_from_upstream_hint = false;
     }
 
@@ -324,11 +338,19 @@ impl KeyHealthTracker {
     /// far beyond the 1h exponential cap (e.g. a weekly limit) or far below it
     /// ("try again in 20s"). Without a hint this behaves like
     /// [`Self::record_failure`].
+    ///
+    /// `limit_window` is the provider's stated quota cycle (parsed from the
+    /// same body by `parse_body_limit_window` — Z.AI's "limit reached for 5
+    /// hour"). When present alongside a hint it becomes the ring/tooltip
+    /// denominator (`backoff_total`), replacing the time-to-reset delta: the
+    /// delta shrinks on every re-429 during the wait, which made the countdown
+    /// restart at "remaining ≈ total" and read as permanently near-full.
     pub fn record_rate_limit(
         &mut self,
         slot: KeySlot,
         now: Instant,
         retry_after: Option<Duration>,
+        limit_window: Option<Duration>,
     ) {
         let health = self.get_mut(slot);
         health.consecutive_failures = health.consecutive_failures.saturating_add(1);
@@ -347,7 +369,10 @@ impl KeyHealthTracker {
                     window: hint,
                 });
                 health.backoff_until = Some(now + hint);
-                health.backoff_total = Some(hint);
+                // The stated window is the honest denominator; `max` guards a
+                // contradictory hint exceeding it (denominator >= remaining
+                // keeps the drain fraction meaningful).
+                health.backoff_total = Some(limit_window.map_or(hint, |window| window.max(hint)));
                 health.backoff_from_upstream_hint = true;
             }
             // A 429 with no parseable hint still proves the key is limited;
@@ -1194,10 +1219,12 @@ pub fn record_key_failure(
             LanguageModelCompletionError::ProviderRejection {
                 category: ProviderErrorCategory::RateLimit,
                 retry_after,
+                message,
                 ..
             },
         ) => {
-            health.record_rate_limit(slot, Instant::now(), *retry_after);
+            let limit_window = language_model::parse_body_limit_window(message);
+            health.record_rate_limit(slot, Instant::now(), *retry_after, limit_window);
         }
         (ErrorVerdict::Transport, _) => health.record_transport_failure(slot, Instant::now()),
         _ => health.record_failure(slot, Instant::now()),
@@ -1423,7 +1450,7 @@ mod tests {
         let mut tracker = KeyHealthTracker::default();
         let now = Instant::now();
         let hint = Duration::from_secs(3 * 86400);
-        tracker.record_rate_limit(KeySlot::Tertiary, now, Some(hint));
+        tracker.record_rate_limit(KeySlot::Tertiary, now, Some(hint), None);
         let health = tracker.get(KeySlot::Tertiary);
         assert_eq!(health.consecutive_failures, 1);
         assert_eq!(health.backoff_until, Some(now + hint));
@@ -1433,7 +1460,7 @@ mod tests {
     fn record_rate_limit_without_hint_falls_back_to_exponential() {
         let mut tracker = KeyHealthTracker::default();
         let now = Instant::now();
-        tracker.record_rate_limit(KeySlot::Quaternary, now, None);
+        tracker.record_rate_limit(KeySlot::Quaternary, now, None, None);
         let health = tracker.get(KeySlot::Quaternary);
         assert_eq!(health.consecutive_failures, 1);
         let backoff = health.backoff_until.unwrap() - now;
@@ -1448,7 +1475,7 @@ mod tests {
     fn record_rate_limit_records_the_hit_for_prediction() {
         let mut tracker = KeyHealthTracker::default();
         let hint = Duration::from_secs(5 * 3600);
-        tracker.record_rate_limit(KeySlot::Primary, Instant::now(), Some(hint));
+        tracker.record_rate_limit(KeySlot::Primary, Instant::now(), Some(hint), None);
 
         let record = tracker
             .get(KeySlot::Primary)
@@ -1467,12 +1494,60 @@ mod tests {
     #[test]
     fn record_rate_limit_without_hint_records_no_prediction() {
         let mut tracker = KeyHealthTracker::default();
-        tracker.record_rate_limit(KeySlot::Primary, Instant::now(), None);
+        tracker.record_rate_limit(KeySlot::Primary, Instant::now(), None, None);
         assert_eq!(
             tracker.get(KeySlot::Primary).last_limit_hit,
             None,
             "a hintless 429 has no window to estimate the next hit from"
         );
+    }
+
+    /// The ring/tooltip denominator is the provider's stated quota window, not
+    /// the time-to-reset delta. Z.AI's GLM plan is a 5-hour cycle; a key drained
+    /// near the window's end gets a ~1h delta against that 5h window, and every
+    /// re-429 during the wait shrinks the delta — a delta-derived denominator
+    /// restarted the countdown at "remaining ≈ total" on each retry (the
+    /// permanently near-full ring).
+    #[test]
+    fn record_rate_limit_uses_quota_window_as_ring_total() {
+        let mut tracker = KeyHealthTracker::default();
+        let now = Instant::now();
+        let hint = Duration::from_secs(72 * 60);
+        let window = Duration::from_secs(5 * 3600);
+        tracker.record_rate_limit(KeySlot::Primary, now, Some(hint), Some(window));
+        let health = tracker.get(KeySlot::Primary);
+        assert_eq!(health.backoff_until, Some(now + hint));
+        assert_eq!(health.backoff_total, Some(window));
+        // A contradictory hint that exceeds the stated window still wins, so
+        // the denominator never undercuts the remaining wait.
+        let big_hint = Duration::from_secs(8 * 3600);
+        tracker.record_rate_limit(KeySlot::Secondary, now, Some(big_hint), Some(window));
+        assert_eq!(tracker.get(KeySlot::Secondary).backoff_total, Some(big_hint));
+        // No stated window falls back to the delta (today's behavior).
+        tracker.record_rate_limit(KeySlot::Tertiary, now, Some(hint), None);
+        assert_eq!(tracker.get(KeySlot::Tertiary).backoff_total, Some(hint));
+    }
+
+    /// A local failure extending an upstream window must not swap its ring
+    /// denominator for the smaller local candidate — the drain fraction would
+    /// clamp to full and sit there for the rest of the real window.
+    #[test]
+    fn local_backoff_never_shrinks_the_ring_total() {
+        let mut tracker = KeyHealthTracker::default();
+        let hint = Duration::from_secs(30 * 60);
+        let window = Duration::from_secs(5 * 3600);
+        tracker.record_rate_limit(KeySlot::Primary, Instant::now(), Some(hint), Some(window));
+        // A local candidate longer than the remaining upstream window extends
+        // `backoff_until`; the 5h total must survive it.
+        let candidate = Duration::from_secs(2 * 3600);
+        KeyHealthTracker::apply_local_backoff(
+            tracker.get_mut(KeySlot::Primary),
+            Instant::now(),
+            candidate,
+        );
+        let health = tracker.get(KeySlot::Primary);
+        assert_eq!(health.backoff_total, Some(window));
+        assert!(!health.backoff_from_upstream_hint);
     }
 
     #[test]
@@ -1482,6 +1557,7 @@ mod tests {
             KeySlot::Primary,
             Instant::now(),
             Some(Duration::from_secs(18000)),
+            None,
         );
         tracker.record_success(KeySlot::Primary);
         let health = tracker.get(KeySlot::Primary);
@@ -3061,7 +3137,7 @@ mod tests {
             KeyHealthTracker::record_transport_failure,
         ] {
             let mut tracker = KeyHealthTracker::default();
-            tracker.record_rate_limit(KeySlot::Tertiary, now, Some(upstream_hint));
+            tracker.record_rate_limit(KeySlot::Tertiary, now, Some(upstream_hint), None);
             assert!(tracker.get(KeySlot::Tertiary).backoff_from_upstream_hint);
 
             for _ in 0..20 {
@@ -3089,8 +3165,8 @@ mod tests {
     fn a_fresh_upstream_hint_may_shorten_the_window() {
         let now = Instant::now();
         let mut tracker = KeyHealthTracker::default();
-        tracker.record_rate_limit(KeySlot::Primary, now, Some(Duration::from_secs(28905)));
-        tracker.record_rate_limit(KeySlot::Primary, now, Some(Duration::from_secs(30)));
+        tracker.record_rate_limit(KeySlot::Primary, now, Some(Duration::from_secs(28905)), None);
+        tracker.record_rate_limit(KeySlot::Primary, now, Some(Duration::from_secs(30)), None);
         assert_eq!(
             tracker.get(KeySlot::Primary).backoff_total,
             Some(Duration::from_secs(30))
@@ -3104,7 +3180,7 @@ mod tests {
     fn a_hintless_rate_limit_still_backs_the_slot_off() {
         let now = Instant::now();
         let mut tracker = KeyHealthTracker::default();
-        tracker.record_rate_limit(KeySlot::Secondary, now, None);
+        tracker.record_rate_limit(KeySlot::Secondary, now, None, None);
 
         let health = tracker.get(KeySlot::Secondary);
         assert!(health.is_backed_off(now), "a 429 must mark the slot");
@@ -3130,7 +3206,7 @@ mod tests {
         assert!(!tracker.get(KeySlot::Primary).is_backed_off(now));
 
         let mut tracker = KeyHealthTracker::default();
-        tracker.record_rate_limit(KeySlot::Primary, now, Some(Duration::from_secs(28905)));
+        tracker.record_rate_limit(KeySlot::Primary, now, Some(Duration::from_secs(28905)), None);
         tracker.record_success(KeySlot::Primary);
         let health = tracker.get(KeySlot::Primary);
         assert!(
@@ -3147,7 +3223,7 @@ mod tests {
     fn real_success_clears_even_an_upstream_hinted_window() {
         let now = Instant::now();
         let mut tracker = KeyHealthTracker::default();
-        tracker.record_rate_limit(KeySlot::Primary, now, Some(Duration::from_secs(28905)));
+        tracker.record_rate_limit(KeySlot::Primary, now, Some(Duration::from_secs(28905)), None);
         tracker.record_success(KeySlot::Primary);
 
         let health = tracker.get(KeySlot::Primary);
@@ -3223,7 +3299,7 @@ mod tests {
         // — the upstream said so — whereas K3's long window is only a local
         // guess and may well answer.
         for slot in [KeySlot::Primary, KeySlot::Secondary, KeySlot::Quaternary] {
-            health.record_rate_limit(slot, now, Some(Duration::from_secs(10)));
+            health.record_rate_limit(slot, now, Some(Duration::from_secs(10)), None);
         }
         for _ in 0..10 {
             health.record_failure(KeySlot::Tertiary, now);
@@ -3251,10 +3327,10 @@ mod tests {
         let candidates = four_candidates();
         let now = Instant::now();
         let mut health = KeyHealthTracker::default();
-        health.record_rate_limit(KeySlot::Primary, now, Some(Duration::from_secs(28905)));
-        health.record_rate_limit(KeySlot::Secondary, now, Some(Duration::from_secs(900)));
-        health.record_rate_limit(KeySlot::Tertiary, now, Some(Duration::from_secs(7200)));
-        health.record_rate_limit(KeySlot::Quaternary, now, Some(Duration::from_secs(3600)));
+        health.record_rate_limit(KeySlot::Primary, now, Some(Duration::from_secs(28905)), None);
+        health.record_rate_limit(KeySlot::Secondary, now, Some(Duration::from_secs(900)), None);
+        health.record_rate_limit(KeySlot::Tertiary, now, Some(Duration::from_secs(7200)), None);
+        health.record_rate_limit(KeySlot::Quaternary, now, Some(Duration::from_secs(3600)), None);
 
         let (_, slot) = select_from_candidates(&candidates, &mut health, None, now)
             .expect("fail-open must return a slot");
@@ -3293,7 +3369,7 @@ mod tests {
         let now = Instant::now();
         let mut health = KeyHealthTracker::default();
         for slot in ALL_KEY_SLOTS {
-            health.record_rate_limit(slot, now, Some(Duration::from_secs(28905)));
+            health.record_rate_limit(slot, now, Some(Duration::from_secs(28905)), None);
         }
         // The one speculative slot is also the one the user turned off.
         health.record_success(KeySlot::Tertiary);

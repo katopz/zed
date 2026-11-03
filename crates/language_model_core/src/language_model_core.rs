@@ -548,6 +548,36 @@ pub fn parse_body_retry_hint(body: &str, now: chrono::DateTime<chrono::Local>) -
     delta.to_std().ok()
 }
 
+/// Extracts the quota *window* length from a 429 body — the cycle the provider
+/// counts usage against, as opposed to [`parse_body_retry_hint`]'s time-to-reset
+/// delta. Z.AI's coding endpoint states it in the same error message:
+///
+/// ```text
+/// {"error":{"code":"1308","message":"Usage limit reached for 5 hour. Your limit will reset at 2026-09-19 23:42:39"}}
+/// ```
+///
+/// The delta shrinks on every re-429 during the wait (each retry re-reads the
+/// same reset timestamp against a later `now`), so using it as the countdown
+/// denominator kept the drain ring pinned near full. The window is constant for
+/// the whole cycle, which makes `remaining / window` a stable progress measure.
+///
+/// Returns `None` when the body states no parseable window (e.g. the weekly/
+/// monthly 1310 message), in which case callers keep the hint as the total.
+pub fn parse_body_limit_window(body: &str) -> Option<Duration> {
+    const NEEDLE: &str = "limit reached for ";
+    let rest = body.split_once(NEEDLE)?.1;
+    let mut tokens = rest.split_whitespace();
+    let count: u64 = tokens.next()?.parse().ok()?;
+    let unit = tokens.next()?.trim_end_matches('.');
+    let unit = unit.strip_suffix('s').unwrap_or(unit);
+    let seconds = match unit {
+        "hour" => count.checked_mul(3600)?,
+        "day" => count.checked_mul(86400)?,
+        _ => return None,
+    };
+    Some(Duration::from_secs(seconds))
+}
+
 fn is_invalid_encrypted_content_message(message: &str) -> bool {
     let Ok(response) = serde_json::from_str::<serde_json::Value>(message) else {
         return false;
@@ -1417,6 +1447,40 @@ mod tests {
             hint,
             std::time::Duration::from_secs(2 * 86400 + 19 * 3600 + 58 * 60 + 52)
         );
+    }
+
+    #[test]
+    fn test_parse_body_limit_window_zai_five_hour_limit() {
+        let body = r#"{"error":{"code":"1308","message":"Usage limit reached for 5 hour. Your limit will reset at 2026-09-19 23:42:39"}}"#;
+        assert_eq!(
+            parse_body_limit_window(body),
+            Some(std::time::Duration::from_secs(5 * 3600))
+        );
+    }
+
+    #[test]
+    fn test_parse_body_limit_window_plural_and_day_units() {
+        assert_eq!(
+            parse_body_limit_window("Usage limit reached for 3 hours"),
+            Some(std::time::Duration::from_secs(3 * 3600))
+        );
+        assert_eq!(
+            parse_body_limit_window("Usage limit reached for 1 day. Try again later."),
+            Some(std::time::Duration::from_secs(86400))
+        );
+    }
+
+    #[test]
+    fn test_parse_body_limit_window_unrelated_body_is_none() {
+        assert_eq!(parse_body_limit_window("rate limited"), None);
+        // The weekly/monthly 1310 message states no cycle length.
+        assert_eq!(
+            parse_body_limit_window(
+                "Weekly/Monthly Limit Exhausted. Your limit will reset at 2026-09-22 19:05:52"
+            ),
+            None
+        );
+        assert_eq!(parse_body_limit_window(""), None);
     }
 
     #[test]
