@@ -10,7 +10,7 @@
 //! behind it, so benchmarks cannot be starved by a stream of builds.
 
 use crate::rig::{self, Contention};
-use crate::{Address, Mailroom, validate_name};
+use crate::{Address, MailMode, Mailroom, validate_name};
 use anyhow::{Context as _, Result, anyhow, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -80,6 +80,9 @@ pub struct JobSpec {
     /// Who gets the lifecycle mail (`name@rig`).
     #[serde(default)]
     pub notify: Option<String>,
+    /// How the recipient delivers mid-turn lifecycle mail (issue 046).
+    #[serde(default)]
+    pub notify_mode: MailMode,
     #[serde(default)]
     pub timeout_secs: Option<u64>,
     /// `repo@sha`: run in a fresh worktree of `~/git/<repo>` at `sha`, with its
@@ -690,6 +693,8 @@ impl Mailroom {
             return;
         };
         if let Ok(envelope) = self.compose(&to, "jobs", body, None) {
+            let mut envelope = envelope;
+            envelope.mode = spec.notify_mode;
             self.send(&envelope).ok();
         }
     }
@@ -1216,6 +1221,7 @@ mod tests {
             },
             key: None,
             notify: None,
+            notify_mode: MailMode::Queued,
             timeout_secs: None,
             worktree: None,
             submitted_at: now(),

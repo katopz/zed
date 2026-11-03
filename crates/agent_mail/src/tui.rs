@@ -752,6 +752,7 @@ mod tests {
             sent_at: "2026-11-01T04:10:00.000Z".into(),
             reply_to: None,
             deliver_at: None,
+            mode: Default::default(),
             body: "HEADS-UP: repos vanished — clone them back".into(),
         });
         let text = screen(&mut app, 100, 24);

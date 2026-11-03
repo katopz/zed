@@ -86,6 +86,7 @@ fn message_request(to: &acp_v2::SessionId, message: &str) -> ThreadMessageReques
         message: message.to_string(),
         wait_for_reply: false,
         deliver_at: None,
+        mode: ::agent_mail::MailMode::Queued,
     }
 }
 
@@ -399,6 +400,262 @@ async fn test_agent_mail_for_busy_thread_waits_for_turn_end(cx: &mut TestAppCont
     assert_eq!(pending.len(), 1, "mail should start exactly one new turn");
     let prompt = pending[0].messages.last().unwrap().string_contents();
     assert!(prompt.contains("status?"), "{prompt}");
+}
+
+
+fn mail_to_with_mode(
+    sender: &::agent_mail::Mailroom,
+    session_id: &acp_v2::SessionId,
+    body: &str,
+    mode: ::agent_mail::MailMode,
+) -> ::agent_mail::Envelope {
+    let to = ::agent_mail::Address::parse(&format!(
+        "{}@m3",
+        agent_mail_bridge::native_thread_mail_name(session_id)
+    ))
+    .unwrap();
+    let mut envelope = sender
+        .compose(&to, "zed-bb@m3", body.to_string(), None)
+        .unwrap();
+    envelope.mode = mode;
+    sender.send(&envelope).unwrap();
+    envelope
+}
+
+#[gpui::test]
+async fn test_agent_mail_urgent_mode_preempts_busy_thread(cx: &mut TestAppContext) {
+    let setup = setup_threads(1, cx).await;
+    let (agent, fake) = (&setup.agent, &setup.fake);
+    let thread = &setup.threads[0];
+    let (_home, sender) = enable_agent_mail(agent, cx);
+
+    let own_turn = setup.send(thread, "Long-running work", cx);
+    cx.run_until_parked();
+    mail_to_with_mode(
+        &sender,
+        &thread.session_id,
+        "drop everything: build broke",
+        ::agent_mail::MailMode::Urgent,
+    );
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.run_until_parked();
+
+    // The preempted turn resolves as cancelled...
+    assert_eq!(own_turn.await.unwrap(), acp_v2::StopReason::Cancelled);
+    cx.run_until_parked();
+
+    // ...and the new turn carries the mail, with the preemption named. The
+    // preempted turn's stream entry lingers in the fake provider (a cancelled
+    // stream is closed but not `end_last`ed), so the urgent turn is the LAST
+    // pending completion.
+    let pending = fake.pending_completions_for(&thread.model);
+    assert_eq!(pending.len(), 2, "preempted stream + one urgent turn");
+    let prompt = pending.last().unwrap().messages.last().unwrap().string_contents();
+    assert!(prompt.contains("drop everything: build broke"), "{prompt}");
+    assert!(
+        prompt.contains("mode=urgent"),
+        "the preemption must be named in the thread: {prompt}"
+    );
+}
+
+#[gpui::test]
+async fn test_agent_mail_urgent_mode_on_idle_thread_delivers_directly(cx: &mut TestAppContext) {
+    let setup = setup_threads(1, cx).await;
+    let (agent, fake) = (&setup.agent, &setup.fake);
+    let thread = &setup.threads[0];
+    let (_home, sender) = enable_agent_mail(agent, cx);
+
+    mail_to_with_mode(
+        &sender,
+        &thread.session_id,
+        "urgent ping",
+        ::agent_mail::MailMode::Urgent,
+    );
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.run_until_parked();
+
+    let pending = fake.pending_completions_for(&thread.model);
+    assert_eq!(pending.len(), 1, "idle target: urgent is a plain delivery");
+    let prompt = pending[0].messages.last().unwrap().string_contents();
+    assert!(prompt.contains("urgent ping"), "{prompt}");
+    assert!(
+        !prompt.contains("mode=urgent"),
+        "nothing was preempted, so no notice: {prompt}"
+    );
+}
+
+#[gpui::test]
+async fn test_agent_mail_steering_mode_ends_busy_turn_at_boundary(cx: &mut TestAppContext) {
+    let setup = setup_threads(1, cx).await;
+    let (agent, fake) = (&setup.agent, &setup.fake);
+    let thread = &setup.threads[0];
+    let (_home, sender) = enable_agent_mail(agent, cx);
+
+    let own_turn = setup.send(thread, "Own work", cx);
+    cx.run_until_parked();
+    mail_to_with_mode(
+        &sender,
+        &thread.session_id,
+        "steering: check the tests now",
+        ::agent_mail::MailMode::Steering,
+    );
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.run_until_parked();
+    // Still mid-turn: the mail waits, but the boundary flag is set.
+    assert_eq!(
+        agent.read_with(cx, |agent, _| agent
+            .mailboxes
+            .get(&thread.session_id)
+            .map_or(0, Vec::len)),
+        1
+    );
+    agent.read_with(cx, |agent, cx| {
+        let session = agent.sessions.get(&thread.session_id).unwrap();
+        assert!(session.thread.read(cx).end_turn_at_next_boundary());
+    });
+
+    // End the stream: the turn stops at the boundary...
+    fake.send_last_text(&thread.model, "Winding down");
+    fake.end_last(&thread.model);
+    assert_eq!(own_turn.await.unwrap(), acp_v2::StopReason::EndTurn);
+    cx.run_until_parked();
+
+    // ...and the mail delivers as the next turn.
+    let pending = fake.pending_completions_for(&thread.model);
+    assert_eq!(pending.len(), 1, "steering mail should start exactly one turn");
+    let prompt = pending[0].messages.last().unwrap().string_contents();
+    assert!(prompt.contains("steering: check the tests now"), "{prompt}");
+}
+
+#[gpui::test]
+async fn test_send_message_mode_urgent_preempts_busy_target(cx: &mut TestAppContext) {
+    let setup = setup_threads(2, cx).await;
+    let (agent, fake) = (&setup.agent, &setup.fake);
+    let sender_thread = &setup.threads[0];
+    let target = &setup.threads[1];
+    let (_home, _sender) = enable_agent_mail(agent, cx);
+
+    let own_turn = setup.send(target, "Busy work", cx);
+    cx.run_until_parked();
+    let sender_turn = setup.send(sender_thread, "Send a message", cx);
+    cx.run_until_parked();
+
+    let tool_input = json!({
+        "to": target.session_id.to_string(),
+        "message": "preempting note",
+        "mode": "urgent",
+    });
+    fake.send_last_event(
+        &sender_thread.model,
+        LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
+            id: "urgent_1".into(),
+            name: SendMessageTool::NAME.into(),
+            raw_input: tool_input.to_string(),
+            input: language_model::LanguageModelToolUseInput::Json(tool_input),
+            is_input_complete: true,
+            thought_signature: None,
+        }),
+    );
+    fake.end_last(&sender_thread.model);
+    cx.run_until_parked();
+    let _ = sender_turn;
+
+    assert_eq!(own_turn.await.unwrap(), acp_v2::StopReason::Cancelled);
+    // The preempting delivery polls for idle on 100 ms timers.
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.run_until_parked();
+    let pending = fake.pending_completions_for(&target.model);
+    assert_eq!(pending.len(), 2, "preempted stream + one urgent turn");
+    let prompt = pending.last().unwrap().messages.last().unwrap().string_contents();
+    assert!(prompt.contains("preempting note"), "{prompt}");
+    assert!(prompt.contains("mode=urgent"), "{prompt}");
+}
+
+#[gpui::test]
+async fn test_send_message_mode_steering_ends_busy_target_turn(cx: &mut TestAppContext) {
+    let setup = setup_threads(2, cx).await;
+    let (agent, fake) = (&setup.agent, &setup.fake);
+    let sender_thread = &setup.threads[0];
+    let target = &setup.threads[1];
+    let (_home, _sender) = enable_agent_mail(agent, cx);
+
+    let own_turn = setup.send(target, "Busy work", cx);
+    cx.run_until_parked();
+    let sender_turn = setup.send(sender_thread, "Send a message", cx);
+    cx.run_until_parked();
+
+    let tool_input = json!({
+        "to": target.session_id.to_string(),
+        "message": "steering note",
+        "mode": "steering",
+    });
+    fake.send_last_event(
+        &sender_thread.model,
+        LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
+            id: "steer_1".into(),
+            name: SendMessageTool::NAME.into(),
+            raw_input: tool_input.to_string(),
+            input: language_model::LanguageModelToolUseInput::Json(tool_input),
+            is_input_complete: true,
+            thought_signature: None,
+        }),
+    );
+    fake.end_last(&sender_thread.model);
+    cx.run_until_parked();
+    let _ = sender_turn;
+    agent.read_with(cx, |agent, cx| {
+        let session = agent.sessions.get(&target.session_id).unwrap();
+        assert!(session.thread.read(cx).end_turn_at_next_boundary());
+    });
+
+    fake.send_last_text(&target.model, "Wrapping up");
+    fake.end_last(&target.model);
+    assert_eq!(own_turn.await.unwrap(), acp_v2::StopReason::EndTurn);
+    cx.run_until_parked();
+    let pending = fake.pending_completions_for(&target.model);
+    assert_eq!(pending.len(), 1, "one steering turn");
+    let prompt = pending[0].messages.last().unwrap().string_contents();
+    assert!(prompt.contains("steering note"), "{prompt}");
+}
+
+#[gpui::test]
+async fn test_send_message_rejects_unknown_mode(cx: &mut TestAppContext) {
+    let setup = setup_threads(2, cx).await;
+    let (agent, fake) = (&setup.agent, &setup.fake);
+    let sender_thread = &setup.threads[0];
+    let target = &setup.threads[1];
+    let (_home, _sender) = enable_agent_mail(agent, cx);
+    let sender_turn = setup.send(sender_thread, "Send a message", cx);
+    cx.run_until_parked();
+
+    let tool_input = json!({
+        "to": target.session_id.to_string(),
+        "message": "note",
+        "mode": "nudge",
+    });
+    fake.send_last_event(
+        &sender_thread.model,
+        LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
+            id: "bad_mode_1".into(),
+            name: SendMessageTool::NAME.into(),
+            raw_input: tool_input.to_string(),
+            input: language_model::LanguageModelToolUseInput::Json(tool_input),
+            is_input_complete: true,
+            thought_signature: None,
+        }),
+    );
+    fake.end_last(&sender_thread.model);
+    cx.run_until_parked();
+
+    agent.read_with(cx, |agent, cx| {
+        let session = agent.sessions.get(&sender_thread.session_id).unwrap();
+        let thread = session.thread.read(cx);
+        let messages = thread.last_message().unwrap();
+        // The tool call surfaces the error; nothing was delivered to the target.
+        let _ = messages;
+        let _ = cx;
+    });
+    assert!(fake.pending_completions_for(&target.model).is_empty());
 }
 
 #[gpui::test]

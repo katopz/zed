@@ -4,7 +4,10 @@
 //! agent-mail. Child module of the crate root, like `agent_fork`.
 
 use super::*;
-use ::agent_mail::{Address, Envelope, Mailroom};
+use ::agent_mail::{Address, Envelope, MailMode, Mailroom};
+use acp_thread::ThreadStatus;
+use futures::channel::oneshot;
+use futures::future::Shared;
 use agent_settings::AgentSettings;
 use settings::{Settings as _, SettingsStore};
 
@@ -12,6 +15,8 @@ use settings::{Settings as _, SettingsStore};
 /// session, cheap enough to run continuously.
 const MAIL_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const OUTBOX_FLUSH_TICKS: u32 = 120;
+/// Refresh liveness entries every ~5 s of poll ticks (issue 046).
+const LIVE_REFRESH_TICKS: u32 = 10;
 
 pub(crate) struct AgentMailState {
     mailroom: Arc<Mailroom>,
@@ -52,17 +57,32 @@ impl AgentMailState {
                         cx.background_spawn(async move { mailroom.flush_outbox() })
                             .detach();
                     }
-                    let Ok(inboxes) = this.read_with(cx, |agent, _| {
-                        agent
-                            .sessions
-                            .keys()
-                            .map(|session_id| {
-                                (session_id.clone(), native_thread_mail_name(session_id))
-                            })
-                            .collect::<Vec<_>>()
+                    let Ok((inboxes, live_entries)) = this.read_with(cx, |agent, cx| {
+                        let mut inboxes = Vec::new();
+                        let mut live_entries = Vec::new();
+                        for (session_id, session) in &agent.sessions {
+                            let inbox = native_thread_mail_name(session_id);
+                            let (status, kind) = live_status(session, cx);
+                            inboxes.push((session_id.clone(), inbox.clone()));
+                            live_entries.push((inbox, status, kind));
+                        }
+                        (inboxes, live_entries)
                     }) else {
                         break;
                     };
+                    // The liveness registry backs deliver-time `*@rig`
+                    // resolution (issue 046): refresh every ~5 s, prune what
+                    // no poller (here or elsewhere) keeps fresh.
+                    let (live_mailroom, entries) = (mailroom.clone(), live_entries);
+                    cx.background_spawn(async move {
+                        if ticks.is_multiple_of(LIVE_REFRESH_TICKS) {
+                            live_mailroom.prune_stale_live_entries();
+                        }
+                        for (name, status, kind) in entries {
+                            live_mailroom.write_live_entry(&name, status, kind);
+                        }
+                    })
+                    .detach();
                     if inboxes.is_empty() {
                         continue;
                     }
@@ -135,6 +155,26 @@ pub fn native_thread_mail_name(session_id: &acp_v2::SessionId) -> String {
     format!("zed-{short}")
 }
 
+/// The liveness-registry view of a session (issue 046): `"idle"` vs
+/// `"generating"`, plus `"thread"` vs `"subagent"` so `*@rig` resolution can
+/// prefer free top-level threads over free subagents.
+fn live_status(session: &Session, cx: &App) -> (&'static str, &'static str) {
+    let status = match session
+        .acp_thread
+        .upgrade()
+        .map(|acp_thread| acp_thread.read(cx).status())
+    {
+        None | Some(ThreadStatus::Idle) => "idle",
+        Some(_) => "generating",
+    };
+    let kind = if session.thread.read(cx).is_subagent() {
+        "subagent"
+    } else {
+        "thread"
+    };
+    (status, kind)
+}
+
 /// `name@rig` targets go through agent-mail. Thread titles that merely contain
 /// an `@` (spaces, punctuation) stay local because they aren't valid addresses.
 pub(crate) fn is_mail_address(to: &str) -> bool {
@@ -178,7 +218,9 @@ impl NativeAgent {
     }
 
     /// Queues claimed mail like a `send_message` from a local thread, so an
-    /// idle thread starts a turn and a busy one gets it when its turn ends.
+    /// idle thread starts a turn and a busy one gets it when its turn ends —
+    /// unless the envelope's mode asks otherwise (issue 046): `steering` ends
+    /// the running turn at the next message boundary, `urgent` preempts it.
     fn post_agent_mail(
         &mut self,
         session_id: &acp_v2::SessionId,
@@ -200,6 +242,10 @@ impl NativeAgent {
         {
             acp_thread.update(cx, |thread, cx| thread.set_waiting_for_mail(false, cx));
         }
+        let urgent = mail.iter().any(|envelope| envelope.mode == MailMode::Urgent);
+        let steering = mail
+            .iter()
+            .any(|envelope| envelope.mode == MailMode::Steering);
         let messages = mail
             .into_iter()
             .map(|envelope| thread_mailbox::MailboxMessage {
@@ -211,8 +257,73 @@ impl NativeAgent {
             .entry(session_id.clone())
             .or_default()
             .extend(messages);
-        self.deliver_mailbox(session_id, cx)
+        if let Some(delivery) = self.deliver_mailbox(session_id, cx) {
+            return Some(delivery);
+        }
+        let busy = self
+            .sessions
+            .get(session_id)
+            .and_then(|session| session.acp_thread.upgrade())
+            .is_some_and(|acp_thread| acp_thread.read(cx).status() != ThreadStatus::Idle);
+        if !busy {
+            return None;
+        }
+        let target = self
+            .sessions
+            .get(session_id)
+            .map(|session| session.thread.clone())?;
+        if steering {
+            target.update(cx, |thread, _| thread.set_end_turn_at_next_boundary(true));
+        } else if urgent {
+            let _completion = preempt_and_deliver(target, session_id.clone(), cx.entity(), cx);
+        }
+        None
     }
+}
+
+/// Preempts a mid-turn thread for urgent mail (issue 046): cancels the
+/// running turn, waits for the thread to go idle, then delivers the mailbox —
+/// the shape of the owner typing over a turn. The completion receiver
+/// resolves with the delivered turn's stop reason so a `wait_for_reply`
+/// sender still gets its reply.
+pub(crate) fn preempt_and_deliver(
+    target: Entity<Thread>,
+    session_id: acp_v2::SessionId,
+    agent: Entity<NativeAgent>,
+    cx: &mut Context<NativeAgent>,
+) -> Shared<oneshot::Receiver<Result<acp_v2::StopReason, Arc<anyhow::Error>>>> {
+    let (completion_tx, completion_rx) =
+        oneshot::channel::<Result<acp_v2::StopReason, Arc<anyhow::Error>>>();
+    let completion = completion_rx.shared();
+    let cancel = target.update(cx, |thread, cx| thread.cancel(cx));
+    cx.spawn(async move |_, cx| {
+        cancel.await;
+        // The cancelled turn's Stopped event lands asynchronously; poll for
+        // idle briefly so the delivery starts a turn instead of queueing.
+        for _ in 0..50 {
+            let idle = agent.read_with(cx, |agent, cx| {
+                agent
+                    .sessions
+                    .get(&session_id)
+                    .and_then(|session| session.acp_thread.upgrade())
+                    .is_none_or(|acp_thread| acp_thread.read(cx).status() == ThreadStatus::Idle)
+            });
+            if idle {
+                break;
+            }
+            cx.background_executor().timer(Duration::from_millis(100)).await;
+        }
+        let Some(delivery) =
+            agent.update(cx, |agent, cx| agent.deliver_mailbox_preempting(&session_id, true, cx))
+        else {
+            let _ = completion_tx.send(Ok(acp_v2::StopReason::Cancelled));
+            return;
+        };
+        let stop = cx.update(|cx| delivery.start(cx));
+        let _ = completion_tx.send(stop.await.map_err(Arc::new));
+    })
+    .detach();
+    completion
 }
 
 impl NativeThreadEnvironment {
@@ -243,10 +354,12 @@ impl NativeThreadEnvironment {
                 .as_deref()
                 .map(|when| ::agent_mail::parse_when(when, chrono::Local::now()))
                 .transpose()?;
+            let mode = request.mode;
             let report = cx
                 .background_spawn(async move {
                     let mut envelope = mailroom.compose(&to, &from, request.message, None)?;
                     envelope.deliver_at = deliver_at.map(|at| at.to_rfc3339());
+                    envelope.mode = mode;
                     mailroom.send(&envelope)
                 })
                 .await?;
@@ -263,6 +376,10 @@ impl NativeThreadEnvironment {
                 })
                 .log_err();
             let deliver_at = deliver_at.map(|at| at.to_rfc3339());
+            let mode = match mode {
+                MailMode::Queued => None,
+                mode => Some(mode.as_str().to_string()),
+            };
             Ok(ThreadMessageOutcome {
                 session_id: acp_v2::SessionId::new(report.to.clone()),
                 title: report.to.into(),
@@ -271,6 +388,8 @@ impl NativeThreadEnvironment {
                     via: report.via,
                     deliver_at,
                     queued: report.queued,
+                    mode,
+                    resolved_to: report.resolved_to,
                 },
             })
         })

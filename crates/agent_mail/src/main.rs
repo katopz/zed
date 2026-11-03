@@ -6,12 +6,17 @@ const USAGE: &str = "\
 agent-mail — message coding agents on other machines (and this one) over SSH
 
 USAGE:
-  agent-mail send <name@rig | *@rig | all@rig> [--from NAME] [--reply-to ID] [--at WHEN] [MESSAGE...]
+  agent-mail send <name@rig | *@rig | all@rig> [--from NAME] [--reply-to ID] [--at WHEN]
+                       [--mode urgent|steering|queued] [MESSAGE...]
                        MESSAGE defaults to stdin; `*@rig` = first free agent there (ONE agent);
                        `all@rig` = broadcast, every agent on that rig gets a copy.
                        --at schedules it (30m, 8h, 2d, 23:45, or RFC 3339): it lands, and
                        wakes the recipient, only then. Send to yourself for a timed wake-up
                        instead of a sleep loop.
+                       --mode (default queued): urgent interrupts a mid-turn recipient's
+                       running turn and delivers now; steering ends its turn at the next
+                       message boundary and delivers then; queued waits for the turn to end.
+                       The receipt names the `*@rig` agent that actually took the mail.
   agent-mail recv [--as NAME]...   claim and print your mail (also the rig-wide `*` box)
   agent-mail peek [--as NAME]...   print pending mail without claiming it
   agent-mail scheduled [--as NAME]...  print your scheduled (not yet due) mail
@@ -26,7 +31,7 @@ USAGE:
                                    and whether it is QUIET enough for a benchmark
   agent-mail rig run <RIG|auto> [--shared|--exclusive] [--key K] [--title T] [--cores N]
                 [--mem GB] [--gpu-mem GB] [--needs cuda,metal] [--timeout 2h]
-                [--worktree repo@sha] [--cwd DIR] [--notify name@rig] -- <command>
+                [--worktree repo@sha] [--cwd DIR] [--notify name@rig] [--notify-mode M] -- <command>
                                    queue a job: shared jobs run when resources fit, an
                                    exclusive one waits for a quiet empty rig; mail on
                                    start/poison/end; same --key twice = one run (amo referees)
@@ -143,7 +148,11 @@ fn run(args: Vec<String>) -> Result<i32> {
         }
         Some("deliver") => {
             let envelope = decode_payload(&args.next().context("deliver needs a payload")?)?;
-            room.deliver(&envelope)?;
+            // The resolved-to line goes BEFORE the `delivered` marker: the
+            // sender's ssh reader returns the pre-marker lines (issue 046).
+            if let Some(name) = room.deliver(&envelope)? {
+                println!("resolved-to {name}");
+            }
             println!("delivered {}", envelope.id);
             Ok(0)
         }
@@ -369,6 +378,7 @@ fn rig_run(room: &Mailroom, args: Vec<String>) -> Result<i32> {
     };
     let (mut key, mut title, mut cwd, mut notify, mut timeout, mut worktree) =
         (None, None, None, None, None, None);
+    let mut notify_mode = agent_mail::MailMode::Queued;
     let mut argv = Vec::new();
     while let Some(arg) = args.next() {
         let mut value = |name: &str| args.next().with_context(|| format!("{name} needs a value"));
@@ -379,6 +389,9 @@ fn rig_run(room: &Mailroom, args: Vec<String>) -> Result<i32> {
             "--title" => title = Some(value("--title")?),
             "--cwd" => cwd = Some(value("--cwd")?),
             "--notify" => notify = Some(value("--notify")?),
+            "--notify-mode" => {
+                notify_mode = agent_mail::MailMode::parse(&value("--notify-mode")?)?;
+            }
             "--worktree" => worktree = Some(value("--worktree")?),
             "--timeout" => {
                 timeout = Some(agent_mail::jobs::parse_duration(&value("--timeout")?)?.as_secs())
@@ -446,6 +459,7 @@ fn rig_run(room: &Mailroom, args: Vec<String>) -> Result<i32> {
         needs,
         key: key.clone(),
         notify: notify.clone(),
+        notify_mode,
         timeout_secs: timeout,
         worktree,
         submitted_at: chrono::Utc::now().to_rfc3339(),
@@ -512,6 +526,7 @@ fn send(room: &Mailroom, args: Vec<String>) -> Result<i32> {
     let mut from = None;
     let mut reply_to = None;
     let mut deliver_at = None;
+    let mut mode = agent_mail::MailMode::Queued;
     let mut words = Vec::new();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -520,6 +535,10 @@ fn send(room: &Mailroom, args: Vec<String>) -> Result<i32> {
             "--at" => {
                 let when = args.next().context("--at needs a time (30m, 8h, 23:45)")?;
                 deliver_at = Some(agent_mail::parse_when(&when, chrono::Local::now())?);
+            }
+            "--mode" => {
+                let raw = args.next().context("--mode needs urgent, steering or queued")?;
+                mode = agent_mail::MailMode::parse(&raw)?;
             }
             _ => words.push(arg),
         }
@@ -541,6 +560,7 @@ fn send(room: &Mailroom, args: Vec<String>) -> Result<i32> {
     };
     let mut envelope = room.compose(&to, &from, body, reply_to)?;
     envelope.deliver_at = deliver_at.map(|at| at.to_rfc3339());
+    envelope.mode = mode;
     let report = room.send(&envelope)?;
     if let Some(reason) = &report.queued {
         println!(
@@ -552,8 +572,16 @@ fn send(room: &Mailroom, args: Vec<String>) -> Result<i32> {
         );
         return Ok(0);
     }
+    let mode_note = match mode {
+        agent_mail::MailMode::Queued => String::new(),
+        mode => format!(", mode {}", mode.as_str()),
+    };
+    let resolved_note = report
+        .resolved_to
+        .map(|name| format!(" (took it: {name})"))
+        .unwrap_or_default();
     println!(
-        "sent {} to {}{}{} in {} ms",
+        "sent {} to {}{}{}{}{} in {} ms",
         report.id,
         report.to,
         report
@@ -566,6 +594,8 @@ fn send(room: &Mailroom, args: Vec<String>) -> Result<i32> {
                 at.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M %Z")
             ))
             .unwrap_or_default(),
+        mode_note,
+        resolved_note,
         report.elapsed.as_millis()
     );
     Ok(0)

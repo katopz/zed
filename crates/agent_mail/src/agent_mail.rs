@@ -44,6 +44,12 @@ const OUTBOX_MAX_RETRY: Duration = Duration::from_secs(15 * 60);
 const OUTBOX_FLUSH_EVERY: Duration = Duration::from_secs(60);
 /// A `sending/` claim older than this belongs to a flusher that died mid-send.
 const STALE_SEND: Duration = Duration::from_secs(5 * 60);
+/// A liveness entry older than this is stale (the native poller refreshes its
+/// entries well inside this window; a dead Zed goes stale and `*@rig`
+/// resolution falls back to the shared `_any` inbox).
+const LIVE_FRESH: Duration = Duration::from_secs(15);
+/// How often a poller should refresh its liveness entries.
+pub const LIVE_REFRESH: Duration = Duration::from_secs(5);
 
 /// A `Command` that never opens a console window. Zed (a GUI app) calls into
 /// this crate for rig probes, and on Windows every console child of a GUI
@@ -62,6 +68,41 @@ pub(crate) fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     command
 }
 
+/// How a recipient's poller should deliver mail that arrives mid-turn
+/// (agent-mail issue 046): `urgent` preempts the running turn, `steering` ends
+/// it at the next message boundary, `queued` waits for the turn to finish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MailMode {
+    Urgent,
+    Steering,
+    #[default]
+    Queued,
+}
+
+impl MailMode {
+    pub fn parse(text: &str) -> Result<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "urgent" => Ok(Self::Urgent),
+            "steering" => Ok(Self::Steering),
+            "queued" => Ok(Self::Queued),
+            other => bail!("unknown mode {other:?}; expected urgent, steering or queued"),
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Urgent => "urgent",
+            Self::Steering => "steering",
+            Self::Queued => "queued",
+        }
+    }
+
+    fn is_default(&self) -> bool {
+        *self == Self::Queued
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Envelope {
     pub id: String,
@@ -73,6 +114,10 @@ pub struct Envelope {
     /// RFC 3339; set for scheduled mail, which stays out of the inbox until then.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deliver_at: Option<String>,
+    /// How the recipient delivers mid-turn mail (issue 046). Queued is the
+    /// default and is left off the wire, so old payloads decode unchanged.
+    #[serde(default, skip_serializing_if = "MailMode::is_default")]
+    pub mode: MailMode,
     pub body: String,
 }
 
@@ -181,7 +226,46 @@ pub struct SendReport {
     /// Set when the rig was unreachable: the message waits in the outbox and
     /// is retried by [`Mailroom::flush_outbox`]; this is why it could not go now.
     pub queued: Option<String>,
+    /// For `*@rig` sends: the agent whose inbox took the mail (deliver-time
+    /// resolution, issue 046). `None` when the mail went to the shared `_any`
+    /// inbox to be claimed, or the target named an agent directly.
+    pub resolved_to: Option<String>,
     pub elapsed: Duration,
+}
+
+/// One liveness-registry entry (issue 046): a poller's statement that
+/// `name` is a live agent thread right now, with how it is behaving.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiveAgent {
+    pub name: String,
+    /// `"idle"` or `"generating"`.
+    pub status: String,
+    /// `"thread"` (top-level) or `"subagent"`.
+    pub kind: String,
+    /// RFC 3339 write time; entries older than [`LIVE_FRESH`] are stale.
+    pub updated_at: String,
+}
+
+fn live_rank(agent: &LiveAgent) -> u8 {
+    match (agent.status.as_str(), agent.kind.as_str()) {
+        ("idle", "thread") => 0,
+        ("idle", _) => 1,
+        (_, "thread") => 2,
+        _ => 3,
+    }
+}
+
+fn parse_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
+    let bytes = fs::read(path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn resolved_from_lines(lines: &[String]) -> Option<String> {
+    lines.iter().rev().find_map(|line| {
+        line.strip_prefix("resolved-to ")
+            .map(str::to_string)
+            .filter(|name| validate_name(name).is_ok())
+    })
 }
 
 #[derive(Debug, Default)]
@@ -287,12 +371,85 @@ impl Mailroom {
         Ok(path)
     }
 
+    fn live_dir(&self) -> PathBuf {
+        self.home.join("live")
+    }
+
+    /// Records that `name` is a live agent thread right now (issue 046
+    /// `*@rig` resolution). Pollers call this every [`LIVE_REFRESH`]; a dead
+    /// poller's entries age past [`LIVE_FRESH`] and stop resolving.
+    pub fn write_live_entry(&self, name: &str, status: &str, kind: &str) {
+        let Ok(name) = validate_name(name) else {
+            return;
+        };
+        let entry = LiveAgent {
+            name: name.to_string(),
+            status: status.to_string(),
+            kind: kind.to_string(),
+            updated_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        };
+        if fs::create_dir_all(self.live_dir()).is_ok()
+            && let Ok(json) = serde_json::to_vec(&entry)
+        {
+            let _ = fs::write(self.live_dir().join(format!("{name}.json")), json);
+        }
+    }
+
+    /// Removes liveness entries stale past [`LIVE_FRESH`] (their poller died).
+    pub fn prune_stale_live_entries(&self) {
+        let Ok(entries) = fs::read_dir(self.live_dir()) else {
+            return;
+        };
+        let now = SystemTime::now();
+        for entry in entries.flatten() {
+            let stale = entry
+                .metadata()
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .and_then(|modified| now.duration_since(modified).ok())
+                .is_some_and(|age| age > LIVE_FRESH)
+                || entry.metadata().is_err();
+            if stale {
+                fs::remove_file(entry.path()).ok();
+            }
+        }
+    }
+
+    /// Fresh liveness entries, best `*@rig` candidate first: idle top-level
+    /// threads, idle subagents, busy top-level threads, busy subagents;
+    /// newest write first within a class.
+    pub fn live_agents(&self) -> Vec<LiveAgent> {
+        let Ok(entries) = fs::read_dir(self.live_dir()) else {
+            return Vec::new();
+        };
+        let mut agents: Vec<LiveAgent> = entries
+            .flatten()
+            .filter_map(|entry| parse_json::<LiveAgent>(&entry.path()))
+            .filter(|agent| {
+                validate_name(&agent.name).is_ok()
+                    && chrono::DateTime::parse_from_rfc3339(&agent.updated_at)
+                        .map(|written| chrono::Utc::now().signed_duration_since(written).num_milliseconds() as u128 <= LIVE_FRESH.as_millis())
+                        .unwrap_or(false)
+            })
+            .collect();
+        agents.sort_by(|left, right| {
+            live_rank(left)
+                .cmp(&live_rank(right))
+                .then(right.updated_at.cmp(&left.updated_at))
+        });
+        agents
+    }
+
     /// Atomic maildir delivery: readers only ever see complete files in `new/`.
     /// Scheduled mail waits in `later/<due unix ms>_<id>.json` instead; every
     /// inbox scan promotes what is due, so whatever already polls the inbox
     /// (the Claude waiter hook, Zed's poller) delivers it on time without a
     /// scheduler process.
-    pub fn deliver(&self, envelope: &Envelope) -> Result<()> {
+    /// Files a `*@rig` envelope into the best live inbox when the liveness
+    /// registry has a fresh entry, else into the shared `_any` inbox to be
+    /// claimed (today's behavior). Returns the resolved inbox name when
+    /// `*@rig` mail landed somewhere specific (issue 046 receipts).
+    pub fn deliver(&self, envelope: &Envelope) -> Result<Option<String>> {
         let address = Address::parse(&envelope.to)?;
         validate_name(&envelope.id)?;
         let due = envelope
@@ -304,7 +461,23 @@ impl Mailroom {
             })
             .transpose()?
             .filter(|due| *due > chrono::Utc::now());
-        let inbox = self.inbox(&address.name);
+        let inbox_name = match address.name.as_str() {
+            ANY_NAME => self
+                .live_agents()
+                .first()
+                .map(|agent| agent.name.clone())
+                .unwrap_or_else(|| ANY_NAME.to_string()),
+            name => name.to_string(),
+        };
+        let resolved = (inbox_name != address.name).then_some(inbox_name.clone());
+        // `*@rig` may resolve to a different inbox on each attempt, so the
+        // at-least-once outbox retry dedups across every inbox, not just the
+        // resolved one.
+        if inbox_name != address.name && self.envelope_held_anywhere(&format!("{}.json", envelope.id))
+        {
+            return Ok(resolved);
+        }
+        let inbox = self.inbox(&inbox_name);
         for sub in ["tmp", "new", "cur", "later"] {
             fs::create_dir_all(inbox.join(sub))?;
         }
@@ -322,7 +495,7 @@ impl Mailroom {
                 })
             });
         if already_held {
-            return Ok(());
+            return Ok(resolved);
         }
         let staged = inbox.join("tmp").join(&file_name);
         fs::write(&staged, serde_json::to_vec(envelope)?)?;
@@ -338,7 +511,31 @@ impl Mailroom {
             // Broadcasts stay in new/ (never claimed), so age them out here.
             prune_claimed(&inbox.join("new"));
         }
-        Ok(())
+        Ok(resolved)
+    }
+
+    /// Whether any inbox on this rig already holds `file_name` (new/, cur/
+    /// or a scheduled later/ copy).
+    fn envelope_held_anywhere(&self, file_name: &str) -> bool {
+        let Ok(inboxes) = fs::read_dir(self.home.join("inbox")) else {
+            return false;
+        };
+        inboxes.flatten().any(|inbox| {
+            let dir = inbox.path();
+            ["new", "cur"]
+                .into_iter()
+                .chain(std::iter::once("later"))
+                .any(|sub| {
+                    fs::read_dir(dir.join(sub)).is_ok_and(|entries| {
+                        entries.flatten().any(|entry| {
+                            entry
+                                .file_name()
+                                .to_str()
+                                .is_some_and(|name| name == file_name || name.ends_with(&format!("_{file_name}")))
+                        })
+                    })
+                })
+        })
     }
 
     /// What is waiting in this rig's mailboxes, read-only: viewers (the
@@ -550,6 +747,7 @@ impl Mailroom {
             sent_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             reply_to,
             deliver_at: None,
+            mode: MailMode::Queued,
             body,
         })
     }
@@ -559,16 +757,17 @@ impl Mailroom {
         let rigs = self.rigs()?;
         let address = Address::parse(&envelope.to)?;
         let rig_name = address.rig.as_deref().unwrap_or(&rigs.self_rig);
-        let report = |via, queued| SendReport {
+        let report = |via, queued, resolved_to| SendReport {
             id: envelope.id.clone(),
             to: envelope.to.clone(),
             via,
             queued,
+            resolved_to,
             elapsed: started.elapsed(),
         };
         if rig_name == rigs.self_rig {
-            self.deliver(envelope)?;
-            return Ok(report(None, None));
+            let resolved_to = self.deliver(envelope)?;
+            return Ok(report(None, None, resolved_to));
         }
         if !rigs.rigs.contains_key(rig_name) {
             bail!(
@@ -578,16 +777,21 @@ impl Mailroom {
             );
         }
         match self.send_remote(&rigs, rig_name, envelope) {
-            Ok(target) => Ok(report(Some(target), None)),
+            Ok((target, resolved_to)) => Ok(report(Some(target), None, resolved_to)),
             Err(error) => {
                 let reason = format!("{error:#}");
                 self.park_in_outbox(rig_name, envelope, 0)?;
-                Ok(report(None, Some(reason)))
+                Ok(report(None, Some(reason), None))
             }
         }
     }
 
-    fn send_remote(&self, rigs: &Rigs, rig_name: &str, envelope: &Envelope) -> Result<String> {
+    fn send_remote(
+        &self,
+        rigs: &Rigs,
+        rig_name: &str,
+        envelope: &Envelope,
+    ) -> Result<(String, Option<String>)> {
         let rig = rigs.rigs.get(rig_name).with_context(|| {
             format!(
                 "unknown rig {rig_name:?}; known: {} (edit {})",
@@ -607,7 +811,9 @@ impl Mailroom {
                 &remote_command,
                 &format!("delivered {}", envelope.id),
             ) {
-                Ok(_) => return Ok(target.clone()),
+                Ok(lines) => {
+                    return Ok((target.clone(), resolved_from_lines(&lines)));
+                }
                 Err(error) => failures.push(format!("{target}: {error:#}")),
             }
         }
@@ -1015,8 +1221,12 @@ pub fn render(mail: &[Envelope], self_name: Option<&str>) -> String {
             .as_deref()
             .map(|at| format!(" scheduled_for=\"{at}\""))
             .unwrap_or_default();
+        let mode = match envelope.mode {
+            MailMode::Queued => String::new(),
+            mode => format!(" mode=\"{}\"", mode.as_str()),
+        };
         text.push_str(&format!(
-            "<agent_mail from=\"{}\" to=\"{}\" id=\"{}\" sent_at=\"{}\"{reply_to}{scheduled}>\n{}\n</agent_mail>\n",
+            "<agent_mail from=\"{}\" to=\"{}\" id=\"{}\" sent_at=\"{}\"{reply_to}{scheduled}{mode}>\n{}\n</agent_mail>\n",
             envelope.from, envelope.to, envelope.id, envelope.sent_at, envelope.body
         ));
     }
@@ -1633,4 +1843,105 @@ mod tests {
         assert!(outcome.stderr.unwrap().contains("wake"));
         assert!(!dir.path().join("waiters/s1.lock").exists());
     }
+
+    #[test]
+    fn mail_mode_parses_and_defaults_to_queued() {
+        assert_eq!(MailMode::parse("urgent").unwrap(), MailMode::Urgent);
+        assert_eq!(MailMode::parse(" Steering ").unwrap(), MailMode::Steering);
+        assert_eq!(MailMode::parse("queued").unwrap(), MailMode::Queued);
+        assert!(MailMode::parse("nudge").is_err());
+        // A payload from an older sender (no mode field) reads as queued.
+        let legacy = serde_json::json!({
+            "id": "i", "from": "a@m3", "to": "b@m3",
+            "sent_at": "2026-01-01T00:00:00Z", "body": "hi"
+        });
+        let envelope: Envelope = serde_json::from_value(legacy).unwrap();
+        assert_eq!(envelope.mode, MailMode::Queued);
+        // Queued is not serialized; urgent is.
+        let mut envelope = envelope;
+        envelope.mode = MailMode::Queued;
+        assert!(serde_json::to_string(&envelope).unwrap().contains("\"mode\"") == false);
+        envelope.mode = MailMode::Urgent;
+        assert!(serde_json::to_string(&envelope).unwrap().contains("\"mode\":\"urgent\""));
+    }
+
+    fn live_entry(room: &Mailroom, name: &str, status: &str, kind: &str) {
+        room.write_live_entry(name, status, kind);
+    }
+
+    #[test]
+    fn any_address_resolves_by_rank_and_falls_back_to_shared_inbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let room = mailroom(dir.path(), "m3");
+        let any = Address::parse("*@m3").unwrap();
+
+        // No registry: mail lands in the shared `_any` inbox, unresolved.
+        let envelope = room
+            .compose(&any, "peer@m3", "first".into(), None)
+            .unwrap();
+        assert_eq!(room.deliver(&envelope).unwrap(), None);
+        assert!(dir.path().join("inbox/_any/new").exists());
+
+        // Stale entries are ignored (a dead Zed must not resolve): an entry
+        // whose written timestamp is past LIVE_FRESH is not a candidate.
+        std::fs::create_dir_all(dir.path().join("live")).unwrap();
+        std::fs::write(
+            dir.path().join("live/zed-stale.json"),
+            serde_json::to_vec(&LiveAgent {
+                name: "zed-stale".into(),
+                status: "idle".into(),
+                kind: "thread".into(),
+                updated_at: (chrono::Utc::now() - chrono::Duration::seconds(60)).to_rfc3339(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        // Rank: idle thread > idle subagent > busy thread > busy subagent,
+        // newest first within a class.
+        live_entry(&room, "zed-busy-sub", "generating", "subagent");
+        live_entry(&room, "zed-busy", "generating", "thread");
+        live_entry(&room, "zed-idle-sub", "idle", "subagent");
+        live_entry(&room, "zed-idle", "idle", "thread");
+
+        let envelope = room
+            .compose(&any, "peer@m3", "second".into(), None)
+            .unwrap();
+        let resolved = room.deliver(&envelope).unwrap();
+        assert_eq!(resolved.as_deref(), Some("zed-idle"));
+        let claimed = room.claim(&["zed-idle".to_string()]).unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].body, "second");
+
+        // A directly-addressed send never reports resolution.
+        let direct = room
+            .compose(&Address::parse("zed-busy@m3").unwrap(), "peer@m3", "hey".into(), None)
+            .unwrap();
+        assert_eq!(room.deliver(&direct).unwrap(), None);
+    }
+
+    #[test]
+    fn any_delivery_dedups_across_inboxes_on_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let room = mailroom(dir.path(), "m3");
+        let any = Address::parse("*@m3").unwrap();
+        live_entry(&room, "zed-one", "idle", "thread");
+
+        let mut envelope = room
+            .compose(&any, "peer@m3", "once only".into(), None)
+            .unwrap();
+        assert_eq!(room.deliver(&envelope).unwrap().as_deref(), Some("zed-one"));
+
+        // The outbox retry re-sends the same id after the recipient's status
+        // changed: it must not land in a second inbox.
+        room.write_live_entry("zed-two", "idle", "thread");
+        envelope.mode = MailMode::Steering;
+        room.deliver(&envelope).unwrap();
+        assert!(room.claim(&["zed-two".to_string()]).unwrap().is_empty());
+        // Exactly one copy, still in the first recipient's inbox.
+        let held = room.claim(&["zed-one".to_string()]).unwrap();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].body, "once only");
+    }
 }
+

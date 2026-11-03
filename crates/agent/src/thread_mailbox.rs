@@ -1,6 +1,9 @@
 use acp_thread::{AcpThread, AcpThreadEvent, ThreadStatus};
 use agent_client_protocol::schema::v2 as acp;
 use anyhow::{Context as _, Result, anyhow};
+use futures::channel::oneshot;
+use futures::future::Shared;
+use std::sync::Arc;
 use gpui::{App, Context, Entity, SharedString, Task, TaskExt as _};
 use itertools::Itertools as _;
 use serde::{Deserialize, Serialize};
@@ -55,6 +58,10 @@ pub struct ThreadMessageRequest {
     pub wait_for_reply: bool,
     /// Schedule agent-mail for later (`30m`, `8h`, `23:45`, RFC 3339).
     pub deliver_at: Option<String>,
+    /// How a mid-turn target should treat this message (issue 046): urgent
+    /// preempts its running turn, steering ends it at the next message
+    /// boundary, queued (the default) waits for the turn to end.
+    pub mode: ::agent_mail::MailMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,6 +87,12 @@ pub enum ThreadMessageDelivery {
         /// retried automatically; this is why it could not go now.
         #[serde(skip_serializing_if = "Option::is_none")]
         queued: Option<String>,
+        /// Non-queued delivery modes ride the envelope (issue 046).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mode: Option<String>,
+        /// For `*@rig`: the agent whose inbox actually took the mail.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        resolved_to: Option<String>,
     },
 }
 
@@ -100,8 +113,18 @@ pub(crate) struct MailboxMessage {
 
 /// Wraps pending messages into a single user prompt so a burst of messages
 /// costs the recipient one turn instead of one turn per message.
-pub(crate) fn format_mailbox_prompt(messages: &[MailboxMessage]) -> String {
+pub(crate) fn format_mailbox_prompt(
+    messages: &[MailboxMessage],
+    preempted: bool,
+) -> String {
     let mut prompt = String::new();
+    if preempted {
+        prompt.push_str(
+            "<agent_message notice>Delivered with mode=urgent: the running turn was \
+             interrupted for this mail. Summarize or checkpoint what you were doing, \
+             then handle the mail.</agent_message>\n",
+        );
+    }
     for message in messages {
         prompt.push_str(&format!(
             "<agent_message from=\"{}\" session_id=\"{}\">\n{}\n</agent_message>\n",
@@ -199,6 +222,14 @@ pub(crate) enum PostedMessage {
     },
     Queued {
         position: usize,
+    },
+    /// The target was mid-turn and the message's mode preempts it (issue
+    /// 046): the turn is cancelled and the mailbox delivered right after.
+    /// `completion` resolves with the delivered turn's stop reason, so a
+    /// `wait_for_reply` sender still gets its reply.
+    Preempting {
+        thread: Entity<Thread>,
+        completion: Shared<oneshot::Receiver<Result<acp::StopReason, Arc<anyhow::Error>>>>,
     },
 }
 
@@ -307,12 +338,41 @@ impl NativeAgent {
                 from_title,
                 body: request.message,
             });
+        // Read before the mutable `deliver_mailbox` borrow below.
+        let busy = target_session
+            .acp_thread
+            .upgrade()
+            .is_some_and(|acp_thread| acp_thread.read(cx).status() != ThreadStatus::Idle);
 
         let posted = match self.deliver_mailbox(&target, cx) {
             Some(delivery) => PostedMessage::Delivered {
                 delivery,
                 thread: target_thread,
             },
+            None if !busy => PostedMessage::Queued {
+                position: self.mailboxes.get(&target).map_or(0, Vec::len),
+            },
+            None if request.mode == ::agent_mail::MailMode::Steering => {
+                target_thread.update(cx, |thread, _| {
+                    thread.set_end_turn_at_next_boundary(true)
+                });
+                PostedMessage::Queued {
+                    position: self.mailboxes.get(&target).map_or(0, Vec::len),
+                }
+            }
+            None if request.mode == ::agent_mail::MailMode::Urgent => {
+                let agent = cx.entity();
+                let completion = crate::agent_mail_bridge::preempt_and_deliver(
+                    target_thread.clone(),
+                    target.clone(),
+                    agent,
+                    cx,
+                );
+                PostedMessage::Preempting {
+                    thread: target_thread.clone(),
+                    completion,
+                }
+            }
             None => PostedMessage::Queued {
                 position: self.mailboxes.get(&target).map_or(0, Vec::len),
             },
@@ -328,6 +388,17 @@ impl NativeAgent {
         session_id: &acp::SessionId,
         cx: &mut Context<Self>,
     ) -> Option<MailboxDelivery> {
+        self.deliver_mailbox_preempting(session_id, false, cx)
+    }
+
+    /// `preempting` marks a delivery that interrupted the recipient's running
+    /// turn (urgent mail, issue 046), so the prompt names it.
+    pub(crate) fn deliver_mailbox_preempting(
+        &mut self,
+        session_id: &acp::SessionId,
+        preempting: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<MailboxDelivery> {
         let acp_thread = self.sessions.get(session_id)?.acp_thread.upgrade()?;
         if acp_thread.read(cx).status() != ThreadStatus::Idle {
             return None;
@@ -338,7 +409,7 @@ impl NativeAgent {
         }
         Some(MailboxDelivery {
             acp_thread,
-            prompt: format_mailbox_prompt(&messages),
+            prompt: format_mailbox_prompt(&messages, preempting),
         })
     }
 
@@ -415,7 +486,8 @@ mod tests {
 
     #[test]
     fn mailbox_prompt_names_every_sender() {
-        let prompt = format_mailbox_prompt(&[
+        let prompt = format_mailbox_prompt(
+            &[
             MailboxMessage {
                 from_session_id: session("s1"),
                 from_title: "Planner".into(),
@@ -426,7 +498,9 @@ mod tests {
                 from_title: "Reviewer".into(),
                 body: "Tests fail".into(),
             },
-        ]);
+            ],
+            false,
+        );
 
         assert!(prompt.contains("from=\"Planner\" session_id=\"s1\">\nStart on step 2\n"));
         assert!(prompt.contains("from=\"Reviewer\" session_id=\"s2\">\nTests fail\n"));

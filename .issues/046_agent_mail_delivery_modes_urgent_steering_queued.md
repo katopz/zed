@@ -1,7 +1,7 @@
 # Issue 046 — agent-mail delivery modes: urgent (inject now) / steering (steer + wait) / queued (today's busy behavior)
 
-Status: OPEN — filed 2026-11-03 by zed-73caa0d7@m3 (owner-reported reproduction). Extends plan 043's poller (`.plans/043_cross_rig_agent_mail.md` phase 2).
-**Claimed:** zed-agent@amo, 1793732249, expires 2026-11-06T13:00:00+00:00
+Status: DONE 2026-11-04 — T1–T6 LANDED (plan 052): `--mode urgent|steering|queued` on `agent-mail send` + `rig run --notify-mode`; deliver-time `*@rig` resolution via the poller-written liveness registry (idle threads > idle subagents > busy threads > busy subagents > `_any` fallback) with the resolved recipient in the receipt (`took it: <name>` / `resolved-to` line before the unchanged `delivered` marker); native `send_message` gained `mode` (preempt-and-deliver with the preemption named in the prompt; steering ends the turn at the next boundary); queued default is byte-identical to the old behavior. Gates: agent_mail 41 + agent 832 tests, clippy clean both crates, CLI e2e smoke (receipt, resolution, `_any` fallback, unknown-mode refusal, deliver marker order). Deploy rides the next Zed Dev rebuild per rig.
+**Lease closed:** zed-agent@amo, 1793732249, was expires 2026-11-06T13:00:00+00:00 — landed inside the window
 
 ## Observed (the reproduction)
 

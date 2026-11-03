@@ -202,6 +202,36 @@ impl NativeThreadEnvironment {
                 thread_mailbox::PostedMessage::Queued { position } => {
                     ThreadMessageDelivery::Queued { position }
                 }
+                thread_mailbox::PostedMessage::Preempting { thread, completion } => {
+                    // The recipient's turn was preempted (issue 046); the
+                    // delivered turn runs detached, and `wait_for_reply`
+                    // follows it to its final message like a direct delivery.
+                    let (response_tx, response_rx) = oneshot::channel();
+                    cx.spawn(async move |_| {
+                        let flattened = match completion.await {
+                            Ok(Ok(reason)) => Ok(reason),
+                            Ok(Err(error)) => Err(anyhow!("{error:#}")),
+                            Err(_) => Err(anyhow!("The preempting delivery was dropped")),
+                        };
+                        response_tx.send(flattened).ok();
+                    })
+                    .detach();
+
+                    let reply = if wait_for_reply {
+                        let response = response_rx
+                            .await
+                            .context("The target thread was dropped")??;
+                        if matches!(response, acp_v2::StopReason::Cancelled) {
+                            anyhow::bail!("The target thread's turn was cancelled");
+                        }
+                        thread.read_with(cx, |thread, _| {
+                            thread_mailbox::last_agent_message_text(thread)
+                        })
+                    } else {
+                        None
+                    };
+                    ThreadMessageDelivery::Delivered { reply }
+                }
                 thread_mailbox::PostedMessage::Delivered { delivery, thread } => {
                     let turn = cx.update(|cx| delivery.start(cx));
                     // The turn runs detached so cancelling this tool call

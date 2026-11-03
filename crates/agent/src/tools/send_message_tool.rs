@@ -45,6 +45,12 @@ pub struct SendMessageToolInput {
     /// (`23:45`), or an RFC 3339 timestamp. Only for `name@rig` targets.
     #[serde(default)]
     pub deliver_at: Option<String>,
+    /// How a mid-turn target treats this message (default `queued`): `steering`
+    /// ends the target's current turn at the next message boundary so this lands
+    /// sooner; `urgent` interrupts that turn now (preempts, like the user typing)
+    /// and delivers immediately; `queued` waits for the turn to end.
+    #[serde(default)]
+    pub mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,11 +116,23 @@ impl AgentTool for SendMessageTool {
                 .map_err(|e| SendMessageToolOutput::Error {
                     error: format!("Failed to receive tool input: {e}"),
                 })?;
+            let mode = match input.mode.as_deref() {
+                None => ::agent_mail::MailMode::Queued,
+                Some(raw) => match ::agent_mail::MailMode::parse(raw) {
+                    Ok(mode) => mode,
+                    Err(error) => {
+                        return Err(SendMessageToolOutput::Error {
+                            error: error.to_string(),
+                        });
+                    }
+                },
+            };
             let request = ThreadMessageRequest {
                 to: input.to,
                 message: input.message,
                 wait_for_reply: input.wait_for_reply,
                 deliver_at: input.deliver_at,
+                mode,
             };
             match self.environment.send_message_to_thread(request, cx).await {
                 Ok(outcome) => Ok(SendMessageToolOutput::Success(outcome)),
