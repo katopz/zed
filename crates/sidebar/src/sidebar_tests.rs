@@ -503,6 +503,7 @@ fn save_thread_metadata(
             archived: false,
             continued_from_session_id: None,
             pinned: false,
+            pinned_at: None,
             remote_connection,
         };
         ThreadMetadataStore::global(cx).update(cx, |store, cx| store.save(metadata, cx));
@@ -541,6 +542,7 @@ fn save_thread_metadata_with_main_paths(
         archived: false,
         continued_from_session_id: None,
         pinned: false,
+        pinned_at: None,
         remote_connection: None,
     };
     cx.update(|cx| {
@@ -570,6 +572,7 @@ fn save_draft_metadata_with_main_paths(
         archived: false,
         continued_from_session_id: None,
         pinned: false,
+        pinned_at: None,
         remote_connection: None,
     };
     cx.update(|cx| {
@@ -577,6 +580,24 @@ fn save_draft_metadata_with_main_paths(
     });
     cx.run_until_parked();
     thread_id
+}
+
+/// Saves the thread with an explicit pin state so ordering tests can control
+/// pin times deterministically instead of relying on `Utc::now()` spacing.
+fn set_pinned_at(session_id: &str, pinned_at: Option<DateTime<Utc>>, cx: &mut TestAppContext) {
+    let session_id = acp::SessionId::new(Arc::from(session_id));
+    cx.update(|cx| {
+        ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+            let mut metadata = store
+                .entry_by_session(&session_id)
+                .expect("thread metadata should exist")
+                .clone();
+            metadata.pinned = pinned_at.is_some();
+            metadata.pinned_at = pinned_at;
+            store.save(metadata, cx);
+        });
+    });
+    cx.run_until_parked();
 }
 
 fn focus_sidebar(sidebar: &Entity<Sidebar>, cx: &mut gpui::VisualTestContext) {
@@ -1537,6 +1558,7 @@ async fn test_neighboring_activatable_entry_stays_within_project(cx: &mut TestAp
                 remote_connection: None,
                 continued_from_session_id: None,
                 pinned: false,
+                pinned_at: None,
             },
             icon: IconName::ZedAgent,
             icon_from_external_svg: None,
@@ -1630,6 +1652,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                     archived: false,
                     continued_from_session_id: None,
                     pinned: false,
+                    pinned_at: None,
                     remote_connection: None,
                 },
                 icon: IconName::ZedAgent,
@@ -1659,6 +1682,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                     archived: false,
                     continued_from_session_id: None,
                     pinned: false,
+                    pinned_at: None,
                     remote_connection: None,
                 },
                 icon: IconName::ZedAgent,
@@ -1688,6 +1712,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                     archived: false,
                     continued_from_session_id: None,
                     pinned: false,
+                    pinned_at: None,
                     remote_connection: None,
                 },
                 icon: IconName::ZedAgent,
@@ -1718,6 +1743,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                     archived: false,
                     continued_from_session_id: None,
                     pinned: false,
+                    pinned_at: None,
                     remote_connection: None,
                 },
                 icon: IconName::ZedAgent,
@@ -1748,6 +1774,7 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
                     archived: false,
                     continued_from_session_id: None,
                     pinned: false,
+                    pinned_at: None,
                     remote_connection: None,
                 },
                 icon: IconName::ZedAgent,
@@ -6157,31 +6184,36 @@ async fn test_pin_selected_thread_action_pins_selected_thread(cx: &mut TestAppCo
     cx.dispatch_action(PinSelectedThread);
     cx.run_until_parked();
 
-    let pinned = cx.update(|_, cx| {
+    let (pinned, pinned_at) = cx.update(|_, cx| {
         ThreadMetadataStore::global(cx)
             .read(cx)
             .entry(thread_id)
+            .map(|metadata| (metadata.pinned, metadata.pinned_at))
             .expect("thread metadata should exist")
-            .pinned
     });
     assert!(
         pinned,
         "dispatching PinSelectedThread should pin the selected thread"
     );
+    assert!(pinned_at.is_some(), "pinning should record the pin time");
 
     // Toggling again should unpin.
     cx.dispatch_action(PinSelectedThread);
     cx.run_until_parked();
-    let pinned_again = cx.update(|_, cx| {
+    let (pinned_again, pinned_at_after_unpin) = cx.update(|_, cx| {
         ThreadMetadataStore::global(cx)
             .read(cx)
             .entry(thread_id)
+            .map(|metadata| (metadata.pinned, metadata.pinned_at))
             .expect("thread metadata should exist")
-            .pinned
     });
     assert!(
         !pinned_again,
         "dispatching PinSelectedThread a second time should unpin the thread"
+    );
+    assert!(
+        pinned_at_after_unpin.is_none(),
+        "unpinning should clear the pin time"
     );
 }
 
@@ -6248,6 +6280,229 @@ async fn test_pinned_thread_floats_to_top_of_group(cx: &mut TestAppContext) {
         vec!["Older Thread".to_string(), "Newer Thread".to_string()],
         "pinned older thread should float above the newer unpinned thread"
     );
+}
+
+#[gpui::test]
+async fn test_pinned_threads_order_by_pin_time(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, _panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    let now = Utc::now();
+    // Thread A was interacted with most recently but pinned earlier;
+    // thread B is staler but pinned later. Pin time decides: B above A.
+    save_thread_metadata(
+        acp::SessionId::new(Arc::from("thread-a")),
+        Some("Thread A".into()),
+        now - chrono::Duration::minutes(1),
+        None,
+        None,
+        &project,
+        cx,
+    );
+    save_thread_metadata(
+        acp::SessionId::new(Arc::from("thread-b")),
+        Some("Thread B".into()),
+        now - chrono::Duration::minutes(30),
+        None,
+        None,
+        &project,
+        cx,
+    );
+    cx.run_until_parked();
+
+    set_pinned_at("thread-a", Some(now - chrono::Duration::minutes(10)), cx);
+    set_pinned_at("thread-b", Some(now - chrono::Duration::minutes(5)), cx);
+
+    let titles = thread_titles_in_order(&sidebar, cx);
+    assert_eq!(
+        titles,
+        vec!["Thread B".to_string(), "Thread A".to_string()],
+        "the later-pinned thread should sort above the earlier-pinned one \
+         even when it is staler"
+    );
+
+    // Unpinning clears the pin state and drops the thread below the pinned one.
+    set_pinned_at("thread-b", None, cx);
+    let titles = thread_titles_in_order(&sidebar, cx);
+    assert_eq!(
+        titles,
+        vec!["Thread A".to_string(), "Thread B".to_string()],
+        "the unpinned thread should fall below the remaining pinned thread"
+    );
+}
+
+#[gpui::test]
+async fn test_running_thread_sorts_below_pinned_above_idle(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    let now = Utc::now();
+    // A pinned thread last touched two hours ago.
+    let pinned_time = now - chrono::Duration::hours(2);
+    save_thread_metadata(
+        acp::SessionId::new(Arc::from("pinned-thread")),
+        Some("Pinned Thread".into()),
+        pinned_time,
+        Some(pinned_time),
+        Some(pinned_time),
+        &project,
+        cx,
+    );
+    cx.run_until_parked();
+    let pinned_thread_id = cx.update(|_, cx| {
+        ThreadMetadataStore::global(cx)
+            .read(cx)
+            .entry_by_session(&acp::SessionId::new(Arc::from("pinned-thread")))
+            .expect("pinned thread should exist")
+            .thread_id
+    });
+    sidebar.update(cx, |sidebar, cx| {
+        sidebar.pin_thread(pinned_thread_id, true, cx);
+    });
+    cx.run_until_parked();
+
+    // Start a live thread and keep it generating (the stub never completes
+    // the turn). Its persisted metadata is stale (2024), so under a
+    // recency-only sort the idle thread below would beat it.
+    let connection = StubAgentConnection::new();
+    open_thread_with_connection(&panel, connection.clone(), cx);
+    send_message(&panel, cx);
+    let running_session = active_session_id(&panel, cx);
+    save_test_thread_metadata(&running_session, &project, cx).await;
+    cx.update(|_, cx| {
+        connection.send_update(
+            running_session.clone(),
+            acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(
+                "working...".into(),
+            )),
+            cx,
+        );
+    });
+    cx.run_until_parked();
+
+    // An idle thread updated just now.
+    save_thread_metadata(
+        acp::SessionId::new(Arc::from("idle-thread")),
+        Some("Idle Thread".into()),
+        now,
+        Some(now),
+        Some(now),
+        &project,
+        cx,
+    );
+    cx.run_until_parked();
+
+    let entries = visible_entries_as_strings(&sidebar, cx);
+    assert_eq!(entries[0], "v [my-project]");
+    assert_eq!(
+        entries[1], "  Pinned Thread",
+        "the pinned thread should stay at the top of the group"
+    );
+    assert!(
+        entries[2].contains("(running)"),
+        "the running thread should come right after pinned threads, \
+         got {:?}",
+        entries
+    );
+    assert_eq!(
+        entries[3], "  Idle Thread",
+        "the idle thread should sort below the running thread despite \
+         being the most recently updated"
+    );
+}
+
+#[gpui::test]
+async fn test_draft_sorts_above_pinned_threads(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, _panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    let now = Utc::now();
+    save_thread_metadata(
+        acp::SessionId::new(Arc::from("pinned-thread")),
+        Some("Pinned Thread".into()),
+        now,
+        Some(now),
+        Some(now),
+        &project,
+        cx,
+    );
+    cx.run_until_parked();
+    let pinned_thread_id = cx.update(|_, cx| {
+        ThreadMetadataStore::global(cx)
+            .read(cx)
+            .entry_by_session(&acp::SessionId::new(Arc::from("pinned-thread")))
+            .expect("pinned thread should exist")
+            .thread_id
+    });
+    sidebar.update(cx, |sidebar, cx| {
+        sidebar.pin_thread(pinned_thread_id, true, cx);
+    });
+    cx.run_until_parked();
+
+    // A new thread with a typed-but-unsent prompt floats above pinned threads.
+    let project_paths = PathList::new(&[PathBuf::from("/my-project")]);
+    let draft_id = save_draft_metadata_with_main_paths(
+        Some("Draft".into()),
+        project_paths.clone(),
+        project_paths,
+        now,
+        cx,
+    );
+    cx.update(|_, cx| {
+        agent_ui::draft_prompt_store::write(
+            draft_id,
+            &[acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
+                "a typed but unsent prompt",
+            ))],
+            cx,
+        )
+    })
+    .await
+    .expect("draft prompt should persist");
+    sidebar.update(cx, |sidebar, cx| sidebar.update_entries(cx));
+    cx.run_until_parked();
+
+    let (draft_index, pinned_index) = sidebar.read_with(cx, |sidebar, _cx| {
+        let position = |thread_id| {
+            sidebar
+                .contents
+                .entries
+                .iter()
+                .position(
+                    |entry| matches!(entry, ListEntry::Thread(thread) if thread.metadata.thread_id == thread_id),
+                )
+                .expect("thread should be visible in the sidebar")
+        };
+        (position(draft_id), position(pinned_thread_id))
+    });
+    assert!(
+        draft_index < pinned_index,
+        "the unsent draft should float above the pinned thread, \
+         draft at {draft_index}, pinned at {pinned_index}"
+    );
+}
+
+fn thread_titles_in_order(
+    sidebar: &Entity<Sidebar>,
+    cx: &mut gpui::VisualTestContext,
+) -> Vec<String> {
+    sidebar.read_with(cx, |sidebar, _cx| {
+        sidebar
+            .contents
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                ListEntry::Thread(thread) => Some(thread.metadata.display_title().to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    })
 }
 
 #[gpui::test]
@@ -8549,6 +8804,7 @@ async fn test_sidebar_keeps_multi_root_thread_with_stale_main_paths(cx: &mut Tes
                     archived: false,
                     continued_from_session_id: None,
                     pinned: false,
+                    pinned_at: None,
                     remote_connection: None,
                 },
                 cx,
@@ -8634,6 +8890,7 @@ async fn test_activate_archived_thread_with_saved_paths_activates_matching_works
                 archived: false,
                 continued_from_session_id: None,
                 pinned: false,
+                pinned_at: None,
                 remote_connection: None,
             },
             window,
@@ -8706,6 +8963,7 @@ async fn test_activate_archived_thread_cwd_fallback_with_matching_workspace(
                 archived: false,
                 continued_from_session_id: None,
                 pinned: false,
+                pinned_at: None,
                 remote_connection: None,
             },
             window,
@@ -8774,6 +9032,7 @@ async fn test_activate_archived_thread_no_paths_no_cwd_uses_active_workspace(
                 archived: false,
                 continued_from_session_id: None,
                 pinned: false,
+                pinned_at: None,
                 remote_connection: None,
             },
             window,
@@ -8834,6 +9093,7 @@ async fn test_activate_archived_thread_saved_paths_opens_new_workspace(cx: &mut 
                 archived: false,
                 continued_from_session_id: None,
                 pinned: false,
+                pinned_at: None,
                 remote_connection: None,
             },
             window,
@@ -8895,6 +9155,7 @@ async fn test_activate_archived_thread_reuses_workspace_in_another_window(cx: &m
                 archived: false,
                 continued_from_session_id: None,
                 pinned: false,
+                pinned_at: None,
                 remote_connection: None,
             },
             window,
@@ -8976,6 +9237,7 @@ async fn test_activate_archived_thread_reuses_workspace_in_another_window_with_t
         archived: false,
         continued_from_session_id: None,
         pinned: false,
+        pinned_at: None,
         remote_connection: None,
     };
     seed_thread_metadata(metadata.clone(), cx_a);
@@ -9061,6 +9323,7 @@ async fn test_activate_archived_thread_prefers_current_window_for_matching_paths
         archived: false,
         continued_from_session_id: None,
         pinned: false,
+        pinned_at: None,
         remote_connection: None,
     };
     seed_thread_metadata(metadata.clone(), cx_a);
@@ -9396,6 +9659,7 @@ async fn test_archive_last_worktree_thread_removes_workspace(cx: &mut TestAppCon
             remote_connection: Some(remote_host),
             continued_from_session_id: None,
             pinned: false,
+            pinned_at: None,
         };
         ThreadMetadataStore::global(cx).update(cx, |store, cx| store.save(metadata, cx));
     });
@@ -10051,6 +10315,7 @@ async fn test_archive_last_worktree_thread_not_blocked_by_remote_thread_at_same_
             archived: false,
             continued_from_session_id: None,
             pinned: false,
+            pinned_at: None,
             remote_connection: Some(remote_host),
         };
         ThreadMetadataStore::global(cx).update(cx, |store, cx| {
@@ -10866,6 +11131,7 @@ async fn test_unarchive_first_thread_in_group_does_not_create_spurious_draft(
                     archived: true,
                     continued_from_session_id: None,
                     pinned: false,
+                    pinned_at: None,
                     remote_connection: None,
                 },
                 cx,
@@ -10962,6 +11228,7 @@ async fn test_unarchive_into_new_workspace_does_not_create_duplicate_real_thread
                     archived: true,
                     continued_from_session_id: None,
                     pinned: false,
+                    pinned_at: None,
                     remote_connection: None,
                 },
                 cx,
@@ -11193,6 +11460,7 @@ async fn test_unarchive_into_inactive_existing_workspace_does_not_leave_active_d
                     archived: true,
                     continued_from_session_id: None,
                     pinned: false,
+                    pinned_at: None,
                     remote_connection: None,
                 },
                 cx,
@@ -12120,6 +12388,7 @@ async fn test_unarchive_linked_worktree_thread_into_project_group_shows_only_res
                     archived: true,
                     continued_from_session_id: None,
                     pinned: false,
+                    pinned_at: None,
                     remote_connection: None,
                 },
                 cx,
@@ -12671,6 +12940,7 @@ async fn test_legacy_thread_with_canonical_path_opens_main_repo_workspace(cx: &m
             archived: false,
             continued_from_session_id: None,
             pinned: false,
+            pinned_at: None,
             remote_connection: None,
         };
         ThreadMetadataStore::global(cx).update(cx, |store, cx| store.save(metadata, cx));
@@ -13661,6 +13931,7 @@ mod property_test {
             archived: false,
             continued_from_session_id: None,
             pinned: false,
+            pinned_at: None,
             remote_connection: None,
         };
         cx.update(|_, cx| {
@@ -13735,6 +14006,7 @@ mod property_test {
                         archived: false,
                         continued_from_session_id: None,
                         pinned: false,
+                        pinned_at: None,
                         remote_connection: project.read(cx).remote_connection_options(cx),
                     });
                     cx.update(|_, cx| {
@@ -14605,6 +14877,7 @@ async fn test_remote_project_integration_does_not_briefly_render_as_separate_pro
             archived: false,
             continued_from_session_id: None,
             pinned: false,
+            pinned_at: None,
             remote_connection,
         };
         ThreadMetadataStore::global(cx).update(cx, |store, cx| store.save(metadata, cx));
@@ -15572,6 +15845,7 @@ async fn test_remote_archive_thread_with_active_connection(
             archived: false,
             continued_from_session_id: None,
             pinned: false,
+            pinned_at: None,
             remote_connection,
         };
         ThreadMetadataStore::global(cx).update(cx, |store, cx| store.save(metadata, cx));
@@ -15715,6 +15989,7 @@ async fn test_remote_linked_worktree_workspace_to_remove_uses_remote_connection(
             archived: false,
             continued_from_session_id: None,
             pinned: false,
+            pinned_at: None,
             remote_connection: Some(remote_connection.clone()),
         };
         ThreadMetadataStore::global(cx).update(cx, |store, cx| store.save(metadata, cx));

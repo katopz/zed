@@ -144,6 +144,7 @@ fn migrate_thread_metadata(cx: &mut App) -> Task<anyhow::Result<()>> {
                         archived: true,
                         continued_from_session_id: None,
                         pinned: false,
+                        pinned_at: None,
                     })
                 })
                 .collect::<Vec<_>>()
@@ -350,6 +351,11 @@ pub struct ThreadMetadata {
     /// above all unpinned threads. Toggled via the hover pin button or the
     /// right-click context menu.
     pub pinned: bool,
+    /// When the thread was last pinned. Pinned threads order among themselves
+    /// by this time, most recently pinned first. `None` when unpinned and for
+    /// threads pinned before this field existed (they fall back to
+    /// `updated_at` so legacy rows keep a stable order).
+    pub pinned_at: Option<DateTime<Utc>>,
 }
 
 impl ThreadMetadata {
@@ -1009,15 +1015,18 @@ impl ThreadMetadataStore {
     }
 
     /// Set or clear the pinned state for a thread. Pinned threads float to the
-    /// top of their sidebar project group. Emits `ThreadPinned` so observers
-    /// can rebuild entries without polling.
+    /// top of their sidebar project group, ordered among themselves by pin
+    /// time (most recent first). Emits `ThreadPinned` so observers can rebuild
+    /// entries without polling.
     pub fn set_pinned(&mut self, thread_id: ThreadId, pinned: bool, cx: &mut Context<Self>) {
         if let Some(thread) = self.threads.get(&thread_id) {
             if thread.pinned == pinned {
                 return;
             }
+            let pinned_at = pinned.then(Utc::now);
             self.save_internal(ThreadMetadata {
                 pinned,
+                pinned_at,
                 ..thread.clone()
             });
             cx.emit(ThreadMetadataStoreEvent::ThreadPinned(thread_id, pinned));
@@ -1570,6 +1579,7 @@ impl ThreadMetadataStore {
             continued_from_session_id: existing_thread
                 .and_then(|t| t.continued_from_session_id.clone()),
             pinned: existing_thread.is_some_and(|t| t.pinned),
+            pinned_at: existing_thread.and_then(|t| t.pinned_at),
         };
 
         self.save(metadata, cx);
@@ -1691,6 +1701,9 @@ impl Domain for ThreadMetadataDb {
         sql!(
             ALTER TABLE sidebar_threads ADD COLUMN pinned INTEGER DEFAULT 0;
         ),
+        sql!(
+            ALTER TABLE sidebar_threads ADD COLUMN pinned_at TEXT;
+        ),
     ];
 }
 
@@ -1707,7 +1720,7 @@ impl ThreadMetadataDb {
 
     const LIST_QUERY: &str = "SELECT thread_id, session_id, agent_id, title, updated_at, \
         created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, \
-        main_worktree_paths_order, remote_connection, title_override, continued_from_session_id, pinned \
+        main_worktree_paths_order, remote_connection, title_override, continued_from_session_id, pinned, pinned_at \
         FROM sidebar_threads \
         ORDER BY updated_at DESC";
 
@@ -1762,10 +1775,11 @@ impl ThreadMetadataDb {
         let archived = row.archived;
         let continued_from_session_id = row.continued_from_session_id.as_ref().map(|s| s.0.clone());
         let pinned = row.pinned;
+        let pinned_at = row.pinned_at.map(|dt| dt.to_rfc3339());
 
         self.write(move |conn| {
-            let sql = "INSERT INTO sidebar_threads(thread_id, session_id, agent_id, title, updated_at, created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, main_worktree_paths_order, remote_connection, title_override, continued_from_session_id, pinned) \
-                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16) \
+            let sql = "INSERT INTO sidebar_threads(thread_id, session_id, agent_id, title, updated_at, created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, main_worktree_paths_order, remote_connection, title_override, continued_from_session_id, pinned, pinned_at) \
+                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17) \
                        ON CONFLICT(thread_id) DO UPDATE SET \
                            session_id = excluded.session_id, \
                            agent_id = excluded.agent_id, \
@@ -1781,7 +1795,8 @@ impl ThreadMetadataDb {
                            remote_connection = excluded.remote_connection, \
                            title_override = excluded.title_override, \
                            continued_from_session_id = excluded.continued_from_session_id, \
-                           pinned = excluded.pinned";
+                           pinned = excluded.pinned, \
+                           pinned_at = excluded.pinned_at";
             let mut stmt = Statement::prepare(conn, sql)?;
             let mut i = stmt.bind(&thread_id, 1)?;
             i = stmt.bind(&session_id, i)?;
@@ -1798,7 +1813,8 @@ impl ThreadMetadataDb {
             i = stmt.bind(&remote_connection, i)?;
             i = stmt.bind(&title_override, i)?;
             i = stmt.bind(&continued_from_session_id, i)?;
-            stmt.bind(&pinned, i)?;
+            i = stmt.bind(&pinned, i)?;
+            stmt.bind(&pinned_at, i)?;
             stmt.exec()
         })
         .await
@@ -1959,6 +1975,7 @@ impl Column for ThreadMetadata {
         let (continued_from_session_id, next): (Option<Arc<str>>, i32) =
             Column::column(statement, next)?;
         let (pinned, next): (bool, i32) = Column::column(statement, next)?;
+        let (pinned_at_str, next): (Option<String>, i32) = Column::column(statement, next)?;
 
         let agent_id = agent_id
             .map(|id| AgentId::new(id))
@@ -1972,6 +1989,12 @@ impl Column for ThreadMetadata {
             .map(|dt| dt.with_timezone(&Utc));
 
         let interacted_at = interacted_at_str
+            .as_deref()
+            .map(DateTime::parse_from_rfc3339)
+            .transpose()?
+            .map(|dt| dt.with_timezone(&Utc));
+
+        let pinned_at = pinned_at_str
             .as_deref()
             .map(DateTime::parse_from_rfc3339)
             .transpose()?
@@ -2027,6 +2050,7 @@ impl Column for ThreadMetadata {
                 archived,
                 continued_from_session_id: continued_from_session_id.map(acp::SessionId::new),
                 pinned,
+                pinned_at,
             },
             next,
         ))
@@ -2119,6 +2143,7 @@ mod tests {
             worktree_paths: WorktreePaths::from_folder_paths(&folder_paths),
             remote_connection: None,
             pinned: false,
+            pinned_at: None,
         }
     }
 
@@ -2291,6 +2316,38 @@ mod tests {
             rows[0].continued_from_session_id.as_ref(),
             Some(&acp::SessionId::new("source-session")),
             "continued_from_session_id should survive a DB round-trip"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_database_round_trips_pinned_at(_cx: &mut TestAppContext) {
+        let now = Utc::now();
+        let pinned_at = now - chrono::Duration::minutes(5);
+        let mut metadata = make_metadata(
+            "pinned-session",
+            "Pinned Thread",
+            now,
+            PathList::new(&[Path::new("/project-a")]),
+        );
+        metadata.pinned = true;
+        metadata.pinned_at = Some(pinned_at);
+
+        let thread = std::thread::current();
+        let test_name = thread.name().unwrap_or("unknown_test");
+        let db_name = format!("THREAD_METADATA_DB_{}", test_name);
+        let db = ThreadMetadataDb(gpui::block_on(db::open_test_db::<ThreadMetadataDb>(
+            &db_name,
+        )));
+
+        db.save(metadata).await.unwrap();
+
+        let rows = db.list().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].pinned, "pinned should survive a DB round-trip");
+        assert_eq!(
+            rows[0].pinned_at,
+            Some(pinned_at),
+            "pinned_at should survive a DB round-trip"
         );
     }
 
@@ -2718,6 +2775,7 @@ mod tests {
             archived: false,
             continued_from_session_id: None,
             pinned: false,
+            pinned_at: None,
         };
 
         cx.update(|cx| {
@@ -2805,6 +2863,7 @@ mod tests {
             archived: false,
             continued_from_session_id: None,
             pinned: false,
+            pinned_at: None,
         };
 
         cx.update(|cx| {
@@ -2933,6 +2992,7 @@ mod tests {
             archived: false,
             continued_from_session_id: None,
             pinned: false,
+            pinned_at: None,
         };
 
         cx.update(|cx| {
@@ -3884,6 +3944,7 @@ mod tests {
             archived: false,
             continued_from_session_id: None,
             pinned: false,
+            pinned_at: None,
             session_id: Some(acp::SessionId::new("local-linked")),
             agent_id: agent::ZED_AGENT_ID.clone(),
             title: Some("Local Linked".into()),
@@ -3900,6 +3961,7 @@ mod tests {
             archived: false,
             continued_from_session_id: None,
             pinned: false,
+            pinned_at: None,
             session_id: Some(acp::SessionId::new("remote-linked")),
             agent_id: agent::ZED_AGENT_ID.clone(),
             title: Some("Remote Linked".into()),

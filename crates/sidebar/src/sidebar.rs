@@ -1931,12 +1931,26 @@ impl Sidebar {
                 threads.sort_by(|a, b| {
                     let a_time = Self::thread_display_time(&a.metadata);
                     let b_time = Self::thread_display_time(&b.metadata);
-                    // Pinned threads float to the top of their group; within
-                    // each tier, sort by recency descending.
-                    b.metadata
-                        .pinned
-                        .cmp(&a.metadata.pinned)
-                        .then_with(|| b_time.cmp(&a_time))
+                    // Tier 0: drafts (a new thread whose prompt hasn't been
+                    // sent) float above everything, pinned threads included.
+                    // Once the prompt is sent the draft gains a session and
+                    // re-sorts into the tiers below. Tier 1: pinned threads,
+                    // most recently pinned first. Tier 2: unpinned threads —
+                    // active ones (waiting/running) above idle ones, then by
+                    // recency descending.
+                    b.draft
+                        .is_some()
+                        .cmp(&a.draft.is_some())
+                        .then_with(|| b.metadata.pinned.cmp(&a.metadata.pinned))
+                        .then_with(|| match a.metadata.pinned {
+                            true => Self::thread_pin_time(&b.metadata)
+                                .cmp(&Self::thread_pin_time(&a.metadata)),
+                            false => b
+                                .status
+                                .urgency()
+                                .cmp(&a.status.urgency())
+                                .then_with(|| b_time.cmp(&a_time)),
+                        })
                 });
             } else {
                 for info in live_infos {
@@ -6052,6 +6066,12 @@ impl Sidebar {
         metadata.interacted_at.unwrap_or(metadata.updated_at)
     }
 
+    /// Ordering key for pinned threads: when they were pinned, falling back to
+    /// `updated_at` for rows pinned before `pinned_at` was recorded.
+    fn thread_pin_time(metadata: &ThreadMetadata) -> DateTime<Utc> {
+        metadata.pinned_at.unwrap_or(metadata.updated_at)
+    }
+
     fn push_entries_by_display_time(
         entries: &mut Vec<ListEntry>,
         terminals: Vec<TerminalEntry>,
@@ -6071,11 +6091,25 @@ impl Sidebar {
             }
         }
 
-        // Terminals are never pinned, so they sort as the unpinned tier.
+        let is_draft = |entry: &ListEntry| matches!(entry, ListEntry::Thread(thread) if thread.draft.is_some());
+        // Terminals are never pinned and never running, so they join the
+        // unpinned tier with zero urgency.
         let pinned = |entry: &ListEntry| -> bool {
             match entry {
                 ListEntry::Thread(thread) => thread.metadata.pinned,
                 _ => false,
+            }
+        };
+        let pin_time = |entry: &ListEntry| -> DateTime<Utc> {
+            match entry {
+                ListEntry::Thread(thread) => Sidebar::thread_pin_time(&thread.metadata),
+                _ => DateTime::<Utc>::MIN_UTC,
+            }
+        };
+        let urgency = |entry: &ListEntry| -> u8 {
+            match entry {
+                ListEntry::Thread(thread) if !thread.metadata.pinned => thread.status.urgency(),
+                _ => 0,
             }
         };
 
@@ -6084,11 +6118,21 @@ impl Sidebar {
             .map(ListEntry::Terminal)
             .chain(threads.into_iter().map(ListEntry::Thread))
             .sorted_by(|left, right| {
-                // Pinned first, then recency descending (matches the in-group
-                // sort in `rebuild_contents`).
-                pinned(right)
-                    .cmp(&pinned(left))
-                    .then_with(|| display_time(right).cmp(&display_time(left)))
+                // Tier 0: drafts (a new thread whose prompt hasn't been sent)
+                // float above everything, pinned threads included. Tier 1:
+                // pinned threads, most recently pinned first. Tier 2: unpinned
+                // threads — active ones (waiting/running) above idle ones,
+                // then recency descending. Matches the in-group sort in
+                // `rebuild_contents`.
+                is_draft(right)
+                    .cmp(&is_draft(left))
+                    .then_with(|| pinned(right).cmp(&pinned(left)))
+                    .then_with(|| match pinned(left) {
+                        true => pin_time(right).cmp(&pin_time(left)),
+                        false => urgency(right)
+                            .cmp(&urgency(left))
+                            .then_with(|| display_time(right).cmp(&display_time(left))),
+                    })
             })
             .collect();
         let grouped = continuation_chains::group_continuation_chains(

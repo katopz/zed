@@ -26,17 +26,8 @@ pub(crate) fn chain_status(
     head: AgentThreadStatus,
     hidden: impl IntoIterator<Item = AgentThreadStatus>,
 ) -> AgentThreadStatus {
-    fn urgency(status: AgentThreadStatus) -> u8 {
-        match status {
-            AgentThreadStatus::WaitingForConfirmation => 4,
-            AgentThreadStatus::Running => 3,
-            AgentThreadStatus::Error => 2,
-            AgentThreadStatus::Unconfirmed => 1,
-            AgentThreadStatus::Completed => 0,
-        }
-    }
     hidden.into_iter().fold(head, |shown, status| {
-        match urgency(status) > urgency(shown) {
+        match status.urgency() > shown.urgency() {
             true => status,
             false => shown,
         }

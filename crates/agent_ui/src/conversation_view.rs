@@ -7659,6 +7659,7 @@ pub(crate) mod tests {
                             archived: false,
                             continued_from_session_id: None,
                             pinned: false,
+                            pinned_at: None,
                         },
                         cx,
                     );
@@ -8176,6 +8177,7 @@ pub(crate) mod tests {
                         archived: false,
                         continued_from_session_id: None,
                         pinned: false,
+                        pinned_at: None,
                     },
                     cx,
                 );

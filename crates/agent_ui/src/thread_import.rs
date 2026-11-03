@@ -884,6 +884,7 @@ fn collect_importable_threads(
                 archived: true,
                 continued_from_session_id: None,
                 pinned: false,
+                pinned_at: None,
             });
         }
     }

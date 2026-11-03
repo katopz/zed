@@ -17,6 +17,20 @@ pub enum AgentThreadStatus {
     Error,
 }
 
+impl AgentThreadStatus {
+    /// Sort weight so statuses that need attention or are actively working
+    /// order above idle ones. Higher sorts first.
+    pub fn urgency(self) -> u8 {
+        match self {
+            Self::WaitingForConfirmation => 4,
+            Self::Running => 3,
+            Self::Error => 2,
+            Self::Unconfirmed => 1,
+            Self::Completed => 0,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum WorktreeKind {
     #[default]
