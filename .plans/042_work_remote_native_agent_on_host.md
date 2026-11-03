@@ -1,6 +1,6 @@
 # 042 — Work Remote: run the built-in Zed Agent on the host
 Status: IN EXECUTION — tasks 1–3 done (`b752f35687`); host Zed Agent smoke PASS local + bmo + amo; only task 4 left (GUI click-through, owner)
-**Claimed:** zed-4a@m3, 2026-11-02T03:25Z, expires 2026-11-03T03:25:00+00:00
+**Lease closed:** zed-4a@m3, 1793564700, was expires 2026-11-03T03:25:00+00:00 — tasks 2–3 LANDED in the window (b861c7a0d3, 017fc7258f); task 4 (GUI click-through) is owner-gated
 
 ## Goal
 

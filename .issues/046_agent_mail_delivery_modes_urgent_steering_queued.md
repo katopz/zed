@@ -1,6 +1,7 @@
 # Issue 046 — agent-mail delivery modes: urgent (inject now) / steering (steer + wait) / queued (today's busy behavior)
 
 Status: OPEN — filed 2026-11-03 by zed-73caa0d7@m3 (owner-reported reproduction). Extends plan 043's poller (`.plans/043_cross_rig_agent_mail.md` phase 2).
+**Claimed:** zed-agent@amo, 1793732249, expires 2026-11-06T13:00:00+00:00
 
 ## Observed (the reproduction)
 
