@@ -712,6 +712,8 @@ pub fn waits_on_owner(paragraph: &str) -> bool {
         "your decision",
         "parked",
         "needs you",
+        // auto_prompt's halt keyword: the agent ended its chain on purpose.
+        "<stop>",
     ]
     .iter()
     .any(|marker| lower.contains(marker))
@@ -1199,6 +1201,7 @@ mod tests {
         ));
         assert!(waits_on_owner("Plan 037: GUI test awaiting you."));
         assert!(!waits_on_owner("Done: shipped c911487602; next is P1."));
+        assert!(waits_on_owner("<stop>"));
     }
 
     #[test]
