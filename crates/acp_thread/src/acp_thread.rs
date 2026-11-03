@@ -3573,6 +3573,11 @@ pub struct AcpThread {
     pending_terminal_output: HashMap<acp_v2::TerminalId, Vec<Vec<u8>>>,
     pending_terminal_exit: HashMap<acp_v2::TerminalId, acp_v1::TerminalExitStatus>,
     had_error: bool,
+    /// Fork: the thread ended its turn with agent-mail outstanding — a reply
+    /// or a scheduled `deliver_at` wake it expects to receive. Purely live
+    /// state (never persisted); the sidebar shows a waiting indicator for such
+    /// threads so a parked thread reads as "waiting", not finished.
+    waiting_for_mail: bool,
     api_error: fork::TurnApiError,
     /// Fork: the turn adopted from zed-agentd's turn state (`fork.rs`).
     detached_turn: Option<u32>,
@@ -3941,6 +3946,7 @@ impl AcpThread {
             pending_terminal_output: HashMap::default(),
             pending_terminal_exit: HashMap::default(),
             had_error: false,
+            waiting_for_mail: false,
             api_error: fork::TurnApiError::default(),
             detached_turn: None,
             local_execution_error: None,
@@ -4242,6 +4248,20 @@ impl AcpThread {
 
     pub fn had_error(&self) -> bool {
         self.had_error
+    }
+
+    /// Fork: whether the thread ended its turn with agent-mail outstanding
+    /// (a reply or a scheduled `deliver_at` wake it expects to receive). Set
+    /// when one of its mails goes out, cleared when mail is claimed for it.
+    pub fn is_waiting_for_mail(&self) -> bool {
+        self.waiting_for_mail
+    }
+
+    pub fn set_waiting_for_mail(&mut self, waiting: bool, cx: &mut Context<Self>) {
+        if self.waiting_for_mail != waiting {
+            self.waiting_for_mail = waiting;
+            cx.notify();
+        }
     }
 
     pub fn local_execution_error(&self) -> Option<&Arc<anyhow::Error>> {

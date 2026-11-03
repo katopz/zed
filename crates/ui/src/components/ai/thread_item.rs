@@ -14,6 +14,10 @@ pub enum AgentThreadStatus {
     Unconfirmed,
     Running,
     WaitingForConfirmation,
+    /// Fork: the thread ended its turn and is parked waiting for an external
+    /// event (an agent-mail reply or a scheduled wake). Not running, but not
+    /// finished either — the item shows a waiting icon on the metadata line.
+    Waiting,
     Error,
 }
 
@@ -25,6 +29,7 @@ impl AgentThreadStatus {
             Self::WaitingForConfirmation => 4,
             Self::Running => 3,
             Self::Error => 2,
+            Self::Waiting => 2,
             Self::Unconfirmed => 1,
             Self::Completed => 0,
         }
@@ -458,7 +463,9 @@ impl RenderOnce for ThreadItem {
 
         let show_tooltip = matches!(
             self.status,
-            AgentThreadStatus::Error | AgentThreadStatus::WaitingForConfirmation
+            AgentThreadStatus::Error
+                | AgentThreadStatus::WaitingForConfirmation
+                | AgentThreadStatus::Waiting
         );
 
         let linked_worktrees: Vec<ThreadItemWorktreeInfo> = self
@@ -479,7 +486,8 @@ impl RenderOnce for ThreadItem {
             || has_worktree
             || has_diff_stats
             || has_timestamp
-            || has_continuation;
+            || has_continuation
+            || self.status == AgentThreadStatus::Waiting;
 
         v_flex()
             .id(self.id.clone())
@@ -555,7 +563,20 @@ impl RenderOnce for ThreadItem {
                         .when(self.continuation_child, |this| {
                             this.child(continuation_indent())
                         })
-                        .child(icon_container()) // Icon Spacing
+                        // Icon Spacing — holds the waiting indicator when the
+                        // thread is parked waiting for a mail reply or a
+                        // scheduled wake, so the agent logo on the line above
+                        // stays untouched.
+                        .child(icon_container().when(
+                            self.status == AgentThreadStatus::Waiting,
+                            |this| {
+                                this.child(
+                                    Icon::new(IconName::CountdownTimer)
+                                        .size(IconSize::XSmall)
+                                        .color(Color::Accent),
+                                )
+                            },
+                        ))
                         .when(self.archived, |this| {
                             this.child(
                                 Icon::new(IconName::Archive).size(IconSize::XSmall).color(
@@ -739,6 +760,15 @@ impl RenderOnce for ThreadItem {
                                 .color(Color::Warning),
                         )
                         .child(Label::new("Waiting for Confirmation"))
+                        .into_any_element(),
+                    AgentThreadStatus::Waiting => h_flex()
+                        .gap_1()
+                        .child(
+                            Icon::new(IconName::CountdownTimer)
+                                .size(IconSize::Small)
+                                .color(Color::Accent),
+                        )
+                        .child(Label::new("Waiting for mail (reply or scheduled wake)"))
                         .into_any_element(),
                     _ => gpui::Empty.into_any_element(),
                 }))

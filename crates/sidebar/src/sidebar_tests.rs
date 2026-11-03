@@ -715,6 +715,7 @@ fn visible_entries_as_strings(
                                 AgentThreadStatus::Running => " (running)",
                                 AgentThreadStatus::Error => " (error)",
                                 AgentThreadStatus::WaitingForConfirmation => " (waiting)",
+                                AgentThreadStatus::Waiting => " (waiting-for-mail)",
                                 _ => "",
                             };
                             let notified = if sidebar

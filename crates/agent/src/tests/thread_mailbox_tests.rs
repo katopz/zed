@@ -461,3 +461,77 @@ async fn test_thread_schedules_its_own_wake_up(cx: &mut TestAppContext) {
     let prompt = pending[0].messages.last().unwrap().string_contents();
     assert!(prompt.contains("check the long job"), "{prompt}");
 }
+
+/// A thread that mails out (here: schedules its own wake) and ends its turn
+/// is parked waiting on that mail. The sidebar's waiting indicator keys off
+/// this flag: set when the mail goes out, cleared when mail is claimed for
+/// the thread's inbox.
+#[gpui::test]
+async fn test_outgoing_mail_marks_thread_waiting_until_wake_arrives(cx: &mut TestAppContext) {
+    let setup = setup_threads(1, cx).await;
+    let (agent, fake) = (&setup.agent, &setup.fake);
+    let thread = &setup.threads[0];
+    let (home, _sender) = enable_agent_mail(agent, cx);
+    let name = agent_mail_bridge::native_thread_mail_name(&thread.session_id);
+    let assert_waiting = |thread: &MailboxTestThread, cx: &mut TestAppContext, expected: bool| {
+        thread.acp_thread.read_with(cx, |thread, _| {
+            assert_eq!(
+                thread.is_waiting_for_mail(),
+                expected,
+                "waiting-for-mail flag mismatch"
+            );
+        });
+    };
+
+    assert_waiting(thread, cx, false);
+
+    let turn = setup.send(thread, "Start the long job, then check it later", cx);
+    cx.run_until_parked();
+    let tool_input = json!({
+        "to": format!("{name}@m3"),
+        "message": "check the long job",
+        "deliver_at": "8h",
+    });
+    fake.send_last_event(
+        &thread.model,
+        LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
+            id: "wake_1".into(),
+            name: SendMessageTool::NAME.into(),
+            raw_input: tool_input.to_string(),
+            input: language_model::LanguageModelToolUseInput::Json(tool_input),
+            is_input_complete: true,
+            thought_signature: None,
+        }),
+    );
+    fake.end_last(&thread.model);
+    cx.run_until_parked();
+    fake.send_last_text(&thread.model, "Scheduled; going idle.");
+    fake.end_last(&thread.model);
+    assert_eq!(turn.await.unwrap(), acp_v2::StopReason::EndTurn);
+
+    // The turn ended with the wake still out: the thread must read as waiting
+    // while it sits idle.
+    assert_waiting(thread, cx, true);
+
+    // The due time arrives (simulated by back-dating the parked file); the
+    // wake is claimed into the inbox, which clears the waiting state.
+    let later = home.path().join("inbox").join(&name).join("later");
+    let parked = std::fs::read_dir(&later)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let file_name = parked.file_name().unwrap().to_str().unwrap().to_string();
+    let (_, rest) = file_name.split_once('_').unwrap();
+    std::fs::rename(&parked, later.join(format!("1_{rest}"))).unwrap();
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.run_until_parked();
+
+    assert_eq!(
+        fake.pending_completions_for(&thread.model).len(),
+        1,
+        "the scheduled mail should wake the thread"
+    );
+    assert_waiting(thread, cx, false);
+}

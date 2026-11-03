@@ -192,6 +192,14 @@ impl NativeAgent {
             );
             return None;
         }
+        // Mail claimed for this thread means its wait is over (the reply or
+        // scheduled wake arrived), whether it is delivered now or queued for
+        // the current turn's end.
+        if let Some(session) = self.sessions.get(session_id)
+            && let Some(acp_thread) = session.acp_thread.upgrade()
+        {
+            acp_thread.update(cx, |thread, cx| thread.set_waiting_for_mail(false, cx));
+        }
         let messages = mail
             .into_iter()
             .map(|envelope| thread_mailbox::MailboxMessage {
@@ -242,6 +250,18 @@ impl NativeThreadEnvironment {
                     mailroom.send(&envelope)
                 })
                 .await?;
+            // The sender now waits on the reply (or its own scheduled wake):
+            // its turn usually ends here, and the sidebar marks it waiting
+            // until the mail is claimed back into its inbox.
+            agent
+                .update(cx, |agent, cx| {
+                    if let Some(session) = agent.sessions.get(&sender)
+                        && let Some(acp_thread) = session.acp_thread.upgrade()
+                    {
+                        acp_thread.update(cx, |thread, cx| thread.set_waiting_for_mail(true, cx));
+                    }
+                })
+                .log_err();
             let deliver_at = deliver_at.map(|at| at.to_rfc3339());
             Ok(ThreadMessageOutcome {
                 session_id: acp_v2::SessionId::new(report.to.clone()),
