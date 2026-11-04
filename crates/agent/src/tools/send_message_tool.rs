@@ -48,7 +48,12 @@ pub struct SendMessageToolInput {
     /// How a mid-turn target treats this message (default `queued`): `steering`
     /// ends the target's current turn at the next message boundary so this lands
     /// sooner; `urgent` interrupts that turn now (preempts, like the user typing)
-    /// and delivers immediately; `queued` waits for the turn to end.
+    /// and delivers immediately; `queued` waits for the turn to end; `fyi`
+    /// never wakes an idle target — it reads the message at its next natural
+    /// turn boundary. Broadcasts to `all@rig` must use fyi (or urgent/steering
+    /// for genuinely critical incidents); a queued all@ blast is refused. fyi
+    /// cost note: each ACTIVE target still spends one boundary turn reading a
+    /// fyi batch; idle targets pay nothing.
     #[serde(default)]
     pub mode: Option<String>,
 }

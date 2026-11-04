@@ -3,10 +3,10 @@ use agent_client_protocol::schema::v2 as acp;
 use anyhow::{Context as _, Result, anyhow};
 use futures::channel::oneshot;
 use futures::future::Shared;
-use std::sync::Arc;
 use gpui::{App, Context, Entity, SharedString, Task, TaskExt as _};
 use itertools::Itertools as _;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 use crate::{AgentMessageContent, NativeAgent, NativeAgentConnection, Thread};
 
@@ -113,10 +113,7 @@ pub(crate) struct MailboxMessage {
 
 /// Wraps pending messages into a single user prompt so a burst of messages
 /// costs the recipient one turn instead of one turn per message.
-pub(crate) fn format_mailbox_prompt(
-    messages: &[MailboxMessage],
-    preempted: bool,
-) -> String {
+pub(crate) fn format_mailbox_prompt(messages: &[MailboxMessage], preempted: bool) -> String {
     let mut prompt = String::new();
     if preempted {
         prompt.push_str(
@@ -353,9 +350,7 @@ impl NativeAgent {
                 position: self.mailboxes.get(&target).map_or(0, Vec::len),
             },
             None if request.mode == ::agent_mail::MailMode::Steering => {
-                target_thread.update(cx, |thread, _| {
-                    thread.set_end_turn_at_next_boundary(true)
-                });
+                target_thread.update(cx, |thread, _| thread.set_end_turn_at_next_boundary(true));
                 PostedMessage::Queued {
                     position: self.mailboxes.get(&target).map_or(0, Vec::len),
                 }
@@ -488,16 +483,16 @@ mod tests {
     fn mailbox_prompt_names_every_sender() {
         let prompt = format_mailbox_prompt(
             &[
-            MailboxMessage {
-                from_session_id: session("s1"),
-                from_title: "Planner".into(),
-                body: "Start on step 2".into(),
-            },
-            MailboxMessage {
-                from_session_id: session("s2"),
-                from_title: "Reviewer".into(),
-                body: "Tests fail".into(),
-            },
+                MailboxMessage {
+                    from_session_id: session("s1"),
+                    from_title: "Planner".into(),
+                    body: "Start on step 2".into(),
+                },
+                MailboxMessage {
+                    from_session_id: session("s2"),
+                    from_title: "Reviewer".into(),
+                    body: "Tests fail".into(),
+                },
             ],
             false,
         );

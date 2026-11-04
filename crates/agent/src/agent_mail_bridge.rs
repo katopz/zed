@@ -6,9 +6,9 @@
 use super::*;
 use ::agent_mail::{Address, Envelope, MailMode, Mailroom};
 use acp_thread::ThreadStatus;
+use agent_settings::AgentSettings;
 use futures::channel::oneshot;
 use futures::future::Shared;
-use agent_settings::AgentSettings;
 use settings::{Settings as _, SettingsStore};
 
 /// Same cadence as the Claude Code waiter hook: a directory listing per live
@@ -22,6 +22,12 @@ pub(crate) struct AgentMailState {
     mailroom: Arc<Mailroom>,
     self_rig: String,
     applied_watch_interval: Option<u64>,
+    /// When each live session last (re)entered this Zed, in UTC. Broadcasts
+    /// older than a session's re-entry are skipped for it: a stopped thread
+    /// the user clicks gets its old inbox name back, and without this gate
+    /// `take_broadcasts`' ten-minute lookback would hand it every recent
+    /// blast it was never part of, starting a turn behind the user's click.
+    pub(crate) live_since: HashMap<acp_v2::SessionId, chrono::DateTime<chrono::Utc>>,
     _poller: Task<()>,
     _settings: Subscription,
 }
@@ -57,16 +63,29 @@ impl AgentMailState {
                         cx.background_spawn(async move { mailroom.flush_outbox() })
                             .detach();
                     }
-                    let Ok((inboxes, live_entries)) = this.read_with(cx, |agent, cx| {
-                        let mut inboxes = Vec::new();
+                    // Sync the per-session liveness cutoffs with the session
+                    // set: sessions that closed are pruned, sessions that
+                    // appeared (a new thread, or a stopped thread the user
+                    // just clicked back open) re-enter at `now`, so they
+                    // claim only broadcasts sent from then on.
+                    let Ok(Some((claims, live_entries))) = this.update(cx, |agent, cx| {
+                        let Some(state) = agent.agent_mail.as_mut() else {
+                            return None;
+                        };
+                        let now = chrono::Utc::now();
+                        state
+                            .live_since
+                            .retain(|session_id, _| agent.sessions.contains_key(session_id));
+                        let mut claims = Vec::new();
                         let mut live_entries = Vec::new();
                         for (session_id, session) in &agent.sessions {
                             let inbox = native_thread_mail_name(session_id);
+                            let cutoff = *state.live_since.entry(session_id.clone()).or_insert(now);
                             let (status, kind) = live_status(session, cx);
-                            inboxes.push((session_id.clone(), inbox.clone()));
+                            claims.push((session_id.clone(), inbox.clone(), cutoff));
                             live_entries.push((inbox, status, kind));
                         }
-                        (inboxes, live_entries)
+                        Some((claims, live_entries))
                     }) else {
                         break;
                     };
@@ -83,12 +102,12 @@ impl AgentMailState {
                         }
                     })
                     .detach();
-                    if inboxes.is_empty() {
+                    if claims.is_empty() {
                         continue;
                     }
                     let mailroom = mailroom.clone();
                     let claimed = cx
-                        .background_spawn(async move { claim_inboxes(&mailroom, inboxes) })
+                        .background_spawn(async move { claim_inboxes(&mailroom, claims) })
                         .await;
                     if claimed.is_empty() {
                         continue;
@@ -118,6 +137,7 @@ impl AgentMailState {
             mailroom,
             self_rig,
             applied_watch_interval: None,
+            live_since: HashMap::default(),
             _poller: poller,
             _settings: settings,
         };
@@ -183,11 +203,11 @@ pub(crate) fn is_mail_address(to: &str) -> bool {
 
 fn claim_inboxes(
     mailroom: &Mailroom,
-    inboxes: Vec<(acp_v2::SessionId, String)>,
+    inboxes: Vec<(acp_v2::SessionId, String, chrono::DateTime<chrono::Utc>)>,
 ) -> Vec<(acp_v2::SessionId, Vec<Envelope>)> {
     inboxes
         .into_iter()
-        .filter_map(|(session_id, name)| {
+        .filter_map(|(session_id, name, cutoff)| {
             let reader = name.clone();
             let names = [name];
             if !mailroom.has_mail(&names) && !mailroom.has_broadcast(&reader) {
@@ -195,7 +215,7 @@ fn claim_inboxes(
             }
             match mailroom.claim(&names) {
                 Ok(mut mail) => {
-                    mail.extend(mailroom.take_broadcasts(&reader));
+                    mail.extend(mailroom.take_broadcasts_since(&reader, cutoff));
                     (!mail.is_empty()).then_some((session_id, mail))
                 }
                 Err(error) => {
@@ -220,7 +240,10 @@ impl NativeAgent {
     /// Queues claimed mail like a `send_message` from a local thread, so an
     /// idle thread starts a turn and a busy one gets it when its turn ends —
     /// unless the envelope's mode asks otherwise (issue 046): `steering` ends
-    /// the running turn at the next message boundary, `urgent` preempts it.
+    /// the running turn at the next message boundary, `urgent` preempts it,
+    /// `fyi` never wakes anyone: it parks and is read at the next natural
+    /// turn end, so a broadcast costs busy threads a queued slice and idle
+    /// threads nothing.
     fn post_agent_mail(
         &mut self,
         session_id: &acp_v2::SessionId,
@@ -234,22 +257,35 @@ impl NativeAgent {
             );
             return None;
         }
+        let fyi_only = mail.iter().all(|envelope| envelope.mode == MailMode::Fyi);
         // Mail claimed for this thread means its wait is over (the reply or
         // scheduled wake arrived), whether it is delivered now or queued for
-        // the current turn's end.
-        if let Some(session) = self.sessions.get(session_id)
-            && let Some(acp_thread) = session.acp_thread.upgrade()
-        {
-            acp_thread.update(cx, |thread, cx| thread.set_waiting_for_mail(false, cx));
+        // the current turn's end — but an unrelated fyi blast must not end a
+        // mail wait it has nothing to do with.
+        if !fyi_only {
+            if let Some(session) = self.sessions.get(session_id)
+                && let Some(acp_thread) = session.acp_thread.upgrade()
+            {
+                acp_thread.update(cx, |thread, cx| thread.set_waiting_for_mail(false, cx));
+            }
         }
-        let urgent = mail.iter().any(|envelope| envelope.mode == MailMode::Urgent);
+        let urgent = mail
+            .iter()
+            .any(|envelope| envelope.mode == MailMode::Urgent);
         let steering = mail
             .iter()
             .any(|envelope| envelope.mode == MailMode::Steering);
         let messages = mail
             .into_iter()
             .map(|envelope| thread_mailbox::MailboxMessage {
-                from_title: format!("{} via agent-mail, to {}", envelope.from, envelope.to).into(),
+                from_title: match envelope.mode {
+                    MailMode::Fyi => format!(
+                        "{} via agent-mail, to {} (fyi — no reply needed)",
+                        envelope.from, envelope.to
+                    ),
+                    _ => format!("{} via agent-mail, to {}", envelope.from, envelope.to),
+                }
+                .into(),
                 from_session_id: acp_v2::SessionId::new(envelope.from),
                 body: envelope.body,
             });
@@ -257,6 +293,14 @@ impl NativeAgent {
             .entry(session_id.clone())
             .or_default()
             .extend(messages);
+        if fyi_only {
+            // Delivered by the existing turn-end path: a busy thread reads it
+            // at its next boundary (one extra turn per fyi batch — cheaper
+            // than a wake, and the prompt's "no reply needed" hint stops the
+            // reply round-trips); an idle thread pays nothing until its next
+            // turn for any reason.
+            return None;
+        }
         if let Some(delivery) = self.deliver_mailbox(session_id, cx) {
             return Some(delivery);
         }
@@ -311,11 +355,13 @@ pub(crate) fn preempt_and_deliver(
             if idle {
                 break;
             }
-            cx.background_executor().timer(Duration::from_millis(100)).await;
+            cx.background_executor()
+                .timer(Duration::from_millis(100))
+                .await;
         }
-        let Some(delivery) =
-            agent.update(cx, |agent, cx| agent.deliver_mailbox_preempting(&session_id, true, cx))
-        else {
+        let Some(delivery) = agent.update(cx, |agent, cx| {
+            agent.deliver_mailbox_preempting(&session_id, true, cx)
+        }) else {
             let _ = completion_tx.send(Ok(acp_v2::StopReason::Cancelled));
             return;
         };
@@ -348,6 +394,7 @@ impl NativeThreadEnvironment {
                      `name@rig` targets need it",
                 )?;
             let to = Address::parse(request.to.trim())?;
+            agent_mail::ensure_broadcast_mode(&to, request.mode)?;
             let from = native_thread_mail_name(&sender);
             let deliver_at = request
                 .deliver_at

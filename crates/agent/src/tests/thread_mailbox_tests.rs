@@ -402,7 +402,6 @@ async fn test_agent_mail_for_busy_thread_waits_for_turn_end(cx: &mut TestAppCont
     assert!(prompt.contains("status?"), "{prompt}");
 }
 
-
 fn mail_to_with_mode(
     sender: &::agent_mail::Mailroom,
     session_id: &acp_v2::SessionId,
@@ -450,7 +449,13 @@ async fn test_agent_mail_urgent_mode_preempts_busy_thread(cx: &mut TestAppContex
     // pending completion.
     let pending = fake.pending_completions_for(&thread.model);
     assert_eq!(pending.len(), 2, "preempted stream + one urgent turn");
-    let prompt = pending.last().unwrap().messages.last().unwrap().string_contents();
+    let prompt = pending
+        .last()
+        .unwrap()
+        .messages
+        .last()
+        .unwrap()
+        .string_contents();
     assert!(prompt.contains("drop everything: build broke"), "{prompt}");
     assert!(
         prompt.contains("mode=urgent"),
@@ -522,9 +527,159 @@ async fn test_agent_mail_steering_mode_ends_busy_turn_at_boundary(cx: &mut TestA
 
     // ...and the mail delivers as the next turn.
     let pending = fake.pending_completions_for(&thread.model);
-    assert_eq!(pending.len(), 1, "steering mail should start exactly one turn");
+    assert_eq!(
+        pending.len(),
+        1,
+        "steering mail should start exactly one turn"
+    );
     let prompt = pending[0].messages.last().unwrap().string_contents();
     assert!(prompt.contains("steering: check the tests now"), "{prompt}");
+}
+
+#[gpui::test]
+async fn test_agent_mail_fyi_mode_never_wakes_idle_thread(cx: &mut TestAppContext) {
+    let setup = setup_threads(1, cx).await;
+    let (agent, fake) = (&setup.agent, &setup.fake);
+    let thread = &setup.threads[0];
+    let (_home, sender) = enable_agent_mail(agent, cx);
+
+    // An idle thread must stay idle: fyi parks until the thread's next
+    // natural turn end, costing nothing now.
+    mail_to_with_mode(
+        &sender,
+        &thread.session_id,
+        "fyi: the fleet watchdog noted heavy load",
+        ::agent_mail::MailMode::Fyi,
+    );
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.run_until_parked();
+    assert!(
+        fake.pending_completions_for(&thread.model).is_empty(),
+        "fyi must not start a turn in an idle thread"
+    );
+    assert_eq!(
+        agent.read_with(cx, |agent, _| agent
+            .mailboxes
+            .get(&thread.session_id)
+            .map_or(0, Vec::len)),
+        1,
+        "the fyi should be parked in the mailbox"
+    );
+
+    // The user talks to the thread; at that turn's end the parked fyi
+    // delivers as one queued slice.
+    let own_turn = setup.send(thread, "Do some real work", cx);
+    cx.run_until_parked();
+    assert_eq!(fake.pending_completions_for(&thread.model).len(), 1);
+    fake.send_last_text(&thread.model, "Done");
+    fake.end_last(&thread.model);
+    assert_eq!(own_turn.await.unwrap(), acp_v2::StopReason::EndTurn);
+    cx.run_until_parked();
+
+    let pending = fake.pending_completions_for(&thread.model);
+    assert_eq!(
+        pending.len(),
+        1,
+        "the only in-flight turn is the fyi delivery"
+    );
+    let prompt = pending
+        .last()
+        .unwrap()
+        .messages
+        .last()
+        .unwrap()
+        .string_contents();
+    assert!(
+        prompt.contains("fyi: the fleet watchdog noted heavy load"),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains("no reply needed"),
+        "the fyi hint must tell the thread not to answer: {prompt}"
+    );
+}
+
+#[gpui::test]
+async fn test_agent_mail_broadcast_respects_liveness_cutoff(cx: &mut TestAppContext) {
+    // A thread that (re)entered after a blast landed must not process it —
+    // this is what stops a clicked stopped thread from waking on old mail.
+    let setup = setup_threads(2, cx).await;
+    let (agent, fake) = (&setup.agent, &setup.fake);
+    let live_thread = &setup.threads[0];
+    let reentered_thread = &setup.threads[1];
+    let (_home, sender) = enable_agent_mail(agent, cx);
+
+    // Let one poller tick run so both sessions have liveness cutoffs stamped
+    // before any mail is sent (chrono reads the real clock, so ordering is
+    // otherwise racy against the executor's timers).
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.run_until_parked();
+
+    // Both threads are live; a broadcast wakes both (the known blast cost).
+    let broadcast_to = ::agent_mail::Address::parse("all@m3").unwrap();
+    let blast = sender
+        .compose(&broadcast_to, "watch@amo", "blast one".into(), None)
+        .unwrap();
+    sender.send(&blast).unwrap();
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.run_until_parked();
+    assert_eq!(fake.pending_completions_for(&live_thread.model).len(), 1);
+    assert_eq!(
+        fake.pending_completions_for(&reentered_thread.model).len(),
+        1
+    );
+    // Wind the blast-one turns down so the next delivery starts clean turns.
+    fake.send_last_text(&live_thread.model, "noted");
+    fake.end_last(&live_thread.model);
+    fake.send_last_text(&reentered_thread.model, "noted");
+    fake.end_last(&reentered_thread.model);
+    cx.run_until_parked();
+
+    // The re-entered thread's cutoff moves past the next blast (as if the
+    // user clicked it open again now, after this next mail landed).
+    agent.update(cx, |agent, _| {
+        if let Some(state) = agent.agent_mail.as_mut() {
+            state.live_since.insert(
+                reentered_thread.session_id.clone(),
+                chrono::Utc::now() + chrono::Duration::minutes(1),
+            );
+        }
+    });
+    let blast = sender
+        .compose(&broadcast_to, "watch@amo", "blast two".into(), None)
+        .unwrap();
+    sender.send(&blast).unwrap();
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.run_until_parked();
+
+    let live_pending = fake.pending_completions_for(&live_thread.model);
+    assert_eq!(live_pending.len(), 1, "the live thread claims blast two");
+    assert!(
+        live_pending
+            .last()
+            .unwrap()
+            .messages
+            .last()
+            .unwrap()
+            .string_contents()
+            .contains("blast two")
+    );
+    assert!(
+        fake.pending_completions_for(&reentered_thread.model)
+            .is_empty(),
+        "the re-entered thread must skip the blast that predates its cutoff"
+    );
+    // And it is marked seen: winding down the live turn (and re-running the
+    // poller) must not resurrect the skipped blast for the re-entered one.
+    fake.send_last_text(&live_thread.model, "done");
+    fake.end_last(&live_thread.model);
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.run_until_parked();
+    assert!(
+        fake.pending_completions_for(&reentered_thread.model)
+            .is_empty(),
+        "the skipped blast must stay skipped"
+    );
 }
 
 #[gpui::test]
@@ -566,7 +721,13 @@ async fn test_send_message_mode_urgent_preempts_busy_target(cx: &mut TestAppCont
     cx.run_until_parked();
     let pending = fake.pending_completions_for(&target.model);
     assert_eq!(pending.len(), 2, "preempted stream + one urgent turn");
-    let prompt = pending.last().unwrap().messages.last().unwrap().string_contents();
+    let prompt = pending
+        .last()
+        .unwrap()
+        .messages
+        .last()
+        .unwrap()
+        .string_contents();
     assert!(prompt.contains("preempting note"), "{prompt}");
     assert!(prompt.contains("mode=urgent"), "{prompt}");
 }
@@ -625,7 +786,7 @@ async fn test_send_message_rejects_unknown_mode(cx: &mut TestAppContext) {
     let sender_thread = &setup.threads[0];
     let target = &setup.threads[1];
     let (_home, _sender) = enable_agent_mail(agent, cx);
-    let sender_turn = setup.send(sender_thread, "Send a message", cx);
+    let _sender_turn = setup.send(sender_thread, "Send a message", cx);
     cx.run_until_parked();
 
     let tool_input = json!({

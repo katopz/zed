@@ -7,15 +7,21 @@ agent-mail — message coding agents on other machines (and this one) over SSH
 
 USAGE:
   agent-mail send <name@rig | *@rig | all@rig> [--from NAME] [--reply-to ID] [--at WHEN]
-                       [--mode urgent|steering|queued] [MESSAGE...]
+                       [--mode urgent|steering|fyi|queued] [MESSAGE...]
                        MESSAGE defaults to stdin; `*@rig` = first free agent there (ONE agent);
-                       `all@rig` = broadcast, every agent on that rig gets a copy.
+                       `all@rig` = broadcast, every agent on that rig gets a copy — refused
+                       with the default mode (see below): broadcasts must say `fyi` (no wake)
+                       or `urgent`/`steering` (wakes everyone) explicitly.
                        --at schedules it (30m, 8h, 2d, 23:45, or RFC 3339): it lands, and
                        wakes the recipient, only then. Send to yourself for a timed wake-up
                        instead of a sleep loop.
                        --mode (default queued): urgent interrupts a mid-turn recipient's
                        running turn and delivers now; steering ends its turn at the next
                        message boundary and delivers then; queued waits for the turn to end.
+                       fyi never wakes an idle recipient: it is parked and read at its next
+                       natural turn boundary — the right mode for broadcast FYIs. Cost note:
+                       on a busy rig each ACTIVE agent still spends one boundary turn per
+                       fyi batch; idle ones pay nothing.
                        The receipt names the `*@rig` agent that actually took the mail.
   agent-mail recv [--as NAME]...   claim and print your mail (also the rig-wide `*` box)
   agent-mail peek [--as NAME]...   print pending mail without claiming it
@@ -537,9 +543,12 @@ fn send(room: &Mailroom, args: Vec<String>) -> Result<i32> {
                 deliver_at = Some(agent_mail::parse_when(&when, chrono::Local::now())?);
             }
             "--mode" => {
-                let raw = args.next().context("--mode needs urgent, steering or queued")?;
+                let raw = args
+                    .next()
+                    .context("--mode needs urgent, steering, fyi or queued")?;
                 mode = agent_mail::MailMode::parse(&raw)?;
             }
+            "--fyi" => mode = agent_mail::MailMode::Fyi,
             _ => words.push(arg),
         }
     }
@@ -558,6 +567,7 @@ fn send(room: &Mailroom, args: Vec<String>) -> Result<i32> {
         Some(from) => from,
         None => room.whoami()?,
     };
+    agent_mail::ensure_broadcast_mode(&to, mode)?;
     let mut envelope = room.compose(&to, &from, body, reply_to)?;
     envelope.deliver_at = deliver_at.map(|at| at.to_rfc3339());
     envelope.mode = mode;

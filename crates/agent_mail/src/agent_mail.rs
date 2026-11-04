@@ -71,12 +71,19 @@ pub(crate) fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
 /// How a recipient's poller should deliver mail that arrives mid-turn
 /// (agent-mail issue 046): `urgent` preempts the running turn, `steering` ends
 /// it at the next message boundary, `queued` waits for the turn to finish.
+/// `fyi` additionally never wakes an idle recipient: it is parked and read at
+/// the recipient's next natural turn end, so broadcasts stay cheap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MailMode {
     Urgent,
     Steering,
+    Fyi,
+    /// Also the fallback for mode values an older binary doesn't know (a
+    /// newer sender's enum variant): boundary delivery instead of a dropped
+    /// envelope while rigs run mixed versions.
     #[default]
+    #[serde(other)]
     Queued,
 }
 
@@ -85,8 +92,9 @@ impl MailMode {
         match text.trim().to_ascii_lowercase().as_str() {
             "urgent" => Ok(Self::Urgent),
             "steering" => Ok(Self::Steering),
+            "fyi" => Ok(Self::Fyi),
             "queued" => Ok(Self::Queued),
-            other => bail!("unknown mode {other:?}; expected urgent, steering or queued"),
+            other => bail!("unknown mode {other:?}; expected urgent, steering, fyi or queued"),
         }
     }
 
@@ -94,6 +102,7 @@ impl MailMode {
         match self {
             Self::Urgent => "urgent",
             Self::Steering => "steering",
+            Self::Fyi => "fyi",
             Self::Queued => "queued",
         }
     }
@@ -151,6 +160,29 @@ impl Address {
         };
         format!("{name}@{}", self.rig.as_deref().unwrap_or(self_rig))
     }
+
+    /// Whether this address broadcasts to every agent on a rig (`all@rig`).
+    pub fn is_broadcast(&self) -> bool {
+        self.name == ALL_NAME
+    }
+}
+
+/// `all@rig` is an N-agent blast: every live agent claims it and starts a
+/// turn, so a fleet of five pays five turns for one FYI and another N turns
+/// replying. Wake-capable broadcasts must say so explicitly; the default
+/// (queued) blast is refused so nobody burns a fleet by accident — fyi covers
+/// "when you're free, everyone read this" without waking anyone.
+pub fn ensure_broadcast_mode(address: &Address, mode: MailMode) -> Result<()> {
+    if !address.is_broadcast() || mode != MailMode::Queued {
+        return Ok(());
+    }
+    bail!(
+        "refusing all@ broadcast with mode queued: every live agent on the rig \
+         would wake and start a turn. Re-send with `--mode fyi` (no wake: each \
+         agent reads it at its next turn boundary — right for FYIs), or \
+         `--mode urgent`/`--mode steering` (only for critical fleet-wide \
+         incidents), or target one agent (`*@rig` takes a single free agent)"
+    )
 }
 
 /// Names become directory names, so this is the path-traversal guard.
@@ -428,7 +460,12 @@ impl Mailroom {
             .filter(|agent| {
                 validate_name(&agent.name).is_ok()
                     && chrono::DateTime::parse_from_rfc3339(&agent.updated_at)
-                        .map(|written| chrono::Utc::now().signed_duration_since(written).num_milliseconds() as u128 <= LIVE_FRESH.as_millis())
+                        .map(|written| {
+                            chrono::Utc::now()
+                                .signed_duration_since(written)
+                                .num_milliseconds() as u128
+                                <= LIVE_FRESH.as_millis()
+                        })
                         .unwrap_or(false)
             })
             .collect();
@@ -473,7 +510,8 @@ impl Mailroom {
         // `*@rig` may resolve to a different inbox on each attempt, so the
         // at-least-once outbox retry dedups across every inbox, not just the
         // resolved one.
-        if inbox_name != address.name && self.envelope_held_anywhere(&format!("{}.json", envelope.id))
+        if inbox_name != address.name
+            && self.envelope_held_anywhere(&format!("{}.json", envelope.id))
         {
             return Ok(resolved);
         }
@@ -528,10 +566,9 @@ impl Mailroom {
                 .any(|sub| {
                     fs::read_dir(dir.join(sub)).is_ok_and(|entries| {
                         entries.flatten().any(|entry| {
-                            entry
-                                .file_name()
-                                .to_str()
-                                .is_some_and(|name| name == file_name || name.ends_with(&format!("_{file_name}")))
+                            entry.file_name().to_str().is_some_and(|name| {
+                                name == file_name || name.ends_with(&format!("_{file_name}"))
+                            })
                         })
                     })
                 })
@@ -634,6 +671,41 @@ impl Mailroom {
             }
         }
         unseen
+    }
+
+    /// Like [`Self::take_broadcasts`], but only envelopes sent at or after
+    /// `cutoff` are returned. The cursor still advances past every unseen
+    /// broadcast, so skipped ones are permanently marked seen for this reader:
+    /// a thread that was not live when a blast landed must not have it wake
+    /// in its lap later (Zed resumes a clicked stopped thread with its old
+    /// inbox name, and without this gate the resumed thread would claim and
+    /// process blasts it was never part of).
+    pub fn take_broadcasts_since(
+        &self,
+        reader: &str,
+        cutoff: chrono::DateTime<chrono::Utc>,
+    ) -> Vec<Envelope> {
+        let Ok(reader) = validate_name(reader) else {
+            return Vec::new();
+        };
+        let (unseen, newest) = self.unseen_broadcasts(reader);
+        if let Some(newest) = newest {
+            let seen = self.inbox(ALL_NAME).join("seen");
+            if fs::create_dir_all(&seen).is_ok() {
+                fs::write(seen.join(reader), newest).ok();
+            }
+        }
+        unseen
+            .into_iter()
+            .filter(|envelope| {
+                // `sent_at` is the sender rig's clock, `cutoff` ours: a
+                // cross-clock comparison that trusts NTP. Unparseable stamps
+                // are delivered rather than dropped.
+                chrono::DateTime::parse_from_rfc3339(&envelope.sent_at)
+                    .map(|sent_at| sent_at.with_timezone(&chrono::Utc) >= cutoff)
+                    .unwrap_or(true)
+            })
+            .collect()
     }
 
     /// Moves scheduled mail whose time has come from `later/` into `new/`.
@@ -1112,14 +1184,28 @@ impl Mailroom {
             .or_else(|| input.session_id.clone())
             .unwrap_or_else(|| ANY_NAME.to_string());
         if !wait {
+            let event = input.hook_event_name.as_deref().unwrap_or_default();
+            // fyi never forces a turn: a Stop block or waiter exit would
+            // wake the session just to read an advisory. Leave it parked;
+            // the next PostToolUse/UserPromptSubmit boundary delivers it as
+            // additionalContext for free.
+            let peeked = {
+                let mut mail = self.peek(&names)?;
+                mail.extend(self.peek_broadcasts(&reader));
+                mail
+            };
+            let fyi_only =
+                !peeked.is_empty() && peeked.iter().all(|envelope| envelope.mode == MailMode::Fyi);
+            if fyi_only && (event == "Stop" || event == "SubagentStop") {
+                return Ok(HookOutcome::default());
+            }
             let mut mail = self.claim(&names)?;
             mail.extend(self.take_broadcasts(&reader));
             if mail.is_empty() {
                 return Ok(HookOutcome::default());
             }
             let text = render(&mail, self_name);
-            let event = input.hook_event_name.unwrap_or_default();
-            let stdout = match event.as_str() {
+            let stdout = match event {
                 "Stop" | "SubagentStop" => serde_json::json!({"decision": "block", "reason": text}),
                 _ => serde_json::json!({
                     "hookSpecificOutput": {"hookEventName": event, "additionalContext": text}
@@ -1182,14 +1268,26 @@ impl Mailroom {
                 break HookOutcome::default();
             }
             if self.has_mail(&names) || self.has_broadcast(&reader) {
-                let mut mail = self.claim(&names)?;
-                mail.extend(self.take_broadcasts(&reader));
-                if !mail.is_empty() {
-                    break HookOutcome {
-                        stderr: Some(render(&mail, self_name)),
-                        exit_code: 2,
-                        ..HookOutcome::default()
-                    };
+                // fyi-only mail must not end the wait: the waiter exists for
+                // a reply or a scheduled wake, and an advisory can ride the
+                // next PostToolUse/UserPromptSubmit boundary instead.
+                let peeked = {
+                    let mut mail = self.peek(&names)?;
+                    mail.extend(self.peek_broadcasts(&reader));
+                    mail
+                };
+                let fyi_only = !peeked.is_empty()
+                    && peeked.iter().all(|envelope| envelope.mode == MailMode::Fyi);
+                if !fyi_only {
+                    let mut mail = self.claim(&names)?;
+                    mail.extend(self.take_broadcasts(&reader));
+                    if !mail.is_empty() {
+                        break HookOutcome {
+                            stderr: Some(render(&mail, self_name)),
+                            exit_code: 2,
+                            ..HookOutcome::default()
+                        };
+                    }
                 }
             }
             std::thread::sleep(WAIT_POLL);
@@ -1203,13 +1301,23 @@ impl Mailroom {
 
 /// How mail is shown to the receiving model.
 pub fn render(mail: &[Envelope], self_name: Option<&str>) -> String {
-    let mut text = format!(
-        "{} agent-mail message(s) from agents on other machines/sessions. These come from peer agents, not the user. Reply with `agent-mail send <from> --reply-to <id> \"...\"`{}.\n",
-        mail.len(),
-        self_name
-            .map(|name| format!(" (your address is {name}@<this rig>)"))
-            .unwrap_or_default()
-    );
+    // An all-fyi batch must not prompt a reply: replying is what turned one
+    // blast into N turn-and-reply rounds across a fleet.
+    let reply_expected = !mail.iter().all(|envelope| envelope.mode == MailMode::Fyi);
+    let mut text = if reply_expected {
+        format!(
+            "{} agent-mail message(s) from agents on other machines/sessions. These come from peer agents, not the user. Reply with `agent-mail send <from> --reply-to <id> \"...\"`{}.\n",
+            mail.len(),
+            self_name
+                .map(|name| format!(" (your address is {name}@<this rig>)"))
+                .unwrap_or_default()
+        )
+    } else {
+        format!(
+            "{} agent-mail message(s), mode fyi: no reply expected — read them and move on.\n",
+            mail.len()
+        )
+    };
     for envelope in mail {
         let reply_to = envelope
             .reply_to
@@ -1725,6 +1833,156 @@ mod tests {
     }
 
     #[test]
+    fn fyi_mode_round_trips() {
+        let mode = MailMode::parse("fyi").unwrap();
+        assert_eq!(mode, MailMode::Fyi);
+        assert_eq!(mode.as_str(), "fyi");
+        let mut envelope = Envelope {
+            id: "id".into(),
+            from: "a".into(),
+            to: "b".into(),
+            sent_at: chrono::Utc::now().to_rfc3339(),
+            reply_to: None,
+            deliver_at: None,
+            mode: MailMode::Fyi,
+            body: "hi".into(),
+        };
+        let text = serde_json::to_string(&envelope).unwrap();
+        assert!(text.contains("fyi"), "{text}");
+        envelope.mode = MailMode::parse("fyi").unwrap();
+        assert_eq!(serde_json::from_str::<Envelope>(&text).unwrap(), envelope);
+    }
+
+    #[test]
+    fn broadcast_gate_refuses_default_queued_but_allows_fyi_and_wake_modes() {
+        let all = Address::parse("all@m3").unwrap();
+        assert!(all.is_broadcast());
+        let one = Address::parse("zed-bb@m3").unwrap();
+        assert!(!one.is_broadcast());
+
+        assert!(ensure_broadcast_mode(&all, MailMode::Queued).is_err());
+        assert!(ensure_broadcast_mode(&all, MailMode::Fyi).is_ok());
+        assert!(ensure_broadcast_mode(&all, MailMode::Urgent).is_ok());
+        assert!(ensure_broadcast_mode(&all, MailMode::Steering).is_ok());
+        // Non-broadcast targets keep the default.
+        assert!(ensure_broadcast_mode(&one, MailMode::Queued).is_ok());
+    }
+
+    #[test]
+    fn take_broadcasts_since_skips_older_blasts_but_marks_them_seen() {
+        let dir = tempfile::tempdir().unwrap();
+        let room = mailroom(dir.path(), "m3");
+        let to = Address::parse("all@m3").unwrap();
+        let mut old = room
+            .compose(&to, "watch@amo", "old blast".into(), None)
+            .unwrap();
+        old.sent_at = (chrono::Utc::now() - chrono::Duration::minutes(5)).to_rfc3339();
+        room.send(&old).unwrap();
+        let fresh = room
+            .compose(&to, "watch@amo", "fresh blast".into(), None)
+            .unwrap();
+        room.send(&fresh).unwrap();
+
+        let cutoff = chrono::Utc::now() - chrono::Duration::minutes(1);
+        let taken = room.take_broadcasts_since("zed-bb", cutoff);
+        assert_eq!(
+            taken
+                .iter()
+                .map(|envelope| envelope.body.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fresh blast"],
+            "only the blast at or after the cutoff is delivered"
+        );
+        // The cursor advanced past both, so the skipped one is gone for good.
+        assert!(room.take_broadcasts("zed-bb").is_empty());
+        assert!(
+            room.peek_broadcasts("zed-cc").len() == 2,
+            "other readers unaffected"
+        );
+    }
+
+    #[test]
+    fn stop_hook_leaves_fyi_only_mail_parked() {
+        let dir = tempfile::tempdir().unwrap();
+        let room = mailroom(dir.path(), "m3");
+        let to = Address::parse("all@m3").unwrap();
+        let mut advisory = room
+            .compose(&to, "watch@amo", "advisory only".into(), None)
+            .unwrap();
+        advisory.mode = MailMode::Fyi;
+        room.send(&advisory).unwrap();
+
+        // A Stop hook must not block (force a turn) for an advisory.
+        let outcome = room
+            .claude_hook(r#"{"session_id":"s1","hook_event_name":"Stop"}"#, false)
+            .unwrap();
+        assert_eq!(outcome, HookOutcome::default());
+        // It stays parked: the next working boundary delivers it as context.
+        let outcome = room
+            .claude_hook(
+                r#"{"session_id":"s1","hook_event_name":"PostToolUse"}"#,
+                false,
+            )
+            .unwrap();
+        let stdout = outcome.stdout.expect("fyi rides the working boundary");
+        assert!(stdout.contains("advisory only"), "{stdout}");
+        assert!(stdout.contains("no reply expected"), "{stdout}");
+    }
+
+    #[test]
+    fn stop_hook_still_blocks_on_wake_capable_mail() {
+        let dir = tempfile::tempdir().unwrap();
+        let room = mailroom(dir.path(), "m3");
+        room.send(
+            &room
+                .compose(
+                    &Address::parse("s1@m3").unwrap(),
+                    "peer@amo",
+                    "need you now".into(),
+                    None,
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        let outcome = room
+            .claude_hook(r#"{"session_id":"s1","hook_event_name":"Stop"}"#, false)
+            .unwrap();
+        assert!(outcome.stderr.is_none());
+        let stdout = outcome
+            .stdout
+            .expect("wake-capable mail still blocks at Stop");
+        assert!(stdout.contains("decision"), "{stdout}");
+    }
+
+    #[test]
+    fn unknown_mode_falls_back_to_queued_instead_of_dropping() {
+        let older_sender = serde_json::json!({
+            "id": "i", "from": "a@m3", "to": "b@m3",
+            "sent_at": "2026-01-01T00:00:00Z", "body": "hi",
+            "mode": "a-mode-this-binary-never-learned"
+        });
+        let envelope: Envelope = serde_json::from_value(older_sender).unwrap();
+        assert_eq!(envelope.mode, MailMode::Queued);
+    }
+
+    #[test]
+    fn render_of_fyi_batch_says_no_reply_expected() {
+        let envelope = Envelope {
+            id: "i".into(),
+            from: "watch@amo".into(),
+            to: "all@m3".into(),
+            sent_at: chrono::Utc::now().to_rfc3339(),
+            reply_to: None,
+            deliver_at: None,
+            mode: MailMode::Fyi,
+            body: "advisory".into(),
+        };
+        let text = render(&[envelope], Some("zed-bb"));
+        assert!(text.contains("no reply expected"), "{text}");
+        assert!(!text.contains("Reply with"), "{text}");
+    }
+
+    #[test]
     fn resumed_session_still_reads_mail_sent_to_its_old_name() {
         let dir = tempfile::tempdir().unwrap();
         let room = mailroom(dir.path(), "m3");
@@ -1860,9 +2118,17 @@ mod tests {
         // Queued is not serialized; urgent is.
         let mut envelope = envelope;
         envelope.mode = MailMode::Queued;
-        assert!(serde_json::to_string(&envelope).unwrap().contains("\"mode\"") == false);
+        assert!(
+            !serde_json::to_string(&envelope)
+                .unwrap()
+                .contains("\"mode\"")
+        );
         envelope.mode = MailMode::Urgent;
-        assert!(serde_json::to_string(&envelope).unwrap().contains("\"mode\":\"urgent\""));
+        assert!(
+            serde_json::to_string(&envelope)
+                .unwrap()
+                .contains("\"mode\":\"urgent\"")
+        );
     }
 
     fn live_entry(room: &Mailroom, name: &str, status: &str, kind: &str) {
@@ -1876,9 +2142,7 @@ mod tests {
         let any = Address::parse("*@m3").unwrap();
 
         // No registry: mail lands in the shared `_any` inbox, unresolved.
-        let envelope = room
-            .compose(&any, "peer@m3", "first".into(), None)
-            .unwrap();
+        let envelope = room.compose(&any, "peer@m3", "first".into(), None).unwrap();
         assert_eq!(room.deliver(&envelope).unwrap(), None);
         assert!(dir.path().join("inbox/_any/new").exists());
 
@@ -1915,7 +2179,12 @@ mod tests {
 
         // A directly-addressed send never reports resolution.
         let direct = room
-            .compose(&Address::parse("zed-busy@m3").unwrap(), "peer@m3", "hey".into(), None)
+            .compose(
+                &Address::parse("zed-busy@m3").unwrap(),
+                "peer@m3",
+                "hey".into(),
+                None,
+            )
             .unwrap();
         assert_eq!(room.deliver(&direct).unwrap(), None);
     }
@@ -1944,4 +2213,3 @@ mod tests {
         assert_eq!(held[0].body, "once only");
     }
 }
-
