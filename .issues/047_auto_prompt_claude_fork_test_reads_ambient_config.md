@@ -53,4 +53,4 @@ always-zero-for-Claude `input_tokens` — see the test's doc comment).
 
 ## Commit
 
-- fix: `<hash>`
+- fix: 7c2f1fba27 (also carries this issue file)
