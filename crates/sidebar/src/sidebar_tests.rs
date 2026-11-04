@@ -6417,6 +6417,136 @@ async fn test_running_thread_sorts_below_pinned_above_idle(cx: &mut TestAppConte
 }
 
 #[gpui::test]
+async fn test_running_thread_sorts_above_continuation_of_pinned_root(
+    cx: &mut TestAppContext,
+) {
+    // A pinned thread that was continued (auto_prompt summary handoff)
+    // becomes a hidden child of a chain headed by a fresh unpinned thread.
+    // The hidden pinned child must not drag the chain into the pinned tier:
+    // the visible chain head is unpinned and idle, so the running thread
+    // has to sort above it.
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    let now = Utc::now();
+    // The pinned root, continued by the thread below.
+    save_thread_metadata(
+        acp::SessionId::new(Arc::from("root-session")),
+        Some("Pinned Root".into()),
+        now - chrono::Duration::hours(3),
+        None,
+        None,
+        &project,
+        cx,
+    );
+    cx.run_until_parked();
+    let root_thread_id = cx.update(|_, cx| {
+        ThreadMetadataStore::global(cx)
+            .read(cx)
+            .entry_by_session(&acp::SessionId::new(Arc::from("root-session")))
+            .expect("root thread should exist")
+            .thread_id
+    });
+    sidebar.update(cx, |sidebar, cx| {
+        sidebar.pin_thread(root_thread_id, true, cx);
+    });
+
+    // Its fresh continuation, unpinned and idle. This is the row the
+    // sidebar renders for the chain.
+    save_thread_metadata(
+        acp::SessionId::new(Arc::from("cont-session")),
+        Some("Continuation Head".into()),
+        now - chrono::Duration::minutes(1),
+        None,
+        None,
+        &project,
+        cx,
+    );
+    cx.run_until_parked();
+    let cont_thread_id = cx.update(|_, cx| {
+        ThreadMetadataStore::global(cx)
+            .read(cx)
+            .entry_by_session(&acp::SessionId::new(Arc::from("cont-session")))
+            .expect("continuation thread should exist")
+            .thread_id
+    });
+    cx.update(|_, cx| {
+        ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+            store.set_continued_from(
+                cont_thread_id,
+                acp::SessionId::new(Arc::from("root-session")),
+                cx,
+            )
+        });
+    });
+    cx.run_until_parked();
+
+    // A live running thread whose persisted metadata is stale.
+    let connection = StubAgentConnection::new();
+    open_thread_with_connection(&panel, connection.clone(), cx);
+    send_message(&panel, cx);
+    let running_session = active_session_id(&panel, cx);
+    save_test_thread_metadata(&running_session, &project, cx).await;
+    cx.update(|_, cx| {
+        connection.send_update(
+            running_session.clone(),
+            acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(
+                "working...".into(),
+            )),
+            cx,
+        );
+    });
+    cx.run_until_parked();
+
+    let entries = visible_entries_as_strings(&sidebar, cx);
+    assert_eq!(entries[0], "v [my-project]");
+    assert!(
+        entries[1].contains("(running)"),
+        "the running thread should come first: no pinned row is visible \
+         because the pinned root is folded under its continuation, got {:?}",
+        entries
+    );
+    assert_eq!(
+        entries[2], "  Continuation Head",
+        "the chain (headed by its fresh unpinned thread) must sort below \
+         the running thread even though its hidden root is pinned, got {:?}",
+        entries
+    );
+    // The chain stays intact: the head carries the fold, the pinned root
+    // hides under it.
+    let (roles, visible_titles) = sidebar.read_with(cx, |sidebar, _| {
+        (
+            sidebar.contents.continuation_rows.clone(),
+            sidebar
+                .contents
+                .entries
+                .iter()
+                .filter_map(|entry| match entry {
+                    ListEntry::Thread(thread) => {
+                        Some(thread.metadata.display_title().to_string())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+        )
+    });
+    assert_eq!(
+        visible_titles,
+        vec!["Hello".to_string(), "Continuation Head".to_string()],
+        "the pinned root should be folded under its continuation head"
+    );
+    assert!(
+        matches!(
+            roles.get(&cont_thread_id),
+            Some(continuation_chains::ContinuationRow::Head { .. })
+        ),
+        "the continuation should head the chain"
+    );
+}
+
+#[gpui::test]
 async fn test_draft_sorts_above_pinned_threads(cx: &mut TestAppContext) {
     let project = init_test_project_with_agent_panel("/my-project", cx).await;
     let (multi_workspace, cx) =

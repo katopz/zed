@@ -1927,31 +1927,6 @@ impl Sidebar {
                         notified_threads.remove(&thread.metadata.thread_id);
                     }
                 }
-
-                threads.sort_by(|a, b| {
-                    let a_time = Self::thread_display_time(&a.metadata);
-                    let b_time = Self::thread_display_time(&b.metadata);
-                    // Tier 0: drafts (a new thread whose prompt hasn't been
-                    // sent) float above everything, pinned threads included.
-                    // Once the prompt is sent the draft gains a session and
-                    // re-sorts into the tiers below. Tier 1: pinned threads,
-                    // most recently pinned first. Tier 2: unpinned threads —
-                    // active ones (waiting/running) above idle ones, then by
-                    // recency descending.
-                    b.draft
-                        .is_some()
-                        .cmp(&a.draft.is_some())
-                        .then_with(|| b.metadata.pinned.cmp(&a.metadata.pinned))
-                        .then_with(|| match a.metadata.pinned {
-                            true => Self::thread_pin_time(&b.metadata)
-                                .cmp(&Self::thread_pin_time(&a.metadata)),
-                            false => b
-                                .status
-                                .urgency()
-                                .cmp(&a.status.urgency())
-                                .then_with(|| b_time.cmp(&a_time)),
-                        })
-                });
             } else {
                 for info in live_infos {
                     if info.status == AgentThreadStatus::Running {
@@ -6081,84 +6056,131 @@ impl Sidebar {
         current_thread_ids: &mut HashSet<agent_ui::ThreadId>,
         chains: ChainLayout,
     ) {
-        fn display_time(entry: &ListEntry) -> DateTime<Utc> {
-            match entry {
-                ListEntry::Thread(thread) if thread.draft == Some(DraftKind::Empty) => {
-                    DateTime::<Utc>::MAX_UTC
+        // Chain membership is metadata-only, so units are built before
+        // ordering and each chain sorts as one row represented by its head
+        // (the newest thread, which is what the list renders). A chain's tier
+        // comes from the head's pinned flag plus the chain's aggregate status,
+        // never from a hidden member's pinned flag: a pinned root hidden under
+        // a fresh continuation must not drag the chain into the pinned tier,
+        // or running threads would sort below stopped-looking rows.
+        enum SortItem {
+            Terminal(TerminalEntry),
+            Chain(continuation_chains::ChainUnit),
+        }
+
+        impl SortItem {
+            fn is_draft(&self) -> bool {
+                match self {
+                    SortItem::Terminal(_) => false,
+                    SortItem::Chain(unit) => unit.head.draft.is_some(),
                 }
-                ListEntry::Thread(thread) => Sidebar::thread_display_time(&thread.metadata),
-                ListEntry::Terminal(terminal) => terminal.metadata.created_at,
-                ListEntry::ProjectHeader { .. } => unreachable!(),
+            }
+
+            fn pinned(&self) -> bool {
+                match self {
+                    SortItem::Terminal(_) => false,
+                    SortItem::Chain(unit) => unit.head.metadata.pinned,
+                }
+            }
+
+            fn pin_time(&self) -> DateTime<Utc> {
+                match self {
+                    SortItem::Terminal(_) => DateTime::<Utc>::MIN_UTC,
+                    SortItem::Chain(unit) => Sidebar::thread_pin_time(&unit.head.metadata),
+                }
+            }
+
+            fn urgency(&self) -> u8 {
+                match self {
+                    // Terminals are never pinned and never running, so they
+                    // join the unpinned tier with zero urgency.
+                    SortItem::Terminal(_) => 0,
+                    SortItem::Chain(unit) => unit.status().urgency(),
+                }
+            }
+
+            fn display_time(&self) -> DateTime<Utc> {
+                match self {
+                    SortItem::Terminal(terminal) => terminal.metadata.created_at,
+                    SortItem::Chain(unit) => match unit.head.draft {
+                        Some(DraftKind::Empty) => DateTime::<Utc>::MAX_UTC,
+                        _ => Sidebar::thread_display_time(&unit.head.metadata),
+                    },
+                }
             }
         }
 
-        let is_draft = |entry: &ListEntry| matches!(entry, ListEntry::Thread(thread) if thread.draft.is_some());
-        // Terminals are never pinned and never running, so they join the
-        // unpinned tier with zero urgency.
-        let pinned = |entry: &ListEntry| -> bool {
-            match entry {
-                ListEntry::Thread(thread) => thread.metadata.pinned,
-                _ => false,
-            }
-        };
-        let pin_time = |entry: &ListEntry| -> DateTime<Utc> {
-            match entry {
-                ListEntry::Thread(thread) => Sidebar::thread_pin_time(&thread.metadata),
-                _ => DateTime::<Utc>::MIN_UTC,
-            }
-        };
-        let urgency = |entry: &ListEntry| -> u8 {
-            match entry {
-                ListEntry::Thread(thread) if !thread.metadata.pinned => thread.status.urgency(),
-                _ => 0,
-            }
-        };
-
-        let row_entries: Vec<ListEntry> = terminals
+        let items: Vec<SortItem> = terminals
             .into_iter()
-            .map(ListEntry::Terminal)
-            .chain(threads.into_iter().map(ListEntry::Thread))
+            .map(SortItem::Terminal)
+            .chain(
+                continuation_chains::compute_chain_units(threads)
+                    .into_iter()
+                    .map(SortItem::Chain),
+            )
+            .collect();
+
+        // Tier 0: drafts (a new thread whose prompt hasn't been sent) float
+        // above everything, pinned threads included. Tier 1: pinned threads,
+        // most recently pinned first. Tier 2: unpinned threads — active ones
+        // (waiting/running) above idle ones, then recency descending.
+        let mut sorted: Vec<SortItem> = items
+            .into_iter()
             .sorted_by(|left, right| {
-                // Tier 0: drafts (a new thread whose prompt hasn't been sent)
-                // float above everything, pinned threads included. Tier 1:
-                // pinned threads, most recently pinned first. Tier 2: unpinned
-                // threads — active ones (waiting/running) above idle ones,
-                // then recency descending. Matches the in-group sort in
-                // `rebuild_contents`.
-                is_draft(right)
-                    .cmp(&is_draft(left))
-                    .then_with(|| pinned(right).cmp(&pinned(left)))
-                    .then_with(|| match pinned(left) {
-                        true => pin_time(right).cmp(&pin_time(left)),
-                        false => urgency(right)
-                            .cmp(&urgency(left))
-                            .then_with(|| display_time(right).cmp(&display_time(left))),
+                right
+                    .is_draft()
+                    .cmp(&left.is_draft())
+                    .then_with(|| right.pinned().cmp(&left.pinned()))
+                    .then_with(|| match left.pinned() {
+                        true => right.pin_time().cmp(&left.pin_time()),
+                        false => right
+                            .urgency()
+                            .cmp(&left.urgency())
+                            .then_with(|| right.display_time().cmp(&left.display_time())),
                     })
             })
             .collect();
-        let grouped = continuation_chains::group_continuation_chains(
-            row_entries,
-            chains.expanded,
-            chains.active,
-            chains.force_expanded,
-        );
-        chains.rows.extend(grouped.roles);
-        for thread in grouped.hidden {
-            if let Some(session_id) = &thread.metadata.session_id {
-                current_session_ids.insert(session_id.clone());
-            }
-            current_thread_ids.insert(thread.metadata.thread_id);
-            chains.hidden.insert(thread.metadata.thread_id, thread);
-        }
 
-        for entry in grouped.visible {
-            if let ListEntry::Thread(thread) = &entry {
-                if let Some(session_id) = &thread.metadata.session_id {
-                    current_session_ids.insert(session_id.clone());
+        for item in sorted.drain(..) {
+            match item {
+                SortItem::Terminal(terminal) => {
+                    entries.push(ListEntry::Terminal(terminal));
                 }
-                current_thread_ids.insert(thread.metadata.thread_id);
+                SortItem::Chain(unit) => {
+                    let mut visible = Vec::new();
+                    let mut hidden = Vec::new();
+                    let mut roles = Vec::new();
+                    continuation_chains::emit_chain_unit(
+                        unit,
+                        &mut visible,
+                        &mut hidden,
+                        &mut roles,
+                        chains.expanded,
+                        chains.active,
+                        chains.force_expanded,
+                    );
+                    let track =
+                        |thread: &Arc<ThreadEntry>, current_session_ids: &mut HashSet<acp::SessionId>, current_thread_ids: &mut HashSet<agent_ui::ThreadId>| {
+                            if let Some(session_id) = &thread.metadata.session_id {
+                                current_session_ids.insert(session_id.clone());
+                            }
+                            current_thread_ids.insert(thread.metadata.thread_id);
+                        };
+                    for entry in &visible {
+                        if let ListEntry::Thread(thread) = entry {
+                            track(thread, current_session_ids, current_thread_ids);
+                        }
+                    }
+                    for thread in &hidden {
+                        track(thread, current_session_ids, current_thread_ids);
+                    }
+                    chains.rows.extend(roles);
+                    for thread in hidden {
+                        chains.hidden.insert(thread.metadata.thread_id, thread);
+                    }
+                    entries.extend(visible);
+                }
             }
-            entries.push(entry);
         }
     }
 

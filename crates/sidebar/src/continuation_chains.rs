@@ -9,8 +9,11 @@ use super::*;
 pub(crate) enum ContinuationRow {
     /// The newest thread of a chain; the older threads fold under it.
     Head {
-        /// Identifies the chain across rebuilds: the oldest visible thread,
-        /// which stays put while new continuations are added on top.
+        /// Identifies the chain across rebuilds so the fold state survives.
+        /// This is the thread the parent walk terminates at (the one no
+        /// continuation links from), not a position anchor: the chain sorts
+        /// by its head's keys so the row moves as the chain's newest thread
+        /// does.
         root: ThreadId,
         /// The older threads, newest first.
         earlier: Vec<ThreadId>,
@@ -34,47 +37,48 @@ pub(crate) fn chain_status(
     })
 }
 
-/// Rows grouped into chains, ready to push.
-pub(crate) struct GroupedRows {
-    pub visible: Vec<ListEntry>,
-    /// Children of collapsed chains: not rendered, but still part of the group.
-    pub hidden: Vec<Arc<ThreadEntry>>,
-    pub roles: Vec<(ThreadId, ContinuationRow)>,
+/// One continuation chain as a single sortable unit, represented by the
+/// newest thread (the head the list renders).
+pub(crate) struct ChainUnit {
+    pub head: Arc<ThreadEntry>,
+    /// The older threads, newest first.
+    pub children: Vec<Arc<ThreadEntry>>,
+    /// The thread the parent walk terminates at; identifies the chain.
+    pub root_id: ThreadId,
 }
 
-/// Groups `rows` (already in display order) into continuation chains. A chain
-/// takes the place of its first row and lists its threads newest first, so the
-/// newest thread heads it. A chain is expanded when `expanded` says so, else
-/// when `active` is one of its older threads (so the active row never hides).
-pub(crate) fn group_continuation_chains(
-    rows: Vec<ListEntry>,
-    expanded: &HashMap<ThreadId, bool>,
-    active: Option<ThreadId>,
-    force_expanded: bool,
-) -> GroupedRows {
-    let session_index: HashMap<&acp::SessionId, usize> = rows
+impl ChainUnit {
+    /// The status the chain's row shows: the head's own, upgraded when a
+    /// hidden thread needs attention more (so folding never hides work).
+    pub(crate) fn status(&self) -> AgentThreadStatus {
+        chain_status(
+            self.head.status,
+            self.children.iter().map(|child| child.status),
+        )
+    }
+}
+
+/// Groups `threads` into chain units by `continued_from_session_id` links.
+/// Order-independent: membership comes from session ids alone, so callers can
+/// sort the resulting units afterwards without changing who belongs where.
+pub(crate) fn compute_chain_units(threads: Vec<Arc<ThreadEntry>>) -> Vec<ChainUnit> {
+    let session_index: HashMap<&acp::SessionId, usize> = threads
         .iter()
         .enumerate()
-        .filter_map(|(ix, row)| match row {
-            ListEntry::Thread(thread) => thread.metadata.session_id.as_ref().map(|id| (id, ix)),
-            _ => None,
-        })
+        .filter_map(|(ix, thread)| thread.metadata.session_id.as_ref().map(|id| (id, ix)))
         .collect();
     let parent = |ix: usize| -> Option<usize> {
-        let ListEntry::Thread(thread) = &rows[ix] else {
-            return None;
-        };
-        let from = thread.metadata.continued_from_session_id.as_ref()?;
+        let from = threads[ix].metadata.continued_from_session_id.as_ref()?;
         session_index
             .get(from)
             .copied()
             .filter(|parent| *parent != ix)
     };
-    let roots: Vec<usize> = (0..rows.len())
+    let roots: Vec<usize> = (0..threads.len())
         .map(|ix| {
             let mut current = ix;
             // Bounded walk: a corrupt link cycle must not hang the sidebar.
-            for _ in 0..rows.len() {
+            for _ in 0..threads.len() {
                 match parent(current) {
                     Some(next) => current = next,
                     None => break,
@@ -83,40 +87,17 @@ pub(crate) fn group_continuation_chains(
             current
         })
         .collect();
-    let root_ids: Vec<Option<ThreadId>> = roots
-        .iter()
-        .map(|&root| match &rows[root] {
-            ListEntry::Thread(thread) => Some(thread.metadata.thread_id),
-            _ => None,
-        })
-        .collect();
     let mut members: HashMap<usize, Vec<usize>> = HashMap::default();
     for (ix, &root) in roots.iter().enumerate() {
         members.entry(root).or_default().push(ix);
     }
 
-    let mut slots: Vec<Option<ListEntry>> = rows.into_iter().map(Some).collect();
-    let mut grouped = GroupedRows {
-        visible: Vec::new(),
-        hidden: Vec::new(),
-        roles: Vec::new(),
-    };
-    for ix in 0..slots.len() {
-        let Some(group) = members.remove(&roots[ix]) else {
-            continue;
-        };
-        let (Some(root_id), true) = (root_ids[ix], group.len() > 1) else {
-            grouped
-                .visible
-                .extend(group.iter().filter_map(|&member| slots[member].take()));
-            continue;
-        };
+    let mut units = Vec::new();
+    for (root_ix, group) in members {
+        let root_id = threads[root_ix].metadata.thread_id;
         let mut threads: Vec<Arc<ThreadEntry>> = group
-            .iter()
-            .filter_map(|&member| match slots[member].take() {
-                Some(ListEntry::Thread(thread)) => Some(thread),
-                _ => None,
-            })
+            .into_iter()
+            .map(|member| threads[member].clone())
             .collect();
         threads.sort_by(|left, right| {
             Sidebar::thread_display_time(&right.metadata)
@@ -126,7 +107,34 @@ pub(crate) fn group_continuation_chains(
         let Some(head) = threads.next() else {
             continue;
         };
-        let children: Vec<Arc<ThreadEntry>> = threads.collect();
+        units.push(ChainUnit {
+            head,
+            children: threads.collect(),
+            root_id,
+        });
+    }
+    units
+}
+
+/// Emits one chain unit into the list: the head row carries the chain role,
+/// and children either show indented (expanded) or fold away (hidden). A chain
+/// is expanded when `expanded` says so, else when `active` is one of its older
+/// threads (so the active row never hides).
+pub(crate) fn emit_chain_unit(
+    unit: ChainUnit,
+    visible: &mut Vec<ListEntry>,
+    hidden: &mut Vec<Arc<ThreadEntry>>,
+    roles: &mut Vec<(ThreadId, ContinuationRow)>,
+    expanded: &HashMap<ThreadId, bool>,
+    active: Option<ThreadId>,
+    force_expanded: bool,
+) {
+    let ChainUnit {
+        head,
+        children,
+        root_id,
+    } = unit;
+    if !children.is_empty() {
         let is_expanded = force_expanded
             || expanded.get(&root_id).copied().unwrap_or_else(|| {
                 active.is_some_and(|active| {
@@ -135,7 +143,7 @@ pub(crate) fn group_continuation_chains(
                         .any(|child| child.metadata.thread_id == active)
                 })
             });
-        grouped.roles.push((
+        roles.push((
             head.metadata.thread_id,
             ContinuationRow::Head {
                 root: root_id,
@@ -146,18 +154,17 @@ pub(crate) fn group_continuation_chains(
                 expanded: is_expanded,
             },
         ));
-        grouped.visible.push(ListEntry::Thread(head));
+        visible.push(ListEntry::Thread(head));
         for child in children {
-            grouped
-                .roles
-                .push((child.metadata.thread_id, ContinuationRow::Child));
+            roles.push((child.metadata.thread_id, ContinuationRow::Child));
             match is_expanded {
-                true => grouped.visible.push(ListEntry::Thread(child)),
-                false => grouped.hidden.push(child),
+                true => visible.push(ListEntry::Thread(child)),
+                false => hidden.push(child),
             }
         }
+    } else {
+        visible.push(ListEntry::Thread(head));
     }
-    grouped
 }
 
 /// Per-rebuild inputs and outputs of chain grouping, shared by every project group.
