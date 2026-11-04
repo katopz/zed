@@ -811,8 +811,14 @@ async fn test_manual_auto_prompt_forks_claude_thread_above_overflow_gate(cx: &mu
     });
     cx.run_until_parked();
 
-    let overflow_gate =
-        auto_prompt::AutoPromptConfig::default().effective_claude_context_overflow_tokens() as u64;
+    // The gate must come from the config the dispatch actually reads
+    // (`load_config_cached`, which loads `~/.config/zed/auto_prompt.json`),
+    // not from `AutoPromptConfig::default()`: a user config with a larger
+    // `max_context_tokens` (e.g. 320k) shifts the effective gate and would
+    // leave `gate + 1` below it (issue 047).
+    let overflow_gate = auto_prompt::load_config_cached()
+        .unwrap_or_default()
+        .effective_claude_context_overflow_tokens() as u64;
     active_thread(&conversation_view, cx).update(cx, |view, cx| {
         view.thread.update(cx, |thread, cx| {
             thread.update_usage(
