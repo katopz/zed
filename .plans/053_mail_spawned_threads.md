@@ -9,6 +9,16 @@ Status: DONE — round 2 (owner follow-up): resume + rig watcher landed, setting
 - [x] Owner settings: `{ "agent": { "fork": { "agent_mail_spawn_threads": true } } }` added to `~/.config/zed/settings.json` (m3).
 - [x] Zed Dev rebuilt via `./script/bundle-mac -i` and agent-mail binary reinstalled.
 
+## Round 3 — per-rig deployment (owner follow-up)
+
+- [x] **m3** (this rig): watcher verified loaded (`launchctl list` → `dev.agent-mail.zed-wake`, exit 0).
+- [x] **amo** (has Zed IDE): repo pulled to `eac5b5e0fa` (clean tree, ff-only); `cargo install --path crates/agent_mail --force`; `rig zed-wake --install` + launchctl bootstrapped (loaded, exit 0); settings key added (JSON5 validated); **Zed Dev rebuilt + installed** via direct `./script/bundle-mac -i` run (binary mtime Nov 6 00:02; rig-job runner exit 255 — see below). Takes effect on amo's next Zed restart.
+- [x] **4090** (Windows, Zed at `C:\Users\katop\OneDrive\Desktop\zed.exe`): gitsync had already pulled `eac5b5e0fa`; `cargo install --path crates\agent_mail --force` → new `agent-mail.exe`; watcher via Task Scheduler `\zed-wake` (every minute, `/it`, wrapper `E:\git\zed-wake.cmd` sets `AGENT_MAIL_WAKE_COMMAND` to the Desktop zed.exe since Windows has no default launch command; log `E:\git\zed-wake.log`); settings key added via `E:\git\zed-wake-settings.ps1` (since removed); first tick ran, task Ready with next run scheduled.
+- [x] **bmo**: skipped — no Zed, no zed repo ("first free agent" mail there is Claude-waiter-only; a Zed wake is meaningless and the wire format is compat-by-design). Revisit only if bmo gains a Zed.
+- [x] **Known issue (rig-job runner)**: `agent-mail rig run amo` job `01a1ac98` failed exit 255 in ~1s with the runner's SSH answering `Host key verification failed` (amo's known_hosts entry predates its Tailscale IP; the log path `rig log` gives resolves differently from amo's side — retrieval via `HostKeyAlias=amo` scp worked). Direct ssh run used instead; runner auth on amo needs a look (filed below).
+- [ ] **Deferred**: 4090 Zed rebuild (spawn/resume support in its Desktop zed.exe) — the box is BUSY with 3 GPU contenders and a Windows release build would contend for CPU; do it in a quiet window via `script/dev-rebuild-windows.ps1` on the box. Watcher + settings are in place, so mail-triggered wakes already work there once its Zed build ships the feature.
+- [ ] **Deferred (refinement)**: pinned mail-driven threads hold their `AcpThread` until Zed restarts; unpin when the user deletes the thread from history (needs a delete-notification hook into `NativeAgent`).
+
 ## Why
 
 Cross-rig mail can only reach threads that already exist: the poller claims
