@@ -341,8 +341,44 @@ fn run(args: Vec<String>) -> Result<i32> {
                 }
                 Ok(0)
             }
+            Some("zed-wake") => {
+                let mut once = false;
+                let mut install = false;
+                for arg in args.by_ref() {
+                    match arg.as_str() {
+                        "--once" => once = true,
+                        "--install" => install = true,
+                        other => bail!("unexpected argument {other:?}"),
+                    }
+                }
+                let _ = once; // --once is the invocation shape; a tick runs either way
+                if install {
+                    let path = agent_mail::zed_wake::install_launchd(&room)?;
+                    println!(
+                        "wrote {}\nload it with: launchctl bootstrap gui/$(id -u) {}",
+                        path.display(),
+                        path.display()
+                    );
+                    return Ok(0);
+                }
+                let report = agent_mail::zed_wake::tick(&room, chrono::Utc::now())?;
+                if report.woke {
+                    println!(
+                        "zed-wake: launched Zed for {}",
+                        report.candidates.join(", ")
+                    );
+                } else if report.candidates.is_empty() {
+                    println!("zed-wake: nothing waiting");
+                } else {
+                    println!(
+                        "zed-wake: {} waiting (cooldown or a live Zed)",
+                        report.candidates.join(", ")
+                    );
+                }
+                Ok(0)
+            }
             _ => bail!(
-                "usage: agent-mail rig status [RIG...|all] [--json] | rig watch [--once|--force|--install|--interval MIN]"
+                "usage: agent-mail rig status [RIG...|all] [--json] | rig watch [--once|--force|--install|--interval MIN] | rig zed-wake [--once|--install]"
             ),
         },
         Some("flush") => {

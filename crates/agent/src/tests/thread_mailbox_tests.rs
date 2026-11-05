@@ -1065,6 +1065,92 @@ async fn test_agent_mail_spawn_is_off_by_default(cx: &mut TestAppContext) {
     assert_eq!(sender.peek(&["task-off".to_string()]).unwrap().len(), 1);
 }
 
+fn make_saved_thread(title: &str) -> crate::db::DbThread {
+    crate::db::DbThread {
+        title: title.to_string().into(),
+        messages: Vec::new(),
+        updated_at: chrono::Utc::now(),
+        detailed_summary: None,
+        initial_project_snapshot: None,
+        cumulative_token_usage: Default::default(),
+        request_token_usage: HashMap::default(),
+        model: None,
+        profile: None,
+        subagent_context: None,
+        speed: None,
+        thinking_enabled: false,
+        thinking_effort: None,
+        draft_prompt: None,
+        ui_scroll_position: None,
+        sandboxed_terminal_temp_dir: None,
+        sandbox_grants: crate::db::DbSandboxGrants::default(),
+    }
+}
+
+#[gpui::test]
+async fn test_agent_mail_resumes_saved_thread_for_zed_name(cx: &mut TestAppContext) {
+    let setup = setup_threads(1, cx).await;
+    let (agent, fake) = (&setup.agent, &setup.fake);
+    let (_home, sender) = enable_agent_mail(agent, cx);
+    enable_mail_spawn(cx);
+
+    // A thread that is not live: only a row in the thread database.
+    let departed_id = acp_v2::SessionId::new("11111111-2222-3333-4444-555555555555");
+    let mail_name = agent_mail_bridge::native_thread_mail_name(&departed_id);
+    let database = cx
+        .update(|cx| crate::db::ThreadsDatabase::connect(cx))
+        .await
+        .unwrap();
+    database
+        .save_thread(
+            departed_id.clone(),
+            make_saved_thread("Departed"),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+
+    mail_to_name(&sender, &mail_name, "continue where you left off");
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.run_until_parked();
+
+    let (resumed_title, resumed_model) = agent.read_with(cx, |agent, cx| {
+        assert!(
+            agent.sessions.contains_key(&departed_id),
+            "mail to a saved thread's inbox should resume it"
+        );
+        assert!(
+            agent
+                .agent_mail
+                .as_ref()
+                .unwrap()
+                .pinned_threads
+                .contains_key(&departed_id),
+            "the resumed thread must be pinned or it releases itself"
+        );
+        assert_eq!(
+            agent.agent_mail_address(&departed_id).unwrap(),
+            format!("{mail_name}@m3")
+        );
+        assert_eq!(agent.sessions.len(), 2);
+        let thread = agent.sessions[&departed_id].thread.read(cx);
+        (
+            thread.title().unwrap().to_string(),
+            thread.model().unwrap().clone(),
+        )
+    });
+    assert_eq!(resumed_title, "Departed");
+
+    let pending = fake.pending_completions_for(&resumed_model);
+    assert_eq!(
+        pending.len(),
+        1,
+        "the mail should start the resumed thread's turn"
+    );
+    let prompt = pending[0].messages.last().unwrap().string_contents();
+    assert!(prompt.contains("continue where you left off"), "{prompt}");
+}
+
 #[gpui::test]
 async fn test_agent_mail_never_spawns_for_zed_names(cx: &mut TestAppContext) {
     let setup = setup_threads(1, cx).await;

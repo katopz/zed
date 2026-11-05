@@ -11,6 +11,7 @@ pub mod rig;
 #[cfg(feature = "tui")]
 pub mod tui;
 pub mod watch;
+pub mod zed_wake;
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use base64::Engine as _;
