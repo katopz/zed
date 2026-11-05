@@ -1,6 +1,6 @@
 # 053 — Mail-triggered thread spawn (`[M]` threads)
 
-Status: DONE — round 2 (owner follow-up): resume + rig watcher landed, settings on for m3, Zed Dev rebuilt; impl `eb06bedf77`
+Status: DONE — round 2: resume + rig watcher landed, settings on for m3, Zed Dev rebuilt (`eb06bedf77`); round 3: per-rig deployment amo/4090 done, bmo skipped (no Zed), 4090 Zed rebuild deferred to a quiet window (`5a6ab3d865`)
 
 ## Round 2 — the two defers, done
 
