@@ -763,6 +763,28 @@ impl Mailroom {
         !self.pending_files(names).is_empty()
     }
 
+    /// Inbox names that currently hold at least one pending (unclaimed, due)
+    /// message, sorted by name. The broadcast inbox (`_all`) is never
+    /// included: broadcasts are cursor-based, not claim-based.
+    pub fn pending_names(&self) -> Vec<String> {
+        let mut names = Vec::new();
+        if let Ok(entries) = fs::read_dir(self.home.join("inbox")) {
+            for entry in entries.flatten() {
+                let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                    continue;
+                };
+                if name == ALL_NAME {
+                    continue;
+                }
+                if !self.pending_files(std::slice::from_ref(&name)).is_empty() {
+                    names.push(name);
+                }
+            }
+        }
+        names.sort();
+        names
+    }
+
     pub fn peek(&self, names: &[String]) -> Result<Vec<Envelope>> {
         self.pending_files(names)
             .iter()
@@ -1644,6 +1666,21 @@ mod tests {
         fs::rename(&parked, later_dir.join(format!("1_{rest}"))).unwrap();
         assert_eq!(room.claim(&names).unwrap(), vec![later]);
         assert!(room.scheduled(&names).unwrap().is_empty());
+    }
+
+    #[test]
+    fn pending_names_lists_inboxes_with_unclaimed_mail() {
+        let dir = tempfile::tempdir().unwrap();
+        let room = mailroom(dir.path(), "m3");
+        assert!(room.pending_names().is_empty());
+
+        let to = Address::parse("task-foo@m3").unwrap();
+        let envelope = room.compose(&to, "peer@m3", "hi".into(), None).unwrap();
+        room.send(&envelope).unwrap();
+        assert_eq!(room.pending_names(), ["task-foo"]);
+
+        room.claim(&["task-foo".to_string()]).unwrap();
+        assert!(room.pending_names().is_empty());
     }
 
     #[test]

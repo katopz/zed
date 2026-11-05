@@ -4,7 +4,7 @@
 //! agent-mail. Child module of the crate root, like `agent_fork`.
 
 use super::*;
-use ::agent_mail::{Address, Envelope, MailMode, Mailroom};
+use ::agent_mail::{ANY_NAME, Address, Envelope, MailMode, Mailroom};
 use acp_thread::ThreadStatus;
 use agent_settings::AgentSettings;
 use futures::channel::oneshot;
@@ -17,6 +17,9 @@ const MAIL_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const OUTBOX_FLUSH_TICKS: u32 = 120;
 /// Refresh liveness entries every ~5 s of poll ticks (issue 046).
 const LIVE_REFRESH_TICKS: u32 = 10;
+/// Cap on live threads spawned from mail (plan 053): a runaway sender must
+/// not fill the sidebar with threads.
+const MAX_MAIL_SPAWNED_THREADS: usize = 8;
 
 pub(crate) struct AgentMailState {
     mailroom: Arc<Mailroom>,
@@ -28,6 +31,15 @@ pub(crate) struct AgentMailState {
     /// `take_broadcasts`' ten-minute lookback would hand it every recent
     /// blast it was never part of, starting a turn behind the user's click.
     pub(crate) live_since: HashMap<acp_v2::SessionId, chrono::DateTime<chrono::Utc>>,
+    /// Inbox-name overrides for mail-spawned threads (plan 053): the session
+    /// → the requested inbox name it answers as. Pruned alongside
+    /// `live_since`; closing the thread releases the name, so a later mail
+    /// respawns a fresh `[M]` thread for it.
+    pub(crate) spawned_names: HashMap<acp_v2::SessionId, String>,
+    /// Strong handles keeping mail-spawned threads alive (plan 053): no panel
+    /// view owns them, so without this the `AcpThread` release would clean the
+    /// session up the moment the spawn returns.
+    spawned_threads: HashMap<acp_v2::SessionId, Entity<acp_thread::AcpThread>>,
     _poller: Task<()>,
     _settings: Subscription,
 }
@@ -68,25 +80,49 @@ impl AgentMailState {
                     // appeared (a new thread, or a stopped thread the user
                     // just clicked back open) re-enter at `now`, so they
                     // claim only broadcasts sent from then on.
-                    let Ok(Some((claims, live_entries))) = this.update(cx, |agent, cx| {
-                        let Some(state) = agent.agent_mail.as_mut() else {
-                            return None;
-                        };
-                        let now = chrono::Utc::now();
-                        state
-                            .live_since
-                            .retain(|session_id, _| agent.sessions.contains_key(session_id));
-                        let mut claims = Vec::new();
-                        let mut live_entries = Vec::new();
-                        for (session_id, session) in &agent.sessions {
-                            let inbox = native_thread_mail_name(session_id);
-                            let cutoff = *state.live_since.entry(session_id.clone()).or_insert(now);
-                            let (status, kind) = live_status(session, cx);
-                            claims.push((session_id.clone(), inbox.clone(), cutoff));
-                            live_entries.push((inbox, status, kind));
-                        }
-                        Some((claims, live_entries))
-                    }) else {
+                    let Ok(Some((claims, live_entries, inbox_names, spawn_budget))) =
+                        this.update(cx, |agent, cx| {
+                            let Some(state) = agent.agent_mail.as_mut() else {
+                                return None;
+                            };
+                            let now = chrono::Utc::now();
+                            state
+                                .live_since
+                                .retain(|session_id, _| agent.sessions.contains_key(session_id));
+                            state
+                                .spawned_names
+                                .retain(|session_id, _| agent.sessions.contains_key(session_id));
+                            state
+                                .spawned_threads
+                                .retain(|session_id, _| agent.sessions.contains_key(session_id));
+                            let mut claims = Vec::new();
+                            let mut live_entries = Vec::new();
+                            let mut inbox_names = Vec::new();
+                            for (session_id, session) in &agent.sessions {
+                                let inbox = state
+                                    .spawned_names
+                                    .get(session_id)
+                                    .cloned()
+                                    .unwrap_or_else(|| native_thread_mail_name(session_id));
+                                let cutoff =
+                                    *state.live_since.entry(session_id.clone()).or_insert(now);
+                                let (status, kind) = live_status(session, cx);
+                                claims.push((session_id.clone(), inbox.clone(), cutoff));
+                                live_entries.push((inbox.clone(), status, kind));
+                                inbox_names.push(inbox);
+                            }
+                            let spawn_budget =
+                                if AgentSettings::get_global(cx).fork.agent_mail_spawn_threads
+                                    && !agent.sessions.is_empty()
+                                    && state.spawned_names.len() < MAX_MAIL_SPAWNED_THREADS
+                                {
+                                    Some(MAX_MAIL_SPAWNED_THREADS - state.spawned_names.len())
+                                } else {
+                                    None
+                                };
+                            Some((claims, live_entries, inbox_names, spawn_budget))
+                        })
+                    else {
                         break;
                     };
                     // The liveness registry backs deliver-time `*@rig`
@@ -102,23 +138,73 @@ impl AgentMailState {
                         }
                     })
                     .detach();
-                    if claims.is_empty() {
-                        continue;
-                    }
-                    let mailroom = mailroom.clone();
-                    let claimed = cx
-                        .background_spawn(async move { claim_inboxes(&mailroom, claims) })
-                        .await;
-                    if claimed.is_empty() {
+                    // Plan 053: mail waiting in an inbox no live session
+                    // claims is addressed to a thread that does not exist
+                    // yet. Discover candidates and claim them only when a
+                    // spawn can actually start: enabled, under the cap, a
+                    // donor project exists (a live session), and the batch is
+                    // not fyi-only, which must never wake anyone. Discovery
+                    // precedes the claim, so a spawn that fails on the next
+                    // tick's retry never drops mail already claimed.
+                    let spawn_targets = if let Some(budget) = spawn_budget {
+                        let mailroom = mailroom.clone();
+                        cx.background_spawn(async move {
+                            discover_spawn_targets(&mailroom, &inbox_names, budget)
+                        })
+                        .await
+                    } else {
+                        Vec::new()
+                    };
+                    let claimed = if claims.is_empty() {
+                        Vec::new()
+                    } else {
+                        let mailroom = mailroom.clone();
+                        cx.background_spawn(async move { claim_inboxes(&mailroom, claims) })
+                            .await
+                    };
+                    let claimed_spawns = if spawn_targets.is_empty() {
+                        Vec::new()
+                    } else {
+                        let mailroom = mailroom.clone();
+                        cx.background_spawn(async move {
+                            spawn_targets
+                                .into_iter()
+                                .filter_map(|name| {
+                                    mailroom
+                                        .claim(std::slice::from_ref(&name))
+                                        .ok()
+                                        .filter(|mail| !mail.is_empty())
+                                        .map(|mail| (name, mail))
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .await
+                    };
+                    if claimed.is_empty() && claimed_spawns.is_empty() {
                         continue;
                     }
                     let Ok(deliveries) = this.update(cx, |agent, cx| {
-                        claimed
-                            .into_iter()
-                            .filter_map(|(session_id, mail)| {
-                                agent.post_agent_mail(&session_id, mail, cx)
-                            })
-                            .collect::<Vec<_>>()
+                        let mut deliveries = Vec::new();
+                        for (name, mail) in claimed_spawns {
+                            let message_count = mail.len();
+                            match agent.spawn_mail_thread(&name, cx) {
+                                Some(session_id) => {
+                                    if let Some(delivery) =
+                                        agent.post_agent_mail(&session_id, mail, cx)
+                                    {
+                                        deliveries.push(delivery);
+                                    }
+                                }
+                                None => log::error!(
+                                    "agent-mail: could not spawn a thread for inbox {name}; \
+                                     dropping {message_count} message(s)"
+                                ),
+                            }
+                        }
+                        deliveries.extend(claimed.into_iter().filter_map(|(session_id, mail)| {
+                            agent.post_agent_mail(&session_id, mail, cx)
+                        }));
+                        deliveries
                     }) else {
                         break;
                     };
@@ -138,6 +224,8 @@ impl AgentMailState {
             self_rig,
             applied_watch_interval: None,
             live_since: HashMap::default(),
+            spawned_names: HashMap::default(),
+            spawned_threads: HashMap::default(),
             _poller: poller,
             _settings: settings,
         };
@@ -227,14 +315,90 @@ fn claim_inboxes(
         .collect()
 }
 
+/// Plan 053: inbox names holding mail that no live session claims — each one
+/// is a thread that does not exist yet, so spawning is what the mail asks
+/// for. Machine addresses never spawn: `zed-*` names a specific session that
+/// is gone (its mail stays parked), and `_any` is the shared `*@rig` fallback
+/// claimed by whichever agent gets there first. An fyi-only batch never wakes
+/// anyone, so it never spawns either.
+fn discover_spawn_targets(
+    mailroom: &Mailroom,
+    live_names: &[String],
+    budget: usize,
+) -> Vec<String> {
+    mailroom
+        .pending_names()
+        .into_iter()
+        .filter(|name| !name.starts_with("zed-") && name != ANY_NAME)
+        .filter(|name| !live_names.contains(name))
+        .filter(|name| {
+            mailroom
+                .peek(std::slice::from_ref(name))
+                .is_ok_and(|mail| mail.iter().any(|envelope| envelope.mode != MailMode::Fyi))
+        })
+        .take(budget)
+        .collect()
+}
+
 impl NativeAgent {
     pub(crate) fn agent_mail_address(&self, session_id: &acp_v2::SessionId) -> Option<String> {
         let state = self.agent_mail.as_ref()?;
         Some(format!(
             "{}@{}",
-            native_thread_mail_name(session_id),
+            self.mail_name_for_session(session_id),
             state.self_rig
         ))
+    }
+
+    /// The inbox name a session answers as (plan 053): mail-spawned threads
+    /// keep the name their first mail asked for; every other session derives
+    /// `zed-<id>` from its session id.
+    pub(crate) fn mail_name_for_session(&self, session_id: &acp_v2::SessionId) -> String {
+        if let Some(state) = self.agent_mail.as_ref()
+            && let Some(name) = state.spawned_names.get(session_id)
+        {
+            return name.clone();
+        }
+        native_thread_mail_name(session_id)
+    }
+
+    /// Creates the thread an unknown inbox name asks for (plan 053): a fresh
+    /// top-level thread titled `[M] <name>` on a live session's project,
+    /// answering as `<name>@<this rig>` from then on. `None` when no live
+    /// session exists to borrow a project from — normally filtered out by the
+    /// budget gate, but possible if the last session closed between the
+    /// poller's snapshot and this call, in which case the already-claimed
+    /// mail is dropped with an error log.
+    fn spawn_mail_thread(
+        &mut self,
+        name: &str,
+        cx: &mut Context<Self>,
+    ) -> Option<acp_v2::SessionId> {
+        let donor = self.sessions.values().next()?;
+        let project = self.projects.get(&donor.project_id)?.project.clone();
+        let work_dirs = donor
+            .acp_thread
+            .upgrade()
+            .and_then(|acp_thread| acp_thread.read(cx).work_dirs().cloned())
+            .unwrap_or_default();
+        let acp_thread = self.new_session(project, work_dirs, cx);
+        let session_id = acp_thread.read(cx).session_id().clone();
+        if let Some(session) = self.sessions.get(&session_id) {
+            let title = SharedString::from(format!("[M] {name}"));
+            session
+                .thread
+                .update(cx, |thread, cx| thread.set_title(title, cx));
+        }
+        if let Some(state) = self.agent_mail.as_mut() {
+            state
+                .spawned_names
+                .insert(session_id.clone(), name.to_string());
+            state
+                .spawned_threads
+                .insert(session_id.clone(), acp_thread);
+        }
+        log::info!("agent-mail: spawned thread [M] {name} as {session_id}");
+        Some(session_id)
     }
 
     /// Queues claimed mail like a `send_message` from a local thread, so an
@@ -395,7 +559,7 @@ impl NativeThreadEnvironment {
                 )?;
             let to = Address::parse(request.to.trim())?;
             agent_mail::ensure_broadcast_mode(&to, request.mode)?;
-            let from = native_thread_mail_name(&sender);
+            let from = agent.read_with(cx, |agent, _| agent.mail_name_for_session(&sender))?;
             let deliver_at = request
                 .deliver_at
                 .as_deref()

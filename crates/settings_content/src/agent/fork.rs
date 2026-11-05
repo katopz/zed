@@ -113,6 +113,17 @@ pub struct ForkAgentSettingsContent {
     ///
     /// Default: null
     pub agent_mail_watch_interval_minutes: Option<u64>,
+
+    /// Whether mail that arrives for an inbox no live thread claims spawns a
+    /// new native thread to answer it (plan 053). The spawned thread is
+    /// titled `[M] <inbox name>` and keeps answering as that inbox, so
+    /// replies thread back to it. `fyi` mail, broadcasts, machine-generated
+    /// `zed-*` addresses, and the shared `_any` inbox never spawn. At most 8
+    /// mail-spawned threads are live at once. A remote work trigger: enable
+    /// per rig (worker rigs yes, an owner's laptop no).
+    ///
+    /// Default: false
+    pub agent_mail_spawn_threads: Option<bool>,
 }
 
 /// Which backend provides the reviewer thread for the `request_verdict` tool.

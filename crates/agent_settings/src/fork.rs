@@ -43,6 +43,9 @@ pub struct ForkAgentSettings {
     pub external_subagents: bool,
     /// Watchdog interval pushed to the agent-mail orchestrator rig (plan 048).
     pub agent_mail_watch_interval_minutes: Option<u64>,
+    /// Whether mail for an inbox no live thread claims spawns a new `[M]`-
+    /// titled thread (plan 053). Default: false.
+    pub agent_mail_spawn_threads: bool,
 }
 
 impl ForkAgentSettings {
@@ -64,6 +67,7 @@ impl ForkAgentSettings {
                 .unwrap_or(DEFAULT_STREAM_IDLE_TIMEOUT_SECS),
             external_subagents: content.external_subagents.unwrap_or(true),
             agent_mail_watch_interval_minutes: content.agent_mail_watch_interval_minutes,
+            agent_mail_spawn_threads: content.agent_mail_spawn_threads.unwrap_or(false),
         }
     }
 }

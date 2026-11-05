@@ -953,3 +953,131 @@ async fn test_outgoing_mail_marks_thread_waiting_until_wake_arrives(cx: &mut Tes
     );
     assert_waiting(thread, cx, false);
 }
+
+fn enable_mail_spawn(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        let mut settings = agent_settings::AgentSettings::get_global(cx).clone();
+        settings.fork.agent_mail_spawn_threads = true;
+        agent_settings::AgentSettings::override_global(settings, cx);
+    });
+}
+
+fn mail_to_name(sender: &::agent_mail::Mailroom, name: &str, body: &str) -> ::agent_mail::Envelope {
+    let to = ::agent_mail::Address::parse(&format!("{name}@m3")).unwrap();
+    let envelope = sender
+        .compose(&to, "zed-bb@m3", body.to_string(), None)
+        .unwrap();
+    sender.send(&envelope).unwrap();
+    envelope
+}
+
+#[gpui::test]
+async fn test_agent_mail_spawns_thread_for_unknown_name(cx: &mut TestAppContext) {
+    let setup = setup_threads(1, cx).await;
+    let (agent, fake) = (&setup.agent, &setup.fake);
+    let (_home, sender) = enable_agent_mail(agent, cx);
+    enable_mail_spawn(cx);
+
+    mail_to_name(&sender, "task-foo", "run the batch job");
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.run_until_parked();
+
+    let (spawned_session, mail_address, title, model) = agent.read_with(cx, |agent, cx| {
+        let (session_id, name) = agent
+            .agent_mail
+            .as_ref()
+            .and_then(|state| state.spawned_names.iter().next())
+            .map(|(session_id, name)| (session_id.clone(), name.clone()))
+            .expect("mail to an unknown inbox should spawn a thread");
+        assert_eq!(name, "task-foo");
+        let session = agent.sessions.get(&session_id).unwrap();
+        let thread = session.thread.read(cx);
+        (
+            session_id.clone(),
+            agent.agent_mail_address(&session_id).unwrap(),
+            thread.title().unwrap().to_string(),
+            thread.model().unwrap().clone(),
+        )
+    });
+    assert_eq!(mail_address, "task-foo@m3");
+    assert_eq!(title, "[M] task-foo");
+
+    let pending = fake.pending_completions_for(&model);
+    assert_eq!(
+        pending.len(),
+        1,
+        "the mail body should start the spawned thread's first turn"
+    );
+    let prompt = pending[0].messages.last().unwrap().string_contents();
+    assert!(prompt.contains("run the batch job"), "{prompt}");
+    assert!(prompt.contains("task-foo@m3"), "{prompt}");
+
+    // A follow-up to the same inbox lands on the same thread — no respawn.
+    mail_to_name(&sender, "task-foo", "second note");
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.run_until_parked();
+    agent.read_with(cx, |agent, _| {
+        assert_eq!(agent.sessions.len(), 2);
+        assert_eq!(
+            agent.mailboxes.get(&spawned_session).map_or(0, Vec::len),
+            1,
+            "the busy spawned thread queues the follow-up"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_agent_mail_fyi_for_unknown_name_never_spawns(cx: &mut TestAppContext) {
+    let setup = setup_threads(1, cx).await;
+    let agent = &setup.agent;
+    let (_home, sender) = enable_agent_mail(agent, cx);
+    enable_mail_spawn(cx);
+
+    let to = ::agent_mail::Address::parse("task-quiet@m3").unwrap();
+    let mut envelope = sender
+        .compose(&to, "zed-bb@m3", "heads up only".to_string(), None)
+        .unwrap();
+    envelope.mode = ::agent_mail::MailMode::Fyi;
+    sender.send(&envelope).unwrap();
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.run_until_parked();
+
+    agent.read_with(cx, |agent, _| {
+        assert_eq!(agent.sessions.len(), 1);
+        assert!(agent.agent_mail.as_ref().unwrap().spawned_names.is_empty());
+    });
+    assert_eq!(sender.peek(&["task-quiet".to_string()]).unwrap().len(), 1);
+}
+
+#[gpui::test]
+async fn test_agent_mail_spawn_is_off_by_default(cx: &mut TestAppContext) {
+    let setup = setup_threads(1, cx).await;
+    let agent = &setup.agent;
+    let (_home, sender) = enable_agent_mail(agent, cx);
+
+    mail_to_name(&sender, "task-off", "should stay parked");
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.run_until_parked();
+
+    agent.read_with(cx, |agent, _| {
+        assert_eq!(agent.sessions.len(), 1);
+    });
+    assert_eq!(sender.peek(&["task-off".to_string()]).unwrap().len(), 1);
+}
+
+#[gpui::test]
+async fn test_agent_mail_never_spawns_for_zed_names(cx: &mut TestAppContext) {
+    let setup = setup_threads(1, cx).await;
+    let agent = &setup.agent;
+    let (_home, sender) = enable_agent_mail(agent, cx);
+    enable_mail_spawn(cx);
+
+    mail_to_name(&sender, "zed-99999999", "for a session that is gone");
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.run_until_parked();
+
+    agent.read_with(cx, |agent, _| {
+        assert_eq!(agent.sessions.len(), 1);
+    });
+    assert_eq!(sender.peek(&["zed-99999999".to_string()]).unwrap().len(), 1);
+}
