@@ -1,6 +1,13 @@
 # 053 — Mail-triggered thread spawn (`[M]` threads)
 
-Status: DONE — all gates green (agent_mail 49 + agent 838 tests, clippy clean on agent/agent_mail/agent_settings/settings_content/agent_ui); impl `f9f692ab4b`
+Status: DONE — round 2 (owner follow-up): resume + rig watcher landed, settings on for m3, Zed Dev rebuilt; impl `eb06bedf77`
+
+## Round 2 — the two defers, done
+
+- [x] **Resume saved thread for `zed-*` mail** (`discover_resume_targets` + `lookup_saved_threads` + `NativeAgent::open_saved_mail_thread`): mail to a `zed-<8>` inbox whose session is not live now loads the saved thread from `ThreadsDatabase` (top-level rows only), reopens it via `open_thread_with_work_dirs` on the donor project with the thread's original `folder_paths`, pins it in `pinned_threads`, and delivers the mail through the normal mailbox path. No match (history pruned) → stays parked. Same gate (`agent_mail_spawn_threads`) and cap as spawning; `spawned_threads` renamed `pinned_threads` (spawn + resume) and is now the cap source. Test: `test_agent_mail_resumes_saved_thread_for_zed_name` (in-memory per-test DB, synthetic id, asserts resume + pin + turn prompt).
+- [x] **Rig watcher for Zed-not-running** (`agent-mail rig zed-wake`, new `crates/agent_mail/src/zed_wake.rs`): one tick per invocation — wakes only when this rig has NO fresh live entry (a running Zed either claims the mail itself or has the gate off), mail is past a 2 min grace, not fyi-only, not `_any`/`_all`; 10 min cooldown via `watch/zed-wake.json`; launch command from `AGENT_MAIL_WAKE_COMMAND` (space-separated argv), default `open -ga "Zed Dev"` on macOS; `--install` writes a launchd plist (`dev.agent-mail.zed-wake`, 60 s interval). Tests: wake-past-grace + cooldown, never-when-live-entry, fyi-never. Deploy per rig: rebuild agent-mail, `agent-mail rig zed-wake --install`, `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.agent-mail.zed-wake.plist` (Windows: Task Scheduler on `rig zed-wake --once`).
+- [x] Owner settings: `{ "agent": { "fork": { "agent_mail_spawn_threads": true } } }` added to `~/.config/zed/settings.json` (m3).
+- [x] Zed Dev rebuilt via `./script/bundle-mac -i` and agent-mail binary reinstalled.
 
 ## Why
 
@@ -43,11 +50,14 @@ so its mail origin is visible.
 
 ## Non-goals / known limits
 
-- No saved-thread resume for `zed-*` addresses of stopped sessions (parked;
-  follow-up candidate).
 - Zed running with zero live sessions: no donor project → mail parks.
-- If Zed itself is not running on the rig, no poller exists — needs an
-  agent-mail-side rig watcher, out of scope here.
+- Closing a mail-driven thread's panel view does not release the session while
+  `pinned_threads` pins it; the name respawns/resumes only after the session
+  leaves the agent (Zed restart). Refinement candidate: observe thread deletion.
+- The rig watcher wakes at most one editor per 10 min and only when no fresh
+  live entry exists; it cannot distinguish "Zed running with the gate off"
+  from "Zed absent" in that case — both leave mail parked, so the watcher stays
+  quiet while a Zed poller is alive.
 - Closing a spawned thread's panel view does not release the session while
   `spawned_threads` pins it; the name respawns only after the session leaves
   the agent (Zed restart). Refinement candidate: observe thread deletion.
@@ -60,6 +70,6 @@ so its mail origin is visible.
 - [x] Bridge: poller discovery + claim + `spawn_mail_thread` (`[M]` title, strong AcpThread pin)
 - [x] Tests: spawn + follow-up threads to same session, fyi never spawns, off by default, `zed-*` never spawns
 - [x] `./script/clippy` clean (agent, agent_mail, agent_settings, settings_content, agent_ui)
-- [-] Defer: resume saved thread for `zed-*` mail instead of parking
-- [-] Defer: rig-level watcher for spawning when Zed is not running
-- [x] Plan updated, commit `feat:` on develop, push
+- [x] Round 2: resume saved thread for `zed-*` mail (see above)
+- [x] Round 2: rig watcher `agent-mail rig zed-wake` (see above)
+- [x] Plan updated, commits `feat:` on develop, push
