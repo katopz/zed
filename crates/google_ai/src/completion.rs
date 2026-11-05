@@ -667,12 +667,8 @@ mod tests {
             ..Default::default()
         };
 
-        let request = into_google(
-            request,
-            "gemini-4-argon".to_string(),
-            GoogleModelMode::Auto,
-        )
-        .unwrap();
+        let request =
+            into_google(request, "gemini-4-argon".to_string(), GoogleModelMode::Auto).unwrap();
         let serialized = serde_json::to_value(request).unwrap();
         assert_eq!(
             serialized["contents"][0]["parts"],

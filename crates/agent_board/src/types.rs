@@ -288,8 +288,11 @@ impl MuteKey {
     /// Returns true if this mute key matches the given state message. A `None`
     /// field acts as a wildcard.
     pub fn matches(&self, state: &AgentStateMessage) -> bool {
-        self.device_id.as_deref().is_none_or(|d| d == state.device_id)
-            && self.session_id
+        self.device_id
+            .as_deref()
+            .is_none_or(|d| d == state.device_id)
+            && self
+                .session_id
                 .as_deref()
                 .is_none_or(|s| s == state.session_id)
             && self

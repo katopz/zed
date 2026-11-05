@@ -22,8 +22,8 @@ use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use ui::{ActiveTheme, CopyButton, FluentBuilder, IconSize};
-use workspace::dock::{DockPosition, Panel, PanelEvent};
 use workspace::Workspace;
+use workspace::dock::{DockPosition, Panel, PanelEvent};
 
 use crate::mentions;
 use crate::runtime::BoardRuntime;
@@ -177,7 +177,10 @@ pub fn build_work_board(
     // snapshot above). `active_claims` only returns heartbeat-fresh claims,
     // so these are `Doing` by definition.
     for claim in local_claims {
-        if claim.session_id.starts_with(crate::feeder::REMOTE_SESSION_PREFIX) {
+        if claim
+            .session_id
+            .starts_with(crate::feeder::REMOTE_SESSION_PREFIX)
+        {
             continue;
         }
         let acc = items.entry(normalize_path(&claim.plan_file)).or_default();
@@ -297,11 +300,7 @@ pub fn build_work_board(
 }
 
 fn race_rank(item: &WorkItem) -> u8 {
-    if item.race {
-        0
-    } else {
-        1
-    }
+    if item.race { 0 } else { 1 }
 }
 
 fn state_rank(item: &WorkItem) -> u8 {
@@ -331,7 +330,11 @@ impl MarkdownCache {
         hasher.update(message.sender.as_bytes());
         hasher.update(message.text.as_bytes());
         let hash = hasher.finalize();
-        u64::from_le_bytes(hash.as_bytes()[..8].try_into().expect("blake3 gives ≥8 bytes"))
+        u64::from_le_bytes(
+            hash.as_bytes()[..8]
+                .try_into()
+                .expect("blake3 gives ≥8 bytes"),
+        )
     }
 
     fn get_or_create(
@@ -343,9 +346,8 @@ impl MarkdownCache {
         if let Some(entity) = self.0.get(&key) {
             return entity.clone();
         }
-        let entity = cx.new(|cx| {
-            Markdown::new(SharedString::from(message.text.clone()), None, None, cx)
-        });
+        let entity =
+            cx.new(|cx| Markdown::new(SharedString::from(message.text.clone()), None, None, cx));
         self.0.insert(key, entity.clone());
         entity
     }
@@ -654,9 +656,7 @@ impl WarRoomPanel {
                     .text_xs()
                     .text_color(muted)
                     .hover(|style| style.text_color(accent))
-                    .child(SharedString::from(format!(
-                        "— work board ({summary}) —"
-                    )))
+                    .child(SharedString::from(format!("— work board ({summary}) —")))
                     .on_click(cx.listener(|this, _event, _window, cx| {
                         this.board_collapsed = !this.board_collapsed;
                         cx.notify();
@@ -823,11 +823,7 @@ impl WarRoomPanel {
                         .unwrap_or_else(|| "?".to_string());
                     let is_mention = message.text.starts_with('@');
                     let own = !local_device.is_empty() && message.device_name == local_device;
-                    let sender_color = if own || is_mention {
-                        accent
-                    } else {
-                        fg
-                    };
+                    let sender_color = if own || is_mention { accent } else { fg };
                     let markdown = self.markdown_cache.get_or_create(message, cx);
                     current_keys.push(MarkdownCache::key(message));
                     rows.push(
@@ -1059,29 +1055,31 @@ impl Panel for WarRoomPanel {
 /// Register war-room actions with all workspaces. The runtime global must
 /// already exist (created by [`crate::agent_board::init`]).
 pub fn init(cx: &mut App) {
-    cx.observe_new(|workspace: &mut Workspace, _window, _cx: &mut Context<Workspace>| {
-        workspace.register_action(|workspace, _: &Toggle, window, cx| {
-            mentions::clear_unwatched_mentions();
-            if !workspace.toggle_panel_focus::<WarRoomPanel>(window, cx) {
-                if workspace.panel::<WarRoomPanel>(cx).is_none() {
-                    let panel = WarRoomPanel::new(window, cx);
-                    workspace.add_panel(panel, window, cx);
-                } else {
-                    workspace.close_panel::<WarRoomPanel>(window, cx);
+    cx.observe_new(
+        |workspace: &mut Workspace, _window, _cx: &mut Context<Workspace>| {
+            workspace.register_action(|workspace, _: &Toggle, window, cx| {
+                mentions::clear_unwatched_mentions();
+                if !workspace.toggle_panel_focus::<WarRoomPanel>(window, cx) {
+                    if workspace.panel::<WarRoomPanel>(cx).is_none() {
+                        let panel = WarRoomPanel::new(window, cx);
+                        workspace.add_panel(panel, window, cx);
+                    } else {
+                        workspace.close_panel::<WarRoomPanel>(window, cx);
+                    }
                 }
-            }
-        });
-        workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
-            mentions::clear_unwatched_mentions();
-            workspace.toggle_panel_focus::<WarRoomPanel>(window, cx);
-        });
-        workspace.register_action(|workspace, _: &Refresh, _window, cx| {
-            if let Some(panel) = workspace.panel::<WarRoomPanel>(cx) {
-                let runtime = panel.read(cx).runtime.clone();
-                runtime.update(cx, |runtime, cx| runtime.force_refresh(cx));
-            }
-        });
-    })
+            });
+            workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
+                mentions::clear_unwatched_mentions();
+                workspace.toggle_panel_focus::<WarRoomPanel>(window, cx);
+            });
+            workspace.register_action(|workspace, _: &Refresh, _window, cx| {
+                if let Some(panel) = workspace.panel::<WarRoomPanel>(cx) {
+                    let runtime = panel.read(cx).runtime.clone();
+                    runtime.update(cx, |runtime, cx| runtime.force_refresh(cx));
+                }
+            });
+        },
+    )
     .detach();
 }
 
@@ -1103,8 +1101,7 @@ fn now_unix_ms() -> i64 {
 /// tests that draw the panel serialize on `PANEL_TEST_LOCK` because cargo
 /// runs tests in parallel within one process.
 #[cfg(test)]
-static PANEL_RENDER_COUNT: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+static PANEL_RENDER_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Serializes tests that assert on [`PANEL_RENDER_COUNT`] deltas — the
 /// counter is process-global and cargo runs tests in parallel.
@@ -1116,7 +1113,12 @@ mod tests {
     use super::*;
     use crate::types::{ActiveScope, DeviceStatus, ScopeKind};
 
-    fn claim(plan_file: &str, session_id: &str, summary: &str, claimed_ago_secs: u64) -> ActivePlanClaim {
+    fn claim(
+        plan_file: &str,
+        session_id: &str,
+        summary: &str,
+        claimed_ago_secs: u64,
+    ) -> ActivePlanClaim {
         ActivePlanClaim {
             plan_file: plan_file.to_string(),
             session_id: session_id.to_string(),
@@ -1125,7 +1127,12 @@ mod tests {
         }
     }
 
-    fn status(device_name: &str, stale: bool, updated_at: i64, scopes: Vec<ActiveScope>) -> DeviceStatus {
+    fn status(
+        device_name: &str,
+        stale: bool,
+        updated_at: i64,
+        scopes: Vec<ActiveScope>,
+    ) -> DeviceStatus {
         DeviceStatus {
             v: 1,
             device_id: format!("id-{device_name}"),
@@ -1147,7 +1154,12 @@ mod tests {
         }
     }
 
-    fn released_state(device_name: &str, session_id: &str, plan_path: &str, ts: i64) -> AgentStateMessage {
+    fn released_state(
+        device_name: &str,
+        session_id: &str,
+        plan_path: &str,
+        ts: i64,
+    ) -> AgentStateMessage {
         let plan_name = basename(plan_path);
         AgentStateMessage {
             v: 1,
@@ -1213,7 +1225,12 @@ mod tests {
     fn released_state_pins_released_item() {
         let snap = snapshot(
             vec![],
-            vec![released_state("SHIKUWA", "b1c9ffff", "/repo/.plans/023_b.md", NOW - 60_000)],
+            vec![released_state(
+                "SHIKUWA",
+                "b1c9ffff",
+                "/repo/.plans/023_b.md",
+                NOW - 60_000,
+            )],
         );
         let board = build_work_board(&snap, &[], "m3", NOW);
         assert_eq!(board.len(), 1);
@@ -1273,10 +1290,7 @@ mod tests {
                 "m3",
                 false,
                 NOW - 10_000,
-                vec![
-                    scope("f3a2ffff", path, "a"),
-                    scope("aaaa1111", path, "b"),
-                ],
+                vec![scope("f3a2ffff", path, "a"), scope("aaaa1111", path, "b")],
             )],
             vec![],
         );
@@ -1405,7 +1419,12 @@ mod tests {
                     vec![scope("b1c9ffff", path_race, "race work 2")],
                 ),
             ],
-            vec![released_state("m3", "f3a2ffff", "/repo/.plans/done.md", NOW - 5_000)],
+            vec![released_state(
+                "m3",
+                "f3a2ffff",
+                "/repo/.plans/done.md",
+                NOW - 5_000,
+            )],
         );
         let board = build_work_board(&snap, &[], "m3", NOW);
         assert_eq!(board.len(), 4);
@@ -1420,14 +1439,25 @@ mod tests {
     #[test]
     fn row_cap_truncates() {
         let scopes: Vec<ActiveScope> = (0..30)
-            .map(|i| scope(&format!("sess{i:04}"), &format!("/repo/.plans/p{i:02}.md"), "w"))
+            .map(|i| {
+                scope(
+                    &format!("sess{i:04}"),
+                    &format!("/repo/.plans/p{i:02}.md"),
+                    "w",
+                )
+            })
             .collect();
         let snap = snapshot(vec![status("SHIKUWA", false, NOW, scopes)], vec![]);
         let board = build_work_board(&snap, &[], "m3", NOW);
         assert_eq!(board.len(), WORK_BOARD_ROW_CAP);
     }
 
-    fn agent_state(device_name: &str, session_id: &str, state_text: &str, ts: i64) -> AgentStateMessage {
+    fn agent_state(
+        device_name: &str,
+        session_id: &str,
+        state_text: &str,
+        ts: i64,
+    ) -> AgentStateMessage {
         AgentStateMessage {
             v: 1,
             device_id: format!("id-{device_name}"),
@@ -1444,7 +1474,12 @@ mod tests {
     fn fresh_state_without_plan_yields_adhoc_doing_row() {
         let snap = snapshot(
             vec![],
-            vec![agent_state("m3", "f3a2ffff", "editing auth bridge", NOW - 10_000)],
+            vec![agent_state(
+                "m3",
+                "f3a2ffff",
+                "editing auth bridge",
+                NOW - 10_000,
+            )],
         );
         let board = build_work_board(&snap, &[], "m3", NOW);
         assert_eq!(board.len(), 1);
@@ -1557,9 +1592,7 @@ mod tests {
             })
             .unwrap();
         let visual = &mut gpui::VisualTestContext::from_window(window.into(), cx);
-        let war_room = workspace.update_in(visual, |_, window, cx| {
-            WarRoomPanel::new(window, cx)
-        });
+        let war_room = workspace.update_in(visual, |_, window, cx| WarRoomPanel::new(window, cx));
         let board_panel = workspace.update_in(visual, |workspace, window, cx| {
             crate::AgentBoardPanel::new(workspace, window, cx)
         });
@@ -1650,13 +1683,16 @@ mod tests {
                 text: "@m3:f3a2 run cargo clippy".to_string(),
                 ts: now - 5_000,
             }],
-            states: vec![released_state("SHIKUWA", "b1c9ffff", "/repo/.plans/023_b.md", now - 60_000)],
+            states: vec![released_state(
+                "SHIKUWA",
+                "b1c9ffff",
+                "/repo/.plans/023_b.md",
+                now - 60_000,
+            )],
             replies: Vec::new(),
         };
         cx.update(|_window, cx| {
-            BoardRuntime::global(cx).update(cx, |runtime, cx| {
-                runtime.on_snapshot(snapshot, cx)
-            });
+            BoardRuntime::global(cx).update(cx, |runtime, cx| runtime.on_snapshot(snapshot, cx));
         });
         cx.update(|_window, cx| {
             assert_eq!(BoardRuntime::global(cx).read(cx).poll_rounds(), 1);
@@ -1731,9 +1767,7 @@ mod tests {
             vec![],
         );
         cx.update(|_window, cx| {
-            BoardRuntime::global(cx).update(cx, |runtime, cx| {
-                runtime.on_snapshot(snapshot, cx)
-            });
+            BoardRuntime::global(cx).update(cx, |runtime, cx| runtime.on_snapshot(snapshot, cx));
         });
         cx.run_until_parked();
         assert_eq!(
@@ -1761,15 +1795,12 @@ mod tests {
     /// dock ordering that places its icon directly behind CollabPanel.
     #[gpui::test]
     #[should_panic(expected = "have the same activation priority")]
-    async fn duplicate_activation_priority_panics_in_debug_builds(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    async fn duplicate_activation_priority_panics_in_debug_builds(cx: &mut gpui::TestAppContext) {
         let (window, workspace, war_room, _board_panel) = setup_local_only_harness(cx).await;
         let cx = &mut gpui::VisualTestContext::from_window(window.into(), cx);
         workspace.update_in(cx, |workspace, window, cx| {
             workspace.add_panel(war_room.clone(), window, cx);
-            let impostor =
-                workspace::dock::test::TestPanel::new(DockPosition::Left, 6, cx);
+            let impostor = workspace::dock::test::TestPanel::new(DockPosition::Left, 6, cx);
             let impostor = cx.new(|_| impostor);
             workspace.add_panel(impostor, window, cx);
         });

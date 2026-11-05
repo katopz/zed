@@ -236,10 +236,7 @@ fn raise_open_file_limit() {
         rlim_max: limit.rlim_max,
     };
     if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0 {
-        log::info!(
-            "raised open file limit: {} -> {target}",
-            limit.rlim_cur
-        );
+        log::info!("raised open file limit: {} -> {target}", limit.rlim_cur);
     } else {
         log::warn!(
             "failed to raise open file limit from {}: {}",

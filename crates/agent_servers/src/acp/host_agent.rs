@@ -4,8 +4,8 @@
 //! same zed-agentd shim (turns survive this window closing) and gets the same
 //! session list / reattach handling as Claude Code or Codex.
 
-use std::any::Any;
 use collections::HashMap;
+use std::any::Any;
 
 use anyhow::{Context as _, Result};
 use gpui::{App, AsyncApp, Task};
@@ -22,22 +22,25 @@ pub fn register(project: &Project, cx: &mut App) {
     if !project.is_via_remote_server() {
         return;
     }
-    project.agent_server_store().clone().update(cx, |store, cx| {
-        let agent_id = AgentId::new(HOST_AGENT_ID);
-        if store.external_agents.contains_key(&agent_id) {
-            return;
-        }
-        store.external_agents.insert(
-            agent_id,
-            ExternalAgentEntry::new(
-                Box::new(HostNativeAgent),
-                ExternalAgentSource::Custom,
-                None,
-                Some(DISPLAY_NAME.into()),
-            ),
-        );
-        cx.emit(AgentServersUpdated);
-    });
+    project
+        .agent_server_store()
+        .clone()
+        .update(cx, |store, cx| {
+            let agent_id = AgentId::new(HOST_AGENT_ID);
+            if store.external_agents.contains_key(&agent_id) {
+                return;
+            }
+            store.external_agents.insert(
+                agent_id,
+                ExternalAgentEntry::new(
+                    Box::new(HostNativeAgent),
+                    ExternalAgentSource::Custom,
+                    None,
+                    Some(DISPLAY_NAME.into()),
+                ),
+            );
+            cx.emit(AgentServersUpdated);
+        });
 }
 
 struct HostNativeAgent;
@@ -79,9 +82,12 @@ fn host_command(
     let model = registry
         .default_model()
         .context("select a model for the Zed Agent first: the host agent uses the same one")?;
-    let provider = registry
-        .provider(&model.provider_id)
-        .with_context(|| format!("language model provider {} is not available", model.provider_id.0))?;
+    let provider = registry.provider(&model.provider_id).with_context(|| {
+        format!(
+            "language model provider {} is not available",
+            model.provider_id.0
+        )
+    })?;
 
     let mut env: HashMap<String, String> =
         provider.host_environment(&model, cx).into_iter().collect();

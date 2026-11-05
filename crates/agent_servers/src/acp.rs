@@ -1,7 +1,7 @@
 mod debug_log;
 pub mod detachable;
-pub mod host_agent;
 pub mod external_subagents;
+pub mod host_agent;
 mod runtime;
 mod session_updates;
 mod terminal_updates;

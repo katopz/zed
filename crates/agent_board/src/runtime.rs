@@ -15,10 +15,10 @@ use std::time::Duration;
 use gpui::{App, AppContext, AsyncApp, Context, Entity, Global, Task};
 use http_client::HttpClient;
 
+use crate::AgentBoardConfig;
 use crate::client::BoardClient;
 use crate::identity::DeviceIdentity;
 use crate::types::RoomSnapshot;
-use crate::AgentBoardConfig;
 
 struct GlobalBoardRuntime(Entity<BoardRuntime>);
 
@@ -593,13 +593,15 @@ mod tests {
             ..AgentBoardConfig::default()
         };
         assert!(!config.enabled, "the obsolete stack must default to off");
-        let runtime = cx.update(|cx| {
-            BoardRuntime::init_global_with_config(inert_http(), config, cx)
-        });
+        let runtime =
+            cx.update(|cx| BoardRuntime::init_global_with_config(inert_http(), config, cx));
         cx.run_until_parked();
         runtime.read_with(cx, |runtime, _| {
             assert!(!runtime.connected());
-            assert!(runtime.client.is_none(), "disabled board must not build a client");
+            assert!(
+                runtime.client.is_none(),
+                "disabled board must not build a client"
+            );
             assert!(!runtime.has_poll_task(), "disabled board must not poll");
             assert!(runtime.mcp_server.is_none());
             assert!(runtime.realtime_client.is_none());
@@ -699,9 +701,10 @@ mod tests {
         });
         assert_eq!(
             drain_reply_texts(),
-            vec![
-                ("f3a2".to_string(), "📢 war-room [@m3:aaaa] rebase please".to_string())
-            ],
+            vec![(
+                "f3a2".to_string(),
+                "📢 war-room [@m3:aaaa] rebase please".to_string()
+            )],
         );
         assert_eq!(crate::mentions::unwatched_mention_count(), 1);
 

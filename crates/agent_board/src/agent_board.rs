@@ -44,8 +44,8 @@ use gpui::{
 use http_client::HttpClient;
 use serde::{Deserialize, Serialize};
 use ui::ActiveTheme;
-use workspace::dock::{DockPosition, Panel, PanelEvent};
 use workspace::Workspace;
+use workspace::dock::{DockPosition, Panel, PanelEvent};
 
 use crate::runtime::BoardRuntime;
 use crate::types::BoardMessage;
@@ -521,44 +521,46 @@ pub fn init(http: Arc<dyn HttpClient>, cx: &mut App) {
     BoardRuntime::init_global(http, cx);
     war_room::init(cx);
 
-    cx.observe_new(move |workspace: &mut Workspace, _window, _cx: &mut Context<Workspace>| {
-        workspace.register_action(|workspace, _: &Toggle, window, cx| {
-            if !workspace.toggle_panel_focus::<AgentBoardPanel>(window, cx) {
-                close_or_open(workspace, window, cx);
-            }
-        });
-        workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
-            workspace.toggle_panel_focus::<AgentBoardPanel>(window, cx);
-        });
-        workspace.register_action(|workspace, _: &SetRoom, window, cx| {
-            open_or_focus(workspace, window, cx, |runtime, cx| {
-                let current = runtime.config().room.clone();
-                if let Some(room) = prompt_string("Set agent board room name", &current) {
-                    runtime.set_room(room, cx);
+    cx.observe_new(
+        move |workspace: &mut Workspace, _window, _cx: &mut Context<Workspace>| {
+            workspace.register_action(|workspace, _: &Toggle, window, cx| {
+                if !workspace.toggle_panel_focus::<AgentBoardPanel>(window, cx) {
+                    close_or_open(workspace, window, cx);
                 }
             });
-        });
-        workspace.register_action(|workspace, _: &JoinRoom, window, cx| {
-            open_or_focus(workspace, window, cx, |runtime, cx| {
-                let current = runtime.config().room.clone();
-                if let Some(room) = prompt_string("Join agent board room", &current) {
-                    runtime.set_room(room, cx);
-                }
+            workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
+                workspace.toggle_panel_focus::<AgentBoardPanel>(window, cx);
             });
-        });
-        workspace.register_action(|workspace, _: &Refresh, window, cx| {
-            open_or_focus(workspace, window, cx, |runtime, cx| {
-                runtime.force_refresh(cx);
+            workspace.register_action(|workspace, _: &SetRoom, window, cx| {
+                open_or_focus(workspace, window, cx, |runtime, cx| {
+                    let current = runtime.config().room.clone();
+                    if let Some(room) = prompt_string("Set agent board room name", &current) {
+                        runtime.set_room(room, cx);
+                    }
+                });
             });
-        });
-        workspace.register_action(|workspace, _: &PostMessage, window, cx| {
-            open_or_focus(workspace, window, cx, |runtime, cx| {
-                if let Some(text) = prompt_string("Post a short message to the board", "") {
-                    runtime.post_message(text, cx);
-                }
+            workspace.register_action(|workspace, _: &JoinRoom, window, cx| {
+                open_or_focus(workspace, window, cx, |runtime, cx| {
+                    let current = runtime.config().room.clone();
+                    if let Some(room) = prompt_string("Join agent board room", &current) {
+                        runtime.set_room(room, cx);
+                    }
+                });
             });
-        });
-    })
+            workspace.register_action(|workspace, _: &Refresh, window, cx| {
+                open_or_focus(workspace, window, cx, |runtime, cx| {
+                    runtime.force_refresh(cx);
+                });
+            });
+            workspace.register_action(|workspace, _: &PostMessage, window, cx| {
+                open_or_focus(workspace, window, cx, |runtime, cx| {
+                    if let Some(text) = prompt_string("Post a short message to the board", "") {
+                        runtime.post_message(text, cx);
+                    }
+                });
+            });
+        },
+    )
     .detach();
 }
 

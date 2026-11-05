@@ -15,8 +15,8 @@
 //! for mentions and must share one high-water mark and one rate budget.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 
 use crate::types::BoardMessage;
 

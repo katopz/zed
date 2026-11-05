@@ -623,7 +623,13 @@ mod tests {
                 .expect("provider definition"),
         )
         .expect("definition is JSON");
-        assert_eq!(definition["my-gateway"]["api_url"], "https://example.com/v1");
-        assert_eq!(definition["my-gateway"]["available_models"][0]["name"], "m1");
+        assert_eq!(
+            definition["my-gateway"]["api_url"],
+            "https://example.com/v1"
+        );
+        assert_eq!(
+            definition["my-gateway"]["available_models"][0]["name"],
+            "m1"
+        );
     }
 }

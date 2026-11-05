@@ -55,8 +55,8 @@ use {
     fs::Fs,
     git_ui::git_panel::GitPanel,
     gpui::{
-        App, AppContext as _, Bounds, Entity, UpdateGlobal as _, VisualTestAppContext, WindowBounds,
-        WindowHandle, WindowOptions, point, px, size,
+        App, AppContext as _, Bounds, Entity, UpdateGlobal as _, VisualTestAppContext,
+        WindowBounds, WindowHandle, WindowOptions, point, px, size,
     },
     http_client::FakeHttpClient,
     node_runtime::NodeRuntime,
@@ -177,9 +177,8 @@ fn main() -> anyhow::Result<()> {
     // Outline dock right; WarRoom docks left — so the honest default shot
     // shows the WarRoom icon in the LEFT strip.
     // ------------------------------------------------------------------
-    let first_project =
-        create_project_with_worktree(&project_path, &app_state, &mut cx)
-            .expect("failed to create first project");
+    let first_project = create_project_with_worktree(&project_path, &app_state, &mut cx)
+        .expect("failed to create first project");
     let default_window = open_window_with_panels(&mut cx, &app_state, &first_project)
         .expect("failed to open default-layout window");
 
@@ -197,8 +196,7 @@ fn main() -> anyhow::Result<()> {
     );
     anyhow::ensure!(
         default_docks.right_war_room.is_none()
-            && default_docks.right_outline
-                == default_docks.right_collab.map(|index| index + 1),
+            && default_docks.right_outline == default_docks.right_collab.map(|index| index + 1),
         "default layout: right dock order should be ...Collab, Outline with no WarRoom, got {default_docks:#?}"
     );
 
@@ -231,9 +229,8 @@ fn main() -> anyhow::Result<()> {
     });
     cx.run_until_parked();
 
-    let second_project =
-        create_project_with_worktree(&project_path, &app_state, &mut cx)
-            .expect("failed to create second project");
+    let second_project = create_project_with_worktree(&project_path, &app_state, &mut cx)
+        .expect("failed to create second project");
     let classic_window = open_window_with_panels(&mut cx, &app_state, &second_project)
         .expect("failed to open classic-layout window");
 
@@ -244,8 +241,7 @@ fn main() -> anyhow::Result<()> {
         "classic layout: expected 5 left-dock panels, got {classic_docks:#?}"
     );
     anyhow::ensure!(
-        classic_docks.left_war_room
-            == classic_docks.left_collab.map(|index| index + 1),
+        classic_docks.left_war_room == classic_docks.left_collab.map(|index| index + 1),
         "classic layout: WarRoom ({:?}) must sit directly behind Collab ({:?})",
         classic_docks.left_war_room,
         classic_docks.left_collab,
@@ -378,10 +374,7 @@ fn open_window_with_panels(
         .context("failed to load collab panel")?;
     let outline_panel = cx
         .foreground_executor
-        .block_test(OutlinePanel::load(
-            weak_workspace,
-            async_window_cx,
-        ))
+        .block_test(OutlinePanel::load(weak_workspace, async_window_cx))
         .context("failed to load outline panel")?;
     cx.background_executor.forbid_parking();
 
@@ -417,31 +410,30 @@ struct DockIndices {
 
 #[cfg(target_os = "macos")]
 fn read_dock_indices(cx: &mut VisualTestAppContext, workspace: &Entity<Workspace>) -> DockIndices {
-    workspace
-        .update(cx, |workspace, cx| {
-            let read = |dock: &workspace::dock::Dock| {
-                (
-                    dock.panels_len(),
-                    dock.panel_index_for_type::<CollabPanel>(),
-                    dock.panel_index_for_type::<WarRoomPanel>(),
-                    dock.panel_index_for_type::<OutlinePanel>(),
-                )
-            };
-            let (left_len, left_collab, left_war_room, left_outline) =
-                read(workspace.left_dock().read(cx));
-            let (right_len, right_collab, right_war_room, right_outline) =
-                read(workspace.right_dock().read(cx));
-            DockIndices {
-                left_len,
-                left_collab,
-                left_war_room,
-                left_outline,
-                right_len,
-                right_collab,
-                right_war_room,
-                right_outline,
-            }
-        })
+    workspace.update(cx, |workspace, cx| {
+        let read = |dock: &workspace::dock::Dock| {
+            (
+                dock.panels_len(),
+                dock.panel_index_for_type::<CollabPanel>(),
+                dock.panel_index_for_type::<WarRoomPanel>(),
+                dock.panel_index_for_type::<OutlinePanel>(),
+            )
+        };
+        let (left_len, left_collab, left_war_room, left_outline) =
+            read(workspace.left_dock().read(cx));
+        let (right_len, right_collab, right_war_room, right_outline) =
+            read(workspace.right_dock().read(cx));
+        DockIndices {
+            left_len,
+            left_collab,
+            left_war_room,
+            left_outline,
+            right_len,
+            right_collab,
+            right_war_room,
+            right_outline,
+        }
+    })
 }
 
 /// Settle, refresh, capture, and write the full window plus crops of the
@@ -476,7 +468,9 @@ fn capture_and_save(
     );
 
     let full_path = Path::new(output_dir).join(format!("{name}.png"));
-    screenshot.save(&full_path).context("failed to save screenshot")?;
+    screenshot
+        .save(&full_path)
+        .context("failed to save screenshot")?;
 
     let strip_width = (480 * scale).min(screenshot.width());
     let strip_height = (48 * scale).min(screenshot.height());

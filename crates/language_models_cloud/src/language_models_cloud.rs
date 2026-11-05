@@ -2206,7 +2206,7 @@ mod tests {
             request.messages[0].content.push(MessageContent::Image(
                 language_model::LanguageModelImage {
                     source: "aW1hZ2U=".into(),
-                            uri: None,
+                    uri: None,
                 },
             ));
             assert_eq!(
@@ -2317,7 +2317,7 @@ mod tests {
         request.messages[0].content.push(MessageContent::Image(
             language_model::LanguageModelImage {
                 source: "aW1hZ2U=".into(),
-                            uri: None,
+                uri: None,
             },
         ));
         assert!(matches!(

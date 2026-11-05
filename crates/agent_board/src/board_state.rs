@@ -6,12 +6,12 @@
 
 use std::sync::{Arc, RwLock};
 
-use auto_prompt::peer_states::{AgentStateBroadcaster, ThreadEntry};
 use crate::client::BoardClient;
 use crate::types::{
-    truncate_to_byte_budget, PostMessageBody, PostThreadBody, RoomSnapshot, ThreadEntryWire,
-    MAX_STATE_TEXT_BYTES, MAX_THREAD_ENTRY_BYTES,
+    MAX_STATE_TEXT_BYTES, MAX_THREAD_ENTRY_BYTES, PostMessageBody, PostThreadBody, RoomSnapshot,
+    ThreadEntryWire, truncate_to_byte_budget,
 };
+use auto_prompt::peer_states::{AgentStateBroadcaster, ThreadEntry};
 
 /// Global: writer handle (client + room) set by the panel after `try_start`.
 static WRITER: RwLock<Option<WriterHandle>> = RwLock::new(None);

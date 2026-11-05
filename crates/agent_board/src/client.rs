@@ -28,7 +28,11 @@ pub struct BoardClient {
 }
 
 impl BoardClient {
-    pub fn new(http: Arc<dyn HttpClient>, mut base_url: String, identity: Arc<DeviceIdentity>) -> Self {
+    pub fn new(
+        http: Arc<dyn HttpClient>,
+        mut base_url: String,
+        identity: Arc<DeviceIdentity>,
+    ) -> Self {
         // Accept the short form (`name.account.workers.dev`) and normalize to
         // https — one less thing to get wrong in agent_board.json.
         if !base_url.contains("://") {
@@ -37,7 +41,11 @@ impl BoardClient {
         while base_url.ends_with('/') {
             base_url.pop();
         }
-        Self { http, base_url, identity }
+        Self {
+            http,
+            base_url,
+            identity,
+        }
     }
 
     #[allow(dead_code)]
@@ -64,7 +72,9 @@ impl BoardClient {
             .get(&uri, AsyncBody::empty(), true)
             .await
             .context("agent_board GET room")?;
-        let snapshot = read_json(response).await.context("decoding room snapshot")?;
+        let snapshot = read_json(response)
+            .await
+            .context("decoding room snapshot")?;
         Ok(snapshot)
     }
 
@@ -81,7 +91,9 @@ impl BoardClient {
         let body_text = serde_json::to_string(&body).context("serializing message body")?;
         let uri = format!("{}/v1/rooms/{}/msg", self.base_url, urlencoding(room));
         let response = self.send_signed(&uri, body_text.into_bytes()).await?;
-        let message = read_json(response).await.context("decoding posted message")?;
+        let message = read_json(response)
+            .await
+            .context("decoding posted message")?;
         Ok(message)
     }
 
@@ -103,11 +115,7 @@ impl BoardClient {
     /// `POST /v1/rooms/{room}/reply` — post a steering reply from the web UI
     /// (Plan 015). Signed with ed25519 so Zed-originated replies also work.
     /// The web UI uses the Google OAuth path instead.
-    pub async fn post_reply(
-        &self,
-        room: &str,
-        body: crate::types::WebReply,
-    ) -> Result<()> {
+    pub async fn post_reply(&self, room: &str, body: crate::types::WebReply) -> Result<()> {
         let body_text = serde_json::to_string(&body).context("serializing reply body")?;
         let uri = format!("{}/v1/rooms/{}/reply", self.base_url, urlencoding(room));
         self.send_signed(&uri, body_text.into_bytes()).await?;
@@ -117,11 +125,7 @@ impl BoardClient {
     /// `POST /v1/rooms/{room}/thread` — append thread-timeline entries for a
     /// session (Plan 026 web Threads tab). The worker keeps a per-session ring
     /// and relays the payload to SSE listeners.
-    pub async fn post_thread(
-        &self,
-        room: &str,
-        body: crate::types::PostThreadBody,
-    ) -> Result<()> {
+    pub async fn post_thread(&self, room: &str, body: crate::types::PostThreadBody) -> Result<()> {
         let body_text = serde_json::to_string(&body).context("serializing thread body")?;
         let uri = format!("{}/v1/rooms/{}/thread", self.base_url, urlencoding(room));
         self.send_signed(&uri, body_text.into_bytes()).await?;
@@ -159,7 +163,9 @@ impl BoardClient {
                 if status.is_success() {
                     Ok(response)
                 } else {
-                    Err(anyhow!("agent_board request to {uri} failed: HTTP {status}"))
+                    Err(anyhow!(
+                        "agent_board request to {uri} failed: HTTP {status}"
+                    ))
                 }
             })
             .with_context(|| format!("agent_board POST {uri}"))

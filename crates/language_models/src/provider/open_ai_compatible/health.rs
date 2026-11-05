@@ -1522,7 +1522,10 @@ mod tests {
         // the denominator never undercuts the remaining wait.
         let big_hint = Duration::from_secs(8 * 3600);
         tracker.record_rate_limit(KeySlot::Secondary, now, Some(big_hint), Some(window));
-        assert_eq!(tracker.get(KeySlot::Secondary).backoff_total, Some(big_hint));
+        assert_eq!(
+            tracker.get(KeySlot::Secondary).backoff_total,
+            Some(big_hint)
+        );
         // No stated window falls back to the delta (today's behavior).
         tracker.record_rate_limit(KeySlot::Tertiary, now, Some(hint), None);
         assert_eq!(tracker.get(KeySlot::Tertiary).backoff_total, Some(hint));
@@ -3165,7 +3168,12 @@ mod tests {
     fn a_fresh_upstream_hint_may_shorten_the_window() {
         let now = Instant::now();
         let mut tracker = KeyHealthTracker::default();
-        tracker.record_rate_limit(KeySlot::Primary, now, Some(Duration::from_secs(28905)), None);
+        tracker.record_rate_limit(
+            KeySlot::Primary,
+            now,
+            Some(Duration::from_secs(28905)),
+            None,
+        );
         tracker.record_rate_limit(KeySlot::Primary, now, Some(Duration::from_secs(30)), None);
         assert_eq!(
             tracker.get(KeySlot::Primary).backoff_total,
@@ -3206,7 +3214,12 @@ mod tests {
         assert!(!tracker.get(KeySlot::Primary).is_backed_off(now));
 
         let mut tracker = KeyHealthTracker::default();
-        tracker.record_rate_limit(KeySlot::Primary, now, Some(Duration::from_secs(28905)), None);
+        tracker.record_rate_limit(
+            KeySlot::Primary,
+            now,
+            Some(Duration::from_secs(28905)),
+            None,
+        );
         tracker.record_success(KeySlot::Primary);
         let health = tracker.get(KeySlot::Primary);
         assert!(
@@ -3223,7 +3236,12 @@ mod tests {
     fn real_success_clears_even_an_upstream_hinted_window() {
         let now = Instant::now();
         let mut tracker = KeyHealthTracker::default();
-        tracker.record_rate_limit(KeySlot::Primary, now, Some(Duration::from_secs(28905)), None);
+        tracker.record_rate_limit(
+            KeySlot::Primary,
+            now,
+            Some(Duration::from_secs(28905)),
+            None,
+        );
         tracker.record_success(KeySlot::Primary);
 
         let health = tracker.get(KeySlot::Primary);
@@ -3327,10 +3345,30 @@ mod tests {
         let candidates = four_candidates();
         let now = Instant::now();
         let mut health = KeyHealthTracker::default();
-        health.record_rate_limit(KeySlot::Primary, now, Some(Duration::from_secs(28905)), None);
-        health.record_rate_limit(KeySlot::Secondary, now, Some(Duration::from_secs(900)), None);
-        health.record_rate_limit(KeySlot::Tertiary, now, Some(Duration::from_secs(7200)), None);
-        health.record_rate_limit(KeySlot::Quaternary, now, Some(Duration::from_secs(3600)), None);
+        health.record_rate_limit(
+            KeySlot::Primary,
+            now,
+            Some(Duration::from_secs(28905)),
+            None,
+        );
+        health.record_rate_limit(
+            KeySlot::Secondary,
+            now,
+            Some(Duration::from_secs(900)),
+            None,
+        );
+        health.record_rate_limit(
+            KeySlot::Tertiary,
+            now,
+            Some(Duration::from_secs(7200)),
+            None,
+        );
+        health.record_rate_limit(
+            KeySlot::Quaternary,
+            now,
+            Some(Duration::from_secs(3600)),
+            None,
+        );
 
         let (_, slot) = select_from_candidates(&candidates, &mut health, None, now)
             .expect("fail-open must return a slot");

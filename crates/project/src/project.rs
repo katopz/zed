@@ -5619,9 +5619,7 @@ impl Project {
                 .components()
                 .any(|c| matches!(c, std::path::Component::ParentDir));
             let mut visible = worktree_store.visible_worktrees(cx);
-            if !contains_dotdot
-                && let (Some(worktree), None) = (visible.next(), visible.next())
-            {
+            if !contains_dotdot && let (Some(worktree), None) = (visible.next(), visible.next()) {
                 let worktree = worktree.read(cx);
                 if let Ok(rel_path) = RelPath::new(path, path_style)
                     && rel_path

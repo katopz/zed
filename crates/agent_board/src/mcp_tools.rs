@@ -261,7 +261,10 @@ fn format_room_text(output: &GetAgentRoomOutput) -> String {
     }
     for device in &output.devices {
         if device.states.is_empty() {
-            lines.push(format!("  {} ({}): no active states", device.device_name, device.device_id));
+            lines.push(format!(
+                "  {} ({}): no active states",
+                device.device_name, device.device_id
+            ));
         } else {
             for state in &device.states {
                 let sub = state.sub_agent_id.as_deref().unwrap_or("main");
@@ -319,8 +322,9 @@ mod tests {
 
     #[test]
     fn build_response_with_no_snapshot_returns_graceful_message() {
-        let _state_guard =
-            crate::board_state::TEST_LOCK.lock().expect("board-state test lock poisoned");
+        let _state_guard = crate::board_state::TEST_LOCK
+            .lock()
+            .expect("board-state test lock poisoned");
         crate::board_state::clear_for_test();
         let result = build_response().unwrap();
         assert_eq!(result.structured_content.room, "");
@@ -334,8 +338,9 @@ mod tests {
 
     #[test]
     fn build_response_groups_states_by_device() {
-        let _state_guard =
-            crate::board_state::TEST_LOCK.lock().expect("board-state test lock poisoned");
+        let _state_guard = crate::board_state::TEST_LOCK
+            .lock()
+            .expect("board-state test lock poisoned");
         crate::board_state::clear_for_test();
         let snapshot = crate::types::RoomSnapshot {
             v: 1,
@@ -437,8 +442,9 @@ mod tests {
     fn build_response_includes_orphan_states_without_status() {
         // A device posted a state but never posted a status — the state should
         // still appear in the output as an "orphan" device entry.
-        let _state_guard =
-            crate::board_state::TEST_LOCK.lock().expect("board-state test lock poisoned");
+        let _state_guard = crate::board_state::TEST_LOCK
+            .lock()
+            .expect("board-state test lock poisoned");
         crate::board_state::clear_for_test();
         let snapshot = crate::types::RoomSnapshot {
             v: 1,
@@ -463,13 +469,17 @@ mod tests {
         assert_eq!(result.structured_content.devices.len(), 1);
         assert_eq!(result.structured_content.devices[0].device_id, "dev-ghost");
         assert_eq!(result.structured_content.devices[0].device_name, "ghost");
-        assert_eq!(result.structured_content.devices[0].states[0].state_text, "haunting");
+        assert_eq!(
+            result.structured_content.devices[0].states[0].state_text,
+            "haunting"
+        );
     }
 
     #[test]
     fn build_response_includes_work_board_from_scopes() {
-        let _state_guard =
-            crate::board_state::TEST_LOCK.lock().expect("board-state test lock poisoned");
+        let _state_guard = crate::board_state::TEST_LOCK
+            .lock()
+            .expect("board-state test lock poisoned");
         crate::board_state::clear_for_test();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -519,8 +529,9 @@ mod tests {
     fn build_response_empty_room_has_devices_but_no_states() {
         // Devices with statuses but no state broadcasts: each appears with an
         // empty states vec, and the text says "no active states".
-        let _state_guard =
-            crate::board_state::TEST_LOCK.lock().expect("board-state test lock poisoned");
+        let _state_guard = crate::board_state::TEST_LOCK
+            .lock()
+            .expect("board-state test lock poisoned");
         crate::board_state::clear_for_test();
         let snapshot = crate::types::RoomSnapshot {
             v: 1,

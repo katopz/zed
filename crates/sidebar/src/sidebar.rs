@@ -8594,7 +8594,9 @@ fn all_thread_infos_for_workspace(
                     ThreadStatus::Idle if thread.had_error() => AgentThreadStatus::Error,
                     // Idle with agent-mail outstanding (a reply or scheduled
                     // wake still out): parked waiting, not finished.
-                    ThreadStatus::Idle if thread.is_waiting_for_mail() => AgentThreadStatus::Waiting,
+                    ThreadStatus::Idle if thread.is_waiting_for_mail() => {
+                        AgentThreadStatus::Waiting
+                    }
                     ThreadStatus::Idle => AgentThreadStatus::Completed,
                 }
             };

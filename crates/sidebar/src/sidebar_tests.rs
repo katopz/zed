@@ -6417,9 +6417,7 @@ async fn test_running_thread_sorts_below_pinned_above_idle(cx: &mut TestAppConte
 }
 
 #[gpui::test]
-async fn test_running_thread_sorts_above_continuation_of_pinned_root(
-    cx: &mut TestAppContext,
-) {
+async fn test_running_thread_sorts_above_continuation_of_pinned_root(cx: &mut TestAppContext) {
     // A pinned thread that was continued (auto_prompt summary handoff)
     // becomes a hidden child of a chain headed by a fresh unpinned thread.
     // The hidden pinned child must not drag the chain into the pinned tier:
@@ -6524,9 +6522,7 @@ async fn test_running_thread_sorts_above_continuation_of_pinned_root(
                 .entries
                 .iter()
                 .filter_map(|entry| match entry {
-                    ListEntry::Thread(thread) => {
-                        Some(thread.metadata.display_title().to_string())
-                    }
+                    ListEntry::Thread(thread) => Some(thread.metadata.display_title().to_string()),
                     _ => None,
                 })
                 .collect::<Vec<_>>(),

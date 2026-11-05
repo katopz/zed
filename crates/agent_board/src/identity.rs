@@ -45,7 +45,11 @@ impl DeviceIdentity {
     /// Load an ed25519 OpenSSH private key from `path` (e.g. `~/.ssh/id_ed25519`).
     /// `device_name` is a human label (hostname); `location_hash` is the
     /// best-effort location fingerprint (see [`location_hash`]).
-    pub fn load(path: &std::path::Path, device_name: String, location_hash: String) -> Result<Self> {
+    pub fn load(
+        path: &std::path::Path,
+        device_name: String,
+        location_hash: String,
+    ) -> Result<Self> {
         let pem = std::fs::read_to_string(path)
             .with_context(|| format!("reading ssh private key at {}", path.display()))?;
         // ssh-key auto-detects OpenSSH vs PEM; ed25519 keys need no passphrase
@@ -164,10 +168,7 @@ fn primary_mac() -> String {
     for (_, data) in networks.list() {
         let mac = data.mac_address().to_string();
         // "00:00:00:00:00:00:00:00:e0" / zeroed MACs appear on some virt ifaces.
-        if !mac.trim().is_empty()
-            && !mac.starts_with("00:00:00:00:00:00")
-            && mac != "??"
-        {
+        if !mac.trim().is_empty() && !mac.starts_with("00:00:00:00:00:00") && mac != "??" {
             return mac;
         }
     }
@@ -187,7 +188,10 @@ pub fn expand_ssh_path(path: &str) -> Result<std::path::PathBuf> {
 fn shellexpand_home(input: &str) -> String {
     if let Some(rest) = input.strip_prefix("~/") {
         if let Some(home) = std::env::var_os("HOME") {
-            return std::path::Path::new(&home).join(rest).to_string_lossy().into_owned();
+            return std::path::Path::new(&home)
+                .join(rest)
+                .to_string_lossy()
+                .into_owned();
         }
     }
     input.to_string()
@@ -281,7 +285,11 @@ mod tests {
         let msg_b = "body-b|1000";
         let sig_a = key.sign(msg_a.as_bytes());
         let sig_b = key.sign(msg_b.as_bytes());
-        assert_ne!(sig_a.to_bytes(), sig_b.to_bytes(), "different messages produce different sigs");
+        assert_ne!(
+            sig_a.to_bytes(),
+            sig_b.to_bytes(),
+            "different messages produce different sigs"
+        );
 
         // sig_a must not verify against body-b's message.
         assert!(verifying.verify(msg_b.as_bytes(), &sig_a).is_err());
