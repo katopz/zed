@@ -6,6 +6,12 @@ durable record lives in this row + the linked commits. Convention per the
 workspace's noise-reduction rule: work lands → the record is documented
 (here or in its own `.docs/NNN` page) → the issue file is removed.
 
+## Removed 2026-11-06 (zed idle lane, issue 055)
+
+| issue | verdict | landed in | durable record |
+|---|---|---|---|
+| 055 | native agent request-phase hang never armed the 120s stream idle timeout — no auto retry, turn wedged in `Generating` until the watchdog — FIXED in both request paths | turn loop `08f72a5a7a` + issue-file removal `0b19681fe6` + metadata (title/summary) follow-up `2f170a550c` | the fork_tests doc comments (`test_request_phase_idle_timeout_*`, `test_metadata_request_idle_timeout_*`) carry the scenario records; root cause + evidence live in the fix commits' messages |
+
 ## Removed 2026-11-05 (amo-idle hygiene pass)
 
 | issue | verdict | landed in | durable record |
