@@ -329,6 +329,17 @@ impl AgentMailState {
     }
 }
 
+/// The address a saved native thread answers mail at (`zed-<id>@<rig>`),
+/// for when no live [`NativeAgent`] can report a mail-spawned name override.
+/// `None` where agent-mail is not set up on this machine.
+pub fn saved_thread_mail_address(session_id: &acp_v2::SessionId) -> Option<String> {
+    let self_rig = Mailroom::from_env().ok()?.rigs().ok()?.self_rig;
+    Some(format!(
+        "{}@{self_rig}",
+        native_thread_mail_name(session_id)
+    ))
+}
+
 /// A native thread's inbox name, stable for the session's lifetime.
 pub fn native_thread_mail_name(session_id: &acp_v2::SessionId) -> String {
     let short = session_id

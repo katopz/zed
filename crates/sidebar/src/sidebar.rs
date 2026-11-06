@@ -7,6 +7,7 @@ use action_log::DiffStats;
 use agent::{ThreadStore, ZED_AGENT_ID};
 use agent_client_protocol::schema::v2 as acp;
 use agent_settings::{AgentSettings, THREADS_LIST_MAX_WIDTH, THREADS_LIST_MIN_WIDTH};
+use agent_ui::agent_connection_store::AgentConnectionEntry;
 use agent_ui::terminal_thread_metadata_store::{
     TerminalThreadMetadata, TerminalThreadMetadataStore, terminal_title_prefix,
 };
@@ -30,10 +31,10 @@ use feature_flags::{
     AgentThreadWorktreeLabel, AgentThreadWorktreeLabelFlag, FeatureFlag, FeatureFlagAppExt as _,
 };
 use gpui::{
-    Action as _, AnyElement, App, ClickEvent, Context, Decorations, DismissEvent, Entity, EntityId,
-    FocusHandle, Focusable, KeyContext, ListState, Modifiers, Pixels, Render, SharedString, Task,
-    TaskExt, WeakEntity, Window, WindowBackgroundAppearance, WindowHandle, linear_color_stop,
-    linear_gradient, list, prelude::*, px,
+    Action as _, AnyElement, App, ClickEvent, ClipboardItem, Context, Decorations, DismissEvent,
+    Entity, EntityId, FocusHandle, Focusable, KeyContext, ListState, Modifiers, Pixels, Render,
+    SharedString, Task, TaskExt, WeakEntity, Window, WindowBackgroundAppearance, WindowHandle,
+    linear_color_stop, linear_gradient, list, prelude::*, px,
 };
 use itertools::Itertools;
 use language_model::LanguageModelRegistry;
@@ -3932,6 +3933,36 @@ impl Sidebar {
         .detach_and_log_err(cx);
     }
 
+    /// The `name@rig` a native thread answers agent-mail at. A live native
+    /// agent knows the inbox name a mail-spawned thread was created for, so
+    /// ask it first and derive `zed-<id>@<rig>` only when none is connected.
+    fn native_thread_mail_address(
+        session_id: &acp::SessionId,
+        workspaces: [Option<&Entity<Workspace>>; 2],
+        cx: &App,
+    ) -> Option<String> {
+        workspaces
+            .into_iter()
+            .flatten()
+            .find_map(|workspace| {
+                let panel = workspace.read(cx).panel::<AgentPanel>(cx)?;
+                let entry = panel
+                    .read(cx)
+                    .connection_store()
+                    .read(cx)
+                    .entry(&Agent::NativeAgent)?;
+                match entry.read(cx) {
+                    AgentConnectionEntry::Connected(state) => state
+                        .connection
+                        .clone()
+                        .downcast::<agent::NativeAgentConnection>()?
+                        .mail_address(session_id, cx),
+                    _ => None,
+                }
+            })
+            .or_else(|| agent::saved_thread_mail_address(session_id))
+    }
+
     fn open_closed_native_thread_as_markdown(
         session_id: &acp::SessionId,
         title: Option<SharedString>,
@@ -6928,6 +6959,15 @@ impl Sidebar {
                         .read(cx)
                         .entry(thread_id)
                         .is_some_and(|metadata| metadata.pinned);
+                    let mail_address = is_zed_thread
+                        .then(|| {
+                            Self::native_thread_mail_address(
+                                &session_id,
+                                [thread_workspace.as_ref(), active_workspace.as_ref()],
+                                cx,
+                            )
+                        })
+                        .flatten();
                     ContextMenu::build(_window, cx, move |mut menu, _window, _cx| {
                         menu = menu.entry(
                             if is_pinned {
@@ -6985,6 +7025,14 @@ impl Sidebar {
                                         })
                                         .ok();
                                 }
+                            });
+                        }
+
+                        if let Some(mail_address) = mail_address.clone() {
+                            menu = menu.entry("Copy Agent ID", None, move |_window, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                    mail_address.clone(),
+                                ));
                             });
                         }
 

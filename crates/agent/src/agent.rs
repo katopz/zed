@@ -1,5 +1,6 @@
 mod agent_fork;
 mod agent_mail_bridge;
+pub use agent_mail_bridge::saved_thread_mail_address;
 mod thread_mailbox;
 
 mod db;
@@ -2395,6 +2396,12 @@ impl NativeAgent {
 pub struct NativeAgentConnection(pub Entity<NativeAgent>);
 
 impl NativeAgentConnection {
+    /// The `name@rig` this session answers agent-mail at, honoring the inbox
+    /// name a mail-spawned thread was created for. `None` when mail is off.
+    pub fn mail_address(&self, session_id: &acp_v2::SessionId, cx: &App) -> Option<String> {
+        self.0.read(cx).agent_mail_address(session_id)
+    }
+
     pub fn thread(&self, session_id: &acp_v2::SessionId, cx: &App) -> Option<Entity<Thread>> {
         self.0
             .read(cx)
