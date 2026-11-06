@@ -3056,7 +3056,23 @@ impl Thread {
             let stream_idle_timeout_secs = Self::stream_idle_timeout_secs(&this, cx)?;
 
             let events = match provider {
-                Ok(provider) => provider.stream_completion(&model, request, cx).await,
+                Ok(provider) => {
+                    // The idle timer guards the event stream once the request
+                    // resolves, but the request phase itself — HTTP call plus
+                    // response headers — happens before any timer is armed. A
+                    // provider that accepts the connection and never responds
+                    // would otherwise wedge the turn in `Generating` with no
+                    // retry, so race the request the same way `stream_compaction`
+                    // races its request.
+                    let mut request_idle_timeout =
+                        Self::stream_idle_timeout_future(stream_idle_timeout_secs, cx);
+                    futures::select_biased! {
+                        result = provider.stream_completion(&model, request, cx).fuse() => result,
+                        _ = request_idle_timeout => {
+                            Err(StreamIdleTimeout::turn_request_error(stream_idle_timeout_secs))
+                        }
+                    }
+                }
                 Err(error) => Err(error),
             };
             let (mut events, mut error) = match events {

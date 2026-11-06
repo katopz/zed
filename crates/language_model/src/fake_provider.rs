@@ -26,6 +26,7 @@ struct FakeProviderState {
     models: Vec<LanguageModel>,
     pending_completions: Vec<PendingCompletion>,
     forbid_requests: bool,
+    hang_stream_completions: bool,
     input_token_counts: VecDeque<u64>,
     input_token_count_requests: Vec<LanguageModelRequest>,
 }
@@ -99,6 +100,19 @@ impl LanguageModelClient for FakeLanguageModelProvider {
         let mut state = self.state.lock();
         if state.forbid_requests {
             return async { Err(anyhow!("requests are forbidden").into()) }.boxed();
+        }
+        if state.hang_stream_completions {
+            // Model the request-phase hang the stream idle timeout exists to
+            // recover: the endpoint accepts the request but the response never
+            // arrives, so the returned future never resolves. The completion
+            // is still registered so tests can count attempts.
+            let (events, _rx) = mpsc::unbounded();
+            state.pending_completions.push(PendingCompletion {
+                model_id: model.id.clone(),
+                request,
+                events,
+            });
+            return futures::future::pending().boxed();
         }
         let (events, rx) = mpsc::unbounded();
         state.pending_completions.push(PendingCompletion {
@@ -180,6 +194,18 @@ impl FakeLanguageModelProvider {
 
     pub fn forbid_requests(&self) {
         self.state.lock().forbid_requests = true;
+    }
+
+    /// Makes every subsequent `stream_completion` return a future that never
+    /// resolves, without delivering a stream — the request-phase hang.
+    pub fn hang_stream_completions(&self) {
+        self.state.lock().hang_stream_completions = true;
+    }
+
+    /// Stops hanging `stream_completion` again; pending hung requests stay
+    /// dead, later requests resolve normally.
+    pub fn resume_stream_completions(&self) {
+        self.state.lock().hang_stream_completions = false;
     }
 
     pub fn queue_input_token_count(&self, count: u64) {

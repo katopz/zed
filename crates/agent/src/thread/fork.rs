@@ -130,6 +130,22 @@ impl StreamIdleTimeout {
         )))
     }
 
+    /// The request phase of a turn (HTTP call plus response headers) races
+    /// the same idle timeout as the event stream: a provider that accepts the
+    /// connection and never responds is the same transient hang one notch
+    /// earlier, and without this the turn wedges before any timer exists.
+    pub(super) fn turn_request_error(
+        stream_idle_timeout_secs: u64,
+    ) -> LanguageModelCompletionError {
+        log::warn!(
+            "No completion response for {stream_idle_timeout_secs}s; \
+             treating the request as dead and retrying"
+        );
+        Self::error(format!(
+            "stream idle timeout: no response in {stream_idle_timeout_secs}s"
+        ))
+    }
+
     pub(super) fn compaction_no_reply(stream_idle_timeout_secs: u64) -> anyhow::Error {
         log::warn!(
             "Compaction stream request idle for {stream_idle_timeout_secs}s; \

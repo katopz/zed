@@ -154,6 +154,172 @@ async fn test_stream_idle_timeout_recovers_mid_retry_cascade(cx: &mut TestAppCon
     });
 }
 
+/// The same provider hang one notch earlier — the request phase itself never
+/// resolves (endpoint accepts the connection but never sends response
+/// headers) — must also hit the idle timeout and auto-retry instead of
+/// wedging the turn in `Generating` forever. The stream-phase timer can't
+/// fire here because `stream_completion` never returns a stream to race
+/// (issue 055).
+#[gpui::test]
+async fn test_request_phase_idle_timeout_retries_hung_request(cx: &mut TestAppContext) {
+    let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
+    let model = fake.model("fake");
+
+    cx.update(|cx| {
+        thread.update(cx, |thread, cx| {
+            thread.set_model(model.clone(), cx);
+        });
+    });
+
+    fake.hang_stream_completions();
+
+    let mut events = cx
+        .update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.send(ClientUserMessageId::new(), vec!["hello"], cx)
+            })
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    // Five attempts (initial + 4 retries), each burning the 120s
+    // request-phase idle timeout plus a 30s retry delay (~750s of virtual
+    // time). Advance in chunks so each due timer's task runs first.
+    for _ in 0..14 {
+        cx.executor().advance_clock(Duration::from_secs(60));
+        cx.run_until_parked();
+    }
+
+    assert_eq!(
+        fake.pending_completions_for(&model).len(),
+        5,
+        "initial attempt plus four retries should have opened five requests"
+    );
+
+    let mut saw_idle_timeout_error = false;
+    while let Some(event) = events.next().await {
+        if let Err(error) = event {
+            assert!(
+                format!("{error:#}").contains("stream idle timeout"),
+                "unexpected turn error: {error:#}"
+            );
+            saw_idle_timeout_error = true;
+        }
+    }
+    assert!(
+        saw_idle_timeout_error,
+        "the turn must end with the idle-timeout error instead of wedging"
+    );
+
+    thread.read_with(cx, |thread, _| {
+        assert!(
+            thread.running_turn.is_none(),
+            "the turn must have finished, not stayed Generating forever"
+        );
+    });
+}
+
+/// A provider that accepts requests but never responds must recover
+/// automatically when the endpoint comes back: the request-phase idle timeout
+/// turns each dead attempt into a retryable error, and when a later retry
+/// finally opens a stream the turn completes without surfacing an error
+/// (issue 055).
+#[gpui::test]
+async fn test_request_phase_idle_timeout_recovers_mid_cascade(cx: &mut TestAppContext) {
+    let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
+    let model = fake.model("fake");
+
+    cx.update(|cx| {
+        thread.update(cx, |thread, cx| {
+            thread.set_model(model.clone(), cx);
+        });
+    });
+
+    fake.hang_stream_completions();
+
+    let mut events = cx
+        .update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.send(ClientUserMessageId::new(), vec!["hello"], cx)
+            })
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    // Two attempts hang; each burns the 120s request-phase idle timeout plus
+    // a 30s retry delay. Advance in 60s chunks until the second request opens.
+    for _ in 0..10 {
+        if fake.pending_completions_for(&model).len() >= 2 {
+            break;
+        }
+        cx.executor().advance_clock(Duration::from_secs(60));
+        cx.run_until_parked();
+    }
+    assert_eq!(
+        fake.pending_completions_for(&model).len(),
+        2,
+        "two hung attempts should have opened two requests"
+    );
+
+    // The provider recovers. The hung attempts' registered completions have
+    // dead receivers, so respond via the last-entry helper once the third
+    // request opens.
+    fake.resume_stream_completions();
+    for _ in 0..10 {
+        if fake.pending_completions_for(&model).len() >= 3 {
+            break;
+        }
+        cx.executor().advance_clock(Duration::from_secs(60));
+        cx.run_until_parked();
+    }
+    assert_eq!(
+        fake.pending_completions_for(&model).len(),
+        3,
+        "the recovered third attempt should have opened a third request"
+    );
+
+    fake.respond_to_last_pending_completion(
+        &model,
+        [LanguageModelCompletionEvent::Text(
+            "Recovered after retry.".into(),
+        )],
+    );
+    cx.run_until_parked();
+
+    let mut saw_recovered_text = false;
+    let mut ended_normally = false;
+    let mut saw_error = false;
+    while let Some(event) = events.next().await {
+        match event {
+            Ok(ThreadEvent::AgentText(text)) => {
+                saw_recovered_text |= text.contains("Recovered after retry.");
+            }
+            Ok(ThreadEvent::Stop(_)) => ended_normally = true,
+            Err(error) => {
+                saw_error = true;
+                log::error!("unexpected turn error: {error:#}");
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_recovered_text,
+        "the recovered attempt's text must reach the event stream"
+    );
+    assert!(
+        ended_normally,
+        "the turn must end with a stop event instead of an error"
+    );
+    assert!(!saw_error, "no error may be surfaced when a retry recovers");
+
+    thread.read_with(cx, |thread, _| {
+        assert!(
+            thread.running_turn.is_none(),
+            "the turn must have finished cleanly"
+        );
+    });
+}
+
 /// A compaction stream that accepts the request but never delivers
 /// events must not wedge the turn: the idle timeout in `stream_compaction`
 /// turns it into a retryable error (initial + 4 retries against the
