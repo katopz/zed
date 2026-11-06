@@ -225,7 +225,7 @@ impl Thread {
     /// first because the tool branch mutably borrows `tool_results`.
     pub(crate) fn stream_idle_timeout_future(
         stream_idle_timeout_secs: u64,
-        cx: &mut AsyncApp,
+        cx: &AsyncApp,
     ) -> futures::future::Fuse<
         std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>,
     > {
@@ -322,9 +322,30 @@ pub(crate) async fn stream_completion_with_retry(
     let provider =
         cx.update(|cx| LanguageModelRegistry::read_global(cx).provider_for_model(model))?;
     let request = &strip_unsupported_images(model, request.clone());
+    let stream_idle_timeout_secs = cx.update(|cx| {
+        // Fault-tolerant: the timeout is a recovery mechanism, so a missing
+        // settings store (bare tests, early app init) falls back to the
+        // default instead of panicking inside `get_global`.
+        agent_settings::AgentSettings::try_get(cx).map_or(
+            agent_settings::DEFAULT_STREAM_IDLE_TIMEOUT_SECS,
+            |settings| settings.fork.stream_idle_timeout_secs,
+        )
+    });
     let mut attempt = 0;
     loop {
-        match provider.stream_completion(model, request.clone(), cx).await {
+        // The request phase (HTTP call plus response headers) races the same
+        // idle timeout as the turn loop's request phase: a provider that
+        // accepts the connection and never responds would otherwise wedge a
+        // spawned title/summary task forever, since nothing else bounds it.
+        let mut request_idle_timeout =
+            Thread::stream_idle_timeout_future(stream_idle_timeout_secs, cx);
+        let result = futures::select_biased! {
+            result = provider.stream_completion(model, request.clone(), cx).fuse() => result,
+            _ = request_idle_timeout => {
+                Err(StreamIdleTimeout::turn_request_error(stream_idle_timeout_secs))
+            }
+        };
+        match result {
             Ok(stream) => return Ok(stream),
             Err(err) if attempt < METADATA_GENERATION_MAX_RETRIES => {
                 attempt += 1;

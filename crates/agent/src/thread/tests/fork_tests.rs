@@ -320,6 +320,48 @@ async fn test_request_phase_idle_timeout_recovers_mid_cascade(cx: &mut TestAppCo
     });
 }
 
+/// The same request-phase hang applied to the one-shot metadata calls (title,
+/// summary): each attempt must burn the idle timeout instead of hanging
+/// forever, retry up to `METADATA_GENERATION_MAX_RETRIES` times, then surface
+/// the error (issue 055 follow-up).
+#[gpui::test]
+async fn test_metadata_request_idle_timeout_retries_then_errors(cx: &mut TestAppContext) {
+    let (_thread, _event_stream, fake) = setup_thread_for_test(cx).await;
+    let model = fake.model("fake");
+
+    fake.hang_stream_completions();
+
+    let request = LanguageModelRequest::default();
+    let title_task = cx.spawn({
+        let model = model.clone();
+        async move |cx| crate::stream_thread_title(model, request, &cx).await
+    });
+    cx.run_until_parked();
+
+    // Three attempts (initial + 2 retries), each burning the 120s idle
+    // timeout plus a 500ms retry delay (~361s of virtual time); advance in
+    // chunks so each due timer's task runs first.
+    for _ in 0..8 {
+        cx.executor().advance_clock(Duration::from_secs(60));
+        cx.run_until_parked();
+    }
+
+    assert_eq!(
+        fake.pending_completions_for(&model).len(),
+        3,
+        "initial attempt plus two retries should have opened three requests"
+    );
+
+    let result = title_task.await;
+    assert!(
+        result
+            .as_ref()
+            .err()
+            .is_some_and(|error| format!("{error:#}").contains("stream idle timeout")),
+        "the title task must end with the idle-timeout error instead of hanging: {result:?}"
+    );
+}
+
 /// A compaction stream that accepts the request but never delivers
 /// events must not wedge the turn: the idle timeout in `stream_compaction`
 /// turns it into a retryable error (initial + 4 retries against the
