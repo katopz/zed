@@ -3,6 +3,38 @@
 
 use super::*;
 
+/// Mail from other agents (same-rig `send_message` and cross-rig agent-mail)
+/// reaches a thread as a user message opening with an `<agent_message>` tag;
+/// see `format_mailbox_prompt` in the `agent` crate.
+fn is_agent_mail_prompt(message: &acp_thread::UserMessage) -> bool {
+    message
+        .content
+        .source_blocks()
+        .first()
+        .is_some_and(|block| match block {
+            acp_v2::ContentBlock::Text(text) => {
+                let text = text.text.trim_start();
+                text.starts_with("<agent_message") || text.starts_with("<agent_mail")
+            }
+            _ => false,
+        })
+}
+
+/// The jump-strip label for the prompt at `index`: user prompts count
+/// `1, 2, 3, ...` and agent mail counts `M1, M2, ...`, each in its own series.
+fn prompt_jump_label(mail_flags: &[bool], index: usize) -> Option<String> {
+    let is_mail = *mail_flags.get(index)?;
+    let ordinal = mail_flags[..=index]
+        .iter()
+        .filter(|&&flag| flag == is_mail)
+        .count();
+    Some(if is_mail {
+        format!("M{ordinal}")
+    } else {
+        ordinal.to_string()
+    })
+}
+
 /// Fraction (0..1) of the backoff window still remaining, driving the drain
 /// ring beside a backed-off K-chip: 1.0 renders a full ring, the arc shrinks
 /// as the countdown progresses, and 0.0 means the backoff is over (the caller
@@ -2185,10 +2217,14 @@ impl ThreadView {
         // match check) and the button rendering is capped at
         // 2 * PROMPT_BUTTON_EDGE_WINDOW entries, so it's safe to run on every
         // render even during streaming.
-        let user_prompt_count = entries
+        let mail_flags = entries
             .iter()
-            .filter(|e| matches!(e, AgentThreadEntry::UserMessage(_)))
-            .count();
+            .filter_map(|entry| match entry {
+                AgentThreadEntry::UserMessage(message) => Some(is_agent_mail_prompt(message)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let user_prompt_count = mail_flags.len();
         if user_prompt_count == 0 {
             return None;
         }
@@ -2266,7 +2302,7 @@ impl ThreadView {
         // Kept visible during generation so the user can see the re-indexed
         // prompt numbers after editing and resending an earlier message.
         if user_prompt_count > 1 {
-            buttons = buttons.children(self.render_numbered_prompt_buttons(user_prompt_count, cx));
+            buttons = buttons.children(self.render_numbered_prompt_buttons(&mail_flags, cx));
         }
 
         // BOTTOM bookend: jump to the very last entry.
@@ -2309,7 +2345,8 @@ impl ThreadView {
         Some(buttons)
     }
 
-    /// Renders the numbered `[1] [2] ... [N]` prompt-jump buttons, capped at
+    /// Renders the numbered `[1] [2] [M1] ... [N]` prompt-jump buttons (mail
+    /// from other agents is numbered separately as `M1`, `M2`, ...), capped at
     /// `2 * PROMPT_BUTTON_EDGE_WINDOW` entries with an ellipsis in the middle
     /// when the thread has more prompts than `PROMPT_BUTTON_CAP`. Each button
     /// scrolls its prompt to the top of the viewport on click.
@@ -2318,9 +2355,10 @@ impl ThreadView {
     /// `.children(...)` call.
     pub(super) fn render_numbered_prompt_buttons(
         &self,
-        user_prompt_count: usize,
+        mail_flags: &[bool],
         cx: &Context<Self>,
     ) -> Vec<AnyElement> {
+        let user_prompt_count = mail_flags.len();
         /// How many buttons to render at each edge (head + tail) once the cap
         /// is exceeded. Tuned so a 200-prompt thread renders ~20 buttons.
         const PROMPT_BUTTON_EDGE_WINDOW: usize = 10;
@@ -2357,6 +2395,13 @@ impl ThreadView {
                 );
             }
             last_rendered = Some(prompt_index);
+            let Some(label) = prompt_jump_label(mail_flags, prompt_index) else {
+                continue;
+            };
+            let tooltip = match label.strip_prefix('M') {
+                Some(number) => format!("Jump to agent mail {number}"),
+                None => format!("Jump to prompt {label}"),
+            };
 
             out.push(
                 div()
@@ -2364,12 +2409,9 @@ impl ThreadView {
                     .px_1()
                     .rounded_sm()
                     .hover(|s| s.bg(cx.theme().colors().element_hover))
-                    .tooltip(Tooltip::text(format!(
-                        "Jump to prompt {}",
-                        prompt_index + 1
-                    )))
+                    .tooltip(Tooltip::text(tooltip))
                     .child(
-                        Label::new(format!("{}", prompt_index + 1))
+                        Label::new(label)
                             .size(LabelSize::XSmall)
                             .color(Color::Muted),
                     )
@@ -2572,5 +2614,27 @@ impl ThreadView {
             style.prevent_mouse_interaction = true;
         }
         style
+    }
+}
+
+#[cfg(test)]
+mod prompt_jump_label_tests {
+    use super::prompt_jump_label;
+
+    #[test]
+    fn numbers_user_prompts_and_agent_mail_in_separate_series() {
+        let mail_flags = [false, false, false, true, false, true, false, false];
+        let labels = (0..mail_flags.len())
+            .map(|index| prompt_jump_label(&mail_flags, index))
+            .collect::<Option<Vec<_>>>();
+        assert_eq!(
+            labels.as_deref(),
+            Some(
+                ["1", "2", "3", "M1", "4", "M2", "5", "6"]
+                    .map(String::from)
+                    .as_slice()
+            )
+        );
+        assert_eq!(prompt_jump_label(&mail_flags, mail_flags.len()), None);
     }
 }
