@@ -1491,7 +1491,7 @@ impl ThreadMetadataStore {
     fn handle_conversation_event(
         &mut self,
         conversation_view: Entity<crate::ConversationView>,
-        _event: &crate::conversation_view::RootThreadUpdated,
+        event: &crate::conversation_view::RootThreadUpdated,
         cx: &mut Context<Self>,
     ) {
         let view = conversation_view.read(cx);
@@ -1517,7 +1517,17 @@ impl ThreadMetadataStore {
         let title = thread_ref.title();
         let title_override = existing_thread.and_then(|t| t.title_override.clone());
 
-        let updated_at = Utc::now();
+        // Merely opening a thread re-connects its view without producing new
+        // content; stamping `updated_at` there would jump an old thread to the
+        // top of the sidebar despite no activity. Known threads keep their
+        // timestamp on `Connected`; unseen ones (and any real content change)
+        // start at "now".
+        let updated_at = match event {
+            crate::conversation_view::RootThreadUpdated::Activity => Utc::now(),
+            crate::conversation_view::RootThreadUpdated::Connected => existing_thread
+                .map(|thread| thread.updated_at)
+                .unwrap_or_else(Utc::now),
+        };
 
         let created_at = existing_thread
             .and_then(|t| t.created_at)

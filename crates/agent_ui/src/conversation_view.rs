@@ -703,7 +703,13 @@ impl Conversation {
     }
 }
 
-pub(crate) struct RootThreadUpdated;
+/// Why a conversation view's root thread state changed. Opening a thread
+/// emits `Connected` without any new content; only `Activity` should count
+/// as thread activity when ordering the sidebar's thread list.
+pub(crate) enum RootThreadUpdated {
+    Activity,
+    Connected,
+}
 
 impl EventEmitter<RootThreadUpdated> for ConversationView {}
 
@@ -1201,7 +1207,7 @@ impl ConversationView {
         cx.emit(StateChange);
         cx.emit(AcpServerViewEvent::ActiveThreadChanged);
         if matches!(&self.server_state, ServerState::Connected(_)) {
-            cx.emit(RootThreadUpdated);
+            cx.emit(RootThreadUpdated::Connected);
         }
         cx.notify();
     }
@@ -1967,7 +1973,7 @@ impl ConversationView {
         };
         let is_subagent = thread.read(cx).parent_session_id().is_some();
         if !is_subagent && affects_thread_metadata(event) {
-            cx.emit(RootThreadUpdated);
+            cx.emit(RootThreadUpdated::Activity);
         }
         match event {
             AcpThreadEvent::ActivityConfirmedIdle => {
@@ -8255,6 +8261,79 @@ pub(crate) mod tests {
                 "the live AcpThread should hold the resumed session id"
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_reconnect_preserves_updated_at_until_real_activity(cx: &mut TestAppContext) {
+        use crate::thread_metadata_store::ThreadMetadata;
+        use chrono::{TimeZone, Utc};
+
+        init_test(cx);
+
+        let connection = StubAgentConnection::new().with_supports_load_session(true);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+
+        let thread_id = conversation_view.read_with(cx, |view, _cx| view.thread_id);
+
+        // The initial connect recorded metadata. Age it, simulating an old
+        // thread that was written days ago and is only being re-opened now.
+        let historical_timestamp = TimeZone::with_ymd_and_hms(&Utc, 2024, 6, 1, 0, 0, 0).unwrap();
+        cx.update(|_window, cx| {
+            ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                let existing = store
+                    .entry(thread_id)
+                    .cloned()
+                    .expect("metadata should be recorded on the initial connect");
+                store.save(
+                    ThreadMetadata {
+                        updated_at: historical_timestamp,
+                        ..existing
+                    },
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+
+        // Re-connecting the same view (what opening or retrying a thread
+        // does) is not user activity: it must not rewrite the timestamp, or
+        // the thread would jump to the top of the sidebar thread list.
+        conversation_view.update_in(cx, |view, window, cx| view.retry_connection(window, cx));
+        cx.run_until_parked();
+
+        let updated_at_after_reconnect = cx.read(|cx| {
+            ThreadMetadataStore::global(cx)
+                .read(cx)
+                .entry(thread_id)
+                .expect("metadata should survive the reconnect")
+                .updated_at
+        });
+        assert_eq!(
+            updated_at_after_reconnect, historical_timestamp,
+            "opening/reconnecting a thread must not bump its updated_at"
+        );
+
+        // Sending a message is activity, and must bump the timestamp.
+        let thread_view = active_thread(&conversation_view, cx);
+        let editor = message_editor(&conversation_view, cx);
+        editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("hello", window, cx);
+        });
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+
+        let updated_at_after_send = cx.read(|cx| {
+            ThreadMetadataStore::global(cx)
+                .read(cx)
+                .entry(thread_id)
+                .expect("metadata should survive the send")
+                .updated_at
+        });
+        assert!(
+            updated_at_after_send > historical_timestamp,
+            "sending a message must bump updated_at"
+        );
     }
 
     #[gpui::test]
