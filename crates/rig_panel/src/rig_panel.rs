@@ -7,18 +7,21 @@
 //! while the panel is open; the badge refreshes at most once a minute. Mail
 //! is only peeked, never claimed.
 
-use agent_mail::jobs::JobAction;
+use agent_mail::jobs::{JobAction, JobLine};
 use agent_mail::rig::{self, RigProbe};
-use agent_mail::{Envelope, MailboxSummary, Mailroom, Rigs};
+use agent_mail::{MailboxSummary, Mailroom, Rigs};
 use gpui::{
     Action, App, AppContext as _, Context, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, ParentElement, Render, SharedString,
+    InteractiveElement, IntoElement, MouseButton, ParentElement, Render, SharedString, Stateful,
     StatefulInteractiveElement, Styled, Task, Window, actions, div, px,
 };
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use ui::{ActiveTheme, Color, Disclosure, IconButton, IconName, Label, LabelSize, prelude::*};
+use ui::{
+    ActiveTheme, Color, CommonAnimationExt, Icon, IconButton, IconName, IconSize, Label, LabelSize,
+    Tooltip, prelude::*,
+};
 use workspace::dock::{DockPosition, Panel, PanelEvent};
 use workspace::{StatusItemView, Workspace};
 
@@ -114,6 +117,8 @@ pub struct RigPanel {
     log: Option<String>,
     open_message: Option<String>,
     confirm_cancel: bool,
+    hovered_job: Option<(String, String)>,
+    mail_open: bool,
     poll: Option<Task<()>>,
 }
 
@@ -134,6 +139,8 @@ impl RigPanel {
             log: None,
             open_message: None,
             confirm_cancel: false,
+            hovered_job: None,
+            mail_open: true,
             poll: None,
         }
     }
@@ -255,50 +262,143 @@ impl RigPanel {
             Ok(_) => ("BUSY", Color::Warning),
         };
         let open = !self.collapsed.contains(name);
+        let job_count = outcome
+            .as_ref()
+            .ok()
+            .map(|probe| probe.running.len() + probe.queued.len())
+            .unwrap_or(0);
         let toggle_name = name.to_string();
-        let mut rows = v_flex().w_full().child(
-            h_flex()
-                .gap_1()
-                .px_2()
-                .py_1()
-                .child(
-                    Disclosure::new(SharedString::from(format!("rig-{name}")), open).on_click(
-                        cx.listener(move |panel, _, _, cx| {
-                            if !panel.collapsed.remove(&toggle_name) {
-                                panel.collapsed.insert(toggle_name.clone());
-                            }
-                            cx.notify();
-                        }),
-                    ),
-                )
-                .child(Label::new(name.to_string()).size(LabelSize::Small))
-                .child(Label::new(state).size(LabelSize::Small).color(state_color))
-                .child(
-                    Label::new(match no_jobs {
-                        true => format!("{role} · no jobs"),
-                        false => role,
-                    })
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted),
-                ),
-        );
+
+        // Folded-group indicators, like the thread sidebar's collapsed headers:
+        // a spinner while busy, an accent dot for owner escalations, an error
+        // icon when the probe failed.
+        let mut indicators: Vec<AnyElement> = Vec::new();
         if !open {
-            return rows.into_any_element();
+            match outcome {
+                Err(_) => indicators.push(
+                    Icon::new(IconName::Close)
+                        .size(IconSize::XSmall)
+                        .color(Color::Error)
+                        .into_any_element(),
+                ),
+                Ok(probe) => {
+                    if !probe.quiet {
+                        indicators.push(
+                            Icon::new(IconName::LoadCircle)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted)
+                                .with_rotate_animation(2)
+                                .into_any_element(),
+                        );
+                    }
+                    if probe.owner_mail > 0 {
+                        indicators.push(
+                            Icon::new(IconName::Circle)
+                                .size(IconSize::XSmall)
+                                .color(Color::Accent)
+                                .into_any_element(),
+                        );
+                    }
+                }
+            }
+        }
+
+        let header = h_flex()
+            .id(SharedString::from(format!("rig-header-{name}")))
+            .w_full()
+            .px_2()
+            .py_1()
+            .gap_1()
+            .cursor_pointer()
+            .hover(|row| row.bg(cx.theme().colors().ghost_element_hover))
+            .on_click(cx.listener(move |panel, _, _, cx| {
+                if !panel.collapsed.remove(&toggle_name) {
+                    panel.collapsed.insert(toggle_name.clone());
+                }
+                cx.notify();
+            }))
+            .child(
+                Icon::new(match open {
+                    true => IconName::ChevronDown,
+                    false => IconName::ChevronRight,
+                })
+                .size(IconSize::Small)
+                .color(Color::Muted),
+            )
+            .child(Label::new(name.to_string()).size(LabelSize::Small))
+            .child(Label::new(state).size(LabelSize::XSmall).color(state_color))
+            .child(
+                Label::new(match no_jobs {
+                    true => format!("{role} · no jobs"),
+                    false => role,
+                })
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
+            )
+            .when(!open, |header| header.children(indicators));
+
+        let mut section = v_flex().w_full().child(header);
+        if !open {
+            if job_count > 0 {
+                section = section.child(
+                    div().px_2().pb_1().child(
+                        Label::new(format!(
+                            "{job_count} job{}",
+                            if job_count == 1 { "" } else { "s" }
+                        ))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                    ),
+                );
+            }
+            return section.into_any_element();
         }
         let probe = match outcome {
             Ok(probe) => probe,
             Err(error) => {
-                return rows
-                    .child(detail(truncate(error, 160), Color::Error))
+                return section
+                    .child(
+                        h_flex()
+                            .pl_6()
+                            .pr_2()
+                            .py_0p5()
+                            .gap_1p5()
+                            .child(
+                                Icon::new(IconName::Close)
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Error),
+                            )
+                            .child(
+                                h_flex().min_w_0().child(
+                                    Label::new(error.clone())
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Error)
+                                        .truncate(),
+                                ),
+                            ),
+                    )
                     .into_any_element();
             }
         };
-        rows = rows.child(detail(facts(probe), Color::Muted));
+        section = section.child(facts_row(probe, cx));
         if !probe.quiet {
-            rows = rows.child(detail(
-                format!("not quiet: {}", probe.not_quiet_because.join(", ")),
-                Color::Warning,
-            ));
+            section = section.child(
+                h_flex()
+                    .pl_6()
+                    .pr_2()
+                    .py_0p5()
+                    .gap_1p5()
+                    .child(
+                        Icon::new(IconName::Warning)
+                            .size(IconSize::XSmall)
+                            .color(Color::Warning),
+                    )
+                    .child(
+                        Label::new(format!("not quiet: {}", probe.not_quiet_because.join(", ")))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Warning),
+                    ),
+            );
         }
         for job in probe
             .running
@@ -307,30 +407,7 @@ impl RigPanel {
             .chain(probe.queued.iter().map(|job| (job, false)))
         {
             let (job, running) = job;
-            let selected = self.selected_job.as_ref() == Some(&(name.to_string(), job.id.clone()));
-            let (rig_name, id) = (name.to_string(), job.id.clone());
-            rows = rows.child(
-                div()
-                    .id(SharedString::from(format!("job-{}", job.id)))
-                    .pl_6()
-                    .pr_2()
-                    .py_0p5()
-                    .cursor_pointer()
-                    .when(selected, |row| row.bg(cx.theme().colors().element_selected))
-                    .hover(|row| row.bg(cx.theme().colors().element_hover))
-                    .on_click(cx.listener(move |panel, _, _, cx| {
-                        panel.select_job(rig_name.clone(), id.clone(), cx)
-                    }))
-                    .child(
-                        Label::new(format!("{} {}", if running { "▶" } else { "…" }, job.text))
-                            .size(LabelSize::XSmall)
-                            .color(if running {
-                                Color::Accent
-                            } else {
-                                Color::Default
-                            }),
-                    ),
-            );
+            section = section.child(self.render_job(name, job, running, cx));
         }
         let mut seen: Vec<(&str, usize)> = Vec::new();
         for contender in &probe.contenders {
@@ -353,41 +430,166 @@ impl RigPanel {
                 1 => contender_name.to_string(),
                 count => format!("{contender_name} ×{count}"),
             };
-            rows = rows.child(detail(
-                truncate(&format!("heavy {label}  {where_}"), 120),
-                Color::Warning,
-            ));
+            section = section.child(
+                Row::new(
+                    SharedString::from(format!("contender-{name}-{contender_name}")),
+                    IconName::Flame,
+                    label,
+                )
+                .icon_color(Color::Warning)
+                .title_color(Color::Warning)
+                .meta(vec![(where_, Color::Muted)])
+                .tooltip(Some("Heavy process — the rig is not quiet".into()))
+                .render(cx),
+            );
         }
         for agent in &probe.agents {
-            rows = rows.child(detail(
-                truncate(
-                    &format!(
-                        "agent {} [{}] {}",
-                        agent.name,
-                        agent.status,
-                        short_path(&agent.cwd)
-                    ),
-                    120,
-                ),
-                Color::Muted,
-            ));
+            let waiting_for_wake = agent.wake_scheduled;
+            section = section.child(
+                Row::new(
+                    SharedString::from(format!("agent-{}-{}", name, agent.name)),
+                    if waiting_for_wake {
+                        IconName::CountdownTimer
+                    } else {
+                        IconName::Person
+                    },
+                    agent.name.clone(),
+                )
+                .icon_color(if waiting_for_wake {
+                    Color::Accent
+                } else {
+                    Color::Muted
+                })
+                .meta(vec![
+                    (agent.status.clone(), Color::Muted),
+                    (short_path(&agent.cwd).to_string(), Color::Muted),
+                ])
+                .tooltip(agent.last_paragraph.clone())
+                .render(cx),
+            );
         }
         for (target, count) in &probe.outbox {
-            rows = rows.child(detail(
-                format!("outbox {count} waiting for {target}"),
-                Color::Muted,
-            ));
+            section = section.child(
+                Row::new(
+                    SharedString::from(format!("outbox-{name}-{target}")),
+                    IconName::Send,
+                    target.clone(),
+                )
+                .meta(vec![(format!("{count} waiting"), Color::Muted)])
+                .render(cx),
+            );
         }
         if probe.owner_mail > 0 {
-            rows = rows.child(detail(
-                format!(
-                    "{} escalation(s) for you: agent-mail recv --as owner",
-                    probe.owner_mail
-                ),
-                Color::Accent,
-            ));
+            section = section.child(
+                Row::new(
+                    SharedString::from(format!("owner-mail-{name}")),
+                    IconName::Envelope,
+                    format!("{} escalation(s) for you", probe.owner_mail),
+                )
+                .icon_color(Color::Accent)
+                .title_color(Color::Accent)
+                .meta(vec![(
+                    "agent-mail recv --as owner".to_string(),
+                    Color::Muted,
+                )])
+                .render(cx),
+            );
         }
-        rows.into_any_element()
+        section.into_any_element()
+    }
+
+    /// A managed job as a thread-list row: spinner (or poison warning) with
+    /// the job title, and a muted `lane · id · for target` metadata line.
+    /// Hovering reveals a cancel action; clicking selects it for the log tail.
+    fn render_job(
+        &self,
+        rig_name: &str,
+        job: &JobLine,
+        running: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let selected = self.selected_job.as_ref() == Some(&(rig_name.to_string(), job.id.clone()));
+        let hovered = self.hovered_job.as_ref() == Some(&(rig_name.to_string(), job.id.clone()));
+        let poisoned = job.poisoned;
+        let (icon, icon_color, spinning) = match (running, poisoned > 0) {
+            (true, false) => (IconName::LoadCircle, Color::Muted, true),
+            (_, true) => (IconName::Warning, Color::Warning, false),
+            (false, false) => (IconName::CountdownTimer, Color::Muted, false),
+        };
+        let mut meta: Vec<(String, Color)> = Vec::new();
+        if let Some(position) = job.position {
+            meta.push((format!("#{position}"), Color::Muted));
+        }
+        if let Some(lane) = &job.lane {
+            meta.push((lane.clone(), Color::Muted));
+        }
+        meta.push((short_id(&job.id).to_string(), Color::Muted));
+        if let Some(notify) = &job.notify {
+            meta.push((format!("for {notify}"), Color::Muted));
+        }
+        if poisoned > 0 {
+            meta.push((format!("POISONED ×{poisoned}"), Color::Warning));
+        }
+        let (select_rig, select_id) = (rig_name.to_string(), job.id.clone());
+        let (stop_rig, stop_id) = (rig_name.to_string(), job.id.clone());
+        let (hover_rig, hover_id) = (rig_name.to_string(), job.id.clone());
+        let row = Row::new(
+            SharedString::from(format!("job-{rig_name}-{}", job.id)),
+            icon,
+            job.title.clone().unwrap_or_else(|| job.text.clone()),
+        )
+        .icon_color(icon_color)
+        .spinning(spinning)
+        .title_color(if poisoned > 0 {
+            Color::Warning
+        } else {
+            Color::Default
+        })
+        .meta(meta)
+        .timestamp(job.minutes.map(|minutes| format!("{minutes} min")))
+        .tooltip(Some(job.text.clone()))
+        .selected(selected)
+        .hovered(hovered)
+        .action(
+            h_flex()
+                .child(
+                    IconButton::new(
+                        SharedString::from(format!("stop-{rig_name}-{}", job.id)),
+                        IconName::Stop,
+                    )
+                    .icon_size(IconSize::Small)
+                    .icon_color(Color::Muted)
+                    .tooltip(Tooltip::text("Cancel this job"))
+                    .on_click(cx.listener(move |panel, _, _, cx| {
+                        panel.selected_job = Some((stop_rig.clone(), stop_id.clone()));
+                        panel.log = None;
+                        panel.confirm_cancel = true;
+                        cx.notify();
+                    })),
+                )
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .into_any_element(),
+        )
+        .render(cx);
+        row.cursor_pointer()
+            .on_click(cx.listener(move |panel, _, _, cx| {
+                panel.select_job(select_rig.clone(), select_id.clone(), cx)
+            }))
+            .on_hover(cx.listener(move |panel, is_hovered: &bool, _, cx| {
+                let key = (hover_rig.clone(), hover_id.clone());
+                match *is_hovered {
+                    true => panel.hovered_job = Some(key),
+                    false => {
+                        if panel.hovered_job.as_ref()
+                            == Some(&(hover_rig.clone(), hover_id.clone()))
+                        {
+                            panel.hovered_job = None;
+                        }
+                    }
+                }
+                cx.notify();
+            }))
+            .into_any_element()
     }
 
     fn render_log(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -399,7 +601,20 @@ impl RigPanel {
             .justify_between()
             .px_2()
             .py_1()
-            .child(Label::new(format!("log {} on {rig_name}", short_id(id))).size(LabelSize::Small))
+            .child(
+                h_flex()
+                    .min_w_0()
+                    .gap_1p5()
+                    .child(
+                        Icon::new(IconName::Terminal)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new(format!("log {} on {rig_name}", short_id(id)))
+                            .size(LabelSize::Small),
+                    ),
+            )
             .child(match self.confirm_cancel {
                 false => IconButton::new("cancel-job", IconName::Stop)
                     .icon_size(ui::IconSize::Small)
@@ -458,93 +673,167 @@ impl RigPanel {
             .as_ref()
             .map(|rigs| rigs.self_rig.clone())
             .unwrap_or_default();
+        let open = self.mail_open;
+        let pending: usize = self.mail.inboxes.iter().map(|inbox| inbox.pending).sum();
         let mut section = v_flex()
             .w_full()
             .border_t_1()
             .border_color(cx.theme().colors().border)
             .child(
                 h_flex()
+                    .id("mail-header")
+                    .w_full()
                     .px_2()
                     .py_1()
                     .gap_1()
-                    .child(
-                        ui::Icon::new(IconName::Envelope)
-                            .size(ui::IconSize::Small)
-                            .color(Color::Muted),
-                    )
-                    .child(
-                        Label::new(format!("Mail on {rig_name} (read-only)"))
-                            .size(LabelSize::Small),
-                    ),
-            );
-        if self.mail.inboxes.is_empty() && self.mail.broadcasts.is_empty() {
-            return section
-                .child(detail("nothing pending".into(), Color::Muted))
-                .into_any_element();
-        }
-        for inbox in &self.mail.inboxes {
-            section = section.child(detail(
-                format!(
-                    "{}: {} new{}",
-                    match inbox.name.as_str() {
-                        agent_mail::ANY_NAME => "*",
-                        name => name,
-                    },
-                    inbox.pending,
-                    match inbox.scheduled {
-                        0 => String::new(),
-                        scheduled => format!(", {scheduled} scheduled"),
-                    }
-                ),
-                Color::Default,
-            ));
-        }
-        let messages: Vec<&Envelope> = self
-            .mail
-            .pending
-            .iter()
-            .chain(self.mail.broadcasts.iter())
-            .collect();
-        for envelope in messages {
-            let open = self.open_message.as_deref() == Some(envelope.id.as_str());
-            let id = envelope.id.clone();
-            let first = envelope.body.lines().next().unwrap_or("").to_string();
-            section = section.child(
-                v_flex()
-                    .id(SharedString::from(format!("mail-{}", envelope.id)))
-                    .pl_6()
-                    .pr_2()
-                    .py_0p5()
                     .cursor_pointer()
-                    .hover(|row| row.bg(cx.theme().colors().element_hover))
-                    .on_click(cx.listener(move |panel, _, _, cx| {
-                        panel.open_message =
-                            match panel.open_message.as_deref() == Some(id.as_str()) {
-                                true => None,
-                                false => Some(id.clone()),
-                            };
+                    .hover(|row| row.bg(cx.theme().colors().ghost_element_hover))
+                    .on_click(cx.listener(|panel, _, _, cx| {
+                        panel.mail_open = !panel.mail_open;
                         cx.notify();
                     }))
                     .child(
-                        Label::new(truncate(
-                            &format!(
-                                "{} {} → {}: {first}",
-                                envelope.sent_at.get(11..16).unwrap_or(""),
-                                envelope.from,
-                                envelope.to
-                            ),
-                            120,
-                        ))
-                        .size(LabelSize::XSmall),
+                        Icon::new(match open {
+                            true => IconName::ChevronDown,
+                            false => IconName::ChevronRight,
+                        })
+                        .size(IconSize::Small)
+                        .color(Color::Muted),
                     )
-                    .when(open, |row| {
+                    .child(
+                        Icon::new(IconName::Envelope)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(Label::new("Mail").size(LabelSize::Small))
+                    .child(
+                        Label::new(format!("on {rig_name} · read-only"))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(div().flex_1())
+                    .when(pending > 0, |row| {
                         row.child(
-                            Label::new(envelope.body.clone())
+                            Label::new(format!("{pending} new"))
                                 .size(LabelSize::XSmall)
-                                .color(Color::Muted),
+                                .color(Color::Accent),
                         )
                     }),
             );
+        if !open {
+            return section.into_any_element();
+        }
+        let inboxes = self
+            .mail
+            .inboxes
+            .iter()
+            .filter(|inbox| inbox.pending > 0 || inbox.scheduled > 0);
+        if inboxes.clone().count() == 0
+            && self.mail.pending.is_empty()
+            && self.mail.broadcasts.is_empty()
+        {
+            return section
+                .child(
+                    h_flex()
+                        .pl_6()
+                        .pr_2()
+                        .py_1()
+                        .gap_1p5()
+                        .child(
+                            Icon::new(IconName::Circle)
+                                .size(IconSize::Small)
+                                .color(Color::Placeholder),
+                        )
+                        .child(
+                            Label::new("nothing pending")
+                                .size(LabelSize::Small)
+                                .color(Color::Placeholder),
+                        ),
+                )
+                .into_any_element();
+        }
+        for inbox in inboxes {
+            let name = match inbox.name.as_str() {
+                agent_mail::ANY_NAME => "*",
+                name => name,
+            };
+            let mut meta = vec![(
+                format!("{} new", inbox.pending),
+                if inbox.pending > 0 {
+                    Color::Accent
+                } else {
+                    Color::Muted
+                },
+            )];
+            if inbox.scheduled > 0 {
+                meta.push((format!("{} scheduled", inbox.scheduled), Color::Muted));
+            }
+            section = section.child(
+                Row::new(
+                    SharedString::from(format!("inbox-{}", inbox.name)),
+                    IconName::Folder,
+                    name,
+                )
+                .meta(meta)
+                .render(cx),
+            );
+        }
+        let messages = self
+            .mail
+            .pending
+            .iter()
+            .map(|envelope| (envelope, false))
+            .chain(self.mail.broadcasts.iter().map(|envelope| (envelope, true)));
+        for (envelope, broadcast) in messages {
+            let open_message = self.open_message.as_deref() == Some(envelope.id.as_str());
+            let first = envelope.body.lines().next().unwrap_or("").to_string();
+            let mut meta: Vec<(String, Color)> = Vec::new();
+            if broadcast {
+                meta.push(("broadcast".to_string(), Color::Accent));
+            }
+            meta.push((format!("{} → {}", envelope.from, envelope.to), Color::Muted));
+            let click_id = envelope.id.clone();
+            let mut row = Row::new(
+                SharedString::from(format!("mail-{}", envelope.id)),
+                if broadcast {
+                    IconName::Send
+                } else {
+                    IconName::Envelope
+                },
+                first,
+            )
+            .icon_color(Color::Muted)
+            .meta(meta)
+            .timestamp(Some(envelope.sent_at.get(11..16).unwrap_or("").to_string()))
+            .selected(open_message)
+            .render(cx)
+            .cursor_pointer()
+            .hover(|row| row.bg(cx.theme().colors().ghost_element_hover))
+            .on_click(cx.listener(move |panel, _, _, cx| {
+                panel.open_message = match panel.open_message.as_deref() == Some(click_id.as_str())
+                {
+                    true => None,
+                    false => Some(click_id.clone()),
+                };
+                cx.notify();
+            }));
+            if open_message {
+                row = row.child(
+                    div()
+                        .mx_1p5()
+                        .mb_1()
+                        .px_2()
+                        .py_1p5()
+                        .rounded_sm()
+                        .bg(cx.theme().colors().element_background)
+                        .child(
+                            Label::new(envelope.body.clone())
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        ),
+                );
+            }
+            section = section.child(row);
         }
         section.into_any_element()
     }
@@ -580,7 +869,13 @@ impl Render for RigPanel {
             .size_full()
             .overflow_y_scroll();
         if let Some(error) = &self.error {
-            body = body.child(detail(error.clone(), Color::Error));
+            body = body.child(
+                div().px_2().py_1().child(
+                    Label::new(error.clone())
+                        .size(LabelSize::XSmall)
+                        .color(Color::Error),
+                ),
+            );
         }
         for (name, outcome) in &fleet {
             body = body.child(self.render_rig(name, outcome, cx));
@@ -743,14 +1038,210 @@ impl StatusItemView for RigBadge {
     }
 }
 
-fn detail(text: String, color: Color) -> impl IntoElement {
-    div()
-        .pl_6()
-        .pr_2()
-        .child(Label::new(text).size(LabelSize::XSmall).color(color))
+/// One list row in the thread-history grammar: a title line (status icon,
+/// truncated title, hover-only action) over a muted, dot-separated metadata
+/// line. Visual twin of `ui::ThreadItem` without the thread-specific slots.
+struct Row {
+    id: SharedString,
+    icon: IconName,
+    icon_color: Color,
+    spinning: bool,
+    title: String,
+    title_color: Color,
+    meta: Vec<(String, Color)>,
+    timestamp: Option<String>,
+    tooltip: Option<String>,
+    selected: bool,
+    hovered: bool,
+    action: Option<AnyElement>,
 }
 
-fn facts(probe: &RigProbe) -> String {
+impl Row {
+    fn new(id: impl Into<SharedString>, icon: IconName, title: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            icon,
+            icon_color: Color::Muted,
+            spinning: false,
+            title: title.into(),
+            title_color: Color::Default,
+            meta: Vec::new(),
+            timestamp: None,
+            tooltip: None,
+            selected: false,
+            hovered: false,
+            action: None,
+        }
+    }
+
+    fn icon_color(mut self, color: Color) -> Self {
+        self.icon_color = color;
+        self
+    }
+
+    fn spinning(mut self, spinning: bool) -> Self {
+        self.spinning = spinning;
+        self
+    }
+
+    fn title_color(mut self, color: Color) -> Self {
+        self.title_color = color;
+        self
+    }
+
+    fn meta(mut self, meta: Vec<(String, Color)>) -> Self {
+        self.meta = meta;
+        self
+    }
+
+    fn timestamp(mut self, timestamp: Option<String>) -> Self {
+        self.timestamp = timestamp;
+        self
+    }
+
+    fn tooltip(mut self, tooltip: Option<String>) -> Self {
+        self.tooltip = tooltip;
+        self
+    }
+
+    fn selected(mut self, selected: bool) -> Self {
+        self.selected = selected;
+        self
+    }
+
+    fn hovered(mut self, hovered: bool) -> Self {
+        self.hovered = hovered;
+        self
+    }
+
+    fn action(mut self, action: AnyElement) -> Self {
+        self.action = Some(action);
+        self
+    }
+
+    fn render(self, cx: &App) -> Stateful<Div> {
+        let colors = cx.theme().colors();
+        let icon = if self.spinning {
+            Icon::new(IconName::LoadCircle)
+                .size(IconSize::Small)
+                .color(self.icon_color)
+                .with_rotate_animation(2)
+                .into_any_element()
+        } else {
+            Icon::new(self.icon)
+                .size(IconSize::Small)
+                .color(self.icon_color)
+                .into_any_element()
+        };
+        let meta_elements = meta_elements(self.meta, self.timestamp, cx);
+        let title_line = h_flex()
+            .min_w_0()
+            .w_full()
+            .h_6()
+            .gap_1p5()
+            .justify_between()
+            .child(
+                h_flex()
+                    .min_w_0()
+                    .flex_1()
+                    .gap_1p5()
+                    .child(icon)
+                    .child(Label::new(self.title).color(self.title_color).truncate()),
+            )
+            .when(self.hovered, |line| {
+                line.when_some(self.action, |line, action| {
+                    line.child(
+                        h_flex()
+                            .pr_1()
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .child(action),
+                    )
+                })
+            });
+        v_flex()
+            .id(self.id)
+            .w_full()
+            .px_1p5()
+            .py_1()
+            .overflow_hidden()
+            .when(self.selected, |row| row.bg(colors.ghost_element_selected))
+            .hover(|row| row.bg(colors.ghost_element_hover))
+            .child(title_line)
+            .when(!meta_elements.is_empty(), |row| {
+                row.child(
+                    h_flex()
+                        .min_w_0()
+                        .gap_1p5()
+                        .child(div().size_4().flex_none())
+                        .children(meta_elements),
+                )
+            })
+            .when_some(self.tooltip, |row, tooltip| {
+                row.tooltip(Tooltip::text(tooltip))
+            })
+    }
+}
+
+/// Muted, dot-separated metadata labels as they appear under a thread-list
+/// title, with an optional trailing timestamp.
+fn meta_elements(
+    pieces: Vec<(String, Color)>,
+    timestamp: Option<String>,
+    cx: &App,
+) -> Vec<AnyElement> {
+    let separator_color = Color::Custom(cx.theme().colors().text_muted.opacity(0.4));
+    let mut elements: Vec<AnyElement> = Vec::new();
+    for (index, (text, color)) in pieces.into_iter().enumerate() {
+        if index > 0 {
+            elements.push(
+                Label::new("•")
+                    .size(LabelSize::Small)
+                    .color(separator_color)
+                    .into_any_element(),
+            );
+        }
+        elements.push(
+            Label::new(text)
+                .size(LabelSize::Small)
+                .color(color)
+                .truncate()
+                .into_any_element(),
+        );
+    }
+    if let Some(timestamp) = timestamp {
+        if !elements.is_empty() {
+            elements.push(
+                Label::new("•")
+                    .size(LabelSize::Small)
+                    .color(separator_color)
+                    .into_any_element(),
+            );
+        }
+        elements.push(
+            Label::new(timestamp)
+                .size(LabelSize::Small)
+                .color(Color::Muted)
+                .into_any_element(),
+        );
+    }
+    elements
+}
+
+fn facts_row(probe: &RigProbe, cx: &App) -> AnyElement {
+    let pieces = facts(probe)
+        .into_iter()
+        .map(|fact| (fact, Color::Muted))
+        .collect();
+    h_flex()
+        .pl_6()
+        .pr_2()
+        .py_0p5()
+        .min_w_0()
+        .children(meta_elements(pieces, None, cx))
+        .into_any_element()
+}
+
+fn facts(probe: &RigProbe) -> Vec<String> {
     let mut facts = vec![match probe.load1 {
         Some(load) => format!("load {load:.1}/{}", probe.cores),
         None => format!("{} cores", probe.cores),
@@ -770,14 +1261,7 @@ fn facts(probe: &RigProbe) -> String {
             gpu.util_pct, gpu.mem_used_gb, gpu.mem_total_gb
         ));
     }
-    facts.join(" · ")
-}
-
-fn truncate(text: &str, max_chars: usize) -> String {
-    match text.char_indices().nth(max_chars) {
-        Some((end, _)) => format!("{}…", &text[..end]),
-        None => text.to_string(),
-    }
+    facts
 }
 
 fn short_id(id: &str) -> &str {
@@ -828,8 +1312,7 @@ mod tests {
     }
 
     #[test]
-    fn truncation_is_char_safe() {
-        assert_eq!(truncate("é—日本語", 2), "é—…");
+    fn ids_and_paths_are_shortened() {
         assert_eq!(short_id("01a19485-eeff-702f-8abd-fab50e6ffdbe"), "0e6ffdbe");
         assert_eq!(short_path("/Users/kat/git/riir-ai"), "riir-ai");
     }

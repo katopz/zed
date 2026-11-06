@@ -125,11 +125,32 @@ struct Worktree {
     path: PathBuf,
 }
 
-/// One line of `rig status` for a managed job.
+/// One line of `rig status` for a managed job. `text` is the preformatted
+/// CLI rendering; the rest is structured for UIs that split title and
+/// metadata. Structured fields are `#[serde(default)]` so probes from older
+/// builds — which send only `id` and `text` — still decode.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct JobLine {
     pub id: String,
     pub text: String,
+    /// The job's title/command, without the id, lane, or target prefixes.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// `Shared` or `Exclusive`.
+    #[serde(default)]
+    pub lane: Option<String>,
+    /// Queue position (1-based), for waiting jobs.
+    #[serde(default)]
+    pub position: Option<usize>,
+    /// Elapsed minutes, for running jobs.
+    #[serde(default)]
+    pub minutes: Option<i64>,
+    /// Who gets the lifecycle mail.
+    #[serde(default)]
+    pub notify: Option<String>,
+    /// Poison-probe strikes against an exclusive run.
+    #[serde(default)]
+    pub poisoned: usize,
 }
 
 pub struct JobSummary {
@@ -872,6 +893,12 @@ impl Mailroom {
                         count => format!(" · POISONED ×{count}"),
                     }
                 ),
+                title: Some(record.spec.title.clone()),
+                lane: Some(format!("{:?}", record.spec.lane)),
+                position: None,
+                minutes: Some(elapsed),
+                notify: record.spec.notify.clone(),
+                poisoned: record.poisoned.len(),
             });
         }
         for (position, path) in json_files(&self.jobs_dir("queue")).iter().enumerate() {
@@ -888,6 +915,12 @@ impl Mailroom {
                     spec.title,
                     spec.notify.as_deref().unwrap_or("-")
                 ),
+                title: Some(spec.title.clone()),
+                lane: Some(format!("{:?}", spec.lane)),
+                position: Some(position + 1),
+                minutes: None,
+                notify: spec.notify.clone(),
+                poisoned: 0,
             });
         }
         summary
@@ -1307,6 +1340,33 @@ mod tests {
         assert_eq!(parse_duration("2h").unwrap(), Duration::from_secs(7200));
         assert!(parse_duration("5").is_err());
         assert!(parse_duration("5w").is_err());
+    }
+
+    #[test]
+    fn job_lines_decode_from_pre_structured_probes() {
+        // Probes from older builds carry only `id` and `text`.
+        let line: JobLine = serde_json::from_str(
+            r#"{"id":"j1","text":"j1e80 Exclusive 5 min · bench · for a@m3"}"#,
+        )
+        .unwrap();
+        assert_eq!(line.title, None);
+        assert_eq!(line.lane, None);
+        assert_eq!(line.position, None);
+        assert_eq!(line.minutes, None);
+        assert_eq!(line.notify, None);
+        assert_eq!(line.poisoned, 0);
+        // Newer probes carry the structured fields alongside `text`.
+        let line: JobLine = serde_json::from_str(
+            r#"{"id":"j1","text":"j1e80 Exclusive 5 min · bench · for a@m3",
+                "title":"bench","lane":"Exclusive","minutes":5,
+                "notify":"a@m3","poisoned":2}"#,
+        )
+        .unwrap();
+        assert_eq!(line.title.as_deref(), Some("bench"));
+        assert_eq!(line.lane.as_deref(), Some("Exclusive"));
+        assert_eq!(line.minutes, Some(5));
+        assert_eq!(line.notify.as_deref(), Some("a@m3"));
+        assert_eq!(line.poisoned, 2);
     }
 
     #[test]
