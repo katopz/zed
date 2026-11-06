@@ -77,10 +77,12 @@ pub fn record_usage_hint(hint: UsageHint) {
 const EXHAUSTED_THRESHOLD: f32 = 0.99;
 
 /// Subscription-limit phrases Claude Code prints in its error and splash
-/// text, one per window family: `session limit` (5-hour), `weekly limit` /
-/// `weekly chat limit` (7-day), `opus limit` (7-day, Opus-only).
-const LIMIT_PHRASES: [&str; 4] = [
+/// text: `session limit` (5-hour window, older builds) / `5-hour limit`
+/// (same window, current builds), `weekly limit` / `weekly chat limit`
+/// (7-day), `opus limit` (7-day, Opus-only).
+const LIMIT_PHRASES: [&str; 5] = [
     "session limit",
+    "5-hour limit",
     "weekly limit",
     "weekly chat limit",
     "opus limit",
@@ -425,6 +427,8 @@ mod tests {
     const SAMPLE_ERROR: &str = "Internal error: You've hit your session limit \u{00b7} resets 1:20am (Asia/Bangkok): {\n  \"errorKind\": \"rate_limit\"\n}";
     const SAMPLE_MESSAGE: &str =
         "You've hit your session limit \u{00b7} resets 1:20am (Asia/Bangkok)";
+    // Current builds name the window instead of calling it a session limit.
+    const SAMPLE_FIVE_HOUR_ERROR: &str = "Internal error: You've hit your 5-hour limit \u{00b7} resets 10:30pm (Asia/Bangkok):{\n  \"errorKind\": \"rate_limit\"\n}";
 
     #[test]
     fn parses_full_claude_error_payload() {
@@ -522,6 +526,20 @@ mod tests {
     }
 
     #[test]
+    fn parses_five_hour_limit_form() {
+        let now = local(2026, 8, 18, 19, 0);
+        let limit = build_session_limit(SAMPLE_FIVE_HOUR_ERROR, now, 60).unwrap();
+        let expected_retry = local(2026, 8, 18, 22, 31);
+        assert_eq!(limit.reset_at, local(2026, 8, 18, 22, 30));
+        assert_eq!(limit.retry_at, expected_retry);
+        assert_eq!(
+            limit.retry_delay_ms,
+            (expected_retry - now).num_milliseconds() as u64
+        );
+        assert_eq!(limit.retry_display, "10:31pm (Asia/Bangkok)");
+    }
+
+    #[test]
     fn margin_is_applied() {
         let now = local(2026, 8, 18, 1, 0);
         let limit = build_session_limit(SAMPLE_MESSAGE, now, 300).unwrap();
@@ -574,6 +592,10 @@ mod tests {
         ));
         assert!(looks_like_usage_limit(
             "You've hit your Opus limit · resets 3:45pm"
+        ));
+        assert!(looks_like_usage_limit(SAMPLE_FIVE_HOUR_ERROR));
+        assert!(looks_like_usage_limit(
+            "You've hit your 5-hour limit · resets 10:30pm"
         ));
         assert!(!looks_like_usage_limit("connection refused"));
     }
@@ -703,6 +725,22 @@ mod tests {
                 .unwrap();
         assert_eq!(limit.reset_at.weekday(), Weekday::Mon);
         assert!(limit.retry_display.ends_with("9:31am"));
+
+        // 13. Five-hour phrasing with a healthy five_hour hint must not be
+        //     inferred as the weekly constraint (that routed the retry days
+        //     away before the phrase was recognized); the named window's own
+        //     text parse is authoritative.
+        record_usage_hint(super::UsageHint {
+            five_hour: Some(window(0.95, five_reset)),
+            seven_day: Some(window(1.0, seven_day_reset)),
+            seven_day_opus: None,
+        });
+        assert!(usage_hint_limit(SAMPLE_FIVE_HOUR_ERROR, 60, now).is_none());
+        let limit = session_limit_from_error_text(SAMPLE_FIVE_HOUR_ERROR, 60).unwrap();
+        assert_eq!(
+            limit.reset_at.time(),
+            NaiveTime::from_hms_opt(22, 30, 0).unwrap()
+        );
 
         *USAGE_HINT
             .lock()
