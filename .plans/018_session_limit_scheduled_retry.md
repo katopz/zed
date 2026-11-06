@@ -95,3 +95,14 @@ $ CARGO_TARGET_DIR=/tmp/zed-018 cargo test -p agent_ui --lib auto_prompt|watchdo
 ## GOAT
 
 Not a perf change (control-flow only, zero hot loops) — no feature gate.
+
+## Follow-up (2026-11-06)
+
+- [-] Claude Code now emits `You've hit your 5-hour limit · resets …` — a
+  phrasing absent from `LIMIT_PHRASES`, so the parser missed it and the
+  chain fell through to the orchestrator against the same exhausted quota;
+  with a healthy `five_hour` hint + exhausted weekly it even misrouted the
+  retry to the weekly reset. Fixed in `aa7e32f0c7` (develop): phrase added
+  to `session_limit::LIMIT_PHRASES`, regression pinned in
+  `parses_five_hour_limit_form` + hint-matrix scenario 13 (463 lib tests
+  pass, clippy/fmt clean).
