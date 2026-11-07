@@ -906,7 +906,7 @@ const DECISIVE_STOP_THRESHOLD: f64 = 0.15;
 /// new/same thread is continued with this instruction and the summary itself
 /// carries "what remains". The manual click dispatches this same directive
 /// directly, with no orchestrator call at all.
-pub const CONTINUE_REMAINS_DECISION: &str = "Continue remaining work with best perf/sec, prod-grade decisions (SOLID, DRY); file issues/plans as needed to ensure full coverage. If nothing remains, check other repos for unfinished tasks or do housekeeping (doc-sync, riir-clippy mining, code-smell hunt, online search to distill perf/sec or unblock deferred work). If everything that remains is blocked, owner-gated, or otherwise not executable now, do not loop on re-checking: end your final message with a single line containing only <stop> — auto-prompt halts the chain when it sees that keyword. A <stop> above a remaining-work section that still lists open, unblocked items is rejected and re-prompts you with the offending section — only emit it when the section itself declares everything left blocked/deferred/owner-gated/waiting.";
+pub const CONTINUE_REMAINS_DECISION: &str = "Continue remaining work — best perf/sec, prod-grade (SOLID/DRY); file issues/plans for full coverage. Nothing left? Housekeeping (doc-sync, riir-clippy mining, code-smell hunt, online search to unblock deferred work) or unclaimed tasks in other repos. Do not loop re-checking: if everything that remains is blocked/deferred/owner-gated, say so in the what-remains section and end with a lone <stop> line — a <stop> above open, unblocked work is rejected and re-prompts.";
 
 /// Returns true when the orchestration LLM is decisively stopping.
 /// A decisive stop has very low confidence and no prompt — the LLM is

@@ -270,14 +270,12 @@ pub(crate) fn stop_keyword_violation_section(text: &str) -> Option<String> {
 /// contract so the next stop attempt is either real work or a valid stop.
 pub(crate) fn stop_keyword_violation_prompt(section: &str) -> String {
     format!(
-        "Your previous message ended with a lone `{STOP_KEYWORD}` line, but its \
-         remaining-work section still lists open, unblocked work — the stop was \
-         rejected and the chain continues. Offending section:\n\n{section}\n\n\
-         Do not summarize and do not re-emit `{STOP_KEYWORD}` for this same list: \
-         execute the highest-priority open item now (claim or file a plan first \
-         when it is a fresh engagement). `{STOP_KEYWORD}` is valid only when every \
-         item that remains is blocked, owner-gated, or waiting on the user — and \
-         the section must then say so explicitly."
+        "Lone `{STOP_KEYWORD}` line — the stop was rejected: its remaining-work \
+         section still lists open, unblocked work.\n\n{section}\n\n\
+         Execute the highest-priority item now (claim/file a plan first when it is a \
+         fresh engagement); do not summarize or re-emit `{STOP_KEYWORD}` for this list. \
+         `{STOP_KEYWORD}` is valid only when every remaining item is blocked, \
+         owner-gated, or waiting on the user — stated explicitly in the section."
     )
 }
 
@@ -411,15 +409,13 @@ pub(crate) fn section_all_deferred(section: &str) -> bool {
 /// Continuation for summaries that declare no remaining work: switch to
 /// housekeeping instead of ordering work on an empty queue.
 pub(crate) fn housekeeping_continuation() -> String {
-    "The previous session's summary reports no remaining work. Do NOT summarize again — \
-     switch to housekeeping, in this order:\n\
+    "Summary reports no remaining work. Do NOT summarize again — housekeeping, in order:\n\
      1. Run the boundary-guard and doc-sync skills for this repo.\n\
-     2. Mine the next riir-clippy batch; search online to unblock any blocked task.\n\
+     2. Mine the next riir-clippy batch; search online to unblock blocked tasks.\n\
      3. Re-run benchmarks if the working tree is dirty.\n\
-     4. If no issues, plans, or proposals remain in this repo, look for unclaimed work \
-     in the other workspace repos — only where no other agent is active.\
-     \n5. If nothing actionable remains, stop cleanly: end your final message with a \
-     single line containing only `<stop>`; do not invent work."
+     4. No issues/plans/proposals left here → unclaimed work in other workspace \
+     repos — only where no other agent is active.\n\
+     5. Nothing actionable left → stop cleanly: lone `<stop>` line; do not invent work."
         .to_string()
 }
 
