@@ -32,6 +32,14 @@ struct ChainState {
     last_turn_secs: u64,
     steps_fingerprint: Option<u64>,
     steps_repeats: u32,
+    /// A valid `<stop>` already got its one housekeeping pass; the next
+    /// `<stop>` in this session halts the chain outright.
+    stop_housekeeping_sent: bool,
+    /// Fingerprint of the last rejected keyword-stop section. The same
+    /// section re-emitted after its corrective round honors the stop —
+    /// one correction round is enough, and the runaway caps stay a
+    /// backstop instead of the primary loop breaker.
+    stop_violation_fingerprint: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -199,6 +207,34 @@ pub fn record_summary_steps(session_id: &str, steps: &str) -> u32 {
         }
         chain.steps_repeats
     })
+}
+
+/// Whether this session's first valid keyword stop already got its
+/// housekeeping pass.
+pub fn stop_housekeeping_sent(session_id: &str) -> bool {
+    with_chain(session_id, |chain| chain.stop_housekeeping_sent)
+}
+
+pub fn record_stop_housekeeping_sent(session_id: &str) {
+    with_chain(session_id, |chain| chain.stop_housekeeping_sent = true);
+}
+
+/// Pure read: has this exact violating section already been rejected once in
+/// this session?
+pub fn stop_violation_seen(session_id: &str, section: &str) -> bool {
+    let print = fingerprint(section);
+    with_chain(session_id, |chain| {
+        chain.stop_violation_fingerprint == Some(print)
+    })
+}
+
+/// Commit a rejected violation section so a re-emitted identical stop is
+/// honored instead of corrected again.
+pub fn record_stop_violation(session_id: &str, section: &str) {
+    let print = fingerprint(section);
+    with_chain(session_id, |chain| {
+        chain.stop_violation_fingerprint = Some(print)
+    });
 }
 
 pub fn clear_session(session_id: &str) {

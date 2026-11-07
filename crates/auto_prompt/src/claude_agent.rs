@@ -231,19 +231,67 @@ pub fn decide_claude(
     // Worker-requested stop (`<stop>` keyword, loop-bug): an explicit stop
     // keyword on its own line in the last assistant message ends the chain
     // deterministically — ahead of the session-limit scheduler, connectivity
-    // retries and idle accounting. This is the worker's only channel to halt
-    // chaining when everything left is blocked or owner-gated.
-    if thread
-        .read(cx)
-        .last_assistant_message_text(cx)
-        .as_deref()
-        .is_some_and(crate::message_requests_stop)
+    // retries and idle accounting. Verdict comes from the shared
+    // `classify_keyword_stop` (see decide_precheck): a non-repeated
+    // violating stop is re-prompted with the offending section; a plan-031
+    // terminal summary stops without housekeeping; the first valid stop
+    // dispatches one housekeeping pass before the halt; repeats halt.
     {
-        log::warn!(
-            "[auto_prompt::claude] worker emitted the `{}` stop keyword — stopping chain",
-            crate::STOP_KEYWORD
-        );
-        return AutoPromptDecision::NoAction;
+        let last_message = thread.read(cx).last_assistant_message_text(cx);
+        if last_message
+            .as_deref()
+            .is_some_and(crate::message_requests_stop)
+        {
+            let session_key = thread.read(cx).session_id().to_string();
+            match crate::classify_keyword_stop(&session_key, last_message.as_deref().unwrap_or(""))
+            {
+                crate::KeywordStop::Violation {
+                    section,
+                    repeat: false,
+                } => {
+                    log::warn!(
+                        "[auto_prompt::claude] `{}` stop carries actionable remaining work — re-prompting with the offending section",
+                        crate::STOP_KEYWORD
+                    );
+                    crate::chain::record_stop_violation(&session_key, &section);
+                    let action = crate::stop_followup_action(
+                        &thread,
+                        cx,
+                        crate::stop_keyword_violation_prompt(&section),
+                        last_message.clone(),
+                    );
+                    return AutoPromptDecision::DispatchNow(action);
+                }
+                crate::KeywordStop::Housekeeping => {
+                    crate::chain::record_stop_housekeeping_sent(&session_key);
+                    log::warn!(
+                        "[auto_prompt::claude] valid `{}` stop — dispatching one housekeeping pass before the halt",
+                        crate::STOP_KEYWORD
+                    );
+                    let action = crate::stop_followup_action(
+                        &thread,
+                        cx,
+                        crate::housekeeping_continuation(),
+                        last_message.clone(),
+                    );
+                    return AutoPromptDecision::DispatchNow(action);
+                }
+                crate::KeywordStop::Terminal => {
+                    log::warn!(
+                        "[auto_prompt::claude] `{}` stop over a terminal summary — stopping chain without housekeeping",
+                        crate::STOP_KEYWORD
+                    );
+                    return AutoPromptDecision::NoAction;
+                }
+                crate::KeywordStop::Final | crate::KeywordStop::Violation { repeat: true, .. } => {
+                    log::warn!(
+                        "[auto_prompt::claude] worker emitted the `{}` stop keyword — stopping chain",
+                        crate::STOP_KEYWORD
+                    );
+                    return AutoPromptDecision::NoAction;
+                }
+            }
+        }
     }
 
     // Session limit: the reset time is embedded in the turn error or the

@@ -57,20 +57,181 @@ fn overflow_test_data_with(
 }
 
 #[test]
-fn summary_with_stop_keyword_is_terminal() {
-    // A worker-requested stop (`<stop>` on its own line) must read as
-    // terminal even without a `## Summary` heading, so the stop-time
-    // housekeeping hook is skipped too (loop-bug).
-    assert!(summary_declares_terminal(Some(
+fn stop_keyword_stop_is_not_a_terminal_summary() {
+    // A keyword stop is not automatically a plan-031 terminal summary:
+    // whether it ends the chain quietly, without the housekeeping pass, is
+    // decided by the normal terminal classification, not by the keyword.
+    assert!(!summary_declares_terminal(Some(
         "## Summary\nEverything left is owner-gated.\n<stop>"
     )));
-    assert!(summary_declares_terminal(Some(
+    assert!(!summary_declares_terminal(Some(
         "All work is blocked on the owner.\n<stop>"
     )));
     // Prose mentions of the keyword don't stop anything.
     assert!(!summary_declares_terminal(Some(
         "## Summary\nWork continues; say <stop> on its own line to halt."
     )));
+}
+
+#[test]
+fn stop_keyword_outcome_rejects_stop_over_open_work() {
+    // The reported regression: a summary listing open, unblocked work (prose
+    // "None blocked", open plan phases) above a lone `<stop>` line used to
+    // halt the chain deterministically. It must re-prompt with the offending
+    // section instead.
+    let session = "stop-violation-prose-test";
+    let message = "## Summary\n\n\
+        **(1) Original task:** implement the session filings.\n\n\
+        **(2) Accomplished:**\n\
+        - Landed the harness (commit 4f2c5640).\n\n\
+        **(3) What remains:** rethink 055 T1-T4 + 056 T1 (capture plumbing); \
+        train 490 Phase 2-4 (Phases 2-4 open). None blocked; each is a fresh \
+        engagement rather than an incremental step.\n\n\
+        **(4) Active plan state:** `.plans/490` (Phase 1 done) — in flight.\n\n\
+        <stop>";
+    let mut data = overflow_test_data(session, Some(message));
+    data.context_exceeds_limit = false;
+    match stop_keyword_outcome(&data) {
+        Some(AutoPromptOutcome::Continue(action)) => {
+            assert!(
+                action.next_prompt.contains("stop was rejected"),
+                "corrective prompt must name the rejection: {}",
+                action.next_prompt
+            );
+            assert!(
+                action.next_prompt.contains("None blocked"),
+                "corrective prompt must quote the offending section: {}",
+                action.next_prompt
+            );
+        }
+        other => panic!("expected Continue(corrective), got {other:?}"),
+    }
+}
+
+#[test]
+fn stop_keyword_outcome_rejects_stop_over_open_bullets() {
+    let session = "stop-violation-bullets-test";
+    let message = "## Summary\n\n## What Remains\n\n\
+        - Rework the serializer format\n\
+        - [ ] Run the port test suite\n\n\
+        <stop>";
+    let mut data = overflow_test_data(session, Some(message));
+    data.context_exceeds_limit = false;
+    match stop_keyword_outcome(&data) {
+        Some(AutoPromptOutcome::Continue(action)) => {
+            assert!(
+                action.next_prompt.contains("Rework the serializer"),
+                "corrective prompt must quote the open items: {}",
+                action.next_prompt
+            );
+        }
+        other => panic!("expected Continue(corrective), got {other:?}"),
+    }
+}
+
+#[test]
+fn stop_keyword_outcome_defers_violation_on_overflow() {
+    // Over the context limit a same-thread corrective continuation cannot be
+    // dispatched; the Phase 1/2 machine below owns the fork decision.
+    let session = "stop-violation-overflow-test";
+    let message = "## Summary\n\n## What Remains\n\n- Finish the port\n\n<stop>";
+    let data = overflow_test_data(session, Some(message));
+    assert!(data.context_exceeds_limit);
+    assert!(stop_keyword_outcome(&data).is_none());
+}
+
+#[test]
+fn stop_keyword_outcome_repeated_violation_is_honored() {
+    // One corrective round per distinct section: the identical violating
+    // stop re-emitted after its correction halts the chain instead of
+    // correcting again (the runaway caps stay a backstop, not the breaker).
+    let session = "stop-violation-repeat-test";
+    let message = "## Summary\n\n## What Remains\n\n- Finish the port\n\n<stop>";
+    let mut data = overflow_test_data(session, Some(message));
+    data.context_exceeds_limit = false;
+    match stop_keyword_outcome(&data) {
+        Some(AutoPromptOutcome::Continue(action)) => {
+            assert!(action.next_prompt.contains("stop was rejected"));
+        }
+        other => panic!("expected Continue(corrective), got {other:?}"),
+    }
+    match stop_keyword_outcome(&data) {
+        Some(AutoPromptOutcome::Stopped { .. }) => {}
+        other => panic!("expected Stopped on the repeated violation, got {other:?}"),
+    }
+}
+
+#[test]
+fn stop_keyword_outcome_terminal_summary_stops_without_housekeeping() {
+    // Plan 031: a `<stop>` above an all-deferred summary is a silent stop —
+    // no housekeeping pass may run behind it.
+    let session = "stop-terminal-summary-test";
+    let message = "\n## Summary\n\n\
+        **(1) Original task:** Build and measure the q8 arm.\n\n\
+        **(2) Accomplished:**\n\
+        - All gates PASS.\n\n\
+        **(3) What remains:**\n\
+        - 32K cooled-window cell (7-min cooldown protocol).\n\
+        - Phase 3: owner-gated, needs you to scope T3.1.\n\n\
+        **(4) Active plan state:** `.plans/562_x.md` — COMPLETE.\n\n\
+        <stop>";
+    let mut data = overflow_test_data(session, Some(message));
+    data.context_exceeds_limit = false;
+    match stop_keyword_outcome(&data) {
+        Some(AutoPromptOutcome::Stopped { .. }) => {}
+        other => panic!("expected Stopped (terminal, plan 031), got {other:?}"),
+    }
+}
+
+#[test]
+fn stop_keyword_outcome_defers_on_api_error() {
+    // A stale stop: the message predates a failed turn, so the retry
+    // machinery owns the round.
+    let session = "stop-valid-api-error-test";
+    let mut data = overflow_test_data(session, Some("## Summary\n\nAll tasks complete.\n\n<stop>"));
+    data.context_exceeds_limit = false;
+    data.had_api_error = true;
+    assert!(stop_keyword_outcome(&data).is_none());
+}
+
+#[test]
+fn stop_keyword_outcome_valid_stop_gets_one_housekeeping_pass() {
+    // First valid stop: one housekeeping pass is dispatched ahead of the
+    // halt (endless housekeeping is the intended base state, plan 031); the
+    // second stop is final. The per-session flag keeps this single-shot.
+    let session = "stop-valid-housekeeping-test";
+    let mut data = overflow_test_data(
+        session,
+        Some("## Summary\n\nEverything left is owner-gated.\n\n<stop>"),
+    );
+    data.context_exceeds_limit = false;
+    match stop_keyword_outcome(&data) {
+        Some(AutoPromptOutcome::Continue(action)) => {
+            assert!(
+                action.next_prompt.contains("housekeeping"),
+                "first valid stop must dispatch the housekeeping pass: {}",
+                action.next_prompt
+            );
+        }
+        other => panic!("expected Continue(housekeeping), got {other:?}"),
+    }
+    match stop_keyword_outcome(&data) {
+        Some(AutoPromptOutcome::Stopped { reason }) => {
+            assert!(reason.contains("stop"), "reason: {reason}");
+        }
+        other => panic!("expected Stopped on the second stop, got {other:?}"),
+    }
+}
+
+#[test]
+fn stop_keyword_outcome_ignores_prose_stop_mentions() {
+    let session = "stop-prose-mention-test";
+    let mut data = overflow_test_data(
+        session,
+        Some("## Summary\nWork continues; say <stop> on its own line to halt."),
+    );
+    data.context_exceeds_limit = false;
+    assert!(stop_keyword_outcome(&data).is_none());
 }
 
 #[test]

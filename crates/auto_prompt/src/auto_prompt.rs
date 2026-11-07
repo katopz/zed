@@ -56,11 +56,76 @@ use overflow::{
     MAX_TOKENS_RESUME_PROMPT, api_unreachable_decision, context_overflow_outcome,
     cutoff_context_full_outcome, max_tokens_context_window_full, output_bloat_directive,
 };
-pub(crate) use remaining_work::{STOP_KEYWORD, message_requests_stop};
+pub(crate) use remaining_work::{
+    STOP_KEYWORD, housekeeping_continuation, message_requests_stop, stop_keyword_violation_prompt,
+    stop_keyword_violation_section,
+};
 use remaining_work::{
     SummaryContinuation, detect_remaining_work, extract_summary_next_steps,
-    housekeeping_continuation, is_auto_prompt_summary_response, looks_like_voluntary_summary,
+    is_auto_prompt_summary_response, looks_like_voluntary_summary,
 };
+
+/// Verdict for a keyword stop, shared by all three decision paths
+/// (`decide_precheck`, `decide_claude`, `stop_keyword_outcome`) so a fix
+/// cannot land in one path and miss the others.
+pub(crate) enum KeywordStop {
+    /// Open, unblocked work is still listed above the stop.
+    Violation {
+        section: String,
+        /// The identical section was already rejected once this session —
+        /// one corrective round is enough, honor the stop now.
+        repeat: bool,
+    },
+    /// Everything that remains is armed/deferred/owner-gated (plan 031
+    /// terminal summary) — silent stop, no housekeeping pass.
+    Terminal,
+    /// Valid quiet stop that has not had its single housekeeping pass yet.
+    Housekeeping,
+    /// Valid stop whose housekeeping pass already ran — halt outright.
+    Final,
+}
+
+/// Classify a keyword stop for a session. Pure: nothing is recorded here;
+/// callers commit via `chain::record_*` only when they act on the verdict,
+/// so a native violating stop can fall through from the precheck and be
+/// re-classified (identically) on the LLM path.
+pub(crate) fn classify_keyword_stop(session_key: &str, text: &str) -> KeywordStop {
+    if let Some(section) = stop_keyword_violation_section(text) {
+        let repeat = chain::stop_violation_seen(session_key, &section);
+        return KeywordStop::Violation { section, repeat };
+    }
+    if summary_declares_terminal(Some(text)) {
+        return KeywordStop::Terminal;
+    }
+    if chain::stop_housekeeping_sent(session_key) {
+        return KeywordStop::Final;
+    }
+    KeywordStop::Housekeeping
+}
+
+/// The same-thread action dispatched on a keyword-stop verdict (the
+/// housekeeping pass, or a corrective re-prompt after a rejected stop).
+pub(crate) fn stop_followup_action(
+    thread: &gpui::Entity<acp_thread::AcpThread>,
+    cx: &App,
+    next_prompt: String,
+    last_assistant_message: Option<String>,
+) -> AutoPromptAction {
+    let thread_ref = thread.read(cx);
+    AutoPromptAction {
+        from_session_id: thread_ref.session_id().clone(),
+        from_title: thread_ref.title().map(|title| title.to_string()),
+        next_prompt,
+        work_dirs: thread_ref.work_dirs().map(|pl| pl.paths().to_vec()),
+        original_user_message: None,
+        profile_id: None,
+        actual_input_tokens: thread_ref.token_usage().map(|usage| usage.input_tokens),
+        approximate_token_count: 0,
+        last_assistant_message,
+        force_new_thread: false,
+        focus_new_thread: false,
+    }
+}
 use std::path::PathBuf;
 
 /// Per-session summary tracking for the context-overflow flow.
@@ -841,7 +906,7 @@ const DECISIVE_STOP_THRESHOLD: f64 = 0.15;
 /// new/same thread is continued with this instruction and the summary itself
 /// carries "what remains". The manual click dispatches this same directive
 /// directly, with no orchestrator call at all.
-pub const CONTINUE_REMAINS_DECISION: &str = "Continue remaining work with best perf/sec, prod-grade decisions (SOLID, DRY); file issues/plans as needed to ensure full coverage. If nothing remains, check other repos for unfinished tasks or do housekeeping (doc-sync, riir-clippy mining, code-smell hunt, online search to distill perf/sec or unblock deferred work). If everything that remains is blocked, owner-gated, or otherwise not executable now, do not loop on re-checking: end your final message with a single line containing only <stop> — auto-prompt halts the chain when it sees that keyword.";
+pub const CONTINUE_REMAINS_DECISION: &str = "Continue remaining work with best perf/sec, prod-grade decisions (SOLID, DRY); file issues/plans as needed to ensure full coverage. If nothing remains, check other repos for unfinished tasks or do housekeeping (doc-sync, riir-clippy mining, code-smell hunt, online search to distill perf/sec or unblock deferred work). If everything that remains is blocked, owner-gated, or otherwise not executable now, do not loop on re-checking: end your final message with a single line containing only <stop> — auto-prompt halts the chain when it sees that keyword. A <stop> above a remaining-work section that still lists open, unblocked items is rejected and re-prompts you with the offending section — only emit it when the section itself declares everything left blocked/deferred/owner-gated/waiting.";
 
 /// Returns true when the orchestration LLM is decisively stopping.
 /// A decisive stop has very low confidence and no prompt — the LLM is
@@ -1016,12 +1081,6 @@ pub fn summary_declares_terminal(last_assistant_message: Option<&str>) -> bool {
     else {
         return false;
     };
-    // A worker-requested stop (`<stop>` keyword, loop-bug) is terminal even
-    // without a `## Summary` heading: the stop-time housekeeping hook checks
-    // this function and must not spin up new work behind an explicit stop.
-    if message_requests_stop(text) {
-        return true;
-    }
     if !looks_like_voluntary_summary(text) {
         return false;
     }
@@ -1029,6 +1088,71 @@ pub fn summary_declares_terminal(last_assistant_message: Option<&str>) -> bool {
         extract_summary_next_steps(text),
         Some(SummaryContinuation::Terminal)
     )
+}
+
+/// Outcome for a keyword stop seen on the LLM path (defense in depth —
+/// decide_precheck / decide_claude already gate on this, but data can be
+/// constructed directly via tests or manual dispatches). Classification is
+/// shared (`classify_keyword_stop`): a non-repeated violating stop continues
+/// with the corrective directive; a repeated one, a plan-031 terminal
+/// summary, or a stop whose housekeeping pass already ran halts the chain; a
+/// first valid stop dispatches one housekeeping pass ahead of the halt.
+/// Over the context limit or after an API-level failure the keyword is
+/// deferred entirely — the Phase 1/2 fork machine / retry backoff own the
+/// round and the keyword is re-evaluated afterwards.
+pub(crate) fn stop_keyword_outcome(data: &LlmCallData) -> Option<AutoPromptOutcome> {
+    let text = data.last_assistant_message.as_deref()?;
+    if !message_requests_stop(text) {
+        return None;
+    }
+    if data.had_api_error || data.context_exceeds_limit {
+        return None;
+    }
+    let session_key = data.session_id.to_string();
+    match classify_keyword_stop(&session_key, text) {
+        KeywordStop::Violation { section, repeat } => {
+            if repeat {
+                log::warn!(
+                    "[auto_prompt::decide_with_llm] `{STOP_KEYWORD}` stop repeated after its corrective round — honoring the stop (session={session_key})"
+                );
+                return Some(AutoPromptOutcome::Stopped {
+                    reason: format!("worker requested stop ({STOP_KEYWORD} keyword)"),
+                });
+            }
+            chain::record_stop_violation(&session_key, &section);
+            log::warn!(
+                "[auto_prompt::decide_with_llm] `{STOP_KEYWORD}` stop rejected — remaining-work section lists open work (session={session_key})"
+            );
+            Some(AutoPromptOutcome::Continue(data.make_continue_action(
+                stop_keyword_violation_prompt(&section),
+            )))
+        }
+        KeywordStop::Terminal => {
+            log::warn!(
+                "[auto_prompt::decide_with_llm] `{STOP_KEYWORD}` stop over a terminal summary — stopping chain without housekeeping (session={session_key})"
+            );
+            Some(AutoPromptOutcome::Stopped {
+                reason: format!("worker requested stop ({STOP_KEYWORD} keyword)"),
+            })
+        }
+        KeywordStop::Housekeeping => {
+            chain::record_stop_housekeeping_sent(&session_key);
+            log::warn!(
+                "[auto_prompt::decide_with_llm] valid `{STOP_KEYWORD}` stop — one housekeeping pass before the halt (session={session_key})"
+            );
+            Some(AutoPromptOutcome::Continue(
+                data.make_continue_action(housekeeping_continuation()),
+            ))
+        }
+        KeywordStop::Final => {
+            log::warn!(
+                "[auto_prompt::decide_with_llm] worker emitted the `{STOP_KEYWORD}` stop keyword — stopping chain (session={session_key})"
+            );
+            Some(AutoPromptOutcome::Stopped {
+                reason: format!("worker requested stop ({STOP_KEYWORD} keyword)"),
+            })
+        }
+    }
 }
 
 /// Outcome of the cheap pre-decide checks: either an immediate decision
@@ -1148,23 +1272,77 @@ fn decide_precheck(
     // Worker-requested stop (`<stop>` keyword, loop-bug): an explicit stop
     // keyword on its own line in the last assistant message ends the chain
     // deterministically — ahead of connectivity retries, idle accounting and
-    // every fast path. This is the worker's only channel to halt chaining
-    // when everything left is blocked or owner-gated; prose deferrals get
-    // reworded every round and defeat the repetition caps.
+    // every fast path. The verdict comes from the shared
+    // `classify_keyword_stop`:
+    //
+    // - Violation (open, unblocked work still listed): fall through —
+    //   `decide_with_llm` re-prompts with the offending section (`loop-bug`
+    //   contract: `<stop>` requires everything left blocked/gated/waiting).
+    // - Terminal (plan 031, all-deferred): silent stop, no housekeeping.
+    // - Housekeeping: the first valid stop dispatches one housekeeping pass
+    //   before the halt — skipping it starved the idle lane.
+    // - Final / repeated Violation: halt outright.
     let last_assistant_message = thread.read(cx).last_assistant_message_text(cx);
     if last_assistant_message
         .as_deref()
         .is_some_and(message_requests_stop)
     {
-        log::warn!(
-            "[auto_prompt::decide] worker emitted the `{STOP_KEYWORD}` stop keyword — stopping chain (session={:?})",
-            thread.read(cx).session_id()
-        );
-        debug_log::write_log(
-            "no_action",
-            serde_json::json!({"reason": "worker_stop_keyword"}),
-        );
-        return DecidePrecheck::Decision(AutoPromptDecision::NoAction);
+        let session_key = thread.read(cx).session_id().to_string();
+        match classify_keyword_stop(
+            &session_key,
+            last_assistant_message.as_deref().unwrap_or(""),
+        ) {
+            KeywordStop::Violation { repeat: false, .. } => {
+                log::warn!(
+                    "[auto_prompt::decide] `{STOP_KEYWORD}` stop carries actionable remaining work — falling through to the corrective re-prompt (session={:?})",
+                    thread.read(cx).session_id()
+                );
+                debug_log::write_log(
+                    "stop_keyword_violation",
+                    serde_json::json!({"reason": "stop_keyword_with_actionable_work"}),
+                );
+            }
+            KeywordStop::Housekeeping => {
+                chain::record_stop_housekeeping_sent(&session_key);
+                log::warn!(
+                    "[auto_prompt::decide] valid `{STOP_KEYWORD}` stop — dispatching one housekeeping pass before the halt (session={:?})",
+                    thread.read(cx).session_id()
+                );
+                debug_log::write_log(
+                    "stop_keyword_housekeeping",
+                    serde_json::json!({"reason": "worker_stop_keyword_housekeeping_pass"}),
+                );
+                let action = stop_followup_action(
+                    &thread,
+                    cx,
+                    housekeeping_continuation(),
+                    last_assistant_message.clone(),
+                );
+                return DecidePrecheck::Decision(AutoPromptDecision::DispatchNow(action));
+            }
+            KeywordStop::Terminal => {
+                log::warn!(
+                    "[auto_prompt::decide] `{STOP_KEYWORD}` stop over a terminal summary — stopping chain without housekeeping (session={:?})",
+                    thread.read(cx).session_id()
+                );
+                debug_log::write_log(
+                    "no_action",
+                    serde_json::json!({"reason": "worker_stop_keyword_terminal"}),
+                );
+                return DecidePrecheck::Decision(AutoPromptDecision::NoAction);
+            }
+            KeywordStop::Final | KeywordStop::Violation { repeat: true, .. } => {
+                log::warn!(
+                    "[auto_prompt::decide] worker emitted the `{STOP_KEYWORD}` stop keyword — stopping chain (session={:?})",
+                    thread.read(cx).session_id()
+                );
+                debug_log::write_log(
+                    "no_action",
+                    serde_json::json!({"reason": "worker_stop_keyword"}),
+                );
+                return DecidePrecheck::Decision(AutoPromptDecision::NoAction);
+            }
+        }
     }
 
     // Before `chain::record_turn`: connectivity retries have their own bounded
@@ -1899,17 +2077,8 @@ pub async fn decide_with_llm(
     // decide_precheck / decide_claude already gate on this, but data can be
     // constructed directly (tests, manual dispatches), so re-check before any
     // fast path answers a stop request with a continuation.
-    if data
-        .last_assistant_message
-        .as_deref()
-        .is_some_and(message_requests_stop)
-    {
-        log::warn!(
-            "[auto_prompt::decide_with_llm] worker emitted the `{STOP_KEYWORD}` stop keyword — stopping chain (session={session_id_str})"
-        );
-        return Ok(AutoPromptOutcome::Stopped {
-            reason: format!("worker requested stop ({STOP_KEYWORD} keyword)"),
-        });
+    if let Some(outcome) = stop_keyword_outcome(&data) {
+        return Ok(outcome);
     }
 
     // ── Summary-first fast path (plan 027, tightened plan 031) ──────────

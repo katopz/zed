@@ -99,6 +99,188 @@ pub(crate) fn message_requests_stop(text: &str) -> bool {
         .any(|line| line.trim().eq_ignore_ascii_case(STOP_KEYWORD))
 }
 
+/// Prose cues that explicitly declare open, executable work inside a
+/// what-remains paragraph. Bold-label summaries (`**(3) What remains:** …`)
+/// carry the remaining work as prose, so there are no list items to scan.
+/// Each hit must survive two guards before it counts: a negation window
+/// ("no actionable items", "not blocked", "non-actionable") and a
+/// deferral-marker skip ("still open, awaiting owner review" is gated work,
+/// not an ask).
+const OPEN_WORK_CUES: &[&str] = &[
+    "none blocked",
+    "nothing blocked",
+    "not blocked",
+    "unblocked",
+    "unclaimed",
+    "still open",
+    "open items",
+    "actionable",
+];
+
+/// Negation tokens checked in a small window before a prose-cue hit.
+const PROSE_CUE_NEGATIONS: &[&str] = &["no ", "not ", "non-", "nothing ", "n't"];
+
+/// Word-boundary cue hit whose preceding window carries no negation.
+fn prose_cue_matches(lower_paragraph: &str, cue: &str) -> bool {
+    lower_paragraph.match_indices(cue).any(|(index, _)| {
+        let boundary_start = lower_paragraph[..index]
+            .chars()
+            .next_back()
+            .is_none_or(|previous| !previous.is_alphanumeric());
+        if !boundary_start {
+            return false;
+        }
+        let window_start = lower_paragraph.floor_char_boundary(index.saturating_sub(12));
+        let prefix = &lower_paragraph[window_start..index];
+        !PROSE_CUE_NEGATIONS
+            .iter()
+            .any(|negation| prefix.contains(negation))
+    })
+}
+
+/// Paragraphs that continue a what-remains section: only plain bullets,
+/// numbered items and checkbox rows. Bold-label paragraphs (the
+/// `**(4) Active plan state:**` bookkeeping) and ATX headings end the
+/// region, so plan-state bullets after a settled section never read as open
+/// work.
+fn continues_remaining_region(paragraph: &str) -> bool {
+    let lines: Vec<&str> = paragraph
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    !lines.is_empty()
+        && lines.iter().all(|line| {
+            !line.starts_with("**") && !line.starts_with('#') && is_list_or_heading_line(line)
+        })
+}
+
+/// The message's what-remains region: the last trigger paragraph plus any
+/// pure-list paragraphs that follow it. None when no trigger paragraph sits
+/// in the last three paragraphs — a keyword stop without a recognizable
+/// remaining-work region is honored as-is.
+fn stop_violation_region(text: &str) -> Option<(String, String)> {
+    const TRIGGERS: &[&str] = &[
+        "what remains",
+        "what is left",
+        "what's left",
+        "remaining work",
+        "remaining:",
+        "still need",
+        "still needs",
+        "next step",
+        "todo:",
+        "to do",
+        "action items",
+        "left to do",
+        "follow-up",
+        "pending",
+    ];
+    let paragraphs: Vec<&str> = text
+        .split("\n\n")
+        .map(str::trim)
+        .filter(|paragraph| !paragraph.is_empty())
+        .collect();
+    let scan_start = paragraphs.len().saturating_sub(3);
+    for idx in (scan_start..paragraphs.len()).rev() {
+        let lower = paragraphs[idx].to_lowercase();
+        if TRIGGERS.iter().any(|trigger| lower.contains(trigger)) {
+            let mut region = vec![paragraphs[idx]];
+            for paragraph in &paragraphs[idx + 1..] {
+                if continues_remaining_region(paragraph) {
+                    region.push(paragraph);
+                } else {
+                    break;
+                }
+            }
+            let region_text = region.join("\n\n");
+            let trigger_paragraph = region[0].to_string();
+            return Some((region_text, trigger_paragraph));
+        }
+    }
+    None
+}
+
+/// The offending remaining-work section when a keyword stop is a protocol
+/// violation. The `<stop>` contract requires everything that remains to be
+/// blocked, owner-gated, or waiting on the user; a stop pasted above a
+/// remaining-work section that still lists open, unblocked work halts the
+/// chain with actionable items on the table and starves the idle-housekeeping
+/// lane. Conservative by design so it cannot re-prompt a legitimate stop
+/// into a loop:
+///
+/// - no recognizable remaining-work region → the stop is honored;
+/// - an explicit nothing-left declaration wins over everything else;
+/// - open work counts only when structural (an open checkbox, or a bullet /
+///   numbered item without a deferral marker) or explicitly declared in
+///   prose ("None blocked", "unclaimed", …) inside the trigger paragraph.
+///   Prose deferrals and plan-state bookkeeping alone never reject a stop.
+pub(crate) fn stop_keyword_violation_section(text: &str) -> Option<String> {
+    if !message_requests_stop(text) {
+        return None;
+    }
+    let (region, trigger_paragraph) = stop_violation_region(text)?;
+    if section_indicates_no_remaining_work(&region) {
+        return None;
+    }
+    let has_open_item = region.lines().any(|line| {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with("- ")
+            && !trimmed.starts_with("* ")
+            && numbered_item_text(line).is_none()
+        {
+            return false;
+        }
+        if is_actionable_checkbox(trimmed) {
+            return true;
+        }
+        if let Some(item) = numbered_item_text(line) {
+            let item_lower = item.to_lowercase();
+            if NOTHING_LEFT_CUES.iter().any(|cue| item_lower.contains(cue)) {
+                return false;
+            }
+        }
+        let lower = line.to_lowercase();
+        !DEFERRED_ITEM_MARKERS
+            .iter()
+            .any(|marker| contains_marker(&lower, marker))
+    });
+    if has_open_item {
+        return Some(region);
+    }
+    // Prose declarations only: skipped entirely when the trigger paragraph
+    // carries any deferral vocabulary ("still open, awaiting owner review"),
+    // so gated-work phrasing never reads as an ask to continue.
+    let trigger_lower = trigger_paragraph.to_lowercase();
+    let has_deferral_marker = DEFERRED_ITEM_MARKERS
+        .iter()
+        .any(|marker| contains_marker(&trigger_lower, marker));
+    if !has_deferral_marker
+        && OPEN_WORK_CUES
+            .iter()
+            .any(|cue| prose_cue_matches(&trigger_lower, cue))
+    {
+        return Some(region);
+    }
+    None
+}
+
+/// The corrective continuation dispatched when a keyword stop is rejected:
+/// names the violation, quotes the offending section, and restates the
+/// contract so the next stop attempt is either real work or a valid stop.
+pub(crate) fn stop_keyword_violation_prompt(section: &str) -> String {
+    format!(
+        "Your previous message ended with a lone `{STOP_KEYWORD}` line, but its \
+         remaining-work section still lists open, unblocked work — the stop was \
+         rejected and the chain continues. Offending section:\n\n{section}\n\n\
+         Do not summarize and do not re-emit `{STOP_KEYWORD}` for this same list: \
+         execute the highest-priority open item now (claim or file a plan first \
+         when it is a fresh engagement). `{STOP_KEYWORD}` is valid only when every \
+         item that remains is blocked, owner-gated, or waiting on the user — and \
+         the section must then say so explicitly."
+    )
+}
+
 /// Nothing-left cues: phrases a summary uses to declare that no work remains.
 pub(crate) const NOTHING_LEFT_CUES: &[&str] = &[
     "nothing left",
@@ -930,6 +1112,109 @@ mod tests {
         assert!(!message_requests_stop("<stop\n>"));
         assert!(!message_requests_stop(""));
         assert!(!message_requests_stop("no stop here"));
+    }
+
+    #[test]
+    fn stop_violation_rejects_prose_none_blocked() {
+        // The reported regression shape: bold-label summary, remaining work
+        // as prose with an explicit "None blocked", lone <stop> at the end.
+        let text = "## Summary\n\n\
+            **(2) Accomplished:**\n\
+            - Landed the harness.\n\n\
+            **(3) What remains:** rethink 055 T1-T4; train 490 Phase 2-4 \
+            (Phases 2-4 open). None blocked; each is a fresh engagement.\n\n\
+            **(4) Active plan state:** `.plans/490` in flight.\n\n\
+            <stop>";
+        let section = stop_keyword_violation_section(text).expect("violation expected");
+        assert!(section.contains("None blocked"), "section: {section}");
+        // The plan-state bookkeeping paragraph must not leak into the region.
+        assert!(!section.contains("Active plan state"), "section: {section}");
+    }
+
+    #[test]
+    fn stop_violation_rejects_open_bullets_and_open_checkboxes() {
+        let bullets = "## Summary\n\n## What Remains\n\n\
+            - Rework the serializer format\n\
+            - Finish the port\n\n\
+            <stop>";
+        assert!(stop_keyword_violation_section(bullets).is_some());
+
+        let checkbox = "## What Remains\n\n- [ ] Run the port test suite\n\n<stop>";
+        assert!(stop_keyword_violation_section(checkbox).is_some());
+    }
+
+    #[test]
+    fn stop_violation_honors_fully_blocked_bullets() {
+        // Plan 031 vocabulary: every bullet carries a deferral / gating marker.
+        let text = "## Summary\n\n\
+            **(3) What remains:**\n\
+            - 32K cooled-window cell (7-min cooldown protocol).\n\
+            - Phase 3: owner-gated, needs you to scope T3.1.\n\
+            - `.issues/016`: waiting on 9 more reviewed chains.\n\n\
+            <stop>";
+        assert!(stop_keyword_violation_section(text).is_none());
+    }
+
+    #[test]
+    fn stop_violation_honors_nothing_left_and_bare_stops() {
+        let nothing_left = "## Summary\n\nAll done.\n\n\
+            ## What Remains\n\nNothing left to do.\n\n<stop>";
+        assert!(stop_keyword_violation_section(nothing_left).is_none());
+
+        // No recognizable remaining-work region at all → honored as-is.
+        assert!(stop_keyword_violation_section("<stop>").is_none());
+        assert!(stop_keyword_violation_section("Wrapped up.\n\n<stop>").is_none());
+    }
+
+    #[test]
+    fn stop_violation_ignores_accomplished_bullets_and_bookkeeping() {
+        // Unmarked bullets under "Accomplished" are shipped work, and
+        // plan-state bookkeeping (sibling lanes marked "unclaimed") is not an
+        // ask for this chain — neither may reject the stop.
+        let text = "## Summary\n\n\
+            **(2) Accomplished:**\n\
+            - Landed the harness (commit 4f2c5640).\n\
+            - Landed the smoke run.\n\n\
+            **(3) What remains:** Nothing outstanding — everything is \
+            owner-gated.\n\n\
+            **(4) Active plan state:** `.issues/216`: sibling's unclaimed lane.\n\n\
+            <stop>";
+        assert!(stop_keyword_violation_section(text).is_none());
+    }
+
+    #[test]
+    fn stop_violation_honors_negated_and_gated_prose() {
+        // Negated cues ("no actionable items", "non-actionable") and
+        // deferral-marked prose ("still open, awaiting owner review") are
+        // gated or absent work, never an ask to continue. Bold-label shape
+        // so the prose cue layer actually runs.
+        let not_actionable = "**(3) What remains:** The cleanup is not \
+            actionable now.\n\n<stop>";
+        assert!(stop_keyword_violation_section(not_actionable).is_none());
+
+        let no_actionable_items = "**(3) What remains:** No actionable items; \
+            everything landed.\n\n<stop>";
+        assert!(stop_keyword_violation_section(no_actionable_items).is_none());
+
+        let non_actionable = "**(3) What remains:** The follow-up here is \
+            non-actionable until specs arrive.\n\n<stop>";
+        assert!(stop_keyword_violation_section(non_actionable).is_none());
+
+        let gated_until_unblocked = "**(3) What remains:** T2 is blocked until \
+            the review gate is unblocked.\n\n<stop>";
+        assert!(stop_keyword_violation_section(gated_until_unblocked).is_none());
+
+        let awaiting_review = "**(3) What remains:** PR #12 still open, \
+            awaiting owner review.\n\n<stop>";
+        assert!(stop_keyword_violation_section(awaiting_review).is_none());
+    }
+
+    #[test]
+    fn stop_violation_prompt_names_rejection_and_quotes_section() {
+        let prompt = stop_keyword_violation_prompt("- Finish the port");
+        assert!(prompt.contains("stop was rejected"));
+        assert!(prompt.contains("- Finish the port"));
+        assert!(prompt.contains("<stop>"));
     }
 
     #[test]

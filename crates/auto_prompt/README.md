@@ -276,7 +276,16 @@ Exception: the turn that follows an auto-prompt continuation never counts as a t
 
 A worker can halt its own auto-prompt chain deterministically by ending its final message with a line containing only `<stop>` (case-insensitive). `message_requests_stop` matches the keyword only when it is alone on a line, so quoting or explaining it in prose does not stop anything.
 
-The check runs ahead of everything else in both decision paths (`decide_precheck` for the native flow, `decide_claude` for Claude Code threads) — before session-limit scheduling, API-unreachable backoff, idle accounting and the summary fast paths — and once more in `decide_with_llm` as defense in depth. A keyword stop also reads as terminal to `summary_declares_terminal`, so the stop-time housekeeping hook is skipped: nothing new spins up behind an explicit stop.
+The check runs ahead of everything else in both decision paths (`decide_precheck` for the native flow, `decide_claude` for Claude Code threads) — before session-limit scheduling, API-unreachable backoff, idle accounting and the summary fast paths — and once more in `decide_with_llm` as defense in depth (`stop_keyword_outcome`).
+
+The keyword is validated, not obeyed blindly. All three decision paths share one verdict machine, `classify_keyword_stop`:
+
+- **Violation** — `stop_keyword_violation_section` extracts the message's what-remains region (the last trigger paragraph plus pure-list continuations; bold-label bookkeeping like `**(4) Active plan state:**` and ATX headings end the region) and rejects the stop when it still lists open, unblocked work: an open checkbox, a bullet/numbered item without a deferral marker, or an explicit prose declaration in the trigger paragraph ("None blocked", "unclaimed", …). Prose hits must survive a negation window ("no actionable items", "non-actionable") and are skipped entirely when the paragraph carries deferral vocabulary ("still open, awaiting owner review"). A first-time violation re-prompts the worker with `stop_keyword_violation_prompt` (quoting the offending section); the identical section re-emitted after its corrective round is honored — one correction round is enough (`chain::record_stop_violation` fingerprint, `loop-bug`: the runaway caps stay a backstop, not the loop breaker).
+- **Terminal** — the stop sits above a plan-031 all-deferred summary: silent stop, no housekeeping (gated work is not picked up autonomously and unrelated housekeeping would run uninvited).
+- **Housekeeping** — a valid quiet stop that has not had its single pass yet: `housekeeping_continuation` is dispatched ahead of the halt. Endless housekeeping is the intended idle base state (plan 031); when every keyword stop read as terminal, the idle-housekeeping lane silently starved. The second stop is final (`chain::stop_housekeeping_sent`).
+- **Final** — the pass already ran: halt outright.
+
+The classifier is conservative so it cannot loop a legitimate stop: no recognizable region, an explicit nothing-left declaration, prose deferrals, and fully deferred/blocked/gated bullets all honor the stop.
 
 Continuation prompts teach the keyword (`CONTINUE_REMAINS_DECISION`, the housekeeping continuation, the overflow Phase 1 summarize request): "if everything that remains is blocked, owner-gated, or otherwise not executable now … end your final message with a single line containing only `<stop>`". This is the deterministic fix for re-prompt loops where the worker's prose deferrals get reworded every round and defeat the repetition caps.
 
