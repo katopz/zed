@@ -1074,7 +1074,21 @@ impl AcpConnection {
                                 )));
                             };
                             session.session_modes = modes;
-                            session.config_options = config_options;
+                            session.config_options = config_options.clone();
+                            // Fork divergence from upstream #65850 (kept since
+                            // 937cdc59bf): saved default_config_options also
+                            // re-apply on load/resume. Upstream deliberately
+                            // trusts the agent's returned config, but
+                            // claude-code-acp does not persist per-session
+                            // picks, so without this every reopen (and every
+                            // recovery reload after sleep/wake or a dropped
+                            // connection) reset the model/effort selectors to
+                            // the agent's own defaults.
+                            session.default_config_task = config_options.as_ref().map(|options| {
+                                connection_state
+                                    .apply_default_config_options(&session_id, options, cx)
+                                    .shared()
+                            });
                         }
                         if replays_history {
                             loaded_thread.update(cx, |thread, cx| {
@@ -6403,7 +6417,11 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn loaded_sessions_do_not_apply_config_defaults(cx: &mut gpui::TestAppContext) {
+    async fn loaded_sessions_reapply_saved_config_defaults(cx: &mut gpui::TestAppContext) {
+        // Fork divergence from upstream #65850: unlike upstream, load/resume
+        // re-applies saved default_config_options. claude-code-acp does not
+        // persist per-session picks, so without this every reopen reset the
+        // model/effort selectors to the agent's own defaults.
         cx.update(|cx| {
             let store = SettingsStore::test(cx);
             cx.set_global(store);
@@ -6411,7 +6429,15 @@ mod tests {
         let fs = fs::FakeFs::new(cx.executor());
         fs.insert_tree("/", serde_json::json!({"a": {}})).await;
         let project = project::Project::test(fs, [std::path::Path::new("/a")], cx).await;
-        let (connection, requests) = connect_config_defaults_test_agent(cx).await;
+        let (connection, requests) = connect_config_defaults_test_agent_with_handler(
+            |_| {
+                Ok(acp::SetSessionConfigOptionResponse::new(vec![
+                    acp::SessionConfigOption::boolean("web_search", "Web Search", true),
+                ]))
+            },
+            cx,
+        )
+        .await;
         connection.defaults.set(
             None,
             HashMap::from_iter([("web_search".into(), AgentConfigOptionValue::Boolean(true))]),
@@ -6447,18 +6473,25 @@ mod tests {
                 )
             })
             .await
-            .expect("load preserves saved settings");
+            .expect("load applies saved defaults");
         cx.run_until_parked();
+        let requests = requests.lock().expect("config requests");
         assert!(
-            requests.lock().expect("config requests").is_empty(),
-            "load must not send saved defaults"
+            !requests.is_empty(),
+            "load must re-apply saved defaults: {:?}",
+            *requests
         );
+        drop(requests);
         let options = cx
             .read(|cx| connection.session_config_options(thread.read(cx).session_id(), cx))
             .expect("loaded config");
-        assert_eq!(
-            options.config_options(),
-            acp_thread::config_options::from_v1(returned).expect("v2 projection")
+        let projected = options.config_options();
+        assert!(
+            matches!(
+                &projected[0].kind,
+                acp_v2::SessionConfigKind::Boolean(boolean) if boolean.current_value
+            ),
+            "saved default must win over the agent's returned value: {projected:?}"
         );
     }
 
