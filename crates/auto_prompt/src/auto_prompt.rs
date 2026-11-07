@@ -578,6 +578,11 @@ pub enum AutoPromptDecision {
         delay_ms: u64,
         /// Why the dispatch is delayed; drives the resume notification.
         reason: AutoPromptDelayReason,
+        /// Human-readable wake time for usage-limit schedules (e.g.
+        /// "11:51pm (Asia/Bangkok)"), surfaced in the scheduling
+        /// notification. None for short backoffs, which keep the
+        /// Processing state instead.
+        schedule_display: Option<String>,
     },
     /// Need to call LLM asynchronously to determine the next step.
     NeedsLlmCall(LlmCallData),
@@ -1821,6 +1826,7 @@ fn decide_with_context(
             },
             delay_ms: delay,
             reason: AutoPromptDelayReason::Backoff,
+            schedule_display: None,
         };
     }
 
@@ -1880,6 +1886,7 @@ fn decide_with_context(
             },
             delay_ms: limit.retry_delay_ms,
             reason: AutoPromptDelayReason::UsageLimitReset,
+            schedule_display: Some(limit.retry_display),
         };
     }
 

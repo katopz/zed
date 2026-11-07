@@ -277,6 +277,7 @@ pub(crate) fn api_unreachable_decision(
         } else {
             AutoPromptDelayReason::ApiUnreachable
         },
+        schedule_display: None,
     })
 }
 

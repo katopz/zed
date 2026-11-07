@@ -6280,7 +6280,7 @@ pub(crate) mod tests {
             );
         });
         cx.run_until_parked();
-        thread_view.read_with(cx, |view, cx| {
+        thread_view.read_with(cx, |view, _cx| {
             assert_eq!(view.message_queue.len(), 1);
         });
         // Drain the queue so the token-limit portion below exercises the

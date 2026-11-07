@@ -1490,6 +1490,10 @@ impl ThreadView {
             self.fork.auto_prompt_state,
             crate::auto_prompt::AutoPromptState::WaitingForBackground
         );
+        let is_scheduled = matches!(
+            self.fork.auto_prompt_state,
+            crate::auto_prompt::AutoPromptState::Scheduled
+        );
 
         let failed_error_message = match &self.fork.auto_prompt_state {
             crate::auto_prompt::AutoPromptState::Failed(msg) => Some(msg.clone()),
@@ -1498,6 +1502,11 @@ impl ThreadView {
 
         let (tooltip_text, icon_color) = if is_processing {
             ("Auto-Prompt: Processing…", Color::Accent)
+        } else if is_scheduled {
+            (
+                "Auto-Prompt: usage-limit wake scheduled — click to cancel the wake",
+                Color::Accent,
+            )
         } else if is_waiting {
             (
                 "Auto-Prompt: waiting for the agent's background task — click to stop waiting",
@@ -1526,17 +1535,19 @@ impl ThreadView {
         // The processing state gets a visible text label (not just a tooltip) because
         // it's the one state where the button is also a cancel target — users need to
         // see at a glance that something is running and clickable, not discover it on hover.
-        if is_processing || is_waiting {
+        if is_processing || is_waiting || is_scheduled {
             Button::new(
                 "auto-prompt-toggle",
                 if is_waiting {
                     "Waiting for background task…"
+                } else if is_scheduled {
+                    "Waiting for limit reset…"
                 } else {
                     "Processing…"
                 },
             )
             .start_icon(
-                Icon::new(if is_waiting {
+                Icon::new(if is_waiting || is_scheduled {
                     IconName::Clock
                 } else {
                     IconName::Sparkle
@@ -1691,6 +1702,7 @@ impl ThreadView {
             self.fork.auto_prompt_state,
             crate::auto_prompt::AutoPromptState::Processing
                 | crate::auto_prompt::AutoPromptState::WaitingForBackground
+                | crate::auto_prompt::AutoPromptState::Scheduled
         );
         let is_failed = matches!(
             self.fork.auto_prompt_state,

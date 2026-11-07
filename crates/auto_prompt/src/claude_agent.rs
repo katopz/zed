@@ -336,6 +336,7 @@ pub fn decide_claude(
                 action,
                 delay_ms: limit.retry_delay_ms,
                 reason: AutoPromptDelayReason::UsageLimitReset,
+                schedule_display: Some(limit.retry_display),
             };
         }
     }

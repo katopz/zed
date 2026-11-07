@@ -325,6 +325,11 @@ pub enum AutoPromptState {
     Idle,
     /// Auto-prompt is waiting for LLM decision or dispatching.
     Processing,
+    /// A usage-limit wake is scheduled (plan 018): nothing is running — the
+    /// chain sleeps until reset + margin. Click cancels the wake. Distinct
+    /// from [`AutoPromptState::Processing`] so an hours-long limit wait
+    /// doesn't read as calls being made against the exhausted quota.
+    Scheduled,
     /// The turn ended while a command the agent detached into the background
     /// still runs; the chain resumes once that work and the agent's own
     /// follow-up turn are done.
@@ -1029,7 +1034,10 @@ fn is_cancelled(
 ) -> bool {
     thread_view
         .read_with(cx, |tv, _| {
-            !matches!(tv.fork.auto_prompt_state, AutoPromptState::Processing)
+            !matches!(
+                tv.fork.auto_prompt_state,
+                AutoPromptState::Processing | AutoPromptState::Scheduled
+            )
         })
         .unwrap_or(true)
 }
@@ -1341,6 +1349,7 @@ fn run_auto_prompt(
             mut action,
             delay_ms,
             reason,
+            schedule_display,
         } => {
             action.profile_id = profile_id.take();
             action.focus_new_thread |= is_manual;
@@ -1351,18 +1360,46 @@ fn run_auto_prompt(
                 action.next_prompt
             );
 
+            // A usage-limit wait sleeps for HOURS — holding "Processing…"
+            // across it read as calls being made against the exhausted quota
+            // (2026-11-07 screenshot). Surface the schedule instead, flip the
+            // toggle to the honest Scheduled state, and keep the click-to-
+            // cancel path (Scheduled is a cancel target like Processing).
+            if reason == auto_prompt::AutoPromptDelayReason::UsageLimitReset {
+                let scheduled_note = match &schedule_display {
+                    Some(display) => format!(
+                        "Usage limit reached — auto-continue scheduled at {display}"
+                    ),
+                    None => "Usage limit reached — auto-continue scheduled at the window reset"
+                        .to_string(),
+                };
+                let _ = _view.update_in(cx, |_view, window, cx| {
+                    if let Some(active) = _view.active_thread() {
+                        active.update(cx, |tv, cx| {
+                            tv.fork.auto_prompt_state = AutoPromptState::Scheduled;
+                            cx.notify();
+                        });
+                    }
+                    _view.notify_with_sound(scheduled_note, IconName::Clock, window, cx);
+                });
+            }
+
             // Spawn the delay task off the live view (it owns `window`), then
             // stay alive until it finishes so dropping the outer task cancels
             // the delayed dispatch too.
             let inner = _view.update_in(cx, |_view, window, cx| {
                 cx.spawn_in(window, async move |_view, cx| {
+                // Scheduled was set above for usage-limit waits; only short
+                // backoffs repaint as Processing here.
                 let thread_weak = _view
                     .update_in(cx, |cv, _window, cx| {
                         cv.active_thread().map(|tv| {
-                            tv.update(cx, |tv, cx| {
-                                tv.fork.auto_prompt_state = AutoPromptState::Processing;
-                                cx.notify();
-                            });
+                            if reason != auto_prompt::AutoPromptDelayReason::UsageLimitReset {
+                                tv.update(cx, |tv, cx| {
+                                    tv.fork.auto_prompt_state = AutoPromptState::Processing;
+                                    cx.notify();
+                                });
+                            }
                             tv.downgrade()
                         })
                     })
