@@ -169,6 +169,9 @@ impl ConversationView {
         cx: &mut Context<Self>,
     ) {
         let Some(thread_view) = self.thread_view(session_id) else {
+            log::warn!(
+                "[auto_prompt] {trigger:?}: chain skipped — no thread view for session (session={session_id:?}, stop_reason={stop_reason:?})"
+            );
             return;
         };
         if !thread_view.read(cx).fork.auto_prompt_enabled {

@@ -2141,6 +2141,14 @@ impl ConversationView {
                     });
                 }
 
+                // Error-class stops (MaxTokens/Refusal/Error) surface their own
+                // notification below, but must NOT return: native (reported-
+                // activity) threads never emit the legacy `AcpThreadEvent::Error`,
+                // so this arm is their only chance to reach `chain_auto_prompt`.
+                // Early-returning here killed the chain silently whenever a turn
+                // failed after the stream-death retry wall (issue 976 session
+                // death, 2026-11-06: five silent streams, then nothing).
+                let mut turn_error_surfaced = false;
                 if *stop_reason == Some(acp_v2::StopReason::MaxTokens)
                     && thread.read(cx).uses_reported_activity()
                 {
@@ -2159,7 +2167,7 @@ impl ConversationView {
                             cx,
                         );
                     }
-                    return;
+                    turn_error_surfaced = true;
                 }
                 if *stop_reason == Some(acp_v2::StopReason::Refusal)
                     && thread.read(cx).uses_reported_activity()
@@ -2178,7 +2186,7 @@ impl ConversationView {
                             cx,
                         );
                     }
-                    return;
+                    turn_error_surfaced = true;
                 }
                 if let Some(acp_v2::StopReason::Error(details)) = stop_reason
                     && thread.read(cx).uses_reported_activity()
@@ -2211,7 +2219,7 @@ impl ConversationView {
                             cx,
                         );
                     }
-                    return;
+                    turn_error_surfaced = true;
                 }
                 if is_subagent {
                     return;
@@ -2230,16 +2238,18 @@ impl ConversationView {
                 // next turn starts.
                 if !sent_queued_message {
                     let used_tools = thread.read(cx).used_tools_since_last_user_message();
-                    self.notify_with_sound(
-                        if used_tools {
-                            "Finished running tools"
-                        } else {
-                            "New message"
-                        },
-                        IconName::ZedAssistant,
-                        window,
-                        cx,
-                    );
+                    if !turn_error_surfaced {
+                        self.notify_with_sound(
+                            if used_tools {
+                                "Finished running tools"
+                            } else {
+                                "New message"
+                            },
+                            IconName::ZedAssistant,
+                            window,
+                            cx,
+                        );
+                    }
 
                     self.chain_auto_prompt(
                         thread,
@@ -6241,6 +6251,9 @@ pub(crate) mod tests {
             assert!(view.should_be_following);
         });
         assert!(thread.read_with(cx, |thread, _| thread.activity_generation() > generation_a));
+        // The generation-C MaxTokens stop below must not consume the queue
+        // either — the MaxTokens branch pauses it before the chain runs, and
+        // queue priority dispatches it ahead of any continuation.
         thread.update(cx, |thread, cx| {
             thread
                 .update_session_state(
@@ -6254,6 +6267,39 @@ pub(crate) mod tests {
                     cx,
                 )
                 .expect("running C");
+            // Real reported usage with a tiny fraction of the 1M-token fake
+            // window: the MaxTokens classifier must take the output-cap branch
+            // (resume in place), not the window-full fork.
+            thread.update_token_usage(
+                Some(acp_thread::TokenUsage {
+                    input_tokens: 1_000,
+                    output_tokens: 1_000,
+                    ..Default::default()
+                }),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        thread_view.read_with(cx, |view, cx| {
+            assert_eq!(view.message_queue.len(), 1);
+        });
+        // Drain the queue so the token-limit portion below exercises the
+        // auto-prompt chain in isolation (the stub cannot complete a queued
+        // send — no deferred receipt response — which would overwrite the
+        // assertions with an unrelated submission error).
+        thread_view.update(cx, |view, cx| {
+            view.message_queue.clear();
+            cx.notify();
+        });
+        // A CURRENT-generation MaxTokens stop must reach the auto-prompt chain
+        // (issue 976 chain-death fix: error-class stops used to early-return
+        // before `chain_auto_prompt`, silently killing the chain). The output-
+        // cap classification dispatches a same-thread resume directly (no
+        // orchestrator call): send_content first clears the thread error, then
+        // the stub's receipt submission fails (no deferred response), so the
+        // error card is REPLACED. Under the old early-return the error would
+        // still be MaxOutputTokens here.
+        thread.update(cx, |thread, cx| {
             thread
                 .update_session_state(
                     acp_v2::StateUpdate::Idle(
@@ -6263,47 +6309,22 @@ pub(crate) mod tests {
                 )
                 .expect("token limit");
         });
+        // The decide pipeline's 4s pre-call backoff (had_error) runs on the
+        // mock executor clock; advancing it lets the dispatch run.
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(5));
         cx.run_until_parked();
-        thread_view.read_with(cx, |view, cx| {
-            assert!(matches!(
+        thread_view.read_with(cx, |view, _| {
+            assert_eq!(view.message_queue.len(), 0);
+            let replaced = matches!(
                 view.thread_error,
-                Some(ThreadError::MaxOutputTokens)
-            ));
-            assert_eq!(view.message_queue.len(), 1);
-            assert!(!view.should_be_following);
-            assert!(view.turn_fields.turn_started_at.is_none());
-            assert!(view.turn_fields._turn_timer_task.is_none());
-            assert_eq!(
-                view.turn_fields.last_turn_duration,
-                thread.read(cx).activity_duration(),
+                Some(ThreadError::Other { ref message, .. })
+                    if message.contains("No deferred receipt response"),
             );
-        });
-        thread.update(cx, |thread, cx| {
-            thread
-                .update_session_state(
-                    acp_v2::StateUpdate::Running(acp_v2::RunningStateUpdate::new()),
-                    cx,
-                )
-                .expect("independent running");
-            thread
-                .update_session_state(
-                    acp_v2::StateUpdate::Idle(acp_v2::IdleStateUpdate::new()),
-                    cx,
-                )
-                .expect("independent idle");
-        });
-        cx.run_until_parked();
-        thread_view.read_with(cx, |view, cx| {
-            assert!(matches!(
-                view.thread_error,
-                Some(ThreadError::MaxOutputTokens)
-            ));
-            assert_eq!(view.message_queue.len(), 1);
-            assert!(view.turn_fields.turn_started_at.is_none());
-            assert!(view.turn_fields._turn_timer_task.is_none());
-            assert_eq!(
-                view.turn_fields.last_turn_duration,
-                thread.read(cx).activity_duration(),
+            assert!(
+                replaced,
+                "the chain must have dispatched a same-thread resume on the MaxTokens stop (error card would stay MaxOutputTokens under the old early-return); got {:?}",
+                view.thread_error
             );
         });
     }
@@ -6430,6 +6451,71 @@ pub(crate) mod tests {
                 );
             });
         }
+    }
+
+    /// A reported (native, receipt-transport) turn failure must still reach the
+    /// auto-prompt chain. Native threads never emit the legacy
+    /// `AcpThreadEvent::Error`, so the `Stopped` arm is their only path into
+    /// `chain_auto_prompt`; before the fix the error branch early-returned and
+    /// every failed turn silently killed the chain (issue 976 session death:
+    /// five silent streams exhausted the retry wall, then nothing continued
+    /// the thread).
+    #[gpui::test]
+    async fn test_reported_error_still_chains_auto_prompt(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(language_model::init);
+        let connection = StubAgentConnection::new().with_receipt_submissions(true);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        thread_view.update(cx, |view, cx| {
+            view.fork.auto_prompt_enabled = true;
+            cx.notify();
+        });
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        message_editor(&conversation_view, cx).update_in(cx, |editor, window, cx| {
+            editor.set_text("do work", window, cx);
+        });
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+
+        // The turn fails the way the native stream-death retry wall does:
+        // the completion never finished, so the failure is an execution error
+        // reported on top of the running turn.
+        thread.update(cx, |thread, cx| {
+            thread
+                .update_session_state(
+                    acp_v2::StateUpdate::Running(acp_v2::RunningStateUpdate::new()),
+                    cx,
+                )
+                .expect("running turn");
+            thread
+                .report_local_execution_error(
+                    Arc::new(anyhow!("stream idle timeout: no events in 120s")),
+                    cx,
+                )
+                .expect("failed turn");
+        });
+        cx.run_until_parked();
+
+        thread_view.read_with(cx, |view, cx| {
+            assert!(
+                view.thread_error.is_some(),
+                "the error must still surface in the UI"
+            );
+            let thread = view.thread.read(cx);
+            assert!(thread.had_api_error());
+            assert_eq!(
+                thread.last_api_error(),
+                Some("stream idle timeout: no events in 120s"),
+                "the failure text must reach auto_prompt's connectivity classifiers"
+            );
+            assert!(
+                view.fork.auto_prompt_enabled && view.fork._auto_prompt_task.is_some(),
+                "a reported error stop must still hand the turn to auto-prompt"
+            );
+        });
     }
 
     #[gpui::test]

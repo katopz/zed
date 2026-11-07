@@ -4565,6 +4565,7 @@ impl AcpThread {
         if self.activity.generation() != previous_generation {
             self.had_error = false;
             self.local_execution_error = None;
+            self.api_error = fork::TurnApiError::default();
         }
         cx.notify();
     }
@@ -4641,6 +4642,16 @@ impl AcpThread {
                             | acp_v2::StopReason::Error(_)
                     )
                 );
+                // Mirror the legacy turn path's `record_turn_api_error`:
+                // auto_prompt's connectivity/session-limit classifiers read
+                // `last_api_error()`, and without this a native (reported-
+                // activity) turn that failed — a stream-death retry wall, a
+                // local execution error — looks API-healthy to them.
+                if let Some(acp_v2::StopReason::Error(details)) = &stop_reason
+                    && let Some(error) = details.error.as_deref()
+                {
+                    self.record_turn_api_error(&anyhow::anyhow!("{}", error.message));
+                }
                 // Reported refusal does not authorize deleting agent-owned history.
                 cx.emit(AcpThreadEvent::Stopped {
                     activity_generation: self.activity.generation(),
@@ -12233,6 +12244,14 @@ mod tests {
             assert!(Arc::ptr_eq(retained, &original_error));
             assert!(retained.downcast_ref::<MaxOutputTokensError>().is_some());
             assert!(thread.had_error());
+            // The failure must also surface through the turn-level API-error
+            // accessors that auto_prompt's connectivity/session-limit
+            // classifiers read.
+            assert!(thread.had_api_error());
+            assert_eq!(
+                thread.last_api_error(),
+                Some(original_error.to_string()).as_deref()
+            );
         });
         cx.run_until_parked();
         {
@@ -12254,9 +12273,13 @@ mod tests {
                 .expect("next generation");
             assert!(thread.local_execution_error().is_none());
             assert!(!thread.had_error());
+            // A new turn generation also clears the recorded turn API error.
+            assert!(!thread.had_api_error());
+            assert!(thread.last_api_error().is_none());
             thread
                 .report_local_execution_error(Arc::new(anyhow!(sdk_error.clone())), cx)
                 .expect("SDK execution error");
+            assert!(thread.had_api_error());
         });
         cx.run_until_parked();
         let stops = stops.borrow();
@@ -12266,6 +12289,15 @@ mod tests {
         };
         assert_eq!(reason.error.as_deref(), Some(&sdk_error));
         assert_eq!(*errors.borrow(), 0);
+        // A reported (agent-sent) error stop with details also records the
+        // turn-level API error text.
+        thread.update(cx, |thread, _| {
+            assert!(thread.had_api_error());
+            assert_eq!(
+                thread.last_api_error(),
+                Some(sdk_error.message.clone()).as_deref()
+            );
+        });
     }
 
     #[gpui::test]

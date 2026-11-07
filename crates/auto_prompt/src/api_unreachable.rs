@@ -23,8 +23,10 @@ use acp_thread::{AcpThread, AgentThreadEntry};
 use gpui::App;
 
 /// Lowercased connectivity markers: Node errno codes (Claude Code), Claude
-/// Code's own phrasing, and the Rust HTTP client's resolver/connect errors.
-const NETWORK_MARKERS: [&str; 15] = [
+/// Code's own phrasing, the Rust HTTP client's resolver/connect errors, and
+/// the native agent's stream-idle-timeout wording (a provider that accepts
+/// the connection and then goes silent mid-generation).
+const NETWORK_MARKERS: [&str; 16] = [
     "enotfound",
     "eai_again",
     "econnrefused",
@@ -40,6 +42,7 @@ const NETWORK_MARKERS: [&str; 15] = [
     "failed to lookup address",
     "network is unreachable",
     "error sending request",
+    "stream idle timeout",
 ];
 
 /// Claude Code prefixes its synthetic failure messages with this.
@@ -186,5 +189,12 @@ mod tests {
             "dns error: failed to lookup address information: nodename nor servname provided"
         ));
         assert!(!is_network_error("429 Too Many Requests"));
+    }
+
+    #[test]
+    fn detects_native_stream_idle_timeout() {
+        // The native agent's stream-death wording: a provider that accepted
+        // the connection and then went silent mid-generation.
+        assert!(is_network_error("stream idle timeout: no events in 120s"));
     }
 }
