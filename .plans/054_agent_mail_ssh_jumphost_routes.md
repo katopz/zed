@@ -1,5 +1,5 @@
 # 054 — Agent-mail SSH jump-host routes: bmo via amo when Tailscale is down
-Status: DEPLOYED + e2e verified (bmo online via jump on the panel API; mail rides the jump) — owner-gated: Tailscale Funnel on amo is OFF so the public panel can't render (GUI toggle), and amo→m3 TCP is blackholed at the Tailscale relay (both pre-existing); `54c1ecf` — wait, hash set at commit
+Status: DEPLOYED + e2e verified (bmo online via jump on the panel API; mail rides the jump) — owner-gated: Tailscale Funnel on amo is OFF so the public panel can't render (GUI toggle), and amo→m3 TCP is blackholed at the Tailscale relay (both pre-existing); `54c1ecf` — wait, commit e2c4d01028
 
 ## Owner ask (2026-11-08)
 bmo is ON/OFF time to time; its Tailscale link drops while the box itself is up
