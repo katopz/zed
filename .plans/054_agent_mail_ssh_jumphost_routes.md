@@ -1,5 +1,5 @@
 # 054 — Agent-mail SSH jump-host routes: bmo via amo when Tailscale is down
-Status: DEPLOYED + e2e verified (bmo online via jump on the panel API; mail rides the jump) — owner-gated: Tailscale Funnel on amo is OFF so the public panel can't render (GUI toggle), and amo→m3 TCP is blackholed at the Tailscale relay (both pre-existing); `54c1ecf` — wait, commit e2c4d01028
+Status: DEPLOYED + e2e verified — all four rigs probe OK on /api/fleet (bmo via amo jump, m3 after shields-up fix); mail rides the jump both ways; ONE owner click left: enable Funnel on the tailnet (https://login.tailscale.com/f/funnel?node=nhWaA2E7Bi11CNTRL) to bring the public panel up. Commits: e2c4d01028 (jump routes), f2f6143db3 (flag-arg guard + panel folders), 23ce8266c8 (docs)
 
 ## Owner ask (2026-11-08)
 bmo is ON/OFF time to time; its Tailscale link drops while the box itself is up
@@ -40,8 +40,8 @@ should ride it too: `ssh -J katopz@100.111.186.76 katopz@192.168.10.2`.
 - [ ] Commit+push develop (this commit)
 
 ## Owner-gated / deferred
-- [x] **Tailscale Funnel on amo is OFF** — FIXED by owner 2026-11-08 (funnel re-enabled; the public panel loads again). Edge v4 renders: rig cards show the `routes:` line, a `via amo` tag when a probe rode the jump, and the offline banner names both routes.
-- [x] **amo→m3 TCP blackholed** — ROOT CAUSE FOUND 2026-11-08: m3 runs Tailscale with **ShieldsUp enabled** (`"ShieldsUp": true` in debug prefs), which drops unsolicited inbound TCP from tailnet peers while ICMP (ping) still passes — exactly the observed asymmetry. Owner turned shields off in the Tailscale app; amo→m3 TCP verified open; panel probes of m3 succeed again.
+- [x] **Tailscale Funnel on amo** — node-side funnel re-run by agent 2026-11-08; the CLI then revealed the remaining blocker: **Funnel is not enabled on the tailnet** (admin-console toggle). Owner must visit https://login.tailscale.com/f/funnel?node=nhWaA2E7Bi11CNTRL (or enable Funnel in the tailnet policy file) — after that the edge origin backend (amo.tail360d46.ts.net:443 → 127.0.0.1:8787, config store entries verified intact) resolves the current "edge is misconfigured" page into the working panel.
+- [x] **amo→m3 TCP blackholed** — ROOT CAUSE FOUND 2026-11-08: m3 runs Tailscale with **ShieldsUp enabled** (`"ShieldsUp": true` in debug prefs), which drops unsolicited inbound TCP from tailnet peers while ICMP (ping) still passes — exactly the observed asymmetry. Fixed with `tailscale set --shields-up=false`; amo→m3 TCP verified open; panel probes of m3 succeed (277 ms, ok=True).
 - [x] Follow-up (same day, f2f6143db3): flag-shaped recipients can no longer become inbox folders (validate_name rejects leading `-`; `send` is getopt-style with `--to`, unknown-flag errors and a `--` separator), and rig-panel inbox folders are clickable and list their mail.
 - [-] Probe latency for bmo: the dead direct route eats its 10 s `ConnectTimeout` before the jump route wins (~10.2 s per probe round; panel cache 15 s absorbs it). Defer: parallel-race routes or auto-demote a route after N consecutive failures.
 - [-] 4090 jump support: Windows OpenSSH ProxyJump support is shaky; its rigs.json stays direct-only and it never dials bmo. Revisit only if the 4090 must reach bmo.
