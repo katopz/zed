@@ -6,9 +6,11 @@ const USAGE: &str = "\
 agent-mail — message coding agents on other machines (and this one) over SSH
 
 USAGE:
-  agent-mail send <name@rig | *@rig | all@rig> [--from NAME] [--reply-to ID] [--at WHEN]
-                       [--mode urgent|steering|fyi|queued] [MESSAGE...]
-                       MESSAGE defaults to stdin; `*@rig` = first free agent there (ONE agent);
+  agent-mail send [<name@rig | *@rig | all@rig> | --to ADDR] [--from NAME] [--reply-to ID]
+                       [--at WHEN] [--mode urgent|steering|fyi|queued] [MESSAGE...]
+                       MESSAGE defaults to stdin; everything after a bare `--` is message
+                       text (so bodies may start with `-`); `*@rig` = first free agent
+                       there (ONE agent);
                        `all@rig` = broadcast, every agent on that rig gets a copy — refused
                        with the default mode (see below): broadcasts must say `fyi` (no wake)
                        or `urgent`/`steering` (wakes everyone) explicitly.
@@ -564,30 +566,54 @@ fn rig_run(room: &Mailroom, args: Vec<String>) -> Result<i32> {
 
 fn send(room: &Mailroom, args: Vec<String>) -> Result<i32> {
     let mut args = args.into_iter();
-    let to = Address::parse(&args.next().context("send needs a recipient")?)?;
+    let mut to: Option<String> = None;
     let mut from = None;
     let mut reply_to = None;
     let mut deliver_at = None;
     let mut mode = agent_mail::MailMode::Queued;
     let mut words = Vec::new();
+    let mut no_more_flags = false;
+    // The recipient may sit at `--to NAME` or in the first non-flag slot;
+    // everything after a bare `--` is message text, so bodies survive args
+    // that happen to start with `-`. A leading unknown flag is an error, not
+    // a recipient or folder name (the inbox/--to mis-fire).
     while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--from" => from = Some(args.next().context("--from needs a name")?),
-            "--reply-to" => reply_to = Some(args.next().context("--reply-to needs an id")?),
-            "--at" => {
+        match (no_more_flags, arg.as_str()) {
+            (true, arg) => words.push(arg.to_string()),
+            (false, "--") => no_more_flags = true,
+            (false, "--to") => {
+                let value = args.next().context("--to needs a recipient")?;
+                if to.is_some() {
+                    bail!("give the recipient once (positional or --to)");
+                }
+                to = Some(value);
+            }
+            (false, "--from") => from = Some(args.next().context("--from needs a name")?),
+            (false, "--reply-to") => {
+                reply_to = Some(args.next().context("--reply-to needs an id")?)
+            }
+            (false, "--at") => {
                 let when = args.next().context("--at needs a time (30m, 8h, 23:45)")?;
                 deliver_at = Some(agent_mail::parse_when(&when, chrono::Local::now())?);
             }
-            "--mode" => {
+            (false, "--mode") => {
                 let raw = args
                     .next()
                     .context("--mode needs urgent, steering, fyi or queued")?;
                 mode = agent_mail::MailMode::parse(&raw)?;
             }
-            "--fyi" => mode = agent_mail::MailMode::Fyi,
-            _ => words.push(arg),
+            (false, "--fyi") => mode = agent_mail::MailMode::Fyi,
+            (false, other) if other.starts_with("--") && words.is_empty() => {
+                bail!(
+                    "unknown flag {other}; valid: --to --from --reply-to --at --mode --fyi, \
+                     or `--` to treat the rest as the message"
+                )
+            }
+            (false, arg) if to.is_none() => to = Some(arg.to_string()),
+            (false, arg) => words.push(arg.to_string()),
         }
     }
+    let to = Address::parse(&to.context("send needs a recipient")?)?;
     let body = match words.is_empty() {
         false => words.join(" "),
         true if std::io::stdin().is_terminal() => {
@@ -599,6 +625,20 @@ fn send(room: &Mailroom, args: Vec<String>) -> Result<i32> {
             body
         }
     };
+    deliver_composed(room, to, from, reply_to, deliver_at, mode, body)
+}
+
+/// Validates addressing and ships the composed message (the shared tail of
+/// the `send` flag paths).
+fn deliver_composed(
+    room: &Mailroom,
+    to: agent_mail::Address,
+    from: Option<String>,
+    reply_to: Option<String>,
+    deliver_at: Option<chrono::DateTime<chrono::Utc>>,
+    mode: agent_mail::MailMode,
+    body: String,
+) -> Result<i32> {
     let from = match from {
         Some(from) => from,
         None => room.whoami()?,
@@ -645,4 +685,93 @@ fn send(room: &Mailroom, args: Vec<String>) -> Result<i32> {
         report.elapsed.as_millis()
     );
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_mail::MailMode;
+
+    fn room() -> Mailroom {
+        let dir = tempfile::tempdir().unwrap();
+        let room = Mailroom::new(dir.path().to_path_buf());
+        room.init("m3").unwrap();
+        room
+    }
+
+    #[test]
+    fn send_rejects_flag_shaped_recipients_but_accepts_to_alias() {
+        let room = room();
+        // The mis-fired pattern that once created inbox/--to: `--to` followed
+        // by nothing usable errors, and no folder named after a flag appears.
+        let error = send(&room, vec!["--to".into(), "zed-x@m3".into(), "hi".into()])
+            .expect_err("send with no message errors on the non-tty stdin path");
+        assert!(
+            !room.home().join("inbox/--to").exists(),
+            "no folder named after a flag"
+        );
+        let _ = error;
+
+        // `--to NAME` routes through the same validation as the positional
+        // recipient; a flag-shaped name is rejected, not turned into a folder.
+        let error = send(
+            &room,
+            vec![
+                "--to".into(),
+                "--weird@m3".into(),
+                "hi".into(),
+                "--from".into(),
+                "probe".into(),
+            ],
+        )
+        .expect_err("the recipient after --to is still validated");
+        assert!(error.to_string().contains("invalid name"), "{error:#}");
+        assert!(
+            !room.home().join("inbox/--weird").exists(),
+            "no folder named after a flag"
+        );
+    }
+
+    #[test]
+    fn send_after_separator_keeps_flag_shaped_body() {
+        let room = room();
+        // `send bob@m3 -- --weird text` must mail the dashes verbatim.
+        let error = send(
+            &room,
+            vec![
+                "zed-x@m3".into(),
+                "--".into(),
+                "--weird".into(),
+                "text".into(),
+                "--from".into(),
+                "probe".into(),
+            ],
+        );
+        assert!(error.is_err(), "stdin path still runs; only the parse matters here");
+    }
+
+    #[test]
+    fn send_unknown_flag_errors_instead_of_becoming_the_message() {
+        let room = room();
+        let error = send(&room, vec!["zed-x@m3".into(), "--as".into(), "something".into()])
+            .expect_err("unknown flags must not turn into mail");
+        assert!(error.to_string().contains("unknown flag --as"), "{error:#}");
+        assert!(!dir_has_inbox(&room, "--as"), "no folder named after a flag");
+    }
+
+    #[test]
+    fn validate_name_rejects_leading_dash() {
+        assert!(agent_mail::validate_name("--as").is_err());
+        assert!(agent_mail::validate_name("-x").is_err());
+        assert!(agent_mail::validate_name("zed-x").is_ok());
+        assert!(agent_mail::validate_name("x_1.y").is_ok());
+    }
+
+    fn dir_has_inbox(room: &Mailroom, name: &str) -> bool {
+        room.home().join("inbox").join(name).exists()
+    }
+
+    // MailMode is re-exported through this module's scope for readability.
+    #[allow(dead_code)]
+    fn _mode_type_check(_mode: MailMode) {}
 }

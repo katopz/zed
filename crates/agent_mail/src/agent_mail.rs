@@ -18,6 +18,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{BufRead as _, BufReader, ErrorKind, Read as _};
 use std::path::{Path, PathBuf};
@@ -255,18 +256,31 @@ impl std::fmt::Display for SshRoute {
     }
 }
 
+impl AsRef<str> for SshRoute {
+    fn as_ref(&self) -> &str {
+        self.target()
+    }
+}
+
+impl AsRef<OsStr> for SshRoute {
+    fn as_ref(&self) -> &OsStr {
+        self.target().as_ref()
+    }
+}
+
 /// Names become directory names, so this is the path-traversal guard.
 pub fn validate_name(name: &str) -> Result<&str> {
     let well_formed = !name.is_empty()
         && name.len() <= MAX_NAME_LEN
         && !name.starts_with('.')
+        && !name.starts_with('-')
         && name
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'));
     match well_formed {
         true => Ok(name),
         false => bail!(
-            "invalid name {name:?}: use 1-{MAX_NAME_LEN} of [A-Za-z0-9._-], not starting with '.'"
+            "invalid name {name:?}: use 1-{MAX_NAME_LEN} of [A-Za-z0-9._-], not starting with '.' or '-'"
         ),
     }
 }
@@ -383,6 +397,9 @@ pub struct InboxCount {
     pub name: String,
     pub pending: usize,
     pub scheduled: usize,
+    /// The pending envelopes themselves (newest first), so read-only viewers
+    /// (the Zed panel) can show an inbox's mail without claiming it.
+    pub messages: Vec<Envelope>,
 }
 
 /// Read-only view of a rig's mail for the terminal UI and the Zed panel.
@@ -574,7 +591,9 @@ impl Mailroom {
             ANY_NAME => self
                 .live_agents()
                 .first()
-                .map(|agent| agent.name.clone())
+                // Registry names are re-validated: they become directory names.
+                .map(|agent| validate_name(&agent.name).map(|name| name.to_string()))
+                .transpose()?
                 .unwrap_or_else(|| ANY_NAME.to_string()),
             name => name.to_string(),
         };
@@ -664,10 +683,13 @@ impl Mailroom {
                 let pending = self.peek(&names).unwrap_or_default();
                 let scheduled = self.scheduled(&names).map_or(0, |mail| mail.len());
                 if !pending.is_empty() || scheduled > 0 {
+                    let mut messages = pending.clone();
+                    messages.sort_by(|a, b| b.sent_at.cmp(&a.sent_at));
                     inboxes.push(InboxCount {
                         name: name.clone(),
                         pending: pending.len(),
                         scheduled,
+                        messages,
                     });
                 }
                 latest.extend(pending);
@@ -823,7 +845,7 @@ impl Mailroom {
             .filter_map(|entry| entry.ok().map(|entry| entry.path()))
             .filter(|path| {
                 path.extension()
-                    .is_some_and(|extension| extension == "json")
+                    .is_some_and(|extension| extension.as_encoded_bytes() == b"json")
             })
             .collect();
         // UUIDv7 file names sort by send time.

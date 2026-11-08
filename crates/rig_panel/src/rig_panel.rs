@@ -9,7 +9,7 @@
 
 use agent_mail::jobs::{JobAction, JobLine};
 use agent_mail::rig::{self, RigProbe};
-use agent_mail::{MailboxSummary, Mailroom, Rigs};
+use agent_mail::{Envelope, MailboxSummary, Mailroom, Rigs};
 use gpui::{
     Action, App, AppContext as _, Context, EventEmitter, FocusHandle, Focusable,
     InteractiveElement, IntoElement, MouseButton, ParentElement, Render, SharedString, Stateful,
@@ -116,6 +116,8 @@ pub struct RigPanel {
     selected_job: Option<(String, String)>,
     log: Option<String>,
     open_message: Option<String>,
+    /// The inbox folder whose mail is expanded in the Mail section.
+    open_inbox: Option<String>,
     confirm_cancel: bool,
     hovered_job: Option<(String, String)>,
     mail_open: bool,
@@ -138,6 +140,7 @@ impl RigPanel {
             selected_job: None,
             log: None,
             open_message: None,
+            open_inbox: None,
             confirm_cancel: false,
             hovered_job: None,
             mail_open: true,
@@ -768,15 +771,37 @@ impl RigPanel {
             if inbox.scheduled > 0 {
                 meta.push((format!("{} scheduled", inbox.scheduled), Color::Muted));
             }
-            section = section.child(
-                Row::new(
+            let open_inbox = self.open_inbox.as_deref() == Some(inbox.name.as_str());
+            let click_name = inbox.name.clone();
+            let folder = Row {
+                icon: if open_inbox {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                },
+                ..Row::new(
                     SharedString::from(format!("inbox-{}", inbox.name)),
                     IconName::Folder,
                     name,
                 )
                 .meta(meta)
-                .render(cx),
-            );
+            }
+            .render(cx)
+            .cursor_pointer()
+            .hover(|row| row.bg(cx.theme().colors().ghost_element_hover))
+            .on_click(cx.listener(move |panel, _, _, cx| {
+                panel.open_inbox = match panel.open_inbox.as_deref() {
+                    Some(open) if open == click_name => None,
+                    _ => Some(click_name.clone()),
+                };
+                cx.notify();
+            }));
+            section = section.child(folder);
+            if open_inbox {
+                for envelope in &inbox.messages {
+                    section = section.child(self.message_row(envelope, false, cx));
+                }
+            }
         }
         let messages = self
             .mail
@@ -785,57 +810,66 @@ impl RigPanel {
             .map(|envelope| (envelope, false))
             .chain(self.mail.broadcasts.iter().map(|envelope| (envelope, true)));
         for (envelope, broadcast) in messages {
-            let open_message = self.open_message.as_deref() == Some(envelope.id.as_str());
-            let first = envelope.body.lines().next().unwrap_or("").to_string();
-            let mut meta: Vec<(String, Color)> = Vec::new();
-            if broadcast {
-                meta.push(("broadcast".to_string(), Color::Accent));
-            }
-            meta.push((format!("{} → {}", envelope.from, envelope.to), Color::Muted));
-            let click_id = envelope.id.clone();
-            let mut row = Row::new(
-                SharedString::from(format!("mail-{}", envelope.id)),
-                if broadcast {
-                    IconName::Send
-                } else {
-                    IconName::Envelope
-                },
-                first,
-            )
-            .icon_color(Color::Muted)
-            .meta(meta)
-            .timestamp(Some(envelope.sent_at.get(11..16).unwrap_or("").to_string()))
-            .selected(open_message)
-            .render(cx)
-            .cursor_pointer()
-            .hover(|row| row.bg(cx.theme().colors().ghost_element_hover))
-            .on_click(cx.listener(move |panel, _, _, cx| {
-                panel.open_message = match panel.open_message.as_deref() == Some(click_id.as_str())
-                {
-                    true => None,
-                    false => Some(click_id.clone()),
-                };
-                cx.notify();
-            }));
-            if open_message {
-                row = row.child(
-                    div()
-                        .mx_1p5()
-                        .mb_1()
-                        .px_2()
-                        .py_1p5()
-                        .rounded_sm()
-                        .bg(cx.theme().colors().element_background)
-                        .child(
-                            Label::new(envelope.body.clone())
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
-                        ),
-                );
-            }
-            section = section.child(row);
+            section = section.child(self.message_row(envelope, broadcast, cx));
         }
         section.into_any_element()
+    }
+
+    /// One mail message row: click to open/close the body (read-only).
+    fn message_row(
+        &self,
+        envelope: &Envelope,
+        broadcast: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let open_message = self.open_message.as_deref() == Some(envelope.id.as_str());
+        let first = envelope.body.lines().next().unwrap_or("").to_string();
+        let mut meta: Vec<(String, Color)> = Vec::new();
+        if broadcast {
+            meta.push(("broadcast".to_string(), Color::Accent));
+        }
+        meta.push((format!("{} → {}", envelope.from, envelope.to), Color::Muted));
+        let click_id = envelope.id.clone();
+        let mut row = Row::new(
+            SharedString::from(format!("mail-{}", envelope.id)),
+            if broadcast {
+                IconName::Send
+            } else {
+                IconName::Envelope
+            },
+            first,
+        )
+        .icon_color(Color::Muted)
+        .meta(meta)
+        .timestamp(Some(envelope.sent_at.get(11..16).unwrap_or("").to_string()))
+        .selected(open_message)
+        .render(cx)
+        .cursor_pointer()
+        .hover(|row| row.bg(cx.theme().colors().ghost_element_hover))
+        .on_click(cx.listener(move |panel, _, _, cx| {
+            panel.open_message = match panel.open_message.as_deref() == Some(click_id.as_str()) {
+                true => None,
+                false => Some(click_id.clone()),
+            };
+            cx.notify();
+        }));
+        if open_message {
+            row = row.child(
+                div()
+                    .mx_1p5()
+                    .mb_1()
+                    .px_2()
+                    .py_1p5()
+                    .rounded_sm()
+                    .bg(cx.theme().colors().element_background)
+                    .child(
+                        Label::new(envelope.body.clone())
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+            );
+        }
+        row.into_any_element()
     }
 }
 
