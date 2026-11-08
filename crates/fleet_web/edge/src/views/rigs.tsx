@@ -44,7 +44,11 @@ function RigCard({ rig }: { rig: FleetRig }) {
         <h3>{rig.name}</h3>
         {rig.role && <span class="dim">{rig.role}</span>}
         <span class={`badge badge-${state.toLowerCase()}`}>{state}</span>
+        {probe?.via && <span class="tag accent">via {probe.via}</span>}
       </header>
+      {(rig.routes ?? []).length > 0 && (
+        <p class="dim mono">routes: {(rig.routes ?? []).join(" · ")}</p>
+      )}
       {!probe ? (
         <p class="dim">{rig.error ? clip(rig.error, 200) : "no probe"}</p>
       ) : (

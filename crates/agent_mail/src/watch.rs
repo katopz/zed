@@ -326,10 +326,10 @@ impl Mailroom {
             rig.bin.as_deref().unwrap_or("agent-mail")
         );
         let mut failures = Vec::new();
-        for target in &rig.ssh {
-            match self.ssh(target, &command, "wrote ") {
+        for route in &rig.ssh {
+            match self.ssh(route, &command, "wrote ") {
                 Ok(_) => return Ok(()),
-                Err(error) => failures.push(format!("{target}: {error:#}")),
+                Err(error) => failures.push(format!("{route}: {error:#}")),
             }
         }
         anyhow::bail!("could not reach {orchestrator}: {}", failures.join("; "))
@@ -1051,6 +1051,7 @@ mod tests {
             owner_mail: 0,
             running: Vec::new(),
             queued: Vec::new(),
+            via: None,
         }
     }
 

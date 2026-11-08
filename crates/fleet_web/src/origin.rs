@@ -31,6 +31,10 @@ pub struct FleetRig {
     pub latency_ms: u128,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub probe: Option<RigProbe>,
+    /// Configured SSH routes, short labels (`100.100.117.44`,
+    /// `192.168.10.2 via amo`) so the panel can mention the jump fallback.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub routes: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -153,7 +157,13 @@ impl Origin {
             rigs: results
                 .into_iter()
                 .map(|(name, outcome, latency)| {
-                    let role = rigs.rigs.get(&name).and_then(|rig| rig.role.clone());
+                    let config = rigs.rigs.get(&name);
+                    let role = config.and_then(|rig| rig.role.clone());
+                    let routes = config
+                        .map(|rig| {
+                            rig.ssh.iter().map(|route| route.label(&rigs)).collect()
+                        })
+                        .unwrap_or_default();
                     let (ok, error, probe) = match outcome {
                         Ok(probe) => (true, None, Some(probe)),
                         Err(error) => (false, Some(format!("{error:#}")), None),
@@ -165,6 +175,7 @@ impl Origin {
                         error,
                         latency_ms: latency.as_millis(),
                         probe,
+                        routes,
                     }
                 })
                 .collect(),

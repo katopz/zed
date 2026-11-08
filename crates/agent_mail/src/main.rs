@@ -536,9 +536,9 @@ fn rig_run(room: &Mailroom, args: Vec<String>) -> Result<i32> {
                 rig.bin.as_deref().unwrap_or("agent-mail"),
                 agent_mail::jobs::encode_spec(&spec)?
             );
-            let mut result = Err(anyhow::anyhow!("rig {rig_name} has no ssh target"));
-            for target_ssh in &rig.ssh {
-                result = room.ssh_lines(target_ssh, &command, "queued ").map(|_| ());
+            let mut result = Err(anyhow::anyhow!("rig {rig_name} has no ssh route"));
+            for route in &rig.ssh {
+                result = room.ssh_lines(route, &command, "queued ").map(|_| ());
                 if result.is_ok() {
                     break;
                 }

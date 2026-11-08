@@ -156,15 +156,15 @@ pub fn ship(
         return Ok(0);
     }
     let rigs = mailroom.rigs()?;
-    let targets = &rigs
+    let routes = &rigs
         .rigs
         .get(origin)
         .with_context(|| format!("origin rig {origin:?} is not in rigs.json"))?
         .ssh;
     let remote_dir = format!(".agent-mail/web/threads/{rig}");
     let mut last_error = None;
-    for target in targets {
-        match send_tar(target, &dir, &remote_dir, &all) {
+    for route in routes {
+        match send_tar(route, &dir, &remote_dir, &all) {
             Ok(()) => {
                 fs::remove_file(&pending_path).ok();
                 return Ok(all.len());
@@ -174,12 +174,17 @@ pub fn ship(
     }
     let list: Vec<&str> = all.iter().map(String::as_str).collect();
     fs::write(&pending_path, list.join("\n"))?;
-    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("origin rig {origin:?} has no ssh target")))
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("origin rig {origin:?} has no ssh route")))
 }
 
 // A headless std binary: the smol-preferring lint targets async gpui code.
 #[allow(clippy::disallowed_methods)]
-fn send_tar(target: &str, dir: &Path, remote_dir: &str, files: &BTreeSet<String>) -> Result<()> {
+fn send_tar(
+    route: &agent_mail::SshRoute,
+    dir: &Path,
+    remote_dir: &str,
+    files: &BTreeSet<String>,
+) -> Result<()> {
     let mut tar = Command::new("tar")
         .arg("-cf")
         .arg("-")
@@ -191,16 +196,20 @@ fn send_tar(target: &str, dir: &Path, remote_dir: &str, files: &BTreeSet<String>
         .spawn()
         .context("spawn tar")?;
     let tar_output = tar.stdout.take().context("tar stdout")?;
-    let ssh = Command::new("ssh")
-        .args([
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ConnectTimeout=10",
-            "-o",
-            "StrictHostKeyChecking=accept-new",
-        ])
-        .arg(target)
+    let mut ssh = Command::new("ssh");
+    ssh.args([
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=10",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+    ]);
+    if let Some(jump) = route.jump() {
+        ssh.args(["-o", &format!("ProxyJump={jump}")]);
+    }
+    let ssh = ssh
+        .arg(route.target())
         .arg(format!(
             "mkdir -p {remote_dir} && tar -xf - -C {remote_dir}"
         ))
@@ -215,7 +224,7 @@ fn send_tar(target: &str, dir: &Path, remote_dir: &str, files: &BTreeSet<String>
     }
     if !ssh.status.success() {
         bail!(
-            "ssh {target} exit {:?}: {}",
+            "ssh {route} exit {:?}: {}",
             ssh.status.code(),
             String::from_utf8_lossy(&ssh.stderr).trim()
         );

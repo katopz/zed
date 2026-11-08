@@ -186,6 +186,75 @@ pub fn ensure_broadcast_mode(address: &Address, mode: MailMode) -> Result<()> {
     )
 }
 
+/// One way to reach a rig. A plain string is a direct SSH destination;
+/// `{"target": ..., "jump": ...}` dials `target` through a jump host
+/// (`ssh -o ProxyJump=<jump>`), for rigs reachable only via a neighbor
+/// (bmo's thunderbolt bridge through amo). Routes are tried in order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SshRoute {
+    Direct(String),
+    Jumped { target: String, jump: String },
+}
+
+impl SshRoute {
+    pub fn target(&self) -> &str {
+        match self {
+            SshRoute::Direct(target) | SshRoute::Jumped { target, .. } => target,
+        }
+    }
+
+    pub fn jump(&self) -> Option<&str> {
+        match self {
+            SshRoute::Direct(_) => None,
+            SshRoute::Jumped { jump, .. } => Some(jump),
+        }
+    }
+
+    /// Short label for humans: `host` or `host via <rig>`, user@ stripped and
+    /// the jump host replaced by the rig name that owns it when known.
+    pub fn label(&self, rigs: &Rigs) -> String {
+        let host = |target: &str| {
+            target
+                .rsplit_once('@')
+                .map(|(_, host)| host)
+                .unwrap_or(target)
+                .to_string()
+        };
+        match self {
+            SshRoute::Direct(target) => host(target),
+            SshRoute::Jumped { target, .. } => {
+                format!("{} via {}", host(target), self.via_label(rigs).unwrap_or_default())
+            }
+        }
+    }
+
+    /// The jump this route rides, resolved to the rig that owns the jump host
+    /// (`amo`) when one does; `None` for direct routes.
+    pub fn via_label(&self, rigs: &Rigs) -> Option<String> {
+        let jump = self.jump()?;
+        let owner = rigs
+            .rigs
+            .iter()
+            .find(|(_, rig)| {
+                rig.ssh
+                    .iter()
+                    .any(|route| route.target() == jump || route.to_string() == *jump)
+            })
+            .map(|(name, _)| name.as_str());
+        Some(owner.unwrap_or(jump).to_string())
+    }
+}
+
+impl std::fmt::Display for SshRoute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SshRoute::Direct(target) => f.write_str(target),
+            SshRoute::Jumped { target, jump } => write!(f, "{target} via {jump}"),
+        }
+    }
+}
+
 /// Names become directory names, so this is the path-traversal guard.
 pub fn validate_name(name: &str) -> Result<&str> {
     let well_formed = !name.is_empty()
@@ -204,8 +273,10 @@ pub fn validate_name(name: &str) -> Result<&str> {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Rig {
-    /// SSH destinations, tried in order (put the LAN address before Tailscale).
-    pub ssh: Vec<String>,
+    /// SSH routes, tried in order (LAN before Tailscale before jump-hosted).
+    /// A plain string dials directly; `{"target", "jump"}` goes through a
+    /// jump host (see [`SshRoute`]).
+    pub ssh: Vec<SshRoute>,
     /// `agent-mail` path on that rig; non-interactive SSH often lacks ~/.cargo/bin on PATH.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bin: Option<String>,
@@ -900,16 +971,16 @@ impl Mailroom {
             rig.bin.as_deref().unwrap_or("agent-mail")
         );
         let mut failures = Vec::new();
-        for target in &rig.ssh {
+        for route in &rig.ssh {
             match self.ssh(
-                target,
+                route,
                 &remote_command,
                 &format!("delivered {}", envelope.id),
             ) {
                 Ok(lines) => {
-                    return Ok((target.clone(), resolved_from_lines(&lines)));
+                    return Ok((route.to_string(), resolved_from_lines(&lines)));
                 }
-                Err(error) => failures.push(format!("{target}: {error:#}")),
+                Err(error) => failures.push(format!("{route}: {error:#}")),
             }
         }
         Err(anyhow!(
@@ -1030,12 +1101,12 @@ impl Mailroom {
                 continue;
             }
             let command = format!("{} version", rig.bin.as_deref().unwrap_or("agent-mail"));
-            for target in &rig.ssh {
+            for route in &rig.ssh {
                 let started = Instant::now();
                 let outcome = self
-                    .ssh(target, &command, "agent-mail ")
+                    .ssh(route, &command, "agent-mail ")
                     .map(|_| started.elapsed());
-                results.push((name.clone(), target.clone(), outcome));
+                results.push((name.clone(), route.to_string(), outcome));
             }
         }
         Ok(results)
@@ -1043,14 +1114,14 @@ impl Mailroom {
 
     // agent-mail is a runtime-free std binary; the smol-preferring lint targets async gpui code.
     #[allow(clippy::disallowed_methods)]
-    /// Runs `remote_command` on `target` and succeeds once a stdout line starts
+    /// Runs `remote_command` on `route` and succeeds once a stdout line starts
     /// with `marker`. Success is the marker, not the exit status: Windows'
     /// OpenSSH client run inside an sshd session (an agent in a Zed remote
     /// window on the 4090) delivers but never exits, so it is killed instead.
     /// Returns the stdout lines printed before the marker line.
     pub(crate) fn ssh(
         &self,
-        target: &str,
+        route: &SshRoute,
         remote_command: &str,
         marker: &str,
     ) -> Result<Vec<String>> {
@@ -1065,6 +1136,9 @@ impl Mailroom {
             "-o",
             "StrictHostKeyChecking=accept-new",
         ]);
+        if let Some(jump) = route.jump() {
+            command.args(["-o", &format!("ProxyJump={jump}")]);
+        }
         // Reusing one connection per rig turns a ~200 ms handshake into ~10 ms.
         // Windows' OpenSSH client has no ControlMaster support.
         if cfg!(unix) {
@@ -1076,7 +1150,7 @@ impl Mailroom {
             }
         }
         let mut child = command
-            .arg(target)
+            .arg(route.target())
             .arg(remote_command)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -1116,14 +1190,14 @@ impl Mailroom {
         bail!("exit {:?}: {}", status.code(), stderr.trim())
     }
 
-    /// Runs `remote_command` on `target` and returns its output lines before `marker`.
+    /// Runs `remote_command` on `route` and returns its output lines before `marker`.
     pub fn ssh_lines(
         &self,
-        target: &str,
+        route: &SshRoute,
         remote_command: &str,
         marker: &str,
     ) -> Result<Vec<String>> {
-        self.ssh(target, remote_command, marker)
+        self.ssh(route, remote_command, marker)
     }
 
     /// Every name the Claude session `session_id` has had, recording
@@ -1685,6 +1759,54 @@ mod tests {
     }
 
     #[test]
+    fn ssh_routes_parse_old_configs_and_resolve_jump_labels() {
+        // Old string-only rigs.json keeps parsing.
+        let old: Rig = serde_json::from_str(r#"{"ssh": ["katopz@100.100.117.44"]}"#).unwrap();
+        assert_eq!(old.ssh, vec![SshRoute::Direct("katopz@100.100.117.44".into())]);
+
+        // Mixed form: direct first, jump-hosted fallback second.
+        let rigs: Rigs = serde_json::from_str(
+            r#"{
+                "self": "amo",
+                "rigs": {
+                    "amo": {"ssh": ["katopz@100.111.186.76"]},
+                    "bmo": {"ssh": ["katopz@100.100.117.44",
+                                     {"target": "katopz@192.168.10.2",
+                                      "jump": "katopz@100.111.186.76"}]}
+                }
+            }"#,
+        )
+        .unwrap();
+        let bmo = &rigs.rigs["bmo"];
+        assert_eq!(
+            bmo.ssh[1],
+            SshRoute::Jumped {
+                target: "katopz@192.168.10.2".into(),
+                jump: "katopz@100.111.186.76".into()
+            }
+        );
+        assert_eq!(bmo.ssh[0].jump(), None);
+        assert_eq!(bmo.ssh[1].jump().unwrap(), "katopz@100.111.186.76");
+
+        // Labels: user@ stripped, the jump resolved to the rig owning it.
+        assert_eq!(bmo.ssh[0].label(&rigs), "100.100.117.44");
+        assert_eq!(bmo.ssh[1].label(&rigs), "192.168.10.2 via amo");
+        assert_eq!(bmo.ssh[1].via_label(&rigs).as_deref(), Some("amo"));
+        assert_eq!(bmo.ssh[0].via_label(&rigs), None);
+        // An unknown jump host stays a hostname.
+        let stray = SshRoute::Jumped {
+            target: "a@10.0.0.9".into(),
+            jump: "b@10.0.0.1".into(),
+        };
+        assert_eq!(stray.via_label(&rigs).as_deref(), Some("b@10.0.0.1"));
+        assert_eq!(stray.label(&rigs), "10.0.0.9 via b@10.0.0.1");
+
+        // Round-trip keeps the object form for jumped routes.
+        let back = serde_json::to_string(&rigs.rigs["bmo"]).unwrap();
+        assert!(back.contains(r#"{"target":"katopz@192.168.10.2","jump":"katopz@100.111.186.76"}"#));
+    }
+
+    #[test]
     fn parses_delays_clock_times_and_timestamps() {
         use chrono::TimeZone as _;
         let now = chrono::Local
@@ -1731,7 +1853,7 @@ mod tests {
         rigs.rigs.insert(
             "m3".into(),
             Rig {
-                ssh: vec!["nobody@127.0.0.1".into()],
+                ssh: vec![SshRoute::Direct("nobody@127.0.0.1".into())],
                 bin: Some("/nonexistent/agent-mail".into()),
                 ..Rig::default()
             },

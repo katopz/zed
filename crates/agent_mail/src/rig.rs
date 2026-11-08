@@ -74,6 +74,10 @@ pub struct RigProbe {
     pub running: Vec<crate::jobs::JobLine>,
     #[serde(default)]
     pub queued: Vec<crate::jobs::JobLine>,
+    /// Set by the prober, not the probee: the jump rig this probe rode in on,
+    /// when the direct route was not the winner (`amo`, not a hostname).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -492,6 +496,7 @@ pub fn cached_probe(mailroom: &Mailroom) -> RigProbe {
 }
 
 /// Probes this rig. Managed jobs are reported as jobs, not as contenders.
+/// `via` stays `None`: this rig is reached locally, not over a route.
 pub fn probe(mailroom: &Mailroom) -> RigProbe {
     let rig = mailroom
         .rigs()
@@ -536,6 +541,7 @@ pub fn probe(mailroom: &Mailroom) -> RigProbe {
             .collect(),
         running: jobs.running,
         queued: jobs.queued,
+        via: None,
     }
 }
 
@@ -965,7 +971,19 @@ pub fn fleet_summary(
             false => "",
         };
         let line = match outcome {
-            Err(_) => format!("- {name} ({role}{no_jobs}): offline"),
+            Err(_) => {
+                let routes = match rig.map(|rig| rig.ssh.len()).unwrap_or(0) > 1 {
+                    true => format!(
+                        " (routes: {})",
+                        rig.map(|rig| {
+                            rig.ssh.iter().map(|route| route.label(rigs)).collect::<Vec<_>>().join(" · ")
+                        })
+                        .unwrap_or_default()
+                    ),
+                    false => String::new(),
+                };
+                format!("- {name} ({role}{no_jobs}): offline{routes}")
+            }
             Ok(probe) => {
                 let mut busy: Vec<String> = Vec::new();
                 for contender in &probe.contenders {
@@ -980,10 +998,14 @@ pub fn fleet_summary(
                     .map(|job| truncate_chars(&job.text, 60))
                     .collect();
                 format!(
-                    "- {name} ({role}{no_jobs}): {}{}{}",
+                    "- {name} ({role}{no_jobs}): {}{}{}{}",
                     match probe.quiet {
                         true => "QUIET".to_string(),
                         false => format!("BUSY ({})", probe.not_quiet_because.join(", ")),
+                    },
+                    match probe.via.as_deref() {
+                        Some(via) => format!(" (via {via})"),
+                        None => String::new(),
                     },
                     match busy.is_empty() {
                         true => String::new(),
@@ -1032,17 +1054,20 @@ fn probe_remote(mailroom: &Mailroom, rigs: &crate::Rigs, name: &str) -> Result<R
     let rig = rigs.rigs.get(name).context("unknown rig")?;
     let command = format!("{} rig probe", rig.bin.as_deref().unwrap_or("agent-mail"));
     let mut failures = Vec::new();
-    for target in &rig.ssh {
-        match mailroom.ssh(target, &command, PROBE_END) {
+    for route in &rig.ssh {
+        match mailroom.ssh(route, &command, PROBE_END) {
             Ok(lines) => {
                 let json = lines
                     .iter()
                     .rev()
                     .find(|line| line.trim_start().starts_with('{'))
                     .context("probe printed no JSON (agent-mail too old there?)")?;
-                return serde_json::from_str(json).context("unparseable probe");
+                let mut probe: RigProbe =
+                    serde_json::from_str(json).context("unparseable probe")?;
+                probe.via = route.via_label(rigs);
+                return Ok(probe);
             }
-            Err(error) => failures.push(format!("{target}: {error:#}")),
+            Err(error) => failures.push(format!("{route}: {error:#}")),
         }
     }
     bail!("offline: {}", failures.join("; "))
@@ -1327,13 +1352,13 @@ mod tests {
         let room = Mailroom::new(dir.path().to_path_buf());
         room.init("amo").unwrap();
         let rigs: crate::Rigs = serde_json::from_str(
-            r#"{"self":"amo","rigs":{"bmo":{"ssh":[],"role":"runner"},"m3":{"ssh":[],"role":"orchestrator","accepts_jobs":false}}}"#,
+            r#"{"self":"amo","rigs":{"amo":{"ssh":["katopz@100.111.186.76"]},"bmo":{"ssh":["katopz@100.100.117.44",{"target":"katopz@192.168.10.2","jump":"katopz@100.111.186.76"}],"role":"runner"},"m3":{"ssh":[],"role":"orchestrator","accepts_jobs":false}}}"#,
         )
         .unwrap();
         let bmo: RigProbe = serde_json::from_str(
             r#"{"rig":"bmo","os":"macos","at":"","cores":30,"quiet":false,"not_quiet_because":["1 contender(s)"],
                 "contenders":[{"pid":1,"name":"bench_809","cpu_pct":90.0,"rss_gb":8.0,"arm":"name"}],
-                "running":[{"id":"x","text":"0e6ffdbe Shared 9 min · zed release build"}]}"#,
+                "running":[{"id":"x","text":"0e6ffdbe Shared 9 min · zed release build"}],"via":"amo"}"#,
         )
         .unwrap();
         let results = vec![
@@ -1347,12 +1372,46 @@ mod tests {
         let summary = fleet_summary(&results, &rigs);
         assert_eq!(
             summary,
-            "- bmo (runner): BUSY (1 contender(s)); heavy: bench_809; jobs: 0e6ffdbe Shared 9 min · zed release build\n- m3 (orchestrator, takes no jobs): offline"
+            "- bmo (runner): BUSY (1 contender(s)) (via amo); heavy: bench_809; jobs: 0e6ffdbe Shared 9 min · zed release build\n- m3 (orchestrator, takes no jobs): offline"
         );
+
+        // A multi-route rig that is down names its routes in the offline line.
+        let results = vec![(
+            "bmo".to_string(),
+            Err(anyhow::anyhow!(
+                "offline: katopz@100.100.117.44: timeout; katopz@192.168.10.2 via katopz@100.111.186.76: timeout"
+            )),
+            Duration::ZERO,
+        )];
+        assert_eq!(
+            fleet_summary(&results, &rigs),
+            "- bmo (runner): offline (routes: 100.100.117.44 · 192.168.10.2 via amo)"
+        );
+
+        // Online through the jump: the winner is named; direct winners are not.
+        let quiet_probe = |via: Option<&str>| RigProbe {
+            via: via.map(str::to_string),
+            ..serde_json::from_str::<RigProbe>(
+                r#"{"rig":"bmo","os":"macos","at":"","cores":30,"quiet":true}"#,
+            )
+            .unwrap()
+        };
+        let results = vec![(
+            "bmo".to_string(),
+            Ok(quiet_probe(Some("amo"))),
+            Duration::ZERO,
+        )];
+        assert_eq!(
+            fleet_summary(&results, &rigs),
+            "- bmo (runner): QUIET (via amo)"
+        );
+        let results = vec![("bmo".to_string(), Ok(quiet_probe(None)), Duration::ZERO)];
+        assert_eq!(fleet_summary(&results, &rigs), "- bmo (runner): QUIET");
+
         write_fleet_cache(&room, &results, &rigs);
         assert_eq!(
             cached_fleet_summary(&room, chrono::Duration::minutes(5)),
-            Some(summary)
+            Some("- bmo (runner): QUIET".to_string())
         );
         assert_eq!(
             cached_fleet_summary(&room, chrono::Duration::seconds(-1)),

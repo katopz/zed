@@ -46,6 +46,8 @@ export interface RigProbe {
   owner_mail?: number;
   running?: JobLine[];
   queued?: JobLine[];
+  /** Set when the probe reached the rig through a jump host (`amo`). */
+  via?: string | null;
 }
 
 export interface FleetRig {
@@ -55,6 +57,8 @@ export interface FleetRig {
   error?: string | null;
   latency_ms?: number;
   probe?: RigProbe | null;
+  /** Configured SSH routes, short labels (`100.100.117.44`, `192.168.10.2 via amo`). */
+  routes?: string[];
 }
 
 export interface Fleet {

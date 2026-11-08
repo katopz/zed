@@ -854,10 +854,10 @@ impl Mailroom {
         };
         let command = format!("{} {remote}", rig.bin.as_deref().unwrap_or("agent-mail"));
         let mut failures = Vec::new();
-        for target in &rig.ssh {
-            match self.ssh(target, &command, END_MARKER) {
+        for route in &rig.ssh {
+            match self.ssh(route, &command, END_MARKER) {
                 Ok(lines) => return Ok(lines.join("\n")),
-                Err(error) => failures.push(format!("{target}: {error:#}")),
+                Err(error) => failures.push(format!("{route}: {error:#}")),
             }
         }
         Err(anyhow!("{rig_name} unreachable: {}", failures.join("; ")))
@@ -1050,10 +1050,10 @@ impl Mailroom {
             .with_context(|| format!("unknown orchestrator rig {orchestrator:?}"))?;
         let command = format!("{} {remote}", rig.bin.as_deref().unwrap_or("agent-mail"));
         let mut failures = Vec::new();
-        for target in &rig.ssh {
-            match self.ssh(target, &command, marker) {
+        for route in &rig.ssh {
+            match self.ssh(route, &command, marker) {
                 Ok(lines) => return Ok(lines),
-                Err(error) => failures.push(format!("{target}: {error:#}")),
+                Err(error) => failures.push(format!("{route}: {error:#}")),
             }
         }
         Err(anyhow!(
