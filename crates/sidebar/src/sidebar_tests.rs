@@ -6417,6 +6417,64 @@ async fn test_running_thread_sorts_below_pinned_above_idle(cx: &mut TestAppConte
 }
 
 #[gpui::test]
+async fn test_errored_thread_sorts_by_recency_not_above_fresh_idle(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    let now = Utc::now();
+    // A thread whose last turn failed: ending the turn with MaxTokens
+    // leaves it Idle with had_error, which the sidebar shows as Error.
+    let connection = StubAgentConnection::new();
+    open_thread_with_connection(&panel, connection.clone(), cx);
+    send_message(&panel, cx);
+    let errored_session = active_session_id(&panel, cx);
+    connection.end_turn(errored_session.clone(), acp_v1::StopReason::MaxTokens);
+    cx.run_until_parked();
+
+    // Age the errored thread's metadata, as if the failure happened 8
+    // hours ago and nothing touched the thread since.
+    let stale = now - chrono::Duration::hours(8);
+    save_thread_metadata(
+        errored_session,
+        Some("Errored Thread".into()),
+        stale,
+        Some(stale),
+        Some(stale),
+        &project,
+        cx,
+    );
+
+    // An idle thread updated just now.
+    save_thread_metadata(
+        acp::SessionId::new(Arc::from("idle-thread")),
+        Some("Idle Thread".into()),
+        now,
+        Some(now),
+        Some(now),
+        &project,
+        cx,
+    );
+    cx.run_until_parked();
+
+    let entries = visible_entries_as_strings(&sidebar, cx);
+    assert_eq!(entries[0], "v [my-project]");
+    assert_eq!(
+        entries[1], "  Idle Thread",
+        "a stale errored thread must not park above a fresh idle one; \
+         ordering falls back to recency, got {:?}",
+        entries
+    );
+    assert!(
+        entries[2].contains("(error)"),
+        "the errored thread keeps its error indicator below the fresh \
+         idle thread, got {:?}",
+        entries
+    );
+}
+
+#[gpui::test]
 async fn test_running_thread_sorts_above_continuation_of_pinned_root(cx: &mut TestAppContext) {
     // A pinned thread that was continued (auto_prompt summary handoff)
     // becomes a hidden child of a chain headed by a fresh unpinned thread.

@@ -6126,7 +6126,17 @@ impl Sidebar {
                     // Terminals are never pinned and never running, so they
                     // join the unpinned tier with zero urgency.
                     SortItem::Terminal(_) => 0,
-                    SortItem::Chain(unit) => unit.status().urgency(),
+                    // An error is a terminal state, not active work: lifting
+                    // it parked old had_error threads above fresh idle ones
+                    // forever (had_error only clears on the thread's next
+                    // turn). A just-errored thread already sorts first via
+                    // recency — Stopped/Error stamp updated_at — so only
+                    // live or pending-work statuses lift the tier. The red-x
+                    // icon and the folded-chain rollup are unaffected.
+                    SortItem::Chain(unit) => match unit.status() {
+                        AgentThreadStatus::Error => 0,
+                        status => status.urgency(),
+                    },
                 }
             }
 
