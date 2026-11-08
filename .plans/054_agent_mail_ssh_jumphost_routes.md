@@ -40,10 +40,12 @@ should ride it too: `ssh -J katopz@100.111.186.76 katopz@192.168.10.2`.
 - [ ] Commit+push develop (this commit)
 
 ## Owner-gated / deferred
-- [ ] **Tailscale Funnel on amo is OFF** — the Fastly edge 302s/login then renders "The edge is misconfigured" because `https://amo.tail360d46.ts.net` is dead; `tailscale funnel` CLI hangs waiting on the macOS app's GUI approval. Owner: flip Funnel on in the Tailscale app on amo. (Pre-existing outage, plan 051's origin path.)
-- [ ] **amo→m3 TCP blackholed at the Tailscale relay** — `tailscale ping` (DERP) passes both ways but TCP:22 amo→m3 times out; m3→amo is fine; bounced both sides' tailscale, no change; SYNs never reach sshd on m3 (m3's tailscale network extension drops inbound TCP, ICMP passes). Panel shows m3 OFFLINE until fixed. Owner: restart the Tailscale app / network extension on m3 (or reboot m3). Also blocked bmo→m3 and amo→m3 mail flush (bmo's parked mail was rescued manually).
+- [x] **Tailscale Funnel on amo is OFF** — FIXED by owner 2026-11-08 (funnel re-enabled; the public panel loads again). Edge v4 renders: rig cards show the `routes:` line, a `via amo` tag when a probe rode the jump, and the offline banner names both routes.
+- [x] **amo→m3 TCP blackholed** — ROOT CAUSE FOUND 2026-11-08: m3 runs Tailscale with **ShieldsUp enabled** (`"ShieldsUp": true` in debug prefs), which drops unsolicited inbound TCP from tailnet peers while ICMP (ping) still passes — exactly the observed asymmetry. Owner turned shields off in the Tailscale app; amo→m3 TCP verified open; panel probes of m3 succeed again.
+- [x] Follow-up (same day, f2f6143db3): flag-shaped recipients can no longer become inbox folders (validate_name rejects leading `-`; `send` is getopt-style with `--to`, unknown-flag errors and a `--` separator), and rig-panel inbox folders are clickable and list their mail.
 - [-] Probe latency for bmo: the dead direct route eats its 10 s `ConnectTimeout` before the jump route wins (~10.2 s per probe round; panel cache 15 s absorbs it). Defer: parallel-race routes or auto-demote a route after N consecutive failures.
 - [-] 4090 jump support: Windows OpenSSH ProxyJump support is shaky; its rigs.json stays direct-only and it never dials bmo. Revisit only if the 4090 must reach bmo.
+- [-] Gatekeeper note: cargo-built agent-mail binaries can get SIGKILLed on first exec on a Mac (stale provenance verdict; happened to the 055 binary on m3). Fix: `codesign -f -s - ~/.cargo/bin/agent-mail`. Applied on m3; amo/bmo re-signed preemptively.
 
 ## Notes
 - ControlMaster `%C` hashes host/port/user only; bmo's two routes target
