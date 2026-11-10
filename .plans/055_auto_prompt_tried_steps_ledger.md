@@ -21,4 +21,4 @@ Lessons applied from the OpenRSI × SGLang-Omni writeup (Harnessed RSI): the out
 
 - Commit: 1d6a031927 (feat(auto_prompt): tried-steps ledger + plan scoreboard for chains)
 - Blog: https://index.openrsi.foundation/blog/2026/openrsi-sglang-omni/
-- Distill verdict on the RSI-Harness source: NO-GO for the riir-refine rule corpora (agent-harness domain, not Rust-perf rule material); harness-lane intel HIGH — see session notes 2026-11-10
+- Distill verdict on the RSI-Harness source (OpenRSI-Foundation/OpenRSI-Index @ 8d170deed4591fc7e4306f2d86ff4d9bcffd1288, Apache-2.0, ~95k LOC Python): **NO-GO** for the riir-refine rule corpora (decision-content fail, no GOAT candidate); **harness-lane intel HIGH** — mine as design intelligence, not rules. Lane-intel line for `riir-refine/.distill/001_mining_queue_snapshot.md` pending (sibling-gated). Lessons → `.issues/058`
