@@ -103,13 +103,20 @@ if (-not $SkipSwap) {
         throw
     }
 
-    # Prune swap backups, keep the newest one for rollback.
+    # Prune swap backups, keep the newest one for rollback. Pruning is
+    # housekeeping, never fatal: a backup may be a running process's image
+    # (Windows allows renaming a running exe but not deleting it) or OneDrive-
+    # locked — skip it with a note instead of aborting the swap.
     Get-ChildItem $destDir -Filter "zed.exe.prev-*" |
         Sort-Object LastWriteTime -Descending |
         Select-Object -Skip 1 |
         ForEach-Object {
             Write-Host "Pruning old backup: $($_.Name)"
-            Remove-Item $_.FullName -Force
+            try {
+                Remove-Item $_.FullName -Force -ErrorAction Stop
+            } catch {
+                Write-Host "  could not delete (locked or in use) - skipping: $($_.Exception.Message)"
+            }
         }
 
     $newVersion = (Get-Item $DestPath).VersionInfo.ProductVersion
