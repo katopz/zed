@@ -3,6 +3,63 @@ use crate::lightweight_context::is_actionable_checkbox;
 use language_model::LanguageModelCompletionEvent;
 use std::time::Duration;
 
+#[test]
+fn make_continue_action_appends_tried_steps_ledger() {
+    let session = "tried-steps-inject-test";
+    chain::clear_session(session);
+    let data = overflow_test_data(session, Some("mid-work message"));
+    // Empty ledger — prompt untouched.
+    let plain = data.make_continue_action("continue".to_string());
+    assert!(!plain.next_prompt.contains(TRIED_STEPS_HEADER));
+
+    chain::record_summary_steps(session, "- Plan 055: mine the schedulers\n- Ship the ledger");
+    let action = data.make_continue_action("continue".to_string());
+    assert!(action.next_prompt.contains(TRIED_STEPS_HEADER));
+    assert!(action.next_prompt.contains("Ship the ledger"));
+    // Rebuilding from an already-ledgered prompt must not stack the section.
+    let ledgered_prompt = action.next_prompt;
+    let again = data.make_continue_action(ledgered_prompt);
+    assert_eq!(again.next_prompt.matches(TRIED_STEPS_HEADER).count(), 1);
+    chain::clear_session(session);
+}
+
+#[test]
+fn claimed_plan_scoreboard_counts_flipped_checkboxes_as_progress() {
+    let _lock = plan_registry::lock_for_test();
+    plan_registry::release_all_for_session("scoreboard-test-session");
+    let session = "scoreboard-test-session";
+    chain::clear_session(session);
+    let plan_path = std::env::temp_dir().join(format!(
+        "auto-prompt-scoreboard-test-{}.md",
+        std::process::id()
+    ));
+    std::fs::write(&plan_path, "# Plan\n\n- [x] Task A\n- [ ] Task B\n").expect("write plan");
+    plan_registry::try_claim(&plan_path.to_string_lossy(), session, "scoreboard test")
+        .expect("claim the scoreboard plan");
+
+    // First observation has no opinion; flipping Task B counts as progress;
+    // an unchanged second read is flat.
+    assert_eq!(
+        record_claimed_plan_progress(session, None),
+        Some(chain::PlanProgress::First)
+    );
+    std::fs::write(&plan_path, "# Plan\n\n- [x] Task A\n- [x] Task B\n").expect("rewrite plan");
+    assert_eq!(
+        record_claimed_plan_progress(session, None),
+        Some(chain::PlanProgress::Advanced {
+            checked_delta: 1
+        })
+    );
+    assert_eq!(
+        record_claimed_plan_progress(session, None),
+        Some(chain::PlanProgress::Flat)
+    );
+
+    plan_registry::release_all_for_session(session);
+    let _ = std::fs::remove_file(&plan_path);
+    chain::clear_session(session);
+}
+
 /// Minimal LlmCallData for pure state-machine tests (plan 023 F1). The
 /// overflow and clarify machines never call the model; the slot just
 /// satisfies the struct shape.

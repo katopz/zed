@@ -703,13 +703,17 @@ impl std::fmt::Debug for LlmCallData {
 
 impl LlmCallData {
     pub(crate) fn make_continue_action(&self, next_prompt: String) -> AutoPromptAction {
-        let next_prompt = with_bloat_section(&next_prompt, self.bloat_directive.as_deref());
+        let session_key = self.session_id.to_string();
+        let next_prompt = with_tried_steps_section(
+            &with_bloat_section(&next_prompt, self.bloat_directive.as_deref()),
+            &session_key,
+        );
         // The stop that follows this same-thread continuation must count as
         // the same chain no matter how long the turn took — otherwise the
         // chain-timeout reset wipes the idle streak every slow hop and the
         // runaway cap never fires (`loop-bug`). New-thread forks consume this
         // flag benignly: the forked session starts a fresh chain anyway.
-        chain::arm_continuation(&self.session_id.to_string());
+        chain::arm_continuation(&session_key);
         AutoPromptAction {
             from_session_id: self.session_id.clone(),
             from_title: self.title.clone(),
@@ -728,6 +732,78 @@ impl LlmCallData {
     fn make_continue(&self, next_prompt: String) -> AutoPromptOutcome {
         AutoPromptOutcome::Continue(self.make_continue_action(next_prompt))
     }
+}
+
+/// Header for the tried-steps ledger block appended to continuations.
+const TRIED_STEPS_HEADER: &str = "TRIED-STEPS LEDGER (already proposed this chain):";
+
+/// Appends the session's tried-steps ledger to a continuation prompt so the
+/// worker sees every proposal this chain already made and does not re-propose
+/// one without new evidence (openrsi harnessed-RSI lesson: the outer loop
+/// carries every lesson into the next round — reworded summaries used to
+/// defeat the consecutive-repeats fingerprint).
+fn with_tried_steps_section(prompt: &str, session_id: &str) -> String {
+    let excerpts = chain::tried_steps_excerpts(session_id);
+    if excerpts.is_empty() || prompt.contains(TRIED_STEPS_HEADER) {
+        return prompt.to_string();
+    }
+    let mut section = String::from(prompt);
+    section.push_str("\n\n");
+    section.push_str(TRIED_STEPS_HEADER);
+    section.push_str(
+        " do not re-propose any of these without new evidence — make concrete progress instead.\n",
+    );
+    for excerpt in excerpts {
+        section.push_str("- ");
+        section.push_str(&excerpt);
+        section.push('\n');
+    }
+    section
+}
+
+/// Reads the session's claimed plan files, counts (checked, actionable)
+/// tasks and records the delta on the chain. `None` when the session holds
+/// no claims or none of the claimed files could be read — the round then
+/// gets no plan-scoreboard opinion.
+pub(crate) fn record_claimed_plan_progress(
+    session_id: &str,
+    project_root: Option<&std::path::Path>,
+) -> Option<chain::PlanProgress> {
+    let claims = plan_registry::claims_for_session(session_id);
+    if claims.is_empty() {
+        return None;
+    }
+    let mut checked_total = 0u32;
+    let mut actionable_total = 0u32;
+    let mut files_read = 0u32;
+    for plan_file in claims {
+        let candidate = std::path::PathBuf::from(&plan_file);
+        let path = if candidate.is_absolute() {
+            candidate
+        } else {
+            match project_root {
+                Some(root) => root.join(candidate),
+                None => continue,
+            }
+        };
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            log::info!("[auto_prompt::decide] plan scoreboard: unreadable plan file {plan_file}");
+            continue;
+        };
+        files_read += 1;
+        checked_total = checked_total
+            .saturating_add(lightweight_context::count_checked_tasks(&content) as u32);
+        actionable_total = actionable_total
+            .saturating_add(lightweight_context::count_actionable_tasks(&content) as u32);
+    }
+    if files_read == 0 {
+        return None;
+    }
+    Some(chain::record_plan_progress(
+        session_id,
+        checked_total,
+        actionable_total,
+    ))
 }
 
 /// Confidence threshold below which we stop during the Working phase.
@@ -1358,10 +1434,22 @@ fn decide_precheck(
         return DecidePrecheck::Decision(decision);
     }
     let session_id_str = thread.read(cx).session_id().to_string();
-    let turn = chain::record_turn(
-        &session_id_str,
-        chain::turn_made_progress(thread.read(cx).entries()),
-    );
+    // Plan scoreboard (openrsi lesson): flipped checkboxes in the session's
+    // claimed plans are progress even when the summary's wording repeats.
+    let plan_progress = record_claimed_plan_progress(&session_id_str, project_root.as_deref());
+    if let Some(chain::PlanProgress::Advanced { checked_delta }) = plan_progress {
+        log::info!(
+            "[auto_prompt::decide] plan scoreboard: +{checked_delta} checked task(s) — counting the round as progress"
+        );
+    }
+    if let Some(chain::PlanProgress::Regressed) = plan_progress {
+        log::warn!(
+            "[auto_prompt::decide] plan scoreboard: checked task count regressed since the last round"
+        );
+    }
+    let made_progress = chain::turn_made_progress(thread.read(cx).entries())
+        || matches!(plan_progress, Some(chain::PlanProgress::Advanced { .. }));
+    let turn = chain::record_turn(&session_id_str, made_progress);
     let iteration_count = turn.turn;
 
     // Rule-based check: if the last tool call was an interactive auth command

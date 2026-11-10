@@ -23,6 +23,22 @@ const CHAIN_TIMEOUT_SECS: u64 = 300;
 /// repeat is a normal re-check round; a second means nothing is moving.
 pub const MAX_UNCHANGED_REPEATS: u32 = 2;
 
+/// How many distinct next-steps proposals the tried-steps ledger keeps.
+/// Oldest entries drop off the front; the cap bounds the prompt block that
+/// carries the ledger into every continuation.
+pub const STEPS_LEDGER_CAP: usize = 8;
+
+/// Excerpt length per ledger entry, in characters. Steps text routinely
+/// carries CJK and em-dashes, so excerpts are never cut by byte index.
+const LEDGER_EXCERPT_CHARS: usize = 120;
+
+/// One distinct next-steps proposal this chain has already seen.
+#[derive(Clone)]
+struct LedgerEntry {
+    fingerprint: u64,
+    excerpt: String,
+}
+
 #[derive(Default)]
 struct ChainState {
     turns: u32,
@@ -32,6 +48,19 @@ struct ChainState {
     last_turn_secs: u64,
     steps_fingerprint: Option<u64>,
     steps_repeats: u32,
+    /// Rolling ledger of every distinct next-steps proposal this chain has
+    /// seen, oldest first. `steps_fingerprint` is only the last slot: a
+    /// third, differently-worded summary resets the repeat count and the
+    /// chain re-runs earlier steps. The ledger rides every continuation
+    /// prompt so the worker sees what was already proposed (openrsi
+    /// harnessed-RSI lesson: the outer loop carries every lesson into the
+    /// next round).
+    steps_ledger: Vec<LedgerEntry>,
+    /// Last (checked, actionable-unchecked) task counts across this
+    /// session's claimed plan files. The round-over-round delta is the
+    /// plan-level scoreboard: flipped checkboxes count as progress even
+    /// when the summary's wording repeats.
+    last_plan_progress: Option<(u32, u32)>,
     /// A valid `<stop>` already got its one housekeeping pass; the next
     /// `<stop>` in this session halts the chain outright.
     stop_housekeeping_sent: bool,
@@ -205,7 +234,77 @@ pub fn record_summary_steps(session_id: &str, steps: &str) -> u32 {
             chain.steps_fingerprint = Some(steps_fingerprint);
             chain.steps_repeats = 0;
         }
+        if !chain
+            .steps_ledger
+            .iter()
+            .any(|entry| entry.fingerprint == steps_fingerprint)
+        {
+            chain.steps_ledger.push(LedgerEntry {
+                fingerprint: steps_fingerprint,
+                excerpt: ledger_excerpt(steps),
+            });
+            if chain.steps_ledger.len() > STEPS_LEDGER_CAP {
+                chain.steps_ledger.remove(0);
+            }
+        }
         chain.steps_repeats
+    })
+}
+
+/// Collapses a steps block to a single-line excerpt of at most
+/// [`LEDGER_EXCERPT_CHARS`] characters, taken via `chars().take()` so the
+/// cut always lands on a char boundary.
+fn ledger_excerpt(steps: &str) -> String {
+    let collapsed = steps.split_whitespace().collect::<Vec<&str>>().join(" ");
+    collapsed.chars().take(LEDGER_EXCERPT_CHARS).collect()
+}
+
+/// The tried-steps ledger for this chain, oldest first. Continuation
+/// prompts embed it so the worker does not re-propose steps the chain has
+/// already worked through.
+pub fn tried_steps_excerpts(session_id: &str) -> Vec<String> {
+    with_chain(session_id, |chain| {
+        chain
+            .steps_ledger
+            .iter()
+            .map(|entry| entry.excerpt.clone())
+            .collect()
+    })
+}
+
+/// The plan-scoreboard delta between this round and the last.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanProgress {
+    /// First observation this chain — no opinion yet.
+    First,
+    /// At least one plan checkbox flipped to checked since the last round.
+    Advanced {
+        /// How many more tasks are checked than last round.
+        checked_delta: u32,
+    },
+    /// Identical counts — no plan-file movement this round.
+    Flat,
+    /// Fewer checked boxes than last round (a box was unchecked or the plan
+    /// shrank). Never resets the idle streak; the caller logs it.
+    Regressed,
+}
+
+/// Records this round's (checked, actionable-unchecked) task counts across
+/// the session's claimed plan files and classifies the delta. Flipped
+/// checkboxes are the plan-level scoreboard: a round that advances the plan
+/// counts as progress even when the summary's wording repeats.
+pub fn record_plan_progress(session_id: &str, checked: u32, actionable: u32) -> PlanProgress {
+    with_chain(session_id, |chain| {
+        let progress = match chain.last_plan_progress {
+            None => PlanProgress::First,
+            Some((last_checked, _)) if checked > last_checked => PlanProgress::Advanced {
+                checked_delta: checked - last_checked,
+            },
+            Some((last_checked, _)) if checked < last_checked => PlanProgress::Regressed,
+            Some(_) => PlanProgress::Flat,
+        };
+        chain.last_plan_progress = Some((checked, actionable));
+        progress
     })
 }
 
@@ -519,6 +618,57 @@ mod tests {
         assert_eq!(record_summary_steps(session, steps), 0);
         clear_session(session);
         clear_session(other);
+    }
+
+    #[test]
+    fn ledger_keeps_distinct_proposals_and_caps_size() {
+        let session = "chain-test-ledger";
+        clear_session(session);
+        record_summary_steps(session, "- Plan 055: mine the schedulers");
+        // The same proposal again must not add a second ledger entry.
+        record_summary_steps(session, "- plan 055 mine the schedulers");
+        record_summary_steps(session, "- Issue 016: 9 more chains");
+        assert_eq!(tried_steps_excerpts(session).len(), 2);
+        for index in 0..(STEPS_LEDGER_CAP + 2) {
+            record_summary_steps(session, &format!("- fresh proposal {index} with new words"));
+        }
+        assert_eq!(tried_steps_excerpts(session).len(), STEPS_LEDGER_CAP);
+        // The oldest entries dropped off the front.
+        assert!(!tried_steps_excerpts(session)
+            .iter()
+            .any(|excerpt| excerpt.contains("Plan 055")));
+        clear_session(session);
+    }
+
+    #[test]
+    fn ledger_excerpt_is_single_line_and_char_bounded() {
+        let session = "chain-test-ledger-excerpt";
+        clear_session(session);
+        let long = format!("- {} {}", "汉字".repeat(200), "tail marker");
+        record_summary_steps(session, &long);
+        let excerpts = tried_steps_excerpts(session);
+        assert_eq!(excerpts.len(), 1);
+        let excerpt = &excerpts[0];
+        assert!(!excerpt.contains('\n'));
+        assert!(excerpt.chars().count() <= LEDGER_EXCERPT_CHARS);
+        clear_session(session);
+    }
+
+    #[test]
+    fn plan_progress_classifies_deltas_per_session() {
+        let session = "chain-test-plan-progress";
+        clear_session(session);
+        assert_eq!(record_plan_progress(session, 1, 4), PlanProgress::First);
+        assert_eq!(
+            record_plan_progress(session, 3, 2),
+            PlanProgress::Advanced { checked_delta: 2 }
+        );
+        assert_eq!(record_plan_progress(session, 3, 2), PlanProgress::Flat);
+        assert_eq!(record_plan_progress(session, 2, 3), PlanProgress::Regressed);
+        // A fresh chain starts over at First.
+        clear_session(session);
+        assert_eq!(record_plan_progress(session, 0, 0), PlanProgress::First);
+        clear_session(session);
     }
 
     #[test]

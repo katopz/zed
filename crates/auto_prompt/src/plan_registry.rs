@@ -195,6 +195,25 @@ pub fn active_claims_for_others(session_id: &str) -> Vec<ActivePlanClaim> {
         .collect()
 }
 
+/// Plan files claimed by the given session (active, non-stale), oldest
+/// claim first. The plan-scoreboard reader uses this to find which files
+/// to count for the session.
+pub fn claims_for_session(session_id: &str) -> Vec<String> {
+    let now = time_monotonic_secs();
+    with_registry(|registry| {
+        let mut files: Vec<(f64, String)> = registry
+            .iter()
+            .filter(|(_, ownership)| {
+                ownership.session_id == session_id
+                    && (now - ownership.last_heartbeat_secs) < DEFAULT_STALE_TIMEOUT_SECS as f64
+            })
+            .map(|(plan_file, ownership)| (ownership.claimed_at_secs, plan_file.clone()))
+            .collect();
+        files.sort_by(|a, b| a.0.total_cmp(&b.0));
+        files.into_iter().map(|(_, plan_file)| plan_file).collect()
+    })
+}
+
 /// Check if a plan file is currently claimed by another (non-stale) session.
 pub fn is_claimed_by_other(plan_file: &str, session_id: &str) -> bool {
     let now = time_monotonic_secs();
@@ -313,25 +332,48 @@ pub fn format_claims_for_context(session_id: &str) -> Option<String> {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// Serialises every test that touches the global registry — shared by this
+/// module's tests and crate-level tests that claim plans (plan scoreboard),
+/// which would otherwise clear each other's claims mid-test.
+#[cfg(test)]
+pub(crate) fn lock_for_test() -> std::sync::MutexGuard<'static, ()> {
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Acquire a global test lock and clear the registry.
     /// The returned guard must be bound (`let _lock = setup();`) so it is
     /// held for the duration of the test, serialising all plan_registry tests.
     /// Recovers from poisoned locks so a panic in one test doesn't cascade.
     fn setup() -> std::sync::MutexGuard<'static, ()> {
-        let guard = TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let guard = lock_for_test();
         REGISTRY
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
         guard
+    }
+
+    #[test]
+    fn claims_for_session_returns_only_own_active_claims() {
+        let _lock = setup();
+        try_claim(".plans/055_mine.md", "sess_me", "my work").expect("claim 055");
+        try_claim(".plans/056_also_mine.md", "sess_me", "more work").expect("claim 056");
+        try_claim(".plans/057_theirs.md", "sess_them", "their work").expect("claim 057");
+        let mine = claims_for_session("sess_me");
+        assert_eq!(mine.len(), 2);
+        assert!(mine.contains(&".plans/055_mine.md".to_string()));
+        assert!(mine.contains(&".plans/056_also_mine.md".to_string()));
+        assert!(!mine.contains(&".plans/057_theirs.md".to_string()));
+        release_all_for_session("sess_me");
+        assert!(claims_for_session("sess_me").is_empty());
+        release_all_for_session("sess_them");
     }
 
     #[test]

@@ -119,8 +119,20 @@ pub(crate) fn is_actionable_checkbox(line: &str) -> bool {
         .any(|marker| line_lower.contains(&marker.to_lowercase()))
 }
 
-pub(crate) fn count_actionable_tasks(content: &str) -> usize {
-    let mut count = 0;
+/// A checked `- [x]` / `* [x]` box, any marker case. The scored half of a
+/// plan's checkboxes.
+pub(crate) fn is_checked_checkbox(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    ["- [x] ", "* [x] ", "- [X] ", "* [X] "]
+        .iter()
+        .any(|marker| trimmed.starts_with(marker))
+}
+
+/// The trimmed list lines outside code blocks and skip-marked sections —
+/// the single scan both task counters run, so the checked and actionable
+/// scores can never disagree about what counts as a task.
+fn scan_task_lines(content: &str) -> Vec<&str> {
+    let mut lines = Vec::new();
     let mut in_code_block = false;
     let mut skip_section = false;
 
@@ -147,12 +159,28 @@ pub(crate) fn count_actionable_tasks(content: &str) -> usize {
         if skip_section {
             continue;
         }
-        if is_actionable_checkbox(trimmed) {
-            count += 1;
+        if is_actionable_checkbox(trimmed) || is_checked_checkbox(trimmed) {
+            lines.push(trimmed);
         }
     }
 
-    count
+    lines
+}
+
+pub(crate) fn count_actionable_tasks(content: &str) -> usize {
+    scan_task_lines(content)
+        .into_iter()
+        .filter(|line| is_actionable_checkbox(line))
+        .count()
+}
+
+/// Checked boxes under the same scan rules as [`count_actionable_tasks`] —
+/// this is the plan-scoreboard number read each round.
+pub(crate) fn count_checked_tasks(content: &str) -> usize {
+    scan_task_lines(content)
+        .into_iter()
+        .filter(|line| is_checked_checkbox(line))
+        .count()
 }
 
 /// Returns true if the content has any unchecked actionable task items.
@@ -198,6 +226,28 @@ mod tests {
 - [ ] ~~Skipped task~~ Skipped — YAGNI
 - [ ] ~~Deferred task~~ — deferred
 ";
+        assert_eq!(count_actionable_tasks(plan), 1);
+    }
+
+    #[test]
+    fn test_count_checked_tasks_matches_the_actionable_scan() {
+        let plan = "\
+# Plan
+
+- [x] Done task
+- [X] Done task uppercase
+- [ ] Real task
+- [ ] ~~Skipped but checked-looking~~ n/a
+
+```rust
+// - [x] not a checkbox inside a code block
+```
+
+## Backlog
+
+- [x] not scored inside a skip-marked section
+";
+        assert_eq!(count_checked_tasks(plan), 2);
         assert_eq!(count_actionable_tasks(plan), 1);
     }
 
