@@ -297,7 +297,11 @@ impl AcpThread {
 /// `push_assistant_content_block_with_message_id` also skips upstream's per-chunk `EntryUpdated`
 /// emit: the text is only buffered, and the reveal task's `markdown.append()`
 /// notifies and refreshes windows when it lands. Emitting per chunk would
-/// remeasure the list 100+ times/sec during fast streaming.
+/// remeasure the list 100+ times/sec during fast streaming. The reveal tick
+/// does emit `EntryUpdated` once per revealed batch, though: the entity update
+/// alone doesn't re-measure list items outside the rendered viewport, so
+/// without it a background thread's rows kept stale heights until the next
+/// prompt's flush (the stale-view/flood-on-prompt regression).
 pub(crate) const STREAMING_TASK_UPDATE_MS: u64 = 300;
 
 /// Equal to [`STREAMING_TASK_UPDATE_MS`] so buffered text drains in a single

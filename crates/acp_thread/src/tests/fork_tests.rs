@@ -86,3 +86,88 @@ async fn test_complete_subagent_tool_call(cx: &mut TestAppContext) {
         assert_eq!(status_of(thread), ToolCallStatus::Failed);
     });
 }
+
+/// Regression test for the stale-view/flood-on-prompt bug: a buffered
+/// streaming chunk mutates only the entry's Markdown entity, which list items
+/// outside the rendered viewport never see (cached heights are trusted
+/// without re-render). The reveal tick must therefore emit
+/// `EntryUpdated` for the batch it reveals, so ConversationView re-syncs and
+/// re-measures the row while text streams in instead of at the next prompt.
+#[gpui::test]
+async fn test_streaming_reveal_emits_entry_updated(cx: &mut TestAppContext) {
+    init_test(cx);
+    let thread = new_test_thread(cx).await;
+
+    let entry_updates = Rc::new(RefCell::new(Vec::new()));
+    let record = entry_updates.clone();
+    let _subscription = cx.update(|cx| {
+        cx.subscribe(&thread, move |_, event, _| {
+            if let AcpThreadEvent::EntryUpdated(index) = event {
+                record.borrow_mut().push(*index);
+            }
+        })
+    });
+
+    let message_id = acp_v1::MessageId::new("stream-1");
+    let chunk = |text: &str| {
+        acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(
+            acp_v1::ContentBlock::from(text),
+        )
+        .message_id(message_id.clone()))
+    };
+
+    // First chunk creates the entry (NewEntry, not EntryUpdated).
+    thread.update(cx, |thread, cx| {
+        thread
+            .handle_session_update(chunk("first"), cx)
+            .expect("first chunk");
+    });
+    cx.run_until_parked();
+    assert_eq!(*entry_updates.borrow(), Vec::<usize>::new());
+
+    // Second chunk takes the buffered path and emits nothing itself.
+    thread.update(cx, |thread, cx| {
+        thread
+            .handle_session_update(chunk(" second"), cx)
+            .expect("second chunk");
+    });
+    cx.run_until_parked();
+    assert_eq!(*entry_updates.borrow(), Vec::<usize>::new());
+    thread.read_with(cx, |thread, _cx| {
+        let AgentThreadEntry::AssistantMessage(message) = &thread.entries[0] else {
+            panic!("expected assistant message");
+        };
+        let AssistantMessageChunk::Message { block, .. } = &message.chunks[0] else {
+            panic!("expected message chunk");
+        };
+        assert!(block.trailing_text().is_some(), "streaming target");
+    });
+
+    // The reveal tick reveals the buffered text and must emit EntryUpdated so
+    // the list re-measures the growing row.
+    cx.executor().advance_clock(Duration::from_millis(
+        fork::STREAMING_TASK_UPDATE_MS + 50,
+    ));
+    cx.run_until_parked();
+    assert_eq!(
+        *entry_updates.borrow(),
+        vec![0],
+        "reveal tick must emit EntryUpdated for the revealed batch"
+    );
+    thread.read_with(cx, |thread, cx| {
+        let AgentThreadEntry::AssistantMessage(message) = &thread.entries[0] else {
+            panic!("expected assistant message");
+        };
+        let AssistantMessageChunk::Message { block, .. } = &message.chunks[0] else {
+            panic!("expected message chunk");
+        };
+        let Some(markdown) = block.trailing_text() else {
+            panic!("expected trailing markdown");
+        };
+        let rendered = markdown.read(cx).source().to_string();
+        assert!(
+            rendered.contains("first") && rendered.contains("second"),
+            "revealed text should contain both chunks, got: {rendered}"
+        );
+    });
+}

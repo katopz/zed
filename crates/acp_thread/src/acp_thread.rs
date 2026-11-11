@@ -5669,10 +5669,20 @@ impl AcpThread {
                             return false;
                         };
 
+                        let had_pending = buffer.cursor.pending_bytes > 0;
                         let valid =
                             buffer.reveal(&this.entries, buffer.bytes_to_reveal_per_tick, cx);
                         if !valid {
                             this.streaming_text_buffer.take();
+                        } else if had_pending {
+                            // The markdown entity update alone doesn't reach the
+                            // list when the entry is outside the rendered
+                            // viewport: cached item heights are trusted without
+                            // re-render. EntryUpdated drives ConversationView's
+                            // sync_entry + remeasure_items so the row grows (or
+                            // first appears) without waiting for the next turn
+                            // boundary.
+                            cx.emit(AcpThreadEvent::EntryUpdated(buffer.target.entry_index));
                         }
                         valid
                     })
