@@ -72,6 +72,7 @@ pub struct ThreadItem {
     title_generating: bool,
     highlight_positions: Vec<usize>,
     timestamp: SharedString,
+    id_badge: Option<AnyElement>,
     notified: bool,
     status: AgentThreadStatus,
     selected: bool,
@@ -109,6 +110,7 @@ impl ThreadItem {
             title_generating: false,
             highlight_positions: Vec::new(),
             timestamp: "".into(),
+            id_badge: None,
             notified: false,
             status: AgentThreadStatus::default(),
             selected: false,
@@ -134,6 +136,14 @@ impl ThreadItem {
 
     pub fn timestamp(mut self, timestamp: impl Into<SharedString>) -> Self {
         self.timestamp = timestamp.into();
+        self
+    }
+
+    /// Interactive badge (e.g. thread/agent ids) rendered after the timestamp.
+    /// The badge owns its clicks and must stop propagation, or the row's
+    /// activation handler fires too.
+    pub fn id_badge(mut self, badge: impl IntoElement) -> Self {
+        self.id_badge = Some(badge.into_any_element());
         self
     }
 
@@ -460,6 +470,8 @@ impl RenderOnce for ThreadItem {
         let has_project_paths = project_paths.is_some();
         let has_timestamp = !self.timestamp.is_empty();
         let timestamp = self.timestamp;
+        let id_badge = self.id_badge.take();
+        let has_id_badge = id_badge.is_some();
 
         let show_tooltip = matches!(
             self.status,
@@ -486,6 +498,7 @@ impl RenderOnce for ThreadItem {
             || has_worktree
             || has_diff_stats
             || has_timestamp
+            || has_id_badge
             || has_continuation
             || self.status == AgentThreadStatus::Waiting;
 
@@ -693,13 +706,18 @@ impl RenderOnce for ThreadItem {
                                     .color(Color::Muted),
                             )
                         })
+                        .when(has_timestamp && has_id_badge, |this| {
+                            this.child(dot_separator())
+                        })
+                        .when_some(id_badge, |this, badge| this.child(badge))
                         .when(has_continuation, |this| {
                             this.when(
                                 has_project_name
                                     || has_project_paths
                                     || has_worktree
                                     || has_diff_stats
-                                    || has_timestamp,
+                                    || has_timestamp
+                                    || has_id_badge,
                                 |this| this.child(dot_separator()),
                             )
                             .when_some(

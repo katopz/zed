@@ -57,7 +57,7 @@ use std::collections::{HashMap, HashSet};
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use theme::{ActiveTheme, CLIENT_SIDE_DECORATION_ROUNDING};
 use ui::{
     AgentThreadStatus, CommonAnimationExt, ContextMenu, ContextMenuEntry, Divider, GradientFade,
@@ -280,6 +280,41 @@ fn split_leading_icon_char(
         trimmed_title.to_string().into(),
         adjusted_positions,
     ))
+}
+
+/// Last 8 chars of the hyphenated thread id, matching the rig panel's short id form.
+fn short_thread_id(id: &str) -> &str {
+    id.get(id.len().saturating_sub(8)..).unwrap_or(id)
+}
+
+/// A muted id fragment that copies `value` on click. Stops propagation so the
+/// surrounding thread row is not activated.
+fn copyable_id_label(
+    id: impl Into<gpui::ElementId>,
+    label: impl Into<SharedString>,
+    value: String,
+    hover_background: gpui::Hsla,
+) -> AnyElement {
+    div()
+        .id(id.into())
+        .cursor_pointer()
+        .hover(move |style| style.bg(hover_background).rounded_sm())
+        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_click(move |_, _, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string(value.clone()));
+        })
+        .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
+        .tooltip(Tooltip::text("Click to copy"))
+        .into_any_element()
+}
+
+/// This machine's rig name, resolved once per process. `rigs.json` is disk
+/// I/O, and the id badge reads it on the render path for every history row.
+fn cached_self_rig() -> Option<SharedString> {
+    static SELF_RIG: OnceLock<Option<SharedString>> = OnceLock::new();
+    SELF_RIG
+        .get_or_init(|| agent::self_rig().map(Into::into))
+        .clone()
 }
 
 /// Picks a single glyph to render as the icon from a detected title prefix.
@@ -3935,10 +3970,11 @@ impl Sidebar {
 
     /// The `name@rig` a native thread answers agent-mail at. A live native
     /// agent knows the inbox name a mail-spawned thread was created for, so
-    /// ask it first and derive `zed-<id>@<rig>` only when none is connected.
-    fn native_thread_mail_address(
+    /// ask it first and fall back to `fallback` only when none is connected.
+    fn thread_mail_address_with_fallback(
         session_id: &acp::SessionId,
         workspaces: [Option<&Entity<Workspace>>; 2],
+        fallback: impl FnOnce() -> Option<String>,
         cx: &App,
     ) -> Option<String> {
         workspaces
@@ -3960,7 +3996,42 @@ impl Sidebar {
                     _ => None,
                 }
             })
-            .or_else(|| agent::saved_thread_mail_address(session_id))
+            .or_else(fallback)
+    }
+
+    /// Context-menu path: runs rarely, so the authoritative but uncached
+    /// `saved_thread_mail_address` fallback is fine.
+    fn native_thread_mail_address(
+        session_id: &acp::SessionId,
+        workspaces: [Option<&Entity<Workspace>>; 2],
+        cx: &App,
+    ) -> Option<String> {
+        Self::thread_mail_address_with_fallback(
+            session_id,
+            workspaces,
+            || agent::saved_thread_mail_address(session_id),
+            cx,
+        )
+    }
+
+    /// Id-badge path: runs on every row render, so the fallback derives
+    /// `zed-<id>@<rig>` from the process-cached rig name instead of
+    /// re-reading `rigs.json` per frame.
+    fn badge_thread_mail_address(
+        session_id: &acp::SessionId,
+        workspaces: [Option<&Entity<Workspace>>; 2],
+        cx: &App,
+    ) -> Option<String> {
+        Self::thread_mail_address_with_fallback(
+            session_id,
+            workspaces,
+            || {
+                cached_self_rig().map(|self_rig| {
+                    format!("{}@{self_rig}", agent::native_thread_mail_name(session_id))
+                })
+            },
+            cx,
+        )
     }
 
     fn open_closed_native_thread_as_markdown(
@@ -6653,6 +6724,56 @@ impl Sidebar {
             format_history_entry_timestamp(Self::thread_display_time(&thread.metadata)).into()
         };
 
+        let active_workspace = self.active_workspace(cx);
+        let open_workspace = match &thread_workspace {
+            ThreadEntryWorkspace::Open(workspace) => Some(workspace.clone()),
+            ThreadEntryWorkspace::Closed { .. } => None,
+        };
+        let is_zed_thread = thread.metadata.agent_id.as_ref() == ZED_AGENT_ID.as_ref();
+        let id_badge = if is_draft {
+            None
+        } else {
+            let thread_id_string = thread.metadata.thread_id.to_key_string();
+            let short_id: SharedString = short_thread_id(&thread_id_string).to_string().into();
+            let agent_id = thread
+                .metadata
+                .session_id
+                .as_ref()
+                .and_then(|session_id| {
+                    is_zed_thread.then(|| {
+                        Self::badge_thread_mail_address(
+                            session_id,
+                            [open_workspace.as_ref(), active_workspace.as_ref()],
+                            cx,
+                        )
+                    })
+                })
+                .flatten();
+            Some(
+                h_flex()
+                    .gap_0p5()
+                    .child(copyable_id_label(
+                        ("copy-thread-id", ix),
+                        short_id,
+                        thread_id_string,
+                        color.element_hover,
+                    ))
+                    .when_some(agent_id, |this, agent_id| {
+                        this.child(
+                            Label::new("•")
+                                .size(LabelSize::Small)
+                                .color(Color::Custom(color.text_muted.opacity(0.4))),
+                        )
+                        .child(copyable_id_label(
+                            ("copy-agent-id", ix),
+                            agent_id.clone(),
+                            agent_id,
+                            color.element_hover,
+                        ))
+                    }),
+            )
+        };
+
         let is_remote = thread.workspace.is_remote(cx);
 
         let worktrees = apply_worktree_label_mode(
@@ -6714,6 +6835,7 @@ impl Sidebar {
             })
             .worktrees(worktrees)
             .timestamp(timestamp)
+            .when_some(id_badge, |this, badge| this.id_badge(badge))
             .highlight_positions(thread.highlight_positions.to_vec())
             .title_generating(title_generating)
             .notified(has_notification)
@@ -6907,7 +7029,6 @@ impl Sidebar {
                 },
             )
             .on_click({
-                let thread_workspace = thread_workspace.clone();
                 cx.listener(move |this, _, window, cx| {
                     this.selection = None;
                     match &thread_workspace {
@@ -6941,13 +7062,6 @@ impl Sidebar {
         let context_menu_id = SharedString::from(format!("thread-context-menu-{}", ix));
         let sidebar = cx.weak_entity();
 
-        let active_workspace = self.active_workspace(cx);
-        let thread_workspace = match &thread_workspace {
-            ThreadEntryWorkspace::Open(workspace) => Some(workspace.clone()),
-            ThreadEntryWorkspace::Closed { .. } => None,
-        };
-
-        let is_zed_thread = thread.metadata.agent_id.as_ref() == ZED_AGENT_ID.as_ref();
         let can_open_as_markdown = thread.is_live || is_zed_thread;
         let folder_paths = thread.metadata.folder_paths().clone();
 
@@ -6961,7 +7075,7 @@ impl Sidebar {
                     let session_id = session_id.clone();
                     let sidebar = sidebar.clone();
                     let active_workspace = active_workspace.clone();
-                    let thread_workspace = thread_workspace.clone();
+                    let open_workspace = open_workspace.clone();
                     let markdown_title = markdown_title.clone();
                     let rename_title = rename_title.clone();
                     let folder_paths = folder_paths.clone();
@@ -6973,7 +7087,7 @@ impl Sidebar {
                         .then(|| {
                             Self::native_thread_mail_address(
                                 &session_id,
-                                [thread_workspace.as_ref(), active_workspace.as_ref()],
+                                [open_workspace.as_ref(), active_workspace.as_ref()],
                                 cx,
                             )
                         })
@@ -7020,7 +7134,7 @@ impl Sidebar {
                             menu = menu.entry("Regenerate Thread Title", None, {
                                 let session_id = session_id.clone();
                                 let sidebar = sidebar.clone();
-                                let thread_workspace = thread_workspace.clone();
+                                let open_workspace = open_workspace.clone();
                                 let folder_paths = folder_paths.clone();
                                 move |_window, cx| {
                                     sidebar
@@ -7029,7 +7143,7 @@ impl Sidebar {
                                                 &session_id,
                                                 thread_id,
                                                 folder_paths.clone(),
-                                                thread_workspace.clone(),
+                                                open_workspace.clone(),
                                                 cx,
                                             );
                                         })
@@ -7046,13 +7160,19 @@ impl Sidebar {
                             });
                         }
 
+                        menu = menu.entry("Copy Thread ID", None, move |_window, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(
+                                thread_id.to_key_string(),
+                            ));
+                        });
+
                         if can_open_as_markdown {
                             menu = menu.entry("Open Thread as Markdown", None, {
                                 let session_id = session_id.clone();
                                 let markdown_title = markdown_title.clone();
-                                let thread_workspace = thread_workspace.clone();
+                                let open_workspace = open_workspace.clone();
                                 move |window, cx| {
-                                    if let Some(thread_workspace) = thread_workspace.as_ref()
+                                    if let Some(thread_workspace) = open_workspace.as_ref()
                                         && let Some(panel) =
                                             thread_workspace.read(cx).panel::<AgentPanel>(cx)
                                     {

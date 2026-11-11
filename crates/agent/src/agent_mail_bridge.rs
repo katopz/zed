@@ -340,6 +340,12 @@ pub fn saved_thread_mail_address(session_id: &acp_v2::SessionId) -> Option<Strin
     ))
 }
 
+/// This machine's rig name from `rigs.json`. The read is uncached I/O, so
+/// render-path callers must cache the result rather than call this per frame.
+pub fn self_rig() -> Option<String> {
+    Some(Mailroom::from_env().ok()?.rigs().ok()?.self_rig)
+}
+
 /// A native thread's inbox name, stable for the session's lifetime.
 pub fn native_thread_mail_name(session_id: &acp_v2::SessionId) -> String {
     let short = session_id

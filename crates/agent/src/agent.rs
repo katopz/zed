@@ -1,6 +1,6 @@
 mod agent_fork;
 mod agent_mail_bridge;
-pub use agent_mail_bridge::saved_thread_mail_address;
+pub use agent_mail_bridge::{native_thread_mail_name, saved_thread_mail_address, self_rig};
 mod thread_mailbox;
 
 mod db;
