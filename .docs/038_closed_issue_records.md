@@ -25,6 +25,12 @@ workspace's noise-reduction rule: work lands → the record is documented
 | 047 | `test_manual_auto_prompt_forks_claude_thread_above_overflow_gate` ambient-config hermeticity — FIXED | `7c2f1fba27` | this row (one-line test fix; the fix commit's message + this row are the record) |
 | 048 | agent-mail fyi mode + broadcast gate + liveness cutoff — DONE, deployed 4 rigs, Claude verdict AGREE ×2 | `eec5d52d88` + fmt `d30a4a3a44` | `.docs/037_agent_mail_fyi_rollout.md`; the deferred fyi-folding follow-up + the owner-side AGENTS.md row move here |
 
+## Removed 2026-11-11 (amo idle lane, issue 059)
+
+| issue | verdict | landed in | durable record |
+|---|---|---|---|
+| 059 | `test_agent_mail_broadcast_respects_liveness_cutoff` "reads real `~/.agent-mail`" — NOT REPRODUCIBLE: single test (23/23) and full suite (843/0) pass on live amo at the same tree that failed that morning; dependency audit found no reachable real-home read (temp-dir injection covers sender + bridge; `start_if_installed` is `cfg!(test)`-gated; other `from_env` callers unlinked/off-path). Filed `set_var("AGENT_MAIL_HOME")` fix REJECTED: process-global env mutation under a parallel harness guarding a nonexistent path. Suspected real mechanism: real-clock reads vs the mock executor clock (backward wall-step ⇒ exactly the observed 0). Self-adjudicated while the verdict reviewer was rate-limited | evidence + audit in the issue file's life (`git log --follow`), removal commit | this row; if it recurs, re-file WITH the failing assertion output + `date` + env state captured at failure |
+
 ## Removed 2026-11-11 (amo idle lane, issue 054)
 
 | issue | verdict | landed in | durable record |
