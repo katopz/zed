@@ -25,6 +25,12 @@ workspace's noise-reduction rule: work lands → the record is documented
 | 047 | `test_manual_auto_prompt_forks_claude_thread_above_overflow_gate` ambient-config hermeticity — FIXED | `7c2f1fba27` | this row (one-line test fix; the fix commit's message + this row are the record) |
 | 048 | agent-mail fyi mode + broadcast gate + liveness cutoff — DONE, deployed 4 rigs, Claude verdict AGREE ×2 | `eec5d52d88` + fmt `d30a4a3a44` | `.docs/037_agent_mail_fyi_rollout.md`; the deferred fyi-folding follow-up + the owner-side AGENTS.md row move here |
 
+## Removed 2026-11-11 (amo idle lane, issue 054)
+
+| issue | verdict | landed in | durable record |
+|---|---|---|---|
+| 054 | rig-job runner SSH auth on amo (`Host key verification failed`) — FIXED both halves: stale known_hosts entries on amo+m3 healed, and amo→m3 legs must use `kat@` (m3's `katopz` account has no authorized_keys); full mesh verified 2026-11-06 | fixed 2026-11-06 (ops-only, no repo commit); this removal commit is the record | this row. Carried forward: (a) amo cannot reach m3 LAN IPs (192.168.1.34/.36 — m3 firewall stealth mode drops amo-originated legs); Tailscale legs unaffected, fleet routes over Tailscale by design — LAN acceleration needs an m3 firewall allow-rule for amo. (b) If fresh Tailscale/LAN IP churn re-exposes batch-mode prompt-death, re-file in the agent-mail runner source (outside this repo) for `HostKeyAlias`/`StrictHostKeyChecking=accept-new` on fleet-internal legs |
+
 ## Carried-forward watch/deferred items (from the removed files)
 
 - **023's timezone watch**: confirm which timezone Z.AI's reset timestamp
