@@ -1,5 +1,6 @@
 # 059 — test_agent_mail_broadcast_respects_liveness_cutoff reads the real ~/.agent-mail
 Status: open — filed from plan 056 verdict round 2 (AGREE, non-blocking follow-up)
+**Claimed:** amo-verdict-lane, 1762830000, expires 2026-11-13T00:00:00+00:00
 
 - [ ] Point the test's agent-mail home at a temp dir: `Mailroom::from_env()`
       honors `AGENT_MAIL_HOME` (`crates/agent_mail/src/agent_mail.rs:445`) —

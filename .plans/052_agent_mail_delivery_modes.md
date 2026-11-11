@@ -1,7 +1,7 @@
 # 052 — Agent-mail delivery modes: urgent / steering / queued (issue 046)
 
 Status: DONE — all gates green (agent_mail 41 + agent 832 tests, clippy clean, CLI e2e smoke verified)
-**Claimed:** zed-agent@amo, 1793732249, expires 2026-11-06T13:00:00+00:00 (issue 046 carries the lease)
+**Lease closed:** zed-agent@amo claimed this at epoch 1793732249, expiry 2026-11-06T13:00:00+00:00 — long past; the work is DONE and issue 046 carries the lease history.
 
 ## Goal
 
