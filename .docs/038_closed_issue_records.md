@@ -25,6 +25,12 @@ workspace's noise-reduction rule: work lands → the record is documented
 | 047 | `test_manual_auto_prompt_forks_claude_thread_above_overflow_gate` ambient-config hermeticity — FIXED | `7c2f1fba27` | this row (one-line test fix; the fix commit's message + this row are the record) |
 | 048 | agent-mail fyi mode + broadcast gate + liveness cutoff — DONE, deployed 4 rigs, Claude verdict AGREE ×2 | `eec5d52d88` + fmt `d30a4a3a44` | `.docs/037_agent_mail_fyi_rollout.md`; the deferred fyi-folding follow-up + the owner-side AGENTS.md row move here |
 
+## Removed 2026-11-11 (amo idle lane, issue 058)
+
+| issue | verdict | landed in | durable record |
+|---|---|---|---|
+| 058 | rsi_loop adoptables — DONE across five tasks: (1) resume-state contract (`chain::resume_state_section` prepended in `make_continue_action`, the single choke point incl. the Phase 2 fork); (2) minimum-runtime guard (`MIN_TURN_RUNTIME_SECS`=10 / `NEAR_INSTANT_LIMIT`=3, both deciders halt); (3) cross-session fork ceiling (`MAX_FORKS_PER_HOUR`=30 rolling hour, enforced at all three fork sites — the audit's real finding: per-chain caps all existed, the fork LINEAGE did not); (4) argv hygiene audited clean (no task text in argv anywhere in this repo's spawn paths); (5) fairness pinning re-homed to riir-ai `.issues/1198` | `0fe7a1355b` (task 2) + `abe3ea3929` (task 1) + `0abbe91876` (task 3); riir-ai `788433454` (task 5 filing) | this row; tests `near_instant_chained_hops_accumulate_until_real_work_resets`, `make_continue_action_prepends_resume_state_without_stacking`, `resume_state_section_absent_without_a_chain`, `fork_ceiling_refuses_after_the_budget_and_recovers_by_pruning` |
+
 ## Removed 2026-11-11 (amo idle lane, issue 057)
 
 | issue | verdict | landed in | durable record |
