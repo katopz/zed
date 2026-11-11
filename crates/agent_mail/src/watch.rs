@@ -1261,6 +1261,7 @@ mod tests {
             arm: "name".into(),
             command: Some(command.into()),
             cwd: None,
+            vm_infra: false,
         }
     }
 

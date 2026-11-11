@@ -78,8 +78,27 @@ pub struct Needs {
     #[serde(default)]
     pub gpu_mem_gb: f64,
     /// Rig capabilities the job requires (`cuda`, `metal`, `zed`, ...).
+    /// Job-side-only declarations (`vm`, issue 039) are stripped by
+    /// [`Needs::rig_caps`] — every dev box can spawn a VM, so `vm` is an
+    /// environment the job will itself occupy, never a rig capability.
     #[serde(default)]
     pub caps: Vec<String>,
+}
+
+/// Caps that describe the job's own environment, not a rig requirement.
+pub const JOB_SIDE_CAPS: [&str; 1] = ["vm"];
+
+impl Needs {
+    /// The caps that gate rig selection: everything except the job-side
+    /// declarations. Both cap gates (pick_rig and the named-rig check) go
+    /// through this so `--needs vm` behaves the same on every path.
+    pub fn rig_caps(&self) -> Vec<&str> {
+        self.caps
+            .iter()
+            .filter(|cap| !JOB_SIDE_CAPS.contains(&cap.as_str()))
+            .map(|cap| cap.as_str())
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -144,6 +163,18 @@ pub struct JobRecord {
     pub exit_code: Option<i32>,
     #[serde(default)]
     pub poisoned: Vec<Poison>,
+    /// VM-infrastructure processes born after this job started, while the
+    /// job declared `vm` (issue 039): treated as the job's own. Recorded,
+    /// never poison, never mailed per-probe.
+    #[serde(default)]
+    pub vm_exempt: Vec<Poison>,
+    /// VM-infrastructure processes that already existed at job start of a
+    /// `vm`-declaring job: the job's containers may run inside them, so
+    /// their load cannot be told apart from foreign docker work. Recorded,
+    /// never poison — but the end mail carries the bucket so the
+    /// adjudicator sees the run lost its foreign-load guarantee.
+    #[serde(default)]
+    pub vm_shared: Vec<Poison>,
     /// Provenance of the machine that ran the job (issue 055).
     #[serde(default)]
     pub environment: Option<RunEnvironment>,
@@ -217,7 +248,12 @@ pub fn pick_rig(
                 return None;
             }
             let rig = rigs.rigs.get(name)?;
-            if !rig.accepts_jobs || !needs.caps.iter().all(|cap| rig.caps.contains(cap)) {
+            if !rig.accepts_jobs
+                || needs
+                    .rig_caps()
+                    .iter()
+                    .any(|cap| !rig.caps.iter().any(|own| own == cap))
+            {
                 return None;
             }
             let free = probe.cores as f64 - probe.load1.unwrap_or(0.0);
@@ -643,6 +679,8 @@ impl Mailroom {
             outcome: None,
             exit_code: None,
             poisoned: Vec::new(),
+            vm_exempt: Vec::new(),
+            vm_shared: Vec::new(),
             environment: None,
             measured: None,
             verify_outcome: None,
@@ -706,6 +744,21 @@ impl Mailroom {
             }
         };
         record.child_pid = Some(child.id());
+        // Issue 039: a job that declared `vm` scopes its poison exemption by
+        // pid — VM-infrastructure pids existing BEFORE start are shared or
+        // foreign (the vm_shared bucket), pids born after start are the
+        // job's own (vm_exempt). No class or blind table = no exemption.
+        let vm_policy = if record.spec.needs.caps.iter().any(|cap| cap == "vm") {
+            let vocabulary = rig::vocabulary_dir()
+                .map(|dir| rig::Vocabulary::load(&dir))
+                .and_then(|loaded| loaded.ok());
+            let start_pids = vocabulary.and_then(|vocabulary| vocabulary.vm_infrastructure_pids());
+            start_pids.map(|pids| VmPolicy {
+                start_pids: pids.into_iter().collect(),
+            })
+        } else {
+            None
+        };
         write_json(&record_path, &record)?;
 
         let started = Instant::now();
@@ -732,10 +785,26 @@ impl Mailroom {
             }
             if record.spec.lane == Lane::Exclusive && last_probe.elapsed() >= POISON_PROBE_EVERY {
                 last_probe = Instant::now();
-                let fresh = new_poison(
+                let probe = probe_poison(
                     &rig::contention(&[std::process::id(), child.id()]),
                     &record.poisoned,
+                    vm_policy.as_ref(),
                 );
+                let fresh = probe.poison;
+                if !probe.vm_exempt.is_empty() || !probe.vm_shared.is_empty() {
+                    // Issue 039: exempted and shared VM processes are
+                    // recorded, deduplicated by pid, never mailed per-probe.
+                    for bucket in [&mut record.vm_exempt, &mut record.vm_shared] {
+                        for entry in [&probe.vm_exempt, &probe.vm_shared] {
+                            for poison in entry {
+                                if !bucket.iter().any(|p| p.pid == poison.pid) {
+                                    bucket.push(poison.clone());
+                                }
+                            }
+                        }
+                    }
+                    write_json(&record_path, &record)?;
+                }
                 if !fresh.is_empty() {
                     let names = fresh
                         .iter()
@@ -836,6 +905,19 @@ impl Mailroom {
         prune_done(&done);
         let rig_name = self.rigs().map(|rigs| rigs.self_rig).unwrap_or_default();
         let log_path = self.jobs_dir("logs").join(format!("{id}.log"));
+        let vm_shared = match record.vm_shared.is_empty() {
+            true => String::new(),
+            false => format!(
+                "\nVM-SHARED: {} VM-infrastructure process(es) predated this vm-declaring run — their load cannot be told apart from foreign docker work, so the foreign-load guarantee is LOST for this cell (issue 039): {}",
+                record.vm_shared.len(),
+                record
+                    .vm_shared
+                    .iter()
+                    .map(|poison| format!("{} (pid {})", poison.name, poison.pid))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
         let poison = match record.poisoned.is_empty() {
             true => String::new(),
             false => format!(
@@ -877,7 +959,7 @@ impl Mailroom {
             }
         };
         let summary = format!(
-            "job {} {} on {rig_name} (exit {}): {}{poison}{verify}\nlog: {}\n--- log tail ---\n{}",
+            "job {} {} on {rig_name} (exit {}): {}{poison}{vm_shared}{verify}\nlog: {}\n--- log tail ---\n{}",
             short(&id),
             outcome.to_uppercase(),
             exit_code.map_or("-".into(), |code| code.to_string()),
@@ -1472,19 +1554,56 @@ fn kill_tree(pid: u32) {
     }
 }
 
-/// Contenders not already recorded as poison for this run.
-pub fn new_poison(contention: &Contention, known: &[Poison]) -> Vec<Poison> {
-    contention
-        .contenders
-        .iter()
-        .filter(|contender| !known.iter().any(|poison| poison.pid == contender.pid))
-        .map(|contender| Poison {
+/// One poison-probe outcome: what poisons, and what was VM-exempted or
+/// VM-shared instead (issue 039). Every bucket carries its Poison rows —
+/// an exemption with no trace is laundering.
+#[derive(Debug, Default, PartialEq)]
+pub struct PoisonProbe {
+    pub poison: Vec<Poison>,
+    pub vm_exempt: Vec<Poison>,
+    pub vm_shared: Vec<Poison>,
+}
+
+/// The pid-scoped VM exemption state captured at job start.
+#[derive(Debug, Clone)]
+pub struct VmPolicy {
+    /// VM-infrastructure pids alive before the job started: their load is
+    /// shared or foreign, never the job's own.
+    pub start_pids: std::collections::BTreeSet<u32>,
+}
+
+/// Contenders not already recorded as poison for this run. With a
+/// [`VmPolicy`] and a vm-capable vocabulary, VM-infrastructure contenders
+/// are classified instead: born after start = the job's own
+/// (`vm_exempt`), alive at start = shared/foreign (`vm_shared`) — neither
+/// poisons. Without the policy (cap not declared, no class, or a blind
+/// table) every contender poisons exactly as before 039.
+pub fn probe_poison(
+    contention: &Contention,
+    known: &[Poison],
+    vm_policy: Option<&VmPolicy>,
+) -> PoisonProbe {
+    let mut probe = PoisonProbe::default();
+    for contender in &contention.contenders {
+        if known.iter().any(|poison| poison.pid == contender.pid) {
+            continue;
+        }
+        let poison = Poison {
             at: now(),
             pid: contender.pid,
             name: contender.name.clone(),
             command: contender.command.clone(),
-        })
-        .collect()
+        };
+        let classified_vm = vm_policy.is_some() && contender.vm_infra;
+        if !classified_vm {
+            probe.poison.push(poison);
+        } else if vm_policy.is_some_and(|policy| policy.start_pids.contains(&contender.pid)) {
+            probe.vm_shared.push(poison);
+        } else {
+            probe.vm_exempt.push(poison);
+        }
+    }
+    probe
 }
 
 fn log_tail(path: &Path) -> String {
@@ -1991,6 +2110,89 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
+    }
+
+    fn contender(pid: u32, name: &str, vm_infra: bool) -> crate::rig::Contender {
+        crate::rig::Contender {
+            pid,
+            name: name.into(),
+            cpu_pct: 100.0,
+            rss_gb: 1.0,
+            arm: "name".into(),
+            command: None,
+            cwd: None,
+            vm_infra,
+        }
+    }
+
+    fn contention_with(rows: &[crate::rig::Contender]) -> Contention {
+        Contention {
+            contenders: rows.to_vec(),
+            blind: None,
+            power: None,
+            cpu_speed_limit: None,
+            not_quiet_because: Vec::new(),
+            mem_total_gb: None,
+            mem_free_gb: None,
+            disk_free_gb: None,
+        }
+    }
+
+    #[test]
+    fn a_vm_declaring_job_exemptes_vms_born_after_start_and_shares_preexisting_ones() {
+        let rows = vec![
+            contender(10, "com.apple.Virtualization.VirtualMachine", true), // born after
+            contender(11, "qemu-system-x86_64", true),                     // predates
+            contender(12, "cargo", false),                                 // never exempt
+        ];
+        let contention = contention_with(&rows);
+        let known: Vec<Poison> = Vec::new();
+        let policy = VmPolicy {
+            start_pids: [11u32].into_iter().collect(),
+        };
+        let probe = probe_poison(&contention, &known, Some(&policy));
+        assert!(probe.poison.iter().all(|p| p.pid == 12), "a foreign build still poisons");
+        assert!(probe.vm_exempt.iter().all(|p| p.pid == 10), "the job's own VM is exempt");
+        assert!(probe.vm_shared.iter().all(|p| p.pid == 11), "a preexisting VM is shared");
+    }
+
+    #[test]
+    fn without_the_vm_policy_every_contender_poisons_as_before() {
+        let rows = vec![
+            contender(10, "com.apple.Virtualization.VirtualMachine", true),
+            contender(12, "cargo", false),
+        ];
+        let probe = probe_poison(&contention_with(&rows), &[], None);
+        let mut pids: Vec<u32> = probe.poison.iter().map(|p| p.pid).collect();
+        pids.sort();
+        assert_eq!(pids, vec![10, 12]);
+        assert!(probe.vm_exempt.is_empty() && probe.vm_shared.is_empty());
+    }
+
+    #[test]
+    fn exempted_vms_are_recorded_never_laundered_and_deduped_by_pid() {
+        let rows = vec![contender(10, "com.apple.Virtualization.VirtualMachine", true)];
+        let probe = probe_poison(&contention_with(&rows), &[], Some(&VmPolicy { start_pids: Default::default() }));
+        assert_eq!(probe.vm_exempt.len(), 1);
+        assert_eq!(probe.vm_exempt[0].name, "com.apple.Virtualization.VirtualMachine");
+        assert_eq!(probe.vm_exempt[0].command, None, "the full record is kept: name, pid, at");
+        // Dedup: the same pid never double-records across probes.
+        let known = &probe.vm_exempt;
+        let probe2 = probe_poison(&contention_with(&rows), known, Some(&VmPolicy { start_pids: Default::default() }));
+        assert!(probe2.vm_exempt.is_empty(), "pid-dedup suppresses the repeat");
+    }
+
+    #[test]
+    fn rig_caps_strip_the_job_side_vm_declaration() {
+        let needs = Needs {
+            cores: 1.0,
+            mem_gb: 1.0,
+            gpu_mem_gb: 0.0,
+            caps: vec!["vm".into(), "cuda".into()],
+        };
+        assert_eq!(needs.rig_caps(), vec!["cuda"]);
+        let plain = Needs::default();
+        assert!(plain.rig_caps().is_empty());
     }
 
     #[test]

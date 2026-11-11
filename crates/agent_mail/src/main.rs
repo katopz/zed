@@ -559,10 +559,10 @@ fn rig_run(room: &Mailroom, args: Vec<String>) -> Result<i32> {
         rig.accepts_jobs,
         "rig {rig_name} takes no jobs (owner rule)"
     );
-    let missing: Vec<&String> = needs
-        .caps
-        .iter()
-        .filter(|cap| !rig.caps.contains(cap))
+    let missing: Vec<&str> = needs
+        .rig_caps()
+        .into_iter()
+        .filter(|cap| !rig.caps.iter().any(|own| own == cap))
         .collect();
     anyhow::ensure!(missing.is_empty(), "rig {rig_name} lacks {missing:?}");
     let spec = JobSpec {

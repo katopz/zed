@@ -126,6 +126,12 @@ pub struct Contender {
     pub command: Option<String>,
     #[serde(default)]
     pub cwd: Option<String>,
+    /// The process name is VM-infrastructure per `contender_vm_names.txt`
+    /// (issue 039): a `vm`-declaring job's poison probe classifies these
+    /// instead of poisoning them, scoped by pid. False when the vocabulary
+    /// has no vm class.
+    #[serde(default)]
+    pub vm_infra: bool,
 }
 
 /// One row of the process table, normalized like `contender_candidates`.
@@ -180,6 +186,11 @@ pub struct Vocabulary {
     names: Regex,
     gpu: Regex,
     exempt: Option<Regex>,
+    /// The VM-infrastructure name class (`contender_vm_names.txt`): the
+    /// virtualization processes a job that declared `--needs vm` may itself
+    /// spawn. Absent file = no class = the pid-scoped poison exemption
+    /// cannot classify, and a declaring job poisons VMs as before (fail-safe).
+    vm: Option<Regex>,
 }
 
 impl Vocabulary {
@@ -192,15 +203,51 @@ impl Vocabulary {
         let gpu = load_alternation(&dir.join("contender_gpu_names.txt"))?
             .context("contender_gpu_names.txt is missing or empty")?;
         let exempt = load_alternation(&dir.join("contender_exempt_names.txt"))?;
-        Ok(Self { names, gpu, exempt })
+        let vm = load_alternation(&dir.join("contender_vm_names.txt"))?;
+        Ok(Self {
+            names,
+            gpu,
+            exempt,
+            vm,
+        })
     }
 
-    pub fn from_patterns(names: &str, gpu: &str, exempt: Option<&str>) -> Result<Self> {
+    pub fn from_patterns(
+        names: &str,
+        gpu: &str,
+        exempt: Option<&str>,
+        vm: Option<&str>,
+    ) -> Result<Self> {
         Ok(Self {
             names: anchored(names)?,
             gpu: anchored(gpu)?,
             exempt: exempt.map(anchored).transpose()?,
+            vm: vm.map(anchored).transpose()?,
         })
+    }
+
+    /// True when `name` is VM-infrastructure per `contender_vm_names.txt`.
+    pub fn is_vm_infrastructure(&self, name: &str) -> bool {
+        self.vm.as_ref().is_some_and(|vm| vm.is_match(name))
+    }
+
+    /// The VM-infrastructure pids currently alive (`None` when the
+    /// vocabulary has no vm class — callers must treat that as "cannot
+    /// classify" and keep the pre-039 poisoning behavior).
+    pub fn vm_infrastructure_pids(&self) -> Option<Vec<u32>> {
+        let vm = self.vm.as_ref()?;
+        let table = process_table();
+        if table.blind.is_some() {
+            return None;
+        }
+        Some(
+            table
+                .rows
+                .iter()
+                .filter(|row| vm.is_match(&row.name))
+                .map(|row| row.pid)
+                .collect(),
+        )
     }
 }
 
@@ -351,7 +398,7 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
     }
 }
 
-fn vocabulary_dir() -> Option<PathBuf> {
+pub fn vocabulary_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("AGENT_MAIL_CONTENDER_DIR") {
         return Some(PathBuf::from(dir));
     }
@@ -373,9 +420,9 @@ pub struct Contention {
     pub power: Option<String>,
     pub cpu_speed_limit: Option<u32>,
     pub not_quiet_because: Vec<String>,
-    mem_total_gb: Option<f64>,
-    mem_free_gb: Option<f64>,
-    disk_free_gb: Option<f64>,
+    pub mem_total_gb: Option<f64>,
+    pub mem_free_gb: Option<f64>,
+    pub disk_free_gb: Option<f64>,
 }
 
 impl Contention {
@@ -423,6 +470,7 @@ pub fn contention(exclude_trees: &[u32]) -> Contention {
                         command: (!row.command.is_empty())
                             .then(|| truncate_chars(&row.command, MAX_COMMAND_CHARS)),
                         cwd: None,
+                        vm_infra: vocabulary.is_vm_infrastructure(&row.name),
                     })
                 })
                 .collect();
@@ -1282,8 +1330,18 @@ mod tests {
             "cargo|rustc|bench_.*",
             "plan545_.*|llama-server",
             Some("zed|Zed"),
+            Some("com.apple.Virtualization.VirtualMachine|qemu-system-.*"),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn the_vm_class_matches_infrastructure_names_only() {
+        let vocab = vocabulary();
+        assert!(vocab.is_vm_infrastructure("com.apple.Virtualization.VirtualMachine"));
+        assert!(vocab.is_vm_infrastructure("qemu-system-x86_64"));
+        assert!(!vocab.is_vm_infrastructure("cargo"));
+        assert!(!vocab.is_vm_infrastructure("VirtIO"));// anchored: prefix never matches
     }
 
     #[test]
