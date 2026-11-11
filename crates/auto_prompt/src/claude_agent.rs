@@ -358,6 +358,15 @@ pub fn decide_claude(
             &session_id_str,
             crate::chain::turn_made_progress(thread.read(cx).entries()),
         );
+        if turn.near_instant_turns >= crate::chain::NEAR_INSTANT_LIMIT {
+            log::warn!(
+                "[auto_prompt::claude] {} chained hop(s) in a row finished under {}s — the worker is dying on its first turn, halting the chain",
+                turn.near_instant_turns,
+                crate::chain::MIN_TURN_RUNTIME_SECS
+            );
+            crate::reset_iteration_with_session(&session_id_str);
+            return AutoPromptDecision::NoAction;
+        }
         if turn.idle_turns > config.max_iterations {
             log::warn!(
                 "[auto_prompt::claude] {} turns in a row without progress (max {}) — stopping chain",

@@ -23,6 +23,15 @@ const CHAIN_TIMEOUT_SECS: u64 = 300;
 /// repeat is a normal re-check round; a second means nothing is moving.
 pub const MAX_UNCHANGED_REPEATS: u32 = 2;
 
+/// A chained hop that finished this fast is a systematic failure, not
+/// progress: a real agentic turn takes minutes, so a near-instant exit
+/// between auto-prompts is the worker crashing on its first turn, again
+/// (issue 058, the `MIN_RUNTIME_FOR_RESUME` analog; complements the
+/// unchanged-steps repeat cap, which it can outrun by re-wording).
+pub const MIN_TURN_RUNTIME_SECS: u64 = 10;
+/// Near-instant chained hops in a row before the chain halts.
+pub const NEAR_INSTANT_LIMIT: u32 = 3;
+
 /// How many distinct next-steps proposals the tried-steps ledger keeps.
 /// Oldest entries drop off the front; the cap bounds the prompt block that
 /// carries the ledger into every continuation.
@@ -69,6 +78,9 @@ struct ChainState {
     /// one correction round is enough, and the runaway caps stay a
     /// backstop instead of the primary loop breaker.
     stop_violation_fingerprint: Option<u64>,
+    /// Consecutive chained hops that finished under [`MIN_TURN_RUNTIME_SECS`]
+    /// (issue 058's minimum-runtime guard). Any turn that takes real time
+    /// resets the streak.
     /// Chain KPIs (issue 057): when this chain started, when its claimed
     /// plans first showed progress, and how many orchestration rounds it
     /// took — the "time-to-first-verified-gain" and review-median analogs.
@@ -82,6 +94,10 @@ struct ChainState {
     verdict_rounds: u32,
     /// Tool-call ids already counted, so retry upserts do not double-count.
     verdict_tool_ids: Vec<String>,
+    /// Consecutive chained hops that finished under [`MIN_TURN_RUNTIME_SECS`]
+    /// (issue 058's minimum-runtime guard). Any turn that takes real time
+    /// resets the streak.
+    near_instant_turns: u32,
 }
 
 /// One chain's KPI snapshot (issue 057), logged at every chain stop.
@@ -105,6 +121,9 @@ pub struct TurnCount {
     pub turn: u32,
     /// Consecutive turns without progress; what the runaway cap compares.
     pub idle_turns: u32,
+    /// Consecutive chained hops that finished near-instantly (issue 058);
+    /// what the crash-loop guard compares.
+    pub near_instant_turns: u32,
 }
 
 static CHAINS: Mutex<Option<HashMap<String, ChainState>>> = Mutex::new(None);
@@ -200,10 +219,25 @@ fn record_turn_at_impl(
         } else {
             chain.idle_turns + 1
         };
+        // Minimum-runtime guard (issue 058): only chained hops have a
+        // meaningful runtime — the gap since the previous turn's end is the
+        // worker turn itself. A near-instant hop is the worker dying on its
+        // first turn; real work resets the streak.
+        if chained {
+            let runtime = now.saturating_sub(chain.last_turn_secs);
+            chain.near_instant_turns = if made_progress || runtime >= MIN_TURN_RUNTIME_SECS {
+                0
+            } else {
+                chain.near_instant_turns + 1
+            };
+        } else {
+            chain.near_instant_turns = 0;
+        }
         chain.last_turn_secs = now;
         TurnCount {
             turn: chain.turns,
             idle_turns: chain.idle_turns,
+            near_instant_turns: chain.near_instant_turns,
         }
     })
 }
@@ -609,7 +643,8 @@ mod tests {
             record_turn_at(session, false, now),
             TurnCount {
                 turn: 1,
-                idle_turns: 1
+                idle_turns: 1,
+                near_instant_turns: 0
             }
         );
         assert_eq!(record_turn_at(session, false, now + 1).idle_turns, 2);
@@ -620,7 +655,8 @@ mod tests {
             record_turn_at(session, true, now + 2),
             TurnCount {
                 turn: 3,
-                idle_turns: 0
+                idle_turns: 0,
+                near_instant_turns: 0
             }
         );
         assert_eq!(record_turn_at(session, false, now + 3).idle_turns, 1);
@@ -630,7 +666,8 @@ mod tests {
             record_turn_at(session, false, now + 3 + CHAIN_TIMEOUT_SECS + 1),
             TurnCount {
                 turn: 1,
-                idle_turns: 1
+                idle_turns: 1,
+                near_instant_turns: 0
             }
         );
         clear_session(session);
@@ -773,7 +810,8 @@ mod tests {
             record_turn_at_chained(session, false, late),
             TurnCount {
                 turn: 1,
-                idle_turns: 1
+                idle_turns: 1,
+                near_instant_turns: 0
             }
         );
         arm_continuation(session);
@@ -788,7 +826,8 @@ mod tests {
             record_turn_at(session, false, late + 2 * CHAIN_TIMEOUT_SECS + 2),
             TurnCount {
                 turn: 1,
-                idle_turns: 1
+                idle_turns: 1,
+                near_instant_turns: 0
             }
         );
         clear_session(session);
@@ -802,6 +841,56 @@ mod tests {
         arm_continuation(session);
         assert!(take_armed_continuation(session));
         assert!(!take_armed_continuation(session));
+        clear_session(session);
+    }
+
+    #[test]
+    fn near_instant_chained_hops_accumulate_until_real_work_resets() {
+        let session = "chain-test-near-instant";
+        clear_session(session);
+        let start = 2_000;
+        // Seed the chain with a real first turn.
+        record_turn_at(session, false, start);
+        // Chained hops finishing under MIN_TURN_RUNTIME_SECS stack the
+        // crash-loop streak.
+        arm_continuation(session);
+        assert_eq!(
+            record_turn_at_chained(session, false, start + 1).near_instant_turns,
+            1
+        );
+        arm_continuation(session);
+        assert_eq!(
+            record_turn_at_chained(session, false, start + 2).near_instant_turns,
+            2
+        );
+        arm_continuation(session);
+        assert_eq!(
+            record_turn_at_chained(session, false, start + 3).near_instant_turns,
+            3,
+            "at NEAR_INSTANT_LIMIT the decider halts the chain"
+        );
+        // A hop that takes real time (or lands work) resets the streak.
+        arm_continuation(session);
+        assert_eq!(
+            record_turn_at_chained(session, false, start + 3 + MIN_TURN_RUNTIME_SECS)
+                .near_instant_turns,
+            0
+        );
+        // Even a near-instant hop that made progress resets — the worker
+        // may legitimately finish fast when there was nothing to do.
+        arm_continuation(session);
+        assert_eq!(
+            record_turn_at_chained(session, true, start + 3 + MIN_TURN_RUNTIME_SECS + 1)
+                .near_instant_turns,
+            0
+        );
+        // An unchained turn never counts: a fresh stop after long quiet is
+        // not a crash loop.
+        assert_eq!(
+            record_turn_at(session, false, start + 3 + MIN_TURN_RUNTIME_SECS + 2)
+                .near_instant_turns,
+            0
+        );
         clear_session(session);
     }
 }

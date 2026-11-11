@@ -1611,6 +1611,24 @@ fn decide_precheck(
         turn.idle_turns
     );
 
+    if turn.near_instant_turns >= chain::NEAR_INSTANT_LIMIT {
+        log::warn!(
+            "[auto_prompt::decide] {} chained hop(s) in a row finished under {}s — the worker is dying on its first turn, halting the chain",
+            turn.near_instant_turns,
+            chain::MIN_TURN_RUNTIME_SECS
+        );
+        reset_iteration_with_session(&session_id_str);
+        debug_log::write_log(
+            "no_action",
+            serde_json::json!({
+                "reason": "near_instant_turn_crash_loop",
+                "near_instant_turns": turn.near_instant_turns,
+                "min_turn_runtime_secs": chain::MIN_TURN_RUNTIME_SECS,
+            }),
+        );
+        return DecidePrecheck::Decision(AutoPromptDecision::NoAction);
+    }
+
     if turn.idle_turns > config.max_iterations {
         log::info!(
             "[auto_prompt::decide] {} turns in a row without progress (max {}), stopping chain",
