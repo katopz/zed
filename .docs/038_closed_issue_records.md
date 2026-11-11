@@ -25,6 +25,12 @@ workspace's noise-reduction rule: work lands → the record is documented
 | 047 | `test_manual_auto_prompt_forks_claude_thread_above_overflow_gate` ambient-config hermeticity — FIXED | `7c2f1fba27` | this row (one-line test fix; the fix commit's message + this row are the record) |
 | 048 | agent-mail fyi mode + broadcast gate + liveness cutoff — DONE, deployed 4 rigs, Claude verdict AGREE ×2 | `eec5d52d88` + fmt `d30a4a3a44` | `.docs/037_agent_mail_fyi_rollout.md`; the deferred fyi-folding follow-up + the owner-side AGENTS.md row move here |
 
+## Removed 2026-11-11 (amo idle lane, issue 055)
+
+| issue | verdict | landed in | durable record |
+|---|---|---|---|
+| 055 | Harness verifier-rig separation — DONE: `rig run --verify-manifest` (Exclusive-forced, producing-rig refused), BLAKE3-pinned manifest carrier, `Baseline` ratio-to-baseline verdicts (verified/refuted/incomplete/inconclusive, guard-set: any regression refutes), `RunEnvironment` provenance on every job, `no-result` outcome for missing cells, orchestrator `verify_ledger.jsonl` | `34e43f0bda` (verify.rs + jobs.rs wiring + main.rs CLI) | the issue file's git life carries the design + manifest example; tests: `verify_verdicts_follow_the_noise_floor_and_metric_directions`, `verify_run_computes_ratios_and_writes_the_referee_ledger`, `a_verify_run_without_its_result_file_is_no_result`, `pick_rig_never_lands_a_verify_run_on_the_producing_rig`, `manifest_hashes_stably` |
+
 ## Removed 2026-11-11 (amo idle lane, issue 059)
 
 | issue | verdict | landed in | durable record |
