@@ -25,6 +25,12 @@ workspace's noise-reduction rule: work lands → the record is documented
 | 047 | `test_manual_auto_prompt_forks_claude_thread_above_overflow_gate` ambient-config hermeticity — FIXED | `7c2f1fba27` | this row (one-line test fix; the fix commit's message + this row are the record) |
 | 048 | agent-mail fyi mode + broadcast gate + liveness cutoff — DONE, deployed 4 rigs, Claude verdict AGREE ×2 | `eec5d52d88` + fmt `d30a4a3a44` | `.docs/037_agent_mail_fyi_rollout.md`; the deferred fyi-folding follow-up + the owner-side AGENTS.md row move here |
 
+## Removed 2026-11-11 (amo idle lane, issue 057)
+
+| issue | verdict | landed in | durable record |
+|---|---|---|---|
+| 057 | Owner-gate batching + chain KPIs — DONE: both Housekeeping sites wrap the stop prompt with a consolidated `#OwnerGate` demand built from the claimed plans' UNCHECKED gated lines; `chain::chain_kpis` (duration, first plan-gain latency, verdict rounds + turnaround) logged at every chain stop; task 3 (registry frozen-baseline) closed as covered by issue 055's `Baseline`+verify lane (DRY) | this session's auto_prompt commit | the issue file's git life carries the full mapping; tests: `owner_gated_items_come_only_from_claimed_plans_and_gated_lines`, `housekeeping_prompt_gains_the_owner_gate_block_only_when_gates_exist`, `chain_kpis_track_first_gain_and_verdict_turnaround` |
+
 ## Removed 2026-11-11 (amo idle lane, issue 056)
 
 | issue | verdict | landed in | durable record |

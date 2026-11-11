@@ -806,6 +806,72 @@ pub(crate) fn record_claimed_plan_progress(
     ))
 }
 
+/// Lines an unchecked task must mention to count as owner-gated (issue 057).
+/// Matches the workspace's gating vocabulary: the gating law phrases items
+/// as "owner-gated", "owner gate", "gated on owner", or a bare "owner go".
+fn line_is_owner_gated(line: &str) -> bool {
+    let line = line.to_lowercase();
+    line.contains("owner-gat")
+        || line.contains("owner gat")
+        || line.contains("owner go")
+        || line.contains("owner approval")
+        || line.contains("gated on owner")
+}
+
+/// Collects owner-gated unchecked tasks across this session's claimed plans
+/// so the one housekeeping pass before a valid stop can demand a single
+/// consolidated `#OwnerGate` list instead of one question per summary
+/// (issue 057; the review-bandwidth lesson). Lines are capped so a
+/// gate-heavy plan cannot flood the continuation prompt.
+fn owner_gated_items(session_id: &str, project_root: Option<&std::path::Path>) -> Vec<String> {
+    const MAX_ITEMS: usize = 12;
+    const MAX_ITEM_CHARS: usize = 200;
+    let claims = plan_registry::claims_for_session(session_id);
+    let mut items = Vec::new();
+    for plan_file in claims {
+        let candidate = std::path::PathBuf::from(&plan_file);
+        let path = if candidate.is_absolute() {
+            candidate
+        } else {
+            match project_root {
+                Some(root) => root.join(candidate),
+                None => continue,
+            }
+        };
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in content.lines() {
+            if !line.trim_start().starts_with("- [ ]") || !line_is_owner_gated(line) {
+                continue;
+            }
+            let item = line.trim();
+            items.push(item.chars().take(MAX_ITEM_CHARS).collect::<String>());
+            if items.len() >= MAX_ITEMS {
+                return items;
+            }
+        }
+    }
+    items
+}
+
+/// Appends the consolidated `#OwnerGate` demand to the housekeeping prompt
+/// when this chain's claimed plans hold gated work (issue 057). Empty plans
+/// get the plain prompt — no point teaching the block on an empty list.
+fn with_owner_gate_batching(prompt: String, items: &[String]) -> String {
+    if items.is_empty() {
+        return prompt;
+    }
+    let mut section = prompt;
+    section.push_str("\n\nOWNER-GATE CONSOLIDATION (this chain's last pass): before your final `<stop>`, collect every owner-gated item below into ONE consolidated `#OwnerGate` list in the final summary context — one decision per item, no scattering across sections:\n");
+    for item in items {
+        section.push_str("- ");
+        section.push_str(item);
+        section.push('\n');
+    }
+    section
+}
+
 /// Confidence threshold below which we stop during the Working phase.
 /// Low threshold = biased toward continuing.
 const WORKING_CONFIDENCE_THRESHOLD: f64 = 0.2;
@@ -1184,6 +1250,35 @@ fn note_chain_stop(data: &LlmCallData, ended_by: &str) {
     }) {
         return;
     }
+    let session_id = data.session_id.to_string();
+    // Chain KPIs (issue 057): duration, time-to-first-plan-gain, and the
+    // observed verdict turnaround, logged once per chain stop.
+    if let Some(kpis) = chain::chain_kpis(&session_id) {
+        let first_gain = kpis
+            .first_gain_secs
+            .map_or("-".to_string(), |secs| format!("{secs}s"));
+        let turnaround = kpis
+            .verdict_turnaround_secs
+            .map_or("-".to_string(), |secs| format!("{secs}s"));
+        log::info!(
+            "[auto_prompt::kpi] chain: {}s, turns {}, first plan gain {first_gain}, verdict rounds {} (turnaround {turnaround}) — ended by {ended_by}",
+            kpis.duration_secs,
+            kpis.turns,
+            kpis.verdict_rounds,
+        );
+        debug_log::write_log(
+            "chain_kpis",
+            serde_json::json!({
+                "session": session_id,
+                "duration_secs": kpis.duration_secs,
+                "turns": kpis.turns,
+                "first_gain_secs": kpis.first_gain_secs,
+                "verdict_rounds": kpis.verdict_rounds,
+                "verdict_turnaround_secs": kpis.verdict_turnaround_secs,
+                "ended_by": ended_by,
+            }),
+        );
+    }
     let cwd = data
         .work_dirs
         .as_ref()
@@ -1193,12 +1288,7 @@ fn note_chain_stop(data: &LlmCallData, ended_by: &str) {
         .last_assistant_message
         .as_deref()
         .is_some_and(|message| message.contains("## Summary"));
-    agent_mail::boss::note_stop(
-        &data.session_id.to_string(),
-        cwd.as_deref(),
-        ended_by,
-        had_summary,
-    );
+    agent_mail::boss::note_stop(&session_id, cwd.as_deref(), ended_by, had_summary);
 }
 
 /// Outcome for a keyword stop seen on the LLM path (defense in depth —
@@ -1253,9 +1343,10 @@ pub(crate) fn stop_keyword_outcome(data: &LlmCallData) -> Option<AutoPromptOutco
             log::warn!(
                 "[auto_prompt::decide_with_llm] valid `{STOP_KEYWORD}` stop — one housekeeping pass before the halt (session={session_key})"
             );
-            Some(AutoPromptOutcome::Continue(
-                data.make_continue_action(housekeeping_continuation()),
-            ))
+            let gates = owner_gated_items(&session_key, None);
+            Some(AutoPromptOutcome::Continue(data.make_continue_action(
+                with_owner_gate_batching(housekeeping_continuation(), &gates),
+            )))
         }
         KeywordStop::Final => {
             log::warn!(
@@ -1426,10 +1517,11 @@ fn decide_precheck(
                     "stop_keyword_housekeeping",
                     serde_json::json!({"reason": "worker_stop_keyword_housekeeping_pass"}),
                 );
+                let gates = owner_gated_items(&session_key, project_root.as_deref());
                 let action = stop_followup_action(
                     &thread,
                     cx,
-                    housekeeping_continuation(),
+                    with_owner_gate_batching(housekeeping_continuation(), &gates),
                     last_assistant_message.clone(),
                 );
                 return DecidePrecheck::Decision(AutoPromptDecision::DispatchNow(action));
@@ -1482,6 +1574,24 @@ fn decide_precheck(
     }
     let made_progress = chain::turn_made_progress(thread.read(cx).entries())
         || matches!(plan_progress, Some(chain::PlanProgress::Advanced { .. }));
+    // Chain KPIs (issue 057): count new `request_verdict` tool upserts this
+    // turn so the stop log carries the observed verdict turnaround.
+    let verdict_ids: Vec<String> = thread
+        .read(cx)
+        .entries()
+        .iter()
+        .rev()
+        .take_while(|entry| !matches!(entry, acp_thread::AgentThreadEntry::UserMessage(_)))
+        .filter_map(|entry| match entry {
+            acp_thread::AgentThreadEntry::ToolCall(tool)
+                if tool.tool_name.as_deref() == Some("request_verdict") =>
+            {
+                Some(tool.id.0.to_string())
+            }
+            _ => None,
+        })
+        .collect();
+    chain::record_verdict_sightings(&session_id_str, &verdict_ids);
     let turn = chain::record_turn(&session_id_str, made_progress);
     let iteration_count = turn.turn;
 

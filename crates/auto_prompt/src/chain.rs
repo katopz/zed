@@ -69,6 +69,34 @@ struct ChainState {
     /// one correction round is enough, and the runaway caps stay a
     /// backstop instead of the primary loop breaker.
     stop_violation_fingerprint: Option<u64>,
+    /// Chain KPIs (issue 057): when this chain started, when its claimed
+    /// plans first showed progress, and how many orchestration rounds it
+    /// took — the "time-to-first-verified-gain" and review-median analogs.
+    started_at_secs: u64,
+    first_gain_secs: Option<u64>,
+    /// Verdict-tool sightings: first and last turn that upserted a
+    /// `request_verdict` tool call, and how many turns did so. First→last
+    /// is the observed verdict turnaround for this chain.
+    verdict_first_seen_secs: Option<u64>,
+    verdict_last_seen_secs: Option<u64>,
+    verdict_rounds: u32,
+    /// Tool-call ids already counted, so retry upserts do not double-count.
+    verdict_tool_ids: Vec<String>,
+}
+
+/// One chain's KPI snapshot (issue 057), logged at every chain stop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainKpis {
+    /// Chain duration so far, in seconds.
+    pub duration_secs: u64,
+    /// Seconds from chain start to the first plan-scoreboard gain.
+    pub first_gain_secs: Option<u64>,
+    /// Orchestration rounds in this chain.
+    pub turns: u32,
+    /// Turns that upserted a `request_verdict` tool call.
+    pub verdict_rounds: u32,
+    /// First→last verdict sighting, the observed turnaround.
+    pub verdict_turnaround_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,6 +192,9 @@ fn record_turn_at_impl(
             *chain = ChainState::default();
         }
         chain.turns += 1;
+        if chain.started_at_secs == 0 {
+            chain.started_at_secs = now;
+        }
         chain.idle_turns = if made_progress {
             0
         } else {
@@ -303,8 +334,57 @@ pub fn record_plan_progress(session_id: &str, checked: u32, actionable: u32) -> 
             Some((last_checked, _)) if checked < last_checked => PlanProgress::Regressed,
             Some(_) => PlanProgress::Flat,
         };
+        if matches!(progress, PlanProgress::Advanced { .. }) && chain.first_gain_secs.is_none() {
+            chain.first_gain_secs = Some(now_secs());
+        }
         chain.last_plan_progress = Some((checked, actionable));
         progress
+    })
+}
+
+/// Counts the round's `request_verdict` tool upserts for the KPI record
+/// (issue 057). Tool ids already seen this chain are skipped — retries
+/// upsert the same id, and the turnaround measures negotiations, not polls.
+pub fn record_verdict_sightings(session_id: &str, tool_ids: &[String]) {
+    if tool_ids.is_empty() {
+        return;
+    }
+    let now = now_secs();
+    with_chain(session_id, |chain| {
+        for id in tool_ids {
+            if chain.verdict_tool_ids.iter().any(|seen| seen == id) {
+                continue;
+            }
+            chain.verdict_tool_ids.push(id.clone());
+            chain.verdict_rounds += 1;
+            chain.verdict_first_seen_secs.get_or_insert(now);
+            chain.verdict_last_seen_secs = Some(now);
+        }
+    })
+}
+
+/// The chain's KPI snapshot, for the stop log (issue 057). `None` when the
+/// session holds no chain (nothing ran).
+pub fn chain_kpis(session_id: &str) -> Option<ChainKpis> {
+    with_chain(session_id, |chain| {
+        if chain.turns == 0 {
+            return None;
+        }
+        Some(ChainKpis {
+            duration_secs: chain.last_turn_secs.saturating_sub(chain.started_at_secs),
+            first_gain_secs: chain
+                .first_gain_secs
+                .map(|at| at.saturating_sub(chain.started_at_secs)),
+            turns: chain.turns,
+            verdict_rounds: chain.verdict_rounds,
+            verdict_turnaround_secs: match (
+                chain.verdict_first_seen_secs,
+                chain.verdict_last_seen_secs,
+            ) {
+                (Some(first), Some(last)) => Some(last.saturating_sub(first)),
+                _ => None,
+            },
+        })
     })
 }
 

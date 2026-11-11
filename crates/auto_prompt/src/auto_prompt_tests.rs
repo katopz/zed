@@ -61,6 +61,86 @@ fn claimed_plan_scoreboard_counts_flipped_checkboxes_as_progress() {
     chain::clear_session(session);
 }
 
+#[test]
+fn owner_gated_items_come_only_from_claimed_plans_and_gated_lines() {
+    let _lock = plan_registry::lock_for_test();
+    let session = "owner-gate-batching-test";
+    plan_registry::release_all_for_session(session);
+    let plan_path = std::env::temp_dir().join(format!(
+        "auto-prompt-owner-gate-test-{}.md",
+        std::process::id()
+    ));
+    std::fs::write(
+        &plan_path,
+        "# Plan\n\n\
+         - [ ] plain task, not gated\n\
+         - [ ] deploy the fleet webhook (owner-gated: needs token rotation)\n\
+         - [x] done gated task (owner-gated: was approved)\n\
+         - [ ] rotate keys — gated on owner decision\n",
+    )
+    .expect("write plan");
+    plan_registry::try_claim(&plan_path.to_string_lossy(), session, "owner-gate test")
+        .expect("claim the gate plan");
+
+    // Absolute path claimed → resolvable without a project root; only
+    // UNCHECKED gated lines count (the checked one already has its answer).
+    let items = owner_gated_items(session, None);
+    assert_eq!(items.len(), 2, "plain + checked lines excluded: {items:?}");
+    assert!(items.iter().any(|item| item.contains("token rotation")));
+    assert!(items.iter().any(|item| item.contains("gated on owner")));
+    assert!(!items.iter().any(|item| item.contains("plain task")));
+
+    // No claims → no items.
+    plan_registry::release_all_for_session(session);
+    assert!(owner_gated_items(session, None).is_empty());
+    let _ = std::fs::remove_file(&plan_path);
+}
+
+#[test]
+fn housekeeping_prompt_gains_the_owner_gate_block_only_when_gates_exist() {
+    let plain = with_owner_gate_batching(housekeeping_continuation(), &[]);
+    assert_eq!(plain, housekeeping_continuation());
+    let batched = with_owner_gate_batching(
+        housekeeping_continuation(),
+        &["- [ ] ship it (owner-gated)".to_string()],
+    );
+    assert!(batched.contains("OWNER-GATE CONSOLIDATION"));
+    assert!(batched.contains("#OwnerGate"));
+    assert!(batched.contains("- [ ] ship it (owner-gated)"));
+    assert!(batched.starts_with(&housekeeping_continuation()));
+}
+
+#[test]
+fn chain_kpis_track_first_gain_and_verdict_turnaround() {
+    let session = "chain-kpi-test";
+    chain::clear_session(session);
+    // Chain starts with the first turn; no plan progress yet.
+    chain::record_turn(session, true);
+    let before = chain::chain_kpis(session).expect("chain exists after a turn");
+    assert_eq!(before.turns, 1);
+    assert_eq!(before.first_gain_secs, None);
+    assert_eq!(before.verdict_rounds, 0);
+
+    // First plan-scoreboard observation has no delta; the first ADVANCE
+    // (checked count grew) stamps the time-to-first-gain.
+    chain::record_plan_progress(session, 3, 5);
+    chain::record_plan_progress(session, 5, 3);
+    let after_gain = chain::chain_kpis(session).expect("chain persists");
+    assert!(after_gain.first_gain_secs.is_some(), "first advance stamps");
+
+    // Two distinct verdict tool ids → two rounds; a repeat id is not
+    // double-counted (retries upsert the same id).
+    chain::record_verdict_sightings(session, &["v1".to_string()]);
+    chain::record_verdict_sightings(session, &["v2".to_string(), "v1".to_string()]);
+    let with_verdicts = chain::chain_kpis(session).expect("chain persists");
+    assert_eq!(with_verdicts.verdict_rounds, 2);
+    assert!(with_verdicts.verdict_turnaround_secs.is_some());
+
+    // A session with no chain reads as None.
+    chain::clear_session(session);
+    assert!(chain::chain_kpis(session).is_none());
+}
+
 /// Minimal LlmCallData for pure state-machine tests (plan 023 F1). The
 /// overflow and clarify machines never call the model; the slot just
 /// satisfies the struct shape.
