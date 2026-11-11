@@ -1171,21 +1171,17 @@ pub fn summary_declares_terminal(last_assistant_message: Option<&str>) -> bool {
     )
 }
 
-/// Outcome for a keyword stop seen on the LLM path (defense in depth —
-/// decide_precheck / decide_claude already gate on this, but data can be
-/// constructed directly via tests or manual dispatches). Classification is
-/// shared (`classify_keyword_stop`): a non-repeated violating stop continues
-/// with the corrective directive; a repeated one, a plan-031 terminal
-/// summary, or a stop whose housekeeping pass already ran halts the chain; a
-/// first valid stop dispatches one housekeeping pass ahead of the halt.
-/// Over the context limit or after an API-level failure the keyword is
-/// deferred entirely — the Phase 1/2 fork machine / retry backoff own the
-/// round and the keyword is re-evaluated afterwards.
 /// Telemetry for the fleet boss (plan 056): how a managed chain stopped, so
-/// terminal-over-open-queue false stops can be detected and re-fired. The
-/// cfg!(test) guard keeps tests from writing into the real `~/.agent-mail`.
+/// terminal-over-open-queue false stops can be detected and re-fired.
 fn note_chain_stop(data: &LlmCallData, ended_by: &str) {
-    if cfg!(test) {
+    // Test binaries of this crate AND of any crate linking it run from the
+    // deps dir; the shipped app never does. cfg!(test) only covers the crate
+    // under test, so markers would otherwise leak into the real
+    // `~/.agent-mail` from dependency tests (the `.issues/059` class).
+    if std::env::current_exe()
+        .ok()
+        .is_some_and(|path| path.components().any(|component| component.as_os_str() == "deps"))
+    {
         return;
     }
     let cwd = data
@@ -1200,6 +1196,16 @@ fn note_chain_stop(data: &LlmCallData, ended_by: &str) {
     agent_mail::boss::note_stop(&data.session_id.to_string(), cwd.as_deref(), ended_by, had_summary);
 }
 
+/// Outcome for a keyword stop seen on the LLM path (defense in depth —
+/// decide_precheck / decide_claude already gate on this, but data can be
+/// constructed directly via tests or manual dispatches). Classification is
+/// shared (`classify_keyword_stop`): a non-repeated violating stop continues
+/// with the corrective directive; a repeated one, a plan-031 terminal
+/// summary, or a stop whose housekeeping pass already ran halts the chain; a
+/// first valid stop dispatches one housekeeping pass ahead of the halt.
+/// Over the context limit or after an API-level failure the keyword is
+/// deferred entirely — the Phase 1/2 fork machine / retry backoff own the
+/// round and the keyword is re-evaluated afterwards.
 pub(crate) fn stop_keyword_outcome(data: &LlmCallData) -> Option<AutoPromptOutcome> {
     let text = data.last_assistant_message.as_deref()?;
     if !message_requests_stop(text) {

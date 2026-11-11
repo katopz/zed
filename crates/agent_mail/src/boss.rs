@@ -21,6 +21,10 @@ use std::time::Duration;
 /// Boss incidents must persist this many watchdog ticks (10 min each, ~1 h)
 /// before the boss acts, so a queue being drained right now never fires.
 pub const BOSS_MIN_TICKS: u32 = 6;
+/// A thread-end marker is hard evidence of the stop, so few ticks are needed
+/// — but a marker is only kept for [`THREAD_END_WINDOW`], and 6 ticks
+/// (~55 min) would often outlive it.
+pub const BOSS_STOP_TICKS: u32 = 2;
 /// Mail rots faster than queues: fewer ticks for the unread-mail rule.
 pub const BOSS_MAIL_TICKS: u32 = 3;
 /// Thread-end markers older than this no longer count as false stops.
@@ -276,13 +280,17 @@ pub fn is_system_inbox(name: &str) -> bool {
 
 /// Pending mail past `grace` in inboxes whose addressee is not live on any
 /// rig: the poller only claims live sessions and the delivery-time thread
-/// resume already ran, so this mail is stuck. The owner's own inbox and the
-/// local OS user's inbox are excluded. Newest-oldest first.
+/// resume already ran, so this mail is stuck. Excluded: system inboxes, the
+/// owner's inbox, the local OS user's inbox, configured no-go inboxes
+/// (reply sinks and misaddressed placeholders), and every live agent's
+/// inbox. Scheduled mail ages from `deliver_at` — it was not readable
+/// before then. Newest-oldest first.
 pub fn stale_mail(
     mailroom: &Mailroom,
     now: chrono::DateTime<chrono::Utc>,
     grace: Duration,
     live_names: &BTreeSet<String>,
+    exclude_inboxes: &BTreeSet<String>,
 ) -> Vec<StaleMail> {
     let local_user = std::env::var("USER")
         .or_else(|_| std::env::var("USERNAME"))
@@ -292,6 +300,7 @@ pub fn stale_mail(
         if is_system_inbox(&name)
             || name == OWNER_INBOX
             || name == local_user
+            || exclude_inboxes.contains(&name)
             || live_names.contains(&name)
         {
             continue;
@@ -301,8 +310,13 @@ pub fn stale_mail(
         };
         let oldest = envelopes
             .iter()
-            .filter_map(|envelope| chrono::DateTime::parse_from_rfc3339(&envelope.sent_at).ok())
-            .map(|sent| now.signed_duration_since(sent.with_timezone(&chrono::Utc)))
+            .filter_map(|envelope| {
+                chrono::DateTime::parse_from_rfc3339(
+                    envelope.deliver_at.as_deref().unwrap_or(&envelope.sent_at),
+                )
+                .ok()
+            })
+            .map(|readable| now.signed_duration_since(readable.with_timezone(&chrono::Utc)))
             .max();
         let Some(age) = oldest else {
             continue;
@@ -348,27 +362,66 @@ pub fn detect<'a>(
         by_repo.entry(work.repo.as_str()).or_default().push(work);
     }
 
-    // Claimed-and-worked is accounted; claimed-but-stopped is not, so a repo
-    // only counts as busy while a live agent or a heavy process sits in it.
+    // Claimed-and-worked is accounted; claimed-but-stopped is not. An idle
+    // agent parked in the repo for hours IS the false-stop shape (its chain
+    // already ended), so only a live agent — generating, or idle for under
+    // an hour — or a heavy process in the repo suppresses the rule.
+    const WORKED_IDLE_MAX_MINUTES: f64 = 60.0;
     let repo_is_worked = |repo: &str| {
         online.iter().any(|(_, probe)| {
-            probe
-                .agents
-                .iter()
-                .any(|agent| cwd_in_repo(&agent.cwd, repo))
-                || (!probe.quiet
-                    && probe.contenders.iter().any(|contender| {
-                        contender
-                            .cwd
-                            .as_deref()
-                            .is_some_and(|cwd| cwd_in_repo(cwd, repo))
-                    }))
+            probe.agents.iter().any(|agent| {
+                cwd_in_repo(&agent.cwd, repo)
+                    && (agent.status != "idle"
+                        || agent
+                            .idle_minutes
+                            .is_some_and(|minutes| minutes < WORKED_IDLE_MAX_MINUTES))
+            }) || (!probe.quiet
+                && probe.contenders.iter().any(|contender| {
+                    contender
+                        .cwd
+                        .as_deref()
+                        .is_some_and(|cwd| cwd_in_repo(cwd, repo))
+                }))
         })
     };
 
     if let Some(target) = quiet_target.as_deref() {
+        // A false stop is the more specific evidence for its repo; the plain
+        // queue rule must not double-fire for the same work.
+        let window_ms = chrono::Duration::from_std(THREAD_END_WINDOW)
+            .unwrap_or_default()
+            .num_milliseconds();
+        let mut false_stops: Vec<Incident> = Vec::new();
+        let mut false_stopped_repos: BTreeSet<String> = BTreeSet::new();
+        for end in thread_ends {
+            if !is_false_stop(end) || now.timestamp_millis() - end.at > window_ms {
+                continue;
+            }
+            let Some(repo) = cwd_repo_name(&end.cwd) else {
+                continue;
+            };
+            let Some(works) = by_repo.get(repo.as_str()) else {
+                continue;
+            };
+            false_stopped_repos.insert(repo.clone());
+            false_stops.push(Incident {
+                fingerprint: format!("boss:false-stop:{}", end.session),
+                detail: format!(
+                    "session {} on {} ended `{}` while {repo} still holds {} actionable item(s) — \
+                     the terminal stop hid the ordinary queue; wake a free agent with the boss \
+                     housekeeping contract",
+                    end.session,
+                    end.rig,
+                    end.ended_by,
+                    works.len(),
+                ),
+                min_ticks: BOSS_STOP_TICKS,
+                reset_key: None,
+            });
+        }
+
         for (repo, works) in &by_repo {
-            if repo_is_worked(repo) {
+            if repo_is_worked(repo) || false_stopped_repos.contains(*repo) {
                 continue;
             }
             let examples = works
@@ -385,38 +438,10 @@ pub fn detect<'a>(
                     works.len(),
                 ),
                 min_ticks: BOSS_MIN_TICKS,
+                reset_key: Some(work_set_key(works)),
             });
         }
-
-        // A managed chain that stopped over still-open work hid the ordinary
-        // queue from its worker — the exact false stop this lane exists for.
-        let window_ms = chrono::Duration::from_std(THREAD_END_WINDOW)
-            .unwrap_or_default()
-            .num_milliseconds();
-        for end in thread_ends {
-            if !is_false_stop(end) || now.timestamp_millis() - end.at > window_ms {
-                continue;
-            }
-            let Some(repo) = cwd_repo_name(&end.cwd) else {
-                continue;
-            };
-            let Some(works) = by_repo.get(repo.as_str()) else {
-                continue;
-            };
-            incidents.push(Incident {
-                fingerprint: format!("boss:false-stop:{}", end.session),
-                detail: format!(
-                    "session {} on {} ended `{}` while {repo} still holds {} actionable item(s) — \
-                     the terminal stop hid the ordinary queue; wake a free agent with the boss \
-                     housekeeping contract",
-                    end.session,
-                    end.rig,
-                    end.ended_by,
-                    works.len(),
-                ),
-                min_ticks: BOSS_MIN_TICKS,
-            });
-        }
+        incidents.extend(false_stops);
     }
 
     // Stale mail with a live Zed somewhere is the boss's to handle; with no
@@ -442,10 +467,19 @@ pub fn detect<'a>(
                 },
             ),
             min_ticks: BOSS_MAIL_TICKS,
+            reset_key: None,
         });
     }
 
     incidents
+}
+
+/// Identity of the open-item set: when items resolve or new ones land, the
+/// changed key starts a fresh wake cycle instead of waiting out the cooldown.
+fn work_set_key(works: &[&OpenWork]) -> String {
+    let mut names: Vec<&str> = works.iter().map(|work| work.file.as_str()).collect();
+    names.sort_unstable();
+    format!("{}:{}", works.len(), names.join(","))
 }
 
 /// The bounded contract a boss-woken agent runs. Bounded because housekeeping
@@ -458,7 +492,8 @@ pub fn housekeeping_prompt(detail: &str, rig: &str, budget: usize) -> String {
          item you take with a `**Claimed:** <name>, <unix-ms>, expires <RFC3339 +2h>` line in \
          the doc you touch, so the fleet sees the lease.\n\
          \n\
-         Boss incident: {detail}\n\
+         Boss incident(s):
+         {detail}\n\
          \n\
          Checklist, in priority order — skip anything genuinely gated, never invent work:\n\
          1. Git hygiene: fast-forward sync the fleet repos (`~/git`; `E:/git` on Windows); prune \
@@ -620,16 +655,35 @@ mod tests {
         assert_eq!(incidents.len(), 1);
         assert_eq!(incidents[0].fingerprint, "boss:queue:katgpt-rs");
         assert_eq!(incidents[0].min_ticks, BOSS_MIN_TICKS);
+        assert_eq!(incidents[0].reset_key.as_deref(), Some("2:a.md,b.md"));
         assert!(incidents[0].detail.contains("2 actionable item(s)"));
         assert!(incidents[0].detail.contains("on amo"), "lowest quiet rig name wins");
 
-        // An agent sitting in the repo means it is being worked.
+        // A generating agent sitting in the repo means it is being worked.
         let busy_repo = probe(
             r#"{"rig":"amo","os":"macos","at":"","cores":8,"quiet":true,
-                "agents":[{"name":"katgpt-rs-1","status":"idle","cwd":"/Users/k/git/katgpt-rs/crates/x"}]}"#,
+                "agents":[{"name":"katgpt-rs-1","status":"generating","cwd":"/Users/k/git/katgpt-rs/crates/x"}]}"#,
         );
         let online = vec![("amo", &busy_repo), ("bmo", &bmo)];
         assert!(detect(&online, &rigs, &work, &[], &[], now, false).is_empty());
+
+        // A freshly idle agent (under an hour) still counts as working — it
+        // may be between turns of the very run the queue rule describes.
+        let fresh_idle = probe(
+            r#"{"rig":"amo","os":"macos","at":"","cores":8,"quiet":true,
+                "agents":[{"name":"katgpt-rs-1","status":"idle","cwd":"/Users/k/git/katgpt-rs","idle_minutes":5}]}"#,
+        );
+        let online = vec![("amo", &fresh_idle), ("bmo", &bmo)];
+        assert!(detect(&online, &rigs, &work, &[], &[], now, false).is_empty());
+
+        // An agent idle in the repo for days IS the claimed-but-stopped
+        // shape: it must not suppress the queue forever.
+        let parked = probe(
+            r#"{"rig":"amo","os":"macos","at":"","cores":8,"quiet":true,
+                "agents":[{"name":"katgpt-rs-1","status":"idle","cwd":"/Users/k/git/katgpt-rs","idle_minutes":4320}]}"#,
+        );
+        let online = vec![("amo", &parked), ("bmo", &bmo)];
+        assert_eq!(detect(&online, &rigs, &work, &[], &[], now, false).len(), 1);
 
         // A busy contender in the repo counts as worked too.
         let compiling = probe(
@@ -670,15 +724,19 @@ mod tests {
             now,
             false,
         );
-        assert_eq!(incidents.len(), 2, "queue + false-stop over the same work");
-        assert!(incidents
-            .iter()
-            .any(|incident| incident.fingerprint == "boss:false-stop:s1"));
+        assert_eq!(
+            incidents.len(),
+            1,
+            "the false stop subsumes the queue rule for its repo"
+        );
+        assert_eq!(incidents[0].fingerprint, "boss:false-stop:s1");
+        assert_eq!(incidents[0].min_ticks, BOSS_STOP_TICKS);
+        assert!(incidents[0].reset_key.is_none());
 
         assert!(detect(&online, &rigs, &work, &[end("s2", END_FINAL, 30)], &[], now, false)
             .iter()
             .all(|incident| !incident.fingerprint.starts_with("boss:false-stop")),
-        "a final stop ran its housekeeping pass — not a false stop");
+            "a final stop ran its housekeeping pass — not a false stop");
 
         assert!(detect(&online, &rigs, &work, &[end("s3", END_TERMINAL, 90)], &[], now, false)
             .iter()
@@ -717,7 +775,11 @@ mod tests {
             .into_iter()
             .map(|agent| agent.name)
             .collect::<BTreeSet<_>>();
-        let mail = stale_mail(&room, now, MAIL_GRACE, &live);
+        let exclude: BTreeSet<String> = crate::watch::WatchConfig::default()
+            .boss_exclude_inboxes
+            .into_iter()
+            .collect();
+        let mail = stale_mail(&room, now, MAIL_GRACE, &live, &exclude);
         assert_eq!(
             mail,
             vec![StaleMail {
@@ -727,6 +789,31 @@ mod tests {
             }],
             "system, waiter, owner, live-addressee and fresh mail are excluded"
         );
+
+        // Reply sinks and misaddressed placeholders are config-excluded.
+        send_mail(&room, "orchestrator", "reply to boss mail");
+        age_mail(&room, "orchestrator", 90);
+        send_mail(&room, "boss", "agent reply");
+        age_mail(&room, "boss", 90);
+        let mail = stale_mail(&room, now, MAIL_GRACE, &live, &exclude);
+        assert!(
+            mail.iter()
+                .all(|mail| mail.inbox != "orchestrator" && mail.inbox != "boss")
+        );
+
+        // Scheduled mail ages from deliver_at: due five minutes ago is five
+        // minutes stale, no matter when it was composed.
+        send_mail(&room, "zed-sched", "timed wake");
+        let due = (now - chrono::Duration::minutes(5)).to_rfc3339();
+        let sched_new = room.home().join("inbox").join("zed-sched").join("new");
+        for file in fs::read_dir(&sched_new).unwrap().flatten() {
+            let mut envelope: serde_json::Value =
+                serde_json::from_slice(&fs::read(file.path()).unwrap()).unwrap();
+            envelope["deliver_at"] = serde_json::Value::String(due.clone());
+            fs::write(file.path(), serde_json::to_vec(&envelope).unwrap()).unwrap();
+        }
+        let mail = stale_mail(&room, now, MAIL_GRACE, &live, &exclude);
+        assert!(mail.iter().all(|mail| mail.inbox != "zed-sched"));
 
         // A live Zed on the rig makes it the boss's problem; with none, the
         // rig's zed-wake job owns the wake.

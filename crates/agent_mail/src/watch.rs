@@ -66,6 +66,11 @@ pub struct WatchConfig {
     /// issues not authored by the owner).
     #[serde(default = "default_boss_exclude_repos")]
     pub boss_exclude_repos: Vec<String>,
+    /// Inboxes the boss never treats as stale: reply sinks with no reader
+    /// (`orchestrator` when an orchestrator command is configured, `boss`),
+    /// misaddressed placeholders, and known human inboxes on any rig.
+    #[serde(default = "default_boss_exclude_inboxes")]
+    pub boss_exclude_inboxes: Vec<String>,
 }
 
 fn default_true() -> bool {
@@ -77,6 +82,24 @@ fn default_boss_exclude_repos() -> Vec<String> {
         .into_iter()
         .map(str::to_string)
         .collect()
+}
+
+fn default_boss_exclude_inboxes() -> Vec<String> {
+    [
+        "orchestrator",
+        "boss",
+        "self",
+        "agent",
+        "star",
+        "golfktp",
+        "amo-idle",
+        "amo-zed",
+        "katopz",
+        "katop",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
 }
 
 fn default_interval() -> u64 {
@@ -96,6 +119,7 @@ impl Default for WatchConfig {
             orchestrator_env: BTreeMap::new(),
             boss: default_true(),
             boss_exclude_repos: default_boss_exclude_repos(),
+            boss_exclude_inboxes: default_boss_exclude_inboxes(),
         }
     }
 }
@@ -114,6 +138,8 @@ struct IncidentState {
     rounds: u32,
     last_woke_ms: i64,
     detail: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reset_key: Option<String>,
 }
 
 /// One thing the orchestrator should look at.
@@ -124,6 +150,10 @@ pub struct Incident {
     pub detail: String,
     /// Ticks the condition must persist before it counts.
     pub min_ticks: u32,
+    /// Boss lane only (plan 056): when the underlying work set changes
+    /// (items resolve or land), a changed key starts a fresh wake cycle
+    /// instead of waiting out the cooldown. `None` for ordinary incidents.
+    pub reset_key: Option<String>,
 }
 
 /// A thread handoff, sent by the SessionStart hook to the orchestrator.
@@ -431,19 +461,28 @@ pub fn tick(mailroom: &Mailroom, force: bool) -> Result<TickReport> {
     // orchestrator and wake a free agent directly.
     if config.boss {
         let exclude: BTreeSet<String> = config.boss_exclude_repos.iter().cloned().collect();
+        let exclude_inboxes: BTreeSet<String> =
+            config.boss_exclude_inboxes.iter().cloned().collect();
         let open_work = crate::boss::scan_open_work(&repo_roots(), chrono::Utc::now(), &exclude);
         let ends = crate::boss::recent_thread_ends(
             mailroom,
             chrono::Utc::now(),
             crate::boss::THREAD_END_WINDOW,
         );
+        let live = mailroom.live_agents();
         let live_names: BTreeSet<String> = results
             .iter()
             .filter_map(|(_, outcome, _)| outcome.as_ref().ok())
             .flat_map(|probe| probe.agents.iter().map(|agent| agent.name.clone()))
-            .chain(mailroom.live_agents().into_iter().map(|agent| agent.name))
+            .chain(live.iter().map(|agent| agent.name.clone()))
             .collect();
-        let mail = crate::boss::stale_mail(mailroom, chrono::Utc::now(), crate::boss::MAIL_GRACE, &live_names);
+        let mail = crate::boss::stale_mail(
+            mailroom,
+            chrono::Utc::now(),
+            crate::boss::MAIL_GRACE,
+            &live_names,
+            &exclude_inboxes,
+        );
         let online: Vec<(&str, &RigProbe)> = results
             .iter()
             .filter_map(|(name, outcome, _)| {
@@ -457,7 +496,7 @@ pub fn tick(mailroom: &Mailroom, force: bool) -> Result<TickReport> {
             &ends,
             &mail,
             chrono::Utc::now(),
-            !mailroom.live_agents().is_empty(),
+            !live.is_empty(),
         ));
     }
 
@@ -489,22 +528,34 @@ pub fn tick(mailroom: &Mailroom, force: bool) -> Result<TickReport> {
             });
         entry.ticks += 1;
         entry.detail = incident.detail.clone();
+        if entry.reset_key != incident.reset_key {
+            // The work set changed (items resolved or landed): a fresh cycle,
+            // even mid-cooldown, so new work is never stuck behind old waits.
+            entry.reset_key = incident.reset_key.clone();
+            entry.rounds = 0;
+        }
         if entry.ticks < incident.min_ticks {
             continue;
         }
         // Escalated once: stay silent until the incident clears, so a stuck
         // problem never keeps waking agents (and spending their tokens).
-        if entry.rounds > ESCALATE_AFTER_ROUNDS {
+        // Boss incidents (plan 056) never escalate — the gating law sends
+        // non-credential decisions to Claude via the woken agent, not to the
+        // owner — and wait out a run-length cooldown, because one bounded
+        // housekeeping run outlasts the ordinary 30-min cooldown.
+        let boss = incident.fingerprint.starts_with("boss:");
+        if !boss && entry.rounds > ESCALATE_AFTER_ROUNDS {
             continue;
         }
         // Details drift every tick (idle minutes, heads), so only a new
         // fingerprint wakes immediately; a known one waits out its cooldown.
-        if entry.rounds > 0 && now - entry.last_woke_ms < cooldown_ms {
+        let incident_cooldown = if boss { BOSS_COOLDOWN_MS } else { cooldown_ms };
+        if entry.rounds > 0 && now - entry.last_woke_ms < incident_cooldown {
             continue;
         }
         entry.rounds += 1;
         entry.last_woke_ms = now;
-        match entry.rounds > ESCALATE_AFTER_ROUNDS {
+        match entry.rounds > ESCALATE_AFTER_ROUNDS && !boss {
             true => to_escalate.push(incident.clone()),
             false => to_wake.push(incident.clone()),
         }
@@ -608,6 +659,7 @@ pub fn detect(
                 fingerprint: format!("offline:{name}"),
                 detail: format!("rig {name} is offline"),
                 min_ticks: 2,
+                reset_key: None,
             });
         }
     }
@@ -617,6 +669,7 @@ pub fn detect(
                 fingerprint: format!("blind:{name}"),
                 detail: format!("rig {name} cannot classify processes: {reason}"),
                 min_ticks: 1,
+                reset_key: None,
             });
         }
         if !accepts_jobs(name) && !probe.contenders.is_empty() {
@@ -625,6 +678,7 @@ pub fn detect(
                 fingerprint: format!("no-jobs-rig-busy:{name}"),
                 detail: format!("{name} takes no jobs but runs heavy work: {commands}"),
                 min_ticks: 1,
+                reset_key: None,
             });
         }
         for (target, count) in &probe.outbox {
@@ -632,6 +686,7 @@ pub fn detect(
                 fingerprint: format!("outbox:{name}->{target}"),
                 detail: format!("{count} message(s) on {name} waiting for unreachable {target}"),
                 min_ticks: 3,
+                reset_key: None,
             });
         }
         for agent in &probe.agents {
@@ -654,6 +709,7 @@ pub fn detect(
                         agent.last_paragraph.as_deref().unwrap_or("(nothing)")
                     ),
                     min_ticks: 1,
+                reset_key: None,
                 });
             }
         }
@@ -680,6 +736,7 @@ pub fn detect(
                 fingerprint: format!("duplicate:{command}"),
                 detail: format!("same command on {}: `{command}`", running.join(" and ")),
                 min_ticks: 1,
+                reset_key: None,
             });
         }
     }
@@ -724,6 +781,7 @@ pub fn detect(
                 drifted.join("; ")
             ),
             min_ticks: DRIFT_TICKS,
+                reset_key: None,
         });
     }
 
@@ -750,6 +808,7 @@ pub fn detect(
                 event.session, event.rig, event.cwd
             ),
             min_ticks: 1,
+                reset_key: None,
         });
     }
     incidents
@@ -1003,6 +1062,10 @@ fn deliver_digest(
 /// contract (plan 056). Stale-mail incidents always target this rig (the mail
 /// is local); queue and false-stop incidents take the quietest usable rig.
 /// Returns how many were delivered.
+/// A thread-end marker is hard evidence, but one bounded housekeeping run
+/// outlasts the ordinary cooldown: the boss re-fires at most hourly.
+const BOSS_COOLDOWN_MS: i64 = 60 * 60 * 1000;
+
 fn deliver_boss(
     mailroom: &Mailroom,
     rigs: &crate::Rigs,
@@ -1020,18 +1083,29 @@ fn deliver_boss(
         })
         .map(|(name, _)| name.clone())
         .min();
-    let mut delivered = 0;
+    // One mail per target rig per tick: `*@rig` resolves to one free agent,
+    // so several boss incidents must land in a single bounded run, not one
+    // wake per repo.
+    let mut per_target: BTreeMap<String, Vec<&Incident>> = BTreeMap::new();
     for incident in incidents {
         let target = if incident.fingerprint.starts_with("boss:unread-mail") {
             Some(rigs.self_rig.clone())
         } else {
             quiet_target.clone()
         };
-        let Some(target) = target else {
-            continue;
-        };
+        if let Some(target) = target {
+            per_target.entry(target).or_default().push(incident);
+        }
+    }
+    let mut delivered = 0;
+    for (target, incidents) in per_target {
+        let details = incidents
+            .iter()
+            .map(|incident| format!("- {}", incident.detail))
+            .collect::<Vec<_>>()
+            .join("\n");
         let body = crate::boss::housekeeping_prompt(
-            &incident.detail,
+            &details,
             &target,
             crate::boss::BOSS_BUDGET_UNITS,
         );
@@ -1192,6 +1266,45 @@ mod tests {
                 "C:\\Users\\katop\\.rustup\\toolchains\\x\\bin\\cargo.exe test -p a C:\\Users\\katop\\git\\r"
             )
         );
+    }
+
+    #[test]
+    fn deliver_boss_groups_incidents_into_one_mail_per_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let room = Mailroom::new(dir.path().to_path_buf());
+        room.init("amo").unwrap();
+        room.write_live_entry("zed-aaaa", "idle", "thread");
+        let rigs = serde_json::from_str::<crate::Rigs>(
+            r#"{"self":"amo","rigs":{"amo":{"ssh":[]}}}"#,
+        )
+        .unwrap();
+        let amo = serde_json::from_str::<RigProbe>(
+            r#"{"rig":"amo","os":"macos","at":"","cores":8,"quiet":true}"#,
+        )
+        .unwrap();
+        let results = vec![("amo".to_string(), Ok(amo), Duration::ZERO)];
+        let incidents = vec![
+            Incident {
+                fingerprint: "boss:queue:katgpt-rs".into(),
+                detail: "queue detail".into(),
+                min_ticks: 6,
+                reset_key: None,
+            },
+            Incident {
+                fingerprint: "boss:unread-mail".into(),
+                detail: "mail detail".into(),
+                min_ticks: 3,
+                reset_key: None,
+            },
+        ];
+
+        let delivered = deliver_boss(&room, &rigs, &results, &incidents);
+        assert_eq!(delivered, 1, "one combined mail, not one per incident");
+        let mail = room.peek(&["zed-aaaa".to_string()]).unwrap();
+        assert_eq!(mail.len(), 1);
+        assert!(mail[0].body.contains("queue detail"));
+        assert!(mail[0].body.contains("mail detail"));
+        assert_eq!(mail[0].from, "boss@amo");
     }
 
     #[test]
