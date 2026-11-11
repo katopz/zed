@@ -1,5 +1,5 @@
 # 056 — Boss: hourly fleet housekeeping + false-stop forensics (fallback when auto_prompt & the watchdog both miss)
-Status: hardening landed per round 3 (REVISE addressed in `b6bfd21598`) — round 4 verdict next
+Status: round-4 fixes landed (`55ac424f19`) — awaiting the round-4 diff-check AGREE, then deploy
 
 ## Why (the incident that triggered this)
 
@@ -144,7 +144,18 @@ housekeeper at the fleet layer.
   config `boss_exclude_inboxes` + `deliver_at` aging + `BOSS_STOP_TICKS=2`;
   deps-dir test guard + restored doc; only generating or <60-min-idle
   agents count as working.
-- **Round 4 — pending**: re-verdict of the hardening.
+- **Round 4 — REVISE (narrow)** (same session): five of six round-3 classes
+  verified fixed; two blockers — the `reset_key` reset bypassed the
+  cooldown (the woken agent's own claim changes the key within seconds →
+  re-wake every tick) and `rustfmt` failed on `watch.rs`. Fixed in
+  `55ac424f19`: cooldown anchored to `last_woke_ms` (not `rounds`), a
+  GROWN queue re-fires after a 20-min regrow window, gate extracted into
+  a pure `gate_round` with a regression test (claim-inside-cooldown
+  holds, regrow fires, boss wakes-never-escalates, ordinary escalation
+  preserved); `cargo fmt` run; `BOSS_COOLDOWN_MS` doc restored to
+  `deliver_boss`; prompt continuation fixed.
+- **Round 5 — pending**: diff-check of the two round-4 blockers (reviewer
+  pre-agreed AGREE once they land).
 
 ## Tasks
 
@@ -166,8 +177,8 @@ housekeeper at the fleet layer.
       scan + counts, marker roundtrip, prompt completeness, WatchConfig
       serde defaults, backlog regression (agent_mail 60 + auto_prompt 486
       pass)
-- [ ] W6: verdict round 4 on the hardened implementation (round 3 =
-      REVISE, addressed in `b6bfd21598`)
+- [ ] W6: round-5 diff-check (round 4 = narrow REVISE, addressed in
+      `55ac424f19`)
 - [x] Owner follow-ups folded in: claimed-but-stopped accounting (lease
       expiry + live-in-repo check), benchmark routine + boundary check-up as
       checklist items, compaction scope incl. code comments, un-gating law
