@@ -1434,10 +1434,15 @@ impl Thread {
             .default_model
             .as_ref()
             .and_then(|model| model.effort.clone());
+        // Fast mode defaults to on. Providers strip `speed` from requests for
+        // models that don't support it, and an explicit
+        // `agent.default_model.speed` (including the persisted `standard` set
+        // when the user turns fast mode off) still takes precedence.
         let speed = settings
             .default_model
             .as_ref()
-            .and_then(|model| model.speed);
+            .and_then(|model| model.speed)
+            .or(Some(Speed::Fast));
         let (prompt_capabilities_tx, prompt_capabilities_rx) =
             watch::channel(Self::prompt_capabilities(model.as_ref()));
         let model = match model {
@@ -9710,6 +9715,57 @@ mod tests {
             assert!(sub.thinking_enabled());
             assert_eq!(sub.thinking_effort().map(|s| s.as_str()), Some("high"));
             assert_eq!(sub.profile(), &AgentProfileId("custom-profile".into()));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_new_thread_speed_defaults_to_fast(cx: &mut TestAppContext) {
+        let _fake = cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+
+            LanguageModelRegistry::test(cx)
+        });
+
+        let fs = fs::FakeFs::new(cx.background_executor.clone());
+        let project = Project::test(fs.clone(), [], cx).await;
+
+        let new_thread = |cx: &mut TestAppContext| {
+            cx.new(|cx| {
+                let project_context = cx.new(|_cx| prompt_store::ProjectContext::default());
+                let context_server_store = project.read(cx).context_server_store();
+                let context_server_registry =
+                    cx.new(|cx| ContextServerRegistry::new(context_server_store, cx));
+                Thread::new(
+                    project.clone(),
+                    project_context,
+                    context_server_registry,
+                    Templates::new(),
+                    None,
+                    cx,
+                )
+            })
+        };
+
+        // Fast mode defaults to on when `agent.default_model.speed` is unset.
+        let thread = new_thread(cx);
+        thread.read_with(cx, |thread, _| assert_eq!(thread.speed(), Some(Speed::Fast)));
+
+        // An explicit `agent.default_model.speed` still takes precedence.
+        cx.update(|cx| {
+            let mut settings = AgentSettings::get_global(cx).clone();
+            settings.default_model = Some(LanguageModelSelection {
+                provider: LanguageModelProviderSetting("fake-corp".into()),
+                model: "fake-model".into(),
+                enable_thinking: false,
+                effort: None,
+                speed: Some(Speed::Standard),
+            });
+            AgentSettings::override_global(settings, cx);
+        });
+        let thread = new_thread(cx);
+        thread.read_with(cx, |thread, _| {
+            assert_eq!(thread.speed(), Some(Speed::Standard));
         });
     }
 
