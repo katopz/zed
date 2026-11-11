@@ -1,6 +1,7 @@
 # 057 — auto_prompt: batch the owner gate at stop + chain KPI counters
 
 Status: open — deferred from the openrsi-harness lesson session (zed/auto_prompt follow-up)
+**Claimed:** amo-idle-lane, 1794389000, expires 2026-11-13T00:00:00+00:00
 
 OpenRSI's bottleneck after automation: review bandwidth (median 3.5 days, up to 23 commits). Our analog is the owner gate — questions currently surface one at a time instead of one consolidated list at halt.
 
