@@ -1,6 +1,6 @@
 # Bench 001 — Verdict ping-pong GOAT (interim)
 
-**Status:** INTERIM, 2026-10-27: 12 ON chains scored with the new human-correction and cited-commit measures; no quality gain beyond noise, 3.1x/4.2x tokens, NOT GOAT on current evidence, stays default-on (user-invoked only). Re-score at >= 20 ON chains.
+**Status:** RE-SCORED at the 20-chain bar 2026-11-11 (see the last section) — demotion rule fires on the corrections axis, held by the gating-law conflict recorded there; default stays on pending adjudication.
 
 ## Setup
 
@@ -70,6 +70,48 @@ user-invoked, so it costs nothing until clicked. If the 20-chain run also
 shows 0 vs 0, the post-hoc keyword scorer is too weak to decide the gate and
 the next step is a blinded quality sample (rate N ON vs N OFF final
 summaries), not more waiting.
+
+## Re-run 2026-11-11 (amo, 24 ON chains — the >= 20 bar reached)
+
+`uv run script/verdict_scorer.py` (threads.db on amo): 558 threads / 118
+chains, 0 parse failures, 487 continuation links.
+
+| cohort | chains | post-hoc fix rate | human correction rate | cited commits resolved | aborts | avg chain tokens in / out |
+|---|---|---|---|---|---|---|
+| ON | 24 | 37.5% (9/24) | 58.3% (14/24 with human turns) | 88.2% (1807/2048) | 9 | 11.7 M / 1.17 M |
+| OFF | 86 (73 w/ summary) | 1.4% (1/86) | 10.5% (2/19 with human turns) | 85.7% (233/272) | 0 | 528 k / 50 k |
+| FAILED | 8 | 62.5% (5/8) | 87.5% (7/8) | 95.0% (643/677) | 0 | 7.1 M / 882 k |
+
+The pre-registered rule ("demote only if ON is then *worse* on corrections
+or commit resolution") fires on the corrections axis: ON is 5.6x worse on
+human corrections and 26x worse on post-hoc fix rate; commit resolution is
++2.5 pp in ON's favor (the only pro-ON signal).
+
+**Held — default stays on. Two recorded reasons, deviation from the rule is
+intentional:**
+
+1. **Gating-law conflict (2026-11-11, owner decree):** `request_verdict` is
+   now the delegated decision instrument for the fleet ("decide it via a
+   Claude verdict, record the verdict, implement"); amo/m3 run the tool on
+   the default (settings.json does not set the flag). Demoting unregisters
+   the tool by default and breaks gating-law workflows on every box that
+   relies on the default. The bench rule predates the decree.
+2. **Selection confound, now dominant:** the ON cohort is no longer owner
+   clicks on ordinary work — it is fleet verdict traffic (agent-negotiated
+   REVISE/AGREE loops, plan 056 boss rounds; avg 11.7 M tokens/chain vs
+   528 k OFF = 22x). Big, contested chains attract corrections by nature,
+   so the corrections axis measures task contentiousness at least as much
+   as summary quality. The 10-27(b) confound note about token cost applies
+   to the correction metric too.
+
+Also noted: reviewer-lane reliability is now the bigger problem — 9 aborts
+plus 8 FAILED (all-error) chains out of ~41 attempts (~41%), including
+claude_code 5-hour rate-limit failures. Over the < 10% abort gate by 4x.
+That, not the flag default, is where the verdict lane loses its value.
+
+Resolution path: a verdict session on the conflict itself (demote vs keep
+vs demote-with-fleet-explicit-settings). Until then the feature stays
+default-on; it remains user/agent-invoked with zero autonomous cost.
 
 ## Re-run 2026-10-27 (b): metric replaced, scorer can now see corrections
 

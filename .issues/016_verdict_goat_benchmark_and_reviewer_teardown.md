@@ -1,6 +1,6 @@
 # Verdict ping-pong GOAT benchmark + reviewer session teardown
 
-Status: 2026-10-27 (b) post-hoc metric shown structurally blind on auto-prompt chains (handoffs fill every post-summary slot), replaced in `script/verdict_scorer.py` by a mid-thread human correction rate + a cited-commit resolution rate. 12 ON vs 36 OFF chains: corrections 16.7% vs 22.2% hand-labelled (2 vs 4, noise), commits resolved 95.8% vs 94.2%, tokens 3.1x in / 4.2x out. NOT GOAT on current evidence; stays default-on (user-invoked only). Re-score at >= 20 ON chains, demote only if ON is worse (`.benchmarks/001`). Earlier: post-hoc 0.0% both cohorts at 11 ON; 2026-09-13 baseline 6.3% over 16,578 OFF chains on the old host; PART 1 harness + Part 2 teardown shipped
+Status: 2026-11-11 re-score landed at the 20-chain bar (24 ON / 86 OFF) — demotion rule fires on corrections (ON 58.3% vs OFF 10.5%) but HELD by the gating-law conflict + selection confound; full data + reasoning in `.benchmarks/001` (last section). Resolution path: verdict session on the demote-vs-hold conflict itself; reviewer-lane reliability (41% abort+error) is the bigger loss. Earlier: 2026-10-27 (b) post-hoc metric shown structurally blind on auto-prompt chains, replaced in `script/verdict_scorer.py` by a mid-thread human correction rate + a cited-commit resolution rate. 12 ON vs 36 OFF chains: corrections 16.7% vs 22.2% hand-labelled (2 vs 4, noise), commits resolved 95.8% vs 94.2%, tokens 3.1x in / 4.2x out. PART 1 harness + Part 2 teardown shipped
 
 ## Context
 
@@ -52,7 +52,7 @@ corrections by enough to pay for the extra tokens.
       "request_verdict"`).
 - [x] Human correction rate + cited-commit resolution rate replace the
       post-hoc metric, which auto-prompt handoffs blind (2026-10-27).
-- [ ] Re-score at >= 20 verdict-ON chains with the new measures (13 ON / 36 OFF as of 2026-10-27, deferred until then).
+- [x] Re-score at >= 20 verdict-ON chains with the new measures (24 ON / 86 OFF scored 2026-11-11; demotion rule fires on corrections but held by the gating-law conflict — see `.benchmarks/001` last section).
 - [x] Scorer script: `script/verdict_scorer.py` (uv + zstandard). Reads
       `threads.db`, decompresses the zstd thread blobs, splits verdict-on/off
       cohorts, and reports post-hoc fix rate / rounds distribution / aborts /
