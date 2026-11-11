@@ -35,7 +35,11 @@ rig's agent sessions. Upstream base plus a local feature lane maintained on
   `agent_servers/src/acp/detachable.rs` (plan 037)
 - cross-rig agent mail — `crates/agent_mail` (`agent-mail`, std-only CLI:
   maildir inbox per agent, SSH-over-Tailscale delivery, Claude Code hooks for
-  inject + idle wake; no daemon, no port) (plan 043)
+  inject + idle wake; no daemon, no port) (plan 043); + the boss watchdog lane
+  (hourly fleet housekeeping, false-stop forensics, stale-mail pickup — plan 056)
+  and the verify lane (`rig run --verify-manifest`: BLAKE3-pinned baseline
+  manifests, ratio-to-baseline guard-set verdicts, cross-session fork ceiling,
+  orchestrator verify ledger — issues 055/056/058)
 - fleet web — `crates/fleet_web` (`fleet-web`: read-only origin serving rig
   status/queues + Zed thread history mirrored by `fleet-web publish`, blake3-signed
   requests only) and `crates/fleet_web/edge` (Fastly Compute app: GitHub login,
