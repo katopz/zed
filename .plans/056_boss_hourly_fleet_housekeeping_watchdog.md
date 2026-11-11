@@ -1,5 +1,5 @@
 # 056 — Boss: hourly fleet housekeeping + false-stop forensics (fallback when auto_prompt & the watchdog both miss)
-Status: impl landed — boss lane live in agent_mail (flag `boss: false` in watch.json to disable); W0 counts in fleet-cache + worker context; verdict round 3 pending
+Status: hardening landed per round 3 (REVISE addressed in `b6bfd21598`) — round 4 verdict next
 
 ## Why (the incident that triggered this)
 
@@ -129,10 +129,22 @@ housekeeper at the fleet layer.
   covers every round-1 point. Non-blocking follow-ups: status line rule
   (done), `dot_separator` export (deferred), `.issues/059` for the
   mail-liveness test isolation bug (filed).
-- **Round 3 — pending**: implementation review (boss.rs + tick wiring +
-  W0 + markers) under the owner's new gating law: the only owner gate is a
-  credential/secret touch to deploy; gated decisions go to Claude and are
-  logged here.
+- **Round 3 — REVISE** (`<session 2f16b6d4>`): implementation review found
+  six defect classes — (a) boss incidents hit the 3-round owner escalation
+  (storm + gating-law violation) and the 30-min cooldown is shorter than a
+  housekeeping run; (b) unread-mail misclassifications (`orchestrator`/
+  `boss` reply sinks, placeholder inboxes, remote human inboxes,
+  `deliver_at` aging); (c) false-stop needed 6 ticks but its marker
+  survives ~1 h (would never fire) + `cfg!(test)` guard scope + doc-comment
+  misplacement; (d) default-on accepted under the gating law; (e)
+  `deliver_boss` double-wake (one mail per incident, same resolved agent);
+  (f) idle agents in a repo suppressed the queue rule forever. All fixed in
+  `b6bfd21598`: never-escalate + 60-min cooldown + work-set `reset_key`
+  restarts; per-target combined mail + false-stop subsumes the queue rule;
+  config `boss_exclude_inboxes` + `deliver_at` aging + `BOSS_STOP_TICKS=2`;
+  deps-dir test guard + restored doc; only generating or <60-min-idle
+  agents count as working.
+- **Round 4 — pending**: re-verdict of the hardening.
 
 ## Tasks
 
@@ -154,7 +166,8 @@ housekeeper at the fleet layer.
       scan + counts, marker roundtrip, prompt completeness, WatchConfig
       serde defaults, backlog regression (agent_mail 60 + auto_prompt 486
       pass)
-- [ ] W6: verdict round 3 on the implementation
+- [ ] W6: verdict round 4 on the hardened implementation (round 3 =
+      REVISE, addressed in `b6bfd21598`)
 - [x] Owner follow-ups folded in: claimed-but-stopped accounting (lease
       expiry + live-in-repo check), benchmark routine + boundary check-up as
       checklist items, compaction scope incl. code comments, un-gating law
