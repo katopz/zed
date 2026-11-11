@@ -579,11 +579,16 @@ impl Mailroom {
             verify_outcome: None,
         };
         let rig_name = self.rigs().map(|rigs| rigs.self_rig).unwrap_or_default();
-        record.environment = Some(RunEnvironment::capture(
+        let mut environment = RunEnvironment::capture(
             &rig_name,
             record.spec.worktree.as_deref(),
             record.spec.verify.as_ref().map(|verify| verify.manifest_blake3.as_str()),
-        ));
+        );
+        // Clean-environment evidence (issue 056): a timed cell that did not
+        // start QUIET is suspect however its numbers turn out. Own pid is
+        // excluded — the executor itself is not a contender.
+        environment.quiet_at_start = Some(rig::contention(&[std::process::id()]).quiet());
+        record.environment = Some(environment);
         write_json(&record_path, &record)?;
         self.job_mail(
             &record.spec,
@@ -742,6 +747,10 @@ impl Mailroom {
                     .map(|environment| environment.rig.clone())
                     .unwrap_or_default();
                 verify_outcome.provenance_incomplete = provenance;
+                verify_outcome.quiet_at_start = record
+                    .environment
+                    .as_ref()
+                    .and_then(|environment| environment.quiet_at_start);
                 record.verify_outcome = Some(verify_outcome.clone());
                 self.record_verify_ledger(&record, &verify_outcome, &outcome);
             }
@@ -774,12 +783,16 @@ impl Mailroom {
             None => String::new(),
             Some(outcome) => {
                 let mut lines = vec![format!(
-                    "\nVERIFY: {} vs {} — {}{}",
+                    "\nVERIFY: {} vs {} — {}{}{}",
                     outcome.verified_on, outcome.produced_on, outcome.verdict,
                     if outcome.provenance_incomplete {
                         " (provenance incomplete: does not count)"
                     } else {
                         ""
+                    },
+                    match outcome.quiet_at_start {
+                        Some(false) => " (did NOT start QUIET: suspect cell)",
+                        _ => "",
                     }
                 )];
                 for (name, metric) in &outcome.metrics {
@@ -836,6 +849,12 @@ impl Mailroom {
             outcome: outcome.to_string(),
             verdict: verify_outcome.verdict.clone(),
             provenance_incomplete: verify_outcome.provenance_incomplete,
+            quiet_at_start: verify_outcome.quiet_at_start,
+            arm: record
+                .spec
+                .verify
+                .as_ref()
+                .and_then(|verify| verify.baseline.arm.clone()),
             metrics: verify_outcome
                 .metrics
                 .iter()
@@ -1648,6 +1667,7 @@ mod tests {
             ]),
             noise_floor: 0.05,
             source: ".benchmarks/031/baseline.json".into(),
+            arm: None,
         }
     }
 

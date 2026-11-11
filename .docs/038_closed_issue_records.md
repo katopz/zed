@@ -25,6 +25,12 @@ workspace's noise-reduction rule: work lands → the record is documented
 | 047 | `test_manual_auto_prompt_forks_claude_thread_above_overflow_gate` ambient-config hermeticity — FIXED | `7c2f1fba27` | this row (one-line test fix; the fix commit's message + this row are the record) |
 | 048 | agent-mail fyi mode + broadcast gate + liveness cutoff — DONE, deployed 4 rigs, Claude verdict AGREE ×2 | `eec5d52d88` + fmt `d30a4a3a44` | `.docs/037_agent_mail_fyi_rollout.md`; the deferred fyi-folding follow-up + the owner-side AGENTS.md row move here |
 
+## Removed 2026-11-11 (amo idle lane, issue 056)
+
+| issue | verdict | landed in | durable record |
+|---|---|---|---|
+| 056 | Guard sets + arm isolation — DONE: hard multi-axis gates via the verify lane's ratio verdicts (any regression refutes), `Baseline.arm` one-knob-per-arm labels into `VerifyLedgerRow.arm`, `quiet_at_start` contention evidence on every run (refuse-to-count beyond refuse-to-start) | `34e43f0bda` + retirement commit | this row; the guard-set discipline (declare wall+compile+binary axes per claim) is the manifest contract in `crates/agent_mail/src/verify.rs` docs |
+
 ## Removed 2026-11-11 (amo idle lane, issue 055)
 
 | issue | verdict | landed in | durable record |

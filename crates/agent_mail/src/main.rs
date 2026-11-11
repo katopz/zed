@@ -456,11 +456,13 @@ fn rig_run(room: &Mailroom, args: Vec<String>) -> Result<i32> {
                 timeout = Some(agent_mail::jobs::parse_duration(&value("--timeout")?)?.as_secs())
             }
             "--verify-manifest" => {
-                let manifest: agent_mail::verify::VerifyManifest = serde_json::from_slice(
-                    &std::fs::read(value("--verify-manifest")?)
-                        .context("reading the verify manifest")?,
-                )
-                .context("parsing the verify manifest")?;
+                let bytes = std::fs::read(value("--verify-manifest")?)
+                    .context("reading the verify manifest")?;
+                let manifest: agent_mail::verify::VerifyManifest =
+                    serde_json::from_slice(&bytes).context("parsing the verify manifest")?;
+                let manifest = manifest
+                    .validated()
+                    .context("invalid verify manifest")?;
                 // A measured re-run must hold a quiet rig alone, and the
                 // manifest pins the exact command, commit, and cell path.
                 lane = Lane::Exclusive;

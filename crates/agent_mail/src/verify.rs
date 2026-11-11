@@ -41,6 +41,20 @@ impl VerifyManifest {
         let bytes = serde_json::to_vec(self).context("serializing the verify manifest")?;
         Ok(blake3::hash(&bytes).to_string())
     }
+
+    /// Refuses manifests that cannot produce a countable verdict: without
+    /// declared numbers there is nothing to be a guard set against.
+    pub fn validated(self) -> Result<Self> {
+        anyhow::ensure!(
+            !self.baseline.numbers.is_empty(),
+            "verify manifest declares no baseline numbers: a guard set needs at least one axis"
+        );
+        anyhow::ensure!(
+            self.baseline.noise_floor >= 0.0,
+            "verify manifest noise_floor must be >= 0"
+        );
+        Ok(self)
+    }
 }
 
 /// Per-plan baseline block: every claim is a ratio to these numbers, never an
@@ -58,6 +72,11 @@ pub struct Baseline {
     pub noise_floor: f64,
     /// Where the numbers came from (`.benchmarks/…` file or manifest).
     pub source: String,
+    /// Arm label for one-knob-per-arm isolation (issue 056): each arm is a
+    /// separate verify run measuring exactly one change, so a bundled
+    /// proposal can be split and each line measured alone.
+    #[serde(default)]
+    pub arm: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -99,6 +118,10 @@ pub struct RunEnvironment {
     pub baseline_sha: Option<String>,
     #[serde(default)]
     pub manifest_blake3: Option<String>,
+ /// Contention verdict at start (`None` on older records): a timed cell
+    /// that did not start QUIET is suspect regardless of its numbers.
+    #[serde(default)]
+    pub quiet_at_start: Option<bool>,
 }
 
 impl RunEnvironment {
@@ -122,6 +145,7 @@ impl RunEnvironment {
             baseline_sha: worktree
                 .and_then(|target| target.split_once('@').map(|(_, sha)| sha.to_string())),
             manifest_blake3: manifest_blake3.map(str::to_string),
+            quiet_at_start: None,
         }
     }
 
@@ -149,6 +173,10 @@ pub struct VerifyOutcome {
     /// Set when the provenance row was incomplete (no toolchain, …).
     #[serde(default)]
     pub provenance_incomplete: bool,
+    /// `false` when the cell did not start on a QUIET rig (issue 056:
+    /// clean-environment evidence, hard gate for timed cells).
+    #[serde(default)]
+    pub quiet_at_start: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -217,6 +245,7 @@ pub fn verify_against_baseline(
         metrics,
         verdict: verdict.to_string(),
         provenance_incomplete: false,
+        quiet_at_start: None,
     }
 }
 
@@ -240,6 +269,12 @@ pub struct VerifyLedgerRow {
     /// `verified` / `refuted` / `incomplete` / `inconclusive`.
     pub verdict: String,
     pub provenance_incomplete: bool,
+    /// Contention verdict at start; a `false` row is a suspect cell.
+    #[serde(default)]
+    pub quiet_at_start: Option<bool>,
+    /// Arm label from the baseline, when the submitter isolated one knob.
+    #[serde(default)]
+    pub arm: Option<String>,
     pub metrics: BTreeMap<String, MetricVerdict>,
     pub at: String,
 }
@@ -282,7 +317,40 @@ mod tests {
             ]),
             noise_floor: 0.05,
             source: ".benchmarks/031/baseline.json".into(),
+            arm: Some("chunked-simd".into()),
         }
+    }
+
+    #[test]
+    fn manifests_without_numbers_or_with_negative_noise_floors_are_refused() {
+        let mut manifest = VerifyManifest {
+            origin_job: "01job".into(),
+            produced_on: "bmo".into(),
+            repo: "riir-ai".into(),
+            sha: "abc".into(),
+            argv: vec!["bench".into()],
+            cwd: None,
+            result_path: None,
+            baseline: baseline(),
+        };
+        assert!(manifest.clone().validated().is_ok());
+        manifest.baseline.numbers.clear();
+        assert!(
+            manifest.validated().is_err(),
+            "a guard set needs at least one axis"
+        );
+        let mut manifest = VerifyManifest {
+            origin_job: "01job".into(),
+            produced_on: "bmo".into(),
+            repo: "riir-ai".into(),
+            sha: "abc".into(),
+            argv: vec!["bench".into()],
+            cwd: None,
+            result_path: None,
+            baseline: baseline(),
+        };
+        manifest.baseline.noise_floor = -0.1;
+        assert!(manifest.validated().is_err());
     }
 
     #[test]
