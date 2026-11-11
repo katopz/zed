@@ -1,6 +1,7 @@
 # 056 — Harness: guard sets per lane + one-knob bench arms
 
 Status: open — deferred from the openrsi-harness lesson session (policy + bench harness work)
+**Claimed:** amo-idle-lane, 1794386000, expires 2026-11-13T00:00:00+00:00
 
 One number is gameable; a guard set is not. OpenRSI rejected candidates that gained throughput but regressed latency or WER; the build-hygiene skill already tracks our second and third axes (compile time, binary size) but they are advisory, not gates.
 
