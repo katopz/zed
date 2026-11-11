@@ -555,6 +555,18 @@ struct ProcessTable {
     disk_free_gb: Option<f64>,
 }
 
+/// Every live process's normalized command line, for callers that must
+/// verify a claim's holder without the contender vocabulary. `None` when
+/// the process table is unavailable — callers must treat blind as
+/// "possibly held", never as "absent".
+pub fn process_command_lines() -> Option<Vec<String>> {
+    let table = process_table();
+    if table.blind.is_some() {
+        return None;
+    }
+    Some(table.rows.into_iter().map(|row| row.command).collect())
+}
+
 #[cfg(unix)]
 fn process_table() -> ProcessTable {
     match run("ps", &["-axo", "pid=,ppid=,pcpu=,rss=,time=,args="]) {

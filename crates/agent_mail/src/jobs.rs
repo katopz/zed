@@ -38,6 +38,19 @@ pub enum JobAction {
 }
 const WAIT_POLL: Duration = Duration::from_secs(1);
 const KICK_EVERY: Duration = Duration::from_secs(20);
+/// How long a `.starting` claim may sit unconsumed before the recovery
+/// sweep treats it as stranded. The real executor reads and removes the
+/// marker immediately on start; the window only has to cover process-spawn
+/// latency, generously.
+const STARTING_GRACE: Duration = Duration::from_secs(120);
+
+/// True when some live process's command line claims to be this job's
+/// executor (`rig exec {id}` anywhere in the args — the detached
+/// `agent-mail rig exec` and a `zed rig exec` runner both match).
+fn holder_alive(lines: &[String], id: &str) -> bool {
+    let needle = format!("rig exec {id}");
+    lines.iter().any(|line| line.contains(&needle))
+}
 /// Memory a shared job must leave free for everything else on the rig.
 const MEM_HEADROOM_GB: f64 = 2.0;
 /// Pause after an exclusive job before the next one starts, so a benchmark
@@ -407,6 +420,53 @@ impl Mailroom {
         self.schedule_jobs_inner(true)
     }
 
+    /// A `.starting` marker is a claim between `spawn_executor`'s rename and
+    /// the executor's first read — normally milliseconds. A marker that
+    /// outlives the grace window with no live `rig exec {id}` process is a
+    /// stranded claim (spawn failed, executor died pre-read, kicker died
+    /// between the two steps): requeue it so admission retries the job
+    /// instead of losing it silently. Held claims (a live holder, e.g. a
+    /// `zed rig exec` runner) and a blind process table are left alone.
+    fn recover_stranded_starting(&self, running_dir: &Path) -> usize {
+        let Ok(entries) = fs::read_dir(running_dir) else {
+            return 0;
+        };
+        let Some(lines) = rig::process_command_lines() else {
+            return 0;
+        };
+        let mut recovered = 0;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let Some(id) = name.strip_suffix(".starting") else {
+                continue;
+            };
+            if validate_name(id).is_err() || holder_alive(&lines, id) {
+                continue;
+            }
+            let past_grace = fs::metadata(&path)
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age >= STARTING_GRACE);
+            if !past_grace {
+                continue;
+            }
+            let queued = self.jobs_dir("queue").join(format!("{id}.json"));
+            if queued.exists() || read_json::<JobSpec>(&path).is_none() {
+                // The queue already holds this id (a resubmit raced the
+                // claim) or the marker is unreadable debris — drop it.
+                fs::remove_file(&path).ok();
+            } else {
+                fs::rename(&path, &queued).ok();
+            }
+            recovered += 1;
+        }
+        recovered
+    }
+
     fn schedule_jobs_inner(&self, may_spawn_kicker: bool) -> Result<Vec<String>> {
         let queue_dir = self.jobs_dir("queue");
         if !queue_dir.exists() && !self.jobs_dir("running").exists() {
@@ -416,6 +476,7 @@ impl Mailroom {
         let Some(_lock) = FileLock::acquire(&self.home().join("jobs").join("schedule.lock")) else {
             return Ok(Vec::new());
         };
+        self.recover_stranded_starting(&self.jobs_dir("running"));
         let mut running = Vec::new();
         for path in json_files(&self.jobs_dir("running")) {
             let Some(record) = read_json::<JobRecord>(&path) else {
@@ -509,7 +570,15 @@ impl Mailroom {
         let queued = self.jobs_dir("queue").join(format!("{id}.json"));
         let starting = self.jobs_dir("running").join(format!("{id}.starting"));
         fs::rename(&queued, &starting)?;
-        self.spawn_detached(&["rig", "exec", id], id)
+        if let Err(error) = self.spawn_detached(&["rig", "exec", id], id) {
+            // Roll the claim back so the job returns to admission instead of
+            // stranding in `.starting` — a marker no executor consumed is
+            // invisible to the reaper, to `rig status`, and to `rig cancel`.
+            // A failed rollback is fine: the recovery sweep below requeues it.
+            fs::rename(&starting, &queued).ok();
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Starts `agent-mail <args>` outside this process's lifetime.
@@ -1016,9 +1085,37 @@ impl Mailroom {
             }
             return Ok(format!("cancelled queued job {id}"));
         }
-        let running = self.jobs_dir("running").join(format!("{id}.json"));
+        let running_dir = self.jobs_dir("running");
+        let running = running_dir.join(format!("{id}.json"));
+        let starting = running_dir.join(format!("{id}.starting"));
+        if !running.exists() && starting.exists() {
+            // A claim no executor consumed: cancellable even though it is
+            // neither queued nor running (issue 038). Blind table = assume
+            // held; refuse rather than delete a claim we cannot verify.
+            let held = rig::process_command_lines()
+                .map(|lines| holder_alive(&lines, id))
+                .unwrap_or(true);
+            anyhow::ensure!(
+                !held,
+                "job {id} is starting under a live executor; try again once it is running"
+            );
+            let spec = read_json::<JobSpec>(&starting);
+            fs::remove_file(&starting)?;
+            if let Some(spec) = spec {
+                if let Some(key) = &spec.key {
+                    self.release_key_remote(
+                        key,
+                        &format!("job {} cancelled before it started", short(id)),
+                    )
+                    .ok();
+                }
+            }
+            return Ok(format!(
+                "cancelled stranded job {id} (its executor never started)"
+            ));
+        }
         anyhow::ensure!(running.exists(), "no queued or running job {id} here");
-        fs::write(self.jobs_dir("running").join(format!("{id}.cancel")), now())?;
+        fs::write(running_dir.join(format!("{id}.cancel")), now())?;
         Ok(format!("cancelling running job {id}"))
     }
 
@@ -1866,5 +1963,147 @@ mod tests {
             "a clean exit without the measured cell does not count"
         );
         assert!(record.verify_outcome.is_none());
+    }
+
+    fn stranded_claim(dir: &tempfile::TempDir, room: &Mailroom, id: &str) -> std::path::PathBuf {
+        room.init("amo").unwrap();
+        let spec = job(id, Lane::Shared, 0.0);
+        let queue = dir.path().join("jobs/queue");
+        fs::create_dir_all(&queue).unwrap();
+        fs::create_dir_all(dir.path().join("jobs/running")).unwrap();
+        write_json(&queue.join(format!("{id}.json")), &spec).unwrap();
+        let starting = dir
+            .path()
+            .join("jobs/running")
+            .join(format!("{id}.starting"));
+        fs::rename(queue.join(format!("{id}.json")), &starting).unwrap();
+        starting
+    }
+
+    fn backdate(path: &std::path::Path, secs: u64) {
+        fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(
+                std::time::SystemTime::now()
+                    .checked_sub(Duration::from_secs(secs))
+                    .unwrap(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn holder_alive_matches_executor_command_lines_only() {
+        let lines = vec![
+            "/Applications/Zed Dev.app/Contents/MacOS/zed rig exec 01aaa".to_string(),
+            "/Users/k/.cargo/bin/agent-mail rig exec 01bbb".to_string(),
+            "grep rig exec 01aaa somewhere".to_string(),
+            "cargo test --lib".to_string(),
+        ];
+        assert!(holder_alive(&lines, "01aaa"));
+        assert!(holder_alive(&lines, "01bbb"));
+        assert!(!holder_alive(&lines, "01ccc"), "an unclaimed id has no holder");
+        assert!(!holder_alive(&[], "01aaa"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stranded_starting_claim_past_the_grace_window_is_requeued() {
+        let dir = tempfile::tempdir().unwrap();
+        let room = Mailroom::new(dir.path().to_path_buf());
+        let starting = stranded_claim(&dir, &room, "01str000000000000000000000000001");
+        backdate(&starting, 300);
+        // The test process's own command line never names `rig exec <id>`,
+        // so the claim reads as unheld; recovery must requeue it.
+        let recovered = room.recover_stranded_starting(&dir.path().join("jobs/running"));
+        assert_eq!(recovered, 1);
+        assert!(!starting.exists());
+        let spec: JobSpec = read_json(
+            &dir
+                .path()
+                .join("jobs/queue")
+                .join("01str000000000000000000000000001.json"),
+        )
+        .unwrap();
+        assert_eq!(spec.title, "01str000000000000000000000000001");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fresh_starting_claim_is_left_for_its_executor() {
+        let dir = tempfile::tempdir().unwrap();
+        let room = Mailroom::new(dir.path().to_path_buf());
+        let starting = stranded_claim(&dir, &room, "01frs000000000000000000000000001");
+        // No backdate: the grace window covers spawn latency.
+        let recovered = room.recover_stranded_starting(&dir.path().join("jobs/running"));
+        assert_eq!(recovered, 0);
+        assert!(starting.exists(), "the executor may still consume it");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_starting_marker_is_removed_as_debris() {
+        let dir = tempfile::tempdir().unwrap();
+        let room = Mailroom::new(dir.path().to_path_buf());
+        let starting = stranded_claim(&dir, &room, "01jnk000000000000000000000000001");
+        fs::write(&starting, "not json").unwrap();
+        backdate(&starting, 300);
+        let recovered = room.recover_stranded_starting(&dir.path().join("jobs/running"));
+        assert_eq!(recovered, 1);
+        assert!(!starting.exists());
+        assert!(
+            !dir
+                .path()
+                .join("jobs/queue")
+                .join("01jnk000000000000000000000000001.json")
+                .exists(),
+            "debris never re-enters the queue"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancelling_a_stranded_claim_removes_it_and_releases_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let room = Mailroom::new(dir.path().to_path_buf());
+        room.init("amo").unwrap();
+        // Key release rides the orchestrator route; make this rig its own
+        // orchestrator so the release runs locally in the test.
+        let rigs_path = room.home().join("rigs.json");
+        let mut rigs: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&rigs_path).unwrap()).unwrap();
+        rigs["orchestrator"] = serde_json::Value::String("amo".into());
+        fs::write(&rigs_path, serde_json::to_string(&rigs).unwrap() + "\n").unwrap();
+        let mut spec = job("01stc000000000000000000000000001", Lane::Shared, 0.0);
+        spec.key = Some("bench:x@abc:cell".into());
+        let queue = dir.path().join("jobs/queue");
+        fs::create_dir_all(&queue).unwrap();
+        fs::create_dir_all(dir.path().join("jobs/running")).unwrap();
+        write_json(&queue.join(format!("{}.json", spec.id)), &spec).unwrap();
+        let starting = dir
+            .path()
+            .join("jobs/running")
+            .join(format!("{}.starting", spec.id));
+        fs::rename(queue.join(format!("{}.json", spec.id)), &starting).unwrap();
+        // Key claimed at submit; the stranded cancel must hand it back.
+        let claim = KeyClaim {
+            key: spec.key.clone().unwrap(),
+            rig: "amo".into(),
+            id: spec.id.clone(),
+            notify: None,
+        };
+        room.claim_key(&claim).unwrap();
+        let verdict = room.cancel_job(&spec.id).unwrap();
+        assert!(verdict.contains("stranded"), "{verdict}");
+        assert!(!starting.exists());
+        // The key is free again.
+        let reclaim = KeyClaim {
+            key: "bench:x@abc:cell".into(),
+            rig: "amo".into(),
+            id: "other".into(),
+            notify: None,
+        };
+        assert_eq!(room.claim_key(&reclaim).unwrap(), KeyOutcome::Claimed);
     }
 }
