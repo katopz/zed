@@ -1181,6 +1181,25 @@ pub fn summary_declares_terminal(last_assistant_message: Option<&str>) -> bool {
 /// Over the context limit or after an API-level failure the keyword is
 /// deferred entirely — the Phase 1/2 fork machine / retry backoff own the
 /// round and the keyword is re-evaluated afterwards.
+/// Telemetry for the fleet boss (plan 056): how a managed chain stopped, so
+/// terminal-over-open-queue false stops can be detected and re-fired. The
+/// cfg!(test) guard keeps tests from writing into the real `~/.agent-mail`.
+fn note_chain_stop(data: &LlmCallData, ended_by: &str) {
+    if cfg!(test) {
+        return;
+    }
+    let cwd = data
+        .work_dirs
+        .as_ref()
+        .and_then(|dirs| dirs.first())
+        .map(|dir| dir.to_string_lossy().into_owned());
+    let had_summary = data
+        .last_assistant_message
+        .as_deref()
+        .is_some_and(|message| message.contains("## Summary"));
+    agent_mail::boss::note_stop(&data.session_id.to_string(), cwd.as_deref(), ended_by, had_summary);
+}
+
 pub(crate) fn stop_keyword_outcome(data: &LlmCallData) -> Option<AutoPromptOutcome> {
     let text = data.last_assistant_message.as_deref()?;
     if !message_requests_stop(text) {
@@ -1196,6 +1215,7 @@ pub(crate) fn stop_keyword_outcome(data: &LlmCallData) -> Option<AutoPromptOutco
                 log::warn!(
                     "[auto_prompt::decide_with_llm] `{STOP_KEYWORD}` stop repeated after its corrective round — honoring the stop (session={session_key})"
                 );
+                note_chain_stop(data, agent_mail::boss::END_REPEATED);
                 return Some(AutoPromptOutcome::Stopped {
                     reason: format!("worker requested stop ({STOP_KEYWORD} keyword)"),
                 });
@@ -1212,6 +1232,7 @@ pub(crate) fn stop_keyword_outcome(data: &LlmCallData) -> Option<AutoPromptOutco
             log::warn!(
                 "[auto_prompt::decide_with_llm] `{STOP_KEYWORD}` stop over a terminal summary — stopping chain without housekeeping (session={session_key})"
             );
+            note_chain_stop(data, agent_mail::boss::END_TERMINAL);
             Some(AutoPromptOutcome::Stopped {
                 reason: format!("worker requested stop ({STOP_KEYWORD} keyword)"),
             })
@@ -1229,6 +1250,7 @@ pub(crate) fn stop_keyword_outcome(data: &LlmCallData) -> Option<AutoPromptOutco
             log::warn!(
                 "[auto_prompt::decide_with_llm] worker emitted the `{STOP_KEYWORD}` stop keyword — stopping chain (session={session_key})"
             );
+            note_chain_stop(data, agent_mail::boss::END_FINAL);
             Some(AutoPromptOutcome::Stopped {
                 reason: format!("worker requested stop ({STOP_KEYWORD} keyword)"),
             })

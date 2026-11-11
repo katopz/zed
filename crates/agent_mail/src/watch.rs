@@ -12,7 +12,7 @@ use crate::rig::{self, RigProbe};
 use crate::{Address, Mailroom, validate_name};
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -57,6 +57,26 @@ pub struct WatchConfig {
     /// instruction, so the owner's global CLAUDE.md is pure token cost there.
     #[serde(default)]
     pub orchestrator_env: BTreeMap<String, String>,
+    /// Boss rules (plan 056): hourly queue ownership, false-stop forensics
+    /// and stale-mail pickup. Deterministic 0-token incidents that act by
+    /// directly waking a free agent, bypassing the orchestrator digest.
+    #[serde(default = "default_true")]
+    pub boss: bool,
+    /// Repos the boss never wakes agents for (owner policy: skip seal-*
+    /// issues not authored by the owner).
+    #[serde(default = "default_boss_exclude_repos")]
+    pub boss_exclude_repos: Vec<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_boss_exclude_repos() -> Vec<String> {
+    ["seal-game-editor", "sealm-toolkit"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
 }
 
 fn default_interval() -> u64 {
@@ -74,6 +94,8 @@ impl Default for WatchConfig {
             cooldown_minutes: default_cooldown(),
             orchestrator_command: None,
             orchestrator_env: BTreeMap::new(),
+            boss: default_true(),
+            boss_exclude_repos: default_boss_exclude_repos(),
         }
     }
 }
@@ -402,7 +424,42 @@ pub fn tick(mailroom: &Mailroom, force: bool) -> Result<TickReport> {
         .collect();
     let rigs = mailroom.rigs()?;
     let results = rig::status(mailroom, &[])?;
-    let incidents = detect(&results, &rigs, &events, interval_ms);
+    let mut incidents = detect(&results, &rigs, &events, interval_ms);
+
+    // The boss lane (plan 056): deterministic queue-ownership, false-stop and
+    // stale-mail rules over the same snapshot. Its incidents skip the LLM
+    // orchestrator and wake a free agent directly.
+    if config.boss {
+        let exclude: BTreeSet<String> = config.boss_exclude_repos.iter().cloned().collect();
+        let open_work = crate::boss::scan_open_work(&repo_roots(), chrono::Utc::now(), &exclude);
+        let ends = crate::boss::recent_thread_ends(
+            mailroom,
+            chrono::Utc::now(),
+            crate::boss::THREAD_END_WINDOW,
+        );
+        let live_names: BTreeSet<String> = results
+            .iter()
+            .filter_map(|(_, outcome, _)| outcome.as_ref().ok())
+            .flat_map(|probe| probe.agents.iter().map(|agent| agent.name.clone()))
+            .chain(mailroom.live_agents().into_iter().map(|agent| agent.name))
+            .collect();
+        let mail = crate::boss::stale_mail(mailroom, chrono::Utc::now(), crate::boss::MAIL_GRACE, &live_names);
+        let online: Vec<(&str, &RigProbe)> = results
+            .iter()
+            .filter_map(|(name, outcome, _)| {
+                outcome.as_ref().ok().map(|probe| (name.as_str(), probe))
+            })
+            .collect();
+        incidents.extend(crate::boss::detect(
+            &online,
+            &rigs,
+            &open_work,
+            &ends,
+            &mail,
+            chrono::Utc::now(),
+            !mailroom.live_agents().is_empty(),
+        ));
+    }
 
     let cooldown_ms = i64::try_from(config.cooldown_minutes)
         .unwrap_or(30)
@@ -455,10 +512,16 @@ pub fn tick(mailroom: &Mailroom, force: bool) -> Result<TickReport> {
     state.last_tick_ms = now;
     fs::write(&state_path, serde_json::to_vec_pretty(&state)?)?;
 
-    if !to_wake.is_empty() {
-        let mut digest = digest(&to_wake, &results, &rigs.self_rig);
+    let (boss_wake, llm_wake): (Vec<Incident>, Vec<Incident>) = to_wake
+        .into_iter()
+        .partition(|incident| incident.fingerprint.starts_with("boss:"));
+    if !boss_wake.is_empty() {
+        report.woke = deliver_boss(mailroom, &rigs, &results, &boss_wake);
+    }
+    if !llm_wake.is_empty() {
+        let mut digest = digest(&llm_wake, &results, &rigs.self_rig);
         // Work to hand out, only when someone is idle: zero cost otherwise.
-        if to_wake
+        if llm_wake
             .iter()
             .any(|incident| incident.fingerprint.starts_with("stalled:"))
         {
@@ -475,7 +538,7 @@ pub fn tick(mailroom: &Mailroom, force: bool) -> Result<TickReport> {
         }
         fs::write(dir.join("last_digest.md"), &digest).ok();
         deliver_digest(mailroom, &config, &rigs.self_rig, digest)?;
-        report.woke = to_wake.len();
+        report.woke += llm_wake.len();
     }
     if !to_escalate.is_empty() {
         let body = format!(
@@ -746,7 +809,9 @@ fn summarize_contenders(probe: &RigProbe) -> String {
     }
 }
 
-fn repo_roots() -> Vec<PathBuf> {
+/// The fleet's repo roots (`~/git`, `E:/git` on Windows) — where the queue
+/// convention puts every tracked repo.
+pub fn repo_roots() -> Vec<PathBuf> {
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
     home.map(|home| PathBuf::from(home).join("git"))
         .into_iter()
@@ -759,54 +824,16 @@ fn repo_roots() -> Vec<PathBuf> {
 /// the tracked repos whose status is not done and that carries no live
 /// `**Claimed:**` lease, newest file first.
 pub fn backlog(roots: &[PathBuf], now: chrono::DateTime<chrono::Utc>) -> Vec<String> {
-    let mut found: Vec<(std::time::SystemTime, String)> = Vec::new();
-    for root in roots {
-        let Ok(repos) = fs::read_dir(root) else {
-            continue;
-        };
-        for repo in repos.flatten() {
-            let Some(repo_name) = repo.file_name().to_str().map(str::to_string) else {
-                continue;
-            };
-            if !(repo_name.starts_with("riir-")
-                || repo_name.starts_with("seal-")
-                || repo_name == "katgpt-rs")
-            {
-                continue;
-            }
-            for folder in [".plans", ".issues"] {
-                let Ok(files) = fs::read_dir(repo.path().join(folder)) else {
-                    continue;
-                };
-                for file in files.flatten() {
-                    let path = file.path();
-                    if path.extension().is_none_or(|extension| extension != "md") {
-                        continue;
-                    }
-                    let Ok(text) = fs::read_to_string(&path) else {
-                        continue;
-                    };
-                    let Some(item) = open_item(&text, now) else {
-                        continue;
-                    };
-                    let modified = file
-                        .metadata()
-                        .and_then(|metadata| metadata.modified())
-                        .unwrap_or(std::time::UNIX_EPOCH);
-                    let line = format!(
-                        "{repo_name}/{folder}/{}: {item}",
-                        file.file_name().to_string_lossy()
-                    );
-                    found.push((modified, truncate(&line, BACKLOG_ITEM_CHARS)));
-                }
-            }
-        }
-    }
-    found.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
-    found
+    let exclude = BTreeSet::new();
+    crate::boss::scan_open_work(roots, now, &exclude)
         .into_iter()
         .take(BACKLOG_ITEMS)
-        .map(|(_, line)| line)
+        .map(|work| {
+            truncate(
+                &format!("{}/{}/{}: {}", work.repo, work.folder, work.file, work.item),
+                BACKLOG_ITEM_CHARS,
+            )
+        })
         .collect()
 }
 
@@ -969,6 +996,54 @@ fn deliver_digest(
             mailroom.send(&envelope).map(|_| ())
         }
     }
+}
+
+/// Boss incidents skip the LLM orchestrator: their fix is deterministic —
+/// wake the first free agent on a quiet rig with the bounded housekeeping
+/// contract (plan 056). Stale-mail incidents always target this rig (the mail
+/// is local); queue and false-stop incidents take the quietest usable rig.
+/// Returns how many were delivered.
+fn deliver_boss(
+    mailroom: &Mailroom,
+    rigs: &crate::Rigs,
+    results: &[(String, Result<RigProbe>, Duration)],
+    incidents: &[Incident],
+) -> usize {
+    let quiet_target = results
+        .iter()
+        .filter_map(|(name, outcome, _)| {
+            outcome.as_ref().ok().map(|probe| (name, probe)).filter(
+                |(name, probe)| {
+                    probe.quiet && rigs.rigs.get(*name).is_none_or(|rig| rig.accepts_jobs)
+                },
+            )
+        })
+        .map(|(name, _)| name.clone())
+        .min();
+    let mut delivered = 0;
+    for incident in incidents {
+        let target = if incident.fingerprint.starts_with("boss:unread-mail") {
+            Some(rigs.self_rig.clone())
+        } else {
+            quiet_target.clone()
+        };
+        let Some(target) = target else {
+            continue;
+        };
+        let body = crate::boss::housekeeping_prompt(
+            &incident.detail,
+            &target,
+            crate::boss::BOSS_BUDGET_UNITS,
+        );
+        let sent = Address::parse(&format!("*@{target}"))
+            .and_then(|to| mailroom.compose(&to, "boss", body, None))
+            .and_then(|envelope| mailroom.send(&envelope))
+            .is_ok();
+        if sent {
+            delivered += 1;
+        }
+    }
+    delivered
 }
 
 /// macOS: install the launchd job that runs the tick every 60 s and whenever

@@ -223,9 +223,25 @@ fn fleet_context() -> Option<String> {
         &mailroom,
         chrono::Duration::minutes(FLEET_CONTEXT_MAX_AGE_MINUTES),
     )?;
-    Some(format!(
+    let mut text = format!(
         "Rigs (agent-mail fleet; heavy or timing-sensitive work goes through `agent-mail rig run`, never on a BUSY rig or on m3):\n{summary}\n"
-    ))
+    );
+    // Plan 056 W0: name the unclaimed queue so a "lane empty, everything else
+    // gated" summary cannot silently fold it away.
+    if let Some(issues) = agent_mail::rig::cached_fleet_issues(
+        &mailroom,
+        chrono::Duration::minutes(FLEET_CONTEXT_MAX_AGE_MINUTES),
+    ) {
+        let line = issues
+            .iter()
+            .map(|(repo, count)| format!("{repo} {count}"))
+            .collect::<Vec<_>>()
+            .join(" · ");
+        text.push_str(&format!(
+            "Unclaimed actionable issues (the boss watches these; claim with a `**Claimed:**` lease before working): {line}\n"
+        ));
+    }
+    Some(text)
 }
 
 fn board_states_for_context() -> Option<String> {

@@ -11,6 +11,7 @@ use crate::{Mailroom, process_alive};
 use anyhow::{Context as _, Result, bail};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -951,6 +952,11 @@ pub fn status(
 struct FleetCache {
     at: String,
     summary: String,
+    /// Per-repo actionable `.issues`/`.plans` item counts (plan 056 W0),
+    /// written when the boss lane is on so worker context can name the
+    /// unclaimed queue that "lane empty" summaries tend to fold into "gated".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    issues: Option<BTreeMap<String, usize>>,
 }
 
 /// One line per rig, for an LLM's context: role, state, what it is busy with,
@@ -1028,9 +1034,16 @@ fn write_fleet_cache(
     results: &[(String, Result<RigProbe>, Duration)],
     rigs: &crate::Rigs,
 ) {
+    let config = mailroom.watch_config();
+    let issues = config.boss.then(|| {
+        let exclude: std::collections::BTreeSet<String> =
+            config.boss_exclude_repos.iter().cloned().collect();
+        crate::boss::actionable_issue_counts(&crate::watch::repo_roots(), chrono::Utc::now(), &exclude)
+    });
     let cache = FleetCache {
         at: chrono::Utc::now().to_rfc3339(),
         summary: fleet_summary(results, rigs),
+        issues,
     };
     let path = mailroom.home().join("fleet-cache.json");
     if let Ok(bytes) = serde_json::to_vec(&cache) {
@@ -1048,6 +1061,21 @@ pub fn cached_fleet_summary(mailroom: &Mailroom, max_age: chrono::Duration) -> O
     let at = chrono::DateTime::parse_from_rfc3339(&cache.at).ok()?;
     (chrono::Utc::now().signed_duration_since(at) <= max_age && !cache.summary.is_empty())
         .then_some(cache.summary)
+}
+
+/// The cached per-repo actionable-issue counts (plan 056 W0), if some view
+/// refreshed them within `max_age` and any are non-empty.
+pub fn cached_fleet_issues(
+    mailroom: &Mailroom,
+    max_age: chrono::Duration,
+) -> Option<BTreeMap<String, usize>> {
+    let cache: FleetCache =
+        serde_json::from_slice(&fs::read(mailroom.home().join("fleet-cache.json")).ok()?).ok()?;
+    let at = chrono::DateTime::parse_from_rfc3339(&cache.at).ok()?;
+    if chrono::Utc::now().signed_duration_since(at) > max_age {
+        return None;
+    }
+    cache.issues.filter(|issues| !issues.is_empty())
 }
 
 fn probe_remote(mailroom: &Mailroom, rigs: &crate::Rigs, name: &str) -> Result<RigProbe> {

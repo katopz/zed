@@ -6,6 +6,7 @@
 //! is the SSH key auth the rigs already have. Receiving is a cheap directory
 //! scan, done by Claude Code hooks or by `agent-mail recv`.
 
+pub mod boss;
 pub mod jobs;
 pub mod rig;
 #[cfg(feature = "tui")]
