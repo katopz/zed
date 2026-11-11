@@ -12,7 +12,55 @@ use crate::{
     load_config_cached, paused, peer_states, reset_iteration_with_session, set_summary_state,
     summary_state_for, truncate_at_char_boundary, with_first_prompt_context,
 };
-use std::time::Duration;
+use std::collections::VecDeque;
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// Cross-session fork ceiling (issue 058's `MAX_RESUMES` analog). Every
+/// fork — overflow Phase 2 and both cutoff fallbacks — timestamps itself
+/// here. More than [`MAX_FORKS_PER_HOUR`] within a rolling hour means some
+/// fork lineage is forking without progressing (each fork's chain starts
+/// fresh, so per-chain caps never see the pattern); further forks are
+/// refused and their chains stop with the summary left in the thread.
+const MAX_FORKS_PER_HOUR: usize = 30;
+const FORK_WINDOW_SECS: u64 = 3_600;
+static FORK_TIMES: Mutex<Option<VecDeque<u64>>> = Mutex::new(None);
+
+fn fork_clock_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Records a fork attempt; `false` when the rolling-hour ceiling is hit.
+fn note_fork_within_ceiling() -> bool {
+    let now = fork_clock_secs();
+    let mut guard = FORK_TIMES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let forks = guard.get_or_insert_with(VecDeque::new);
+    while forks
+        .front()
+        .is_some_and(|at| now.saturating_sub(*at) > FORK_WINDOW_SECS)
+    {
+        forks.pop_front();
+    }
+    if forks.len() >= MAX_FORKS_PER_HOUR {
+        return false;
+    }
+    forks.push_back(now);
+    true
+}
+
+/// Test binaries never consume the fleet's real fork budget (the
+/// `.issues/059` class: tests must not mutate shared state).
+fn fork_allowed() -> bool {
+    if cfg!(test) {
+        return true;
+    }
+    note_fork_within_ceiling()
+}
 
 /// Phase 1 request sent to the SAME thread — no `## 1/## 2/## 3` headers
 /// since the AI already has full conversation context. Raw instruction only.
@@ -400,6 +448,15 @@ pub(crate) fn context_overflow_outcome(data: &LlmCallData) -> AutoPromptOutcome 
         // summary, via `skip_phase_1`). The last_assistant_message IS the
         // summary. Create a new thread with the inlined summary.
         clear_summary_for_session(&session_id_str);
+        if !fork_allowed() {
+            log::warn!(
+                "[auto_prompt::context_overflow] fork ceiling reached ({MAX_FORKS_PER_HOUR} forks in a rolling hour) — stopping; the summary stays in this thread (session={session_id_str})"
+            );
+            return AutoPromptOutcome::Stopped {
+                reason: "fork ceiling reached — some fork lineage is forking without progressing"
+                    .to_string(),
+            };
+        }
 
         // Phase 2 (P2.2 native summary hook): broadcast the summary to the
         // agent board so peer agents can see what this agent just concluded.
@@ -618,6 +675,14 @@ pub(crate) async fn cutoff_context_full_outcome(
     let Some(summary) = summary else {
         // Legacy fallback (pre-fix behavior, but forced to fork): the window
         // is full, so a same-thread continuation is guaranteed to be rejected.
+        if !fork_allowed() {
+            log::warn!(
+                "auto_prompt: cutoff fork ceiling reached — stopping; no summary was produced (session={session_id_str})"
+            );
+            return AutoPromptOutcome::Stopped {
+                reason: "fork ceiling reached — cutoff fallback fork refused".to_string(),
+            };
+        }
         log::warn!(
             "auto_prompt: cutoff summary unavailable — falling back to bare fork (session={session_id_str})"
         );
@@ -646,6 +711,14 @@ pub(crate) async fn cutoff_context_full_outcome(
         "auto_prompt: cutoff summary produced ({} chars) — forking with real handoff (session={session_id_str})",
         summary.len()
     );
+    if !fork_allowed() {
+        log::warn!(
+            "auto_prompt: cutoff fork ceiling reached — stopping; the summary stays in this thread (session={session_id_str})"
+        );
+        return AutoPromptOutcome::Stopped {
+            reason: "fork ceiling reached — cutoff handoff fork refused".to_string(),
+        };
+    }
 
     // Mirror the Phase 2 fork: terminal summaries stop the chain, nothing-left
     // summaries defer to plan tasks, otherwise continue with the summary's
@@ -731,6 +804,38 @@ mod tests {
     use super::*;
     use crate::auto_prompt_tests::overflow_test_data;
     use crate::extract_decision_prompt;
+
+    #[test]
+    fn fork_ceiling_refuses_after_the_budget_and_recovers_by_pruning() {
+        // Drain the budget; the next fork must be refused.
+        let mut refused_after = None;
+        for attempt in 0..=MAX_FORKS_PER_HOUR {
+            if !note_fork_within_ceiling() {
+                refused_after = Some(attempt);
+                break;
+            }
+        }
+        assert_eq!(
+            refused_after,
+            Some(MAX_FORKS_PER_HOUR),
+            "exactly MAX_FORKS_PER_HOUR forks fit, the next is refused"
+        );
+        // Age out the whole window: the budget is free again.
+        {
+            let mut guard = FORK_TIMES
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let forks = guard.get_or_insert_with(VecDeque::new);
+            let stale = fork_clock_secs().saturating_sub(FORK_WINDOW_SECS + 1);
+            for at in forks.iter_mut() {
+                *at = stale;
+            }
+        }
+        assert!(
+            note_fork_within_ceiling(),
+            "pruning the expired window frees the budget"
+        );
+    }
 
     // --- output bloat detection tests ---
 
