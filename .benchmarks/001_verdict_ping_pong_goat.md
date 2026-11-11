@@ -100,7 +100,7 @@ standing check). The corrected hold:
    the delegated decision instrument for the fleet; demoting unregisters it
    on every default-relying box, demote-with-fleet-explicit-settings adds
    per-box config drift — neither buys a measured quality gain.
-2. **Selection confound — now SHOWN IN DATA, not asserted (the scorer gained
+2. **Selection confound — tested in data, not asserted (the scorer gained
    `matched_bins`, a token-size-matched ON/OFF comparison; verdict_goat.json
    carries it):**
 
@@ -114,10 +114,14 @@ standing check). The corrected hold:
    In the only sizeable like-for-like bin (1M–5M, 7 vs 7 chains at ~2.3–2.5 M
    avg tokens) the raw 5.6x corrections gap COLLAPSES to 42.9% vs 33.3%
    (3 vs 1 corrected chains — noise at this n) and the post-hoc fix rate is
-   IDENTICAL (14.3% both). The raw gap lives in the ≥5M bin, where the OFF
-   cohort has a single chain — the cohorts are not comparable there. The
-   demotion rule's firing on the raw split was the selection artifact
-   (fleet verdict traffic self-selects big contested chains), now evidenced.
+   IDENTICAL (14.3% both). The raw gap sits almost entirely in the ≥5M bin,
+   where the OFF cohort has a single chain with no human turns — the gap is
+   UNMATCHED, not explained: not attributable to the feature on current
+   evidence, and the ≥5M check below is what settles it. The demotion
+   rule's firing on the raw split rode that unmatched bin (fleet verdict
+   traffic self-selects big contested chains; the FAILED cohort's 87.5%
+   correction rate shows contention alone predicts corrections without any
+   verdict output).
 3. **Cost, stated honestly (the verdict session's correction):** the feature
    is NOT zero-autonomous-cost under the decree — agents invoke it on their
    own, and the ON cohort IS that traffic (528k–11.7M tokens/chain). The

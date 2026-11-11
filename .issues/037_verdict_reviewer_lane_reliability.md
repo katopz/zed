@@ -1,6 +1,7 @@
 # 037 — verdict reviewer lane reliability (abort+error 4x over gate)
 
 Status: OPEN — filed 2026-11-11 (amo idle lane) from the bench-001 verdict session (`.benchmarks/001`, 2026-11-11 section): the reviewer lane's failure rate, not the `verdict_ping_pong` flag default, is where the verdict lane loses its value.
+**Claimed:** amo-zed-037acct@amo, 1794477600, expires 2026-11-13T15:30:00+00:00 — scoped to task 3 (scorer accounting) this lease; tasks 1/2/4 (fallback, backoff, gate check) are a fresh lane's work.
 
 ## Evidence
 
@@ -10,7 +11,7 @@ Bench 001's 2026-11-11 re-run (`script/verdict_scorer.py`, 118 chains): 9 aborte
 
 - [ ] Rate-limit-aware fallback in the reviewer lane: on `rate_limit` from a backend, fail over to the configured secondary reviewer (`agent.verdict_secondary_model`) or re-park the request with the reset time instead of burning an abort
 - [ ] Retry/backoff for transient reviewer failures (one bounded retry with the reset-time delay before the attempt counts as FAILED)
-- [ ] Count FAILED attempts separately from honest aborts in `script/verdict_scorer.py` (a 5-hour-window rate_limit is not a negotiation abort) so the gate reads the true failure rate
+- [x] Count FAILED attempts separately from honest aborts in `script/verdict_scorer.py` (a 5-hour-window rate_limit is not a negotiation abort) so the gate reads the true failure rate — DONE 2026-11-11 (amo-zed-037acct): the report gained a `reliability` block (attempts = ON + FAILED chains, aborted negotiations and all-error attempts counted as distinct classes) and the run prints the gate line; first reading **53.1% abort+error (9 + 8 / 32 attempts) — OVER the < 10% gate** (stricter than the bench's loose ~41% over ~41 attempts: chains are the countable unit, one chain can carry several aborts)
 - [ ] Gate: abort+error rate < 10% at the next bench-001 re-run (checked at every +20 ON chains alongside `matched_bins`); if still over, the tool is unreliable enough that default-on is questionable for that reason alone
 
 ## Refs

@@ -647,6 +647,21 @@ def main() -> int:
         # big contested chains), so the demotion rule re-arms on like-sized
         # chains — FAILED excluded (a different class, recorded separately).
         "matched_bins": matched_bins(chain_records),
+        # Issue 037: the reliability gate reads ATTEMPTS, with FAILED
+        # (all-error, e.g. rate-limited windows) kept apart from honest
+        # negotiation aborts — two different failure classes, one gate.
+        "reliability": {
+            "attempts": len(on_chains) + len(failed_chains),
+            "aborted_negotiations": sum(1 for c in on_chains if c["aborted"]),
+            "failed_attempts": len(failed_chains),
+            "abort_error_rate": (
+                (sum(1 for c in on_chains if c["aborted"]) + len(failed_chains))
+                / (len(on_chains) + len(failed_chains))
+                if (on_chains or failed_chains)
+                else None
+            ),
+            "gate": 0.10,
+        },
     }
 
     # Human-readable table.
@@ -695,6 +710,19 @@ def main() -> int:
         print(f"relative fix-rate reduction: {relative:.1%} (GOAT gate: >= ~30%)")
     else:
         print("relative fix-rate reduction: n/a (need both cohorts with summaries)")
+
+    rel = report["reliability"]
+    if rel["attempts"]:
+        rate = rel["abort_error_rate"]
+        status = "UNDER" if rate < rel["gate"] else "OVER"
+        print(
+            f"reviewer-lane reliability (issue 037): {rate:.1%} abort+error "
+            f"({rel['aborted_negotiations']} aborted negotiations + "
+            f"{rel['failed_attempts']} all-error attempts / {rel['attempts']} "
+            f"attempts) — {status} the < 10% gate"
+        )
+    else:
+        print("reviewer-lane reliability (issue 037): n/a (no verdict attempts)")
 
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)

@@ -1,7 +1,7 @@
 {
   "db": "/Users/katopz/Library/Application Support/Zed/threads/threads.db",
   "metadata_db_linked": true,
-  "scored_threads": 559,
+  "scored_threads": 560,
   "chain_count": 118,
   "parse_failures": 0,
   "verdict_on": {
@@ -18,8 +18,8 @@
     "reviewers": [
       "claude_code"
     ],
-    "avg_chain_input_tokens": 11715453.208333334,
-    "avg_chain_output_tokens": 1175673.7916666667,
+    "avg_chain_input_tokens": 11731551.125,
+    "avg_chain_output_tokens": 1176387.5416666667,
     "chains_with_human_turns": 24,
     "chains_with_human_corrections": 14,
     "human_correction_rate": 0.5833333333333334,
@@ -2769,7 +2769,8 @@
       "members": [
         "73cce97a-00f1-4331-bcf7-b989430b415d",
         "220383b0-fe50-4e0e-9880-54abcf20a53e",
-        "97189399-adc5-461a-a622-1039db6ccc4e"
+        "97189399-adc5-461a-a622-1039db6ccc4e",
+        "2f05dd1a-75a1-43bc-92ee-aeb2cf589b35"
       ],
       "verdict_on": true,
       "verdict_failed": false,
@@ -2786,8 +2787,8 @@
       ],
       "cited_commits": 25,
       "resolved_commits": 25,
-      "input_tokens": 1242939,
-      "output_tokens": 414271,
+      "input_tokens": 1629289,
+      "output_tokens": 431401,
       "human_messages": 2
     },
     {
@@ -2963,7 +2964,7 @@
         "chains_with_human_corrections": 3,
         "human_correction_rate": 0.42857142857142855,
         "commit_resolution_rate": 0.9463087248322147,
-        "avg_total_tokens": 2523695.4285714286
+        "avg_total_tokens": 2581335.4285714286
       },
       "off": {
         "chains": 7,
@@ -2998,5 +2999,12 @@
         "avg_total_tokens": 11094987.0
       }
     }
+  },
+  "reliability": {
+    "attempts": 32,
+    "aborted_negotiations": 9,
+    "failed_attempts": 8,
+    "abort_error_rate": 0.53125,
+    "gate": 0.1
   }
 }
