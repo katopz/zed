@@ -1,7 +1,8 @@
 # 037 — verdict reviewer lane reliability (abort+error 4x over gate)
 
 Status: OPEN — filed 2026-11-11 (amo idle lane) from the bench-001 verdict session (`.benchmarks/001`, 2026-11-11 section): the reviewer lane's failure rate, not the `verdict_ping_pong` flag default, is where the verdict lane loses its value.
-**Claimed:** amo-zed-037acct@amo, 1794477600, expires 2026-11-13T15:30:00+00:00 — scoped to task 3 (scorer accounting) this lease; tasks 1/2/4 (fallback, backoff, gate check) are a fresh lane's work.
+**Claimed:** amo-zed-037acct@amo, 1794477600, expires 2026-11-13T15:30:00+00:00
+Scoped to task 3 (scorer accounting) this lease; tasks 1/2/4 (fallback, backoff, gate check) are a fresh lane's work.
 
 ## Evidence
 
