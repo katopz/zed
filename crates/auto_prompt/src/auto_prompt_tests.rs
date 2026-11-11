@@ -12,7 +12,10 @@ fn make_continue_action_appends_tried_steps_ledger() {
     let plain = data.make_continue_action("continue".to_string());
     assert!(!plain.next_prompt.contains(TRIED_STEPS_HEADER));
 
-    chain::record_summary_steps(session, "- Plan 055: mine the schedulers\n- Ship the ledger");
+    chain::record_summary_steps(
+        session,
+        "- Plan 055: mine the schedulers\n- Ship the ledger",
+    );
     let action = data.make_continue_action("continue".to_string());
     assert!(action.next_prompt.contains(TRIED_STEPS_HEADER));
     assert!(action.next_prompt.contains("Ship the ledger"));
@@ -46,9 +49,7 @@ fn claimed_plan_scoreboard_counts_flipped_checkboxes_as_progress() {
     std::fs::write(&plan_path, "# Plan\n\n- [x] Task A\n- [x] Task B\n").expect("rewrite plan");
     assert_eq!(
         record_claimed_plan_progress(session, None),
-        Some(chain::PlanProgress::Advanced {
-            checked_delta: 1
-        })
+        Some(chain::PlanProgress::Advanced { checked_delta: 1 })
     );
     assert_eq!(
         record_claimed_plan_progress(session, None),

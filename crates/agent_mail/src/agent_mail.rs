@@ -226,7 +226,11 @@ impl SshRoute {
         match self {
             SshRoute::Direct(target) => host(target),
             SshRoute::Jumped { target, .. } => {
-                format!("{} via {}", host(target), self.via_label(rigs).unwrap_or_default())
+                format!(
+                    "{} via {}",
+                    host(target),
+                    self.via_label(rigs).unwrap_or_default()
+                )
             }
         }
     }
@@ -1785,7 +1789,10 @@ mod tests {
     fn ssh_routes_parse_old_configs_and_resolve_jump_labels() {
         // Old string-only rigs.json keeps parsing.
         let old: Rig = serde_json::from_str(r#"{"ssh": ["katopz@100.100.117.44"]}"#).unwrap();
-        assert_eq!(old.ssh, vec![SshRoute::Direct("katopz@100.100.117.44".into())]);
+        assert_eq!(
+            old.ssh,
+            vec![SshRoute::Direct("katopz@100.100.117.44".into())]
+        );
 
         // Mixed form: direct first, jump-hosted fallback second.
         let rigs: Rigs = serde_json::from_str(
@@ -1826,7 +1833,9 @@ mod tests {
 
         // Round-trip keeps the object form for jumped routes.
         let back = serde_json::to_string(&rigs.rigs["bmo"]).unwrap();
-        assert!(back.contains(r#"{"target":"katopz@192.168.10.2","jump":"katopz@100.111.186.76"}"#));
+        assert!(
+            back.contains(r#"{"target":"katopz@192.168.10.2","jump":"katopz@100.111.186.76"}"#)
+        );
     }
 
     #[test]

@@ -747,16 +747,25 @@ mod tests {
                 "probe".into(),
             ],
         );
-        assert!(error.is_err(), "stdin path still runs; only the parse matters here");
+        assert!(
+            error.is_err(),
+            "stdin path still runs; only the parse matters here"
+        );
     }
 
     #[test]
     fn send_unknown_flag_errors_instead_of_becoming_the_message() {
         let room = room();
-        let error = send(&room, vec!["zed-x@m3".into(), "--as".into(), "something".into()])
-            .expect_err("unknown flags must not turn into mail");
+        let error = send(
+            &room,
+            vec!["zed-x@m3".into(), "--as".into(), "something".into()],
+        )
+        .expect_err("unknown flags must not turn into mail");
         assert!(error.to_string().contains("unknown flag --as"), "{error:#}");
-        assert!(!dir_has_inbox(&room, "--as"), "no folder named after a flag");
+        assert!(
+            !dir_has_inbox(&room, "--as"),
+            "no folder named after a flag"
+        );
     }
 
     #[test]

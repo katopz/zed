@@ -450,7 +450,12 @@ pub fn detect<'a>(
         let shown = stale_mail
             .iter()
             .take(STALE_MAIL_NAMES_SHOWN)
-            .map(|mail| format!("{} ×{} ({} min)", mail.inbox, mail.pending, mail.oldest_age_min))
+            .map(|mail| {
+                format!(
+                    "{} ×{} ({} min)",
+                    mail.inbox, mail.pending, mail.oldest_age_min
+                )
+            })
             .collect::<Vec<_>>()
             .join(", ");
         let hidden = stale_mail.len().saturating_sub(STALE_MAIL_NAMES_SHOWN);
@@ -492,7 +497,7 @@ pub fn housekeeping_prompt(detail: &str, rig: &str, budget: usize) -> String {
          item you take with a `**Claimed:** <name>, <unix-ms>, expires <RFC3339 +2h>` line in \
          the doc you touch, so the fleet sees the lease.\n\
          \n\
-         Boss incident(s):
+         Boss incident(s):\n\
          {detail}\n\
          \n\
          Checklist, in priority order — skip anything genuinely gated, never invent work:\n\
@@ -576,7 +581,13 @@ mod tests {
     fn stop_markers_roundtrip_and_expire() {
         let dir = tempfile::tempdir().unwrap();
         let room = room(dir.path());
-        record_stop(&room, "sess-1234", Some("/Users/k/git/katgpt-rs"), END_TERMINAL, true);
+        record_stop(
+            &room,
+            "sess-1234",
+            Some("/Users/k/git/katgpt-rs"),
+            END_TERMINAL,
+            true,
+        );
         record_stop(&room, "sess-5678", None, END_FINAL, true);
 
         let ends = recent_thread_ends(&room, chrono::Utc::now(), THREAD_END_WINDOW);
@@ -610,7 +621,11 @@ mod tests {
             "001_done.md",
             "# one\nStatus: done — merged\n\n- [ ] leftover",
         );
-        write("katgpt-rs", "002_open.md", "# two\nStatus: open\n\n- [ ] first task");
+        write(
+            "katgpt-rs",
+            "002_open.md",
+            "# two\nStatus: open\n\n- [ ] first task",
+        );
         write(
             "katgpt-rs",
             "003_live_lease.md",
@@ -626,7 +641,11 @@ mod tests {
             "005_excluded.md",
             "# five\nStatus: open\n\n- [ ] excluded repo",
         );
-        write("zed", "006_not_tracked.md", "# six\nStatus: open\n\n- [ ] not tracked");
+        write(
+            "zed",
+            "006_not_tracked.md",
+            "# six\nStatus: open\n\n- [ ] not tracked",
+        );
 
         let exclude = BTreeSet::from(["seal-game-editor".to_string()]);
         let work = scan_open_work(std::slice::from_ref(&root), chrono::Utc::now(), &exclude);
@@ -647,7 +666,10 @@ mod tests {
         let rigs = rigs();
         let amo = probe(r#"{"rig":"amo","os":"macos","at":"","cores":8,"quiet":true}"#);
         let bmo = probe(r#"{"rig":"bmo","os":"macos","at":"","cores":8,"quiet":true}"#);
-        let work = vec![open_work("katgpt-rs", "a.md"), open_work("katgpt-rs", "b.md")];
+        let work = vec![
+            open_work("katgpt-rs", "a.md"),
+            open_work("katgpt-rs", "b.md"),
+        ];
         let now = chrono::Utc::now();
 
         let online = vec![("amo", &amo), ("bmo", &bmo)];
@@ -657,7 +679,10 @@ mod tests {
         assert_eq!(incidents[0].min_ticks, BOSS_MIN_TICKS);
         assert_eq!(incidents[0].reset_key.as_deref(), Some("2:a.md,b.md"));
         assert!(incidents[0].detail.contains("2 actionable item(s)"));
-        assert!(incidents[0].detail.contains("on amo"), "lowest quiet rig name wins");
+        assert!(
+            incidents[0].detail.contains("on amo"),
+            "lowest quiet rig name wins"
+        );
 
         // A generating agent sitting in the repo means it is being worked.
         let busy_repo = probe(
@@ -733,15 +758,35 @@ mod tests {
         assert_eq!(incidents[0].min_ticks, BOSS_STOP_TICKS);
         assert!(incidents[0].reset_key.is_none());
 
-        assert!(detect(&online, &rigs, &work, &[end("s2", END_FINAL, 30)], &[], now, false)
+        assert!(
+            detect(
+                &online,
+                &rigs,
+                &work,
+                &[end("s2", END_FINAL, 30)],
+                &[],
+                now,
+                false
+            )
             .iter()
             .all(|incident| !incident.fingerprint.starts_with("boss:false-stop")),
-            "a final stop ran its housekeeping pass — not a false stop");
+            "a final stop ran its housekeeping pass — not a false stop"
+        );
 
-        assert!(detect(&online, &rigs, &work, &[end("s3", END_TERMINAL, 90)], &[], now, false)
+        assert!(
+            detect(
+                &online,
+                &rigs,
+                &work,
+                &[end("s3", END_TERMINAL, 90)],
+                &[],
+                now,
+                false
+            )
             .iter()
             .all(|incident| !incident.fingerprint.starts_with("boss:false-stop")),
-        "a terminal stop outside the window is stale news");
+            "a terminal stop outside the window is stale news"
+        );
 
         let elsewhere = [ThreadEnd {
             session: "s4".into(),
@@ -751,10 +796,12 @@ mod tests {
             had_summary: true,
             at: now.timestamp_millis(),
         }];
-        assert!(detect(&online, &rigs, &work, &elsewhere, &[], now, false)
-            .iter()
-            .all(|incident| incident.fingerprint != "boss:false-stop:s4"),
-        "terminal over a repo with no open work is a legitimate stop");
+        assert!(
+            detect(&online, &rigs, &work, &elsewhere, &[], now, false)
+                .iter()
+                .all(|incident| incident.fingerprint != "boss:false-stop:s4"),
+            "terminal over a repo with no open work is a legitimate stop"
+        );
     }
 
     #[test]
@@ -818,17 +865,9 @@ mod tests {
         // A live Zed on the rig makes it the boss's problem; with none, the
         // rig's zed-wake job owns the wake.
         let incident = |live: bool| {
-            detect(
-                &[],
-                &rigs(),
-                &[],
-                &[],
-                &mail,
-                now,
-                live,
-            )
-            .into_iter()
-            .find(|incident| incident.fingerprint == "boss:unread-mail")
+            detect(&[], &rigs(), &[], &[], &mail, now, live)
+                .into_iter()
+                .find(|incident| incident.fingerprint == "boss:unread-mail")
         };
         assert_eq!(incident(true).unwrap().min_ticks, BOSS_MAIL_TICKS);
         assert!(incident(false).is_none());

@@ -982,7 +982,11 @@ pub fn fleet_summary(
                     true => format!(
                         " (routes: {})",
                         rig.map(|rig| {
-                            rig.ssh.iter().map(|route| route.label(rigs)).collect::<Vec<_>>().join(" · ")
+                            rig.ssh
+                                .iter()
+                                .map(|route| route.label(rigs))
+                                .collect::<Vec<_>>()
+                                .join(" · ")
                         })
                         .unwrap_or_default()
                     ),
@@ -1038,7 +1042,11 @@ fn write_fleet_cache(
     let issues = config.boss.then(|| {
         let exclude: std::collections::BTreeSet<String> =
             config.boss_exclude_repos.iter().cloned().collect();
-        crate::boss::actionable_issue_counts(&crate::watch::repo_roots(), chrono::Utc::now(), &exclude)
+        crate::boss::actionable_issue_counts(
+            &crate::watch::repo_roots(),
+            chrono::Utc::now(),
+            &exclude,
+        )
     });
     let cache = FleetCache {
         at: chrono::Utc::now().to_rfc3339(),

@@ -526,38 +526,10 @@ pub fn tick(mailroom: &Mailroom, force: bool) -> Result<TickReport> {
                 first_seen_ms: now,
                 ..IncidentState::default()
             });
-        entry.ticks += 1;
-        entry.detail = incident.detail.clone();
-        if entry.reset_key != incident.reset_key {
-            // The work set changed (items resolved or landed): a fresh cycle,
-            // even mid-cooldown, so new work is never stuck behind old waits.
-            entry.reset_key = incident.reset_key.clone();
-            entry.rounds = 0;
-        }
-        if entry.ticks < incident.min_ticks {
-            continue;
-        }
-        // Escalated once: stay silent until the incident clears, so a stuck
-        // problem never keeps waking agents (and spending their tokens).
-        // Boss incidents (plan 056) never escalate — the gating law sends
-        // non-credential decisions to Claude via the woken agent, not to the
-        // owner — and wait out a run-length cooldown, because one bounded
-        // housekeeping run outlasts the ordinary 30-min cooldown.
-        let boss = incident.fingerprint.starts_with("boss:");
-        if !boss && entry.rounds > ESCALATE_AFTER_ROUNDS {
-            continue;
-        }
-        // Details drift every tick (idle minutes, heads), so only a new
-        // fingerprint wakes immediately; a known one waits out its cooldown.
-        let incident_cooldown = if boss { BOSS_COOLDOWN_MS } else { cooldown_ms };
-        if entry.rounds > 0 && now - entry.last_woke_ms < incident_cooldown {
-            continue;
-        }
-        entry.rounds += 1;
-        entry.last_woke_ms = now;
-        match entry.rounds > ESCALATE_AFTER_ROUNDS && !boss {
-            true => to_escalate.push(incident.clone()),
-            false => to_wake.push(incident.clone()),
+        match gate_round(entry, incident, now, cooldown_ms) {
+            RoundGate::Wait => {}
+            RoundGate::Wake => to_wake.push(incident.clone()),
+            RoundGate::Escalate => to_escalate.push(incident.clone()),
         }
     }
     state.last_tick_ms = now;
@@ -612,6 +584,73 @@ pub fn tick(mailroom: &Mailroom, force: bool) -> Result<TickReport> {
 }
 
 struct TickLock(PathBuf);
+
+/// One tick's decision for one incident: wait, wake a resolver, or escalate
+/// to the owner. Extracted pure from [`tick`] so the cooldown semantics —
+/// including the boss exceptions — stay unit-testable without a fleet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoundGate {
+    Wait,
+    Wake,
+    Escalate,
+}
+
+fn gate_round(
+    entry: &mut IncidentState,
+    incident: &Incident,
+    now: i64,
+    cooldown_ms: i64,
+) -> RoundGate {
+    entry.ticks += 1;
+    entry.detail = incident.detail.clone();
+    // The cooldown is anchored to the last real wake, NOT to `rounds`: a
+    // boss work-set key changes the moment the woken agent writes its own
+    // `**Claimed:**` lease, and resetting `rounds` alone would re-wake on
+    // the next tick. `rounds` stays the escalation counter only.
+    let since_wake = now - entry.last_woke_ms;
+    let woke_before = entry.last_woke_ms != 0;
+    // The queue grew (new items landed) — allowed to re-fire sooner than the
+    // full cooldown, but never while a fresh wake is still young.
+    let item_count = |key: &Option<String>| {
+        key.as_ref()
+            .and_then(|key| key.split(':').next())
+            .and_then(|count| count.parse::<usize>().ok())
+    };
+    let queue_grew = item_count(&incident.reset_key)
+        .zip(item_count(&entry.reset_key))
+        .is_some_and(|(new, old)| new > old);
+    if entry.reset_key != incident.reset_key {
+        entry.reset_key = incident.reset_key.clone();
+        entry.rounds = 0;
+    }
+    if entry.ticks < incident.min_ticks {
+        return RoundGate::Wait;
+    }
+    // Escalated once: stay silent until the incident clears, so a stuck
+    // problem never keeps waking agents (and spending their tokens). Boss
+    // incidents (plan 056) never escalate — the gating law sends
+    // non-credential decisions to Claude via the woken agent, not to the
+    // owner — and wait out a run-length cooldown, because one bounded
+    // housekeeping run outlasts the ordinary 30-min cooldown.
+    let boss = incident.fingerprint.starts_with("boss:");
+    if !boss && entry.rounds > ESCALATE_AFTER_ROUNDS {
+        return RoundGate::Wait;
+    }
+    // Details drift every tick (idle minutes, heads), so only a new
+    // fingerprint wakes immediately; a known one waits out its cooldown.
+    let incident_cooldown = if boss { BOSS_COOLDOWN_MS } else { cooldown_ms };
+    let in_cooldown = woke_before && since_wake < incident_cooldown;
+    let regrown = queue_grew && since_wake >= BOSS_REGROW_COOLDOWN_MS;
+    if in_cooldown && !regrown {
+        return RoundGate::Wait;
+    }
+    entry.rounds += 1;
+    entry.last_woke_ms = now;
+    match entry.rounds > ESCALATE_AFTER_ROUNDS && !boss {
+        true => RoundGate::Escalate,
+        false => RoundGate::Wake,
+    }
+}
 
 impl TickLock {
     fn acquire(path: &Path) -> Option<Self> {
@@ -781,7 +820,7 @@ pub fn detect(
                 drifted.join("; ")
             ),
             min_ticks: DRIFT_TICKS,
-                reset_key: None,
+            reset_key: None,
         });
     }
 
@@ -808,7 +847,7 @@ pub fn detect(
                 event.session, event.rig, event.cwd
             ),
             min_ticks: 1,
-                reset_key: None,
+            reset_key: None,
         });
     }
     incidents
@@ -1057,15 +1096,18 @@ fn deliver_digest(
     }
 }
 
+/// A thread-end marker is hard evidence, but one bounded housekeeping run
+/// outlasts the ordinary cooldown: the boss re-fires at most hourly, and a
+/// regrown queue (new items landed) at most every 20 minutes.
+const BOSS_COOLDOWN_MS: i64 = 60 * 60 * 1000;
+const BOSS_REGROW_COOLDOWN_MS: i64 = 20 * 60 * 1000;
+
 /// Boss incidents skip the LLM orchestrator: their fix is deterministic —
 /// wake the first free agent on a quiet rig with the bounded housekeeping
 /// contract (plan 056). Stale-mail incidents always target this rig (the mail
 /// is local); queue and false-stop incidents take the quietest usable rig.
-/// Returns how many were delivered.
-/// A thread-end marker is hard evidence, but one bounded housekeeping run
-/// outlasts the ordinary cooldown: the boss re-fires at most hourly.
-const BOSS_COOLDOWN_MS: i64 = 60 * 60 * 1000;
-
+/// Grouped per target: one combined mail per rig per tick, so the resolved
+/// free agent runs a single bounded pass. Returns how many rigs were woken.
 fn deliver_boss(
     mailroom: &Mailroom,
     rigs: &crate::Rigs,
@@ -1075,11 +1117,13 @@ fn deliver_boss(
     let quiet_target = results
         .iter()
         .filter_map(|(name, outcome, _)| {
-            outcome.as_ref().ok().map(|probe| (name, probe)).filter(
-                |(name, probe)| {
+            outcome
+                .as_ref()
+                .ok()
+                .map(|probe| (name, probe))
+                .filter(|(name, probe)| {
                     probe.quiet && rigs.rigs.get(*name).is_none_or(|rig| rig.accepts_jobs)
-                },
-            )
+                })
         })
         .map(|(name, _)| name.clone())
         .min();
@@ -1104,11 +1148,8 @@ fn deliver_boss(
             .map(|incident| format!("- {}", incident.detail))
             .collect::<Vec<_>>()
             .join("\n");
-        let body = crate::boss::housekeeping_prompt(
-            &details,
-            &target,
-            crate::boss::BOSS_BUDGET_UNITS,
-        );
+        let body =
+            crate::boss::housekeeping_prompt(&details, &target, crate::boss::BOSS_BUDGET_UNITS);
         let sent = Address::parse(&format!("*@{target}"))
             .and_then(|to| mailroom.compose(&to, "boss", body, None))
             .and_then(|envelope| mailroom.send(&envelope))
@@ -1274,10 +1315,9 @@ mod tests {
         let room = Mailroom::new(dir.path().to_path_buf());
         room.init("amo").unwrap();
         room.write_live_entry("zed-aaaa", "idle", "thread");
-        let rigs = serde_json::from_str::<crate::Rigs>(
-            r#"{"self":"amo","rigs":{"amo":{"ssh":[]}}}"#,
-        )
-        .unwrap();
+        let rigs =
+            serde_json::from_str::<crate::Rigs>(r#"{"self":"amo","rigs":{"amo":{"ssh":[]}}}"#)
+                .unwrap();
         let amo = serde_json::from_str::<RigProbe>(
             r#"{"rig":"amo","os":"macos","at":"","cores":8,"quiet":true}"#,
         )
@@ -1305,6 +1345,89 @@ mod tests {
         assert!(mail[0].body.contains("queue detail"));
         assert!(mail[0].body.contains("mail detail"));
         assert_eq!(mail[0].from, "boss@amo");
+    }
+
+    #[test]
+    fn a_claim_changing_the_work_set_does_not_skip_the_cooldown() {
+        // The woken agent's own first `**Claimed:**` lease changes the
+        // queue's reset_key within seconds of the wake: the cooldown must
+        // still hold, or the boss re-wakes every tick (double-drive).
+        let now = 1_000_000;
+        let hour = 60 * 60 * 1000;
+        let mut entry = IncidentState::default();
+        let queue = |count: usize| Incident {
+            fingerprint: "boss:queue:katgpt-rs".into(),
+            detail: format!("{count} actionable item(s)"),
+            min_ticks: 6,
+            reset_key: Some(format!("{count}:a.md")),
+        };
+
+        // Six ticks cross min_ticks, then the wake fires and arms cooldown.
+        for _ in 0..5 {
+            assert_eq!(
+                gate_round(&mut entry, &queue(2), now, hour),
+                RoundGate::Wait
+            );
+        }
+        assert_eq!(
+            gate_round(&mut entry, &queue(2), now, hour),
+            RoundGate::Wake
+        );
+
+        // The agent claims item a.md right after: set shrinks to 1 —
+        // within the cooldown, so no re-wake despite the changed key.
+        entry.reset_key = Some("1:a.md".into());
+        entry.rounds = 0;
+        assert_eq!(
+            gate_round(&mut entry, &queue(1), now + 60_000, hour),
+            RoundGate::Wait,
+            "a claim inside the cooldown must not re-wake"
+        );
+
+        // Shrunk further mid-cooldown: still held.
+        entry.reset_key = Some("1:b.md".into());
+        assert_eq!(
+            gate_round(&mut entry, &queue(1), now + 120_000, hour),
+            RoundGate::Wait
+        );
+
+        // The queue GROWS by a new issue after 20+ min: early re-fire.
+        entry.reset_key = Some("1:a.md".into());
+        assert_eq!(
+            gate_round(&mut entry, &queue(2), now + 21 * 60_000, hour),
+            RoundGate::Wake,
+            "a regrown queue re-fires after the regrow window"
+        );
+
+        // Boss incidents never escalate, no matter how many rounds pass.
+        let mut entry = IncidentState::default();
+        entry.ticks = 6;
+        entry.rounds = ESCALATE_AFTER_ROUNDS + 1;
+        entry.last_woke_ms = now - 2 * hour;
+        assert_eq!(
+            gate_round(&mut entry, &queue(2), now, hour),
+            RoundGate::Wake,
+            "boss wakes forever, escalates never"
+        );
+
+        // Ordinary incidents still escalate after their rounds: three wakes,
+        // then the fourth round escalates, then silence.
+        let ordinary = Incident {
+            fingerprint: "stalled:amo:zed-x".into(),
+            detail: "stalled".into(),
+            min_ticks: 1,
+            reset_key: None,
+        };
+        let mut entry = IncidentState::default();
+        for _ in 0..ESCALATE_AFTER_ROUNDS {
+            assert_eq!(gate_round(&mut entry, &ordinary, now, 0), RoundGate::Wake);
+        }
+        assert_eq!(
+            gate_round(&mut entry, &ordinary, now, 0),
+            RoundGate::Escalate
+        );
+        entry.last_woke_ms = now - 10 * hour;
+        assert_eq!(gate_round(&mut entry, &ordinary, now, 0), RoundGate::Wait);
     }
 
     #[test]

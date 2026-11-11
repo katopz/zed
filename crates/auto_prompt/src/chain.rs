@@ -634,9 +634,11 @@ mod tests {
         }
         assert_eq!(tried_steps_excerpts(session).len(), STEPS_LEDGER_CAP);
         // The oldest entries dropped off the front.
-        assert!(!tried_steps_excerpts(session)
-            .iter()
-            .any(|excerpt| excerpt.contains("Plan 055")));
+        assert!(
+            !tried_steps_excerpts(session)
+                .iter()
+                .any(|excerpt| excerpt.contains("Plan 055"))
+        );
         clear_session(session);
     }
 

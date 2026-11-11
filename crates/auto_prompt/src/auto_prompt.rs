@@ -791,8 +791,8 @@ pub(crate) fn record_claimed_plan_progress(
             continue;
         };
         files_read += 1;
-        checked_total = checked_total
-            .saturating_add(lightweight_context::count_checked_tasks(&content) as u32);
+        checked_total =
+            checked_total.saturating_add(lightweight_context::count_checked_tasks(&content) as u32);
         actionable_total = actionable_total
             .saturating_add(lightweight_context::count_actionable_tasks(&content) as u32);
     }
@@ -1178,10 +1178,10 @@ fn note_chain_stop(data: &LlmCallData, ended_by: &str) {
     // deps dir; the shipped app never does. cfg!(test) only covers the crate
     // under test, so markers would otherwise leak into the real
     // `~/.agent-mail` from dependency tests (the `.issues/059` class).
-    if std::env::current_exe()
-        .ok()
-        .is_some_and(|path| path.components().any(|component| component.as_os_str() == "deps"))
-    {
+    if std::env::current_exe().ok().is_some_and(|path| {
+        path.components()
+            .any(|component| component.as_os_str() == "deps")
+    }) {
         return;
     }
     let cwd = data
@@ -1193,7 +1193,12 @@ fn note_chain_stop(data: &LlmCallData, ended_by: &str) {
         .last_assistant_message
         .as_deref()
         .is_some_and(|message| message.contains("## Summary"));
-    agent_mail::boss::note_stop(&data.session_id.to_string(), cwd.as_deref(), ended_by, had_summary);
+    agent_mail::boss::note_stop(
+        &data.session_id.to_string(),
+        cwd.as_deref(),
+        ended_by,
+        had_summary,
+    );
 }
 
 /// Outcome for a keyword stop seen on the LLM path (defense in depth —
