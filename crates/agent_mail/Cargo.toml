@@ -22,6 +22,7 @@ tui = ["dep:ratatui"]
 
 [dependencies]
 anyhow.workspace = true
+blake3.workspace = true
 ratatui = { version = "0.30", optional = true, default-features = false, features = ["crossterm", "layout-cache"] }
 base64.workspace = true
 regex = { workspace = true, features = ["unicode"] }

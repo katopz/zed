@@ -11,6 +11,7 @@ pub mod jobs;
 pub mod rig;
 #[cfg(feature = "tui")]
 pub mod tui;
+pub mod verify;
 pub mod watch;
 pub mod zed_wake;
 

@@ -10,11 +10,16 @@
 //! behind it, so benchmarks cannot be starved by a stream of builds.
 
 use crate::rig::{self, Contention};
+use crate::verify::{
+    read_result_file, verify_against_baseline, RunEnvironment, VerifyLedgerRow, VerifyOutcome,
+    VerifySpec,
+};
 use crate::{Address, MailMode, Mailroom, validate_name};
 use anyhow::{Context as _, Result, anyhow, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -89,6 +94,15 @@ pub struct JobSpec {
     /// own target dir, so the job never builds a sibling agent's dirty tree.
     #[serde(default)]
     pub worktree: Option<String>,
+    /// Set on verifier-lane runs (issue 055): a re-measurement of another
+    /// rig's claimed gain, forced exclusive, refused on the producing rig.
+    #[serde(default)]
+    pub verify: Option<VerifySpec>,
+    /// JSON file (relative to the job's cwd) the command must write with its
+    /// measured numbers; without it a verify run ends `no-result` — a gain
+    /// whose cell is missing is not a result.
+    #[serde(default)]
+    pub result_path: Option<String>,
     pub submitted_at: String,
 }
 
@@ -110,13 +124,23 @@ pub struct JobRecord {
     pub started_at: String,
     #[serde(default)]
     pub ended_at: Option<String>,
-    /// `done`, `failed`, `timeout`, `cancelled`, `executor-died`.
+    /// `done`, `failed`, `timeout`, `cancelled`, `executor-died`, `no-result`.
     #[serde(default)]
     pub outcome: Option<String>,
     #[serde(default)]
     pub exit_code: Option<i32>,
     #[serde(default)]
     pub poisoned: Vec<Poison>,
+    /// Provenance of the machine that ran the job (issue 055).
+    #[serde(default)]
+    pub environment: Option<RunEnvironment>,
+    /// Measured numbers read from `result_path` before the worktree is
+    /// cleaned up (a verify run's counted cell).
+    #[serde(default)]
+    pub measured: Option<BTreeMap<String, f64>>,
+    /// Ratio-to-baseline verdicts, set when a verify run finished.
+    #[serde(default)]
+    pub verify_outcome: Option<VerifyOutcome>,
 }
 
 /// A job's private checkout and the repo it belongs to.
@@ -163,16 +187,22 @@ pub struct JobSummary {
 /// Picks the rig for `rig run auto`: takes jobs, online, has the required
 /// capabilities; an exclusive job prefers a quiet rig with nothing managed
 /// running, a shared one the most free cores; fewer waiting jobs first.
+/// `exclude` names rigs the job may not run on (a verify run never lands on
+/// the rig that produced the gain it re-measures, issue 055).
 pub fn pick_rig(
     results: &[(String, Result<rig::RigProbe>, Duration)],
     rigs: &crate::Rigs,
     needs: &Needs,
     lane: Lane,
+    exclude: &[String],
 ) -> Result<String> {
     let mut candidates: Vec<(usize, i64, String)> = results
         .iter()
         .filter_map(|(name, outcome, _)| {
             let probe = outcome.as_ref().ok()?;
+            if exclude.iter().any(|rig| rig == name) {
+                return None;
+            }
             let rig = rigs.rigs.get(name)?;
             if !rig.accepts_jobs || !needs.caps.iter().all(|cap| rig.caps.contains(cap)) {
                 return None;
@@ -544,9 +574,17 @@ impl Mailroom {
             outcome: None,
             exit_code: None,
             poisoned: Vec::new(),
+            environment: None,
+            measured: None,
+            verify_outcome: None,
         };
-        write_json(&record_path, &record)?;
         let rig_name = self.rigs().map(|rigs| rigs.self_rig).unwrap_or_default();
+        record.environment = Some(RunEnvironment::capture(
+            &rig_name,
+            record.spec.worktree.as_deref(),
+            record.spec.verify.as_ref().map(|verify| verify.manifest_blake3.as_str()),
+        ));
+        write_json(&record_path, &record)?;
         self.job_mail(
             &record.spec,
             format!(
@@ -643,6 +681,14 @@ impl Mailroom {
             }
             std::thread::sleep(WAIT_POLL);
         };
+        // The result file lives in the worktree, which is deleted below —
+        // read the measured cell first so a verify run can count it.
+        if outcome.0 == "done"
+            && let Some(result_path) = &record.spec.result_path
+        {
+            record.measured = read_result_file(&cwd, result_path);
+            write_json(&record_path, &record)?;
+        }
         self.cleanup_worktree(worktree.as_ref());
         if record.spec.lane == Lane::Exclusive {
             fs::write(self.jobs_dir("last_exclusive_end"), now()).ok();
@@ -667,7 +713,40 @@ impl Mailroom {
         exit_code: Option<i32>,
         running_path: &Path,
     ) {
-        record.outcome = Some(outcome.to_string());
+        // A verify run only counts when it produced its measured cell: the
+        // command exiting cleanly without the numbers is `no-result`, not a
+        // gain (issue 055: a cell that lacks its numbers is not a result).
+        let outcome = if outcome == "done"
+            && record.spec.result_path.is_some()
+            && record.measured.is_none()
+        {
+            "no-result"
+        } else {
+            outcome
+        }
+        .to_string();
+        if record.spec.verify.is_some() && outcome == "done" {
+            let provenance = record
+                .environment
+                .as_ref()
+                .is_none_or(|environment| !environment.complete());
+            if let Some(measured) = record.measured.clone()
+                && let Some(verify) = record.spec.verify.clone()
+            {
+                let mut verify_outcome = verify_against_baseline(&measured, &verify.baseline);
+                verify_outcome.origin_job = verify.origin_job;
+                verify_outcome.produced_on = verify.produced_on;
+                verify_outcome.verified_on = record
+                    .environment
+                    .as_ref()
+                    .map(|environment| environment.rig.clone())
+                    .unwrap_or_default();
+                verify_outcome.provenance_incomplete = provenance;
+                record.verify_outcome = Some(verify_outcome.clone());
+                self.record_verify_ledger(&record, &verify_outcome, &outcome);
+            }
+        }
+        record.outcome = Some(outcome.clone());
         record.exit_code = exit_code;
         record.ended_at = Some(now());
         let id = record.spec.id.clone();
@@ -691,8 +770,32 @@ impl Mailroom {
                     .join("; ")
             ),
         };
+        let verify = match &record.verify_outcome {
+            None => String::new(),
+            Some(outcome) => {
+                let mut lines = vec![format!(
+                    "\nVERIFY: {} vs {} — {}{}",
+                    outcome.verified_on, outcome.produced_on, outcome.verdict,
+                    if outcome.provenance_incomplete {
+                        " (provenance incomplete: does not count)"
+                    } else {
+                        ""
+                    }
+                )];
+                for (name, metric) in &outcome.metrics {
+                    lines.push(format!(
+                        "  {name}: measured {} vs baseline {} ({:+.1}%, {})",
+                        metric.measured,
+                        metric.baseline,
+                        (metric.improvement - 1.0) * 100.0,
+                        metric.verdict
+                    ));
+                }
+                lines.join("\n")
+            }
+        };
         let summary = format!(
-            "job {} {} on {rig_name} (exit {}): {}{poison}\nlog: {}\n--- log tail ---\n{}",
+            "job {} {} on {rig_name} (exit {}): {}{poison}{verify}\nlog: {}\n--- log tail ---\n{}",
             short(&id),
             outcome.to_uppercase(),
             exit_code.map_or("-".into(), |code| code.to_string()),
@@ -704,6 +807,80 @@ impl Mailroom {
         if let Some(key) = &record.spec.key {
             self.release_key_remote(key, &summary).ok();
         }
+    }
+
+    /// Posts a verify run's produced-vs-verified row to the orchestrator's
+    /// ledger (issue 055: the referee records which rig verified which
+    /// rig's gain). Best-effort: an old orchestrator just drops the row.
+    fn record_verify_ledger(
+        &self,
+        record: &JobRecord,
+        verify_outcome: &VerifyOutcome,
+        outcome: &str,
+    ) {
+        let row = VerifyLedgerRow {
+            id: record.spec.id.clone(),
+            origin_job: verify_outcome.origin_job.clone(),
+            produced_on: verify_outcome.produced_on.clone(),
+            verified_on: verify_outcome.verified_on.clone(),
+            plan: record.spec.verify.as_ref().map(|verify| verify.baseline.plan.clone()),
+            baseline_sha: record
+                .environment
+                .as_ref()
+                .and_then(|environment| environment.baseline_sha.clone()),
+            manifest_blake3: record
+                .spec
+                .verify
+                .as_ref()
+                .map(|verify| verify.manifest_blake3.clone()),
+            outcome: outcome.to_string(),
+            verdict: verify_outcome.verdict.clone(),
+            provenance_incomplete: verify_outcome.provenance_incomplete,
+            metrics: verify_outcome
+                .metrics
+                .iter()
+                .map(|(name, verdict)| (name.clone(), verdict.clone()))
+                .collect(),
+            at: now(),
+        };
+        let payload = match serde_json::to_vec(&row) {
+            Ok(bytes) => URL_SAFE_NO_PAD.encode(bytes),
+            Err(error) => {
+                eprintln!("agent-mail: encoding verify ledger row failed: {error}");
+                return;
+            }
+        };
+        self.on_orchestrator(
+            &format!("rig verify-ledger {payload}"),
+            END_MARKER,
+            |room| room.append_verify_ledger(&row).map(|()| Vec::new()),
+        )
+        .or_else(|error| {
+            // No orchestrator configured (single-rig setup): the verifying
+            // rig keeps the row locally rather than losing it.
+            let no_orchestrator = self
+                .rigs()
+                .map(|rigs| rigs.orchestrator.is_none())
+                .unwrap_or(true);
+            if no_orchestrator {
+                self.append_verify_ledger(&row).map(|()| Vec::new())
+            } else {
+                Err(error)
+            }
+        })
+        .ok();
+    }
+
+    /// Orchestrator side: appends the row to the append-only verify ledger.
+    pub fn append_verify_ledger(&self, row: &VerifyLedgerRow) -> Result<()> {
+        use std::io::Write as _;
+        let ledger = self.jobs_dir("verify_ledger.jsonl");
+        if let Some(parent) = ledger.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut file = fs::OpenOptions::new().create(true).append(true).open(&ledger)?;
+        writeln!(file, "{}", serde_json::to_string(row)?)?;
+        Ok(())
     }
 
     fn job_mail(&self, spec: &JobSpec, body: String) {
@@ -1239,6 +1416,7 @@ pub fn decode<T: for<'de> Deserialize<'de>>(payload: &str) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::verify::{Baseline, BaselineNumber};
 
     fn job(id: &str, lane: Lane, cores: f64) -> JobSpec {
         JobSpec {
@@ -1257,6 +1435,8 @@ mod tests {
             notify_mode: MailMode::Queued,
             timeout_secs: None,
             worktree: None,
+            verify: None,
+            result_path: None,
             submitted_at: now(),
         }
     }
@@ -1444,5 +1624,227 @@ mod tests {
                 .unwrap()
                 .contains("hello-from-job")
         );
+    }
+
+    fn baseline() -> Baseline {
+        Baseline {
+            plan: "031".into(),
+            commit: "abc1234".into(),
+            numbers: BTreeMap::from([
+                (
+                    "wall_ms".into(),
+                    BaselineNumber {
+                        value: 100.0,
+                        lower_is_better: true,
+                    },
+                ),
+                (
+                    "tok_per_s".into(),
+                    BaselineNumber {
+                        value: 1000.0,
+                        lower_is_better: false,
+                    },
+                ),
+            ]),
+            noise_floor: 0.05,
+            source: ".benchmarks/031/baseline.json".into(),
+        }
+    }
+
+    #[test]
+    fn verify_verdicts_follow_the_noise_floor_and_metric_directions() {
+        // Both metrics gain 10% in their better direction → verified.
+        let measured = BTreeMap::from([("wall_ms".into(), 90.0), ("tok_per_s".into(), 1100.0)]);
+        assert_eq!(verify_against_baseline(&measured, &baseline()).verdict, "verified");
+        // wall_ms regressed 10% (110 > 100) while tok_per_s gained →
+        // refuted: a gain on one metric never buys a regression on another.
+        let measured = BTreeMap::from([("wall_ms".into(), 110.0), ("tok_per_s".into(), 1100.0)]);
+        assert_eq!(verify_against_baseline(&measured, &baseline()).verdict, "refuted");
+        // Inside the 5% noise floor on both → inconclusive.
+        let measured = BTreeMap::from([("wall_ms".into(), 97.0), ("tok_per_s".into(), 1030.0)]);
+        assert_eq!(
+            verify_against_baseline(&measured, &baseline()).verdict,
+            "inconclusive"
+        );
+        // Both directions regress past the floor → refuted.
+        let measured = BTreeMap::from([("wall_ms".into(), 120.0), ("tok_per_s".into(), 800.0)]);
+        assert_eq!(verify_against_baseline(&measured, &baseline()).verdict, "refuted");
+        // An undeclared metric is ignored; a declared-but-unmeasured one
+        // marks the row `incomplete` (the claim is only as good as its full
+        // cell — never countable as verified).
+        let measured = BTreeMap::from([("wall_ms".into(), 90.0), ("extra".into(), 1.0)]);
+        let outcome = verify_against_baseline(&measured, &baseline());
+        assert_eq!(outcome.verdict, "incomplete", "tok_per_s missing");
+        assert!(outcome.metrics.contains_key("wall_ms"));
+        assert!(!outcome.metrics.contains_key("extra"));
+    }
+
+    #[test]
+    fn result_files_parse_and_starve_missing_cells() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("results.json");
+        std::fs::write(&path, r#"{"wall_ms": 87.5, "tok_per_s": 1042.0}"#).unwrap();
+        let numbers = read_result_file(&Some(dir.path().to_path_buf()), "results.json");
+        assert_eq!(numbers.as_ref().unwrap()["wall_ms"], 87.5);
+        assert_eq!(numbers.as_ref().unwrap()["tok_per_s"], 1042.0);
+        // Missing or malformed cells read as None → the run is `no-result`.
+        assert!(read_result_file(&Some(dir.path().to_path_buf()), "absent.json").is_none());
+        std::fs::write(&path, "not json").unwrap();
+        assert!(read_result_file(&Some(dir.path().to_path_buf()), "results.json").is_none());
+    }
+
+    #[test]
+    fn pick_rig_never_lands_a_verify_run_on_the_producing_rig() {
+        let rigs = crate::Rigs {
+            self_rig: "amo".into(),
+            orchestrator: None,
+            rigs: BTreeMap::from([
+                ("amo".into(), crate::Rig::default()),
+                ("bmo".into(), crate::Rig::default()),
+            ]),
+        };
+        let probe = |quiet: bool| {
+            serde_json::from_str::<rig::RigProbe>(&format!(
+                r#"{{"rig":"amo","os":"macos","at":"","cores":8,"load1":0.0,
+                    "quiet":{quiet},"agents":[],"contenders":[],"running":[],"queued":[]}}"#
+            ))
+            .unwrap()
+        };
+        let results = vec![
+            ("amo".to_string(), Ok(probe(true)), Duration::ZERO),
+            ("bmo".to_string(), Ok(probe(false)), Duration::ZERO),
+        ];
+        // Without exclusion the quiet producing rig wins; with it, the only
+        // other rig takes the job even though it is not quiet (verified by
+        // being the only candidate left).
+        assert_eq!(
+            pick_rig(&results, &rigs, &Needs::default(), Lane::Exclusive, &[]).unwrap(),
+            "amo"
+        );
+        assert_eq!(
+            pick_rig(
+                &results,
+                &rigs,
+                &Needs::default(),
+                Lane::Exclusive,
+                &["amo".to_string()]
+            )
+            .unwrap(),
+            "bmo"
+        );
+        // Excluding every candidate refuses the run outright.
+        assert!(pick_rig(
+            &results,
+            &rigs,
+            &Needs::default(),
+            Lane::Exclusive,
+            &["amo".to_string(), "bmo".to_string()]
+        )
+        .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_run_computes_ratios_and_writes_the_referee_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let room = Mailroom::new(dir.path().to_path_buf());
+        room.init("bmo").unwrap();
+        let cell = dir.path().join("cell");
+        fs::create_dir_all(&cell).unwrap();
+        // The measured cell: writes its result file, one metric 10% better,
+        // one metric not declared in the results (blocked verified).
+        std::fs::write(
+            cell.join("measure.sh"),
+            "echo '{\"wall_ms\": 90.0}' > results.json",
+        )
+        .unwrap();
+        let mut spec = job("01job000000000000000000000000002", Lane::Exclusive, 0.0);
+        spec.argv = vec!["sh measure.sh".into()];
+        spec.cwd = Some(cell.display().to_string());
+        spec.result_path = Some("results.json".into());
+        spec.verify = Some(VerifySpec {
+            origin_job: "01job_origin".into(),
+            produced_on: "amo".into(),
+            manifest_blake3: blake3::hash(b"manifest").to_string(),
+            baseline: baseline(),
+        });
+        let queue = dir.path().join("jobs/queue");
+        fs::create_dir_all(&queue).unwrap();
+        fs::create_dir_all(dir.path().join("jobs/running")).unwrap();
+        write_json(&queue.join(format!("{}.json", spec.id)), &spec).unwrap();
+        fs::rename(
+            queue.join(format!("{}.json", spec.id)),
+            dir.path()
+                .join("jobs/running")
+                .join(format!("{}.starting", spec.id)),
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join("jobs/logs")).unwrap();
+        room.execute_job(&spec.id).unwrap();
+        let record: JobRecord = read_json(
+            &dir.path()
+                .join("jobs/done")
+                .join(format!("{}.json", spec.id)),
+        )
+        .unwrap();
+        // wall_ms measured 90 vs 100 (10% better, past the 5% floor), but
+        // tok_per_s never arrived → the row is `incomplete`, not countable.
+        let outcome = record.verify_outcome.expect("verify outcome recorded");
+        assert_eq!(outcome.verdict, "incomplete");
+        assert_eq!(outcome.produced_on, "amo");
+        assert_eq!(outcome.verified_on, "bmo");
+        assert_eq!(record.measured.as_ref().unwrap()["wall_ms"], 90.0);
+        // Provenance is complete here: rustc exists on this dev box.
+        assert!(record.environment.as_ref().unwrap().complete());
+        // The referee ledger row landed, parseable, with the verdict.
+        let ledger = std::fs::read_to_string(dir.path().join("jobs/verify_ledger.jsonl")).unwrap();
+        let row: VerifyLedgerRow = serde_json::from_str(ledger.lines().last().unwrap()).unwrap();
+        assert_eq!(row.verified_on, "bmo");
+        assert_eq!(row.produced_on, "amo");
+        assert_eq!(row.verdict, "incomplete");
+        assert_eq!(row.outcome, "done");
+        assert_eq!(row.plan.as_deref(), Some("031"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_verify_run_without_its_result_file_is_no_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let room = Mailroom::new(dir.path().to_path_buf());
+        room.init("bmo").unwrap();
+        let mut spec = job("01job000000000000000000000000003", Lane::Exclusive, 0.0);
+        spec.argv = vec!["true".into()];
+        spec.result_path = Some("results.json".into());
+        spec.verify = Some(VerifySpec {
+            origin_job: "01job_origin".into(),
+            produced_on: "amo".into(),
+            manifest_blake3: blake3::hash(b"manifest").to_string(),
+            baseline: baseline(),
+        });
+        let queue = dir.path().join("jobs/queue");
+        fs::create_dir_all(&queue).unwrap();
+        fs::create_dir_all(dir.path().join("jobs/running")).unwrap();
+        write_json(&queue.join(format!("{}.json", spec.id)), &spec).unwrap();
+        fs::rename(
+            queue.join(format!("{}.json", spec.id)),
+            dir.path()
+                .join("jobs/running")
+                .join(format!("{}.starting", spec.id)),
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join("jobs/logs")).unwrap();
+        room.execute_job(&spec.id).unwrap();
+        let record: JobRecord = read_json(
+            &dir.path()
+                .join("jobs/done")
+                .join(format!("{}.json", spec.id)),
+        )
+        .unwrap();
+        assert_eq!(
+            record.outcome.as_deref(),
+            Some("no-result"),
+            "a clean exit without the measured cell does not count"
+        );
+        assert!(record.verify_outcome.is_none());
     }
 }

@@ -39,10 +39,15 @@ USAGE:
                                    and whether it is QUIET enough for a benchmark
   agent-mail rig run <RIG|auto> [--shared|--exclusive] [--key K] [--title T] [--cores N]
                 [--mem GB] [--gpu-mem GB] [--needs cuda,metal] [--timeout 2h]
-                [--worktree repo@sha] [--cwd DIR] [--notify name@rig] [--notify-mode M] -- <command>
+                [--worktree repo@sha] [--cwd DIR] [--notify name@rig] [--notify-mode M]
+                [--verify-manifest FILE] -- <command>
                                    queue a job: shared jobs run when resources fit, an
                                    exclusive one waits for a quiet empty rig; mail on
-                                   start/poison/end; same --key twice = one run (amo referees)
+                                   start/poison/end; same --key twice = one run (amo referees).
+                                   --verify-manifest pins the manifest's command + repo@sha,
+                                   forces exclusive, refuses the producing rig, reads the
+                                   result file it names, and posts a ratio-to-baseline row
+                                   to the orchestrator's verify ledger (issue 055)
   agent-mail rig cancel <RIG> <ID> | rig log <RIG> <ID> [LINES]
   agent-mail rig watch [--once|--force]   orchestrator watchdog tick (zero tokens unless an
                                    incident is new); --install writes the launchd job,
@@ -262,6 +267,14 @@ fn run(args: Vec<String>) -> Result<i32> {
                 room.kick_until_drained()?;
                 Ok(0)
             }
+            Some("verify-ledger") => {
+                let row: agent_mail::verify::VerifyLedgerRow = agent_mail::jobs::decode(
+                    &args.next().context("verify-ledger needs a payload")?,
+                )?;
+                room.append_verify_ledger(&row)?;
+                println!("{END_MARKER}");
+                Ok(0)
+            }
             Some("exec") => {
                 room.execute_job(&args.next().context("exec needs a job id")?)?;
                 Ok(0)
@@ -424,6 +437,8 @@ fn rig_run(room: &Mailroom, args: Vec<String>) -> Result<i32> {
         (None, None, None, None, None, None);
     let mut notify_mode = agent_mail::MailMode::Queued;
     let mut argv = Vec::new();
+    let mut verify = None;
+    let mut result_path = None;
     while let Some(arg) = args.next() {
         let mut value = |name: &str| args.next().with_context(|| format!("{name} needs a value"));
         match arg.as_str() {
@@ -439,6 +454,45 @@ fn rig_run(room: &Mailroom, args: Vec<String>) -> Result<i32> {
             "--worktree" => worktree = Some(value("--worktree")?),
             "--timeout" => {
                 timeout = Some(agent_mail::jobs::parse_duration(&value("--timeout")?)?.as_secs())
+            }
+            "--verify-manifest" => {
+                let manifest: agent_mail::verify::VerifyManifest = serde_json::from_slice(
+                    &std::fs::read(value("--verify-manifest")?)
+                        .context("reading the verify manifest")?,
+                )
+                .context("parsing the verify manifest")?;
+                // A measured re-run must hold a quiet rig alone, and the
+                // manifest pins the exact command, commit, and cell path.
+                lane = Lane::Exclusive;
+                worktree = Some(format!("{}@{}", manifest.repo, manifest.sha));
+                cwd = manifest.cwd.clone();
+                result_path = manifest.result_path.clone();
+                if title.is_none() {
+                    title = Some(format!(
+                        "verify {} from {} (plan {})",
+                        &manifest.origin_job[..manifest.origin_job.len().min(8)],
+                        manifest.produced_on,
+                        manifest.baseline.plan
+                    ));
+                }
+                let manifest_blake3 = manifest
+                    .blake3()
+                    .context("hashing the verify manifest")?;
+                verify = Some(agent_mail::verify::VerifySpec {
+                    origin_job: manifest.origin_job.clone(),
+                    produced_on: manifest.produced_on.clone(),
+                    manifest_blake3,
+                    baseline: manifest.baseline,
+                });
+                // The manifest's command wins unless the caller passed `--`
+                // content, which would silently measure a different cell.
+                if argv.is_empty() {
+                    argv = manifest.argv.clone();
+                } else {
+                    bail!(
+                        "a verify run measures the manifest's command; drop the trailing `-- <command>`"
+                    )
+                }
             }
             "--cores" => {
                 needs.cores = value("--cores")?
@@ -465,7 +519,7 @@ fn rig_run(room: &Mailroom, args: Vec<String>) -> Result<i32> {
     }
     anyhow::ensure!(
         !argv.is_empty(),
-        "no command: `agent-mail rig run <rig|auto> [options] -- <command>`"
+        "no command: pass the command after `--`, or use --verify-manifest"
     );
     let rigs = room.rigs()?;
     let notify = notify.or_else(|| {
@@ -473,12 +527,27 @@ fn rig_run(room: &Mailroom, args: Vec<String>) -> Result<i32> {
             .ok()
             .map(|name| format!("{name}@{}", rigs.self_rig))
     });
+    let verify_ref = verify.as_ref();
     let rig_name = match target.as_str() {
         "auto" => {
             let results = agent_mail::rig::status(room, &[])?;
-            agent_mail::jobs::pick_rig(&results, &rigs, &needs, lane)?
+            let exclude: Vec<String> = verify_ref
+                .map(|verify| vec![verify.produced_on.clone()])
+                .unwrap_or_default();
+            agent_mail::jobs::pick_rig(&results, &rigs, &needs, lane, &exclude)?
         }
-        name => name.to_string(),
+        name => {
+            if let Some(verify) = verify_ref
+                && *name == verify.produced_on
+            {
+                bail!(
+                    "refusing to verify job {} on {}: the verifier must be a different rig (issue 055)",
+                    verify.origin_job,
+                    name
+                );
+            }
+            name.to_string()
+        }
     };
     let rig = rigs
         .rigs
@@ -506,6 +575,8 @@ fn rig_run(room: &Mailroom, args: Vec<String>) -> Result<i32> {
         notify_mode,
         timeout_secs: timeout,
         worktree,
+        verify: verify.clone(),
+        result_path,
         submitted_at: chrono::Utc::now().to_rfc3339(),
     };
     if let Some(key) = &key {
