@@ -1,5 +1,5 @@
 # 056 — Boss: hourly fleet housekeeping + false-stop forensics (fallback when auto_prompt & the watchdog both miss)
-Status: round-4 fixes landed (`55ac424f19`) — awaiting the round-4 diff-check AGREE, then deploy
+Status: verdict AGREE (round 4/5 diff-check) — boss live in agent_mail (rollback: `boss: false` in watch.json); deploy pending (bundle-mac → amo + m3)
 
 ## Why (the incident that triggered this)
 
@@ -154,6 +154,13 @@ housekeeper at the fleet layer.
   holds, regrow fires, boss wakes-never-escalates, ordinary escalation
   preserved); `cargo fmt` run; `BOSS_COOLDOWN_MS` doc restored to
   `deliver_boss`; prompt continuation fixed.
+- **Round 4/5 — AGREE** (same session): diff-check of `55ac424f19` —
+  cooldown anchored to `last_woke_ms` (a claim inside the cooldown holds;
+  a GROWN queue re-fires after the 20-min regrow window; numeric count
+  compare), ordinary-incident behavior byte-identical, pure `gate_round`
+  + regression tests, fmt clean. Non-blocking notes: growth seen only on
+  the key-change tick (conservative, fine); test hand-sets some state
+  (harmless).
 - **Round 5 — pending**: diff-check of the two round-4 blockers (reviewer
   pre-agreed AGREE once they land).
 
@@ -177,8 +184,8 @@ housekeeper at the fleet layer.
       scan + counts, marker roundtrip, prompt completeness, WatchConfig
       serde defaults, backlog regression (agent_mail 60 + auto_prompt 486
       pass)
-- [ ] W6: round-5 diff-check (round 4 = narrow REVISE, addressed in
-      `55ac424f19`)
+- [x] W6: verdict loop closed — round 3 REVISE → hardening `b6bfd21598` →
+      round 4 narrow REVISE → `55ac424f19` → AGREE (diff-check)
 - [x] Owner follow-ups folded in: claimed-but-stopped accounting (lease
       expiry + live-in-repo check), benchmark routine + boundary check-up as
       checklist items, compaction scope incl. code comments, un-gating law
