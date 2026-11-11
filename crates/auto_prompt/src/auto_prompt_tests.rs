@@ -111,6 +111,63 @@ fn housekeeping_prompt_gains_the_owner_gate_block_only_when_gates_exist() {
 }
 
 #[test]
+fn make_continue_action_prepends_resume_state_without_stacking() {
+    let session = "resume-state-inject-test";
+    chain::clear_session(session);
+    let data = overflow_test_data(session, Some("mid-work message"));
+
+    // No chain yet — the prompt is untouched.
+    let plain = data.make_continue_action("continue".to_string());
+    assert!(!plain.next_prompt.contains("RESUME-STATE"));
+    // Building the action armed a continuation; the recorded turn makes the
+    // chain real for the next build.
+    chain::record_turn(session, false);
+
+    let with_state = data.make_continue_action("continue".to_string());
+    assert!(
+        with_state.next_prompt.starts_with("RESUME-STATE (chain facts"),
+        "resume state leads the prompt: {}",
+        with_state.next_prompt
+    );
+    assert!(with_state.next_prompt.contains("attempt 1"));
+    assert!(with_state.next_prompt.contains("runaway budget left: 19 rounds"));
+    // Idle streak 2 → budget 20 - 2 = 18 on the next build, attempt 2.
+    chain::record_turn(session, false);
+    let again = data.make_continue_action("continue".to_string());
+    assert!(again.next_prompt.contains("attempt 2"));
+    assert!(again.next_prompt.contains("runaway budget left: 18 rounds"));
+    // A rebuilt action (prompt already carries the section) must not stack
+    // a stale copy.
+    let rebuilt = data.make_continue_action(again.next_prompt);
+    assert_eq!(
+        rebuilt.next_prompt.matches("RESUME-STATE").count(),
+        1,
+        "resume state must not stack on rebuilt actions"
+    );
+    chain::clear_session(session);
+}
+
+#[test]
+fn resume_state_section_absent_without_a_chain() {
+    let session = "resume-state-absent-test";
+    chain::clear_session(session);
+    assert!(chain::resume_state_section(session, 20).is_none());
+    chain::record_turn(session, true);
+    let section = chain::resume_state_section(session, 20).expect("chain exists");
+    assert!(section.contains("attempt 1"));
+    // Made progress → no idle, full budget.
+    assert!(section.contains("idle streak 0"));
+    assert!(section.contains("runaway budget left: 20 rounds"));
+    // Budget never goes negative for an idle streak past the cap.
+    chain::record_turn(session, false);
+    chain::record_turn(session, false);
+    chain::record_turn(session, false);
+    let strained = chain::resume_state_section(session, 2).expect("chain exists");
+    assert!(strained.contains("runaway budget left: 0 rounds"));
+    chain::clear_session(session);
+}
+
+#[test]
 fn chain_kpis_track_first_gain_and_verdict_turnaround() {
     let session = "chain-kpi-test";
     chain::clear_session(session);

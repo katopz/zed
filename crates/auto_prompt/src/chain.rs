@@ -422,6 +422,29 @@ pub fn chain_kpis(session_id: &str) -> Option<ChainKpis> {
     })
 }
 
+/// Structured resume-state facts for the next continuation (issue 058's
+/// resume-message contract): which attempt this chain is on, how the
+/// streaks stand, and the exact runaway budget left — numbers a forked or
+/// fresh context cannot reconstruct and a bare "continue" hides. `None`
+/// when the session holds no chain (nothing ran, nothing to report).
+pub fn resume_state_section(session_id: &str, max_iterations: u32) -> Option<String> {
+    with_chain(session_id, |chain| {
+        if chain.turns == 0 {
+            return None;
+        }
+        let budget_left = max_iterations.saturating_sub(chain.idle_turns);
+        Some(format!(
+            "RESUME-STATE (chain facts, authoritative — do not re-derive or re-summarize them): attempt {} in this chain; idle streak {} (runaway budget left: {} rounds); unchanged-steps repeats {}; near-instant hops {}; verdict negotiations {}.",
+            chain.turns,
+            chain.idle_turns,
+            budget_left,
+            chain.steps_repeats,
+            chain.near_instant_turns,
+            chain.verdict_rounds,
+        ))
+    })
+}
+
 /// Whether this session's first valid keyword stop already got its
 /// housekeeping pass.
 pub fn stop_housekeeping_sent(session_id: &str) -> bool {

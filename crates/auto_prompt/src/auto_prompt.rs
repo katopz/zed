@@ -704,6 +704,10 @@ impl std::fmt::Debug for LlmCallData {
 impl LlmCallData {
     pub(crate) fn make_continue_action(&self, next_prompt: String) -> AutoPromptAction {
         let session_key = self.session_id.to_string();
+        let max_iterations = crate::load_config_cached()
+            .map(|config| config.max_iterations)
+            .unwrap_or(AutoPromptConfig::default().max_iterations);
+        let next_prompt = with_resume_state_section(&next_prompt, &session_key, max_iterations);
         let next_prompt = with_tried_steps_section(
             &with_bloat_section(&next_prompt, self.bloat_directive.as_deref()),
             &session_key,
@@ -736,6 +740,25 @@ impl LlmCallData {
 
 /// Header for the tried-steps ledger block appended to continuations.
 const TRIED_STEPS_HEADER: &str = "TRIED-STEPS LEDGER (already proposed this chain):";
+
+/// Prefix of the resume-state section prepended to continuations (issue 058).
+const RESUME_STATE_HEADER: &str = "RESUME-STATE (chain facts";
+
+/// Prepends the chain's structured resume-state section (issue 058's
+/// resume-message contract) so a continuation — same-thread or forked —
+/// carries the attempt number, streaks, and exact runaway budget instead of
+/// a bare "continue". Skipped when the prompt already carries the section
+/// (a rebuilt action must not stack a stale copy) or when the session has
+/// no chain yet.
+fn with_resume_state_section(prompt: &str, session_key: &str, max_iterations: u32) -> String {
+    if prompt.contains(RESUME_STATE_HEADER) {
+        return prompt.to_string();
+    }
+    match chain::resume_state_section(session_key, max_iterations) {
+        Some(section) => format!("{section}\n\n{prompt}"),
+        None => prompt.to_string(),
+    }
+}
 
 /// Appends the session's tried-steps ledger to a continuation prompt so the
 /// worker sees every proposal this chain already made and does not re-propose
