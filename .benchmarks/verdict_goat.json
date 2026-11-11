@@ -1,0 +1,3002 @@
+{
+  "db": "/Users/katopz/Library/Application Support/Zed/threads/threads.db",
+  "metadata_db_linked": true,
+  "scored_threads": 559,
+  "chain_count": 118,
+  "parse_failures": 0,
+  "verdict_on": {
+    "chains": 24,
+    "chains_with_summary": 24,
+    "chains_with_corrections": 9,
+    "post_hoc_fix_rate": 0.375,
+    "rounds_used_distribution": {
+      "1": 10,
+      "2": 6,
+      "3": 8
+    },
+    "negotiation_aborts": 9,
+    "reviewers": [
+      "claude_code"
+    ],
+    "avg_chain_input_tokens": 11715453.208333334,
+    "avg_chain_output_tokens": 1175673.7916666667,
+    "chains_with_human_turns": 24,
+    "chains_with_human_corrections": 14,
+    "human_correction_rate": 0.5833333333333334,
+    "cited_commits": 2067,
+    "resolved_commits": 1826,
+    "commit_resolution_rate": 0.8834059022738268
+  },
+  "verdict_off": {
+    "chains": 86,
+    "chains_with_summary": 74,
+    "chains_with_corrections": 1,
+    "post_hoc_fix_rate": 0.013513513513513514,
+    "rounds_used_distribution": {},
+    "negotiation_aborts": 0,
+    "reviewers": [],
+    "avg_chain_input_tokens": 532536.6744186047,
+    "avg_chain_output_tokens": 52471.37209302326,
+    "chains_with_human_turns": 19,
+    "chains_with_human_corrections": 2,
+    "human_correction_rate": 0.10526315789473684,
+    "cited_commits": 274,
+    "resolved_commits": 235,
+    "commit_resolution_rate": 0.8576642335766423
+  },
+  "verdict_failed": {
+    "chains": 8,
+    "chains_with_summary": 8,
+    "chains_with_corrections": 5,
+    "post_hoc_fix_rate": 0.625,
+    "rounds_used_distribution": {},
+    "negotiation_aborts": 0,
+    "reviewers": [
+      "claude_code"
+    ],
+    "avg_chain_input_tokens": 7117148.125,
+    "avg_chain_output_tokens": 881583.25,
+    "chains_with_human_turns": 8,
+    "chains_with_human_corrections": 7,
+    "human_correction_rate": 0.875,
+    "cited_commits": 677,
+    "resolved_commits": 643,
+    "commit_resolution_rate": 0.9497784342688331
+  },
+  "chains": [
+    {
+      "root": "1b9306d3-c68c-471f-b42e-7231ca14add3",
+      "members": [
+        "1b9306d3-c68c-471f-b42e-7231ca14add3"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": false,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 0,
+      "resolved_commits": 0,
+      "input_tokens": 172117,
+      "output_tokens": 3516,
+      "human_messages": 2
+    },
+    {
+      "root": "84529a38-0c7b-4168-b072-8ccefc82dad7",
+      "members": [
+        "84529a38-0c7b-4168-b072-8ccefc82dad7",
+        "55158ea9-7f6b-4f1e-895b-699ba08dd088",
+        "9513f25a-e14d-411c-8ccb-aef81eb46261",
+        "880d2020-6625-48b9-80ec-534c3c6e41fd",
+        "7713175d-a555-4eff-b214-d09ee5c20927",
+        "8fcdc84d-2f9e-4da0-b544-9e29076b1f02",
+        "4e53e91c-5ba6-4998-a59a-7f0c85356ab0",
+        "cdf4d0e5-edb6-48ad-905f-256a3c82e73b",
+        "6719549a-412e-4eb2-a2b9-ccedd539b37e",
+        "35de9db9-73f2-4d2a-9a40-097aa8450831",
+        "06ddbce1-ccc6-4f45-b408-2a63536f1094",
+        "9119dd7d-4507-41a0-a7dc-345dc7784f53",
+        "36bed1d1-f09c-4948-bc01-01a12df9cdfb",
+        "4ec84012-602a-4103-a15a-29566adce582",
+        "d62e1d12-5149-4828-9df7-4d8f6ffd17d9",
+        "83fbd99c-4a4e-4a57-b17f-dcda399463eb",
+        "6fd0eb10-4e8f-4c3f-8c13-eaf3475a0ec4",
+        "8e8571cd-b080-4082-8a73-3ecdc407c020",
+        "78d734d1-a426-449e-b6cd-6cfd5de65bbe",
+        "7e13b6d5-b9ea-4a13-9ced-7c63c6c81561",
+        "22ef0891-c5ec-4725-9eda-2c6cd87c5a57",
+        "914610d4-29d0-460f-b667-882d894a60df"
+      ],
+      "verdict_on": true,
+      "verdict_failed": false,
+      "rounds_used": 1,
+      "aborted": false,
+      "reviewers": [
+        "claude_code"
+      ],
+      "has_summary": true,
+      "corrections": [
+        "## 1. Thread Summary Fix M5 Ultra prefill decode issues context overflow: continuing in new thread with summary --- ## 2"
+      ],
+      "human_corrections": [
+        "find m5 ultra issues and do it, mainly fix prefill/decode first, HF_TOKEN is at /Users/katopz/git/riir-train/.env"
+      ],
+      "cited_commits": 114,
+      "resolved_commits": 109,
+      "input_tokens": 14842110,
+      "output_tokens": 1614869,
+      "human_messages": 5
+    },
+    {
+      "root": "0f046160-6376-498f-9733-0faa7be03848",
+      "members": [
+        "0f046160-6376-498f-9733-0faa7be03848"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 3,
+      "resolved_commits": 3,
+      "input_tokens": 211853,
+      "output_tokens": 55006,
+      "human_messages": 4
+    },
+    {
+      "root": "b531dc35-25a1-493d-a07b-5053755a31df",
+      "members": [
+        "b531dc35-25a1-493d-a07b-5053755a31df"
+      ],
+      "verdict_on": true,
+      "verdict_failed": false,
+      "rounds_used": 2,
+      "aborted": false,
+      "reviewers": [
+        "claude_code"
+      ],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 1,
+      "resolved_commits": 1,
+      "input_tokens": 230077,
+      "output_tokens": 48056,
+      "human_messages": 1
+    },
+    {
+      "root": "6c129a58-f084-42ee-897d-d5ed009aed21",
+      "members": [
+        "6c129a58-f084-42ee-897d-d5ed009aed21"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": false,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 0,
+      "resolved_commits": 0,
+      "input_tokens": 222209,
+      "output_tokens": 54239,
+      "human_messages": 0
+    },
+    {
+      "root": "73e830b2-f2d5-432b-9130-bc867b1cc08c",
+      "members": [
+        "73e830b2-f2d5-432b-9130-bc867b1cc08c"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 0,
+      "resolved_commits": 0,
+      "input_tokens": 191004,
+      "output_tokens": 22371,
+      "human_messages": 0
+    },
+    {
+      "root": "3bbe5349-458e-4f2b-9f1d-6b1a777d5b5a",
+      "members": [
+        "3bbe5349-458e-4f2b-9f1d-6b1a777d5b5a"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 0,
+      "resolved_commits": 0,
+      "input_tokens": 188529,
+      "output_tokens": 26665,
+      "human_messages": 0
+    },
+    {
+      "root": "49a50d25-6e47-487a-a01b-02776f040ac2",
+      "members": [
+        "49a50d25-6e47-487a-a01b-02776f040ac2"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 0,
+      "resolved_commits": 0,
+      "input_tokens": 122419,
+      "output_tokens": 15901,
+      "human_messages": 0
+    },
+    {
+      "root": "3eb0a346-3936-42da-adba-08608b86b97b",
+      "members": [
+        "3eb0a346-3936-42da-adba-08608b86b97b",
+        "4e80bace-d1a0-41d6-8908-8e750a612991",
+        "abbb431e-5832-4d16-bc83-000c5228b55a",
+        "43cda688-0ad5-46c2-a1fe-23d6cf2b5e04",
+        "bde9d1ce-fb0e-4f5a-9683-3c6819f97bf8",
+        "cb944fca-d171-4be5-8346-e1248dc0d03d",
+        "fcae486f-3911-4bbc-a6ed-398fb3b1b2fd",
+        "23293afd-a5d1-4fcc-9bd3-0bf1dd6b1508",
+        "8e2c86f1-12d6-4dc7-9be0-fcd1c23789be",
+        "a7aa78bf-2c9f-4bb4-984b-b4741861482e",
+        "58bd6a3c-54a6-4805-91c5-5558a85bad5a",
+        "e55547dd-1bef-443b-a766-803193fd9d80",
+        "3967037c-99e5-4ac8-95d9-0015a5ed0135",
+        "a2880e11-2307-4bbb-ab54-79bdb64854d0",
+        "9bf61c00-516f-41a4-860a-21c78808c4c4",
+        "d0ed858f-6d4b-4bfc-a546-d6d573c5d5c5",
+        "bec32465-e9df-48b7-be5b-3444211c9210",
+        "e792252b-1a9e-4af9-8b39-2829db03205d",
+        "28294ea2-8464-473f-b971-33c04015ca4b",
+        "5ebdc054-0d50-423f-ad04-e5ec18b62bdc",
+        "4a2e02c2-2ab5-42c7-9753-09d1602eaab6",
+        "84dea04e-b39a-4639-bf21-a5b7242eac3a",
+        "21534a1e-d378-436c-8f1e-ea9c3dee7858",
+        "c01ce4fc-2636-4e1b-ad05-95311ef01c62",
+        "62025692-0105-49b5-80d4-b7fd825a2f8a",
+        "e98e42fa-9be6-4c82-8f15-e8095a4e63c6"
+      ],
+      "verdict_on": true,
+      "verdict_failed": false,
+      "rounds_used": 2,
+      "aborted": false,
+      "reviewers": [
+        "claude_code"
+      ],
+      "has_summary": true,
+      "corrections": [
+        "## 1. Thread Summary Fix riir-rethink issue run remote bench context overflow: continuing in new thread with summary ---"
+      ],
+      "human_corrections": [
+        "fix this /Users/katopz/git/riir-rethink/.issues use 100.100.117.44 to run bin/bench in tmp folder"
+      ],
+      "cited_commits": 126,
+      "resolved_commits": 118,
+      "input_tokens": 14963219,
+      "output_tokens": 1434252,
+      "human_messages": 3
+    },
+    {
+      "root": "9854461b-42b3-46ac-bdc4-8bba8bcbe827",
+      "members": [
+        "9854461b-42b3-46ac-bdc4-8bba8bcbe827",
+        "66f3bd47-8b45-4fe7-97d6-f4246e94236e",
+        "bd5eb8bc-4302-4edc-a8ee-4b5452940d1d",
+        "07f0c51b-ab8b-4826-88b2-90604c76ff68",
+        "f5ce0219-7169-4328-8217-b2aa9262da38",
+        "c8aff753-60f3-4b37-b112-5f88947cebc6",
+        "d23af06d-556f-4b37-a877-a79ec8e6bba2",
+        "ac336890-335e-4402-a356-123ac772b998",
+        "4f42f3e0-e199-41b1-9759-1a1f04283c39",
+        "2cc03da9-2f4e-4eab-8581-97c277ff1d56",
+        "55f4d5a7-a115-4810-bdb8-1026a306db27",
+        "bb28ff3e-0f71-4d55-962a-594ae0a68c88",
+        "cb77a509-e2d8-48ac-99a6-2aca2430f525",
+        "0f294263-db2e-4e6f-b1ae-c60c99474cc0",
+        "3aacb417-243e-4eaf-8ce5-8308c65eb202",
+        "f3109ce7-f604-481f-9923-cedebc674ba5",
+        "dd0607eb-6cf5-413a-9097-5488f170e6e1",
+        "00bf9f7a-da2e-4f13-abe8-7082e958ee26",
+        "c01b3a19-6170-4a7e-a34b-69a815c42588",
+        "b37a2034-5e41-4126-93c1-680f5cedeeb3",
+        "7cab9386-2ce4-4b35-8ba0-85d54549f6b7",
+        "d223e0db-3a95-451e-b000-95ea44ea9929",
+        "c981500c-9288-46b6-8f38-9c5cca99dfb6",
+        "aa6c3183-bd3b-40ba-a53f-5e532209a1ff",
+        "3b691a63-b58a-4363-bf30-4e62b6cb8aea",
+        "29a2818a-594d-4daf-b68b-9be250762d74",
+        "9590db00-c734-4350-b5dd-63166d7ad03e",
+        "82a09e86-25f8-4ff1-a600-4cb347d7b06f",
+        "9d0680a5-afb4-4c51-bc28-c71067c27e67",
+        "c8156958-c21e-43ea-a20f-662c63c53bb6",
+        "87f294fd-b06e-4fb8-949a-5a3282366c7e",
+        "ba9a21e5-7443-4789-a59c-6e3be3c0078c",
+        "9146e3c2-6919-4620-888b-85744550fda1",
+        "6208998a-4a50-466b-97a0-063e18624332",
+        "c7ba1630-3b6d-45a2-b878-df9fab602c4a",
+        "4a551f91-c350-43bb-8c05-b50919c7db05",
+        "39091100-1435-4e46-b124-05ff6fec8809",
+        "abd93915-e668-4ce8-935c-686f85c3b24f",
+        "ce0acd09-1a28-413e-8b67-d9752069544d",
+        "c7cae9ac-ee1b-4a0d-8ac5-36f61a38e6e7",
+        "d58eba39-cb9f-4a66-9bd0-221c64f02a43",
+        "aba6f5b1-0733-4724-af32-47834b5d651a",
+        "66a7f12a-7377-4a52-b795-92e3ad77b490",
+        "7714ff6f-329d-4193-9af4-0dd47f592180",
+        "0f0226ce-82e7-46e5-a004-1c3c1752a001",
+        "fec574db-2bfd-4f90-98e2-da46b16d0a4c",
+        "a1b83d60-e4e5-4379-ae98-b6a74051dc35",
+        "6cd73c37-27c1-4edf-b613-61b682788626",
+        "d1be4208-fab2-424f-b218-4aaef5bd913f",
+        "26315172-38e2-443c-8ee6-c873c48892a4",
+        "3f2a55f2-3e71-4935-b588-b88a7b5acbd6",
+        "38a0a95e-e485-47ff-9d52-596671ce6774",
+        "1cf51351-e7a6-4f1c-bd1c-3defdd256879",
+        "5313cc3c-65f8-492b-aa12-1c3b3462c13f",
+        "df960061-6302-4177-bff4-89231468944d",
+        "d3380247-0dfd-4e5a-9b79-68aab6202d53",
+        "e22440d3-17b9-4989-8e87-b57109d04dab",
+        "6522f91c-e660-4b95-bc19-d3b663fb2d1a",
+        "ba482155-c564-4ed1-9842-bdea22377ecb",
+        "46bbbecc-44dc-4675-a9bf-15c7692f80ee",
+        "70a8671b-6d67-428d-b72d-74ed278a421b",
+        "b72562cd-f00e-4825-af33-dc04a68057dc",
+        "bf88395b-a5e2-45fa-bbbd-6a253f2536a4",
+        "b628947d-d0b9-4005-b500-302064b3b35f",
+        "1b10c720-bd43-45fb-a69d-83390cf3d26f",
+        "4c5f0765-2f9f-44dd-adc8-6cd41733ab8f",
+        "0695752d-56d6-45f8-8f20-7c13cbde9355",
+        "6a762a3b-de9b-4b78-b0b9-824c962384b1",
+        "08ee0df9-3191-41c0-9bff-6945628b1679",
+        "1a028d22-3c70-4cb3-ad64-87bd40cace6d",
+        "02e667b6-3087-4487-9a36-b5ce70d362f2",
+        "9a34dc60-8e64-4283-941b-1e76ea6611a6",
+        "b9040e71-fc2b-4f2d-8c74-679dd80ffebf",
+        "76e72a3e-07ed-4f6c-a94b-f60c0f689274",
+        "abaff7ca-65c8-4994-ae9d-57b69749c99f",
+        "b2e19210-e4ef-49cb-bbbc-ce7837715b7b",
+        "592179f3-bfaa-4561-8153-ff2fb2d2ea53",
+        "2372d61d-2e2a-4ff3-9cd5-f16f0cfa79ab",
+        "ac10ea49-213a-423e-92f6-a68e1c43cc93",
+        "13b71a4b-2432-4ff5-8bf2-345934ed1774",
+        "c34a3b39-88fb-4203-a483-6f8689796186",
+        "d2568c84-9cf9-43a0-9909-8df59d8690d9",
+        "752b3d38-f285-45f3-a7b6-564a78053c39",
+        "38723aed-6293-45ee-84d4-8283ca1e06fb",
+        "83dcd143-9813-4a3d-bf33-c4ccaac92b88",
+        "48ae3842-976a-4643-a494-5adc3350741b",
+        "d959f248-eddb-43fe-9cc6-53e960a08a7c",
+        "97431a1a-f0bb-403c-a3e7-b4c345779760",
+        "6c6e98f3-b732-4dab-a8f0-28ea8955b706"
+      ],
+      "verdict_on": false,
+      "verdict_failed": true,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [
+        "claude_code"
+      ],
+      "has_summary": true,
+      "corrections": [
+        "## 1. Thread Summary riir-refine idle loop reflex fmt fix context overflow: continuing in new thread with summary --- ##"
+      ],
+      "human_corrections": [],
+      "cited_commits": 414,
+      "resolved_commits": 395,
+      "input_tokens": 39463492,
+      "output_tokens": 4567492,
+      "human_messages": 6
+    },
+    {
+      "root": "7227bcbc-7d1e-4a68-a3ef-8e09883cabf1",
+      "members": [
+        "7227bcbc-7d1e-4a68-a3ef-8e09883cabf1"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 0,
+      "resolved_commits": 0,
+      "input_tokens": 207986,
+      "output_tokens": 26225,
+      "human_messages": 0
+    },
+    {
+      "root": "8da797ce-3104-45db-8de0-c308bf3f0481",
+      "members": [
+        "8da797ce-3104-45db-8de0-c308bf3f0481"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 0,
+      "resolved_commits": 0,
+      "input_tokens": 348346,
+      "output_tokens": 18392,
+      "human_messages": 0
+    },
+    {
+      "root": "c181ae53-e6f3-45d4-bb90-9d4ae5529542",
+      "members": [
+        "c181ae53-e6f3-45d4-bb90-9d4ae5529542"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 6,
+      "resolved_commits": 6,
+      "input_tokens": 812245,
+      "output_tokens": 152845,
+      "human_messages": 0
+    },
+    {
+      "root": "6ceaca80-7768-4d36-bb70-51980d162ec9",
+      "members": [
+        "6ceaca80-7768-4d36-bb70-51980d162ec9"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": false,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 0,
+      "resolved_commits": 0,
+      "input_tokens": 11013403,
+      "output_tokens": 81584,
+      "human_messages": 0
+    },
+    {
+      "root": "9e2419f3-aeef-4e2f-8e9b-f1bf811dd046",
+      "members": [
+        "9e2419f3-aeef-4e2f-8e9b-f1bf811dd046"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 0,
+      "resolved_commits": 0,
+      "input_tokens": 470449,
+      "output_tokens": 25242,
+      "human_messages": 5
+    },
+    {
+      "root": "10268278-78e5-44e6-b7ea-910f5b957998",
+      "members": [
+        "10268278-78e5-44e6-b7ea-910f5b957998"
+      ],
+      "verdict_on": true,
+      "verdict_failed": false,
+      "rounds_used": 3,
+      "aborted": true,
+      "reviewers": [
+        "claude_code"
+      ],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 1,
+      "resolved_commits": 1,
+      "input_tokens": 316629,
+      "output_tokens": 27736,
+      "human_messages": 1
+    },
+    {
+      "root": "04551aba-e4ad-4e17-8e73-3854dd8443bd",
+      "members": [
+        "04551aba-e4ad-4e17-8e73-3854dd8443bd",
+        "06a9992f-b22f-4878-bd23-c76e0706cdbc",
+        "84755c26-d8a6-4458-8636-44e3fe581c1e",
+        "4f2079b5-3106-4738-9103-358d543ee234",
+        "b1c26d12-c481-495b-871f-9c2f15d9d463",
+        "13a6cb16-a0e2-4a96-87df-9f4e3e5f05af",
+        "a76b838f-560c-49fe-bd06-c3ecc978be4a",
+        "d3d66024-22c4-4e8e-9ac9-097d47b6c757",
+        "fd4218cb-ddc3-48fe-bedb-a56d7bf309ed",
+        "4e24c094-afdd-4b4c-8b83-b68832d356ad",
+        "dca6540f-dd35-451c-ad5d-2d3ef7f2c9c5",
+        "585071b2-55d9-43b1-8a9e-43007b787301",
+        "ca5209e7-8275-401d-baa6-2068a875bb4d",
+        "64ee510b-8288-44b8-8a52-c2b1f4672bab",
+        "3eaafd71-877f-4db4-93c1-2ed2363ff9f1",
+        "8a3408fe-ea21-454d-b230-89bb6047956d",
+        "8710b7e8-7baf-4f40-953d-baa19dd9d73b",
+        "ad507a63-7f3a-4b79-b482-ae25a6708fcb",
+        "f201c8af-34b6-446e-a5fa-9e09434877f5",
+        "dc4e1c91-5afe-49af-ad1b-bac6b94dad39",
+        "d62fc074-55ec-4cd4-9c39-eaf93e5a6c40",
+        "d5a2e33f-28fc-4ef1-be0d-b278d978e796",
+        "32758023-4b88-44a0-b9a4-014121ec8073",
+        "5afbbf87-4913-4302-b40f-fcab117eb234",
+        "2df0effa-0d72-4625-8ede-1a9972c83c6a"
+      ],
+      "verdict_on": true,
+      "verdict_failed": false,
+      "rounds_used": 3,
+      "aborted": true,
+      "reviewers": [
+        "claude_code"
+      ],
+      "has_summary": true,
+      "corrections": [
+        "## 1. Thread Summary Fix markdown and remove done riir-ai issues context overflow: continuing in new thread with summary",
+        "## 1. Thread Summary Fix markdown and remove done riir-ai issues context overflow: continuing in new thread with summary"
+      ],
+      "human_corrections": [
+        "fix n md n rm if done /Users/katopz/git/riir-ai/.issues",
+        "dude you must fix the code and update md and rm md if done"
+      ],
+      "cited_commits": 119,
+      "resolved_commits": 113,
+      "input_tokens": 11624098,
+      "output_tokens": 1757382,
+      "human_messages": 5
+    },
+    {
+      "root": "48e4c3a0-3069-4984-a09f-f8caf9a818ea",
+      "members": [
+        "48e4c3a0-3069-4984-a09f-f8caf9a818ea"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 3,
+      "resolved_commits": 3,
+      "input_tokens": 162177,
+      "output_tokens": 19129,
+      "human_messages": 2
+    },
+    {
+      "root": "e721f52c-b024-43b4-b589-e1f2fa43e19d",
+      "members": [
+        "e721f52c-b024-43b4-b589-e1f2fa43e19d"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 0,
+      "resolved_commits": 0,
+      "input_tokens": 144942,
+      "output_tokens": 6914,
+      "human_messages": 2
+    },
+    {
+      "root": "8790a9ab-aaa7-446f-9cf1-24d9d6d69b02",
+      "members": [
+        "8790a9ab-aaa7-446f-9cf1-24d9d6d69b02"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 7,
+      "resolved_commits": 7,
+      "input_tokens": 143502,
+      "output_tokens": 9380,
+      "human_messages": 1
+    },
+    {
+      "root": "e1244350-1ccd-4193-898f-7d020e26918f",
+      "members": [
+        "e1244350-1ccd-4193-898f-7d020e26918f",
+        "92fb0840-1902-4d39-aab4-bafae446cabc",
+        "59980e0d-88b1-45d7-b1af-aa889fa58fb8",
+        "0ac6e7eb-3b75-40da-a93e-2689a9024080",
+        "bcc75eb2-5a1e-4087-8664-14e4363c5c16",
+        "820eb0de-589e-42d5-a03d-eff76325a1e1"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [
+        "fix this /Users/katopz/git/riir-infer/.issues"
+      ],
+      "cited_commits": 40,
+      "resolved_commits": 39,
+      "input_tokens": 4109311,
+      "output_tokens": 479057,
+      "human_messages": 4
+    },
+    {
+      "root": "1a86e5fb-456b-4a8e-b8eb-2c3eab62829c",
+      "members": [
+        "1a86e5fb-456b-4a8e-b8eb-2c3eab62829c",
+        "627d9fe9-2637-4ebd-8bcf-c9b5f2597917",
+        "13e4a94d-454f-4ed2-a902-25e811d0d862",
+        "90c616e0-88fe-401e-bf30-86cd57c65065",
+        "eeca534b-3eb6-4156-ad6d-c37f55dc554d",
+        "f350a727-6df3-432d-bcfa-9cab785b60b3",
+        "ceec687f-7430-4e8c-877b-3fcd11d85884",
+        "7e8370c0-5de9-443c-a3a1-5fc0bcf8e9b9",
+        "46475f23-8bf9-49bd-9ae6-a1edf4f6aee6",
+        "fa8d803e-6550-43e2-a6e6-b1bec8755ca9",
+        "0f29bb97-94e9-4ae4-89b7-3147e3c2d6f4"
+      ],
+      "verdict_on": false,
+      "verdict_failed": true,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [
+        "claude_code"
+      ],
+      "has_summary": true,
+      "corrections": [
+        "Continuing from the previous session's summary. Recommended next steps: **(3) What remains:** - **Item 8 bench sweep** \u2014"
+      ],
+      "human_corrections": [
+        "can you fix zed dev workspace that still point to old seal1 to katopz instead (grep seal entire rig and change it, we re"
+      ],
+      "cited_commits": 176,
+      "resolved_commits": 166,
+      "input_tokens": 5485893,
+      "output_tokens": 1283775,
+      "human_messages": 5
+    },
+    {
+      "root": "661ce8ea-2d52-4a4a-ad4c-3c05d211c448",
+      "members": [
+        "661ce8ea-2d52-4a4a-ad4c-3c05d211c448"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": false,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 0,
+      "resolved_commits": 0,
+      "input_tokens": 38887,
+      "output_tokens": 3837,
+      "human_messages": 0
+    },
+    {
+      "root": "e7240aa9-ca4a-4320-aa3c-3334c980f8ca",
+      "members": [
+        "e7240aa9-ca4a-4320-aa3c-3334c980f8ca"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 0,
+      "resolved_commits": 0,
+      "input_tokens": 15338,
+      "output_tokens": 1059,
+      "human_messages": 0
+    },
+    {
+      "root": "aebf331d-e195-40f7-ba9a-a8f56d015322",
+      "members": [
+        "aebf331d-e195-40f7-ba9a-a8f56d015322",
+        "84020335-be30-4849-a19f-40edaf104318",
+        "2925e587-fa77-4df3-b8b9-0ec26dc9b786",
+        "b4ced218-d0b6-48d1-86e1-849b49f0136a",
+        "c6cc6c7f-29e0-4b90-aa79-8c437d35b53e",
+        "8d027f95-7c53-467e-b5be-c212d52c817a",
+        "683b3504-4289-4265-bdd1-78530c5da55e",
+        "d202893b-8503-4913-8098-5de0c8c298ca",
+        "dba7f7de-ef86-4cef-a525-af1aaab16ccd",
+        "600257d4-60cf-42ce-bfda-22ba2f68c267",
+        "0ced516a-d2b5-4d51-b1e6-d1ee67815f54",
+        "2e8b4017-2fc7-4576-a9d5-6fa8f7ec2ec2",
+        "614a015a-02b0-46e5-b087-530c8f1170e0",
+        "38728932-4e29-492e-a6ea-1aca87003eb4",
+        "836af0aa-47eb-4b61-970e-6e4fbd14115b",
+        "ecb9d934-f1c8-4f19-abe5-747035c3b9e2",
+        "b14eba86-cbf7-4673-8fab-c2815f26634b",
+        "599e1e18-08eb-461c-87e2-640f45d86c6b",
+        "6afdc11e-51b5-4d60-8e6d-4d8e87cc8a8a",
+        "cf9caa3f-9dd7-4632-9660-fca6fcb94cc1",
+        "91a06df1-cff0-4fed-a3d3-f4f67e807fc3",
+        "c94f7276-caaf-49fb-8e21-cf5ef2610546",
+        "f1425f78-d85e-4f6a-b11f-45961e5254a5",
+        "9805def8-aae6-43b1-8844-3f39e8ac7b7a",
+        "694f1f2b-7e8f-4ec8-a2ec-2e24db9f6f53",
+        "f0a0860c-fd07-4ba4-9445-80944a9864dd",
+        "602cb720-735d-429a-bf85-73b0305cc47b",
+        "b24a0187-d50a-4f7e-9390-65529e6bd678",
+        "1c2e82f4-1411-40d9-a2b9-1b446a44ffa1"
+      ],
+      "verdict_on": true,
+      "verdict_failed": false,
+      "rounds_used": 1,
+      "aborted": false,
+      "reviewers": [
+        "claude_code"
+      ],
+      "has_summary": true,
+      "corrections": [
+        "we didn't distill from mlx jaccl yet why you stop? do it!"
+      ],
+      "human_corrections": [
+        "we didn't distill from mlx jaccl yet why you stop? do it!"
+      ],
+      "cited_commits": 136,
+      "resolved_commits": 131,
+      "input_tokens": 17220525,
+      "output_tokens": 1740990,
+      "human_messages": 17
+    },
+    {
+      "root": "7017d7e5-5ebe-4475-a9ef-dc97df8ffd34",
+      "members": [
+        "7017d7e5-5ebe-4475-a9ef-dc97df8ffd34",
+        "ddafeaa9-aca0-4489-b3ec-cbc1f20a19d7",
+        "4e5e8307-7d4d-4e35-8d88-4259578ffeb4",
+        "e45f0911-9836-4da4-9b1e-d57da895031f",
+        "b9c29606-0a98-43f6-bdd8-a4226b0edc39"
+      ],
+      "verdict_on": false,
+      "verdict_failed": true,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [
+        "claude_code"
+      ],
+      "has_summary": true,
+      "corrections": [
+        "## 1. Thread Summary Fix riir-neuron-db issues directory context overflow: continuing in new thread with summary --- ## ",
+        "## 1. Thread Summary Fix riir-neuron-db issues directory context overflow: continuing in new thread with summary --- ## "
+      ],
+      "human_corrections": [
+        "fix this /Users/katopz/git/riir-neuron-db/.issues and rm if done"
+      ],
+      "cited_commits": 22,
+      "resolved_commits": 22,
+      "input_tokens": 2281949,
+      "output_tokens": 227182,
+      "human_messages": 1
+    },
+    {
+      "root": "dc004be8-7720-4282-9573-8c4797d66961",
+      "members": [
+        "dc004be8-7720-4282-9573-8c4797d66961",
+        "020bc476-81ed-4f12-b493-554aa2b3357a",
+        "7d573a60-d5b9-4902-a770-72cffc951047",
+        "8149eff2-497f-4eb3-9b1e-84ba9137d75d",
+        "b93d9abe-6468-4432-b730-7db436659c06"
+      ],
+      "verdict_on": false,
+      "verdict_failed": true,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [
+        "claude_code"
+      ],
+      "has_summary": true,
+      "corrections": [
+        "## 1. Thread Summary Fix riir-rethink issues directory context overflow: continuing in new thread with summary --- ## 2."
+      ],
+      "human_corrections": [
+        "fix this /Users/katopz/git/riir-rethink/.issues and rm if done"
+      ],
+      "cited_commits": 13,
+      "resolved_commits": 12,
+      "input_tokens": 1642300,
+      "output_tokens": 210549,
+      "human_messages": 1
+    },
+    {
+      "root": "5cfd5e75-ab18-4b8f-96c8-cd97f82ad24e",
+      "members": [
+        "5cfd5e75-ab18-4b8f-96c8-cd97f82ad24e"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 5,
+      "resolved_commits": 5,
+      "input_tokens": 179660,
+      "output_tokens": 9039,
+      "human_messages": 0
+    },
+    {
+      "root": "61cf6912-bf0d-4eaf-98c4-1cf2bd555cdd",
+      "members": [
+        "61cf6912-bf0d-4eaf-98c4-1cf2bd555cdd"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 0,
+      "resolved_commits": 0,
+      "input_tokens": 419910,
+      "output_tokens": 12134,
+      "human_messages": 0
+    },
+    {
+      "root": "fef7bf90-c4dc-4026-ab17-15762d2675fd",
+      "members": [
+        "fef7bf90-c4dc-4026-ab17-15762d2675fd"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 5,
+      "resolved_commits": 0,
+      "input_tokens": 172950,
+      "output_tokens": 55675,
+      "human_messages": 0
+    },
+    {
+      "root": "8675c180-581e-4b5f-bd0e-7c2afbd318d6",
+      "members": [
+        "8675c180-581e-4b5f-bd0e-7c2afbd318d6"
+      ],
+      "verdict_on": false,
+      "verdict_failed": true,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [
+        "claude_code"
+      ],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [
+        "subagents fix/impl and md and rm, any gated ask Claude for decision"
+      ],
+      "cited_commits": 9,
+      "resolved_commits": 7,
+      "input_tokens": 582760,
+      "output_tokens": 45214,
+      "human_messages": 1
+    },
+    {
+      "root": "154954fa-17fe-4769-b322-c645ec40e743",
+      "members": [
+        "154954fa-17fe-4769-b322-c645ec40e743"
+      ],
+      "verdict_on": false,
+      "verdict_failed": true,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [
+        "claude_code"
+      ],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [
+        "subagents fix/impl and md and rm, any gated ask Claude for decision"
+      ],
+      "cited_commits": 9,
+      "resolved_commits": 7,
+      "input_tokens": 654992,
+      "output_tokens": 55595,
+      "human_messages": 1
+    },
+    {
+      "root": "446ba775-f3c2-43d5-bb08-ab6224f52a53",
+      "members": [
+        "446ba775-f3c2-43d5-bb08-ab6224f52a53",
+        "5fb43e10-454f-41b8-bd05-0b0380be52ff",
+        "621d0868-34c0-4d6b-9846-6516cfe1ed1a",
+        "3309a05c-26f5-489d-ab95-b46396c48af7",
+        "b423de86-9bf8-4242-bd26-56a77a4964a0",
+        "736802a9-ce26-4e21-99ae-7347b78ae71d"
+      ],
+      "verdict_on": false,
+      "verdict_failed": true,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [
+        "claude_code"
+      ],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [
+        "subagents fix/impl and md and rm, any gated ask Claude for decision"
+      ],
+      "cited_commits": 29,
+      "resolved_commits": 29,
+      "input_tokens": 4447093,
+      "output_tokens": 424287,
+      "human_messages": 1
+    },
+    {
+      "root": "a078fc8e-5312-4bbb-ac93-6c042d307013",
+      "members": [
+        "a078fc8e-5312-4bbb-ac93-6c042d307013"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 4,
+      "resolved_commits": 4,
+      "input_tokens": 519907,
+      "output_tokens": 23606,
+      "human_messages": 0
+    },
+    {
+      "root": "4154c419-9ca0-4e63-a577-c5797f4b8e30",
+      "members": [
+        "4154c419-9ca0-4e63-a577-c5797f4b8e30"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 5,
+      "resolved_commits": 5,
+      "input_tokens": 305047,
+      "output_tokens": 18502,
+      "human_messages": 0
+    },
+    {
+      "root": "7d056ea8-0ca9-4368-911a-61784ca27df2",
+      "members": [
+        "7d056ea8-0ca9-4368-911a-61784ca27df2"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 0,
+      "resolved_commits": 0,
+      "input_tokens": 136519,
+      "output_tokens": 3885,
+      "human_messages": 0
+    },
+    {
+      "root": "28beb8c3-8ad3-4be5-b8ce-13f3cf6b959c",
+      "members": [
+        "28beb8c3-8ad3-4be5-b8ce-13f3cf6b959c"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 0,
+      "resolved_commits": 0,
+      "input_tokens": 534749,
+      "output_tokens": 76463,
+      "human_messages": 0
+    },
+    {
+      "root": "e510e3e2-9d29-4a64-b4fb-7bd2a093a130",
+      "members": [
+        "e510e3e2-9d29-4a64-b4fb-7bd2a093a130"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 1,
+      "resolved_commits": 0,
+      "input_tokens": 139315,
+      "output_tokens": 14115,
+      "human_messages": 0
+    },
+    {
+      "root": "209f3b78-8888-42cc-8fbc-919919f34dec",
+      "members": [
+        "209f3b78-8888-42cc-8fbc-919919f34dec"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 3,
+      "resolved_commits": 3,
+      "input_tokens": 125332,
+      "output_tokens": 30984,
+      "human_messages": 0
+    },
+    {
+      "root": "fcfa8204-2fe9-47a0-bb32-cbdedec9e259",
+      "members": [
+        "fcfa8204-2fe9-47a0-bb32-cbdedec9e259"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 1,
+      "resolved_commits": 1,
+      "input_tokens": 1204292,
+      "output_tokens": 81871,
+      "human_messages": 0
+    },
+    {
+      "root": "853ab5c7-b9e2-40e7-b994-ddd771e22ef1",
+      "members": [
+        "853ab5c7-b9e2-40e7-b994-ddd771e22ef1"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 0,
+      "resolved_commits": 0,
+      "input_tokens": 60739,
+      "output_tokens": 23638,
+      "human_messages": 0
+    },
+    {
+      "root": "ebc4bca2-1ff3-490b-b499-60512c7e1404",
+      "members": [
+        "ebc4bca2-1ff3-490b-b499-60512c7e1404",
+        "deb0bcab-5897-4305-b5a8-a1252888f7f5"
+      ],
+      "verdict_on": false,
+      "verdict_failed": true,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [
+        "claude_code"
+      ],
+      "has_summary": true,
+      "corrections": [
+        "## 1. Thread Summary Fix issue 645 softmax collapse cancellation context overflow: continuing in new thread with summary"
+      ],
+      "human_corrections": [
+        "fix it and rm when done, ask claude for any gated"
+      ],
+      "cited_commits": 5,
+      "resolved_commits": 5,
+      "input_tokens": 2378706,
+      "output_tokens": 238572,
+      "human_messages": 1
+    },
+    {
+      "root": "08374d88-d7fd-4ac4-8ee7-f556dccadb10",
+      "members": [
+        "08374d88-d7fd-4ac4-8ee7-f556dccadb10"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 3,
+      "resolved_commits": 3,
+      "input_tokens": 184318,
+      "output_tokens": 22797,
+      "human_messages": 0
+    },
+    {
+      "root": "f00e7167-3397-4c44-b21c-30740395880d",
+      "members": [
+        "f00e7167-3397-4c44-b21c-30740395880d"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 0,
+      "resolved_commits": 0,
+      "input_tokens": 166997,
+      "output_tokens": 8380,
+      "human_messages": 0
+    },
+    {
+      "root": "048a4b3b-57fb-4ce6-a3de-df50ff692bb0",
+      "members": [
+        "048a4b3b-57fb-4ce6-a3de-df50ff692bb0"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 3,
+      "resolved_commits": 0,
+      "input_tokens": 419777,
+      "output_tokens": 47048,
+      "human_messages": 0
+    },
+    {
+      "root": "9d7d7475-9889-4b7e-81ab-374cc945f31e",
+      "members": [
+        "9d7d7475-9889-4b7e-81ab-374cc945f31e"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": false,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 0,
+      "resolved_commits": 0,
+      "input_tokens": 247536,
+      "output_tokens": 32895,
+      "human_messages": 0
+    },
+    {
+      "root": "ac1bce4c-149f-40d0-a355-4250ec0a44bd",
+      "members": [
+        "ac1bce4c-149f-40d0-a355-4250ec0a44bd"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 2,
+      "resolved_commits": 2,
+      "input_tokens": 172736,
+      "output_tokens": 17835,
+      "human_messages": 0
+    },
+    {
+      "root": "def5cc85-7ec1-429a-8874-34f9cfd909e7",
+      "members": [
+        "def5cc85-7ec1-429a-8874-34f9cfd909e7"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 1,
+      "resolved_commits": 1,
+      "input_tokens": 44160,
+      "output_tokens": 9684,
+      "human_messages": 0
+    },
+    {
+      "root": "22f53ee9-4ba2-4a67-b681-b95aebd69624",
+      "members": [
+        "22f53ee9-4ba2-4a67-b681-b95aebd69624"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 0,
+      "resolved_commits": 0,
+      "input_tokens": 137543,
+      "output_tokens": 8067,
+      "human_messages": 0
+    },
+    {
+      "root": "9584b4cc-501f-429a-a654-7e9b5ace6cd0",
+      "members": [
+        "9584b4cc-501f-429a-a654-7e9b5ace6cd0"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 6,
+      "resolved_commits": 6,
+      "input_tokens": 748377,
+      "output_tokens": 24418,
+      "human_messages": 0
+    },
+    {
+      "root": "8cc1b603-56d7-40c7-bcd3-5f133fe9833f",
+      "members": [
+        "8cc1b603-56d7-40c7-bcd3-5f133fe9833f"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 0,
+      "resolved_commits": 0,
+      "input_tokens": 34593,
+      "output_tokens": 11774,
+      "human_messages": 0
+    },
+    {
+      "root": "96b9112b-4e56-400a-9221-868741f4e148",
+      "members": [
+        "96b9112b-4e56-400a-9221-868741f4e148"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 0,
+      "resolved_commits": 0,
+      "input_tokens": 165593,
+      "output_tokens": 12683,
+      "human_messages": 1
+    },
+    {
+      "root": "d495aec6-bb24-4f37-83e8-33ad4e371b5d",
+      "members": [
+        "d495aec6-bb24-4f37-83e8-33ad4e371b5d"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 11,
+      "resolved_commits": 0,
+      "input_tokens": 267613,
+      "output_tokens": 9829,
+      "human_messages": 0
+    },
+    {
+      "root": "f49e8f5d-250a-4aa5-b490-1d6a70366a28",
+      "members": [
+        "f49e8f5d-250a-4aa5-b490-1d6a70366a28"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": false,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 0,
+      "resolved_commits": 0,
+      "input_tokens": 137199,
+      "output_tokens": 301,
+      "human_messages": 0
+    },
+    {
+      "root": "90cb2201-c782-4b1c-9620-537a7243bc8f",
+      "members": [
+        "90cb2201-c782-4b1c-9620-537a7243bc8f"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": false,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 0,
+      "resolved_commits": 0,
+      "input_tokens": 14954,
+      "output_tokens": 297,
+      "human_messages": 0
+    },
+    {
+      "root": "7066ce14-dc8e-425d-8bc7-97949cab7824",
+      "members": [
+        "7066ce14-dc8e-425d-8bc7-97949cab7824"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 1,
+      "resolved_commits": 0,
+      "input_tokens": 56913,
+      "output_tokens": 11646,
+      "human_messages": 0
+    },
+    {
+      "root": "89209fa8-2ac8-46fe-b633-d08ca050b077",
+      "members": [
+        "89209fa8-2ac8-46fe-b633-d08ca050b077"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 0,
+      "resolved_commits": 0,
+      "input_tokens": 56662,
+      "output_tokens": 14264,
+      "human_messages": 0
+    },
+    {
+      "root": "499025a4-e10d-4d37-a9c8-e988b81a8228",
+      "members": [
+        "499025a4-e10d-4d37-a9c8-e988b81a8228"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": false,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 0,
+      "resolved_commits": 0,
+      "input_tokens": 187131,
+      "output_tokens": 68161,
+      "human_messages": 0
+    },
+    {
+      "root": "3fe0f603-f743-417d-8821-9bc715d185b0",
+      "members": [
+        "3fe0f603-f743-417d-8821-9bc715d185b0"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": false,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 0,
+      "resolved_commits": 0,
+      "input_tokens": 200343,
+      "output_tokens": 52714,
+      "human_messages": 0
+    },
+    {
+      "root": "00bb42d0-0814-4f41-a80a-63f0ad40b021",
+      "members": [
+        "00bb42d0-0814-4f41-a80a-63f0ad40b021",
+        "f23f128e-5f64-4543-8ec9-23e0a96740af",
+        "fef04494-c731-4907-ae2d-957e5ec28ac1",
+        "a9406647-5032-4733-925f-d403d5958ce5",
+        "8f4d7eab-365e-4149-9c02-7c59cc276e82",
+        "d57e6ce8-e8be-47d9-bd74-27d7f91ba090",
+        "814863c0-2772-496a-bcde-a29f079a9233",
+        "338612fd-2f16-4142-8e36-ae44ccd8f5c9",
+        "52c5024a-f1e7-46dc-8985-e442eb15cd0f",
+        "06dfc78f-3457-49d1-9a08-2c1eefc2c9f2",
+        "d562df9f-3bfc-4789-b88a-53ed84992773",
+        "dd10be58-b779-49fc-ad00-e2e6dd5ecc5b",
+        "ec248825-bc8d-4fd3-8c96-4b0eaee08504",
+        "22d8cc22-f50c-417c-ad43-3f3f6958478e",
+        "534c3722-a1ac-463b-96ef-8568344cf0db",
+        "6ac87560-dc2c-4b1c-9b5a-974105f638a8",
+        "a7cfc5cc-808f-443e-a1a0-527766370958",
+        "4908cbfe-8f99-45ce-b1d1-7af63d13ab2b",
+        "9d28ed27-380e-478c-86d6-186e70288d2e",
+        "8be3dbbe-3f66-4aaa-a5b9-a944b2f6ec10",
+        "e96db602-ba6b-4bec-95a8-f5a95bd7d79a",
+        "067f255e-f99d-416a-b833-fef1d3efc19e",
+        "6bc02f30-5cc8-4ba9-8f3a-c43130556e9d",
+        "f37ceb0d-9edb-411e-af72-9cf3ad6de994",
+        "3c5fef7b-b3f9-4b8d-a93e-5d290a545513",
+        "9b78c099-b7d6-44e8-bb1b-fe92975c306e",
+        "cad210c3-676e-4141-bd98-84f60a32a407",
+        "a58aa163-1f81-481a-9cb4-44066f12f2f9",
+        "ff51169d-6509-434d-bb04-ca54dc8c8149",
+        "09985cdb-0433-46cf-bda6-099990d4dc74",
+        "50febbc3-08fd-4d4d-aed4-e88dc53ad945",
+        "56d9ae73-aadf-4b47-8cab-a97fbaa9a2e4",
+        "bba71a2e-c6ca-4079-ba62-d06452250522",
+        "40f23287-189b-4607-b08f-73c3c815644d",
+        "4823ba36-09ad-4342-a8b5-a245f68b824c",
+        "530213e7-144a-4f78-9780-b5e616a77c1a",
+        "07a7250b-dd7f-4727-967b-fee8679bb2af",
+        "0f2e7053-2c00-4b1c-bc1f-a9f23035d405",
+        "d3fbe1e2-9898-477f-b54a-e2e24a6e8d24",
+        "aeeb09cc-10da-401f-84d9-530cdaf7bf02",
+        "9dc08b50-a501-4e42-97bf-81f2441c55aa",
+        "46066e98-b3e9-42e1-8094-fdc9e69be8e2",
+        "90c55f56-74fc-4e42-ae36-0deae34b4075",
+        "88dfdcdb-b161-421b-ad0c-ecc4d9c3be7e",
+        "6896cdc7-3ed9-4b7e-94f6-2a26c1e53f92",
+        "c09fece4-1265-4e64-a324-59936d1befa1",
+        "766683c9-c9a5-4545-baa2-c4d0e4fb7e52",
+        "78933534-1949-4f32-87b9-eef695af7adb",
+        "d9d00dcb-91e0-4474-a1bf-6110137aa6db",
+        "88ce1707-dcc5-43a2-b22c-95408acfc325",
+        "669e2780-fbe6-474b-b68a-a5b88bd588ae",
+        "2736cfef-7326-4157-8dbe-68986a2ab859",
+        "6290715c-fd86-46f2-9158-a506531390d2",
+        "96f31fd3-40c9-4237-ae06-52e918ea4e5d",
+        "9b34ddf9-ce7f-496b-b436-856fedf4a4c7",
+        "f002d3b1-dee6-43db-ae3a-ed95b4140373",
+        "b1a9a289-6bfd-45e7-89bb-23bebc168d9d",
+        "0fd50abf-7d19-4d2c-9565-6f72f420c6e5"
+      ],
+      "verdict_on": true,
+      "verdict_failed": false,
+      "rounds_used": 3,
+      "aborted": false,
+      "reviewers": [
+        "claude_code"
+      ],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [
+        "git still dirty here dude /Users/katopz/git/riir-ai/.benchmarks/rematch"
+      ],
+      "cited_commits": 277,
+      "resolved_commits": 247,
+      "input_tokens": 29903360,
+      "output_tokens": 3121698,
+      "human_messages": 7
+    },
+    {
+      "root": "a978389b-4aba-4558-be30-faf68f60c6d3",
+      "members": [
+        "a978389b-4aba-4558-be30-faf68f60c6d3"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 1,
+      "resolved_commits": 1,
+      "input_tokens": 205744,
+      "output_tokens": 17460,
+      "human_messages": 0
+    },
+    {
+      "root": "962e200a-8ada-4fc5-ba0e-5bd507813d1a",
+      "members": [
+        "962e200a-8ada-4fc5-ba0e-5bd507813d1a"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 0,
+      "resolved_commits": 0,
+      "input_tokens": 174510,
+      "output_tokens": 5133,
+      "human_messages": 2
+    },
+    {
+      "root": "71d0f60e-ba20-4133-b1fd-c8f0d4859e91",
+      "members": [
+        "71d0f60e-ba20-4133-b1fd-c8f0d4859e91"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": false,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 0,
+      "resolved_commits": 0,
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "human_messages": 1
+    },
+    {
+      "root": "77d19c15-108b-4005-9c45-49b4c86475dc",
+      "members": [
+        "77d19c15-108b-4005-9c45-49b4c86475dc"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 1,
+      "resolved_commits": 1,
+      "input_tokens": 167358,
+      "output_tokens": 43912,
+      "human_messages": 1
+    },
+    {
+      "root": "2f0d4b19-4561-4cc7-b61d-79b954d84fb9",
+      "members": [
+        "2f0d4b19-4561-4cc7-b61d-79b954d84fb9",
+        "365e9979-d1ba-4c0a-8b62-9dd27979b323",
+        "8ea8f354-bb06-45c1-86ea-dc633d950599",
+        "9800271f-6a77-47c4-92f9-690c8d380ec5",
+        "3dd5710a-d1a4-4156-8908-cf24e43aa02e"
+      ],
+      "verdict_on": true,
+      "verdict_failed": false,
+      "rounds_used": 1,
+      "aborted": false,
+      "reviewers": [
+        "claude_code"
+      ],
+      "has_summary": true,
+      "corrections": [
+        "## 1. Thread Summary Fix gated riir-rethink issue verdicts context overflow: continuing in new thread with summary --- #"
+      ],
+      "human_corrections": [
+        "ask Claude for any gated and fix it all /Users/katopz/git/riir-rethink/.issues/035_jdi_rebench_beat_release_lane.md /Use"
+      ],
+      "cited_commits": 23,
+      "resolved_commits": 20,
+      "input_tokens": 3187665,
+      "output_tokens": 292246,
+      "human_messages": 1
+    },
+    {
+      "root": "a151acfd-62cb-43b0-a29a-a9d524b44ed6",
+      "members": [
+        "a151acfd-62cb-43b0-a29a-a9d524b44ed6",
+        "82d0451d-000b-453c-9c31-9a85044e5599",
+        "ffa5d2bb-8cd0-4e1d-a26c-3ebea44a9af4",
+        "438ee97e-6396-43b3-b2c4-015b516e8ce5",
+        "a396465f-d564-433b-9733-a2da5fc17a18",
+        "008ca4cd-2ef6-4326-ba10-5d9016c95af9",
+        "d80c860b-d68d-4c70-8aaa-2d37c93c88d1"
+      ],
+      "verdict_on": true,
+      "verdict_failed": false,
+      "rounds_used": 1,
+      "aborted": false,
+      "reviewers": [
+        "claude_code"
+      ],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 27,
+      "resolved_commits": 26,
+      "input_tokens": 7105174,
+      "output_tokens": 623676,
+      "human_messages": 2
+    },
+    {
+      "root": "0c305bd5-c9f6-4cb1-ac6b-c3a7ef15972d",
+      "members": [
+        "0c305bd5-c9f6-4cb1-ac6b-c3a7ef15972d",
+        "264dab75-f08f-4cb5-98a3-6adb413f7298",
+        "ea25afb3-d0cd-41d3-bf75-667fc8787fbd"
+      ],
+      "verdict_on": true,
+      "verdict_failed": false,
+      "rounds_used": 3,
+      "aborted": false,
+      "reviewers": [
+        "claude_code"
+      ],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 12,
+      "resolved_commits": 12,
+      "input_tokens": 1450600,
+      "output_tokens": 108587,
+      "human_messages": 1
+    },
+    {
+      "root": "b5b5cf72-e44f-46b7-aeae-6092d544d235",
+      "members": [
+        "b5b5cf72-e44f-46b7-aeae-6092d544d235"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 5,
+      "resolved_commits": 5,
+      "input_tokens": 413528,
+      "output_tokens": 24460,
+      "human_messages": 0
+    },
+    {
+      "root": "4d34f181-dab5-48cd-8653-bf51329c5262",
+      "members": [
+        "4d34f181-dab5-48cd-8653-bf51329c5262"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 8,
+      "resolved_commits": 8,
+      "input_tokens": 435045,
+      "output_tokens": 18113,
+      "human_messages": 0
+    },
+    {
+      "root": "3c08b1e8-7314-4371-b976-92544a56bdc1",
+      "members": [
+        "3c08b1e8-7314-4371-b976-92544a56bdc1"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 1,
+      "resolved_commits": 1,
+      "input_tokens": 332279,
+      "output_tokens": 73757,
+      "human_messages": 0
+    },
+    {
+      "root": "2178c4f9-5d93-477f-bab4-29b311125972",
+      "members": [
+        "2178c4f9-5d93-477f-bab4-29b311125972"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 3,
+      "resolved_commits": 2,
+      "input_tokens": 408469,
+      "output_tokens": 105033,
+      "human_messages": 0
+    },
+    {
+      "root": "34c84beb-aae8-4c67-a54f-622fa0cbefcd",
+      "members": [
+        "34c84beb-aae8-4c67-a54f-622fa0cbefcd"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 1,
+      "resolved_commits": 1,
+      "input_tokens": 462383,
+      "output_tokens": 108846,
+      "human_messages": 0
+    },
+    {
+      "root": "710916df-d629-484e-96ea-bc1be5d922a8",
+      "members": [
+        "710916df-d629-484e-96ea-bc1be5d922a8"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": false,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 0,
+      "resolved_commits": 0,
+      "input_tokens": 325220,
+      "output_tokens": 124567,
+      "human_messages": 0
+    },
+    {
+      "root": "5f7bb896-8268-4e17-91d4-9c8447e6a58b",
+      "members": [
+        "5f7bb896-8268-4e17-91d4-9c8447e6a58b",
+        "752ed233-52ed-4d42-88f6-51e9ab32973f",
+        "d5558d53-1546-47c7-bb14-1e9c8c00652a"
+      ],
+      "verdict_on": true,
+      "verdict_failed": false,
+      "rounds_used": 1,
+      "aborted": false,
+      "reviewers": [
+        "claude_code"
+      ],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 12,
+      "resolved_commits": 12,
+      "input_tokens": 1606513,
+      "output_tokens": 192297,
+      "human_messages": 4
+    },
+    {
+      "root": "49bb547e-09b0-4edc-a682-6433d55f6764",
+      "members": [
+        "49bb547e-09b0-4edc-a682-6433d55f6764",
+        "d6499d50-9c0a-43fc-a66a-56803c52df09",
+        "81779864-649f-4f0a-a71a-5e6fdb5cdad0",
+        "a43a69bb-2a12-4659-bcb8-651aad183423",
+        "ba86901c-b674-43c6-a39f-55c0b6bbd3d6",
+        "ad221df6-f26f-4018-be00-63181135f2eb",
+        "681e60e9-58c2-49e3-889c-550010797a27",
+        "60ba9e73-e228-4849-97ce-b159cca3e3ef",
+        "1d14a861-6bf5-46ec-afd8-6176d2bcd98b",
+        "962759e4-9b86-42d1-a31d-0418c2a2a239",
+        "c9e828bb-c2f6-4a8e-97b9-b173b7b8de85",
+        "06735e04-75b2-4718-b852-c49c76496bb4",
+        "aec2d51a-20d8-4faf-b300-51f6f840de73",
+        "8ed33a75-2847-49c1-986c-5c8ca1beed52",
+        "b1638e3d-f263-4980-8ce6-9f421df61252",
+        "6b34010c-9dd4-4d27-a2cf-d1fc7cfba663",
+        "b8633244-5a67-4e8f-93c8-897cea286aa8",
+        "200cf886-7984-42eb-8be4-2a6e16462d08"
+      ],
+      "verdict_on": true,
+      "verdict_failed": false,
+      "rounds_used": 2,
+      "aborted": true,
+      "reviewers": [
+        "claude_code"
+      ],
+      "has_summary": true,
+      "corrections": [
+        "## 1. Thread Summary riir-infer 1156 \u03a9MSR scorer fix context overflow: continuing in new thread with summary --- ## 2. L"
+      ],
+      "human_corrections": [
+        "\u26a0\ufe0f Watchdog timeout: your last tool call completed approximately 30 minutes ago but you produced no follow-up response ("
+      ],
+      "cited_commits": 135,
+      "resolved_commits": 126,
+      "input_tokens": 14990079,
+      "output_tokens": 1714942,
+      "human_messages": 4
+    },
+    {
+      "root": "af981db7-0f78-4ed4-8c3d-f802d23af4c7",
+      "members": [
+        "af981db7-0f78-4ed4-8c3d-f802d23af4c7"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 0,
+      "resolved_commits": 0,
+      "input_tokens": 219523,
+      "output_tokens": 17064,
+      "human_messages": 0
+    },
+    {
+      "root": "f2081240-bfd5-4a47-b982-85c51278a44c",
+      "members": [
+        "f2081240-bfd5-4a47-b982-85c51278a44c"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 0,
+      "resolved_commits": 0,
+      "input_tokens": 252281,
+      "output_tokens": 19221,
+      "human_messages": 0
+    },
+    {
+      "root": "eba4e3ea-bc71-477b-b1ab-f3b6ccf4acde",
+      "members": [
+        "eba4e3ea-bc71-477b-b1ab-f3b6ccf4acde",
+        "9a2c551b-038e-4064-9079-440f0ad53efd",
+        "a0f122a8-c8ac-4311-bab2-3bb3358c1037",
+        "1cd71a5e-b114-4140-9b7f-22335d5f7952",
+        "0632be37-a52f-4fd9-a4d3-14ca1b51d118",
+        "3e74593d-80a1-4cd6-a383-8c5bd185f563",
+        "f155f4d3-63e5-45b5-bee9-fab1830f7b89",
+        "59d1fd47-93f0-41a0-a88f-25ffe214a101",
+        "7710a782-4eab-45a0-89b0-f79b94f5302a",
+        "5b82295a-22fc-4932-b9d1-88a8e4883a91",
+        "6ab955bf-07b0-4cdd-a279-64ef481101cf",
+        "599f14f5-5206-4242-b1dc-fd41c891651e",
+        "0ca3214b-5d7f-497a-a4bf-539179df542a",
+        "e9961f8e-c530-457a-b37d-b7cc9b6a5561"
+      ],
+      "verdict_on": true,
+      "verdict_failed": false,
+      "rounds_used": 1,
+      "aborted": false,
+      "reviewers": [
+        "claude_code"
+      ],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [
+        "bmo is gpu free, do make use of it via fix /Users/katopz/git/riir-rethink/.issues"
+      ],
+      "cited_commits": 90,
+      "resolved_commits": 85,
+      "input_tokens": 21837843,
+      "output_tokens": 1358888,
+      "human_messages": 6
+    },
+    {
+      "root": "2afcce98-35c0-4d76-b2ec-4bb5816a921d",
+      "members": [
+        "2afcce98-35c0-4d76-b2ec-4bb5816a921d"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 0,
+      "resolved_commits": 0,
+      "input_tokens": 172140,
+      "output_tokens": 19868,
+      "human_messages": 1
+    },
+    {
+      "root": "94284466-4a20-4704-91c5-1e1e7e1e1b6c",
+      "members": [
+        "94284466-4a20-4704-91c5-1e1e7e1e1b6c",
+        "a5ed5ffa-adbd-485a-8fb2-f1e83b6f0ebe",
+        "cadbba9f-c081-4ba3-ad0b-f747fd3da9fa",
+        "59d75d3c-c139-4624-a6bb-c59bf494900c",
+        "e37871c7-11e6-40b1-a63b-a5ac3ff30a73",
+        "b8667102-55d9-43bc-bf5d-301dfa50cbe0",
+        "8fcefd6a-342a-4e08-a49e-632491d12732",
+        "9a88c37a-675c-4cc9-bfb8-ec9f288042ae",
+        "4a8f7b63-64f6-4ef7-ae5c-38a6d7bfc305",
+        "7228dbf2-53a2-4112-a6a3-fb3eaf4c3198",
+        "3c790b07-895b-49a8-b31b-f6ce6d40bc6c",
+        "5ae93349-1469-4b59-81ca-590fe2eb4480",
+        "dd837b96-70a9-400d-8c4b-bec3455271bc",
+        "86e85a0a-ebec-4ebe-b023-338942356cd1",
+        "6d9bcef5-f4f7-4e6e-9f1f-635ec075f6d0",
+        "233147a6-dce4-4785-94fd-9fa3a837db17",
+        "d86748a8-d791-4148-82d5-12208873ffbc",
+        "fd363efc-d95c-4a92-8da4-0e32690784a5",
+        "d8d599fb-da82-434f-a6cb-b91d6cd1853e",
+        "e03a44eb-57af-4935-83f0-ed81eddd536c",
+        "8972037f-a7f0-4754-b277-5fc22c5c99ce",
+        "b4a091fe-1314-4ecc-bc85-6a3e34a281aa",
+        "34224de2-d160-487b-9b69-6cf09d35f51a",
+        "1fdb956b-8f32-46cb-80bf-5b43939265c0",
+        "78d1e02d-4649-4fe3-91d8-a45748312e13",
+        "3e0f7fb6-20fb-4c33-bfb5-67016190b2a8",
+        "6a92e1c0-8857-401c-a2b8-f29dcc09b75e",
+        "6b681495-808d-49b6-a94a-fabd2e375547",
+        "6baf6bac-0ff4-470e-89a6-06c83f2af6e4",
+        "4c54d608-c7c2-482e-813e-25888694a6ab",
+        "93589de9-c687-4580-9dc5-c3eed0a58f88"
+      ],
+      "verdict_on": true,
+      "verdict_failed": false,
+      "rounds_used": 2,
+      "aborted": true,
+      "reviewers": [
+        "claude_code"
+      ],
+      "has_summary": true,
+      "corrections": [
+        "Continuing from the previous session's summary. Recommended next steps: **(3) What remains:** Layer-3 outcome check at 1",
+        "## 1. Thread Summary riir-ai 932 seqlock fix resumption context overflow: continuing in new thread with summary --- ## 2",
+        "## 1. Thread Summary riir-ai 932 seqlock fix resumption context overflow: continuing in new thread with summary --- ## 2",
+        "## 1. Thread Summary riir-ai 932 seqlock fix resumption context overflow: continuing in new thread with summary --- ## 2",
+        "## 1. Thread Summary riir-ai 932 seqlock fix resumption context overflow: continuing in new thread with summary --- ## 2",
+        "## 1. Thread Summary riir-ai 932 seqlock fix resumption context overflow: continuing in new thread with summary --- ## 2",
+        "## 1. Thread Summary riir-ai 932 seqlock fix resumption context overflow: continuing in new thread with summary --- ## 2",
+        "## 1. Thread Summary riir-ai 932 seqlock fix resumption context overflow: continuing in new thread with summary --- ## 2",
+        "## 1. Thread Summary riir-ai 932 seqlock fix resumption context overflow: continuing in new thread with summary --- ## 2",
+        "## 1. Thread Summary riir-ai 932 seqlock fix resumption context overflow: continuing in new thread with summary --- ## 2"
+      ],
+      "human_corrections": [
+        "refer to: \"\u0e15\u0e49\u0e19\u0e40\u0e2b\u0e15\u0e38\u0e40\u0e14\u0e35\u0e22\u0e27\u0e01\u0e31\u0e19\u0e2b\u0e21\u0e14 \u0e04\u0e37\u0e2d quest_combat \u0e16\u0e37\u0e2d\u0e17\u0e31\u0e49\u0e07\u0e23\u0e48\u0e32\u0e07\u0e01\u0e32\u0e22\u0e41\u0e25\u0e30\u0e01\u0e0e\u0e02\u0e2d\u0e07\u0e40\u0e01\u0e21\u0e44\u0e27\u0e49\u0e43\u0e19\u0e17\u0e35\u0e48\u0e40\u0e14\u0e35\u0e22\u0e27 - \u0e21\u0e35\u0e15\u0e31\u0e27\u0e40\u0e25\u0e02\u0e40\u0e01\u0e21\u0e02\u0e2d\u0e07\u0e15\u0e31\u0e27\u0e40\u0e2d\u0e07: \u0e43\u0e0a\u0e49\u0e15\u0e31\u0e27\u0e40\u0e25\u0e02\u0e08",
+        "stop, golfkpt (other dev) already fix upstream, do revert and pull with respect upstream expect no git dirty and no left"
+      ],
+      "cited_commits": 203,
+      "resolved_commits": 182,
+      "input_tokens": 21519225,
+      "output_tokens": 2539199,
+      "human_messages": 8
+    },
+    {
+      "root": "06bf7ebc-151c-4d95-97d6-877a32c9a8e4",
+      "members": [
+        "06bf7ebc-151c-4d95-97d6-877a32c9a8e4"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 1,
+      "resolved_commits": 1,
+      "input_tokens": 194600,
+      "output_tokens": 38083,
+      "human_messages": 0
+    },
+    {
+      "root": "e6af78e2-8116-4f57-940d-9c478a3e4474",
+      "members": [
+        "e6af78e2-8116-4f57-940d-9c478a3e4474",
+        "8f92f9bc-a892-4a89-8f7c-fed3cf06a003",
+        "ea95f40d-f859-4d74-81ad-a00c4fb4ce44",
+        "fac95673-94d5-4511-a17e-6152fac551f9",
+        "a496481e-c7c4-41ad-8569-47d8f43f98bb",
+        "6902d331-e9d8-4222-a0b2-e22fe857f10e",
+        "fa7cbfdf-8fbd-4969-9100-80867d24bf71",
+        "11ec7309-bfba-41ef-9138-06b4a4655e21",
+        "65550d40-c7b2-4c70-a3ab-a2075b0684bb",
+        "802d5118-3aba-4f3c-85af-bbe171879dd4",
+        "1148fa9c-423d-4c74-b95a-24abef0e7d2d",
+        "d70a4a29-eef2-41b9-80a7-3474868b1e91",
+        "448c815c-ae8b-49b3-bd88-6092a1624d9a",
+        "59704f6d-628f-48a1-a2be-fb27770d896c",
+        "bb30edb5-3169-4d0e-a6c8-da15e5c577cf",
+        "072c4636-4baa-452f-a65b-f775665347d7",
+        "6c26d4a9-0cd3-4f60-9aca-0cfc940e3e7e",
+        "92c75687-e41d-42bd-8b09-3cf78b57b0a9",
+        "9074848c-471d-4d89-839a-07abb33459f3",
+        "ac633c60-89f3-42bd-b2b4-62f83f5b02c5",
+        "57b4ff4d-a507-4f2d-80ec-27f87d38088f"
+      ],
+      "verdict_on": true,
+      "verdict_failed": false,
+      "rounds_used": 1,
+      "aborted": false,
+      "reviewers": [
+        "claude_code"
+      ],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 138,
+      "resolved_commits": 92,
+      "input_tokens": 44264773,
+      "output_tokens": 1912128,
+      "human_messages": 2
+    },
+    {
+      "root": "ea1dad25-7749-46f7-8cd7-5cd6f8c4ae11",
+      "members": [
+        "ea1dad25-7749-46f7-8cd7-5cd6f8c4ae11"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 4,
+      "resolved_commits": 3,
+      "input_tokens": 283029,
+      "output_tokens": 9135,
+      "human_messages": 0
+    },
+    {
+      "root": "ae03a76c-eccf-40a9-bac8-16ae3dd27822",
+      "members": [
+        "ae03a76c-eccf-40a9-bac8-16ae3dd27822"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 2,
+      "resolved_commits": 2,
+      "input_tokens": 410781,
+      "output_tokens": 7695,
+      "human_messages": 0
+    },
+    {
+      "root": "03663727-3150-49d3-aaf1-27560ead0c20",
+      "members": [
+        "03663727-3150-49d3-aaf1-27560ead0c20"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 5,
+      "resolved_commits": 3,
+      "input_tokens": 213378,
+      "output_tokens": 10176,
+      "human_messages": 0
+    },
+    {
+      "root": "cb8b92dd-02e9-46bd-84fb-29a0aa8f6461",
+      "members": [
+        "cb8b92dd-02e9-46bd-84fb-29a0aa8f6461"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 10,
+      "resolved_commits": 9,
+      "input_tokens": 433539,
+      "output_tokens": 21665,
+      "human_messages": 0
+    },
+    {
+      "root": "92058845-6ec8-4420-b3a9-52135304c799",
+      "members": [
+        "92058845-6ec8-4420-b3a9-52135304c799"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 0,
+      "resolved_commits": 0,
+      "input_tokens": 383570,
+      "output_tokens": 96296,
+      "human_messages": 0
+    },
+    {
+      "root": "647126e5-b9f8-42d0-b174-90312d5a09dc",
+      "members": [
+        "647126e5-b9f8-42d0-b174-90312d5a09dc"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 0,
+      "resolved_commits": 0,
+      "input_tokens": 513650,
+      "output_tokens": 71471,
+      "human_messages": 0
+    },
+    {
+      "root": "387beb6c-05b1-474f-901f-ef02464e59b4",
+      "members": [
+        "387beb6c-05b1-474f-901f-ef02464e59b4"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 0,
+      "resolved_commits": 0,
+      "input_tokens": 253171,
+      "output_tokens": 51052,
+      "human_messages": 0
+    },
+    {
+      "root": "03200b68-858c-480a-8dc7-2c8c8f5a418d",
+      "members": [
+        "03200b68-858c-480a-8dc7-2c8c8f5a418d"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 0,
+      "resolved_commits": 0,
+      "input_tokens": 175337,
+      "output_tokens": 5681,
+      "human_messages": 1
+    },
+    {
+      "root": "076053eb-db13-4b23-984c-8ebb2b240280",
+      "members": [
+        "076053eb-db13-4b23-984c-8ebb2b240280"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 1,
+      "resolved_commits": 1,
+      "input_tokens": 214512,
+      "output_tokens": 25134,
+      "human_messages": 1
+    },
+    {
+      "root": "004304c5-87ba-4522-a169-7864bc606800",
+      "members": [
+        "004304c5-87ba-4522-a169-7864bc606800",
+        "3b708fb3-b6cf-4593-96de-fc8bf5396d8d",
+        "23038c16-733d-4974-9cd6-fd4a0a76c490"
+      ],
+      "verdict_on": true,
+      "verdict_failed": false,
+      "rounds_used": 1,
+      "aborted": false,
+      "reviewers": [
+        "claude_code"
+      ],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 28,
+      "resolved_commits": 26,
+      "input_tokens": 3200046,
+      "output_tokens": 582983,
+      "human_messages": 1
+    },
+    {
+      "root": "cb9d5cfb-16c3-437c-a0be-d9748a3e588c",
+      "members": [
+        "cb9d5cfb-16c3-437c-a0be-d9748a3e588c"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 5,
+      "resolved_commits": 5,
+      "input_tokens": 691589,
+      "output_tokens": 38514,
+      "human_messages": 3
+    },
+    {
+      "root": "986a7538-b3fb-49d9-872c-bf744f183b71",
+      "members": [
+        "986a7538-b3fb-49d9-872c-bf744f183b71",
+        "97ab4eb8-b832-4391-894a-cac104540e93",
+        "b06e73bf-2547-4bff-80a7-2ecd69b441d3",
+        "270e2295-7a8d-4d2e-807e-6ea8372d5d7f",
+        "26d2f4b9-273b-4010-a818-7a560b35c790",
+        "1ee7a33e-997c-4e94-8d90-1fa71f90f77a",
+        "5cf67c7d-7c9f-4b48-8ce4-9ebe46f4810a",
+        "a387ce2c-3a35-430f-87a5-0de20cc9e680",
+        "fcebab50-96e5-4483-950f-4c215f38581e",
+        "15be441a-d05b-40cd-ab37-2610ab520e9f",
+        "3fadb41d-3075-4424-bec8-40f38d7b3d98",
+        "2d47a6cb-49c2-457e-ae12-9a1a2a65cb1c",
+        "565907b9-9953-4800-bc46-249a2220cc66",
+        "83c98f61-10b8-4fc0-b18c-7a2e1993fe8b",
+        "dae2c913-6d77-42a8-8adb-dbf3af4a80ad",
+        "a2f73ea7-38a9-406f-9342-116f44a79206"
+      ],
+      "verdict_on": true,
+      "verdict_failed": false,
+      "rounds_used": 3,
+      "aborted": true,
+      "reviewers": [
+        "claude_code"
+      ],
+      "has_summary": true,
+      "corrections": [
+        "Continuing from the previous session's summary. Recommended next steps: **(3) What remains (unchanged, wake-gated):** fu",
+        "## 1. Thread Summary Fix gated issues in riir-infer context overflow: continuing in new thread with summary --- ## 2. La",
+        "## 1. Thread Summary Fix gated issues in riir-infer context overflow: continuing in new thread with summary --- ## 2. La"
+      ],
+      "human_corrections": [
+        "ask Claude for any gated and fix it all /Users/katopz/git/riir-infer/.issues",
+        "still see a lot of issues, closed but not doc n rm? call claude for verdict and ungated and solve it all /Users/katopz/g"
+      ],
+      "cited_commits": 125,
+      "resolved_commits": 99,
+      "input_tokens": 15451425,
+      "output_tokens": 2282505,
+      "human_messages": 6
+    },
+    {
+      "root": "b860ef72-f6ac-40be-a7e5-ab2756086acd",
+      "members": [
+        "b860ef72-f6ac-40be-a7e5-ab2756086acd",
+        "998796b6-6cfa-409e-9e3a-79ebb4d0f3a2",
+        "3f21da83-bd84-4843-84b3-cf16b7cd134d"
+      ],
+      "verdict_on": true,
+      "verdict_failed": false,
+      "rounds_used": 3,
+      "aborted": true,
+      "reviewers": [
+        "claude_code"
+      ],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [
+        "ask Claude for any gated and fix it all /Users/katopz/git/katgpt-rs/.issues",
+        "you said it close but i still see md there, do search closed issue and doc amd rm all repo"
+      ],
+      "cited_commits": 41,
+      "resolved_commits": 40,
+      "input_tokens": 3040856,
+      "output_tokens": 434422,
+      "human_messages": 2
+    },
+    {
+      "root": "ceca6df9-650b-4926-a0fa-17a80d7a9347",
+      "members": [
+        "ceca6df9-650b-4926-a0fa-17a80d7a9347"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 0,
+      "resolved_commits": 0,
+      "input_tokens": 209934,
+      "output_tokens": 62241,
+      "human_messages": 0
+    },
+    {
+      "root": "9aec858d-f936-4778-86b0-f48db268a15a",
+      "members": [
+        "9aec858d-f936-4778-86b0-f48db268a15a"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 5,
+      "resolved_commits": 5,
+      "input_tokens": 932298,
+      "output_tokens": 99155,
+      "human_messages": 0
+    },
+    {
+      "root": "36346837-8610-4a87-bfe5-87098d415e76",
+      "members": [
+        "36346837-8610-4a87-bfe5-87098d415e76"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [
+        "<agent_message from=\"Plan 477 PLM trainer cudarc GPU port\" session_id=\"fac95673-94d5-4511-a17e-6152fac551f9\"> Box run re"
+      ],
+      "human_corrections": [],
+      "cited_commits": 2,
+      "resolved_commits": 2,
+      "input_tokens": 775040,
+      "output_tokens": 285033,
+      "human_messages": 0
+    },
+    {
+      "root": "9d31ffb2-b015-4f23-a212-f2956d6b2498",
+      "members": [
+        "9d31ffb2-b015-4f23-a212-f2956d6b2498",
+        "fa72de7b-9c0d-4c8c-b7a2-449cba90c9ce",
+        "251e8305-fc41-4efc-905f-cb5851f74ad7",
+        "83e79a9e-1721-4307-8ef5-a82005aaa0c0"
+      ],
+      "verdict_on": true,
+      "verdict_failed": false,
+      "rounds_used": 1,
+      "aborted": false,
+      "reviewers": [
+        "claude_code"
+      ],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 49,
+      "resolved_commits": 38,
+      "input_tokens": 4926953,
+      "output_tokens": 476507,
+      "human_messages": 1
+    },
+    {
+      "root": "301625f2-9f0c-4a13-a590-95c83f09d744",
+      "members": [
+        "301625f2-9f0c-4a13-a590-95c83f09d744",
+        "c8b43a99-850a-4231-85ec-a3f2a107c89f",
+        "334321c6-67fc-4f93-9ca6-2f0bc8e82dbb",
+        "367f5565-7778-4a52-9bd0-a3e55c8dd7b2",
+        "daf5c67a-48c1-4ce0-a71a-047969c3e4ef",
+        "bebbd1d7-7a29-4c06-8aa8-800895c89dab",
+        "2eb64b7b-6ca4-41c5-9a4a-fee911e01727"
+      ],
+      "verdict_on": true,
+      "verdict_failed": false,
+      "rounds_used": 2,
+      "aborted": false,
+      "reviewers": [
+        "claude_code"
+      ],
+      "has_summary": true,
+      "corrections": [
+        "## 1. Thread Summary [train] fix and close and doc and rm /Users/katopz/git/riir-train/.issues aim for lowest effort and",
+        "## 1. Thread Summary [train] fix and close and doc and rm /Users/katopz/git/riir-train/.issues aim for lowest effort and",
+        "## 1. Thread Summary [train] fix and close and doc and rm /Users/katopz/git/riir-train/.issues aim for lowest effort and",
+        "## 1. Thread Summary [train] fix and close and doc and rm /Users/katopz/git/riir-train/.issues aim for lowest effort and"
+      ],
+      "human_corrections": [
+        "fix and close and doc and rm /Users/katopz/git/riir-train/.issues aim for lowest effort and gain for Rethink/Refine firs"
+      ],
+      "cited_commits": 62,
+      "resolved_commits": 55,
+      "input_tokens": 8675087,
+      "output_tokens": 582637,
+      "human_messages": 2
+    },
+    {
+      "root": "ff4b7917-516f-4f8a-a22b-bc9c54ac2670",
+      "members": [
+        "ff4b7917-516f-4f8a-a22b-bc9c54ac2670"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 8,
+      "resolved_commits": 6,
+      "input_tokens": 481308,
+      "output_tokens": 21983,
+      "human_messages": 0
+    },
+    {
+      "root": "d4f39cf5-d37c-4010-80a7-3768683f9a6f",
+      "members": [
+        "d4f39cf5-d37c-4010-80a7-3768683f9a6f"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 3,
+      "resolved_commits": 3,
+      "input_tokens": 335369,
+      "output_tokens": 33892,
+      "human_messages": 0
+    },
+    {
+      "root": "167b0b84-4db4-4f84-a029-a8982df0a4cc",
+      "members": [
+        "167b0b84-4db4-4f84-a029-a8982df0a4cc"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 10,
+      "resolved_commits": 8,
+      "input_tokens": 405818,
+      "output_tokens": 31025,
+      "human_messages": 0
+    },
+    {
+      "root": "6be73506-77f5-4931-ba2e-2dd673952d5f",
+      "members": [
+        "6be73506-77f5-4931-ba2e-2dd673952d5f",
+        "e80cce1a-3da3-41a6-bda9-7d36630c7d7b",
+        "3baef301-bf76-46f7-8175-5e5391174043",
+        "de5bb55e-9435-4a88-bfc3-764883a567b8"
+      ],
+      "verdict_on": true,
+      "verdict_failed": false,
+      "rounds_used": 3,
+      "aborted": true,
+      "reviewers": [
+        "claude_code"
+      ],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 14,
+      "resolved_commits": 13,
+      "input_tokens": 5337245,
+      "output_tokens": 956344,
+      "human_messages": 1
+    },
+    {
+      "root": "1b3207ea-d239-4115-8d03-47f65682e07a",
+      "members": [
+        "1b3207ea-d239-4115-8d03-47f65682e07a"
+      ],
+      "verdict_on": true,
+      "verdict_failed": false,
+      "rounds_used": 1,
+      "aborted": false,
+      "reviewers": [
+        "claude_code"
+      ],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 8,
+      "resolved_commits": 6,
+      "input_tokens": 1780115,
+      "output_tokens": 132328,
+      "human_messages": 3
+    },
+    {
+      "root": "5b2423ea-a70f-47eb-ac32-09797d02b6b3",
+      "members": [
+        "5b2423ea-a70f-47eb-ac32-09797d02b6b3"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 0,
+      "resolved_commits": 0,
+      "input_tokens": 328855,
+      "output_tokens": 6628,
+      "human_messages": 1
+    },
+    {
+      "root": "e4136152-fc5a-4014-bba3-978f21db64ce",
+      "members": [
+        "e4136152-fc5a-4014-bba3-978f21db64ce",
+        "b3dd09fa-0203-4a05-b5c3-6d7b234480a0",
+        "dd19ba7e-678d-444b-8bb3-fa9d2042795b",
+        "c85b7db6-3588-42e1-af79-2975daefe878"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 29,
+      "resolved_commits": 21,
+      "input_tokens": 2816225,
+      "output_tokens": 384404,
+      "human_messages": 1
+    },
+    {
+      "root": "4d026066-32d9-4d9f-81f4-a4ca7be7ecdd",
+      "members": [
+        "4d026066-32d9-4d9f-81f4-a4ca7be7ecdd",
+        "0d0b7285-cd29-4c20-908e-65c0682ee91c",
+        "8f7b6203-8332-4193-9347-520ac5cd4f0d"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 25,
+      "resolved_commits": 25,
+      "input_tokens": 1616235,
+      "output_tokens": 295493,
+      "human_messages": 2
+    },
+    {
+      "root": "c52146e9-68ae-456b-9ed6-7d737cd76065",
+      "members": [
+        "c52146e9-68ae-456b-9ed6-7d737cd76065",
+        "754da340-c588-41ef-b387-8fddcde50bbb",
+        "8e263bcf-829c-4885-ac08-6f33c5d3a453",
+        "3b39e0c9-a5e7-48e5-ac8d-8e6935a4757a",
+        "23f836cc-8ffb-423e-b086-2d72fe9eeb3c",
+        "5be7ef13-b33b-484a-95cb-477ba2c25152",
+        "c6a32433-af52-4ea4-ba52-1eb0028c3a96",
+        "549d4a1d-f393-4e09-88eb-f980d8a83ed9",
+        "bd023cba-1364-4845-ab40-4b7b0c8a9622",
+        "19d1809d-e36d-41d8-8735-5b90562a70b3",
+        "95e45495-d9bc-4893-a500-e8270fd7223b",
+        "ab786332-0219-4de5-ab08-549633c7284a",
+        "dadff17f-9a54-46cf-bb53-71fd10cb00f7",
+        "34912c3b-af35-45ec-8824-fa0b2a3bf186",
+        "3ecf601a-e5e3-4bb7-9516-0741a2e75f42",
+        "24646f84-5e31-41a5-8533-9dd0456ccf43",
+        "96a2e9e9-fc17-4be1-bdab-0ea0f89486c6",
+        "aac1c647-c9ed-49e9-a180-fe97c6fd2a7c",
+        "58a67e4e-3274-429d-8f4c-52d9834ad818",
+        "5592b062-d55d-4623-a135-af255438c975",
+        "1d53a4e3-141e-4741-8d96-f11a9d679bdb",
+        "20a1959d-de55-4a20-834b-c4fd610c9426",
+        "58f07ab0-140c-4900-b8e4-d67b6ee5be51",
+        "6dbbadd5-21fa-426d-aded-4014800eca6a",
+        "e48ca88b-be22-4c81-896e-498587557015",
+        "aa12e89a-b7d0-43e9-847d-9560882af273",
+        "573b31d3-b863-4290-9508-f50566abb3d9",
+        "1762bb5e-0539-44ad-8375-3d6ff099e6b9",
+        "8cc35f6c-446e-4ad2-b48a-a230f33d3206",
+        "76a48363-f347-457e-9ca7-39ac8493f87a",
+        "43ca867c-fb96-427b-b54c-6cc058429d93",
+        "0b69b81d-7cb5-4b86-9900-439db9c0ea4d",
+        "0d435db1-a72d-4198-8ae4-797932a2dc0b",
+        "e9acdfd7-9924-4dae-9bbe-85a34b2ee456",
+        "0fa35e47-49ab-4c21-9eb0-a2af9572602f",
+        "d7efc4f9-b9fd-42dd-918d-d04afcff3e80"
+      ],
+      "verdict_on": true,
+      "verdict_failed": false,
+      "rounds_used": 2,
+      "aborted": true,
+      "reviewers": [
+        "claude_code"
+      ],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [
+        "let me remind you that orchard and apple swarm related must not go anywhere in seal-* prod code only examples lane is al"
+      ],
+      "cited_commits": 301,
+      "resolved_commits": 249,
+      "input_tokens": 32454321,
+      "output_tokens": 3867228,
+      "human_messages": 8
+    },
+    {
+      "root": "623d571e-68ac-4ad3-a2e8-282c7bbb8d08",
+      "members": [
+        "623d571e-68ac-4ad3-a2e8-282c7bbb8d08"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 1,
+      "resolved_commits": 1,
+      "input_tokens": 321477,
+      "output_tokens": 51706,
+      "human_messages": 0
+    },
+    {
+      "root": "37fea46d-c968-417d-9308-e33eeebdfd95",
+      "members": [
+        "37fea46d-c968-417d-9308-e33eeebdfd95"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 3,
+      "resolved_commits": 3,
+      "input_tokens": 356415,
+      "output_tokens": 15903,
+      "human_messages": 0
+    },
+    {
+      "root": "73cce97a-00f1-4331-bcf7-b989430b415d",
+      "members": [
+        "73cce97a-00f1-4331-bcf7-b989430b415d",
+        "220383b0-fe50-4e0e-9880-54abcf20a53e",
+        "97189399-adc5-461a-a622-1039db6ccc4e"
+      ],
+      "verdict_on": true,
+      "verdict_failed": false,
+      "rounds_used": 3,
+      "aborted": true,
+      "reviewers": [
+        "claude_code"
+      ],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [
+        "1. some claimed but stopped working should account too 2. i miss benchmark routine and boundary check up in house keepin",
+        "other job for the boss is open mail when no agent wake to open it, rn m3 mailed to amo and there's no agent read and res"
+      ],
+      "cited_commits": 25,
+      "resolved_commits": 25,
+      "input_tokens": 1242939,
+      "output_tokens": 414271,
+      "human_messages": 2
+    },
+    {
+      "root": "66d0f9af-4bb5-4f4f-98dd-5b3b5fbd6052",
+      "members": [
+        "66d0f9af-4bb5-4f4f-98dd-5b3b5fbd6052"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [
+        "regression btw"
+      ],
+      "cited_commits": 5,
+      "resolved_commits": 5,
+      "input_tokens": 531968,
+      "output_tokens": 99359,
+      "human_messages": 4
+    },
+    {
+      "root": "4ae8b90d-6589-4694-9a5f-7322b2227939",
+      "members": [
+        "4ae8b90d-6589-4694-9a5f-7322b2227939"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": false,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 0,
+      "resolved_commits": 0,
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "human_messages": 0
+    },
+    {
+      "root": "b1d91d34-82af-4144-ac54-b9a20c69e72b",
+      "members": [
+        "b1d91d34-82af-4144-ac54-b9a20c69e72b",
+        "d6617f6e-35f1-48cc-8ad4-a34c39fa589f",
+        "e41b3d13-5ca0-416b-8b57-2c665554b12f"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 13,
+      "resolved_commits": 13,
+      "input_tokens": 2856398,
+      "output_tokens": 286846,
+      "human_messages": 0
+    },
+    {
+      "root": "b21ae4a3-9c1d-4784-a351-6439e2f6656b",
+      "members": [
+        "b21ae4a3-9c1d-4784-a351-6439e2f6656b"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 0,
+      "resolved_commits": 0,
+      "input_tokens": 430721,
+      "output_tokens": 78457,
+      "human_messages": 0
+    },
+    {
+      "root": "11b631ce-beb8-43c9-ab99-ec45337fdcee",
+      "members": [
+        "11b631ce-beb8-43c9-ab99-ec45337fdcee"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 10,
+      "resolved_commits": 10,
+      "input_tokens": 203161,
+      "output_tokens": 46985,
+      "human_messages": 0
+    },
+    {
+      "root": "91d03f27-a475-4639-9732-e5655299ac7f",
+      "members": [
+        "91d03f27-a475-4639-9732-e5655299ac7f"
+      ],
+      "verdict_on": false,
+      "verdict_failed": false,
+      "rounds_used": 0,
+      "aborted": false,
+      "reviewers": [],
+      "has_summary": true,
+      "corrections": [],
+      "human_corrections": [],
+      "cited_commits": 2,
+      "resolved_commits": 2,
+      "input_tokens": 245714,
+      "output_tokens": 57025,
+      "human_messages": 0
+    }
+  ],
+  "matched_bins": {
+    "<100k": {
+      "on": {
+        "chains": 0,
+        "chains_with_summary": 0,
+        "post_hoc_fix_rate": null,
+        "chains_with_human_turns": 0,
+        "chains_with_human_corrections": 0,
+        "human_correction_rate": null,
+        "commit_resolution_rate": null,
+        "avg_total_tokens": null
+      },
+      "off": {
+        "chains": 10,
+        "chains_with_summary": 6,
+        "post_hoc_fix_rate": 0.0,
+        "chains_with_human_turns": 1,
+        "chains_with_human_corrections": 0,
+        "human_correction_rate": 0.0,
+        "commit_resolution_rate": 0.5,
+        "avg_total_tokens": 39844.5
+      }
+    },
+    "100k-1M": {
+      "on": {
+        "chains": 2,
+        "chains_with_summary": 2,
+        "post_hoc_fix_rate": 0.0,
+        "chains_with_human_turns": 2,
+        "chains_with_human_corrections": 0,
+        "human_correction_rate": 0.0,
+        "commit_resolution_rate": 1.0,
+        "avg_total_tokens": 311249.0
+      },
+      "off": {
+        "chains": 68,
+        "chains_with_summary": 61,
+        "post_hoc_fix_rate": 0.0,
+        "chains_with_human_turns": 15,
+        "chains_with_human_corrections": 1,
+        "human_correction_rate": 0.06666666666666667,
+        "commit_resolution_rate": 0.8152866242038217,
+        "avg_total_tokens": 332288.26470588235
+      }
+    },
+    "1M-5M": {
+      "on": {
+        "chains": 7,
+        "chains_with_summary": 7,
+        "post_hoc_fix_rate": 0.14285714285714285,
+        "chains_with_human_turns": 7,
+        "chains_with_human_corrections": 3,
+        "human_correction_rate": 0.42857142857142855,
+        "commit_resolution_rate": 0.9463087248322147,
+        "avg_total_tokens": 2523695.4285714286
+      },
+      "off": {
+        "chains": 7,
+        "chains_with_summary": 7,
+        "post_hoc_fix_rate": 0.14285714285714285,
+        "chains_with_human_turns": 3,
+        "chains_with_human_corrections": 1,
+        "human_correction_rate": 0.3333333333333333,
+        "commit_resolution_rate": 0.9217391304347826,
+        "avg_total_tokens": 2317379.714285714
+      }
+    },
+    ">=5M": {
+      "on": {
+        "chains": 15,
+        "chains_with_summary": 15,
+        "post_hoc_fix_rate": 0.5333333333333333,
+        "chains_with_human_turns": 15,
+        "chains_with_human_corrections": 11,
+        "human_correction_rate": 0.7333333333333333,
+        "commit_resolution_rate": 0.8783924843423799,
+        "avg_total_tokens": 19406578.8
+      },
+      "off": {
+        "chains": 1,
+        "chains_with_summary": 0,
+        "post_hoc_fix_rate": null,
+        "chains_with_human_turns": 0,
+        "chains_with_human_corrections": 0,
+        "human_correction_rate": null,
+        "commit_resolution_rate": null,
+        "avg_total_tokens": 11094987.0
+      }
+    }
+  }
+}

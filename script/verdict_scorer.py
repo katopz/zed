@@ -436,6 +436,60 @@ def cohort_stats(chains: list[dict]) -> dict:
     }
 
 
+TOKEN_BINS = [
+    ("<100k", lambda c: c["input_tokens"] + c["output_tokens"] < 100_000),
+    (
+        "100k-1M",
+        lambda c: 100_000 <= c["input_tokens"] + c["output_tokens"] < 1_000_000,
+    ),
+    (
+        "1M-5M",
+        lambda c: 1_000_000 <= c["input_tokens"] + c["output_tokens"] < 5_000_000,
+    ),
+    (">=5M", lambda c: c["input_tokens"] + c["output_tokens"] >= 5_000_000),
+]
+
+
+def matched_bins(chains: list[dict]) -> dict:
+    """Per-token-size-bin cohort comparison: the like-for-like cell that the
+    raw ON/OFF split cannot provide while verdict traffic self-selects big
+    contested chains. FAILED chains are excluded (their 87% correction rate
+    measures the error class, not summary quality)."""
+    out: dict = {}
+    for label, keep in TOKEN_BINS:
+        bin_chains = [c for c in chains if keep(c) and not c["verdict_failed"]]
+        on = [c for c in bin_chains if c["verdict_on"]]
+        off = [c for c in bin_chains if not c["verdict_on"]]
+        out[label] = {
+            "on": bin_stats(on),
+            "off": bin_stats(off),
+        }
+    return out
+
+
+def bin_stats(chains: list[dict]) -> dict:
+    with_summary = [c for c in chains if c["has_summary"]]
+    corrected = [c for c in with_summary if c["corrections"]]
+    with_human = [c for c in chains if c["human_messages"]]
+    human_corrected = [c for c in with_human if c["human_corrections"]]
+    cited = sum(c["cited_commits"] for c in chains)
+    resolved = sum(c["resolved_commits"] for c in chains)
+    return {
+        "chains": len(chains),
+        "chains_with_summary": len(with_summary),
+        "post_hoc_fix_rate": (len(corrected) / len(with_summary)) if with_summary else None,
+        "chains_with_human_turns": len(with_human),
+        "chains_with_human_corrections": len(human_corrected),
+        "human_correction_rate": (len(human_corrected) / len(with_human)) if with_human else None,
+        "commit_resolution_rate": (resolved / cited) if cited else None,
+        "avg_total_tokens": (
+            sum(c["input_tokens"] + c["output_tokens"] for c in chains) / len(chains)
+            if chains
+            else None
+        ),
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -572,6 +626,8 @@ def main() -> int:
             {
                 "root": c["root"],
                 "members": c["members"],
+                "verdict_on": c["verdict_on"],
+                "verdict_failed": c["verdict_failed"],
                 "rounds_used": c["rounds_used"],
                 "aborted": c["aborted"],
                 "reviewers": c["reviewers"],
@@ -580,9 +636,17 @@ def main() -> int:
                 "human_corrections": c["human_corrections"],
                 "cited_commits": c["cited_commits"],
                 "resolved_commits": c["resolved_commits"],
+                "input_tokens": c["input_tokens"],
+                "output_tokens": c["output_tokens"],
+                "human_messages": c["human_messages"],
             }
             for c in chain_records
         ],
+        # The token-matched comparison (bench 001, 2026-11-11 verdict): the
+        # raw cohort split is selection-confounded (fleet verdict traffic on
+        # big contested chains), so the demotion rule re-arms on like-sized
+        # chains — FAILED excluded (a different class, recorded separately).
+        "matched_bins": matched_bins(chain_records),
     }
 
     # Human-readable table.

@@ -74,7 +74,8 @@ summaries), not more waiting.
 ## Re-run 2026-11-11 (amo, 24 ON chains — the >= 20 bar reached)
 
 `uv run script/verdict_scorer.py` (threads.db on amo): 558 threads / 118
-chains, 0 parse failures, 487 continuation links.
+chains, 0 parse failures, 487 continuation links. (Commit-resolution cohort
+numbers below are from this same-day re-run's JSON: OFF 85.8% 235/274.)
 
 | cohort | chains | post-hoc fix rate | human correction rate | cited commits resolved | aborts | avg chain tokens in / out |
 |---|---|---|---|---|---|---|
@@ -84,34 +85,58 @@ chains, 0 parse failures, 487 continuation links.
 
 The pre-registered rule ("demote only if ON is then *worse* on corrections
 or commit resolution") fires on the corrections axis: ON is 5.6x worse on
-human corrections and 26x worse on post-hoc fix rate; commit resolution is
-+2.5 pp in ON's favor (the only pro-ON signal).
+human corrections and 26x worse on post-hoc fix rate. Commit resolution is
++2.5 pp in ON's favor — recorded NEUTRAL (uneven samples, 88.2% of 2048 vs
+85.8% of 274 is noise; the verdict session's call).
 
-**Held — default stays on. Two recorded reasons, deviation from the rule is
-intentional:**
+**Verdict session 2026-11-11 14:52 +07 (the resolution path the 10-27 interim
+named): `#Verdict: REVISE` — posture (a) keep default-on AGREED, justification
+corrected, and the revisions landed in THIS section + the scorer.** Reviewer
+backend claude_code (the same lane the feature runs — conflict-of-interest
+noted for the record; the matched-bin data below, not this reasoning, is the
+standing check). The corrected hold:
 
-1. **Gating-law conflict (2026-11-11, owner decree):** `request_verdict` is
-   now the delegated decision instrument for the fleet ("decide it via a
-   Claude verdict, record the verdict, implement"); amo/m3 run the tool on
-   the default (settings.json does not set the flag). Demoting unregisters
-   the tool by default and breaks gating-law workflows on every box that
-   relies on the default. The bench rule predates the decree.
-2. **Selection confound, now dominant:** the ON cohort is no longer owner
-   clicks on ordinary work — it is fleet verdict traffic (agent-negotiated
-   REVISE/AGREE loops, plan 056 boss rounds; avg 11.7 M tokens/chain vs
-   528 k OFF = 22x). Big, contested chains attract corrections by nature,
-   so the corrections axis measures task contentiousness at least as much
-   as summary quality. The 10-27(b) confound note about token cost applies
-   to the correction metric too.
+1. **Gating-law precedence (owner decree, 2026-11-11):** `request_verdict` is
+   the delegated decision instrument for the fleet; demoting unregisters it
+   on every default-relying box, demote-with-fleet-explicit-settings adds
+   per-box config drift — neither buys a measured quality gain.
+2. **Selection confound — now SHOWN IN DATA, not asserted (the scorer gained
+   `matched_bins`, a token-size-matched ON/OFF comparison; verdict_goat.json
+   carries it):**
 
-Also noted: reviewer-lane reliability is now the bigger problem — 9 aborts
-plus 8 FAILED (all-error) chains out of ~41 attempts (~41%), including
-claude_code 5-hour rate-limit failures. Over the < 10% abort gate by 4x.
-That, not the flag default, is where the verdict lane loses its value.
+   | token bin | ON | OFF | ON human-corr | OFF human-corr | ON post-hoc | OFF post-hoc | ON resolved | OFF resolved |
+   |---|---|---|---|---|---|---|---|---|
+   | <100k | 0 | 10 | — | 0/1 | — | 0/6 | — | 50.0% |
+   | 100k–1M | 2 | 68 | 0/2 | 1/15 | 0/2 | 0/61 | 100% | 81.5% |
+   | 1M–5M | 7 | 7 | 3/7 (42.9%) | 1/3 (33.3%) | 1/7 (14.3%) | 1/7 (14.3%) | 94.6% | 92.2% |
+   | ≥5M | 15 | 1 | 11/15 (73.3%) | — | 8/15 (53.3%) | — | 87.8% | — |
 
-Resolution path: a verdict session on the conflict itself (demote vs keep
-vs demote-with-fleet-explicit-settings). Until then the feature stays
-default-on; it remains user/agent-invoked with zero autonomous cost.
+   In the only sizeable like-for-like bin (1M–5M, 7 vs 7 chains at ~2.3–2.5 M
+   avg tokens) the raw 5.6x corrections gap COLLAPSES to 42.9% vs 33.3%
+   (3 vs 1 corrected chains — noise at this n) and the post-hoc fix rate is
+   IDENTICAL (14.3% both). The raw gap lives in the ≥5M bin, where the OFF
+   cohort has a single chain — the cohorts are not comparable there. The
+   demotion rule's firing on the raw split was the selection artifact
+   (fleet verdict traffic self-selects big contested chains), now evidenced.
+3. **Cost, stated honestly (the verdict session's correction):** the feature
+   is NOT zero-autonomous-cost under the decree — agents invoke it on their
+   own, and the ON cohort IS that traffic (528k–11.7M tokens/chain). The
+   cost is invocation-driven and justified by the decree, not free.
+4. **Reviewer-lane reliability is the actionable defect:** 9 aborts + 8
+   FAILED (all-error) chains out of ~41 attempts (~41%), over the < 10%
+   gate by 4x (claude_code 5-hour rate-limit failures among the causes).
+   Filed as `.issues/037_verdict_reviewer_lane_reliability.md` with the
+   < 10% abort+error gate checked at the next re-run; if it is still over
+   then, the tool is unreliable enough that keeping it default-on is
+   questionable for that reason alone.
+
+**Demotion re-arms on the matched-bin instrument** (the verdict's guard,
+replacing the can-never-fire owner-click cohort): re-run the token-matched
+comparison NOW (done, table above) and at every further +20 ON chains. If ON
+is still clearly worse on corrections inside matched bins, the confound does
+NOT explain the result — demotion returns for adjudication, decree or not,
+and the remedy is fixing the verdict tool's quality, not just its default.
+Feature stays default-on; invocation-driven cost as in (3).
 
 ## Re-run 2026-10-27 (b): metric replaced, scorer can now see corrections
 
