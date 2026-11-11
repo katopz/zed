@@ -1,6 +1,7 @@
 # 055 — Harness: verifier rig separation + frozen baseline manifest
 
-Status: open — deferred from the openrsi-harness lesson session (m3/amo/bmo policy; not zed code)
+Status: open — deferred from the openrsi-harness lesson session (m3/amo/bmo policy; not zed code). Implementation note 2026-11-11: the runner IS zed code (`crates/agent_mail/src/jobs.rs`), so this is implemented here; design = VerifyManifest carrier + Exclusive verify lane + RunEnvironment provenance + orchestrator verify ledger.
+**Claimed:** amo-idle-lane, 1794381000, expires 2026-11-13T00:00:00+00:00
 
 OpenRSI's single strongest control: "every step is verified... an independent verifier, which the agent never sees". Today the agent that produced an artifact also runs the benchmark and reads the result. `--worktree repo@sha` already ships artifacts by hash — the verifier lane should check out the hash itself, rebuild clean, re-run, and only then let a gain count.
 
