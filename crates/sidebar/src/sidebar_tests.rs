@@ -4626,6 +4626,68 @@ async fn test_parallel_threads_shown_with_live_status(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_live_thread_status_transitions_update_sidebar_icons(cx: &mut TestAppContext) {
+    // A thread that errored must not keep its error icon after it resumes:
+    // the sidebar only reads thread statuses while rebuilding, so status
+    // transitions themselves have to schedule a rebuild.
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    let connection = StubAgentConnection::new();
+    open_thread_with_connection(&panel, connection.clone(), cx);
+
+    // First turn ends with MaxTokens so the thread goes Idle with had_error.
+    let finish = connection.defer_next_prompt_response();
+    send_message(&panel, cx);
+
+    let session_id = active_session_id(&panel, cx);
+    save_thread_metadata(
+        session_id,
+        Some("Flaky thread".into()),
+        chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 1, 1, 0, 0, 0).unwrap(),
+        None,
+        None,
+        &project,
+        cx,
+    );
+
+    cx.update(|_, _| {
+        finish
+            .send(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::MaxTokens)))
+            .expect("turn is running");
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec!["v [my-project]", "  Hello * (error)"]
+    );
+
+    // The thread resumes (a retry turn): the icon must reflect Running with
+    // no unrelated sidebar event to lean on.
+    let finish = connection.defer_next_prompt_response();
+    send_message(&panel, cx);
+    cx.run_until_parked();
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec!["v [my-project]", "  Hello * (running)"]
+    );
+
+    // And the retried turn completing cleanly clears the error state.
+    cx.update(|_, _| {
+        finish
+            .send(Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn)))
+            .expect("turn is running");
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        visible_entries_as_strings(&sidebar, cx),
+        vec!["v [my-project]", "  Hello *"]
+    );
+}
+
+#[gpui::test]
 async fn test_subagent_permission_request_marks_parent_sidebar_thread_waiting(
     cx: &mut TestAppContext,
 ) {

@@ -866,6 +866,11 @@ pub struct Sidebar {
     /// transitions can be detected even when the group is collapsed (and
     /// thread entries are not present in the list).
     live_thread_statuses: HashMap<acp::SessionId, (AgentThreadStatus, ThreadId)>,
+    /// Observes each live thread so status transitions (running, stopped,
+    /// errored, waiting-for-mail) schedule a rebuild. Statuses are only read
+    /// during a rebuild, so without this a row keeps its last-rendered icon
+    /// (e.g. Error) until some unrelated panel event happens to fire.
+    _live_thread_status_observations: Vec<gpui::Subscription>,
     /// Remembers whether each draft last rendered as empty or with content so
     /// that when a draft that was empty gains content again, we refresh
     /// its interaction time.
@@ -1025,6 +1030,7 @@ impl Sidebar {
             _thread_switcher_subscriptions: Vec::new(),
             pending_thread_activation: None,
             live_thread_statuses: HashMap::new(),
+            _live_thread_status_observations: Vec::new(),
             draft_kinds: HashMap::new(),
             view: SidebarView::default(),
             restoring_tasks: HashMap::new(),
@@ -2234,6 +2240,7 @@ impl Sidebar {
         self.rebuild_contents(cx);
         self.refresh_refilled_draft_times(cx);
         self.refresh_draft_editor_observations(cx);
+        self.observe_live_thread_statuses(cx);
 
         // Preserve measurements for unchanged entries so sticky headers do not flicker.
         self.apply_list_state_diff(&previous_shapes, multi_workspace.read(cx));
@@ -2247,6 +2254,35 @@ impl Sidebar {
         }
 
         cx.notify();
+    }
+
+    /// Tracks every live thread so its status transitions schedule a rebuild.
+    /// Row statuses are computed from the threads only while rebuilding, so a
+    /// transition with no other sidebar trigger (a background thread resuming
+    /// after an error, finishing a turn, or parking on mail) would otherwise
+    /// leave the row's icon stale until some unrelated event fires.
+    fn observe_live_thread_statuses(&mut self, cx: &mut Context<Self>) {
+        self._live_thread_status_observations.clear();
+        let Some(multi_workspace) = self.multi_workspace.upgrade() else {
+            return;
+        };
+        let workspaces: Vec<_> = multi_workspace.read(cx).workspaces().cloned().collect();
+        for workspace in workspaces {
+            let Some(agent_panel) = workspace.read(cx).panel::<AgentPanel>(cx) else {
+                continue;
+            };
+            let conversation_views = agent_panel.read(cx).conversation_views();
+            for conversation_view in conversation_views {
+                let Some(thread_view) = conversation_view.read(cx).root_thread_view() else {
+                    continue;
+                };
+                let thread = thread_view.read(cx).thread.clone();
+                self._live_thread_status_observations.push(cx.observe(&thread,
+                    |this, _thread, cx| {
+                        this.schedule_update_entries(false, cx);
+                    }));
+            }
+        }
     }
 
     /// Splices only the changed entry range, leaving unchanged item measurements intact.
