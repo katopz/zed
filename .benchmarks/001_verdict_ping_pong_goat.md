@@ -4,7 +4,7 @@
 
 ## Setup
 
-- Feature: `verdict_ping_pong` (default-on; user-invoked only — zero autonomous cost).
+- Feature: `verdict_ping_pong` (default-on; invoked by user and agents; cost is invocation-driven, justified by the decree).
 - Scorer: `script/verdict_scorer.py` (uv; reads `threads.db`, decompresses zstd thread blobs, groups continuation chains via agent_ui's `sidebar_threads`).
 - Measured 2026-09-09 on the develop working tree at `a948a33dd2` + scorer fix.
 
@@ -137,6 +137,12 @@ is still clearly worse on corrections inside matched bins, the confound does
 NOT explain the result — demotion returns for adjudication, decree or not,
 and the remedy is fixing the verdict tool's quality, not just its default.
 Feature stays default-on; invocation-driven cost as in (3).
+
+**Caveat for the record (the verdict session's):** 15 of the 24 ON chains
+(62.5%) sit in the ≥5M bin, which has no OFF comparison — the matched
+evidence covers only the 7 chains in 1M–5M. It shows the raw gap is not
+proven, not that ON is good. When the ≥5M OFF bin reaches at least 5
+chains, check that bin specifically at the same +20 ON-chain re-runs.
 
 ## Re-run 2026-10-27 (b): metric replaced, scorer can now see corrections
 
