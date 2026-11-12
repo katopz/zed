@@ -1,6 +1,6 @@
 # Issue 040 — the `zed rig exec <id>` ghost spawner: someone forks the app binary with fake CLI args on a 70 s cadence
 
-**Status:** OPEN — filed 2026-11-12 (zed-3b0d6444@amo) during the post-fix housekeeping pass. Attribution NOT found; harm mitigated; the remaining question is who forks the editor binary.
+**Status:** OPEN — filed 2026-11-12 (zed-3b0d6444@amo) during the post-fix housekeeping pass. Attribution NOT found; harm mitigated; the remaining question is who forks the editor binary. 2026-11-12 12:20 evidence pass (zed-061faf21@amo): regenerated post-FYI and now known to be lifecycle-bound to a single queued job (see evidence section below).
 
 ## Symptom
 
@@ -32,7 +32,16 @@ An agent thread inside the GUI misreading the pre-fix `holder_alive` doc comment
 2. Ghost helpers are kill-on-sight: `pkill -9 -f 'Zed Dev.app.*rig exec'` (they hold no state).
 3. Fleet FYI sent (`zed rig exec` is not a command; jobs admit automatically via the kicker).
 
+## Evidence pass 2026-11-12 12:20 +07 (zed-061faf21@amo)
+
+- Ghost pid 66953 found live: spawned **11:40:59**, PPID 62690 (GUI), argv `zed rig exec 01a1cde9-326d-7bb0-bac5-f34619ab6e25`. Killed per kill-on-sight; no ghosts remain.
+- Target id decoded (UUIDv7: first 48 bits = ms timestamp): job `01a1cde9` was created ~11:15 +07 — it is the attempt-5 bonsai-decode rematch cell (`agent-mail rig log` confirms: sandbox `/Users/katopz/riir932/sb-amo/` staging, perf_rematch contender gate, REFUSED 04:47:23Z when grafts pid 73096 started mid-run, Issue 1134 F4 fail-fast). The rig log carries no requester line — job owner unattributed.
+- **Lifecycle binding (new):** ghost fired ~25 min into the job's queued-wait and the spawner STOPPED when the job left the queued state (~11:41 admission / 11:47 refusal — no ghosts after 11:40:59 in a 35-min window). Model: a loop owned by the job's requester session — `while job is queued: exec zed rig exec <id>; sleep ~70s` — trying to force-start an exclusive job stuck on the quiet gate. It stops on its own; kill-on-sight only cleans the lingering last helper.
+- Harm re-check: `rig status` showed amo QUIET with the ghost alive (35+ min old, past `STARTING_GRACE`) — mitigation `29b0e20464` verified live; ghosts no longer delay admission.
+- GUI sample (8 s of pid 62690 during a burst-silent window): only standard spawn machinery, no smoking gun. Live attribution still requires `fs_usage`/`log stream` on 62690 during a NEXT burst; the burst trigger is predictable now — watch while any exclusive job sits queued on amo.
+- Logs/config still clean: no `rig exec` hits in `~/Library/Logs/Zed/*`.
+
 ## Open questions
 
-- [ ] Identify the forker: instrument with `log stream`/`fs_usage` against PID 62690 during the next burst, or add a spawn-log line in the GUI's subprocess layer.
+- [ ] Identify the forker: instrument with `log stream`/`fs_usage` against PID 62690 during the next burst (trigger: an exclusive job queued-waiting on amo), or add a spawn-log line in the GUI's subprocess layer.
 - [ ] Consider `Dev`-channel hardening upstream: honoring the single-instance handshake for `Dev` too (or an explicit error for unknown CLI subcommands instead of swallowing them as `paths_or_urls`) would turn this whole class into a clean stderr message.
