@@ -43,7 +43,8 @@ USAGE:
                 [--verify-manifest FILE] -- <command>
                                    queue a job: shared jobs run when resources fit, an
                                    exclusive one waits for a quiet empty rig; mail on
-                                   start/poison/end; same --key twice = one run (amo referees).
+                                   start/poison/end (pass --notify — without it nobody
+                                   is mailed); same --key twice = one run (amo referees).
                                    --verify-manifest pins the manifest's command + repo@sha,
                                    forces exclusive, refuses the producing rig, reads the
                                    result file it names, and posts a ratio-to-baseline row
@@ -581,6 +582,17 @@ fn rig_run(room: &Mailroom, args: Vec<String>) -> Result<i32> {
         result_path,
         submitted_at: chrono::Utc::now().to_rfc3339(),
     };
+    if notify.is_none() {
+        // The 2026-11-12 silent-loss class: a notify-less rig run mails nobody
+        // on start/end — the submitter only learns the outcome by polling. A
+        // deliberate fire-and-forget job (a git sweep) can ignore this; a
+        // measured or blocking job cannot. Warn at the moment of submission,
+        // while the fix is still one flag away.
+        eprintln!(
+            "warning: no --notify given — nobody will be mailed when this job starts or ends; \
+             pass --notify name@rig for any job whose result you are waiting on"
+        );
+    }
     if let Some(key) = &key {
         let claim = KeyClaim {
             key: key.clone(),
