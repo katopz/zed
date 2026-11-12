@@ -972,6 +972,14 @@ impl Mailroom {
                     write_json(&record_path, &record)?;
                 }
                 if !fresh.is_empty() {
+                    // Coalesce the fan-out: the first poison notice carries the
+                    // decision ("keep or re-run"), and a compile storm spawns
+                    // fresh offenders every probe — mailing each probe's new
+                    // pids flooded owners' inboxes 4 mails/minute
+                    // (2026-11-12, i1201t3 + 68bee285, ~60 notices per job).
+                    // Later offenders still land in `record.poisoned`, which
+                    // the end mail reports, so the evidence ledger is intact.
+                    let first_poison = record.poisoned.is_empty();
                     let names = fresh
                         .iter()
                         .map(|poison| format!("{} (pid {})", poison.name, poison.pid))
@@ -979,13 +987,15 @@ impl Mailroom {
                         .join(", ");
                     record.poisoned.extend(fresh);
                     write_json(&record_path, &record)?;
-                    self.job_mail(
-                        &record.spec,
-                        format!(
-                            "job {} POISONED on {rig_name}: {names} started during your exclusive run; results from now on are suspect. Still running: decide whether to keep or re-run.",
-                            short(id)
-                        ),
-                    );
+                    if first_poison {
+                        self.job_mail(
+                            &record.spec,
+                            format!(
+                                "job {} POISONED on {rig_name}: {names} started during your exclusive run; results from now on are suspect. Still running: decide whether to keep or re-run.",
+                                short(id)
+                            ),
+                        );
+                    }
                 }
             }
             std::thread::sleep(WAIT_POLL);
