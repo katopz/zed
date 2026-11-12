@@ -1,7 +1,69 @@
 use super::*;
 use crate::lightweight_context::is_actionable_checkbox;
+use crate::remaining_work::{SummaryContinuation, extract_summary_next_steps, strip_advisory_next_actions};
 use language_model::LanguageModelCompletionEvent;
 use std::time::Duration;
+
+#[test]
+fn advisory_next_actions_section_never_rejects_a_stop() {
+    // Summary-law section 5 is decision guidance for the reader, not
+    // committed work: a `<stop>` above it must be honored even though its
+    // bullets look executable.
+    let message = "## Summary\n\n\
+        **(3) What remains:** every lane is blocked, delegated, or scheduled — \
+        mining waits on walk #25; the lane-intel line waits on the riir-refine lane.\n\n\
+        **(4) Active plan state:** none in flight.\n\n\
+        **(5) Suggested next actions:**\n\
+        - mining (blocked — scheduled): arm the 05:00Z wake\n\
+        - lane-intel (sibling-owned): follow up on the mail\n\
+        - sd dir (owner-call): delete the target dir\n\n\
+        <stop>";
+    assert!(stop_keyword_violation_section(message).is_none());
+
+    // Control: the same bullets under the committed what-remains label ARE
+    // a violation — the guard does the work, not the bullet phrasing.
+    let committed = "## Summary\n\n\
+        **(3) What remains:**\n\
+        - arm the 05:00Z wake\n\
+        - delete the sd target dir\n\n\
+        <stop>";
+    assert!(stop_keyword_violation_section(committed).is_some());
+}
+
+#[test]
+fn advisory_next_actions_section_never_becomes_continuation_steps() {
+    // The overflow handoff resumes on section 3's committed state; advisory
+    // suggestions must neither become Steps nor hide the nothing-left
+    // declaration from the classifier.
+    let summary = "## Summary\n\n\
+        **(3) What remains:** nothing left — every lane is closed or delegated.\n\n\
+        **(4) Active plan state:** none.\n\n\
+        **(5) Suggested next actions:**\n\
+        - arm the wake\n\
+        - follow up on the mail";
+    assert_eq!(
+        extract_summary_next_steps(summary),
+        Some(SummaryContinuation::NothingLeft)
+    );
+}
+
+#[test]
+fn strip_cuts_from_the_label_and_keeps_prose_mentions() {
+    let text = "**(3) What remains:** done.\n\n**(5) Suggested next actions:**\n- arm the wake";
+    assert_eq!(strip_advisory_next_actions(text), "**(3) What remains:** done.");
+    // Lowercase + bare (5) form also cuts.
+    let loose = "state: settled.\n\n(5) suggested next actions: none";
+    assert_eq!(strip_advisory_next_actions(loose), "state: settled.");
+    // A heading form cuts too.
+    let heading = "## What remains\n\nNone.\n\n## Suggested next actions\n\n- x";
+    assert_eq!(strip_advisory_next_actions(heading), "## What remains\n\nNone.");
+    // A mid-sentence mention is NOT a label — never cut.
+    let prose = "We reviewed the suggested next actions from yesterday.";
+    assert_eq!(strip_advisory_next_actions(prose), prose);
+    // No label: text passes through untouched.
+    let plain = "**(3) What remains:** two tasks.\n\n- [ ] one";
+    assert_eq!(strip_advisory_next_actions(plain), plain);
+}
 
 #[test]
 fn make_continue_action_appends_tried_steps_ledger() {

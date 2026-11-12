@@ -5,10 +5,48 @@ use crate::{build_plan_landscape, context, is_perf_related, peer_states, plan_re
 use agent_client_protocol::schema::v2 as acp;
 use std::path::PathBuf;
 
+/// Byte offset where the advisory `**(5) Suggested next actions**` section
+/// starts, or `None`. The label must START a line (bold-label, `(5)`, or
+/// heading form) so a prose mention of the phrase never triggers the cut.
+/// The returned offset is a line start (accumulated `line.len() + 1`), so
+/// slicing there is always on a char boundary.
+fn advisory_next_actions_offset(text: &str) -> Option<usize> {
+    let mut offset = 0usize;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let lower = trimmed.to_lowercase();
+        let is_label = lower.starts_with("**(5) suggested next actions")
+            || lower.starts_with("(5) suggested next actions")
+            || (trimmed.starts_with('#') && lower.contains("suggested next actions"));
+        if is_label {
+            return Some(offset);
+        }
+        offset += line.len() + 1;
+    }
+    None
+}
+
+/// Cuts the advisory `**(5) Suggested next actions**` section and everything
+/// after it from a summary. Summary-law section 5 carries decision guidance
+/// for the reader — each item is labeled blocked/sibling-owned/owner-call and
+/// is not executable without a new verdict — so every summary reader must
+/// treat the label as the end of authoritative content. Without this cut the
+/// stop contract reads advisory bullets as open items and rejects valid
+/// `<stop>`s (the exact loop-bug shape the keyword contract exists to
+/// prevent), and the overflow handoff would resume a fresh chain on mere
+/// suggestions instead of section 3's committed state.
+pub(crate) fn strip_advisory_next_actions(text: &str) -> &str {
+    match advisory_next_actions_offset(text) {
+        Some(offset) => text[..offset].trim_end(),
+        None => text,
+    }
+}
+
 /// Code-level remaining work detection: scans the last assistant message
 /// for patterns that explicitly indicate incomplete work. This is a safety
 /// net that catches cases where the LLM ignores its own Rule 10.
 pub(crate) fn extract_remaining_section(text: &str) -> Option<String> {
+    let text = strip_advisory_next_actions(text);
     let paragraphs: Vec<&str> = text
         .split("\n\n")
         .map(|p| p.trim())
@@ -160,6 +198,7 @@ fn continues_remaining_region(paragraph: &str) -> bool {
 /// in the last three paragraphs — a keyword stop without a recognizable
 /// remaining-work region is honored as-is.
 fn stop_violation_region(text: &str) -> Option<(String, String)> {
+    let text = strip_advisory_next_actions(text);
     const TRIGGERS: &[&str] = &[
         "what remains",
         "what is left",
@@ -438,6 +477,7 @@ pub(crate) fn housekeeping_continuation() -> String {
 /// "all tasks complete") returns `NothingLeft` instead of a continuation that
 /// would order the agent to start working on an empty queue.
 pub(crate) fn extract_summary_next_steps(summary: &str) -> Option<SummaryContinuation> {
+    let summary = strip_advisory_next_actions(summary);
     let trimmed = summary.trim();
     if trimmed.is_empty() {
         return None;
