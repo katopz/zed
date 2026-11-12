@@ -282,8 +282,11 @@ pub fn is_system_inbox(name: &str) -> bool {
 /// rig: the poller only claims live sessions and the delivery-time thread
 /// resume already ran, so this mail is stuck. Excluded: system inboxes, the
 /// owner's inbox, the local OS user's inbox, configured no-go inboxes
-/// (reply sinks and misaddressed placeholders), and every live agent's
-/// inbox. Scheduled mail ages from `deliver_at` — it was not readable
+/// (reply sinks and misaddressed placeholders), every live agent's
+/// inbox, and self-addressed scheduled wake mail (an inbox's own alarm
+/// clocks — after they fire, "the owner hasn't woken yet" is a normal state
+/// for hours, and draining one destroys the checkpoint it carries).
+/// Scheduled mail ages from `deliver_at` — it was not readable
 /// before then. Newest-oldest first.
 pub fn stale_mail(
     mailroom: &Mailroom,
@@ -310,6 +313,12 @@ pub fn stale_mail(
         };
         let oldest = envelopes
             .iter()
+            // A self-addressed scheduled mail is the inbox owner's own alarm
+            // clock, not incoming correspondence: never age it into an
+            // incident, no matter how long ago it fired.
+            .filter(|envelope| {
+                !(envelope.from == envelope.to && envelope.deliver_at.is_some())
+            })
             .filter_map(|envelope| {
                 chrono::DateTime::parse_from_rfc3339(
                     envelope.deliver_at.as_deref().unwrap_or(&envelope.sent_at),
@@ -848,10 +857,15 @@ mod tests {
                 .all(|mail| mail.inbox != "orchestrator" && mail.inbox != "boss")
         );
 
-        // Scheduled mail ages from deliver_at: due five minutes ago is five
-        // minutes stale, no matter when it was composed.
+        // Scheduled mail ages from deliver_at: peer-addressed mail due 45
+        // minutes ago is past the 30-minute grace and counts as stale, no
+        // matter when it was composed. A fired SELF-addressed wake is the
+        // owner's own alarm clock: it never ages into an incident, no matter
+        // how long ago it fired — draining one would kill the checkpoint it
+        // carries (a housekeeping run consumed two live dispatch mails this
+        // way on 2026-11-12).
         send_mail(&room, "zed-sched", "timed wake");
-        let due = (now - chrono::Duration::minutes(5)).to_rfc3339();
+        let due = (now - chrono::Duration::minutes(45)).to_rfc3339();
         let sched_new = room.home().join("inbox").join("zed-sched").join("new");
         for file in fs::read_dir(&sched_new).unwrap().flatten() {
             let mut envelope: serde_json::Value =
@@ -859,8 +873,27 @@ mod tests {
             envelope["deliver_at"] = serde_json::Value::String(due.clone());
             fs::write(file.path(), serde_json::to_vec(&envelope).unwrap()).unwrap();
         }
+
+        send_mail(&room, "zed-alarm", "WAKE — canary verdict check");
+        let fired = (now - chrono::Duration::hours(3)).to_rfc3339();
+        let alarm_new = room.home().join("inbox").join("zed-alarm").join("new");
+        for file in fs::read_dir(&alarm_new).unwrap().flatten() {
+            let mut envelope: serde_json::Value =
+                serde_json::from_slice(&fs::read(file.path()).unwrap()).unwrap();
+            envelope["from"] = serde_json::Value::String("zed-alarm@amo".into());
+            envelope["to"] = serde_json::Value::String("zed-alarm@amo".into());
+            envelope["deliver_at"] = serde_json::Value::String(fired.clone());
+            fs::write(file.path(), serde_json::to_vec(&envelope).unwrap()).unwrap();
+        }
         let mail = stale_mail(&room, now, MAIL_GRACE, &live, &exclude);
-        assert!(mail.iter().all(|mail| mail.inbox != "zed-sched"));
+        assert!(
+            mail.iter().any(|mail| mail.inbox == "zed-sched"),
+            "peer-addressed fired scheduled mail past grace is stale"
+        );
+        assert!(
+            mail.iter().all(|mail| mail.inbox != "zed-alarm"),
+            "a fired self-addressed wake is an alarm clock, not staleness"
+        );
 
         // A live Zed on the rig makes it the boss's problem; with none, the
         // rig's zed-wake job owns the wake.
