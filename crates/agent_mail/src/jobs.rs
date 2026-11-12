@@ -41,12 +41,17 @@ const KICK_EVERY: Duration = Duration::from_secs(20);
 /// How long a `.starting` claim may sit unconsumed before the recovery
 /// sweep treats it as stranded. The real executor reads and removes the
 /// marker immediately on start; the window only has to cover process-spawn
-/// latency, generously.
+/// latency, generously. It is also the stale-claim threshold for
+/// `cancel_job`: past it a claim is abandoned, whatever `ps` says.
 const STARTING_GRACE: Duration = Duration::from_secs(120);
 
 /// True when some live process's command line claims to be this job's
 /// executor (`rig exec {id}` anywhere in the args — the detached
-/// `agent-mail rig exec` and a `zed rig exec` runner both match).
+/// `agent-mail rig exec` and a `zed rig exec` runner both match). Only
+/// consulted inside the fresh-claim race window: the substring match also
+/// fires for unrelated processes merely carrying those strings in their
+/// argv, so a held claim past `STARTING_GRACE` is treated as abandoned
+/// instead (see `recover_stranded_starting`).
 fn holder_alive(lines: &[String], id: &str) -> bool {
     let needle = format!("rig exec {id}");
     lines.iter().any(|line| line.contains(&needle))
@@ -457,17 +462,21 @@ impl Mailroom {
     }
 
     /// A `.starting` marker is a claim between `spawn_executor`'s rename and
-    /// the executor's first read — normally milliseconds. A marker that
-    /// outlives the grace window with no live `rig exec {id}` process is a
-    /// stranded claim (spawn failed, executor died pre-read, kicker died
-    /// between the two steps): requeue it so admission retries the job
-    /// instead of losing it silently. Held claims (a live holder, e.g. a
-    /// `zed rig exec` runner) and a blind process table are left alone.
+    /// the executor's first read — normally milliseconds. A claim that
+    /// outlives the grace window is stranded (spawn failed, executor died
+    /// pre-read, kicker died between the two steps): requeue it so admission
+    /// retries the job instead of losing it silently.
+    ///
+    /// Recovery is age-only. The claim file itself is the single-run lock —
+    /// requeueing renames it away, so a stalled holder's later
+    /// `execute_job` read fails harmlessly and a job can never run twice —
+    /// which makes a liveness check unnecessary here and unsafe to trust:
+    /// a substring `holder_alive` match also fires for stale processes
+    /// merely carrying `rig exec <id>` in their argv (a `zed rig exec <id>`
+    /// helper hung for a day held four claims while reporting "held"), so
+    /// honoring holds past the grace window deadlocks recovery forever.
     fn recover_stranded_starting(&self, running_dir: &Path) -> usize {
         let Ok(entries) = fs::read_dir(running_dir) else {
-            return 0;
-        };
-        let Some(lines) = rig::process_command_lines() else {
             return 0;
         };
         let mut recovered = 0;
@@ -479,7 +488,7 @@ impl Mailroom {
             let Some(id) = name.strip_suffix(".starting") else {
                 continue;
             };
-            if validate_name(id).is_err() || holder_alive(&lines, id) {
+            if validate_name(id).is_err() {
                 continue;
             }
             let past_grace = fs::metadata(&path)
@@ -1172,15 +1181,28 @@ impl Mailroom {
         let starting = running_dir.join(format!("{id}.starting"));
         if !running.exists() && starting.exists() {
             // A claim no executor consumed: cancellable even though it is
-            // neither queued nor running (issue 038). Blind table = assume
-            // held; refuse rather than delete a claim we cannot verify.
-            let held = rig::process_command_lines()
-                .map(|lines| holder_alive(&lines, id))
-                .unwrap_or(true);
-            anyhow::ensure!(
-                !held,
-                "job {id} is starting under a live executor; try again once it is running"
-            );
+            // neither queued nor running (issue 038). Inside the grace
+            // window the claim may be mid-start and a blind process table
+            // means we cannot verify — refuse rather than delete a claim we
+            // cannot verify. Past the grace window the claim is abandoned
+            // (a live executor consumes it within milliseconds of its own
+            // start), stale `rig exec <id>` argv strings notwithstanding:
+            // hung helper processes held four claims for a day while
+            // blocking both recovery and cancel.
+            let past_grace = fs::metadata(&starting)
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age >= STARTING_GRACE);
+            if !past_grace {
+                let held = rig::process_command_lines()
+                    .map(|lines| holder_alive(&lines, id))
+                    .unwrap_or(true);
+                anyhow::ensure!(
+                    !held,
+                    "job {id} is starting under a live executor; try again once it is running"
+                );
+            }
             let spec = read_json::<JobSpec>(&starting);
             fs::remove_file(&starting)?;
             if let Some(spec) = spec {
@@ -2216,8 +2238,8 @@ mod tests {
         let room = Mailroom::new(dir.path().to_path_buf());
         let starting = stranded_claim(&dir, &room, "01str000000000000000000000000001");
         backdate(&starting, 300);
-        // The test process's own command line never names `rig exec <id>`,
-        // so the claim reads as unheld; recovery must requeue it.
+        // Age-only recovery: past the grace window the claim is requeued
+        // even if some live process's argv claims to hold it.
         let recovered = room.recover_stranded_starting(&dir.path().join("jobs/running"));
         assert_eq!(recovered, 1);
         assert!(!starting.exists());
