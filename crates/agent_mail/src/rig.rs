@@ -546,14 +546,39 @@ pub fn cached_probe(mailroom: &Mailroom) -> RigProbe {
 
 /// Probes this rig. Managed jobs are reported as jobs, not as contenders.
 /// `via` stays `None`: this rig is reached locally, not over a route.
+/// The sweep a probe runs, decided by posture (pure so tests can pin
+/// both outcomes without spawning anything).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeSweep {
+    /// Standalone agent-mail: reap AND start what fits.
+    Schedule,
+    /// Embedded host (rig_panel inside Zed): reap only, never start.
+    ReapOnly,
+}
+
+pub fn probe_sweep(standalone: bool) -> ProbeSweep {
+    if standalone {
+        ProbeSweep::Schedule
+    } else {
+        ProbeSweep::ReapOnly
+    }
+}
+
 pub fn probe(mailroom: &Mailroom) -> RigProbe {
     let rig = mailroom
         .rigs()
         .map(|rigs| rigs.self_rig)
         .unwrap_or_else(|_| "unknown".into());
     // Reap-on-touch: every probe (each `rig status`, each watchdog tick)
-    // finishes dead jobs and starts whatever can run now.
-    mailroom.schedule_jobs().ok();
+    // finishes dead jobs. STARTING is marker-gated (issue 040): the
+    // standalone binary starts what fits; an embedded host (the rig panel
+    // inside Zed) reaps only — its `current_exe()` is the host binary and
+    // a started job would fork a ghost of it.
+    let sweep = probe_sweep(crate::jobs::is_standalone());
+    match sweep {
+        ProbeSweep::Schedule => mailroom.schedule_jobs().ok(),
+        ProbeSweep::ReapOnly => mailroom.reap_jobs_only().ok(),
+    };
     let jobs = mailroom.job_summary();
     let contention = contention(&jobs.managed_pids);
     RigProbe {

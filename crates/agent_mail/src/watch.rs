@@ -1167,6 +1167,9 @@ fn deliver_boss(
 /// `AbandonProcessGroup`: the tick exits right after starting the
 /// orchestrator, and launchd would otherwise kill it with the job.
 pub fn install_launchd(mailroom: &Mailroom) -> Result<PathBuf> {
+    if let Err(error) = crate::jobs::require_standalone() {
+        anyhow::bail!("{error}; the launchd plist must run the standalone agent-mail, not the embedding host");
+    }
     let binary = std::env::current_exe()?;
     let home = std::env::var("HOME").context("HOME unset")?;
     let inbox = mailroom.home().join("inbox").join(WATCH_INBOX).join("new");

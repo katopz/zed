@@ -60,6 +60,9 @@ USAGE:
 State: $AGENT_MAIL_HOME (default ~/.agent-mail). Rigs: ~/.agent-mail/rigs.json.";
 
 fn main() {
+    // Before subcommand dispatch: `rig exec`/`rig kick` executors count as
+    // standalone too (issue 040).
+    agent_mail::jobs::mark_standalone_process();
     match run(std::env::args().skip(1).collect()) {
         Ok(code) => std::process::exit(code),
         Err(error) => {

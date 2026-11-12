@@ -149,6 +149,9 @@ fn launch_argv() -> Result<Vec<String>> {
 
 /// Writes a launchd plist that ticks [`tick`] every minute (macOS).
 pub fn install_launchd(mailroom: &Mailroom) -> Result<PathBuf> {
+    if let Err(error) = crate::jobs::require_standalone() {
+        anyhow::bail!("{error}; the launchd plist must run the standalone agent-mail, not the embedding host");
+    }
     let binary = std::env::current_exe()?;
     let home = std::env::var("HOME").context("HOME unset")?;
     fs::create_dir_all(watch_dir(mailroom))?;

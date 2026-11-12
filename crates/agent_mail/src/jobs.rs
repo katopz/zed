@@ -431,6 +431,36 @@ pub fn admit(
     start
 }
 
+/// Marks this process as the standalone agent-mail binary. Called once at
+/// the top of `main`, before subcommand dispatch, so `rig exec`/`rig kick`
+/// executors are covered too. Embedded hosts (rig_panel, fleet_web inside
+/// a GUI) never call this — and can never spawn executors as a result
+/// (issue 040: the ghost `zed rig exec`/`zed rig kick` spawner).
+pub fn mark_standalone_process() {
+    STANDALONE_PROCESS.set(()).ok();
+}
+
+static STANDALONE_PROCESS: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+/// Whether this process is the standalone agent-mail binary (marker set).
+pub fn is_standalone() -> bool {
+    STANDALONE_PROCESS.get().is_some()
+}
+
+/// Pure core of the guard — takes the flag so tests stay independent of
+/// the process-global marker.
+fn require_standalone_in(flag: &std::sync::OnceLock<()>) -> Result<()> {
+    if flag.get().is_some() {
+        Ok(())
+    } else {
+        anyhow::bail!("embedded host; job starting is left to standalone agent-mail")
+    }
+}
+
+pub fn require_standalone() -> Result<()> {
+    require_standalone_in(&STANDALONE_PROCESS)
+}
+
 impl Mailroom {
     fn jobs_dir(&self, sub: &str) -> PathBuf {
         self.home().join("jobs").join(sub)
@@ -456,9 +486,22 @@ impl Mailroom {
         Ok(())
     }
 
-    /// Reaps jobs whose executor died, then starts what fits.
+    /// Reaps jobs whose executor died, then starts what fits. STARTING is
+/// allowed only in the standalone binary — embedded hosts (the rig panel
+/// inside Zed) must call [`Self::reap_jobs_only`]: their `current_exe()`
+/// is the host binary, and every started job would fork a ghost of it
+/// (issue 040).
     pub fn schedule_jobs(&self) -> Result<Vec<String>> {
-        self.schedule_jobs_inner(true)
+        self.schedule_jobs_inner(true, true)
+    }
+
+    /// The status-poller's sweep for embedded hosts: the same lock,
+    /// stranded-claim recovery, and dead-executor reaping as
+    /// [`Self::schedule_jobs`], but never starts a queued job. Starting
+    /// stays with the standalone binary (`rig run`, the kicker, the
+    /// watchdog, and `agent-mail rig probe`).
+    pub fn reap_jobs_only(&self) -> Result<Vec<String>> {
+        self.schedule_jobs_inner(false, false)
     }
 
     /// A `.starting` marker is a claim between `spawn_executor`'s rename and
@@ -512,7 +555,7 @@ impl Mailroom {
         recovered
     }
 
-    fn schedule_jobs_inner(&self, may_spawn_kicker: bool) -> Result<Vec<String>> {
+    fn schedule_jobs_inner(&self, may_spawn_kicker: bool, may_start: bool) -> Result<Vec<String>> {
         let queue_dir = self.jobs_dir("queue");
         if !queue_dir.exists() && !self.jobs_dir("running").exists() {
             return Ok(Vec::new());
@@ -531,6 +574,9 @@ impl Mailroom {
                 true => running.push(record.spec),
                 false => self.finish(record, "executor-died", None, &path),
             }
+        }
+        if !may_start {
+            return Ok(Vec::new());
         }
         let queue: Vec<JobSpec> = json_files(&queue_dir)
             .iter()
@@ -597,7 +643,7 @@ impl Mailroom {
             // Remove our pid first so the scheduler's own ensure_kicker call
             // does not see a live kicker and skip; we re-register right after.
             fs::remove_file(&pid_path).ok();
-            if let Err(error) = self.schedule_jobs_inner(false) {
+            if let Err(error) = self.schedule_jobs_inner(false, true) {
                 eprintln!("agent-mail kicker: scheduling failed: {error:#}");
             }
             fs::write(&pid_path, std::process::id().to_string())?;
@@ -630,6 +676,13 @@ impl Mailroom {
     // agent-mail is a runtime-free std binary; the smol-preferring lint targets async gpui code.
     #[allow(clippy::disallowed_methods)]
     fn spawn_detached(&self, args: &[&str], label: &str) -> Result<()> {
+        // The one gate every launch passes through (executors AND kickers):
+        // an embedded host must never fork itself. Issue 040's ghost
+        // `zed rig exec <id>` / `zed rig kick` spawner came from exactly this
+        // call resolving `current_exe()` to the Zed binary inside the GUI.
+        if let Err(error) = require_standalone() {
+            anyhow::bail!("{error}; refusing to spawn `{label}`");
+        }
         let binary = std::env::current_exe()?;
         let logs = self.jobs_dir("logs");
         fs::create_dir_all(&logs)?;
@@ -2330,4 +2383,34 @@ mod tests {
         };
         assert_eq!(room.claim_key(&reclaim).unwrap(), KeyOutcome::Claimed);
     }
+    #[test]
+    fn guard_is_pure_and_testable() {
+        let flag: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        let err = require_standalone_in(&flag).unwrap_err();
+        assert!(err.to_string().contains("embedded host"));
+        flag.set(()).ok();
+        require_standalone_in(&flag).unwrap();
+    }
+
+    #[test]
+    fn reap_only_sweep_never_takes_the_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let room = Mailroom::new(dir.path().join("mailroom"));
+        let queue = room.jobs_dir("queue");
+        fs::create_dir_all(&queue).unwrap();
+        // a job that WOULD fit: the starting sweep must leave it queued
+        let spec = r#"{"id":"i040reap","rig":"amo","os":"macos","at":"","cores":1,"quiet":true}"#;
+        fs::write(queue.join("i040reap.json"), spec).unwrap();
+        room.schedule_jobs_inner(false, false).unwrap();
+        assert!(queue.join("i040reap.json").exists(), "reap-only must not consume the queue");
+        assert!(!room.jobs_dir("running").join("i040reap.starting").exists());
+    }
+
+    #[test]
+    fn probe_sweep_outcomes_are_posture_pinned() {
+        use crate::rig::{probe_sweep, ProbeSweep};
+        assert_eq!(probe_sweep(true), ProbeSweep::Schedule);
+        assert_eq!(probe_sweep(false), ProbeSweep::ReapOnly);
+    }
+
 }
