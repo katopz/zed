@@ -35,6 +35,13 @@ pub const END_MARKER: &str = "agent-mail-end";
 pub enum JobAction {
     Log(usize),
     Cancel,
+    /// Re-tier a queued job in place: a new estimate and/or urgent flag.
+    /// Nothing else changes — id, key, command, notify all stay, so the
+    /// submitter's bookkeeping survives the reordering.
+    Set {
+        est_secs: Option<u64>,
+        urgent: Option<bool>,
+    },
 }
 const WAIT_POLL: Duration = Duration::from_secs(1);
 const KICK_EVERY: Duration = Duration::from_secs(20);
@@ -140,6 +147,17 @@ pub struct JobSpec {
     /// whose cell is missing is not a result.
     #[serde(default)]
     pub result_path: Option<String>,
+    /// The proposer's wall-clock estimate (`rig run --est 30m`), in seconds.
+    /// It places the job in a queue tier and orders it inside the tier,
+    /// shortest first, so a stream of probes never delays behind a days-long
+    /// run that happened to be submitted earlier.
+    #[serde(default)]
+    pub est_secs: Option<u64>,
+    /// Jumps every tier; urgent jobs run FIFO among themselves, estimate
+    /// ignored. Only `rig run --urgent` sets it, and that refuses any title
+    /// without the human-approved `[urgent]` prefix.
+    #[serde(default)]
+    pub urgent: bool,
     pub submitted_at: String,
 }
 
@@ -224,6 +242,12 @@ pub struct JobLine {
     /// Poison-probe strikes against an exclusive run.
     #[serde(default)]
     pub poisoned: usize,
+    /// Proposed wall-clock estimate in seconds (`rig run --est 30m`).
+    #[serde(default)]
+    pub est_secs: Option<u64>,
+    /// Queue-tier jump, human-approved (`[urgent]` title prefix).
+    #[serde(default)]
+    pub urgent: bool,
 }
 
 pub struct JobSummary {
@@ -391,7 +415,84 @@ pub fn fits(needs: &Needs, capacity: &Capacity, reserved: &Needs) -> bool {
     cores_ok && mem_ok && gpu_ok
 }
 
-/// Which queued jobs to start, in queue order. Pure, so it is testable.
+/// Tier boundaries for the queue order: estimates under a minute, under a
+/// day, and everything longer (owner decree 2026-11-12). Within a tier the
+/// shortest estimate starts first; across tiers the shorter tier wins.
+const TIER_MINUTES_SECS: u64 = 60;
+const TIER_DAYS_SECS: u64 = 24 * 60 * 60;
+/// Sort value for an un-estimated job: it reads as an hour-tier job with a
+/// mid-tier estimate, so omitting `--est` neither starves nor outranks an
+/// honest estimate.
+const EST_PLACEHOLDER_SECS: u64 = 60 * 60;
+
+/// The queue tier [`JobSpec::est_secs`] places a job in. Pure, so the
+/// scheduler, `rig status`, and the panel always agree on the order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum JobTier {
+    Minutes,
+    Hours,
+    Days,
+}
+
+impl JobTier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Minutes => "minutes",
+            Self::Hours => "hours",
+            Self::Days => "days",
+        }
+    }
+}
+
+pub fn job_tier(est_secs: Option<u64>) -> JobTier {
+    match est_secs {
+        None => JobTier::Hours,
+        Some(secs) if secs < TIER_MINUTES_SECS => JobTier::Minutes,
+        Some(secs) if secs < TIER_DAYS_SECS => JobTier::Hours,
+        Some(_) => JobTier::Days,
+    }
+}
+
+/// The human form of a seconds estimate ("45s", "30m", "2h", "3d") — what
+/// `parse_duration` accepts back.
+pub fn format_secs(secs: u64) -> String {
+    match secs {
+        s if s >= TIER_DAYS_SECS && s % TIER_DAYS_SECS == 0 => {
+            format!("{}d", s / TIER_DAYS_SECS)
+        }
+        s if s >= 3600 && s % 3600 == 0 => format!("{}h", s / 3600),
+        s if s >= 60 && s % 60 == 0 => format!("{}m", s / 60),
+        s => format!("{s}s"),
+    }
+}
+
+/// The effective queue order, applied everywhere the queue is read (the
+/// scheduler, `rig status`, the panel): urgent jobs first — FIFO among
+/// themselves, estimate ignored, since the human approval already ranked
+/// them — then by tier, then shortest estimate first, then submission
+/// order. Pure, so it is testable.
+pub fn sort_queue(queue: &mut [JobSpec]) {
+    queue.sort_by(|left, right| {
+        let key = |job: &JobSpec| {
+            let rank = match job.urgent {
+                true => 0,
+                false => 1 + job_tier(job.est_secs) as u8,
+            };
+            let est = match job.urgent {
+                true => 0,
+                false => job.est_secs.unwrap_or(EST_PLACEHOLDER_SECS),
+            };
+            (rank, est, job.submitted_at.clone())
+        };
+        key(left)
+            .cmp(&key(right))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+}
+
+/// Which queued jobs to start, in queue order. Pure, so it is testable. The
+/// queue is expected pre-sorted by [`sort_queue`] — both the scheduler and
+/// the callers that only display it read the same effective order.
 pub fn admit(
     queue: &[JobSpec],
     running: &[JobSpec],
@@ -578,10 +679,13 @@ impl Mailroom {
         if !may_start {
             return Ok(Vec::new());
         }
-        let queue: Vec<JobSpec> = json_files(&queue_dir)
+        let mut queue: Vec<JobSpec> = json_files(&queue_dir)
             .iter()
             .filter_map(|path| read_json(path))
             .collect();
+        // Submission order (UUIDv7 names) is only the tiebreak: admission
+        // follows the tiered order (urgent, tier, shortest estimate).
+        sort_queue(&mut queue);
         if queue.is_empty() {
             return Ok(Vec::new());
         }
@@ -1214,6 +1318,58 @@ impl Mailroom {
             .ok();
     }
 
+    /// Re-tiers a queued job in place (`rig set`): rewrites its estimate
+    /// and/or urgent flag without cancelling, so ids, keys, and notify
+    /// targets survive the reordering. Running jobs are past admission and
+    /// refuse. Starts what fits under the new order, if anything.
+    pub fn set_job_est(
+        &self,
+        id: &str,
+        est_secs: Option<u64>,
+        urgent: Option<bool>,
+    ) -> Result<String> {
+        validate_name(id)?;
+        anyhow::ensure!(
+            est_secs.is_some() || urgent.is_some(),
+            "nothing to set: pass --est and/or --urgent/--deurgent"
+        );
+        let queued = self.jobs_dir("queue").join(format!("{id}.json"));
+        let mut spec: JobSpec = read_json(&queued).with_context(|| {
+            format!("no queued job {id} on this rig (running jobs cannot be re-tiered)")
+        })?;
+        if let Some(secs) = est_secs {
+            spec.est_secs = Some(secs);
+        }
+        if let Some(urgent) = urgent {
+            spec.urgent = urgent;
+        }
+        write_json(&queued, &spec)?;
+        let mut queue: Vec<JobSpec> = json_files(&self.jobs_dir("queue"))
+            .iter()
+            .filter_map(|path| read_json(path))
+            .collect();
+        sort_queue(&mut queue);
+        let position = queue
+            .iter()
+            .position(|job| job.id == id)
+            .map_or("?".to_string(), |index| {
+                format!("{} of {}", index + 1, queue.len())
+            });
+        // Nudge admission under the new order; ignored like the executor's
+        // end-of-job sweep so an embedded host (rig panel) can re-tier
+        // without ever starting a job itself.
+        self.schedule_jobs().ok();
+        Ok(format!(
+            "re-tiered queued job {} (est {}, {}urgent): now #{position} in the queue",
+            short(id),
+            spec.est_secs.map_or_else(|| "-".into(), format_secs),
+            match spec.urgent {
+                true => "",
+                false => "not ",
+            }
+        ))
+    }
+
     /// Cancels a queued or running job on this rig.
     pub fn cancel_job(&self, id: &str) -> Result<String> {
         validate_name(id)?;
@@ -1284,13 +1440,15 @@ impl Mailroom {
         Ok(all[all.len().saturating_sub(lines)..].join("\n"))
     }
 
-    /// `rig log` / `rig cancel` against any rig: locally, or over SSH.
+    /// `rig log` / `rig cancel` / `rig set` against any rig: locally, or over
+    /// SSH.
     pub fn job_on_rig(&self, rig_name: &str, id: &str, action: JobAction) -> Result<String> {
         let rigs = self.rigs()?;
         if rig_name == rigs.self_rig {
             return match action {
                 JobAction::Log(lines) => self.job_log(id, lines),
                 JobAction::Cancel => self.cancel_job(id),
+                JobAction::Set { est_secs, urgent } => self.set_job_est(id, est_secs, urgent),
             };
         }
         validate_name(id)?;
@@ -1301,6 +1459,19 @@ impl Mailroom {
         let remote = match action {
             JobAction::Log(lines) => format!("rig log-local {id} {lines}"),
             JobAction::Cancel => format!("rig cancel-local {id}"),
+            JobAction::Set { est_secs, urgent } => {
+                let mut parts = vec!["rig".to_string(), "set-local".into(), id.to_string()];
+                if let Some(secs) = est_secs {
+                    parts.push("--est".into());
+                    parts.push(format_secs(secs));
+                }
+                match urgent {
+                    Some(true) => parts.push("--urgent".into()),
+                    Some(false) => parts.push("--deurgent".into()),
+                    None => {}
+                }
+                parts.join(" ")
+            }
         };
         let command = format!("{} {remote}", rig.bin.as_deref().unwrap_or("agent-mail"));
         let mut failures = Vec::new();
@@ -1349,19 +1520,35 @@ impl Mailroom {
                 minutes: Some(elapsed),
                 notify: record.spec.notify.clone(),
                 poisoned: record.poisoned.len(),
+                est_secs: record.spec.est_secs,
+                urgent: record.spec.urgent,
             });
         }
-        for (position, path) in json_files(&self.jobs_dir("queue")).iter().enumerate() {
-            let Some(spec) = read_json::<JobSpec>(path) else {
-                continue;
+        let mut queued: Vec<JobSpec> = json_files(&self.jobs_dir("queue"))
+            .iter()
+            .filter_map(|path| read_json(path))
+            .collect();
+        // Render the order admission will follow, not the submission order.
+        sort_queue(&mut queued);
+        for (position, spec) in queued.iter().enumerate() {
+            let tier = job_tier(spec.est_secs);
+            let est = spec
+                .est_secs
+                .map_or_else(|| "-".to_string(), format_secs);
+            let urgent_tag = match spec.urgent {
+                true => "URGENT · ",
+                false => "",
             };
             summary.queued.push(JobLine {
                 id: spec.id.clone(),
                 text: format!(
-                    "#{} {} {:?} · {} · for {}",
+                    "#{} {} {:?} · {}{} · est {} · {} · for {}",
                     position + 1,
                     short(&spec.id),
                     spec.lane,
+                    urgent_tag,
+                    tier.as_str(),
+                    est,
                     spec.title,
                     spec.notify.as_deref().unwrap_or("-")
                 ),
@@ -1371,6 +1558,8 @@ impl Mailroom {
                 minutes: None,
                 notify: spec.notify.clone(),
                 poisoned: 0,
+                est_secs: spec.est_secs,
+                urgent: spec.urgent,
             });
         }
         summary
@@ -1747,6 +1936,8 @@ mod tests {
             worktree: None,
             verify: None,
             result_path: None,
+            est_secs: None,
+            urgent: false,
             submitted_at: now(),
         }
     }
@@ -1830,6 +2021,119 @@ mod tests {
         assert_eq!(parse_duration("2h").unwrap(), Duration::from_secs(7200));
         assert!(parse_duration("5").is_err());
         assert!(parse_duration("5w").is_err());
+    }
+
+    #[test]
+    fn secs_format_round_trips_through_parse_duration() {
+        for secs in [45, 60, 1_800, 3_600, 7_200, 86_400, 3 * TIER_DAYS_SECS] {
+            assert_eq!(parse_duration(&format_secs(secs)).unwrap().as_secs(), secs);
+        }
+        assert_eq!(format_secs(45), "45s");
+        assert_eq!(format_secs(1_800), "30m");
+        assert_eq!(format_secs(7_200), "2h");
+        assert_eq!(format_secs(3 * TIER_DAYS_SECS), "3d");
+    }
+
+    #[test]
+    fn tiers_map_from_estimates() {
+        assert_eq!(job_tier(None), JobTier::Hours);
+        assert_eq!(job_tier(Some(0)), JobTier::Minutes);
+        assert_eq!(job_tier(Some(59)), JobTier::Minutes);
+        assert_eq!(job_tier(Some(60)), JobTier::Hours);
+        assert_eq!(job_tier(Some(86_399)), JobTier::Hours);
+        assert_eq!(job_tier(Some(86_400)), JobTier::Days);
+    }
+
+    #[test]
+    fn queue_sorts_urgent_first_then_tier_then_shortest() {
+        let estimated = |id: &str, lane: Lane, est_secs: u64, submitted_at: &str| {
+            let mut job = job(id, lane, 1.0);
+            job.est_secs = Some(est_secs);
+            job.submitted_at = submitted_at.into();
+            job
+        };
+        let mut queue = vec![
+            estimated("old-days", Lane::Exclusive, 3 * TIER_DAYS_SECS, "t1"),
+            estimated("probe", Lane::Exclusive, 45, "t2"),
+            estimated("canary", Lane::Exclusive, 30 * 60, "t3"),
+            job("unknown", Lane::Shared, 1.0),
+            estimated("sweep", Lane::Shared, 15 * 60, "t5"),
+        ];
+        queue[3].submitted_at = "t4".into();
+        sort_queue(&mut queue);
+        let ids: Vec<&str> = queue.iter().map(|job| job.id.as_str()).collect();
+        // Minutes tier first, then the hour tier shortest-first (an
+        // un-estimated job counts as a 1 h placeholder), days last — even
+        // though the days job was submitted first.
+        assert_eq!(ids, ["probe", "sweep", "canary", "unknown", "old-days"]);
+    }
+
+    #[test]
+    fn urgent_jobs_jump_every_tier_and_stay_fifo() {
+        let mut queue = vec![
+            {
+                let mut job = job("days", Lane::Exclusive, 1.0);
+                job.est_secs = Some(5 * TIER_DAYS_SECS);
+                job.submitted_at = "t1".into();
+                job
+            },
+            {
+                let mut job = job("probe", Lane::Exclusive, 1.0);
+                job.est_secs = Some(10);
+                job.submitted_at = "t2".into();
+                job
+            },
+            {
+                let mut job = job("u1", Lane::Exclusive, 1.0);
+                job.urgent = true;
+                job.submitted_at = "t3".into();
+                job
+            },
+            {
+                let mut job = job("u2", Lane::Shared, 1.0);
+                job.urgent = true;
+                job.est_secs = Some(1);
+                job.submitted_at = "t4".into();
+                job
+            },
+        ];
+        sort_queue(&mut queue);
+        let ids: Vec<&str> = queue.iter().map(|job| job.id.as_str()).collect();
+        // Urgents run FIFO by submission (u2's tiny estimate is ignored —
+        // the human approval already ranked them); everything else keeps
+        // the tier order behind them.
+        assert_eq!(ids, ["u1", "u2", "probe", "days"]);
+    }
+
+    #[test]
+    fn set_job_est_retiers_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let room = Mailroom::new(dir.path().to_path_buf());
+        fs::create_dir_all(room.jobs_dir("queue")).unwrap();
+        let mut early = job("q-early", Lane::Exclusive, 1.0);
+        early.est_secs = Some(30 * 60);
+        early.submitted_at = "2026-11-12T01:00:00+00:00".into();
+        let mut late = job("q-late", Lane::Shared, 1.0);
+        late.est_secs = Some(6 * 3600);
+        late.submitted_at = "2026-11-12T02:00:00+00:00".into();
+        for spec in [&early, &late] {
+            write_json(
+                &room.jobs_dir("queue").join(format!("{}.json", spec.id)),
+                spec,
+            )
+            .unwrap();
+        }
+        // A 45 s estimate plus the urgent jump puts the hour-old last job
+        // first — without touching its id, key, or notify.
+        let verdict = room.set_job_est("q-late", Some(45), Some(true)).unwrap();
+        assert!(verdict.contains("#1 of 2"), "{verdict}");
+        let spec: JobSpec = read_json(&room.jobs_dir("queue").join("q-late.json")).unwrap();
+        assert_eq!(spec.est_secs, Some(45));
+        assert!(spec.urgent);
+        assert_eq!(spec.submitted_at, "2026-11-12T02:00:00+00:00");
+        // Unknown id and no-op set are refused.
+        assert!(room.set_job_est("nope", Some(45), None).is_err());
+        assert!(room.set_job_est("q-late", None, None).is_err());
     }
 
     #[test]

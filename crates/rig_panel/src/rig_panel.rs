@@ -523,8 +523,31 @@ impl RigPanel {
         if let Some(position) = job.position {
             meta.push((format!("#{position}"), Color::Muted));
         }
+        if job.urgent {
+            meta.push(("URGENT".to_string(), Color::Warning));
+        }
         if let Some(lane) = &job.lane {
             meta.push((lane.clone(), Color::Muted));
+        }
+        if let Some(est_secs) = job.est_secs {
+            meta.push((
+                format!(
+                    "{} · est {}",
+                    agent_mail::jobs::job_tier(job.est_secs).as_str(),
+                    agent_mail::jobs::format_secs(est_secs)
+                ),
+                Color::Muted,
+            ));
+            // Real time used vs the proposal: past the estimate on a running
+            // job is the boss's earliest signal to re-tier or cancel it.
+            if running && job.minutes.is_some_and(|minutes| minutes.saturating_mul(60) > est_secs as i64)
+            {
+                meta.push(("over est".to_string(), Color::Warning));
+            }
+        } else {
+            // A missing proposal is a discipline gap the boss should see and
+            // fill with `rig set --est`.
+            meta.push(("no est".to_string(), Color::Muted));
         }
         meta.push((short_id(&job.id).to_string(), Color::Muted));
         if let Some(notify) = &job.notify {

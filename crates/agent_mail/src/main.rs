@@ -39,17 +39,26 @@ USAGE:
                                    and whether it is QUIET enough for a benchmark
   agent-mail rig run <RIG|auto> [--shared|--exclusive] [--key K] [--title T] [--cores N]
                 [--mem GB] [--gpu-mem GB] [--needs cuda,metal] [--timeout 2h]
-                [--worktree repo@sha] [--cwd DIR] [--notify name@rig] [--notify-mode M]
-                [--verify-manifest FILE] -- <command>
+                [--est 30m] [--urgent] [--worktree repo@sha] [--cwd DIR]
+                [--notify name@rig] [--notify-mode M] [--verify-manifest FILE] -- <command>
                                    queue a job: shared jobs run when resources fit, an
                                    exclusive one waits for a quiet empty rig; mail on
                                    start/poison/end (pass --notify — without it nobody
                                    is mailed); same --key twice = one run (amo referees).
+                                   --est is the proposer's wall-clock estimate: the queue
+                                   runs in tiers (minutes < hours < days), shortest first
+                                   inside a tier — always estimate. --urgent jumps every
+                                   tier (FIFO among urgents) and demands the human-approved
+                                   `[urgent]` prefix in the title.
                                    --verify-manifest pins the manifest's command + repo@sha,
                                    forces exclusive, refuses the producing rig, reads the
                                    result file it names, and posts a ratio-to-baseline row
                                    to the orchestrator's verify ledger (issue 055)
   agent-mail rig cancel <RIG> <ID> | rig log <RIG> <ID> [LINES]
+  agent-mail rig set <RIG> <ID> [--est 30m] [--urgent|--deurgent]
+                                   re-tier a queued job in place: new order without a
+                                   cancel — id, key, and notifies all survive. This is how
+                                   the orchestrator rearranges a jammed queue.
   agent-mail rig watch [--once|--force]   orchestrator watchdog tick (zero tokens unless an
                                    incident is new); --install writes the launchd job,
                                    --interval MIN sets the tick interval (default 10)
@@ -294,6 +303,21 @@ fn run(args: Vec<String>) -> Result<i32> {
                 println!("{}", room.job_on_rig(&target, &id, action)?);
                 Ok(0)
             }
+            Some("set") => {
+                let target = args.next().context("which rig?")?;
+                let id = args.next().context("which job id?")?;
+                let (est_secs, urgent) = parse_set_flags(&mut args)?;
+                let action = agent_mail::jobs::JobAction::Set { est_secs, urgent };
+                println!("{}", room.job_on_rig(&target, &id, action)?);
+                Ok(0)
+            }
+            Some("set-local") => {
+                let id = args.next().context("job id")?;
+                let (est_secs, urgent) = parse_set_flags(&mut args)?;
+                println!("{}", room.set_job_est(&id, est_secs, urgent)?);
+                println!("{END_MARKER}");
+                Ok(0)
+            }
             Some("cancel-local") => {
                 println!("{}", room.cancel_job(&args.next().context("job id")?)?);
                 println!("{END_MARKER}");
@@ -427,6 +451,42 @@ fn run(args: Vec<String>) -> Result<i32> {
 
 use agent_mail::jobs::END_MARKER;
 
+/// Shared flag parser for `rig set` and `rig set-local`: `--est DURATION`
+/// and/or `--urgent`/`--deurgent`, at least one of them.
+fn parse_set_flags(
+    args: &mut std::vec::IntoIter<String>,
+) -> Result<(Option<u64>, Option<bool>)> {
+    let mut est_secs = None;
+    let mut urgent = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--est" => {
+                est_secs = Some(
+                    agent_mail::jobs::parse_duration(&args.next().context("--est needs a duration")?)?
+                        .as_secs(),
+                )
+            }
+            "--urgent" => urgent = Some(true),
+            "--deurgent" => urgent = Some(false),
+            other => bail!("unexpected argument {other:?}"),
+        }
+    }
+    Ok((est_secs, urgent))
+}
+
+/// `--urgent` is the only queue jumper and a human approves each one: the
+/// mechanical gate is the `[urgent]` title prefix (owner decree 2026-11-12).
+fn ensure_urgent_title(urgent: bool, title: &str) -> Result<()> {
+    match urgent && !title.starts_with("[urgent]") {
+        true => bail!(
+            "--urgent needs the human-approved `[urgent]` prefix in the title: pass \
+             --title \"[urgent] …\". Urgent is the only queue jumper, and a human \
+             approves each one (owner decree 2026-11-12)"
+        ),
+        false => Ok(()),
+    }
+}
+
 fn rig_run(room: &Mailroom, args: Vec<String>) -> Result<i32> {
     use agent_mail::jobs::{JobSpec, KeyClaim, KeyOutcome, Lane, Needs};
     let mut args = args.into_iter();
@@ -443,6 +503,7 @@ fn rig_run(room: &Mailroom, args: Vec<String>) -> Result<i32> {
     let mut argv = Vec::new();
     let mut verify = None;
     let mut result_path = None;
+    let (mut est_secs, mut urgent) = (None, false);
     while let Some(arg) = args.next() {
         let mut value = |name: &str| args.next().with_context(|| format!("{name} needs a value"));
         match arg.as_str() {
@@ -459,6 +520,11 @@ fn rig_run(room: &Mailroom, args: Vec<String>) -> Result<i32> {
             "--timeout" => {
                 timeout = Some(agent_mail::jobs::parse_duration(&value("--timeout")?)?.as_secs())
             }
+            "--est" => {
+                est_secs =
+                    Some(agent_mail::jobs::parse_duration(&value("--est")?)?.as_secs())
+            }
+            "--urgent" => urgent = true,
             "--verify-manifest" => {
                 let bytes = std::fs::read(value("--verify-manifest")?)
                     .context("reading the verify manifest")?;
@@ -569,10 +635,12 @@ fn rig_run(room: &Mailroom, args: Vec<String>) -> Result<i32> {
         .filter(|cap| !rig.caps.iter().any(|own| own == cap))
         .collect();
     anyhow::ensure!(missing.is_empty(), "rig {rig_name} lacks {missing:?}");
+    let title = title.unwrap_or_else(|| argv.join(" ").chars().take(80).collect());
+    ensure_urgent_title(urgent, &title)?;
     let spec = JobSpec {
         id: uuid::Uuid::now_v7().to_string(),
         lane,
-        title: title.unwrap_or_else(|| argv.join(" ").chars().take(80).collect()),
+        title,
         argv,
         cwd,
         needs,
@@ -583,6 +651,8 @@ fn rig_run(room: &Mailroom, args: Vec<String>) -> Result<i32> {
         worktree,
         verify: verify.clone(),
         result_path,
+        est_secs,
+        urgent,
         submitted_at: chrono::Utc::now().to_rfc3339(),
     };
     if notify.is_none() {
@@ -818,6 +888,31 @@ mod tests {
             !room.home().join("inbox/--weird").exists(),
             "no folder named after a flag"
         );
+    }
+
+    #[test]
+    fn urgent_requires_the_approved_title_prefix() {
+        ensure_urgent_title(false, "plain title").unwrap();
+        ensure_urgent_title(true, "[urgent] drain the stuck verify ledger").unwrap();
+        let error = ensure_urgent_title(true, "plain title")
+            .expect_err("urgent without the [urgent] prefix is refused");
+        assert!(error.to_string().contains("[urgent]"), "{error:#}");
+    }
+
+    #[test]
+    fn set_flags_parse_strictly() {
+        let parse = |args: Vec<&str>| {
+            parse_set_flags(&mut args.into_iter().map(String::from).collect::<Vec<_>>().into_iter())
+        };
+        assert_eq!(parse(vec!["--est", "30m"]).unwrap(), (Some(1_800), None));
+        assert_eq!(parse(vec!["--urgent"]).unwrap(), (None, Some(true)));
+        assert_eq!(
+            parse(vec!["--est", "45s", "--deurgent"]).unwrap(),
+            (Some(45), Some(false))
+        );
+        assert!(parse(vec![]).unwrap().0.is_none());
+        assert!(parse(vec!["--est"]).is_err(), "--est needs a duration");
+        assert!(parse(vec!["--top"]).is_err(), "unknown flags are refused");
     }
 
     #[test]
