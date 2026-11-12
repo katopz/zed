@@ -173,6 +173,13 @@ pub fn reviewer() -> Option<Arc<dyn VerdictReviewer>> {
 /// tool calls this once per `request_verdict` invocation, so the return value
 /// is the round the negotiation has reached.
 pub fn register(session_id: &acp::SessionId) -> usize {
+    register_with_offset(session_id, 0)
+}
+
+/// Like [`register`], but seeds a brand-new session with rounds already used
+/// by the negotiation it replaces (route failover, issue 037) so the round
+/// budget carries over. An already-registered session ignores the seed.
+pub fn register_with_offset(session_id: &acp::SessionId, used_rounds: usize) -> usize {
     let now = Instant::now();
     let mut guard = lock_registry();
     let registry = guard.get_or_insert_with(HashMap::new);
@@ -182,12 +189,145 @@ pub fn register(session_id: &acp::SessionId) -> usize {
         .and_modify(|entry| entry.last_activity = now)
         .or_insert_with(|| VerdictSession {
             last_activity: now,
-            rounds: 0,
+            rounds: used_rounds,
             reviewer_thread: None,
         });
     entry.rounds += 1;
     entry.last_activity = now;
     entry.rounds
+}
+
+/// Classification of a reviewer-lane failure (issue 037): the reliability
+/// gate counts rate-limits separately from honest aborts, and the lane
+/// reacts differently — fail over or re-park on rate limits, one bounded
+/// retry on transient blips, nothing on the rest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewerFailure {
+    /// The backend is rate-limited. `reset_hint` carries the backend's
+    /// verbatim reset clause (e.g. "resets 1:20am (Asia/Bangkok)") for the
+    /// re-park message; wall-clock hints are deliberately not parsed into
+    /// durations — a multi-hour window is a failover/re-park decision, never
+    /// a sleep inside a tool call.
+    RateLimit { reset_hint: Option<String> },
+    /// Timeout / connection-lost / overloaded class: worth one bounded
+    /// retry. `retry_after` carries a parseable "try again in Ns/Nm" hint.
+    Transient { retry_after: Option<Duration> },
+    /// Empty replies, protocol errors — neither retryable nor
+    /// failover-worthy.
+    Other,
+}
+
+/// Upper bound for a retry delay derived from a backend hint. Matches the
+/// fork's `MAX_RETRY_AFTER` posture: long provider windows are a failover or
+/// re-park decision, not a silent sleep.
+pub const MAX_RETRY_DELAY: Duration = Duration::from_secs(2 * 60);
+
+/// Backoff for transient reviewer failures with no parseable hint.
+const DEFAULT_RETRY_DELAY: Duration = Duration::from_secs(5);
+
+/// Longest reset clause copied into a re-park message, in chars.
+const MAX_RESET_HINT_CHARS: usize = 80;
+
+/// ASCII-case-insensitive substring search. Byte-index based, but a match on
+/// ASCII bytes can only start at a char boundary (continuation bytes are
+/// ≥ 0x80), so the returned index is always a safe slice point.
+fn find_ascii_ignore_case(haystack: &str, needle: &str) -> Option<usize> {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .position(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
+/// Classifies a reviewer failure from the turn's error text plus the
+/// reviewer thread's recorded API error (`AcpThread::last_api_error`), which
+/// carries the real backend message when a turn dies on one (e.g. Claude
+/// Code's `… {"errorKind": "rate_limit"}`). Rate-limit detection wins over
+/// transient detection: a message mentioning both is a rate limit.
+pub fn classify_reviewer_failure(turn_error: &str, api_error: Option<&str>) -> ReviewerFailure {
+    let combined = match api_error {
+        Some(api_error) => format!("{api_error}\n{turn_error}"),
+        None => turn_error.to_string(),
+    };
+    let lower = combined.to_lowercase();
+    if lower.contains("rate_limit") || lower.contains("rate limit") {
+        return ReviewerFailure::RateLimit {
+            reset_hint: reset_hint(&combined),
+        };
+    }
+    if lower.contains("timed out")
+        || lower.contains("timeout")
+        || lower.contains("connection lost")
+        || lower.contains("released mid-turn")
+        || lower.contains("overloaded")
+    {
+        return ReviewerFailure::Transient {
+            retry_after: parse_try_after(&combined),
+        };
+    }
+    ReviewerFailure::Other
+}
+
+/// The bounded retry delay for a transient failure: the backend's parsed
+/// hint (already clamped to [`MAX_RETRY_DELAY`]), else a short default
+/// backoff. Rate limits return `None` — their windows are hours long; the
+/// lane must fail over or re-park instead of sleeping.
+pub fn reviewer_retry_delay(failure: &ReviewerFailure) -> Option<Duration> {
+    match failure {
+        ReviewerFailure::Transient { retry_after } => {
+            Some(retry_after.unwrap_or(DEFAULT_RETRY_DELAY))
+        }
+        _ => None,
+    }
+}
+
+/// Extracts a bounded "resets …" clause for re-park messages, trimming the
+/// raw JSON error object backends sometimes append. Char-boundary safe:
+/// capped by chars, and the JSON cut lands on an ASCII match.
+fn reset_hint(text: &str) -> Option<String> {
+    let start = find_ascii_ignore_case(text, "resets")?;
+    let line: String = text[start..]
+        .chars()
+        .take_while(|ch| *ch != '\n')
+        .collect();
+    let capped: String = line.chars().take(MAX_RESET_HINT_CHARS).collect();
+    let end = find_ascii_ignore_case(&capped, "{").unwrap_or(capped.len());
+    let hint = capped[..end].trim();
+    let hint = hint.strip_suffix(':').unwrap_or(hint);
+    if hint.is_empty() {
+        None
+    } else {
+        Some(hint.to_string())
+    }
+}
+
+/// Parses a "try again in Ns / retry after: Nm" style hint into a bounded
+/// duration.
+fn parse_try_after(text: &str) -> Option<Duration> {
+    for needle in ["try again in", "retry after"] {
+        let Some(start) = find_ascii_ignore_case(text, needle) else {
+            continue;
+        };
+        let mut chars = text[start + needle.len()..]
+            .chars()
+            .skip_while(|ch| ch.is_whitespace() || *ch == ':')
+            .peekable();
+        let seconds: String = chars
+            .by_ref()
+            .take_while(|ch| ch.is_ascii_digit())
+            .collect();
+        let Ok(seconds) = seconds.parse::<u64>() else { continue };
+        let Some(unit) = chars.find(|ch| !ch.is_whitespace()) else {
+            continue;
+        };
+        let delay = match unit.to_ascii_lowercase() {
+            's' => Duration::from_secs(seconds),
+            'm' => Duration::from_secs(seconds * 60),
+            'h' => Duration::from_secs(seconds * 3600),
+            _ => continue,
+        };
+        return Some(delay.min(MAX_RETRY_DELAY));
+    }
+    None
 }
 
 /// Like [`register`], but also stores the external reviewer thread so
@@ -399,6 +539,85 @@ mod tests {
     }
 
     #[test]
+    fn classify_flags_rate_limit_and_keeps_the_reset_hint() {
+        let claude_code = "Internal error: You've hit your session limit · resets 1:20am (Asia/Bangkok): {\"errorKind\": \"rate_limit\"}";
+        match classify_reviewer_failure("verdict reviewer returned an empty reply", Some(claude_code)) {
+            ReviewerFailure::RateLimit { reset_hint } => {
+                let hint = reset_hint.expect("reset hint extracted");
+                assert!(hint.starts_with("resets 1:20am"), "hint: {hint}");
+                assert!(!hint.contains("errorKind"), "JSON tail trimmed: {hint}");
+                assert!(!hint.ends_with(':'), "trailing colon trimmed: {hint}");
+            }
+            other => panic!("expected rate limit, got {other:?}"),
+        }
+
+        // Also detected from the turn error alone (native lane's stringified 429s).
+        assert!(matches!(
+            classify_reviewer_failure("HTTP 429: rate limit exceeded", None),
+            ReviewerFailure::RateLimit { reset_hint: None }
+        ));
+
+        // Unknown failures stay Other — no retry, no failover.
+        assert_eq!(
+            classify_reviewer_failure("connection refused", None),
+            ReviewerFailure::Other
+        );
+    }
+
+    #[test]
+    fn classify_prefers_rate_limit_over_transient_keywords() {
+        assert!(matches!(
+            classify_reviewer_failure(
+                "rate limit exceeded. please try again in 3 seconds",
+                None
+            ),
+            ReviewerFailure::RateLimit { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_flags_transient_and_parses_retry_hints() {
+        assert_eq!(
+            classify_reviewer_failure("verdict reviewer timed out after 180s", None),
+            ReviewerFailure::Transient { retry_after: None }
+        );
+        assert_eq!(
+            classify_reviewer_failure(
+                "The server is overloaded. Please try again in 21 seconds",
+                None
+            ),
+            ReviewerFailure::Transient {
+                retry_after: Some(Duration::from_secs(21))
+            }
+        );
+        // Minute hints are honored but clamped to MAX_RETRY_DELAY.
+        assert_eq!(
+            classify_reviewer_failure("overloaded — retry after: 90 minutes", None),
+            ReviewerFailure::Transient {
+                retry_after: Some(MAX_RETRY_DELAY)
+            }
+        );
+        // A matched needle with no parseable hint falls through cleanly.
+        assert_eq!(
+            classify_reviewer_failure("timed out, retry after the window resets", None),
+            ReviewerFailure::Transient { retry_after: None }
+        );
+    }
+
+    #[test]
+    fn retry_delay_borrows_the_hint_but_never_sleeps_on_rate_limits() {
+        assert_eq!(
+            reviewer_retry_delay(&ReviewerFailure::Transient { retry_after: None }),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            reviewer_retry_delay(&ReviewerFailure::RateLimit { reset_hint: None }),
+            None
+        );
+        assert_eq!(reviewer_retry_delay(&ReviewerFailure::Other), None);
+    }
+
+    #[test]
     fn parse_verdict_is_case_and_whitespace_tolerant() {
         assert_eq!(parse_verdict("  #verdict:agree"), Some(VerdictKind::Agree));
         assert_eq!(
@@ -427,6 +646,17 @@ mod tests {
         assert_eq!(rounds(&session), None);
         // Re-registering after completion starts a fresh negotiation.
         assert_eq!(register(&session), 1);
+        complete(&session);
+    }
+
+    #[test]
+    fn register_with_offset_carries_the_budget_over_on_failover() {
+        // The replaced negotiation had used 2 rounds (issue 037 failover).
+        let session = session_id("verdict-test-failover");
+        assert_eq!(register_with_offset(&session, 2), 3);
+        assert_eq!(rounds(&session), Some(3));
+        // An already-registered session ignores the seed.
+        assert_eq!(register_with_offset(&session, 0), 4);
         complete(&session);
     }
 

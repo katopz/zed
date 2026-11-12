@@ -4,7 +4,7 @@ use acp_thread::{
 use agent_client_protocol::schema::v2 as acp;
 use agent_settings::AgentSettings;
 use anyhow::Result;
-use gpui::{App, SharedString, Task};
+use gpui::{App, AsyncApp, Entity, SharedString, Task};
 use language_model::LanguageModelToolResultContent;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -47,6 +47,13 @@ use crate::{AgentTool, ThreadEnvironment, ToolCallEventStream, ToolInput};
 /// `reviewer: "secondary"` only when the user asked for the secondary
 /// reviewer (`agent.verdict_secondary_model`, e.g. GLM); keep the same value
 /// for every round of a negotiation.
+///
+/// If the backend is rate-limited mid-negotiation, the tool fails over to
+/// `agent.verdict_secondary_model` (the round budget carries over) or, when
+/// no secondary is configured, re-parks with the backend's reset hint — do
+/// not retry before that window passes. Transient external-lane failures
+/// (spawn blips, timeouts) get one bounded retry before the round reports
+/// failed.
 ///
 /// ### Output
 /// - You receive only the reviewer's final message for this round, plus the
@@ -163,7 +170,7 @@ impl RequestVerdictTool {
 }
 
 /// Which backend the tool drives for this negotiation.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 enum ReviewerRoute {
     /// Subagent spawned through the environment (phase 1-4 path).
     Native,
@@ -175,7 +182,7 @@ enum ReviewerRoute {
 
 /// Newtype so `ReviewerRoute` can stay `Debug`/`PartialEq` without requiring
 /// `Debug` on the provider trait object.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 struct ReviewerLabel(&'static str);
 
 impl ReviewerRoute {
@@ -262,6 +269,293 @@ fn setting_label(setting: &VerdictReviewerSetting) -> String {
     }
 }
 
+/// One reviewer attempt that ended in a failure the orchestrator may still
+/// react to (fail over, re-park) — issue 037. Plain aborts from config
+/// errors keep using [`error_output`] directly.
+struct AttemptFailure {
+    session_id: Option<acp::SessionId>,
+    session_info: Option<SubagentSessionInfo>,
+    error: String,
+    /// The reviewer thread's own API error text (`AcpThread::last_api_error`),
+    /// read where the lane holds the thread (external route). Carries the real
+    /// backend message behind a wrapper error like "empty reply".
+    api_error: Option<String>,
+    route: ReviewerRoute,
+}
+
+impl AttemptFailure {
+    fn classify(&self) -> verdict::ReviewerFailure {
+        verdict::classify_reviewer_failure(&self.error, self.api_error.as_deref())
+    }
+
+    fn error_output(self) -> RequestVerdictToolOutput {
+        error_output(
+            self.session_id,
+            self.error,
+            route_label(&self.route),
+            self.session_info,
+        )
+    }
+}
+
+/// The re-park error for a rate-limited reviewer lane (issue 037 task 1):
+/// carries the backend's reset hint and the resume path, so the worker
+/// schedules a retry after the window instead of hammering the same
+/// rate-limited backend.
+fn repark_error(underlying: &str, reset_hint: Option<&str>) -> String {
+    let window = reset_hint.unwrap_or("reset time unknown");
+    format!(
+        "verdict reviewer lane is rate-limited — window {window}. \
+         Re-park this verdict request: do not call request_verdict again until \
+         after the reset; resume the SAME session_id then, or present the \
+         remaining disagreement to the user. Underlying backend error: {underlying}"
+    )
+}
+
+impl RequestVerdictTool {
+    /// Runs one attempt on the given route. `resume_session` resumes an
+    /// existing native reviewer session when given (external sessions resume
+    /// via the registry); `round_seed` carries over the rounds of a replaced
+    /// negotiation (route failover, issue 037).
+    async fn run_attempt(
+        environment: &Rc<dyn ThreadEnvironment>,
+        route: &mut ReviewerRoute,
+        input: &RequestVerdictToolInput,
+        resume_session: Option<acp::SessionId>,
+        round_seed: usize,
+        cx: &mut AsyncApp,
+    ) -> Result<(acp::SessionId, String, usize, usize, Option<usize>), Box<AttemptFailure>> {
+        let external = matches!(&*route, ReviewerRoute::External(_));
+        if external {
+            Self::run_external_attempt(environment, route, input, cx).await
+        } else {
+            let model_override = match &*route {
+                ReviewerRoute::Secondary(model) => Some(model.clone()),
+                _ => None,
+            };
+            Self::run_native_attempt(
+                environment,
+                input,
+                model_override,
+                resume_session,
+                route,
+                round_seed,
+                cx,
+            )
+            .await
+        }
+    }
+
+    async fn run_native_attempt(
+        environment: &Rc<dyn ThreadEnvironment>,
+        input: &RequestVerdictToolInput,
+        model_override: Option<LanguageModelSelection>,
+        resume_session: Option<acp::SessionId>,
+        route: &ReviewerRoute,
+        round_seed: usize,
+        cx: &mut AsyncApp,
+    ) -> Result<(acp::SessionId, String, usize, usize, Option<usize>), Box<AttemptFailure>> {
+        let subagent = cx.update(|cx| {
+            if let Some(session_id) = resume_session {
+                environment.resume_subagent(session_id, cx)
+            } else {
+                environment.create_verdict_subagent(input.label.clone(), model_override, cx)
+            }
+            .map_err(|err| Box::new(AttemptFailure {
+                session_id: None,
+                session_info: None,
+                error: err.to_string(),
+                api_error: None,
+                route: route.clone(),
+            }))
+        });
+        let subagent = match subagent {
+            Ok(subagent) => subagent,
+            Err(failure) => return Err(failure),
+        };
+
+        let session_id = subagent.id();
+        let round = cx.update(|_cx| verdict::register_with_offset(&session_id, round_seed));
+        let message_start_index = cx.update(|cx| subagent.num_entries(cx));
+
+        // The thread retries provider errors internally (exponential backoff,
+        // retry-after capped at 2 min); a send error is post-exhaustion, so no
+        // tool-level retry here — the orchestrator's failover/re-park decides.
+        let reply = match subagent.send(input.message.clone(), cx).await {
+            Ok(reply) => reply,
+            Err(err) => {
+                return Err(Box::new(AttemptFailure {
+                    session_id: Some(session_id.clone()),
+                    session_info: Some(SubagentSessionInfo {
+                        session_id,
+                        message_start_index,
+                        message_end_index: None,
+                    }),
+                    error: err.to_string(),
+                    api_error: None,
+                    route: route.clone(),
+                }));
+            }
+        };
+        let message_end_index = cx.update(|cx| Some(subagent.num_entries(cx).saturating_sub(1)));
+
+        if input.final_round {
+            cx.update(|_cx| verdict::complete(&session_id));
+        }
+
+        Ok((
+            session_id,
+            reply,
+            round,
+            message_start_index,
+            message_end_index,
+        ))
+    }
+
+    async fn run_external_attempt(
+        environment: &Rc<dyn ThreadEnvironment>,
+        route: &mut ReviewerRoute,
+        input: &RequestVerdictToolInput,
+        cx: &mut AsyncApp,
+    ) -> Result<(acp::SessionId, String, usize, usize, Option<usize>), Box<AttemptFailure>> {
+        let Some(provider) = verdict::reviewer() else {
+            return Err(Box::new(AttemptFailure {
+                session_id: None,
+                session_info: None,
+                error: "external verdict reviewer was unregistered mid-negotiation".to_string(),
+                api_error: None,
+                route: route.clone(),
+            }));
+        };
+        *route = ReviewerRoute::external(provider.clone());
+
+        let (thread, session_id, turn_timeout) = if let Some(session_id) = input.session_id.clone()
+        {
+            match verdict::reviewer_thread(&session_id) {
+                Some(thread) => (thread, session_id, verdict::REVIEWER_TURN_TIMEOUT),
+                None => {
+                    return Err(Box::new(AttemptFailure {
+                        session_id: Some(session_id),
+                        session_info: None,
+                        error: "verdict reviewer session expired — start a new negotiation \
+                             (call request_verdict without session_id)"
+                            .to_string(),
+                        api_error: None,
+                        route: route.clone(),
+                    }));
+                }
+            }
+        } else {
+            // Issue 037 task 2: one bounded retry on transient spawn blips —
+            // retrying a spawn is cheaper than burning the negotiation.
+            let spawn_result = Self::spawn_external(environment, route, provider.as_ref(), cx).await;
+            let thread = match spawn_result {
+                Ok(thread) => thread,
+                Err(failure) => {
+                    if let Some(delay) = verdict::reviewer_retry_delay(&failure.classify()) {
+                        log::warn!(
+                            "verdict reviewer spawn failed transiently ({}); retrying once in {delay:?}",
+                            failure.error
+                        );
+                        cx.background_executor().timer(delay).await;
+                        match Self::spawn_external(environment, route, provider.as_ref(), cx).await {
+                            Ok(thread) => thread,
+                            Err(retry_failure) => return Err(retry_failure),
+                        }
+                    } else {
+                        return Err(failure);
+                    }
+                }
+            };
+            let session_id = cx.update(|cx| thread.read(cx).session_id().clone());
+            // Fresh session: the first turn also pays the CLI's one-time cold
+            // start (see REVIEWER_COLD_START_TURN_TIMEOUT).
+            (thread, session_id, verdict::REVIEWER_COLD_START_TURN_TIMEOUT)
+        };
+
+        let round = cx.update(|_cx| {
+            verdict::register_reviewer_session(&session_id, thread.clone())
+        });
+
+        // Issue 037 task 2: one bounded retry on transient turn failures. The
+        // thread's own API error (rate-limit JSON, overload notice) is read
+        // off the AcpThread so a wrapper error ("empty reply") can't hide the
+        // real class.
+        let mut retried_turn = false;
+        let reply = loop {
+            match verdict::reviewer_turn(&thread, input.message.clone(), turn_timeout, cx).await {
+                Ok(reply) => break Ok(reply),
+                Err(err) => {
+                    let api_error = cx.update(|cx| {
+                        let reviewer = thread.read(cx);
+                        reviewer
+                            .had_api_error()
+                            .then(|| reviewer.last_api_error().map(str::to_string))
+                            .flatten()
+                    });
+                    let class = verdict::classify_reviewer_failure(
+                        &err.to_string(),
+                        api_error.as_deref(),
+                    );
+                    if !retried_turn && let Some(delay) = verdict::reviewer_retry_delay(&class) {
+                        retried_turn = true;
+                        log::warn!(
+                            "verdict reviewer turn failed transiently ({err:#}); retrying once in {delay:?}"
+                        );
+                        cx.background_executor().timer(delay).await;
+                        continue;
+                    }
+                    break Err(Box::new(AttemptFailure {
+                        session_id: Some(session_id.clone()),
+                        session_info: None,
+                        error: err.to_string(),
+                        api_error,
+                        route: route.clone(),
+                    }));
+                }
+            }
+        };
+        let reply = match reply {
+            Ok(reply) => reply,
+            Err(failure) => return Err(failure),
+        };
+
+        if input.final_round {
+            cx.update(|cx| verdict::complete_reviewer(&session_id, cx));
+        }
+
+        Ok((session_id, reply, round, 0, None))
+    }
+
+    async fn spawn_external(
+        environment: &Rc<dyn ThreadEnvironment>,
+        route: &ReviewerRoute,
+        provider: &dyn VerdictReviewer,
+        cx: &mut AsyncApp,
+    ) -> Result<Entity<acp_thread::AcpThread>, Box<AttemptFailure>> {
+        let Some(project) = cx.update(|cx| environment.project(cx)) else {
+            return Err(Box::new(AttemptFailure {
+                session_id: None,
+                session_info: None,
+                error: "cannot spawn a claude_code reviewer without a project".to_string(),
+                api_error: None,
+                route: route.clone(),
+            }));
+        };
+        let work_dirs = cx.update(|cx| environment.work_dirs(cx));
+        let spawn = cx
+            .update(|cx| provider.spawn_session(project, work_dirs.unwrap_or_default(), cx))
+            .await;
+        spawn.map_err(|err| Box::new(AttemptFailure {
+            session_id: None,
+            session_info: None,
+            error: err.to_string(),
+            api_error: None,
+            route: route.clone(),
+        }))
+    }
+}
+
 impl AgentTool for RequestVerdictTool {
     type Input = RequestVerdictToolInput;
     type Output = RequestVerdictToolOutput;
@@ -330,7 +624,7 @@ impl AgentTool for RequestVerdictTool {
             let route = match resolve_requested_route(
                 input.reviewer,
                 &reviewer_setting,
-                secondary_model,
+                secondary_model.clone(),
                 verdict::reviewer(),
             ) {
                 Ok(route) => route,
@@ -372,159 +666,109 @@ impl AgentTool for RequestVerdictTool {
                 ));
             }
 
+            // Read before any attempt registers a session: the failover seeds
+            // its replacement session with the negotiation's used rounds so
+            // the budget carries over (issue 037).
+            let prior_rounds = input
+                .session_id
+                .as_ref()
+                .and_then(|session_id| cx.update(|_cx| verdict::rounds(session_id)))
+                .unwrap_or(0);
+
             let mut route = route;
-            let reply = match &route {
-                ReviewerRoute::Native | ReviewerRoute::Secondary(_) => {
-                    let model_override = match &route {
-                        ReviewerRoute::Secondary(model) => Some(model.clone()),
-                        _ => None,
-                    };
-                    let subagent = cx.update(|cx| {
-                        if let Some(session_id) = input.session_id.clone() {
-                            self.environment.resume_subagent(session_id, cx)
-                        } else {
-                            self.environment.create_verdict_subagent(
-                                input.label.clone(),
-                                model_override,
-                                cx,
-                            )
+            let mut result = Self::run_attempt(
+                &self.environment,
+                &mut route,
+                &input,
+                input.session_id.clone(),
+                0,
+                cx,
+            )
+            .await;
+
+            // Issue 037 task 1: a rate-limited reviewer used to burn an abort.
+            // With a secondary reviewer configured, this round fails over to
+            // it (the round budget carries over); without one, the error below
+            // re-parks the request with the reset hint instead.
+            let rate_limited = match &result {
+                Err(failure) => matches!(
+                    failure.classify(),
+                    verdict::ReviewerFailure::RateLimit { .. }
+                ),
+                Ok(_) => false,
+            };
+            if rate_limited
+                && let Some(model) = secondary_model.clone()
+                && !matches!(&route, ReviewerRoute::Secondary(_))
+            {
+                let from_label = route_label(&route);
+                let to_route = ReviewerRoute::Secondary(model.clone());
+                let to_label = route_label(&to_route);
+                // The negotiation moves off the failed session — release it
+                // now instead of waiting out the registry TTL.
+                let failed_session = match &result {
+                    Err(failure) => failure.session_id.clone(),
+                    Ok(_) => None,
+                };
+                if let Some(session_id) = failed_session {
+                    match &route {
+                        ReviewerRoute::External(_) => {
+                            cx.update(|cx| verdict::complete_reviewer(&session_id, cx));
                         }
-                        .map_err(|err| {
-                            error_output(None, err.to_string(), route_label(&route), None)
-                        })
-                    });
-                    let subagent = match subagent {
-                        Ok(subagent) => subagent,
-                        Err(error) => return Err(error),
-                    };
-
-                    let session_id = subagent.id();
-                    let round = cx.update(|_cx| verdict::register(&session_id));
-                    let message_start_index = cx.update(|cx| subagent.num_entries(cx));
-
-                    let send_result = subagent.send(input.message, cx).await;
-                    let reply = match send_result {
-                        Ok(reply) => reply,
-                        Err(err) => {
-                            let error = err.to_string();
-                            return Err(error_output(
-                                Some(session_id.clone()),
-                                error,
-                                route_label(&route),
-                                Some(SubagentSessionInfo {
-                                    session_id,
-                                    message_start_index,
-                                    message_end_index: None,
-                                }),
-                            ));
-                        }
-                    };
-                    let message_end_index =
-                        cx.update(|cx| Some(subagent.num_entries(cx).saturating_sub(1)));
-
-                    if input.final_round {
-                        cx.update(|_cx| verdict::complete(&session_id));
+                        _ => cx.update(|_cx| verdict::complete(&session_id)),
                     }
-
-                    (
-                        session_id,
-                        reply,
-                        round,
-                        message_start_index,
-                        message_end_index,
-                    )
                 }
-                ReviewerRoute::External(_) => {
-                    let Some(provider) = verdict::reviewer() else {
-                        return Err(error_output(
-                            None,
-                            "external verdict reviewer was unregistered mid-negotiation"
-                                .to_string(),
-                            route_label(&route),
-                            None,
-                        ));
-                    };
-                    route = ReviewerRoute::external(provider.clone());
+                telemetry::event!(
+                    "Verdict Reviewer Failover",
+                    from = from_label.as_str(),
+                    to = to_label.as_str(),
+                    reason = "rate_limit",
+                );
+                route = to_route;
+                result = Self::run_attempt(&self.environment, &mut route, &input, None, prior_rounds, cx)
+                    .await;
+            }
 
-                    let (thread, session_id, turn_timeout) = if let Some(session_id) =
-                        input.session_id.clone()
-                    {
-                        match verdict::reviewer_thread(&session_id) {
-                            Some(thread) => (thread, session_id, verdict::REVIEWER_TURN_TIMEOUT),
-                            None => {
-                                return Err(error_output(
-                                    Some(session_id),
-                                    "verdict reviewer session expired — start a new negotiation \
-                                         (call request_verdict without session_id)"
-                                        .to_string(),
-                                    route_label(&route),
-                                    None,
-                                ));
-                            }
-                        }
-                    } else {
-                        let Some(project) = cx.update(|cx| self.environment.project(cx)) else {
+            let (session_id, output, round, message_start_index, message_end_index) = match result
+            {
+                Ok(reply) => reply,
+                Err(failure) => {
+                    let class = failure.classify();
+                    let reviewer = route_label(&failure.route);
+                    match class {
+                        verdict::ReviewerFailure::RateLimit { reset_hint } => {
+                            telemetry::event!(
+                                "Verdict Reviewer Failed",
+                                reviewer = reviewer.as_str(),
+                                class = "rate_limit",
+                                status = "re-parked",
+                            );
                             return Err(error_output(
-                                None,
-                                "cannot spawn a claude_code reviewer without a project".to_string(),
-                                route_label(&route),
-                                None,
+                                failure.session_id,
+                                repark_error(&failure.error, reset_hint.as_deref()),
+                                reviewer,
+                                failure.session_info,
                             ));
-                        };
-                        let work_dirs = cx.update(|cx| self.environment.work_dirs(cx));
-                        let spawn = cx
-                            .update(|cx| {
-                                provider.spawn_session(project, work_dirs.unwrap_or_default(), cx)
-                            })
-                            .await;
-                        let thread = match spawn {
-                            Ok(thread) => thread,
-                            Err(err) => {
-                                return Err(error_output(
-                                    None,
-                                    err.to_string(),
-                                    route_label(&route),
-                                    None,
-                                ));
-                            }
-                        };
-                        let session_id = cx.update(|cx| thread.read(cx).session_id().clone());
-                        // Fresh session: the first turn also pays the CLI's
-                        // one-time cold start (see REVIEWER_COLD_START_TURN_TIMEOUT).
-                        (
-                            thread,
-                            session_id,
-                            verdict::REVIEWER_COLD_START_TURN_TIMEOUT,
-                        )
-                    };
-
-                    let round = cx.update(|_cx| {
-                        verdict::register_reviewer_session(&session_id, thread.clone())
-                    });
-
-                    match verdict::reviewer_turn(&thread, input.message.clone(), turn_timeout, cx)
-                        .await
-                    {
-                        Ok(reply) => {
-                            if input.final_round {
-                                cx.update(|cx| verdict::complete_reviewer(&session_id, cx));
-                            }
-                            (session_id, reply, round, 0, None)
                         }
-                        Err(err) => {
-                            let error = err.to_string();
-                            return Err(error_output(
-                                Some(session_id),
-                                error,
-                                route_label(&route),
-                                None,
-                            ));
+                        other_class => {
+                            telemetry::event!(
+                                "Verdict Reviewer Failed",
+                                reviewer = reviewer.as_str(),
+                                class = if matches!(
+                                    other_class,
+                                    verdict::ReviewerFailure::Transient { .. }
+                                ) {
+                                    "transient"
+                                } else {
+                                    "other"
+                                },
+                                status = "failed",
+                            );
+                            return Err(failure.error_output());
                         }
                     }
                 }
             };
-
-            let (session_id, output, round, message_start_index, message_end_index) = reply;
 
             let reviewer = route_label(&route);
             let status = "completed";
@@ -648,6 +892,18 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(input.session_id.unwrap().to_string(), "existing-session");
+    }
+
+    #[test]
+    fn repark_error_names_the_window_and_resume_path() {
+        let message = repark_error("boom: quota", Some("resets 1:20am (Asia/Bangkok)"));
+        assert!(message.contains("resets 1:20am"), "hint carried: {message}");
+        assert!(message.contains("Re-park"));
+        assert!(message.contains("session_id"));
+        assert!(message.contains("boom: quota"));
+
+        let message = repark_error("boom", None);
+        assert!(message.contains("reset time unknown"));
     }
 
     #[test]
