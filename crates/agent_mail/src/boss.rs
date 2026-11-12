@@ -11,7 +11,7 @@
 
 use crate::rig::{OWNER_INBOX, RigProbe};
 use crate::watch::{Incident, open_item};
-use crate::{Mailroom, validate_name};
+use crate::{MailMode, Mailroom, validate_name};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -32,6 +32,11 @@ pub const THREAD_END_WINDOW: Duration = Duration::from_secs(60 * 60);
 /// Mail pending past this grace is stale: delivery and the delivery-time
 /// thread resume have both had their chance.
 pub const MAIL_GRACE: Duration = Duration::from_secs(30 * 60);
+/// Extra grace for fyi-mode mail. fyi is sent with "no reply expected; read
+/// at the next natural turn boundary", so a sleeping lane is normal for
+/// hours — the incident only fires when the boundary is genuinely never
+/// coming (dead session). 6× the actionable grace ≈ 3 hours.
+pub const FYI_MAIL_EXTRA_GRACE: Duration = Duration::from_secs(30 * 60 * 6);
 /// The housekeeping run's budget: at most this many checklist units, then a
 /// normal summary. Housekeeping is endless; runs are not.
 pub const BOSS_BUDGET_UNITS: usize = 5;
@@ -318,6 +323,27 @@ pub fn stale_mail(
             // incident, no matter how long ago it fired.
             .filter(|envelope| {
                 !(envelope.from == envelope.to && envelope.deliver_at.is_some())
+            })
+            // fyi mail is sent with "no reply expected; read at the next
+            // natural turn boundary" — a sleeping lane is normal for hours,
+            // so it gets a longer grace than actionable mail.
+            .filter(|envelope| {
+                let age_grace = if envelope.mode == MailMode::Fyi {
+                    grace + FYI_MAIL_EXTRA_GRACE
+                } else {
+                    grace
+                };
+                let readable = chrono::DateTime::parse_from_rfc3339(
+                    envelope.deliver_at.as_deref().unwrap_or(&envelope.sent_at),
+                );
+                match readable {
+                    Ok(readable) => {
+                        let age =
+                            now.signed_duration_since(readable.with_timezone(&chrono::Utc));
+                        age.num_seconds() >= age_grace.as_secs() as i64
+                    }
+                    Err(_) => true,
+                }
             })
             .filter_map(|envelope| {
                 chrono::DateTime::parse_from_rfc3339(
@@ -893,6 +919,38 @@ mod tests {
         assert!(
             mail.iter().all(|mail| mail.inbox != "zed-alarm"),
             "a fired self-addressed wake is an alarm clock, not staleness"
+        );
+
+        // fyi mail is sent with "no reply expected; read at the next natural
+        // turn boundary" — a sleeping lane is normal for hours, so it takes a
+        // longer grace than actionable mail: fyi 2h past delivery is still
+        // inside the boundary expectation, actionable mail is not.
+        let fyi_due = (now - chrono::Duration::minutes(120)).to_rfc3339();
+        send_mail(&room, "zed-fyi-lane", "queue re-tier notice");
+        let fyi_new = room.home().join("inbox").join("zed-fyi-lane").join("new");
+        for file in fs::read_dir(&fyi_new).unwrap().flatten() {
+            let mut envelope: serde_json::Value =
+                serde_json::from_slice(&fs::read(file.path()).unwrap()).unwrap();
+            envelope["sent_at"] = serde_json::Value::String(fyi_due.clone());
+            envelope["mode"] = serde_json::Value::String("fyi".into());
+            fs::write(file.path(), serde_json::to_vec(&envelope).unwrap()).unwrap();
+        }
+        let mail = stale_mail(&room, now, MAIL_GRACE, &live, &exclude);
+        assert!(
+            mail.iter().all(|mail| mail.inbox != "zed-fyi-lane"),
+            "fyi 2h past delivery is still inside its boundary grace"
+        );
+        let fyi_old = (now - chrono::Duration::hours(4)).to_rfc3339();
+        for file in fs::read_dir(&fyi_new).unwrap().flatten() {
+            let mut envelope: serde_json::Value =
+                serde_json::from_slice(&fs::read(file.path()).unwrap()).unwrap();
+            envelope["sent_at"] = serde_json::Value::String(fyi_old.clone());
+            fs::write(file.path(), serde_json::to_vec(&envelope).unwrap()).unwrap();
+        }
+        let mail = stale_mail(&room, now, MAIL_GRACE, &live, &exclude);
+        assert!(
+            mail.iter().any(|mail| mail.inbox == "zed-fyi-lane"),
+            "fyi 4h past delivery (boundary never came) is stale"
         );
 
         // A live Zed on the rig makes it the boss's problem; with none, the
