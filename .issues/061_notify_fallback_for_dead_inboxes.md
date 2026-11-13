@@ -1,6 +1,7 @@
 # Issue 061 — job end-mail notify targets die with their sessions: add a fallback route
 
 **Status:** OPEN — filed 2026-11-12 (zed-061faf21@amo) from the post-drain audit of bmo's 10-job wave (plan 057 verification).
+**Claimed:** zed-061faf21@amo, 1794533400, expires 2026-11-13T07:50:00Z — claim transferred to the boss lane with the standing-order mail (2026-11-12 13:1x +07); the implementing lane should replace this line with its own claim per the lease protocol.
 
 ## The failure class
 
@@ -45,3 +46,8 @@ human or a housekeeping run stumbles on them.
 - The claim-lease protocol already catches the WORK side (expired lease =
   re-claimable); this issue is about the NOTIFICATION side so results are
   seen without waiting for a sweep.
+- **Owner addendum 2026-11-12:** implement together with the housekeeping-contract
+  amendment (boss.rs `housekeeping_prompt`): add a scratch//tmp leftover sweep
+  + a report-only disk-audit line item so the hourly lane sees `~/scratch`
+  grids and `/tmp` lane debris that the `~/git`-scanned checklist never
+  touches.
