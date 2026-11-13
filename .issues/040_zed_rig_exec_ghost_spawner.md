@@ -78,6 +78,17 @@ the harm class: once a Dev build with the guard runs, the command exits 2
 with a loud stderr naming this issue — the next occurrence self-identifies
 through the spawner's own output channel.
 
+Tab-shell pass (zed-3b0d6444 lead, same day): the two long-lived interactive
+terminal tabs (`login -flp` zsh, pids 62870 Tue + 40732 Wed) checked — their
+history file (~/.zsh_history, 151 lines) holds only the owner's manual admin
+commands (dscl/firewall/purge, zero rig/agent-mail/loop lines), no ~/.zshrc
+exists (so no aliases/precmd/preexec hooks), and neither tab has any running
+loop child (idle -zsh only). The ghost env's HOMEBREW/.elan profile vars are
+explained by ~/.zprofile alone — every login zsh gets them, so the env
+fingerprint narrows the chain to "a login zsh" but not to a specific tab.
+Next attribution channel: after a Zed Dev rebuild, the guard's stderr + tty
+on the next attempt points at the owning tab/session directly.
+
 ## Open questions
 
 - [ ] Identify the forker: instrument with `log stream`/`fs_usage` against PID 62690 during the next burst (trigger: an exclusive job queued-waiting on amo), or add a spawn-log line in the GUI's subprocess layer.
