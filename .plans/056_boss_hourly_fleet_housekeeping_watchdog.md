@@ -1,5 +1,5 @@
 # 056 — Boss: hourly fleet housekeeping + false-stop forensics (fallback when auto_prompt & the watchdog both miss)
-Status: verdict AGREE (round 4/5 diff-check) — boss LIVE on amo (state.json fires `boss:queue:*` per repo, wakes `*@4090` hourly on cooldown; rollback `boss: false` in watch.json) — worker side LIVE on m3 (Zed Dev 2026-11-13 carries stop markers + fleet-context counts); incident-validated 2026-11-13 (below); remaining: skill/AGENTS sync drift is owner-tended
+Status: verdict AGREE (round 4/5 diff-check) — boss LIVE on amo (state.json fires `boss:queue:*` per repo, wakes `*@4090` hourly on cooldown; rollback `boss: false` in watch.json) — worker side LIVE on m3 (Zed Dev 2026-11-13 carries stop markers + fleet-context counts); incident-validated 2026-11-13 (below); drain round LIVE (below): the boss inbox is drainable and wakes go out from the excluded orchestrator sink — remaining: skill/AGENTS sync drift is owner-tended
 
 ## Why (the incident that triggered this)
 
@@ -182,6 +182,46 @@ finds it owes the route. Observation, not a defect: queues nothing ever claims
 (riir-auth: 33 rounds) re-fire hourly forever — wakes-never-escalate is deliberate
 (round-3 gating-law fix); revisit only if wake token cost shows up.
 
+## Drain round — the boss answers its inbox (2026-11-13)
+
+Incident: `boss@amo` held 93 unread envelopes (Nov 11–13) — hourly run reports from the
+4090 lane, sprint!027/028 landing notices from m3, the riir-game-sdk 055 work order —
+with no reader anywhere: `"boss"` sat in `default_boss_exclude_inboxes` (the round-3
+reply-sink fix), so the `boss:unread-mail` rule could never route a drain. Owner
+direction: the boss wakes up and answers its mail.
+
+Changes (`fix:` commit, 2026-11-13):
+- `"boss"` removed from `default_boss_exclude_inboxes`; field doc updated. Mail
+  addressed to the boss now ages into the `boss:unread-mail` incident and gets drained
+  (`agent-mail peek --as boss` / `recv --as boss`, oldest first; `recv` claims new→cur,
+  so the incident refires only for what is left).
+- **Wake sender identity is now `orchestrator@<rig>`, not `boss@<rig>`** — deliberate,
+  not a regression: `deliver_boss` composes from the excluded `orchestrator` sink so a
+  lane replying to its waker lands in a no-reader inbox instead of refilling the boss
+  inbox the drain just emptied (the round-3 sink loop, broken at the transport layer).
+  fyi mode was rejected: an all-fyi batch never wakes an idle target, which would
+  silence the wake itself.
+- `housekeeping_prompt`: the summary is the report — never mail a copy to
+  `boss@*`/`orchestrator@*`; item 4 carries the literal peek/recv commands, oldest-first
+  batches, read-and-archive for status/run reports, answer-or-route for real requests,
+  never reply into a sink.
+- Tests: convergence test `a_lane_reply_to_a_boss_wake_never_re_fires_the_drain`
+  (order → drain wake → consume → lane reply → scan shows no new incident), flipped
+  `stale_mail_skips_system_owner_live_and_fresh_inboxes`, prompt completeness extended;
+  agent_mail 96 pass, `./script/clippy -p agent_mail` deny-warnings clean.
+
+Verdict log: round 1 REVISE (claude reviewer `<session f6ff9772>`: self-feeding
+loop unhandled, missing literal recv command, convergence test required, hand-route
+the actionable backlog) → fixes above → round 2 AGREE (same session; noted the
+orchestrator sink grows unbounded — tracked in `zed/.issues/062`, and asked for this
+sender-identity sentence).
+
+Backlog routing (filing-is-not-routing): sprint!027 (ccca5230) + sprint!028 (68d264d3)
+review requests mailed to `*@4090`; riir-game-sdk 055 work order claimed with a lease
+in its plan doc (amo lane). The remaining ~90 status reports drain via the rule itself
+once the new binary is live (`cargo install --path crates/agent_mail --force`;
+launchd `dev.agent-mail.watch` spawns it per tick).
+
 ## Tasks
 
 - [x] W0: actionable `.issues` counts → `fleet-cache.json` +
@@ -210,6 +250,10 @@ finds it owes the route. Observation, not a defect: queues nothing ever claims
 - [x] Incident validation 2026-11-13 (seal-sprints false-stop): boss derived
       counts refuted the lane's prose; terminal-scope law + filing-is-not-routing
       landed in AGENTS.md (m3/amo/4090) + riir-refine Protocol H
+- [x] Drain round 2026-11-13: boss inbox drainable (exclude-list), wakes sent
+      from the excluded orchestrator sink, bounded drain contract in the prompt,
+      convergence test, verdict AGREE round 2 (`<session f6ff9772>`); orchestrator
+      sink retention filed as `zed/.issues/062`
 
 ## References
 

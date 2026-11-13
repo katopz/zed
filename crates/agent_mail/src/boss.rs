@@ -528,7 +528,9 @@ fn work_set_key(works: &[&OpenWork]) -> String {
 pub fn housekeeping_prompt(detail: &str, rig: &str, budget: usize) -> String {
     format!(
         "You are the boss-run housekeeping agent on {rig}. One bounded run: at most {budget} \
-         checklist units, then end the turn with a normal ## Summary (facts only). Claim each \
+         checklist units, then end the turn with a normal ## Summary (facts only). The summary \
+         is the report — never mail a copy to the boss or a sink (`boss@*`, `orchestrator@*`); \
+         no reply to this wake is expected. Claim each \
          item you take with a `**Claimed:** <name>, <unix-ms>, expires <RFC3339 +2h>` line in \
          the doc you touch, so the fleet sees the lease.\n\
          \n\
@@ -544,7 +546,12 @@ pub fn housekeeping_prompt(detail: &str, rig: &str, budget: usize) -> String {
          drift.\n\
          3. Repo queues: work `.issues`/`.plans` items — resume or resolve until done or gated; \
          update status lines as you go.\n\
-         4. Mail: drain the stale inbox this incident names — read, answer or re-route; flag \
+         4. Mail: drain the stale inbox this incident names — inspect with `agent-mail peek --as \
+         <inbox>`, consume with `agent-mail recv --as <inbox>`, oldest first in batches; what \
+         you consume is gone, and the incident refires only for what is left. Triage each item: \
+         lane status/run reports are read-and-archive with no reply; a real request is answered \
+         by acting on it — route it to the owning lane with a mail or claim it here, then tell \
+         the sender what happened. Never reply into a sink (`boss@*`, `orchestrator@*`). Flag \
          claim collisions to the other agent.\n\
          5. Benchmarks: if a repo you touched is dirty or has a perf-relevant change, run its \
          benchmark routine and record the numbers; never defer a benchmark task.\n\
@@ -872,15 +879,17 @@ mod tests {
             "system, waiter, owner, live-addressee and fresh mail are excluded"
         );
 
-        // Reply sinks and misaddressed placeholders are config-excluded.
+        // The orchestrator reply sink is config-excluded; the boss inbox is
+        // not — mail addressed to the boss is the boss's to answer.
         send_mail(&room, "orchestrator", "reply to boss mail");
         age_mail(&room, "orchestrator", 90);
-        send_mail(&room, "boss", "agent reply");
+        send_mail(&room, "boss", "work order for the boss");
         age_mail(&room, "boss", 90);
         let mail = stale_mail(&room, now, MAIL_GRACE, &live, &exclude);
+        assert!(mail.iter().all(|mail| mail.inbox != "orchestrator"));
         assert!(
-            mail.iter()
-                .all(|mail| mail.inbox != "orchestrator" && mail.inbox != "boss")
+            mail.iter().any(|mail| mail.inbox == "boss"),
+            "mail addressed to the boss must age into a drain incident"
         );
 
         // Scheduled mail ages from deliver_at: peer-addressed mail due 45
@@ -976,6 +985,9 @@ mod tests {
             "Compaction",
             "cargo refine",
             "agent-mail rig run bmo",
+            "agent-mail recv --as",
+            "never mail a copy",
+            "Never reply into a sink",
             "ask Claude for the verdict",
             "<stop>",
         ] {

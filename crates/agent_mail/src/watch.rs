@@ -66,9 +66,12 @@ pub struct WatchConfig {
     /// issues not authored by the owner).
     #[serde(default = "default_boss_exclude_repos")]
     pub boss_exclude_repos: Vec<String>,
-    /// Inboxes the boss never treats as stale: reply sinks with no reader
-    /// (`orchestrator` when an orchestrator command is configured, `boss`),
-    /// misaddressed placeholders, and known human inboxes on any rig.
+    /// Inboxes the boss never treats as stale: the orchestrator reply sink
+    /// (boss wakes are also sent from here, so lane replies land in a
+    /// no-reader inbox instead of refilling the boss inbox it drains),
+    /// misaddressed placeholders, and known human inboxes on any rig. The
+    /// `boss` inbox is deliberately not listed: mail addressed to the boss
+    /// is the boss's to answer (plan 056 drain round).
     #[serde(default = "default_boss_exclude_inboxes")]
     pub boss_exclude_inboxes: Vec<String>,
 }
@@ -87,7 +90,6 @@ fn default_boss_exclude_repos() -> Vec<String> {
 fn default_boss_exclude_inboxes() -> Vec<String> {
     [
         "orchestrator",
-        "boss",
         "self",
         "agent",
         "star",
@@ -1150,8 +1152,12 @@ fn deliver_boss(
             .join("\n");
         let body =
             crate::boss::housekeeping_prompt(&details, &target, crate::boss::BOSS_BUDGET_UNITS);
+        // Sent from the excluded `orchestrator` sink, not `boss`: the wake
+        // renders with a reply instruction, and a lane answering its waker
+        // would refill the very inbox the boss drains. Replies die in the
+        // no-reader orchestrator inbox; the contract's summary is the report.
         let sent = Address::parse(&format!("*@{target}"))
-            .and_then(|to| mailroom.compose(&to, "boss", body, None))
+            .and_then(|to| mailroom.compose(&to, "orchestrator", body, None))
             .and_then(|envelope| mailroom.send(&envelope))
             .is_ok();
         if sent {
@@ -1348,7 +1354,94 @@ mod tests {
         assert_eq!(mail.len(), 1);
         assert!(mail[0].body.contains("queue detail"));
         assert!(mail[0].body.contains("mail detail"));
-        assert_eq!(mail[0].from, "boss@amo");
+        assert_eq!(mail[0].from, "orchestrator@amo");
+    }
+
+    #[test]
+    fn a_lane_reply_to_a_boss_wake_never_re_fires_the_drain() {
+        // The loop the round-3 exclusion once prevented: the drain wake
+        // renders with a reply instruction, the woken lane answers its
+        // waker, and the answer must not age into the next drain incident.
+        // The wake is sent from the excluded orchestrator sink, so the
+        // reply lands where `stale_mail` never looks, and a drained boss
+        // inbox stays drained.
+        let dir = tempfile::tempdir().unwrap();
+        let room = Mailroom::new(dir.path().to_path_buf());
+        room.init("amo").unwrap();
+        room.write_live_entry("zed-lane", "idle", "thread");
+
+        // The backlog: a work order addressed to the boss, past grace.
+        let order = room
+            .compose(
+                &Address::parse("boss@amo").unwrap(),
+                "zed-tide@m3",
+                "sprint!028 landed, review requested".into(),
+                None,
+            )
+            .unwrap();
+        room.send(&order).unwrap();
+        let exclude: BTreeSet<String> =
+            WatchConfig::default().boss_exclude_inboxes.into_iter().collect();
+        let live = BTreeSet::from(["zed-lane".to_string()]);
+        let scan_at = chrono::Utc::now() + chrono::Duration::hours(2);
+        let stale = crate::boss::stale_mail(&room, scan_at, crate::boss::MAIL_GRACE, &live, &exclude);
+        assert!(
+            stale.iter().any(|mail| mail.inbox == "boss"),
+            "the work order ages into a drain incident"
+        );
+
+        // The drain wake fires and resolves to the live lane's inbox.
+        let rigs = serde_json::from_str::<crate::Rigs>(
+            r#"{"self":"amo","rigs":{"amo":{"ssh":[]}}}"#,
+        )
+        .unwrap();
+        let amo = serde_json::from_str::<RigProbe>(
+            r#"{"rig":"amo","os":"macos","at":"","cores":8,"quiet":true}"#,
+        )
+        .unwrap();
+        let incidents = vec![Incident {
+            fingerprint: "boss:unread-mail".into(),
+            detail: "boss holds pending mail".into(),
+            min_ticks: 3,
+            reset_key: None,
+        }];
+        assert_eq!(
+            deliver_boss(
+                &room,
+                &rigs,
+                &[("amo".to_string(), Ok(amo), Duration::ZERO)],
+                &incidents
+            ),
+            1
+        );
+        let wake = room.peek(&["zed-lane".to_string()]).unwrap();
+        assert_eq!(wake.len(), 1);
+        assert_eq!(wake[0].from, "orchestrator@amo");
+
+        // The drain consumes the backlog (what `recv --as boss` does), and
+        // the lane answers its waker.
+        room.claim(&["boss".to_string()]).unwrap();
+        let reply = room
+            .compose(
+                &Address::parse("orchestrator@amo").unwrap(),
+                "zed-lane",
+                "run 18: drained, nothing actionable".into(),
+                Some(wake[0].id.clone()),
+            )
+            .unwrap();
+        room.send(&reply).unwrap();
+
+        // Converged: the consumed boss inbox and the sink-bound reply must
+        // not produce another unread-mail incident.
+        let stale = crate::boss::stale_mail(&room, scan_at, crate::boss::MAIL_GRACE, &live, &exclude);
+        assert!(
+            stale.iter().all(|mail| mail.inbox != "boss"),
+            "consumed mail must not re-fire the drain"
+        );
+        assert!(
+            stale.iter().all(|mail| mail.inbox != "orchestrator"),
+            "a reply to a boss wake dies in the excluded sink, never re-firing the drain"
+        );
     }
 
     #[test]
