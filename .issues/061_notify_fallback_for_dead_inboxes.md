@@ -1,6 +1,6 @@
 # Issue 061 — job end-mail notify targets die with their sessions: add a fallback route
 
-**Status:** LANDED 2026-11-13 (zed-02f4db55@amo, zed `__LANDED_HASH__`) — all three fix-direction arms + the owner addendum:
+**Status:** LANDED 2026-11-13 (zed-02f4db55@amo, zed `eef16db3e7`) — all three fix-direction arms + the owner addendum:
 1. **Delivery fallback** (`jobs.rs` `notify_target_lives` + `job_mail`): a job end-mail addressed to an inbox that has NEVER existed on the target rig routes to `jobs-archive@<rig>` with a `[notify fallback: ...]` body disclosure; local liveness = the inbox dir exists, remote = a `test -d` probe over the rig's own SSH routes (first hit wins; a dark rig delivers as addressed — the outbox retry owns reachability). An existing inbox delivers as addressed even when its session is dead (the boss sweep's known food — never silently reroute a real addressee's history).
 2. **notify=None warning** (`main.rs` `rig run`): the whoami-default failing now prints a loud `nobody will be mailed` warning at submission.
 3. **Owner addendum** (`boss.rs` `housekeeping_prompt`): checklist item 9 — the `~/scratch`/`/tmp` leftover sweep (live-lane cwd keeps it, dead lanes listed for deletion) + the report-only disk audit.
