@@ -1699,7 +1699,13 @@ impl ThreadView {
                     self.thread.read(cx).entries().get(event.entry_index)
                     && self.can_edit_user_message(event.entry_index, cx)
                 {
-                    if editor.read(cx).text(cx).as_str() == user_message.content.to_markdown(cx) {
+                    // Mail prompts display their envelope-stripped body, so
+                    // compare against that form to detect "no edits".
+                    let markdown = user_message.content.to_markdown(cx);
+                    let expected = crate::mail_prompt::MailPromptEnvelope::parse(&markdown)
+                        .map(|envelope| envelope.body)
+                        .unwrap_or(markdown);
+                    if editor.read(cx).text(cx).as_str() == expected.as_str() {
                         self.editing_message = None;
                         cx.notify();
                     }
@@ -2823,6 +2829,24 @@ impl ThreadView {
         }
         let thread = self.thread.clone();
 
+        // Capture the mail envelope before the rewind removes the entry: the
+        // editor displays only the envelope-stripped body, so the resent
+        // prompt must be spliced back into the original envelope to keep its
+        // metadata (see `mail_prompt`).
+        let mail_envelope = thread.read_with(cx, |thread, _| {
+            thread
+                .entries()
+                .get(entry_ix)
+                .and_then(|entry| entry.user_message())
+                .and_then(|message| message.content.source_blocks().first())
+                .and_then(|block| match block {
+                    acp_v2::ContentBlock::Text(text) => {
+                        crate::mail_prompt::MailPromptEnvelope::parse(&text.text)
+                    }
+                    _ => None,
+                })
+        });
+
         let Some(client_id) = thread.update(cx, |thread, _| {
             thread
                 .entries()
@@ -2879,6 +2903,18 @@ impl ThreadView {
                     return;
                 }
                 cx.emit(AcpThreadViewEvent::Interacted);
+                if let Some(envelope) = mail_envelope {
+                    let body = message_editor.read(cx).text(cx);
+                    message_editor.update(cx, |editor, cx| {
+                        editor.set_message(
+                            vec![acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
+                                envelope.rewrap(&body),
+                            ))],
+                            window,
+                            cx,
+                        );
+                    });
+                }
                 thread.send_impl(message_editor, window, cx);
                 thread.activation_focus_handle(cx).focus(window, cx);
             })?;
@@ -7313,6 +7349,35 @@ impl ThreadView {
                     self.agent_id.clone()
                 };
 
+                // Per-message header: number badge + prev/next navigation for
+                // every prompt; mail prompts also get their envelope metadata
+                // as chips (the envelope tag itself is stripped from the
+                // displayed editor text by `entry_view_state`).
+                let entries = self.thread.read(cx).entries();
+                let mail_flags: Vec<bool> = entries
+                    .iter()
+                    .filter_map(|entry| match entry {
+                        AgentThreadEntry::UserMessage(message) => {
+                            Some(is_agent_mail_prompt(message))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                let prompt_ix = entries[..entry_ix]
+                    .iter()
+                    .filter(|entry| matches!(entry, AgentThreadEntry::UserMessage(_)))
+                    .count();
+                let is_mail = is_agent_mail_prompt(message);
+                let label = prompt_jump_label(&mail_flags, prompt_ix)
+                    .unwrap_or_else(|| (prompt_ix + 1).to_string());
+                let mail_envelope = match message.content.source_blocks().first() {
+                    Some(acp_v2::ContentBlock::Text(text)) => {
+                        crate::mail_prompt::MailPromptEnvelope::parse(&text.text)
+                    }
+                    _ => None,
+                };
+                let has_mail_header = mail_envelope.is_some();
+
                 v_flex()
                     .id(("user_message", entry_ix))
                     .map(|this| {
@@ -7361,6 +7426,24 @@ impl ThreadView {
                                             })
                                     })
                                     .text_xs()
+                                    .child(self.render_message_box_header(
+                                        entry_ix,
+                                        prompt_ix,
+                                        mail_flags.len(),
+                                        label,
+                                        is_mail,
+                                        mail_envelope.as_ref(),
+                                        cx,
+                                    ))
+                                    .when(has_mail_header, |this| {
+                                        this.child(
+                                            div()
+                                                .w_full()
+                                                .pt_1()
+                                                .pb_1p5()
+                                                .child(Divider::horizontal()),
+                                        )
+                                    })
                                     .child(editor.clone().into_any_element())
                             )
                             .when(editor_focus, |this| {

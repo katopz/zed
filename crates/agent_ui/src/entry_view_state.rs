@@ -333,7 +333,9 @@ impl EntryViewState {
                     let refreshed_source = ((!was_read_only
                         || *synced_source_version != source_version)
                         && (!is_editable || !editor.focus_handle(cx).is_focused(window)))
-                    .then(|| source_blocks.to_vec());
+                    .then(|| {
+                        crate::mail_prompt::strip_mail_envelope_blocks(source_blocks)
+                    });
                     editor.update(cx, |editor, cx| editor.set_read_only(!is_editable, cx));
                     if let Some(source_blocks) = refreshed_source {
                         editor.update(cx, |editor, cx| {
@@ -342,7 +344,8 @@ impl EntryViewState {
                         *synced_source_version = source_version;
                     }
                 } else {
-                    let source_blocks = source_blocks.to_vec();
+                    let source_blocks =
+                        crate::mail_prompt::strip_mail_envelope_blocks(source_blocks);
                     let message_editor = cx.new(|cx| {
                         let mut editor = MessageEditor::new(
                             self.workspace.clone(),

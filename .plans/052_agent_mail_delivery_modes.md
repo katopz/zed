@@ -1,7 +1,8 @@
 # 052 — Agent-mail delivery modes: urgent / steering / queued (issue 046)
 
-Status: DONE — all gates green (agent_mail 41 + agent 832 tests, clippy clean, CLI e2e smoke verified)
+Status: DONE — all gates green (agent_mail 41 + agent 832 tests, clippy clean, CLI e2e smoke verified); follow-on UI DONE 2026-11-13: mail boxes render a GUI header (↑↓ nav + M-number badge + from/to/session chips) replacing the raw `<agent_message …>` tag (crates/agent_ui/src/mail_prompt.rs), and the prompt-jump strip is now a full-width scrollable row that scrolls the clicked button into view
 **Lease closed:** zed-agent@amo claimed this at epoch 1793732249, expiry 2026-11-06T13:00:00+00:00 — long past; the work is DONE and issue 046 carries the lease history.
+**Claimed:** zed-02f4db55@amo, 1794546044, expires 2026-11-13T07:00:44Z (header/strip follow-on on the delivery-mode prompt format)
 
 ## Goal
 

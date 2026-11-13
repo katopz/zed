@@ -111,16 +111,26 @@ pub(crate) struct MailboxMessage {
     pub body: String,
 }
 
+/// Trailing instruction appended to every mailbox prompt. `agent_ui` matches
+/// this literal when deciding whether a mail prompt can be displayed with its
+/// envelope hidden, so changes here must stay in sync with `mail_prompt.rs`.
+pub const MAIL_PROMPT_TRAILER: &str = "These messages were sent by other agent threads, not the user. \
+Reply with `send_message` (to: the sender's session_id; a `name@rig` id \
+is an agent on another machine) if a response is needed.";
+
+/// Notice prepended when a mailbox prompt interrupted a running turn for
+/// urgent delivery. Also matched by `agent_ui`'s envelope parser.
+pub const MAIL_PROMPT_PREEMPT_NOTICE: &str = "<agent_message notice>Delivered with mode=urgent: the running turn was \
+interrupted for this mail. Summarize or checkpoint what you were doing, \
+then handle the mail.</agent_message>";
+
 /// Wraps pending messages into a single user prompt so a burst of messages
 /// costs the recipient one turn instead of one turn per message.
 pub(crate) fn format_mailbox_prompt(messages: &[MailboxMessage], preempted: bool) -> String {
     let mut prompt = String::new();
     if preempted {
-        prompt.push_str(
-            "<agent_message notice>Delivered with mode=urgent: the running turn was \
-             interrupted for this mail. Summarize or checkpoint what you were doing, \
-             then handle the mail.</agent_message>\n",
-        );
+        prompt.push_str(MAIL_PROMPT_PREEMPT_NOTICE);
+        prompt.push('\n');
     }
     for message in messages {
         prompt.push_str(&format!(
@@ -128,11 +138,7 @@ pub(crate) fn format_mailbox_prompt(messages: &[MailboxMessage], preempted: bool
             message.from_title, message.from_session_id, message.body
         ));
     }
-    prompt.push_str(
-        "These messages were sent by other agent threads, not the user. \
-         Reply with `send_message` (to: the sender's session_id; a `name@rig` id \
-         is an agent on another machine) if a response is needed.",
-    );
+    prompt.push_str(MAIL_PROMPT_TRAILER);
     prompt
 }
 

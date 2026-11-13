@@ -6,7 +6,7 @@ use super::*;
 /// Mail from other agents (same-rig `send_message` and cross-rig agent-mail)
 /// reaches a thread as a user message opening with an `<agent_message>` tag;
 /// see `format_mailbox_prompt` in the `agent` crate.
-fn is_agent_mail_prompt(message: &acp_thread::UserMessage) -> bool {
+pub(super) fn is_agent_mail_prompt(message: &acp_thread::UserMessage) -> bool {
     message
         .content
         .source_blocks()
@@ -22,7 +22,7 @@ fn is_agent_mail_prompt(message: &acp_thread::UserMessage) -> bool {
 
 /// The jump-strip label for the prompt at `index`: user prompts count
 /// `1, 2, 3, ...` and agent mail counts `M1, M2, ...`, each in its own series.
-fn prompt_jump_label(mail_flags: &[bool], index: usize) -> Option<String> {
+pub(super) fn prompt_jump_label(mail_flags: &[bool], index: usize) -> Option<String> {
     let is_mail = *mail_flags.get(index)?;
     let ordinal = mail_flags[..=index]
         .iter()
@@ -33,6 +33,70 @@ fn prompt_jump_label(mail_flags: &[bool], index: usize) -> Option<String> {
     } else {
         ordinal.to_string()
     })
+}
+
+/// All prompts up to this count render in the prompt-jump strip; beyond it
+/// the middle collapses to an ellipsis between head/tail windows. The strip
+/// scrolls horizontally, so up to the cap every button is reachable no matter
+/// how narrow the panel is.
+const PROMPT_BUTTON_RENDER_CAP: usize = 64;
+/// Head/tail window size once `PROMPT_BUTTON_RENDER_CAP` is exceeded.
+const PROMPT_BUTTON_EDGE_WINDOW: usize = 32;
+
+/// Child index of `prompt_ix` inside the scrollable strip (which contains an
+/// extra ellipsis child once the cap is exceeded), or `None` when the prompt
+/// sits in the collapsed middle and has no rendered button to scroll to.
+fn prompt_jump_strip_child_index(prompt_ix: usize, prompt_count: usize) -> Option<usize> {
+    if prompt_count == 0 || prompt_ix >= prompt_count {
+        return None;
+    }
+    if prompt_count <= PROMPT_BUTTON_RENDER_CAP {
+        return Some(prompt_ix);
+    }
+    if prompt_ix < PROMPT_BUTTON_EDGE_WINDOW {
+        Some(prompt_ix)
+    } else if prompt_ix >= prompt_count - PROMPT_BUTTON_EDGE_WINDOW {
+        Some(
+            PROMPT_BUTTON_EDGE_WINDOW
+                + 1
+                + (prompt_ix - (prompt_count - PROMPT_BUTTON_EDGE_WINDOW)),
+        )
+    } else {
+        None
+    }
+}
+
+/// A `key value` chip for the message-box header, e.g. `from boss@amo`.
+fn mail_header_chip(key: &str, value: &str, cx: &App) -> AnyElement {
+    h_flex()
+        .gap_0p5()
+        .max_w_48()
+        .px_1()
+        .py_0p5()
+        .rounded_sm()
+        .border_1()
+        .border_color(cx.theme().colors().border)
+        .bg(cx.theme().colors().ghost_element_background)
+        .overflow_hidden()
+        .child(
+            Label::new(format!("{key} "))
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
+        )
+        .child(Label::new(value.to_string()).size(LabelSize::XSmall).truncate())
+        .into_any_element()
+}
+
+/// A single-word status chip for the message-box header (`urgent`, `fyi`).
+fn mail_header_flag_chip(label: &str, color: Color, cx: &App) -> AnyElement {
+    div()
+        .px_1()
+        .py_0p5()
+        .rounded_sm()
+        .border_1()
+        .border_color(cx.theme().colors().border)
+        .child(Label::new(label.to_string()).size(LabelSize::XSmall).color(color))
+        .into_any_element()
 }
 
 /// Fraction (0..1) of the backoff window still remaining, driving the drain
@@ -543,6 +607,14 @@ pub struct ForkThreadViewState {
     /// otherwise (no chips in backoff → no task). See
     /// `render_key_status_buttons`.
     pub key_backoff_tick_task: Option<Task<()>>,
+    /// The prompt last jumped to via the strip or a message-box header. Drives
+    /// the selected highlight in the strip and, together with
+    /// `prompt_jump_scroll_handle`, keeps the clicked button in view.
+    pub selected_prompt_index: Option<usize>,
+    /// Horizontal scroll handle for the prompt-jump button strip, so a click
+    /// on a clipped button scrolls it into view (with its neighbors) instead
+    /// of the strip relying on an edge-truncation window.
+    pub prompt_jump_scroll_handle: ScrollHandle,
 }
 
 impl ForkThreadViewState {
@@ -1920,12 +1992,19 @@ impl ThreadView {
     }
 
     /// Scrolls the nth user prompt (0-based, in entry order) to the top of the
-    /// viewport. Used by the always-visible prompt-jump strip under the title.
+    /// viewport, marks it selected in the prompt-jump strip, and scrolls the
+    /// strip so the jumped button (plus its neighbors) is in view. Used by the
+    /// strip buttons, the per-message header navigation, and the always-on
+    /// jump bar under the title.
     pub(crate) fn scroll_to_user_prompt(&mut self, prompt_ix: usize, cx: &mut Context<Self>) {
         let entries = self.thread.read(cx).entries();
         if entries.is_empty() {
             return;
         }
+        let prompt_count = entries
+            .iter()
+            .filter(|entry| matches!(entry, AgentThreadEntry::UserMessage(_)))
+            .count();
         let target = entries
             .iter()
             .enumerate()
@@ -1937,6 +2016,10 @@ impl ThreadView {
                 item_ix: ix,
                 offset_in_item: px(0.0),
             });
+            self.fork.selected_prompt_index = Some(prompt_ix);
+            if let Some(child_ix) = prompt_jump_strip_child_index(prompt_ix, prompt_count) {
+                self.fork.prompt_jump_scroll_handle.scroll_to_item(child_ix);
+            }
             cx.notify();
         }
     }
@@ -2215,12 +2298,15 @@ impl ThreadView {
     /// response) still gets end-to-end navigation.
     ///
     /// Performance: the numbered prompt buttons are O(n) in the prompt count
-    /// and this runs on every render frame. To stay cheap while a long thread
-    /// is streaming we cap the visible buttons to the first/last
-    /// `PROMPT_BUTTON_EDGE_WINDOW` with an ellipsis in between, so a 200-prompt
-    /// thread renders ~20 buttons, not 200. The numbered buttons remain visible
-    /// during generation so the user can see re-indexed prompt numbers after
-    /// editing and resending an earlier message.
+    /// and this runs on every render frame, so beyond
+    /// `PROMPT_BUTTON_RENDER_CAP` prompts the middle collapses to an
+    /// ellipsis between head/tail windows. The buttons live in a horizontally
+    /// scrollable row, so up to the cap every prompt is reachable (and a
+    /// click scrolls its button into view) regardless of panel width — the
+    /// strip uses the full available width before anything scrolls. The
+    /// numbered buttons remain visible during generation so the user can see
+    /// re-indexed prompt numbers after editing and resending an earlier
+    /// message.
     pub(super) fn render_user_prompt_jumps(&self, cx: &Context<Self>) -> Option<Div> {
         let thread = self.thread.read(cx);
         let entries = thread.entries();
@@ -2314,7 +2400,41 @@ impl ThreadView {
         // Kept visible during generation so the user can see the re-indexed
         // prompt numbers after editing and resending an earlier message.
         if user_prompt_count > 1 {
-            buttons = buttons.children(self.render_numbered_prompt_buttons(&mail_flags, cx));
+            let rendered = self.render_numbered_prompt_buttons(&mail_flags, cx);
+            let rendered_count = rendered.len();
+            // Overflow markers come from the previous frame's scroll state, so
+            // they lag at most one frame behind. `…` on a side means there are
+            // more buttons in that direction; scrolling (or clicking any
+            // visible button, which scrolls its neighbors into view) reaches
+            // them.
+            let scroll_handle = &self.fork.prompt_jump_scroll_handle;
+            let container_right = scroll_handle.bounds().right();
+            let overflow_left = scroll_handle.offset().x < px(-1.0);
+            let overflow_right = scroll_handle
+                .bounds_for_item(rendered_count - 1)
+                .is_some_and(|last| last.right() > container_right + px(1.0));
+            buttons = buttons.child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_x_hidden()
+                    .child(
+                        h_flex()
+                            .id("prompt-jump-buttons")
+                            .flex_grow_1()
+                            .overflow_x_scroll()
+                            .track_scroll(scroll_handle)
+                            .gap_1()
+                            .children(rendered),
+                    )
+                    .when(overflow_left, |this| {
+                        this.child(self.prompt_strip_overflow_marker(true, cx))
+                    })
+                    .when(overflow_right, |this| {
+                        this.child(self.prompt_strip_overflow_marker(false, cx))
+                    }),
+            );
         }
 
         // BOTTOM bookend: jump to the very last entry.
@@ -2358,10 +2478,13 @@ impl ThreadView {
     }
 
     /// Renders the numbered `[1] [2] [M1] ... [N]` prompt-jump buttons (mail
-    /// from other agents is numbered separately as `M1`, `M2`, ...), capped at
-    /// `2 * PROMPT_BUTTON_EDGE_WINDOW` entries with an ellipsis in the middle
-    /// when the thread has more prompts than `PROMPT_BUTTON_CAP`. Each button
-    /// scrolls its prompt to the top of the viewport on click.
+    /// from other agents is numbered separately as `M1`, `M2`, ...). They live
+    /// in a horizontally scrollable row (`render_user_prompt_jumps`), so all
+    /// prompts up to `PROMPT_BUTTON_RENDER_CAP` render; beyond the cap the
+    /// middle collapses to an ellipsis between head/tail windows. Each button
+    /// scrolls its prompt to the top of the viewport and scrolls itself into
+    /// view in the strip, so buttons clipped by the panel width stay one click
+    /// away with their neighbors visible.
     ///
     /// Returns a `Vec` so the caller can splice it into the strip with a single
     /// `.children(...)` call.
@@ -2371,16 +2494,9 @@ impl ThreadView {
         cx: &Context<Self>,
     ) -> Vec<AnyElement> {
         let user_prompt_count = mail_flags.len();
-        /// How many buttons to render at each edge (head + tail) once the cap
-        /// is exceeded. Tuned so a 200-prompt thread renders ~20 buttons.
-        const PROMPT_BUTTON_EDGE_WINDOW: usize = 10;
-        /// Threshold above which we collapse the middle of the range. Must be
-        /// at least `2 * PROMPT_BUTTON_EDGE_WINDOW` so the capped form never
-        /// drops buttons that the full form would have shown.
-        const PROMPT_BUTTON_CAP: usize = 2 * PROMPT_BUTTON_EDGE_WINDOW;
 
         // Indices (0-based, in prompt order) of the buttons to render.
-        let rendered_indices: Vec<usize> = if user_prompt_count <= PROMPT_BUTTON_CAP {
+        let rendered_indices: Vec<usize> = if user_prompt_count <= PROMPT_BUTTON_RENDER_CAP {
             (0..user_prompt_count).collect()
         } else {
             let tail_start = user_prompt_count - PROMPT_BUTTON_EDGE_WINDOW;
@@ -2388,7 +2504,7 @@ impl ThreadView {
             indices.extend(tail_start..user_prompt_count);
             indices
         };
-        let needs_ellipsis = user_prompt_count > PROMPT_BUTTON_CAP;
+        let needs_ellipsis = user_prompt_count > PROMPT_BUTTON_RENDER_CAP;
 
         let mut out = Vec::with_capacity(rendered_indices.len() + usize::from(needs_ellipsis));
         let mut last_rendered = None;
@@ -2398,6 +2514,7 @@ impl ThreadView {
             if needs_ellipsis && last_rendered.is_some_and(|prev| prompt_index > prev + 1) {
                 out.push(
                     div()
+                        .flex_shrink_0()
                         .child(
                             Label::new("\u{2026}")
                                 .size(LabelSize::XSmall)
@@ -2414,18 +2531,27 @@ impl ThreadView {
                 Some(number) => format!("Jump to agent mail {number}"),
                 None => format!("Jump to prompt {label}"),
             };
+            let is_selected = self.fork.selected_prompt_index == Some(prompt_index);
 
             out.push(
                 div()
                     .id(("prompt-jump", prompt_index))
+                    .flex_shrink_0()
                     .px_1()
                     .rounded_sm()
+                    .when(is_selected, |this| {
+                        this.bg(cx.theme().colors().element_selected)
+                    })
                     .hover(|s| s.bg(cx.theme().colors().element_hover))
                     .tooltip(Tooltip::text(tooltip))
                     .child(
                         Label::new(label)
                             .size(LabelSize::XSmall)
-                            .color(Color::Muted),
+                            .color(if is_selected {
+                                Color::Accent
+                            } else {
+                                Color::Muted
+                            }),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.scroll_to_user_prompt(prompt_index, cx);
@@ -2434,6 +2560,112 @@ impl ThreadView {
             );
         }
         out
+    }
+
+    /// Non-interactive `…` marker pinned to a horizontal edge of the
+    /// prompt-jump strip, shown only while that side overflows (left=true for
+    /// the leading edge). Purely an affordance: the strip scrolls, it does not
+    /// truncate.
+    pub(super) fn prompt_strip_overflow_marker(
+        &self,
+        leading: bool,
+        cx: &Context<Self>,
+    ) -> Div {
+        div()
+            .absolute()
+            .top_0()
+            .h_full()
+            .flex()
+            .items_center()
+            .when(leading, |this| this.left_0())
+            .when(!leading, |this| this.right_0())
+            .px_0p5()
+            .rounded_sm()
+            .bg(cx.theme().colors().panel_background)
+            .child(
+                Label::new("\u{2026}")
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            )
+    }
+
+    /// GUI header for a user-message box: `[up] [down] [1|Mn] [from …] [to …]
+    /// [session …] [urgent] [fyi]` above the message text. Every prompt gets
+    /// the number badge and per-message navigation; mail prompts additionally
+    /// render their envelope metadata as chips (`mail_prompt`) instead of the
+    /// raw `<agent_message …>` tag text.
+    pub(super) fn render_message_box_header(
+        &self,
+        entry_ix: usize,
+        prompt_ix: usize,
+        prompt_count: usize,
+        label: String,
+        is_mail: bool,
+        envelope: Option<&crate::mail_prompt::MailPromptEnvelope>,
+        cx: &Context<Self>,
+    ) -> Div {
+        h_flex()
+            .flex_wrap()
+            .w_full()
+            .gap_1()
+            .items_center()
+            .child(
+                IconButton::new(("message-header-prev", entry_ix), IconName::ArrowUp)
+                    .icon_size(IconSize::XSmall)
+                    .disabled(prompt_ix == 0)
+                    .tooltip(Tooltip::text("Previous message"))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.scroll_to_user_prompt(prompt_ix - 1, cx);
+                    })),
+            )
+            .child(
+                IconButton::new(("message-header-next", entry_ix), IconName::ArrowDown)
+                    .icon_size(IconSize::XSmall)
+                    .disabled(prompt_ix + 1 >= prompt_count)
+                    .tooltip(Tooltip::text("Next message"))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.scroll_to_user_prompt(prompt_ix + 1, cx);
+                    })),
+            )
+            .child(
+                div()
+                    .px_1()
+                    .rounded_sm()
+                    .bg(cx.theme().colors().element_background)
+                    .child(
+                        Label::new(label)
+                            .size(LabelSize::XSmall)
+                            .color(if is_mail {
+                                Color::Accent
+                            } else {
+                                Color::Muted
+                            }),
+                    ),
+            )
+            .children(
+                envelope
+                    .iter()
+                    .filter_map(|envelope| envelope.from.as_deref())
+                    .map(|value| mail_header_chip("from", value, cx)),
+            )
+            .children(
+                envelope
+                    .iter()
+                    .filter_map(|envelope| envelope.to.as_deref())
+                    .map(|value| mail_header_chip("to", value, cx)),
+            )
+            .children(
+                envelope
+                    .iter()
+                    .filter_map(|envelope| envelope.session_id.as_deref())
+                    .map(|value| mail_header_chip("session", value, cx)),
+            )
+            .when(envelope.is_some_and(|envelope| envelope.urgent), |this| {
+                this.child(mail_header_flag_chip("urgent", Color::Error, cx))
+            })
+            .when(envelope.is_some_and(|envelope| envelope.fyi), |this| {
+                this.child(mail_header_flag_chip("fyi", Color::Muted, cx))
+            })
     }
 
     pub(crate) fn manual_auto_prompt(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2648,5 +2880,38 @@ mod prompt_jump_label_tests {
             )
         );
         assert_eq!(prompt_jump_label(&mail_flags, mail_flags.len()), None);
+    }
+}
+
+#[cfg(test)]
+mod prompt_jump_strip_child_index_tests {
+    use super::prompt_jump_strip_child_index;
+
+    #[test]
+    fn below_cap_every_prompt_maps_to_itself() {
+        assert_eq!(prompt_jump_strip_child_index(0, 36), Some(0));
+        assert_eq!(prompt_jump_strip_child_index(23, 36), Some(23));
+        assert_eq!(prompt_jump_strip_child_index(35, 36), Some(35));
+    }
+
+    #[test]
+    fn above_cap_head_and_tail_map_with_ellipsis_offset() {
+        // 100 prompts: head 0..32, ellipsis at child 32, tail 68..100.
+        assert_eq!(prompt_jump_strip_child_index(0, 100), Some(0));
+        assert_eq!(prompt_jump_strip_child_index(31, 100), Some(31));
+        assert_eq!(prompt_jump_strip_child_index(68, 100), Some(33));
+        assert_eq!(prompt_jump_strip_child_index(99, 100), Some(64));
+    }
+
+    #[test]
+    fn above_cap_collapsed_middle_has_no_button() {
+        assert_eq!(prompt_jump_strip_child_index(32, 100), None);
+        assert_eq!(prompt_jump_strip_child_index(67, 100), None);
+    }
+
+    #[test]
+    fn out_of_range_prompts_have_no_button() {
+        assert_eq!(prompt_jump_strip_child_index(0, 0), None);
+        assert_eq!(prompt_jump_strip_child_index(36, 36), None);
     }
 }

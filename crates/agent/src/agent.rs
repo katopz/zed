@@ -2,6 +2,7 @@ mod agent_fork;
 mod agent_mail_bridge;
 pub use agent_mail_bridge::{native_thread_mail_name, saved_thread_mail_address, self_rig};
 mod thread_mailbox;
+pub use thread_mailbox::{MAIL_PROMPT_PREEMPT_NOTICE, MAIL_PROMPT_TRAILER};
 
 mod db;
 mod legacy_thread;

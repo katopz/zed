@@ -21,6 +21,7 @@ mod favorite_models;
 mod inline_assistant;
 mod inline_prompt_editor;
 mod language_model_selector;
+mod mail_prompt;
 mod mention_set;
 mod message_editor;
 mod mode_selector;
