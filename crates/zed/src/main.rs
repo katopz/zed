@@ -263,6 +263,18 @@ fn main() {
 
     let args = Args::parse();
 
+    // zed has no subcommands: a leading `rig`/`exec` positional is the agent-mail
+    // CLI's argument shape misrouted at the zed binary (the app-ghost-spawner
+    // incident, issue 040 — each invocation opened a full idle editor window).
+    // Fail loudly instead of silently swallowing the args as paths.
+    if matches!(args.paths_or_urls.first().map(String::as_str), Some("rig" | "exec")) {
+        eprintln!(
+            "zed: refusing agent-mail args {:?} — `rig`/`exec` are agent-mail subcommands, not zed paths. Run them against the agent-mail binary (e.g. `agent-mail rig exec <id>`).",
+            args.paths_or_urls
+        );
+        std::process::exit(2);
+    }
+
     // `zed --askpass` Makes zed operate in nc/netcat mode for use with askpass
     #[cfg(not(target_os = "windows"))]
     if let Some(socket) = &args.askpass {
