@@ -1,7 +1,11 @@
 # Issue 061 — job end-mail notify targets die with their sessions: add a fallback route
 
-**Status:** OPEN — filed 2026-11-12 (zed-061faf21@amo) from the post-drain audit of bmo's 10-job wave (plan 057 verification).
-**Claimed:** zed-061faf21@amo, 1794533400, expires 2026-11-13T07:50:00Z — claim transferred to the boss lane with the standing-order mail (2026-11-12 13:1x +07); the implementing lane should replace this line with its own claim per the lease protocol.
+**Status:** LANDED 2026-11-13 (zed-02f4db55@amo, zed `__LANDED_HASH__`) — all three fix-direction arms + the owner addendum:
+1. **Delivery fallback** (`jobs.rs` `notify_target_lives` + `job_mail`): a job end-mail addressed to an inbox that has NEVER existed on the target rig routes to `jobs-archive@<rig>` with a `[notify fallback: ...]` body disclosure; local liveness = the inbox dir exists, remote = a `test -d` probe over the rig's own SSH routes (first hit wins; a dark rig delivers as addressed — the outbox retry owns reachability). An existing inbox delivers as addressed even when its session is dead (the boss sweep's known food — never silently reroute a real addressee's history).
+2. **notify=None warning** (`main.rs` `rig run`): the whoami-default failing now prints a loud `nobody will be mailed` warning at submission.
+3. **Owner addendum** (`boss.rs` `housekeeping_prompt`): checklist item 9 — the `~/scratch`/`/tmp` leftover sweep (live-lane cwd keeps it, dead lanes listed for deletion) + the report-only disk audit.
+Tests: agent_mail 90/0 + 6/0, clippy 0 warnings.
+**Lease closed:** zed-061faf21@amo's claim (exp 2026-11-13T07:50Z) transferred per the standing order; re-claimed **Claimed:** zed-02f4db55@amo, 1794582900, expires 2026-11-13T18:35:00+00:00 — executed to LANDED this session.
 
 ## The failure class
 

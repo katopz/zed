@@ -1236,11 +1236,87 @@ impl Mailroom {
         let Ok(to) = Address::parse(notify) else {
             return;
         };
+        // Issue 061 — the delivery fallback: a job end-mail addressed to an
+        // inbox that has NEVER existed on the target rig dies unseen (the
+        // 6a300a3e class — 26 h of work, no notification). Rewrite those to
+        // the rig's catch-all with a disclosure note; a dark rig (probe
+        // unreachable) delivers as addressed — the outbox retry owns
+        // reachability. An existing inbox delivers as addressed even when
+        // its session is dead: that is the boss sweep's known food, and a
+        // real addressee's history must not be silently rerouted.
+        let (to, body) = match self.notify_target_lives(notify) {
+            Some(false) => {
+                let rig = to
+                    .rig
+                    .clone()
+                    .unwrap_or_else(|| self.rigs().map(|r| r.self_rig).unwrap_or_default());
+                eprintln!(
+                    "[jobs] notify fallback: {notify} has no inbox on {rig} — \
+                     the end-mail routes to jobs-archive@{rig}"
+                );
+                (
+                    Address::parse(&format!("jobs-archive@{rig}"))
+                        .unwrap_or_else(|_| to.clone()),
+                    format!(
+                        "[notify fallback: original addressee {notify} has no \
+                         inbox on {rig} — routed to this catch-all]\n\n{body}"
+                    ),
+                )
+            }
+            _ => (to, body),
+        };
         if let Ok(envelope) = self.compose(&to, "jobs", body, None) {
             let mut envelope = envelope;
             envelope.mode = spec.notify_mode;
             self.send(&envelope).ok();
         }
+    }
+
+    /// Issue 061 — does `notify`'s inbox exist on its target rig?
+    ///
+    /// `Some(true)` = the inbox exists (deliver as addressed);
+    /// `Some(false)` = the target rig is reachable AND the inbox has never
+    /// been created there (fall back to the catch-all);
+    /// `None` = unknowable (the rig is dark, or every probe route failed) —
+    /// deliver as addressed and let the outbox retry own reachability.
+    fn notify_target_lives(&self, notify: &str) -> Option<bool> {
+        let Ok(to) = Address::parse(notify) else {
+            return None;
+        };
+        let rigs = self.rigs().ok()?;
+        let is_local = to.rig.as_deref().is_none_or(|rig| rig == rigs.self_rig);
+        if is_local {
+            // Local: the inbox directory's existence IS the registry
+            // (deliver creates it on first mail, so an existing dir
+            // means a real addressee has routed mail there before).
+            return Some(self.inbox(&to.name).exists());
+        }
+        let rig = to.rig.as_deref().expect("non-local implies a rig");
+        let Some(entry) = rigs.rigs.get(rig) else {
+            return None;
+        };
+        // The inbox name is a validated registry name (validate_name law) —
+        // plain shell metacharacters cannot appear; the alphanumeric +
+        // `-`/`_` re-check keeps the probe literal safe even against a
+        // hand-edited rigs.json.
+        if !to
+            .name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return None;
+        }
+        let command = format!("test -d \"$HOME/.agent-mail/inbox/{}\"", to.name);
+        let mut probed = false;
+        for route in &entry.ssh {
+            if let Ok(lines) = self.ssh(route, &command, "PROBE_OK") {
+                probed = true;
+                if lines.iter().any(|line| line.contains("PROBE_OK")) {
+                    return Some(true);
+                }
+            }
+        }
+        probed.then_some(false)
     }
 
     // agent-mail is a runtime-free std binary; the smol-preferring lint targets async gpui code.

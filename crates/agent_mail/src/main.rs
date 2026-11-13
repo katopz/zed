@@ -595,10 +595,21 @@ fn rig_run(room: &Mailroom, args: Vec<String>) -> Result<i32> {
     );
     let rigs = room.rigs()?;
     let notify = notify.or_else(|| {
-        room.whoami()
-            .ok()
-            .map(|name| format!("{name}@{}", rigs.self_rig))
+        room.whoami().ok().map(|name| {
+            format!("{name}@{}", rigs.self_rig)
+        })
     });
+    // Issue 061: notify=None is a spec bug, not a default — the job would
+    // run to a terminal outcome with nobody told (the silent-rot class the
+    // post-drain audit named). The bare-shell context (whoami unavailable)
+    // is exactly where a hand-off expects the submission to say so.
+    if notify.is_none() {
+        eprintln!(
+            "[jobs] WARNING: no notify target — whoami is unavailable in this \
+             shell and --notify was not passed; nobody will be mailed the \
+             result. Pass --notify name@rig."
+        );
+    }
     let verify_ref = verify.as_ref();
     let rig_name = match target.as_str() {
         "auto" => {

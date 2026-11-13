@@ -560,6 +560,11 @@ pub fn housekeeping_prompt(detail: &str, rig: &str, budget: usize) -> String {
          7. `cargo refine fix` tiers on fresh clippy findings in the repos you touched.\n\
          8. Research, only within leftover budget: one perf/sec or corpus improvement, filed as \
          an issue.\n\
+         9. Leftover sweep (owner addendum, issue 061): inventory `~/scratch` grids and stray \
+         `/tmp` lane dirs (`/tmp/<plan>`-shaped build targets) — for each, a LIVE lane process with \
+         that cwd keeps it; a dead one is listed for deletion (delete only when no owning lane is \
+         alive). Plus a REPORT-ONLY disk audit: `df` on `/` and the data volumes, listed even when \
+         nothing is low.\n\
          \n\
          Gated decisions: ask Claude for the verdict and record it — the only owner gate is a \
          credential/secret touch to deploy. Then stop cleanly: a lone `<stop>` after the summary."
@@ -989,6 +994,8 @@ mod tests {
             "never mail a copy",
             "Never reply into a sink",
             "ask Claude for the verdict",
+            "Leftover sweep",
+            "REPORT-ONLY disk audit",
             "<stop>",
         ] {
             assert!(prompt.contains(expected), "prompt must mention {expected}");
