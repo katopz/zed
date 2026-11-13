@@ -1,5 +1,5 @@
 # 056 — Boss: hourly fleet housekeeping + false-stop forensics (fallback when auto_prompt & the watchdog both miss)
-Status: verdict AGREE (round 4/5 diff-check) — boss live in agent_mail (rollback: `boss: false` in watch.json); deploy pending (bundle-mac → amo + m3)
+Status: verdict AGREE (round 4/5 diff-check) — boss LIVE on amo (state.json fires `boss:queue:*` per repo, wakes `*@4090` hourly on cooldown; rollback `boss: false` in watch.json) — worker side LIVE on m3 (Zed Dev 2026-11-13 carries stop markers + fleet-context counts); incident-validated 2026-11-13 (below); remaining: skill/AGENTS sync drift is owner-tended
 
 ## Why (the incident that triggered this)
 
@@ -164,6 +164,24 @@ housekeeper at the fleet layer.
 - **Round 5 — pending**: diff-check of the two round-4 blockers (reviewer
   pre-agreed AGREE once they land).
 
+## Incident validation — 2026-11-13 (seal-sprints false-stop)
+
+An m3 housekeeping lane ended with "Nothing actionable left" while this boss had
+`boss:queue:seal-sprints` open since 2026-11-12 (17 actionable items incl.
+`.issues/031`; 211 ticks; hourly combined wakes to `*@4090`, e.g. 04:37 + 04:58 UTC).
+The boss's `scan_open_work` mechanically refuted the lane's prose — derived counts
+beat summary claims, exactly the W0 design. The lane's failure was doctrine, not
+deploy: its worker binary carries the fleet-context counts (`seal-sprints: 16` in
+m3's `fleet-cache.json`) and it still wrote a scoped-sweep conclusion as a fleet-wide
+negative, in a message that dropped the `## Summary` format. Owner decree same day:
+**terminal-scope law** + **filing-is-not-routing** codified in `~/.config/zed/AGENTS.md`
+(m3) / `AppData/Roaming/Zed/AGENTS.md` (4090) / amo's copy, and in the riir-refine
+Protocol H — emptiness claims must cite derived counts; box-scoped emptiness says
+"from this box"; an issue without a `**Claimed:**` line is unowned and the sweep that
+finds it owes the route. Observation, not a defect: queues nothing ever claims
+(riir-auth: 33 rounds) re-fire hourly forever — wakes-never-escalate is deliberate
+(round-3 gating-law fix); revisit only if wake token cost shows up.
+
 ## Tasks
 
 - [x] W0: actionable `.issues` counts → `fleet-cache.json` +
@@ -189,6 +207,9 @@ housekeeper at the fleet layer.
 - [x] Owner follow-ups folded in: claimed-but-stopped accounting (lease
       expiry + live-in-repo check), benchmark routine + boundary check-up as
       checklist items, compaction scope incl. code comments, un-gating law
+- [x] Incident validation 2026-11-13 (seal-sprints false-stop): boss derived
+      counts refuted the lane's prose; terminal-scope law + filing-is-not-routing
+      landed in AGENTS.md (m3/amo/4090) + riir-refine Protocol H
 
 ## References
 
