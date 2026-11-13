@@ -706,18 +706,13 @@ impl RenderOnce for ThreadItem {
                                     .color(Color::Muted),
                             )
                         })
-                        .when(has_timestamp && has_id_badge, |this| {
-                            this.child(dot_separator())
-                        })
-                        .when_some(id_badge, |this, badge| this.child(badge))
                         .when(has_continuation, |this| {
                             this.when(
-                                has_project_name
-                                    || has_project_paths
-                                    || has_worktree
+                                has_timestamp
                                     || has_diff_stats
-                                    || has_timestamp
-                                    || has_id_badge,
+                                    || has_project_name
+                                    || has_project_paths
+                                    || has_worktree,
                                 |this| this.child(dot_separator()),
                             )
                             .when_some(
@@ -755,7 +750,12 @@ impl RenderOnce for ThreadItem {
                                     )
                                 },
                             )
-                        }),
+                        })
+                        .when(
+                            has_id_badge && (has_timestamp || has_continuation),
+                            |this| this.child(dot_separator()),
+                        )
+                        .when_some(id_badge, |this, badge| this.child(badge)),
                 )
             })
             .when(show_tooltip, |this| {
