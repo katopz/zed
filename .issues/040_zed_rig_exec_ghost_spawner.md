@@ -41,6 +41,43 @@ An agent thread inside the GUI misreading the pre-fix `holder_alive` doc comment
 - GUI sample (8 s of pid 62690 during a burst-silent window): only standard spawn machinery, no smoking gun. Live attribution still requires `fs_usage`/`log stream` on 62690 during a NEXT burst; the burst trigger is predictable now — watch while any exclusive job sits queued on amo.
 - Logs/config still clean: no `rig exec` hits in `~/Library/Logs/Zed/*`.
 
+## Bait experiment 2026-11-12 ~13:4x +07 (zed-061faf21@amo) — trigger pinned, spawner still unnamed
+
+Method: unified-log capture (`log stream` on "rig exec"/"Zed Dev.app") + a bait
+job (`sh -c sleep 45`, NO notify) queued on amo; repeated twice (second bait
+with a 1s watcher grabbing the ghost's env/cwd).
+
+Findings (revision of the earlier lifecycle model):
+- **Fires ONCE per new queued-job event** — ghost appeared ~18 s after
+  queueing, BEFORE admission, with NO notify wired. Not a clock loop, not
+  admission-reactive: queue-event-reactive. (The earlier 70 s cadence = claim
+  churn driving repeated queue events, per 3b0d6444's independent
+  observation.)
+- **Ghost env is a fresh zsh LOGIN profile** (`HOMEBREW_*`, `FPATH`,
+  `INFOPATH`, `~/.elan/bin` in PATH — all from ~/.zprofile) with `cwd=/`,
+  `PWD=/Users/katopz`, NO launchd app env (`XPC_SERVICE_NAME` unset, no
+  TMPDIR) — while the GUI's own env has none of the profile vars. The spawn
+  chain therefore passes through a login-shell constructed inside the GUI
+  (`login -flp` → zsh profile → exec zed), NOT through the GUI's own env and
+  NOT through any launchd/open path. PPID 62690 holds because the GUI-child
+  shell exec'd into the zed binary.
+- TCC `responsible=62690` corroborates an in-GUI origin chain.
+- Negative results (all verified this session): Zed-native thread transcripts
+  (threads.db, 358 MB) contain ZERO "rig exec" mentions; the two Claude Code
+  session transcripts that mention it only RECEIVED the 040 summary as input
+  (never issued the command); no extension/config/task/keymap/MCP/launchd/
+  crontab source; rig_panel + agent_mail spawn no zed binary; the ACP
+  external agent idle with no children; the `tail -F` jobs-dir fds are
+  orphaned Nov 7-8 log waiters (ppid 1, harmless); the `until [ -f /Users/kat/
+  ...]` loops poll a WRONG-HOME path (never fire).
+
+Conclusion: a GUI-internal shell chain reacts to queue-file events by running
+`exec zed rig exec <id>` with a login profile. The author is neither any
+stored transcript nor any launchd unit. The binary guard (2a897fbcdc) ends
+the harm class: once a Dev build with the guard runs, the command exits 2
+with a loud stderr naming this issue — the next occurrence self-identifies
+through the spawner's own output channel.
+
 ## Open questions
 
 - [ ] Identify the forker: instrument with `log stream`/`fs_usage` against PID 62690 during the next burst (trigger: an exclusive job queued-waiting on amo), or add a spawn-log line in the GUI's subprocess layer.
