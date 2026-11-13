@@ -73,6 +73,22 @@ order). Neither is lossless → "can we rearrange without breaking?" was NO.
   `cargo test -p rig_panel` 2 pass; clippy clean on both crates.
 - Live: `rig set` round-trips over SSH, status renders tiered order.
 
+## Post-drain verification (2026-11-12, zed-061faf21@amo)
+
+The bmo queue emptied after the re-tier and was suspected wiped. Verified NOT
+a bug: all 10 re-tiered jobs + the 26 h `6a300a3e` head have terminal records
+in `~/.agent-mail/jobs/done/` on bmo (46 records, 379 logs retained; queue/
+and running/ legitimately empty). Tiering behaved as designed: shared sweeps
+backfilled during the exclusive head, probes/canary first after it, cells
+last. Outcomes: 7 done (exit 0), 1 failed exit 101 (i1190 katgpt-core
+staging conflict — logged in riir-infer 1190), 3 failed exit None
+(worktree-scoped, killed by bmo's riir-infer checkout being in a broken
+`HEAD (no branch)` state — repaired on-box: switched to develop, ff-pulled,
+worktree-add round-trip OK). Regression found: `rig log <SHORT-ID>` no
+longer resolves prefixes in the 057 binary — filed as `.issues/060`.
+Fleet clock note: bmo's wall clock reads ~Nov 13 while amo reads Nov 12 —
+timestamps in job records/mails are bmo-clock; the skew predates 057.
+
 ## Open (deferred, not blocking)
 
 - [ ] Other rigs (m3, 4090) still run the old binary — upgrade opportunistically; mixed-version is serde-safe, only sorting needs the new binary
