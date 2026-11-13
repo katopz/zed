@@ -89,6 +89,36 @@ fingerprint narrows the chain to "a login zsh" but not to a specific tab.
 Next attribution channel: after a Zed Dev rebuild, the guard's stderr + tty
 on the next attempt points at the owning tab/session directly.
 
+## ROOT CAUSE CLOSED 2026-11-12 late (zed-061faf21@amo) — embedded spawn_detached + current_exe
+
+`agent_mail::jobs::spawn_detached` resolved the executor/kicker via
+`std::env::current_exe()` — correct for the standalone binary, wrong wherever
+agent_mail is EMBEDDED (rig_panel/fleet_web inside the Zed GUI): there
+current_exe() is the Zed app binary, so every admitted job forked
+`<zed> rig exec <id>` and every kicker respawn forked `<zed> rig kick` (the
+70 s claim-churn cadence = kicker retries; "fresh login profile" env per
+ghost = Zed's captured login-shell env snapshot replayed at fork —
+zed-3b0d6444's snapshot hypothesis, correct). Dev never redirects, so each
+fork launched a full idle editor that persists forever.
+
+Fixed by `034014b427` (2026-11-12 17:15 +07 — require_standalone() gate in
+spawn_detached: "an embedded host must never fork itself"). WHY GHOSTS
+CONTINUED AFTER THE FIX: the running GUI (pid 62690) started Tue Nov 10
+07:46 from a tree last touching jobs.rs Nov 8 — two days BEFORE the gate.
+The old embedded code kept forking on every job event (Nov 11 c8b5/c8dd
+through the 2026-11-12 9-ghost burst and both bait ghosts).
+
+**Operational close-out: relaunch Zed Dev from a build containing
+`034014b427`** — one restart picks up the gate AND the CLI guard
+(`2a897fbcdc`, defense-in-depth: even a future embedded current_exe bug
+exits 2 loudly instead of opening an editor). Until then, kill-on-sight
+(`pkill -9 -f 'Zed Dev.app.*rig exec'`) stays the containment.
+
+Attribution trail preserved above (trigger model, env fingerprint, all
+negatives) — the negatives stand: no transcript, tab, extension, launchd, or
+agent session was ever the author; the forker was the GUI's own embedded
+Jobs code.
+
 ## Open questions
 
 - [ ] Identify the forker: instrument with `log stream`/`fs_usage` against PID 62690 during the next burst (trigger: an exclusive job queued-waiting on amo), or add a spawn-log line in the GUI's subprocess layer.
