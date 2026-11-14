@@ -168,20 +168,6 @@ pub fn tracked_repo(name: &str) -> bool {
     name.starts_with("riir-") || name.starts_with("seal-") || name == "katgpt-rs"
 }
 
-/// Whether `cwd` points anywhere inside the repo (`/git/<repo>` marker,
-/// slash-normalized so Windows paths compare too).
-fn cwd_in_repo(cwd: &str, repo: &str) -> bool {
-    let normalized = cwd.replace('\\', "/");
-    let needle = format!("/git/{repo}");
-    match normalized.find(&needle) {
-        Some(index) => {
-            let rest = &normalized[index + needle.len()..];
-            rest.is_empty() || rest.starts_with('/')
-        }
-        None => false,
-    }
-}
-
 /// The tracked repo a workspace root points into: its last component.
 fn cwd_repo_name(cwd: &str) -> Option<String> {
     let normalized = cwd.replace('\\', "/");
@@ -397,28 +383,15 @@ pub fn detect<'a>(
         by_repo.entry(work.repo.as_str()).or_default().push(work);
     }
 
-    // Claimed-and-worked is accounted; claimed-but-stopped is not. An idle
-    // agent parked in the repo for hours IS the false-stop shape (its chain
-    // already ended), so only a live agent — generating, or idle for under
-    // an hour — or a heavy process in the repo suppresses the rule.
-    const WORKED_IDLE_MAX_MINUTES: f64 = 60.0;
-    let repo_is_worked = |repo: &str| {
-        online.iter().any(|(_, probe)| {
-            probe.agents.iter().any(|agent| {
-                cwd_in_repo(&agent.cwd, repo)
-                    && (agent.status != "idle"
-                        || agent
-                            .idle_minutes
-                            .is_some_and(|minutes| minutes < WORKED_IDLE_MAX_MINUTES))
-            }) || (!probe.quiet
-                && probe.contenders.iter().any(|contender| {
-                    contender
-                        .cwd
-                        .as_deref()
-                        .is_some_and(|cwd| cwd_in_repo(cwd, repo))
-                }))
-        })
-    };
+    // Claim-scoped occupancy (issue 064, verdict-approved): a live agent or
+    // busy contender suppresses only the files under its own LIVE lease, and
+    // those are already excluded by `open_item` — so presence in the repo
+    // silences nothing here. The old repo-granular rule let one lane working
+    // leases on two files mute the whole repo while sibling files sat
+    // expired or unclaimed (the 2026-11-14 riir-ai zombie-claim incident).
+    // Double-booking is covered by the push-first claim law in both
+    // housekeeping contracts; a just-expired lease gets a 60-min renewal
+    // grace in `open_item`.
 
     if let Some(target) = quiet_target.as_deref() {
         // A false stop is the more specific evidence for its repo; the plain
@@ -456,7 +429,7 @@ pub fn detect<'a>(
         }
 
         for (repo, works) in &by_repo {
-            if repo_is_worked(repo) || false_stopped_repos.contains(*repo) {
+            if false_stopped_repos.contains(*repo) {
                 continue;
             }
             let examples = works
@@ -468,7 +441,7 @@ pub fn detect<'a>(
             incidents.push(Incident {
                 fingerprint: format!("boss:queue:{repo}"),
                 detail: format!(
-                    "{repo} holds {} actionable item(s) with no live agent in the repo ({examples}); \
+                    "{repo} holds {} actionable item(s) ({examples}); \
                      wake a free agent on {target} with the boss housekeeping contract",
                     works.len(),
                 ),
@@ -714,7 +687,7 @@ mod tests {
     }
 
     #[test]
-    fn queue_incident_needs_unworked_repo_and_quiet_target() {
+    fn queue_incident_needs_actionable_work_and_quiet_target() {
         let rigs = rigs();
         let amo = probe(r#"{"rig":"amo","os":"macos","at":"","cores":8,"quiet":true}"#);
         let bmo = probe(r#"{"rig":"bmo","os":"macos","at":"","cores":8,"quiet":true}"#);
@@ -736,25 +709,32 @@ mod tests {
             "lowest quiet rig name wins"
         );
 
-        // A generating agent sitting in the repo means it is being worked.
+        // Claim-scoped occupancy (issue 064): presence in the repo no longer
+        // silences the rule — live-lease files are already excluded by
+        // `open_item`, so a lane working OTHER files must not mute the
+        // unclaimed/expired siblings (the riir-ai zombie-claim incident).
         let busy_repo = probe(
             r#"{"rig":"amo","os":"macos","at":"","cores":8,"quiet":true,
                 "agents":[{"name":"katgpt-rs-1","status":"generating","cwd":"/Users/k/git/katgpt-rs/crates/x"}]}"#,
         );
         let online = vec![("amo", &busy_repo), ("bmo", &bmo)];
-        assert!(detect(&online, &rigs, &work, &[], &[], now, false).is_empty());
+        assert_eq!(
+            detect(&online, &rigs, &work, &[], &[], now, false).len(),
+            1,
+            "a generating lane in the repo does not silence sibling files"
+        );
 
-        // A freshly idle agent (under an hour) still counts as working — it
-        // may be between turns of the very run the queue rule describes.
         let fresh_idle = probe(
             r#"{"rig":"amo","os":"macos","at":"","cores":8,"quiet":true,
                 "agents":[{"name":"katgpt-rs-1","status":"idle","cwd":"/Users/k/git/katgpt-rs","idle_minutes":5}]}"#,
         );
         let online = vec![("amo", &fresh_idle), ("bmo", &bmo)];
-        assert!(detect(&online, &rigs, &work, &[], &[], now, false).is_empty());
+        assert_eq!(
+            detect(&online, &rigs, &work, &[], &[], now, false).len(),
+            1,
+            "a freshly idle agent does not silence the rule either"
+        );
 
-        // An agent idle in the repo for days IS the claimed-but-stopped
-        // shape: it must not suppress the queue forever.
         let parked = probe(
             r#"{"rig":"amo","os":"macos","at":"","cores":8,"quiet":true,
                 "agents":[{"name":"katgpt-rs-1","status":"idle","cwd":"/Users/k/git/katgpt-rs","idle_minutes":4320}]}"#,
@@ -762,13 +742,16 @@ mod tests {
         let online = vec![("amo", &parked), ("bmo", &bmo)];
         assert_eq!(detect(&online, &rigs, &work, &[], &[], now, false).len(), 1);
 
-        // A busy contender in the repo counts as worked too.
         let compiling = probe(
             r#"{"rig":"amo","os":"macos","at":"","cores":8,"quiet":false,
                 "contenders":[{"pid":1,"name":"cargo","cpu_pct":90.0,"rss_gb":1.0,"arm":"name","cwd":"/Users/k/git/katgpt-rs"}]}"#,
         );
         let online = vec![("amo", &compiling), ("bmo", &bmo)];
-        assert!(detect(&online, &rigs, &work, &[], &[], now, false).is_empty());
+        assert_eq!(
+            detect(&online, &rigs, &work, &[], &[], now, false).len(),
+            1,
+            "a busy contender in the repo does not silence the rule"
+        );
 
         // No quiet rig that accepts jobs: nothing to fire into.
         let m3_only = probe(r#"{"rig":"m3","os":"macos","at":"","cores":8,"quiet":true}"#);
