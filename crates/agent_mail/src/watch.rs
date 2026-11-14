@@ -31,6 +31,12 @@ const HANDOFF_WINDOW: chrono::Duration = chrono::Duration::minutes(60);
 const LAST_RETENTION: Duration = Duration::from_secs(2 * 24 * 60 * 60);
 const DIGEST_MAX_CHARS: usize = 6000;
 const ESCALATE_AFTER_ROUNDS: u32 = 3;
+/// Boss re-fires are bounded (issue 064, verdict-approved): an unchanged work
+/// set re-wakes at most this many times, each after a cooldown that grows
+/// with the round; the fire after the cap escalates one report to the owner
+/// instead of spending another agent's turn, and the incident stays quiet
+/// until the work set changes (`reset_key` resets `rounds`).
+const BOSS_REWAKE_CAP: u32 = 3;
 /// Drift must persist this many ticks: agents push all day, so a passing
 /// difference between rigs is normal.
 const DRIFT_TICKS: u32 = 6;
@@ -638,9 +644,19 @@ fn gate_round(
     if !boss && entry.rounds > ESCALATE_AFTER_ROUNDS {
         return RoundGate::Wait;
     }
+    if boss && entry.rounds > BOSS_REWAKE_CAP {
+        return RoundGate::Wait;
+    }
     // Details drift every tick (idle minutes, heads), so only a new
     // fingerprint wakes immediately; a known one waits out its cooldown.
-    let incident_cooldown = if boss { BOSS_COOLDOWN_MS } else { cooldown_ms };
+    // The boss cooldown grows with the round (issue 064): an unconverted
+    // queue is re-waked at 1×, then 2×, then 3× the base cooldown before
+    // the cap report.
+    let incident_cooldown = if boss {
+        BOSS_COOLDOWN_MS * entry.rounds.max(1) as i64
+    } else {
+        cooldown_ms
+    };
     let in_cooldown = woke_before && since_wake < incident_cooldown;
     let regrown = queue_grew && since_wake >= BOSS_REGROW_COOLDOWN_MS;
     if in_cooldown && !regrown {
@@ -650,6 +666,9 @@ fn gate_round(
     entry.last_woke_ms = now;
     match entry.rounds > ESCALATE_AFTER_ROUNDS && !boss {
         true => RoundGate::Escalate,
+        // The boss cap report (issue 064): past BOSS_REWAKE_CAP wakes the
+        // next fire escalates to the owner instead of waking an agent.
+        false if boss && entry.rounds > BOSS_REWAKE_CAP => RoundGate::Escalate,
         false => RoundGate::Wake,
     }
 }
@@ -1509,15 +1528,47 @@ mod tests {
             "a regrown queue re-fires after the regrow window"
         );
 
-        // Boss incidents never escalate, no matter how many rounds pass.
+        // Boss re-fires are bounded (issue 064): an unchanged work set wakes
+        // at most BOSS_REWAKE_CAP times (each after a growing cooldown), then
+        // escalates one report to the owner, then stays quiet until the set
+        // changes.
         let mut entry = IncidentState::default();
         entry.ticks = 6;
-        entry.rounds = ESCALATE_AFTER_ROUNDS + 1;
-        entry.last_woke_ms = now - 2 * hour;
+        entry.last_woke_ms = now - BOSS_COOLDOWN_MS;
         assert_eq!(
             gate_round(&mut entry, &queue(2), now, hour),
             RoundGate::Wake,
-            "boss wakes forever, escalates never"
+            "first re-wake after the base cooldown"
+        );
+        entry.last_woke_ms = now - BOSS_COOLDOWN_MS * 2;
+        assert_eq!(
+            gate_round(&mut entry, &queue(2), now, hour),
+            RoundGate::Wake,
+            "second re-wake after the 2× cooldown"
+        );
+        entry.last_woke_ms = now - BOSS_COOLDOWN_MS * 3;
+        assert_eq!(
+            gate_round(&mut entry, &queue(2), now, hour),
+            RoundGate::Wake,
+            "third re-wake after the 3× cooldown"
+        );
+        entry.last_woke_ms = now - BOSS_COOLDOWN_MS * 4;
+        assert_eq!(
+            gate_round(&mut entry, &queue(2), now, hour),
+            RoundGate::Escalate,
+            "past the cap the owner gets a report, not another agent wake"
+        );
+        entry.last_woke_ms = now - BOSS_COOLDOWN_MS * 5;
+        assert_eq!(
+            gate_round(&mut entry, &queue(2), now, hour),
+            RoundGate::Wait,
+            "after the cap report the incident stays quiet"
+        );
+        // A changed work set restarts the cycle.
+        assert_eq!(
+            gate_round(&mut entry, &queue(3), now, hour),
+            RoundGate::Wake,
+            "the work set changing resets the cap"
         );
 
         // Ordinary incidents still escalate after their rounds: three wakes,
