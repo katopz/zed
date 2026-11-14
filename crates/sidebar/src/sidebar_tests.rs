@@ -6537,6 +6537,74 @@ async fn test_errored_thread_sorts_by_recency_not_above_fresh_idle(cx: &mut Test
 }
 
 #[gpui::test]
+async fn test_waiting_for_mail_thread_sorts_by_recency_not_above_fresh_idle(
+    cx: &mut TestAppContext,
+) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    let now = Utc::now();
+    // A thread that ended its turn with agent-mail outstanding: the sidebar
+    // shows it as Waiting (parked) with a countdown indicator.
+    let connection = StubAgentConnection::new();
+    open_thread_with_connection(&panel, connection.clone(), cx);
+    send_message(&panel, cx);
+    let parked_session = active_session_id(&panel, cx);
+    connection.end_turn(parked_session.clone(), acp_v1::StopReason::EndTurn);
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        panel
+            .read(cx)
+            .active_agent_thread(cx)
+            .expect("active thread")
+            .update(cx, |thread, cx| thread.set_waiting_for_mail(true, cx));
+    });
+    cx.run_until_parked();
+
+    // Age the parked thread's metadata, as if it has been waiting on the
+    // mail for 9 hours with nothing touching the thread since.
+    let stale = now - chrono::Duration::hours(9);
+    save_thread_metadata(
+        parked_session,
+        Some("Parked Thread".into()),
+        stale,
+        Some(stale),
+        Some(stale),
+        &project,
+        cx,
+    );
+
+    // An idle thread updated just now.
+    save_thread_metadata(
+        acp::SessionId::new(Arc::from("idle-thread")),
+        Some("Idle Thread".into()),
+        now,
+        Some(now),
+        Some(now),
+        &project,
+        cx,
+    );
+    cx.run_until_parked();
+
+    let entries = visible_entries_as_strings(&sidebar, cx);
+    assert_eq!(entries[0], "v [my-project]");
+    assert_eq!(
+        entries[1], "  Idle Thread",
+        "a thread parked on mail for hours must not sit above fresh work; \
+         it orders among idle rows by recency, got {:?}",
+        entries
+    );
+    assert!(
+        entries[2].contains("(waiting-for-mail)"),
+        "the parked thread keeps its waiting indicator below the fresh \
+         idle thread, got {:?}",
+        entries
+    );
+}
+
+#[gpui::test]
 async fn test_running_thread_sorts_above_continuation_of_pinned_root(cx: &mut TestAppContext) {
     // A pinned thread that was continued (auto_prompt summary handoff)
     // becomes a hidden child of a chain headed by a fresh unpinned thread.

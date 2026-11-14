@@ -6271,7 +6271,9 @@ impl Sidebar {
         // Tier 0: drafts (a new thread whose prompt hasn't been sent) float
         // above everything, pinned threads included. Tier 1: pinned threads,
         // most recently pinned first. Tier 2: unpinned threads — active ones
-        // (waiting/running) above idle ones, then recency descending.
+        // (waiting-for-confirmation/running) above idle ones, then recency
+        // descending. Mail-parked (Waiting) rows carry no urgency: they can
+        // sit parked for hours, so they order by recency among idle rows.
         let mut sorted: Vec<SortItem> = items
             .into_iter()
             .sorted_by(|left, right| {

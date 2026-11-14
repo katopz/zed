@@ -17,21 +17,25 @@ pub enum AgentThreadStatus {
     /// Fork: the thread ended its turn and is parked waiting for an external
     /// event (an agent-mail reply or a scheduled wake). Not running, but not
     /// finished either — the item shows a waiting icon on the metadata line.
+    /// Carries no sort urgency: a parked thread can legitimately wait for
+    /// hours, so it orders among idle rows by recency (the countdown icon
+    /// keeps signaling that it is parked).
     Waiting,
     Error,
 }
 
 impl AgentThreadStatus {
     /// Sort weight so statuses that need attention or are actively working
-    /// order above idle ones. Higher sorts first.
+    /// order above idle ones. Higher sorts first. Only states that resolve
+    /// on short timescales carry weight: a mail-parked thread can sit for
+    /// hours, so lifting it forever parked it above fresh work.
     pub fn urgency(self) -> u8 {
         match self {
             Self::WaitingForConfirmation => 4,
             Self::Running => 3,
             Self::Error => 2,
-            Self::Waiting => 2,
             Self::Unconfirmed => 1,
-            Self::Completed => 0,
+            Self::Waiting | Self::Completed => 0,
         }
     }
 }
