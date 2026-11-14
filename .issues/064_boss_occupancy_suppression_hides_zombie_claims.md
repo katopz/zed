@@ -1,6 +1,6 @@
 # Issue 064 — boss queue suppression is repo-granular + housekeeping prompts allowed subset sweeps: zombie claims persist while lanes stop "cleanly"
 
-**Status:** OPEN — filed 2026-11-14 (zed-82c2af33@m3, false-stop diagnosis lane, user-directed). TWO code fixes LANDED this lane (sweep/claim law in both housekeeping prompts; commit `9a4de36aef` + this amend). Verdict round 1 REVISE (claude, session `750389e8`): four wording fixes + three housekeeping fixes APPLIED; claim-scoped occupancy and capped re-fire are DESIGN-APPROVED (implement as separate tested commits); open_item LANDED handling moved up to approved work. Boss-rule changes below are NOT yet implemented.
+**Status:** OPEN — filed 2026-11-14 (zed-82c2af33@m3, false-stop diagnosis lane, user-directed). Prompt law LANDED `5184c8b09a` (verdict round 1 REVISE applied). All three verdict-approved boss-side fixes LANDED: claim-scoped occupancy `1e71dc232f`, open_item LANDED+grace `adca307669`, bounded re-fire `fb4e95551b` (agent_mail 90/90, clippy clean). Remaining: close-out debt, highwater (bumped to 064), wake-reachability audit, OPEN-without-checkbox parsing.
 
 ## The incident
 
@@ -23,11 +23,11 @@ Both summaries declared emptiness per-lane and labeled the rest "gated / sibling
 
 - [x] `housekeeping_continuation` step 4/5: fleet sweep + claim-liveness law + proof-before-stop (this lane, see the fix commit).
 - [x] boss `housekeeping_prompt` step 3: same sweep + claim law (same commit).
-- [ ] Implement claim-scoped occupancy for R-unclaimed-queue (VERDICT-APPROVED): a live agent or busy contender suppresses only files under a LIVE lease; unclaimed or expired files fire after a grace period — 60 minutes, matching `WORKED_IDLE_MAX_MINUTES`. The push-first claim law covers the double-booking concern.
-- [ ] Implement bounded re-fire when the work set is unchanged after a wake (VERDICT-APPROVED with cap): growing cooldown, at most ~3 re-fires, `detail` naming the unconverted files; after the cap escalate to a report (an uncapped version recreates the loop bug).
+- [x] Claim-scoped occupancy for R-unclaimed-queue (VERDICT-APPROVED, LANDED `1e71dc232f`): a live agent or busy contender suppresses only files under a LIVE lease — those are already excluded by `open_item`, so occupancy suppresses nothing; `repo_is_worked` + `WORKED_IDLE_MAX_MINUTES` removed. The push-first claim law covers double-booking.
+- [x] Bounded re-fire when the work set is unchanged after a wake (VERDICT-APPROVED with cap, LANDED `fb4e95551b`): `BOSS_REWAKE_CAP = 3`, cooldown grows with the round (1×/2×/3× the base hour), past the cap one report escalates to the owner, then quiet until the work set changes.
 - [ ] Close-out debt pass: remove landed issue files per fleet convention (riir-train 689; riir-ai 1180/1201/1207; riir-game-sdk 059) or fold their landing notes and delete — owner of each = the landing lane; boss housekeeping contract already carries compaction.
-- [ ] `open_item` hygiene (VERDICT-APPROVED, moved up): add `LANDED` to the finished list while guarding the "OPEN — R1 landed" case (landed falling within the first 4 status tokens); decide OPEN-without-checkbox parsing separately.
-- [ ] Highwater drift: `.issues/.highwater` reads 059 while 060/061/062/063/064 exist (this file allocated 064 after the upstream 062/063 collision; same drift class as riir-ai issue 1205) — bump on next issue allocation.
+- [x] `open_item` hygiene (VERDICT-APPROVED, LANDED `adca307669`): LANDED joins the finished list position-gated (first status token only — the "OPEN — R1 landed" prose case cannot finish a file); status tokenization drops markdown-marker empty runs; claim grace of 60 min past expiry. The OPEN-without-checkbox parse stays open below.
+- [ ] Highwater drift: `.issues/.highwater` reads 059 while 060–064 exist (this file allocated 064 after the upstream 062/063 collision; same drift class as riir-ai issue 1205) — bumped to 064 with this issue's landing; keep it monotonic on every future allocation.
 - [ ] Audit wake-target reachability: log-and-verify boss wakes actually drain (ties into issue 061 + the 056 drain round, `02e767737d`); a wake that no live agent picks up should escalate, not cooldown.
 
 ## Evidence
