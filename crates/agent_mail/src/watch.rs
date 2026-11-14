@@ -945,6 +945,12 @@ pub fn open_item(text: &str, now: chrono::DateTime<chrono::Utc>) -> Option<Strin
         .find(|line| line.trim_start().to_ascii_lowercase().starts_with("status"))
         .unwrap_or("")
         .to_ascii_uppercase();
+    // Content tokens only (empty runs from markdown markers dropped), so a
+    // bolded "**Status:** DONE" is read the same as a plain one.
+    let tokens: Vec<&str> = status
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .collect();
     let finished = [
         "DONE",
         "CLOSED",
@@ -953,12 +959,14 @@ pub fn open_item(text: &str, now: chrono::DateTime<chrono::Utc>) -> Option<Strin
         "OBSOLETE",
         "WONTFIX",
     ];
-    if finished.iter().any(|word| {
-        status
-            .split(|c: char| !c.is_ascii_alphanumeric())
-            .take(4)
-            .any(|token| token == *word)
-    }) {
+    if tokens.iter().take(4).any(|token| finished.contains(token)) {
+        return None;
+    }
+    // LANDED is position-gated (issue 064): the fleet convention writes it as
+    // the token right after `Status` ("Status: LANDED (...)"), so a prose
+    // mention in an open file ("Status: OPEN — R1 landed: ...") can never
+    // finish it.
+    if tokens.get(1) == Some(&"LANDED") {
         return None;
     }
     let lease_closed = text.contains("**Lease closed:**");
@@ -972,7 +980,12 @@ pub fn open_item(text: &str, now: chrono::DateTime<chrono::Utc>) -> Option<Strin
                     .and_then(|at| {
                         chrono::DateTime::parse_from_rfc3339(at.trim_end_matches([',', '.'])).ok()
                     })
-                    .is_some_and(|expires| expires > now)
+                    // The claim grace (issue 064, verdict-approved): a lease
+                    // stays live for 60 min past its expiry — matching the old
+                    // occupancy freshness window — so a mid-flight renewal push
+                    // or a push-first lost race never reads as
+                    // claimed-but-stopped.
+                    .is_some_and(|expires| expires > now - chrono::Duration::hours(1))
         });
     if live_claim {
         return None;
@@ -1684,6 +1697,34 @@ mod tests {
             .as_deref(),
             Some("x"),
             "an expired lease does not"
+        );
+        // Issue 064: LANDED finishes only as the first status token; a prose
+        // mention in an open status never does.
+        assert_eq!(
+            open_item("# P\nStatus: LANDED — 9df\n- [ ] stale\n", now),
+            None,
+            "LANDED as the status token finishes the file"
+        );
+        assert_eq!(
+            open_item("# P\nStatus: **LANDED** — this commit\n- [ ] stale\n", now),
+            None,
+            "markdown markers around the token do not hide it"
+        );
+        assert_eq!(
+            open_item("# P\nStatus: OPEN — R1 landed: x\n- [ ] todo\n", now).as_deref(),
+            Some("todo"),
+            "prose `landed` in an open status does not finish it"
+        );
+        // The claim grace: a lease expired inside the last hour still hides
+        // the item (renewal-push / push-first race window).
+        let just_expired = (now - chrono::Duration::minutes(30)).to_rfc3339();
+        assert_eq!(
+            open_item(
+                &format!("# P\nStatus: open\n**Claimed:** s, 1, expires {just_expired}\n- [ ] x\n"),
+                now
+            ),
+            None,
+            "a just-expired lease is inside the claim grace"
         );
 
         let dir = tempfile::tempdir().unwrap();
