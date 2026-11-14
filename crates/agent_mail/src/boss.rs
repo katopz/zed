@@ -544,8 +544,13 @@ pub fn housekeeping_prompt(detail: &str, rig: &str, budget: usize) -> String {
          `agent-mail rig run bmo --shared -- <command>`.\n\
          2. Boundary check-up: run the boundary-guard check for each repo you touch; fix or file \
          drift.\n\
-         3. Repo queues: work `.issues`/`.plans` items — resume or resolve until done or gated; \
-         update status lines as you go.\n\
+         3. Repo queues: the incident repo first, then every non-zero count in \
+         `~/.agent-mail/fleet-cache.json` — grep each repo's `.issues`/`.plans` for \
+         `**Claimed:**` + expiry; a missing or expired lease = claimable (check \
+         `agent-mail rig status` for a live claimer session in that repo first), so \
+         COMMIT AND PUSH a fresh `**Claimed:**` lease line before working — if the \
+         push loses the race, take the next item — then resume or resolve until \
+         done or genuinely gated; update status lines as you go.\n\
          4. Mail: drain the stale inbox this incident names — inspect with `agent-mail peek --as \
          <inbox>`, consume with `agent-mail recv --as <inbox>`, oldest first in batches; what \
          you consume is gone, and the incident refires only for what is left. Triage each item: \
@@ -993,6 +998,8 @@ mod tests {
             "agent-mail recv --as",
             "never mail a copy",
             "Never reply into a sink",
+            "expired lease = claimable",
+            "fleet-cache.json",
             "ask Claude for the verdict",
             "Leftover sweep",
             "REPORT-ONLY disk audit",

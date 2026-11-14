@@ -452,9 +452,21 @@ pub(crate) fn housekeeping_continuation() -> String {
      1. Run the boundary-guard and doc-sync skills for this repo.\n\
      2. Mine the next riir-clippy batch; search online to unblock blocked tasks.\n\
      3. Re-run benchmarks if the working tree is dirty.\n\
-     4. No issues/plans/proposals left here → unclaimed work in other workspace \
-     repos — only where no other agent is active.\n\
-     5. Nothing actionable left → stop cleanly: lone `<stop>` line; do not invent work."
+     4. This lane empty is NOT the fleet empty — sweep the queues: read the boss \
+     counts (`agent-mail rig status`, `~/.agent-mail/fleet-cache.json`), then grep \
+     every non-zero repo's `.issues` and `.plans` markdown for `**Claimed:**` + \
+     expiry. Missing claim or expired lease = claimable — first check the claimer \
+     has no live session in that repo (`agent-mail rig status`: agent cwd + idle \
+     minutes), then COMMIT AND PUSH the `**Claimed:**` lease line before working; \
+     if the push loses the race, take the next item. Do the work here when it \
+     needs no GPU or exclusive rig; rig-bound work goes out via `agent-mail rig \
+     run --est`. 'Owner-gated' means ONLY a credential/secret deploy touch — \
+     anything else resolves through a recorded Claude verdict.\n\
+     5. Stop only with proof: the what-remains section must list every open unit \
+     found (path / status / routed-to), and it is a DUTY to have claimed every \
+     unclaimed, unblocked, box-actionable item before stopping — anything left \
+     unclaimed there betrays the sweep. Otherwise stop cleanly: lone `<stop>` \
+     line; do not invent work."
         .to_string()
 }
 
@@ -1830,7 +1842,12 @@ mod tests {
         assert!(prompt.contains("doc-sync"));
         assert!(prompt.contains("riir-clippy"));
         assert!(prompt.contains("Re-run benchmarks"));
-        assert!(prompt.contains("no other agent is active"));
+        assert!(prompt.contains("**Claimed:**"));
+        assert!(prompt.contains("expired lease = claimable"));
+        assert!(prompt.contains("fleet-cache.json"));
+        assert!(prompt.contains("agent-mail rig status"));
+        assert!(prompt.contains("COMMIT AND PUSH"));
+        assert!(prompt.contains("agent-mail rig run"));
         assert!(
             prompt.contains("stop cleanly"),
             "must end with a stop instruction so the loop terminates"
