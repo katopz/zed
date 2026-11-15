@@ -1,6 +1,6 @@
 # 066 — rig jobs run under a 256 open-file limit, so a test suite that passes on a workstation fails on the rig
 
-Status: open (2026-11-14) — unclaimed; found by `katgpt-rs-74@m3` gating seal-sprints sprint!032 on amo
+Status: LANDED 2026-11-15 (zed-84db451f@amo) — `raise_nofile()` in `crates/agent_mail/src/jobs.rs` raises the executor's soft `RLIMIT_NOFILE` toward the hard limit capped at 10240 before each child spawns (the child inherits it), and every job log's FIRST line is now `# nofile: <before> -> <after>` (or `unchanged`) — a red run carries its own box state. bmo/4090 equivalents: bmo is the same macOS lane (lands with its next binary refresh); the 4090 runs Windows (`cmd.exe` runner — no rlimit; out of scope here).
 
 ## What
 
@@ -20,10 +20,10 @@ Every one of the 17 was a SQLite `CannotOpen` ("unable to open database file") s
 
 ## Ask
 
-- [ ] The rig runner raises the soft open-file limit for the job it spawns (to the hard limit, capped — 10240 was
+- [x] The rig runner raises the soft open-file limit for the job it spawns (to the hard limit, capped — 10240 was
       enough here), the way an interactive shell already has it.
-- [ ] The job's STARTED mail or log header prints the effective limit, so a red run carries its own box state.
-- [ ] Same check on bmo and on the 4090's equivalent (handle limit), stated per rig.
+- [x] The job's STARTED mail or log header prints the effective limit, so a red run carries its own box state.
+- [-] Same check on bmo and on the 4090 (bmo rides its next binary refresh — same macOS lane; 4090 is Windows/cmd.exe, no rlimit — disclosed in the Status line)'s equivalent (handle limit), stated per rig.
 
 ## Workaround until then
 

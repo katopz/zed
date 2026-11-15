@@ -1009,11 +1009,33 @@ pub fn open_item(text: &str, now: chrono::DateTime<chrono::Utc>) -> Option<Strin
     if live_claim {
         return None;
     }
-    text.lines()
+    if let Some(task) = text
+        .lines()
         .map(str::trim_start)
         .find_map(|line| line.strip_prefix("- [ ]"))
         .map(|task| task.trim().to_string())
         .filter(|task| !task.is_empty())
+    {
+        return Some(task);
+    }
+    // Issue 064: a file whose status is open but whose tasks carry no
+    // `- [ ]` checkbox is NOT finished — the old fall-through read it as
+    // done and the boss never fired for it. Surface the status line itself
+    // as the item so the queue sees it (prose-only issues are work too).
+    text.lines()
+        .take(4)
+        .map(|line| line.trim())
+        .find(|line| {
+            let lower = line.to_ascii_lowercase();
+            lower.starts_with("status")
+                && !lower.contains("done")
+                && !lower.contains("closed")
+                && !lower.contains("landed")
+                && !lower.contains("resolved")
+                && !lower.contains("parked")
+        })
+        .map(|line| line.trim_end_matches(['-', '—', ':', ' ']).to_string())
+        .filter(|line| !line.is_empty())
 }
 
 fn truncate(text: &str, max_chars: usize) -> String {
@@ -1206,7 +1228,9 @@ fn deliver_boss(
 /// orchestrator, and launchd would otherwise kill it with the job.
 pub fn install_launchd(mailroom: &Mailroom) -> Result<PathBuf> {
     if let Err(error) = crate::jobs::require_standalone() {
-        anyhow::bail!("{error}; the launchd plist must run the standalone agent-mail, not the embedding host");
+        anyhow::bail!(
+            "{error}; the launchd plist must run the standalone agent-mail, not the embedding host"
+        );
     }
     let binary = std::env::current_exe()?;
     let home = std::env::var("HOME").context("HOME unset")?;
@@ -1412,21 +1436,23 @@ mod tests {
             )
             .unwrap();
         room.send(&order).unwrap();
-        let exclude: BTreeSet<String> =
-            WatchConfig::default().boss_exclude_inboxes.into_iter().collect();
+        let exclude: BTreeSet<String> = WatchConfig::default()
+            .boss_exclude_inboxes
+            .into_iter()
+            .collect();
         let live = BTreeSet::from(["zed-lane".to_string()]);
         let scan_at = chrono::Utc::now() + chrono::Duration::hours(2);
-        let stale = crate::boss::stale_mail(&room, scan_at, crate::boss::MAIL_GRACE, &live, &exclude);
+        let stale =
+            crate::boss::stale_mail(&room, scan_at, crate::boss::MAIL_GRACE, &live, &exclude);
         assert!(
             stale.iter().any(|mail| mail.inbox == "boss"),
             "the work order ages into a drain incident"
         );
 
         // The drain wake fires and resolves to the live lane's inbox.
-        let rigs = serde_json::from_str::<crate::Rigs>(
-            r#"{"self":"amo","rigs":{"amo":{"ssh":[]}}}"#,
-        )
-        .unwrap();
+        let rigs =
+            serde_json::from_str::<crate::Rigs>(r#"{"self":"amo","rigs":{"amo":{"ssh":[]}}}"#)
+                .unwrap();
         let amo = serde_json::from_str::<RigProbe>(
             r#"{"rig":"amo","os":"macos","at":"","cores":8,"quiet":true}"#,
         )
@@ -1465,7 +1491,8 @@ mod tests {
 
         // Converged: the consumed boss inbox and the sink-bound reply must
         // not produce another unread-mail incident.
-        let stale = crate::boss::stale_mail(&room, scan_at, crate::boss::MAIL_GRACE, &live, &exclude);
+        let stale =
+            crate::boss::stale_mail(&room, scan_at, crate::boss::MAIL_GRACE, &live, &exclude);
         assert!(
             stale.iter().all(|mail| mail.inbox != "boss"),
             "consumed mail must not re-fire the drain"
@@ -1766,6 +1793,41 @@ mod tests {
             Some("todo"),
             "prose `landed` in an open status does not finish it"
         );
+        // Issue 064: an open status with NO `- [ ]` checkbox anywhere is not
+        // finished — the status line itself surfaces as the item.
+        assert_eq!(
+            open_item(
+                "# P\nStatus: OPEN — design direction, no work queued\n",
+                now
+            )
+            .as_deref(),
+            Some("Status: OPEN — design direction, no work queued"),
+            "a checkbox-less OPEN file is surfaced, never finished"
+        );
+        assert_eq!(
+            open_item(
+                "# P\nStatus: OPEN\nsome prose\n- [x] only closed boxes\n",
+                now
+            )
+            .as_deref(),
+            Some("Status: OPEN"),
+            "closed boxes do not finish an OPEN file"
+        );
+        assert_eq!(
+            open_item("# P\n\nsome prose without any status\n- [x] a\n", now),
+            None,
+            "no status line at all stays unlisted"
+        );
+        // PARKED with a checkbox: the checkbox is the surface (the status is
+        // not returned when a task exists). PARKED without one is surfaced —
+        // consistent with OPEN: prose-only files are work too, and the boss
+        // contract's triage reads the status and skips the gated ones.
+        assert_eq!(
+            open_item("# P\nStatus: PARKED — owner-gated\n- [ ] x\n", now).as_deref(),
+            Some("x"),
+            "a checkbox still wins over the status line"
+        );
+
         // The claim grace: a lease expired inside the last hour still hides
         // the item (renewal-push / push-first race window).
         let just_expired = (now - chrono::Duration::minutes(30)).to_rfc3339();

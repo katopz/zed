@@ -42,6 +42,10 @@ pub const FYI_MAIL_EXTRA_GRACE: Duration = Duration::from_secs(30 * 60 * 6);
 pub const BOSS_BUDGET_UNITS: usize = 5;
 /// Marker files older than this are pruned on the next scan.
 const THREAD_END_RETENTION: Duration = Duration::from_secs(2 * 60 * 60);
+/// The orchestrator sink inbox is the designated dead-letter office (issue
+/// 062): replies to boss wakes die there by design and no reader claims
+/// them, so archived wake replies age out instead of accumulating forever.
+const ORCHESTRATOR_INBOX_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// Inbox names one unread-mail incident lists before "(+N more)".
 const STALE_MAIL_NAMES_SHOWN: usize = 5;
 
@@ -78,6 +82,7 @@ fn thread_ends_dir(mailroom: &Mailroom) -> PathBuf {
 pub fn note_stop(session_id: &str, cwd: Option<&str>, ended_by: &str, had_summary: bool) {
     if let Ok(mailroom) = Mailroom::from_env() {
         record_stop(&mailroom, session_id, cwd, ended_by, had_summary);
+        prune_orchestrator_inbox(&mailroom);
     }
 }
 
@@ -126,6 +131,30 @@ fn prune_thread_ends(mailroom: &Mailroom) {
             .and_then(|bytes| serde_json::from_slice::<ThreadEnd>(&bytes).ok())
             .is_some_and(|end| end.at >= cutoff);
         if !fresh {
+            fs::remove_file(entry.path()).ok();
+        }
+    }
+}
+
+/// TTL-prune the orchestrator sink inbox (issue 062): envelopes older than
+/// [`ORCHESTRATOR_INBOX_RETENTION`] are deleted from `new/` (the sink has no
+/// reader, so nothing there is ever claimed). Only the sink inbox is
+/// touched — every other inbox is somebody's correspondence.
+fn prune_orchestrator_inbox(mailroom: &Mailroom) {
+    let inbox = mailroom.inbox(crate::watch::ORCHESTRATOR_INBOX).join("new");
+    let cutoff = chrono::Utc::now()
+        - chrono::Duration::from_std(ORCHESTRATOR_INBOX_RETENTION).unwrap_or_default();
+    let Ok(entries) = fs::read_dir(&inbox) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let stale = fs::read(entry.path())
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<crate::Envelope>(&bytes).ok())
+            .map(|envelope| envelope.deliver_at.unwrap_or(envelope.sent_at))
+            .and_then(|at| chrono::DateTime::parse_from_rfc3339(&at).ok())
+            .is_none_or(|readable| readable.with_timezone(&chrono::Utc) < cutoff);
+        if stale {
             fs::remove_file(entry.path()).ok();
         }
     }
@@ -307,9 +336,7 @@ pub fn stale_mail(
             // A self-addressed scheduled mail is the inbox owner's own alarm
             // clock, not incoming correspondence: never age it into an
             // incident, no matter how long ago it fired.
-            .filter(|envelope| {
-                !(envelope.from == envelope.to && envelope.deliver_at.is_some())
-            })
+            .filter(|envelope| !(envelope.from == envelope.to && envelope.deliver_at.is_some()))
             // fyi mail is sent with "no reply expected; read at the next
             // natural turn boundary" — a sleeping lane is normal for hours,
             // so it gets a longer grace than actionable mail.
@@ -324,8 +351,7 @@ pub fn stale_mail(
                 );
                 match readable {
                     Ok(readable) => {
-                        let age =
-                            now.signed_duration_since(readable.with_timezone(&chrono::Utc));
+                        let age = now.signed_duration_since(readable.with_timezone(&chrono::Utc));
                         age.num_seconds() >= age_grace.as_secs() as i64
                     }
                     Err(_) => true,
@@ -554,6 +580,28 @@ mod tests {
     use super::*;
     use crate::Address;
     use std::path::Path;
+
+    #[test]
+    fn orchestrator_sink_prunes_old_and_keeps_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let room = room(dir.path());
+        send_mail(&room, "orchestrator", "old wake reply");
+        age_mail(&room, "orchestrator", 8 * 24 * 60);
+        send_mail(&room, "orchestrator", "fresh wake reply");
+        send_mail(&room, "zed-someone", "peer mail must survive");
+        age_mail(&room, "zed-someone", 8 * 24 * 60);
+        prune_orchestrator_inbox(&room);
+        assert_eq!(
+            room.peek(&["orchestrator".into()]).unwrap().len(),
+            1,
+            "fresh sink mail kept"
+        );
+        assert_eq!(
+            room.peek(&["zed-someone".into()]).unwrap().len(),
+            1,
+            "other inboxes are never pruned"
+        );
+    }
 
     fn room(dir: &Path) -> Mailroom {
         let room = Mailroom::new(dir.to_path_buf());

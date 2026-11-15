@@ -11,8 +11,8 @@
 
 use crate::rig::{self, Contention};
 use crate::verify::{
-    read_result_file, verify_against_baseline, RunEnvironment, VerifyLedgerRow, VerifyOutcome,
-    VerifySpec,
+    RunEnvironment, VerifyLedgerRow, VerifyOutcome, VerifySpec, read_result_file,
+    verify_against_baseline,
 };
 use crate::{Address, MailMode, Mailroom, validate_name};
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -588,10 +588,10 @@ impl Mailroom {
     }
 
     /// Reaps jobs whose executor died, then starts what fits. STARTING is
-/// allowed only in the standalone binary — embedded hosts (the rig panel
-/// inside Zed) must call [`Self::reap_jobs_only`]: their `current_exe()`
-/// is the host binary, and every started job would fork a ghost of it
-/// (issue 040).
+    /// allowed only in the standalone binary — embedded hosts (the rig panel
+    /// inside Zed) must call [`Self::reap_jobs_only`]: their `current_exe()`
+    /// is the host binary, and every started job would fork a ghost of it
+    /// (issue 040).
     pub fn schedule_jobs(&self) -> Result<Vec<String>> {
         self.schedule_jobs_inner(true, true)
     }
@@ -855,7 +855,11 @@ impl Mailroom {
         let mut environment = RunEnvironment::capture(
             &rig_name,
             record.spec.worktree.as_deref(),
-            record.spec.verify.as_ref().map(|verify| verify.manifest_blake3.as_str()),
+            record
+                .spec
+                .verify
+                .as_ref()
+                .map(|verify| verify.manifest_blake3.as_str()),
         );
         // Clean-environment evidence (issue 056): a timed cell that did not
         // start QUIET is suspect however its numbers turn out. Own pid is
@@ -883,8 +887,23 @@ impl Mailroom {
             }
         };
         let log_path = self.jobs_dir("logs").join(format!("{id}.log"));
-        let log = fs::File::create(&log_path)?;
+        let mut log = fs::File::create(&log_path)?;
         let mut command = shell_command(&record.spec.argv);
+        // Issue 066: a red run carries its own box state — the effective
+        // open-file limit is the first log line, raised before the child
+        // spawns (the child inherits the executor's already-raised limit).
+        {
+            use std::io::Write;
+            let raised = raise_nofile();
+            let _ = writeln!(
+                log,
+                "# nofile: {}",
+                match raised {
+                    Some((before, now)) => format!("{before} -> {now}"),
+                    None => "unchanged".to_string(),
+                }
+            );
+        }
         command
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
@@ -1111,7 +1130,9 @@ impl Mailroom {
             Some(outcome) => {
                 let mut lines = vec![format!(
                     "\nVERIFY: {} vs {} — {}{}{}",
-                    outcome.verified_on, outcome.produced_on, outcome.verdict,
+                    outcome.verified_on,
+                    outcome.produced_on,
+                    outcome.verdict,
                     if outcome.provenance_incomplete {
                         " (provenance incomplete: does not count)"
                     } else {
@@ -1163,7 +1184,11 @@ impl Mailroom {
             origin_job: verify_outcome.origin_job.clone(),
             produced_on: verify_outcome.produced_on.clone(),
             verified_on: verify_outcome.verified_on.clone(),
-            plan: record.spec.verify.as_ref().map(|verify| verify.baseline.plan.clone()),
+            plan: record
+                .spec
+                .verify
+                .as_ref()
+                .map(|verify| verify.baseline.plan.clone()),
             baseline_sha: record
                 .environment
                 .as_ref()
@@ -1224,7 +1249,10 @@ impl Mailroom {
         if let Some(parent) = ledger.parent() {
             fs::create_dir_all(parent)?;
         }
-        let mut file = fs::OpenOptions::new().create(true).append(true).open(&ledger)?;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&ledger)?;
         writeln!(file, "{}", serde_json::to_string(row)?)?;
         Ok(())
     }
@@ -1255,8 +1283,7 @@ impl Mailroom {
                      the end-mail routes to jobs-archive@{rig}"
                 );
                 (
-                    Address::parse(&format!("jobs-archive@{rig}"))
-                        .unwrap_or_else(|_| to.clone()),
+                    Address::parse(&format!("jobs-archive@{rig}")).unwrap_or_else(|_| to.clone()),
                     format!(
                         "[notify fallback: original addressee {notify} has no \
                          inbox on {rig} — routed to this catch-all]\n\n{body}"
@@ -1347,6 +1374,19 @@ impl Mailroom {
         .with_context(|| format!("repo {repo} not found under ~/git"))?;
         let worktree = std::env::temp_dir().join("agent-mail-jobs").join(&spec.id);
         fs::create_dir_all(worktree.parent().context("temp dir")?)?;
+        // The 2026-11-15 bmo lesson: a job queued at a just-pushed sha fails
+        // `git worktree add` when this clone has not fetched since the push.
+        // Fetch (shallow-quiet, best-effort) before the add; a repo whose
+        // remote is down still works for shas it already has.
+        crate::command("git")
+            .arg("-C")
+            .arg(&repo_path)
+            .args(["fetch", "--quiet", "origin"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .ok();
         let status = crate::command("git")
             .arg("-C")
             .arg(&repo_path)
@@ -1567,7 +1607,15 @@ impl Mailroom {
                 Err(error) => failures.push(format!("{route}: {error:#}")),
             }
         }
-        Err(anyhow!("{rig_name} unreachable: {}", failures.join("; ")))
+        // The 2026-11-15 bmo lesson: a cancel that answered "no such job"
+        // through a relay chain while the target rig was down read as proof
+        // of absence — both jobs were queued there and started later. When
+        // no route reached the rig, say so ON the failure; a caller reading
+        // "unreachable" cannot mistake it for a completed cancel.
+        Err(anyhow!(
+            "{rig_name} UNREACHABLE — no command ran there ({}); any earlier              not-found answer through a relay was not proof of absence",
+            failures.join("; ")
+        ))
     }
 
     /// Running and queued jobs, for `rig status`.
@@ -1618,9 +1666,7 @@ impl Mailroom {
         sort_queue(&mut queued);
         for (position, spec) in queued.iter().enumerate() {
             let tier = job_tier(spec.est_secs);
-            let est = spec
-                .est_secs
-                .map_or_else(|| "-".to_string(), format_secs);
+            let est = spec.est_secs.map_or_else(|| "-".to_string(), format_secs);
             let urgent_tag = match spec.urgent {
                 true => "URGENT · ",
                 false => "",
@@ -1844,6 +1890,40 @@ fn key_file_name(key: &str) -> String {
         .take(120)
         .collect();
     format!("k_{safe}")
+}
+
+/// The soft open-file limit a rig job inherits from the executor can be 256
+/// (launchctl's default), while an interactive shell carries ~1M — a gate
+/// that opens many SQLite working copies then fails with errors that look
+/// like product bugs (issue 066). Raise THIS process's soft limit toward the
+/// hard limit, capped at 10240 (measured enough); the spawned child inherits
+/// it. Returns (before, after) for the log header, None when unchanged.
+#[cfg(unix)]
+fn raise_nofile() -> Option<(u64, u64)> {
+    const TARGET: u64 = 10_240;
+    // SAFETY: getrlimit/setrlimit(RLIMIT_NOFILE) touch only their own struct.
+    unsafe {
+        let mut rl: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) != 0 {
+            return None;
+        }
+        let want = TARGET.min(rl.rlim_max);
+        if rl.rlim_cur >= want {
+            return None;
+        }
+        let before = rl.rlim_cur;
+        rl.rlim_cur = want;
+        if libc::setrlimit(libc::RLIMIT_NOFILE, &rl) != 0 {
+            return None;
+        }
+        Some((before, want))
+    }
+}
+
+/// No-op off unix: the limit stays whatever the rig's OS default is.
+#[cfg(not(unix))]
+fn raise_nofile() -> Option<(u64, u64)> {
+    None
 }
 
 fn shell_command(argv: &[String]) -> Command {
@@ -2356,11 +2436,17 @@ mod tests {
     fn verify_verdicts_follow_the_noise_floor_and_metric_directions() {
         // Both metrics gain 10% in their better direction → verified.
         let measured = BTreeMap::from([("wall_ms".into(), 90.0), ("tok_per_s".into(), 1100.0)]);
-        assert_eq!(verify_against_baseline(&measured, &baseline()).verdict, "verified");
+        assert_eq!(
+            verify_against_baseline(&measured, &baseline()).verdict,
+            "verified"
+        );
         // wall_ms regressed 10% (110 > 100) while tok_per_s gained →
         // refuted: a gain on one metric never buys a regression on another.
         let measured = BTreeMap::from([("wall_ms".into(), 110.0), ("tok_per_s".into(), 1100.0)]);
-        assert_eq!(verify_against_baseline(&measured, &baseline()).verdict, "refuted");
+        assert_eq!(
+            verify_against_baseline(&measured, &baseline()).verdict,
+            "refuted"
+        );
         // Inside the 5% noise floor on both → inconclusive.
         let measured = BTreeMap::from([("wall_ms".into(), 97.0), ("tok_per_s".into(), 1030.0)]);
         assert_eq!(
@@ -2369,7 +2455,10 @@ mod tests {
         );
         // Both directions regress past the floor → refuted.
         let measured = BTreeMap::from([("wall_ms".into(), 120.0), ("tok_per_s".into(), 800.0)]);
-        assert_eq!(verify_against_baseline(&measured, &baseline()).verdict, "refuted");
+        assert_eq!(
+            verify_against_baseline(&measured, &baseline()).verdict,
+            "refuted"
+        );
         // An undeclared metric is ignored; a declared-but-unmeasured one
         // marks the row `incomplete` (the claim is only as good as its full
         // cell — never countable as verified).
@@ -2434,14 +2523,16 @@ mod tests {
             "bmo"
         );
         // Excluding every candidate refuses the run outright.
-        assert!(pick_rig(
-            &results,
-            &rigs,
-            &Needs::default(),
-            Lane::Exclusive,
-            &["amo".to_string(), "bmo".to_string()]
-        )
-        .is_err());
+        assert!(
+            pick_rig(
+                &results,
+                &rigs,
+                &Needs::default(),
+                Lane::Exclusive,
+                &["amo".to_string(), "bmo".to_string()]
+            )
+            .is_err()
+        );
     }
 
     #[cfg(unix)]
@@ -2607,8 +2698,8 @@ mod tests {
     fn a_vm_declaring_job_exemptes_vms_born_after_start_and_shares_preexisting_ones() {
         let rows = vec![
             contender(10, "com.apple.Virtualization.VirtualMachine", true), // born after
-            contender(11, "qemu-system-x86_64", true),                     // predates
-            contender(12, "cargo", false),                                 // never exempt
+            contender(11, "qemu-system-x86_64", true),                      // predates
+            contender(12, "cargo", false),                                  // never exempt
         ];
         let contention = contention_with(&rows);
         let known: Vec<Poison> = Vec::new();
@@ -2616,9 +2707,18 @@ mod tests {
             start_pids: [11u32].into_iter().collect(),
         };
         let probe = probe_poison(&contention, &known, Some(&policy));
-        assert!(probe.poison.iter().all(|p| p.pid == 12), "a foreign build still poisons");
-        assert!(probe.vm_exempt.iter().all(|p| p.pid == 10), "the job's own VM is exempt");
-        assert!(probe.vm_shared.iter().all(|p| p.pid == 11), "a preexisting VM is shared");
+        assert!(
+            probe.poison.iter().all(|p| p.pid == 12),
+            "a foreign build still poisons"
+        );
+        assert!(
+            probe.vm_exempt.iter().all(|p| p.pid == 10),
+            "the job's own VM is exempt"
+        );
+        assert!(
+            probe.vm_shared.iter().all(|p| p.pid == 11),
+            "a preexisting VM is shared"
+        );
     }
 
     #[test]
@@ -2636,15 +2736,40 @@ mod tests {
 
     #[test]
     fn exempted_vms_are_recorded_never_laundered_and_deduped_by_pid() {
-        let rows = vec![contender(10, "com.apple.Virtualization.VirtualMachine", true)];
-        let probe = probe_poison(&contention_with(&rows), &[], Some(&VmPolicy { start_pids: Default::default() }));
+        let rows = vec![contender(
+            10,
+            "com.apple.Virtualization.VirtualMachine",
+            true,
+        )];
+        let probe = probe_poison(
+            &contention_with(&rows),
+            &[],
+            Some(&VmPolicy {
+                start_pids: Default::default(),
+            }),
+        );
         assert_eq!(probe.vm_exempt.len(), 1);
-        assert_eq!(probe.vm_exempt[0].name, "com.apple.Virtualization.VirtualMachine");
-        assert_eq!(probe.vm_exempt[0].command, None, "the full record is kept: name, pid, at");
+        assert_eq!(
+            probe.vm_exempt[0].name,
+            "com.apple.Virtualization.VirtualMachine"
+        );
+        assert_eq!(
+            probe.vm_exempt[0].command, None,
+            "the full record is kept: name, pid, at"
+        );
         // Dedup: the same pid never double-records across probes.
         let known = &probe.vm_exempt;
-        let probe2 = probe_poison(&contention_with(&rows), known, Some(&VmPolicy { start_pids: Default::default() }));
-        assert!(probe2.vm_exempt.is_empty(), "pid-dedup suppresses the repeat");
+        let probe2 = probe_poison(
+            &contention_with(&rows),
+            known,
+            Some(&VmPolicy {
+                start_pids: Default::default(),
+            }),
+        );
+        assert!(
+            probe2.vm_exempt.is_empty(),
+            "pid-dedup suppresses the repeat"
+        );
     }
 
     #[test]
@@ -2670,7 +2795,10 @@ mod tests {
         ];
         assert!(holder_alive(&lines, "01aaa"));
         assert!(holder_alive(&lines, "01bbb"));
-        assert!(!holder_alive(&lines, "01ccc"), "an unclaimed id has no holder");
+        assert!(
+            !holder_alive(&lines, "01ccc"),
+            "an unclaimed id has no holder"
+        );
         assert!(!holder_alive(&[], "01aaa"));
     }
 
@@ -2687,8 +2815,7 @@ mod tests {
         assert_eq!(recovered, 1);
         assert!(!starting.exists());
         let spec: JobSpec = read_json(
-            &dir
-                .path()
+            &dir.path()
                 .join("jobs/queue")
                 .join("01str000000000000000000000000001.json"),
         )
@@ -2720,8 +2847,7 @@ mod tests {
         assert_eq!(recovered, 1);
         assert!(!starting.exists());
         assert!(
-            !dir
-                .path()
+            !dir.path()
                 .join("jobs/queue")
                 .join("01jnk000000000000000000000000001.json")
                 .exists(),
@@ -2792,15 +2918,17 @@ mod tests {
         let spec = r#"{"id":"i040reap","rig":"amo","os":"macos","at":"","cores":1,"quiet":true}"#;
         fs::write(queue.join("i040reap.json"), spec).unwrap();
         room.schedule_jobs_inner(false, false).unwrap();
-        assert!(queue.join("i040reap.json").exists(), "reap-only must not consume the queue");
+        assert!(
+            queue.join("i040reap.json").exists(),
+            "reap-only must not consume the queue"
+        );
         assert!(!room.jobs_dir("running").join("i040reap.starting").exists());
     }
 
     #[test]
     fn probe_sweep_outcomes_are_posture_pinned() {
-        use crate::rig::{probe_sweep, ProbeSweep};
+        use crate::rig::{ProbeSweep, probe_sweep};
         assert_eq!(probe_sweep(true), ProbeSweep::Schedule);
         assert_eq!(probe_sweep(false), ProbeSweep::ReapOnly);
     }
-
 }
