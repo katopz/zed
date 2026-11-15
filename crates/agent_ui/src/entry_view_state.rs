@@ -321,7 +321,12 @@ impl EntryViewState {
                 let source_is_representable = source_blocks
                     .iter()
                     .all(acp_thread::content::can_convert_to_v1);
-                let is_editable = can_rewind && source_is_representable;
+                // Batch mail prompts stay read-only: the editor shows the
+                // joined section bodies, which no longer splice back into the
+                // per-envelope shapes the resend path needs.
+                let is_editable = can_rewind
+                    && source_is_representable
+                    && !crate::mail_prompt::is_batch_mail_blocks(source_blocks);
                 if let Some(Entry::UserMessage {
                     editor,
                     synced_source_version,
@@ -333,9 +338,7 @@ impl EntryViewState {
                     let refreshed_source = ((!was_read_only
                         || *synced_source_version != source_version)
                         && (!is_editable || !editor.focus_handle(cx).is_focused(window)))
-                    .then(|| {
-                        crate::mail_prompt::strip_mail_envelope_blocks(source_blocks)
-                    });
+                    .then(|| crate::mail_prompt::strip_mail_envelope_blocks(source_blocks));
                     editor.update(cx, |editor, cx| editor.set_read_only(!is_editable, cx));
                     if let Some(source_blocks) = refreshed_source {
                         editor.update(cx, |editor, cx| {

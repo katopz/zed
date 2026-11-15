@@ -83,7 +83,11 @@ fn mail_header_chip(key: &str, value: &str, cx: &App) -> AnyElement {
                 .size(LabelSize::XSmall)
                 .color(Color::Muted),
         )
-        .child(Label::new(value.to_string()).size(LabelSize::XSmall).truncate())
+        .child(
+            Label::new(value.to_string())
+                .size(LabelSize::XSmall)
+                .truncate(),
+        )
         .into_any_element()
 }
 
@@ -95,7 +99,42 @@ fn mail_header_flag_chip(label: &str, color: Color, cx: &App) -> AnyElement {
         .rounded_sm()
         .border_1()
         .border_color(cx.theme().colors().border)
-        .child(Label::new(label.to_string()).size(LabelSize::XSmall).color(color))
+        .child(
+            Label::new(label.to_string())
+                .size(LabelSize::XSmall)
+                .color(color),
+        )
+        .into_any_element()
+}
+
+/// A tiny `text`/`raw` copy chip at the right of a mail section's header row:
+/// `text` copies the displayed body, `raw` copies the byte-exact envelope.
+fn mail_copy_button(
+    id: SharedString,
+    label: &'static str,
+    tooltip: &'static str,
+    payload: String,
+    cx: &App,
+) -> AnyElement {
+    div()
+        .id(id)
+        .px_1()
+        .py_0p5()
+        .rounded_sm()
+        .border_1()
+        .border_color(cx.theme().colors().border)
+        .bg(cx.theme().colors().ghost_element_background)
+        .hover(|style| style.bg(cx.theme().colors().element_hover))
+        .cursor_pointer()
+        .tooltip(Tooltip::text(tooltip))
+        .child(
+            Label::new(label.to_string())
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
+        )
+        .on_click(move |_, _, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string(payload.clone()));
+        })
         .into_any_element()
 }
 
@@ -2566,11 +2605,7 @@ impl ThreadView {
     /// prompt-jump strip, shown only while that side overflows (left=true for
     /// the leading edge). Purely an affordance: the strip scrolls, it does not
     /// truncate.
-    pub(super) fn prompt_strip_overflow_marker(
-        &self,
-        leading: bool,
-        cx: &Context<Self>,
-    ) -> Div {
+    pub(super) fn prompt_strip_overflow_marker(&self, leading: bool, cx: &Context<Self>) -> Div {
         div()
             .absolute()
             .top_0()
@@ -2590,10 +2625,11 @@ impl ThreadView {
     }
 
     /// GUI header for a user-message box: `[up] [down] [1|Mn] [from …] [to …]
-    /// [session …] [urgent] [fyi]` above the message text. Every prompt gets
-    /// the number badge and per-message navigation; mail prompts additionally
-    /// render their envelope metadata as chips (`mail_prompt`) instead of the
-    /// raw `<agent_message …>` tag text.
+    /// [session …] [urgent] [fyi] … [copy as text] [copy as raw]` above the
+    /// message text. Every prompt gets the number badge and per-message
+    /// navigation; mail prompts additionally render their envelope metadata as
+    /// chips (`mail_prompt`) instead of the raw `<agent_message …>` tag text —
+    /// one row per envelope section, so batch delivery shows every message.
     pub(super) fn render_message_box_header(
         &self,
         entry_ix: usize,
@@ -2601,10 +2637,10 @@ impl ThreadView {
         prompt_count: usize,
         label: String,
         is_mail: bool,
-        envelope: Option<&crate::mail_prompt::MailPromptEnvelope>,
+        mail_sections: &[crate::mail_prompt::MailPromptEnvelope],
         cx: &Context<Self>,
     ) -> Div {
-        h_flex()
+        let nav_row = h_flex()
             .flex_wrap()
             .w_full()
             .gap_1()
@@ -2632,40 +2668,65 @@ impl ThreadView {
                     .px_1()
                     .rounded_sm()
                     .bg(cx.theme().colors().element_background)
-                    .child(
-                        Label::new(label)
-                            .size(LabelSize::XSmall)
-                            .color(if is_mail {
-                                Color::Accent
-                            } else {
-                                Color::Muted
-                            }),
-                    ),
-            )
-            .children(
-                envelope
-                    .iter()
-                    .filter_map(|envelope| envelope.from.as_deref())
-                    .map(|value| mail_header_chip("from", value, cx)),
-            )
-            .children(
-                envelope
-                    .iter()
-                    .filter_map(|envelope| envelope.to.as_deref())
-                    .map(|value| mail_header_chip("to", value, cx)),
-            )
-            .children(
-                envelope
-                    .iter()
-                    .filter_map(|envelope| envelope.session_id.as_deref())
-                    .map(|value| mail_header_chip("session", value, cx)),
-            )
-            .when(envelope.is_some_and(|envelope| envelope.urgent), |this| {
-                this.child(mail_header_flag_chip("urgent", Color::Error, cx))
-            })
-            .when(envelope.is_some_and(|envelope| envelope.fyi), |this| {
-                this.child(mail_header_flag_chip("fyi", Color::Muted, cx))
-            })
+                    .child(Label::new(label).size(LabelSize::XSmall).color(if is_mail {
+                        Color::Accent
+                    } else {
+                        Color::Muted
+                    })),
+            );
+        if mail_sections.is_empty() {
+            return nav_row;
+        }
+        let mut header = v_flex().w_full().gap_1().child(nav_row);
+        for (section_ix, section) in mail_sections.iter().enumerate() {
+            header = header.child(
+                h_flex()
+                    .flex_wrap()
+                    .w_full()
+                    .gap_1()
+                    .items_center()
+                    .children(
+                        section
+                            .from
+                            .as_deref()
+                            .map(|value| mail_header_chip("from", value, cx)),
+                    )
+                    .children(
+                        section
+                            .to
+                            .as_deref()
+                            .map(|value| mail_header_chip("to", value, cx)),
+                    )
+                    .children(
+                        section
+                            .session_id
+                            .as_deref()
+                            .map(|value| mail_header_chip("session", value, cx)),
+                    )
+                    .when(section.urgent, |this| {
+                        this.child(mail_header_flag_chip("urgent", Color::Error, cx))
+                    })
+                    .when(section.fyi, |this| {
+                        this.child(mail_header_flag_chip("fyi", Color::Muted, cx))
+                    })
+                    .child(div().flex_1())
+                    .child(mail_copy_button(
+                        SharedString::from(format!("mail-copy-text-{entry_ix}-{section_ix}")),
+                        "text",
+                        "Copy as text",
+                        section.body.clone(),
+                        cx,
+                    ))
+                    .child(mail_copy_button(
+                        SharedString::from(format!("mail-copy-raw-{entry_ix}-{section_ix}")),
+                        "raw",
+                        "Copy as raw",
+                        section.raw(),
+                        cx,
+                    )),
+            );
+        }
+        header
     }
 
     pub(crate) fn manual_auto_prompt(&self, window: &mut Window, cx: &mut Context<Self>) {

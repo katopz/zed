@@ -1620,6 +1620,7 @@ impl ThreadView {
         };
         thread.can_rewind_to(message.client_id.as_ref(), cx)
             && !message.content.source_blocks().is_empty()
+            && !crate::mail_prompt::is_batch_mail_blocks(message.content.source_blocks())
             && message
                 .content
                 .source_blocks()
@@ -7342,7 +7343,17 @@ impl ThreadView {
                     .source_blocks()
                     .iter()
                     .all(acp_thread::content::can_convert_to_v1);
-                let is_editable = can_rewind && source_is_representable;
+                // Batch mail prompts render their sections read-only: the
+                // editor shows the joined bodies, which no longer splice back
+                // into the per-envelope shapes the resend path needs.
+                let mail_sections = match message.content.source_blocks().first() {
+                    Some(acp_v2::ContentBlock::Text(text)) => {
+                        crate::mail_prompt::MailPromptEnvelope::parse_sections(&text.text)
+                            .unwrap_or_default()
+                    }
+                    _ => Vec::new(),
+                };
+                let is_editable = can_rewind && source_is_representable && mail_sections.len() <= 1;
                 let agent_name = if is_subagent {
                     "subagents".into()
                 } else {
@@ -7370,13 +7381,7 @@ impl ThreadView {
                 let is_mail = is_agent_mail_prompt(message);
                 let label = prompt_jump_label(&mail_flags, prompt_ix)
                     .unwrap_or_else(|| (prompt_ix + 1).to_string());
-                let mail_envelope = match message.content.source_blocks().first() {
-                    Some(acp_v2::ContentBlock::Text(text)) => {
-                        crate::mail_prompt::MailPromptEnvelope::parse(&text.text)
-                    }
-                    _ => None,
-                };
-                let has_mail_header = mail_envelope.is_some();
+                let has_mail_header = !mail_sections.is_empty();
 
                 v_flex()
                     .id(("user_message", entry_ix))
@@ -7432,7 +7437,7 @@ impl ThreadView {
                                         mail_flags.len(),
                                         label,
                                         is_mail,
-                                        mail_envelope.as_ref(),
+                                        &mail_sections,
                                         cx,
                                     ))
                                     .when(has_mail_header, |this| {

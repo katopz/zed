@@ -48,18 +48,36 @@ pub(crate) struct MailPromptEnvelope {
     /// Everything before the body: the optional preempt notice, the opening
     /// tag line, and its trailing newline.
     pub head: String,
-    /// The newline before the closing tag, the closing tag, and the known
-    /// mailbox trailer (if present), byte-exact from the original.
+    /// The newline before the closing tag plus the closing tag itself, so
+    /// `head` + `body` + `tail` is this envelope's byte-exact raw form.
     pub tail: String,
+    /// Whatever follows `tail` (the known mailbox trailer, trailing
+    /// whitespace, or nothing), byte-exact from the original, so `rewrap`
+    /// round-trips the whole prompt.
+    pub trailer: String,
     /// The mail body shown in the editor.
     pub body: String,
 }
 
 impl MailPromptEnvelope {
     /// Parses a user-message text into its envelope. Returns `None` for
-    /// anything that is not a known single-envelope mail prompt, which the
-    /// caller must then render raw.
+    /// anything that is not exactly one known-envelope mail prompt, which the
+    /// caller must then render raw. Batch prompts (several envelopes in one
+    /// message) parse with [`Self::parse_sections`] instead.
     pub(crate) fn parse(text: &str) -> Option<Self> {
+        let mut sections = Self::parse_sections(text)?;
+        if sections.len() != 1 {
+            return None;
+        }
+        sections.pop()
+    }
+
+    /// Parses every envelope section of a mail prompt. Batch delivery packs
+    /// several messages into one user prompt (see `format_mailbox_prompt` in
+    /// the `agent` crate), so a known mail shape is an optional preempt
+    /// notice, N >= 1 envelope sections, then optionally the mailbox trailer.
+    /// Returns `None` for anything else, which the caller must render raw.
+    pub(crate) fn parse_sections(text: &str) -> Option<Vec<Self>> {
         let mut rest = text;
         let mut urgent = false;
         if let Some(after) = rest.strip_prefix(MAIL_PROMPT_PREEMPT_NOTICE) {
@@ -67,103 +85,167 @@ impl MailPromptEnvelope {
             rest = after.strip_prefix('\n').unwrap_or(after);
         }
 
-        let (open_tag, close_tag) = if rest.starts_with(OPEN_TAG) {
-            (OPEN_TAG, CLOSE_TAG)
-        } else if rest.starts_with(OPEN_TAG_LEGACY) {
-            (OPEN_TAG_LEGACY, CLOSE_TAG_LEGACY)
-        } else {
-            return None;
-        };
+        let mut sections = Vec::new();
+        loop {
+            let (open_tag, close_tag) = if rest.starts_with(OPEN_TAG) {
+                (OPEN_TAG, CLOSE_TAG)
+            } else if rest.starts_with(OPEN_TAG_LEGACY) {
+                (OPEN_TAG_LEGACY, CLOSE_TAG_LEGACY)
+            } else {
+                return None;
+            };
 
-        // The opening tag is a single line: the attribute values are mail
-        // addresses and never contain newlines.
-        let tag_line_end = rest.find('\n')?;
-        let tag_line = &rest[..tag_line_end];
-        if !tag_line.ends_with('>') {
-            return None;
-        }
-        let attributes = parse_tag_attributes(&tag_line[open_tag.len()..tag_line.len() - 1]);
+            // The opening tag is a single line: the attribute values are mail
+            // addresses and never contain newlines.
+            let tag_line_end = rest.find('\n')?;
+            let tag_line = &rest[..tag_line_end];
+            if !tag_line.ends_with('>') {
+                return None;
+            }
+            let attributes = parse_tag_attributes(&tag_line[open_tag.len()..tag_line.len() - 1]);
 
-        let after_tag = &rest[tag_line_end + 1..];
-        let close_ix = after_tag.rfind(close_tag)?;
-        // The writer puts the closing tag on its own line; requiring the
-        // preceding newline keeps a body that merely mentions the tag intact.
-        if !after_tag[..close_ix].ends_with('\n') {
-            return None;
-        }
-        let body = after_tag[..close_ix - 1].to_string();
-        // A batch prompt concatenates several envelope sections; a body that
-        // itself contains an opening tag means the `rfind` above spanned such
-        // a section, so keep the whole prompt raw instead of mis-merging the
-        // envelopes into one header.
-        if body.contains("<agent_message ") || body.contains("<agent_mail ") {
-            return None;
-        }
-        let tail = after_tag[close_ix - 1..].to_string();
+            let after_tag = &rest[tag_line_end + 1..];
+            // The writer puts each closing tag on its own line. A section
+            // boundary is a closing tag followed only by another envelope, the
+            // known mailbox trailer, or the end of the prompt — a closing tag
+            // merely mentioned inside the body keeps the search going (the
+            // same discipline the single-envelope parser applied via `rfind`).
+            let close_marker = format!("\n{close_tag}");
+            let mut search_from = 0;
+            let (close_ix, after_close) = loop {
+                let rel = after_tag[search_from..].find(&close_marker)?;
+                let candidate = search_from + rel;
+                let candidate_after = &after_tag[candidate + close_marker.len()..];
+                let trimmed = candidate_after.trim();
+                let next_opens_envelope = candidate_after.trim_start().starts_with(OPEN_TAG)
+                    || candidate_after.trim_start().starts_with(OPEN_TAG_LEGACY);
+                if !next_opens_envelope && !trimmed.is_empty() && trimmed != MAIL_PROMPT_TRAILER {
+                    search_from = candidate + 1;
+                    continue;
+                }
+                break (candidate, candidate_after);
+            };
 
-        // Everything after the closing tag must be exactly the known trailer
-        // (plus whitespace). A second envelope section or any other trailing
-        // content means this prompt was not built by `format_mailbox_prompt`
-        // alone, so keep it raw rather than hide something unrecognized.
-        let after_close = after_tag[close_ix + close_tag.len()..].trim();
-        if !(after_close.is_empty() || after_close == MAIL_PROMPT_TRAILER) {
-            return None;
+            // `head` is a prefix of `text`, so this span covers everything
+            // before this section's body: the notice (first section only)
+            // plus every earlier section, this opening tag line, and its
+            // newline.
+            let head = text[..text.len() - after_tag.len()].to_string();
+            let body = after_tag[..close_ix].to_string();
+            // A line-start envelope tag inside a body means the boundary search
+            // could not attribute a quoted envelope (a foreign shape that
+            // `format_mailbox_prompt` never produces) — keep the whole prompt
+            // raw rather than render a mis-split section. Mid-line mentions
+            // stay inside the body and render as mail.
+            if [CLOSE_TAG, CLOSE_TAG_LEGACY, OPEN_TAG, OPEN_TAG_LEGACY]
+                .iter()
+                .any(|tag| body.contains(&format!("\n{tag}")))
+            {
+                return None;
+            }
+            let is_last = {
+                let trimmed = after_close.trim();
+                trimmed.is_empty() || trimmed == MAIL_PROMPT_TRAILER
+            };
+            let (tail, trailer, next) = if is_last {
+                (close_marker, after_close.to_string(), None)
+            } else {
+                (
+                    close_marker.clone(),
+                    String::new(),
+                    Some(after_close.strip_prefix('\n').unwrap_or(after_close)),
+                )
+            };
+
+            let mut section = Self {
+                from: attributes.get("from").cloned(),
+                to: None,
+                session_id: attributes.get("session_id").cloned(),
+                fyi: false,
+                urgent,
+                head,
+                tail,
+                trailer,
+                body,
+            };
+            section.unpack_from_attribute();
+            sections.push(section);
+
+            match next {
+                Some(next_rest) => rest = next_rest,
+                None => break,
+            }
         }
 
-        let mut from = attributes.get("from").cloned();
-        let mut to = attributes.get("to").cloned();
-        let mut fyi = false;
-        if to.is_none()
-            && let Some(raw) = from.as_deref()
+        Some(sections)
+    }
+
+    /// Splits the packed `from` attribute (`"{from} via agent-mail, to {to}"`)
+    /// into the `from`/`to`/`fyi` fields.
+    fn unpack_from_attribute(&mut self) {
+        if self.to.is_none()
+            && let Some(raw) = self.from.as_deref()
             && let Some(ix) = raw.find(FROM_TO_SEPARATOR)
         {
             let mut to_value = raw[ix + FROM_TO_SEPARATOR.len()..].to_string();
             if let Some(stripped) = to_value.strip_suffix(FYI_SUFFIX) {
-                fyi = true;
+                self.fyi = true;
                 to_value = stripped.to_string();
             }
-            from = Some(raw[..ix].to_string());
-            to = Some(to_value);
+            self.from = Some(raw[..ix].to_string());
+            self.to = Some(to_value);
         }
-
-        Some(Self {
-            from,
-            to,
-            session_id: attributes.get("session_id").cloned(),
-            fyi,
-            urgent,
-            // `after_tag` is a suffix of `text`, so this span covers the
-            // optional notice plus the opening tag line and its newline.
-            head: text[..text.len() - after_tag.len()].to_string(),
-            tail,
-            body,
-        })
     }
 
     /// Splices a (possibly edited) body back into the original prompt.
     pub(crate) fn rewrap(&self, body: &str) -> String {
-        format!("{}{}{}", self.head, body, self.tail)
+        format!("{}{}{}{}", self.head, body, self.tail, self.trailer)
+    }
+
+    /// This envelope's byte-exact raw form, without the prompt-level trailer:
+    /// what a `copy as raw` action hands to the clipboard.
+    pub(crate) fn raw(&self) -> String {
+        format!("{}{}{}", self.head, self.body, self.tail)
     }
 }
 
 /// The display form of a user message's source blocks: when the first text
-/// block is a known mail envelope it is replaced by its bare body so the box
-/// header can render the metadata as GUI chips instead of raw tag text.
+/// block is a known mail prompt it is replaced by the bare bodies of its
+/// envelope sections (batch prompts join them with a blank line), so the box
+/// header can render each section's metadata as GUI chips instead of raw tag
+/// text.
 pub(crate) fn strip_mail_envelope_blocks(
     source_blocks: &[acp_v2::ContentBlock],
 ) -> Vec<acp_v2::ContentBlock> {
     let Some(acp_v2::ContentBlock::Text(text)) = source_blocks.first() else {
         return source_blocks.to_vec();
     };
-    let Some(envelope) = MailPromptEnvelope::parse(&text.text) else {
+    let Some(sections) = MailPromptEnvelope::parse_sections(&text.text) else {
         return source_blocks.to_vec();
     };
     let mut display = Vec::with_capacity(source_blocks.len());
     let mut body_text = text.clone();
-    body_text.text = envelope.body;
+    body_text.text = sections
+        .iter()
+        .map(|section| section.body.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
     display.push(acp_v2::ContentBlock::Text(body_text));
     display.extend(source_blocks.iter().skip(1).cloned());
     display
+}
+
+/// Whether a user message packs several mail envelopes into one prompt (batch
+/// delivery). Such prompts render their sections read-only: the editor shows
+/// the joined bodies, which no longer splice back into per-envelope shapes.
+pub(crate) fn is_batch_mail_blocks(source_blocks: &[acp_v2::ContentBlock]) -> bool {
+    match source_blocks.first() {
+        Some(acp_v2::ContentBlock::Text(text)) => matches!(
+            MailPromptEnvelope::parse_sections(&text.text),
+            Some(sections) if sections.len() > 1
+        ),
+        _ => false,
+    }
 }
 
 /// Parses `key="value"` pairs out of a tag's attribute text. Values must be
@@ -193,7 +275,9 @@ mod tests {
     use super::*;
 
     fn envelope_text(from: &str, session_id: &str, body: &str) -> String {
-        format!("<agent_message from=\"{from}\" session_id=\"{session_id}\">\n{body}\n</agent_message>\n{MAIL_PROMPT_TRAILER}")
+        format!(
+            "<agent_message from=\"{from}\" session_id=\"{session_id}\">\n{body}\n</agent_message>\n{MAIL_PROMPT_TRAILER}"
+        )
     }
 
     #[test]
@@ -215,7 +299,13 @@ mod tests {
         assert_eq!(parsed.rewrap(&parsed.body), text);
         assert!(parsed.head.starts_with("<agent_message from="));
         assert!(parsed.tail.starts_with("\n</agent_message>"));
-        assert!(parsed.tail.ends_with(MAIL_PROMPT_TRAILER));
+        assert_eq!(parsed.tail, "\n</agent_message>");
+        assert!(parsed.trailer.ends_with(MAIL_PROMPT_TRAILER));
+        // The raw form carries the envelope without the prompt-level trailer.
+        assert_eq!(
+            parsed.raw(),
+            text.replace(&MAIL_PROMPT_TRAILER, "").trim_end()
+        );
     }
 
     #[test]
@@ -227,9 +317,7 @@ mod tests {
             "boss@amo",
             "status report",
         );
-        let text = format!(
-            "{MAIL_PROMPT_PREEMPT_NOTICE}\n{envelope}",
-        );
+        let text = format!("{MAIL_PROMPT_PREEMPT_NOTICE}\n{envelope}",);
         let parsed = MailPromptEnvelope::parse(&text).expect("should parse");
         assert!(parsed.urgent);
         assert!(parsed.fyi);
@@ -271,16 +359,9 @@ mod tests {
 
     #[test]
     fn keeps_body_that_mentions_the_tag() {
-        let text = envelope_text(
-            "a@b",
-            "s",
-            "the closing </agent_message> tag inside prose",
-        );
+        let text = envelope_text("a@b", "s", "the closing </agent_message> tag inside prose");
         let parsed = MailPromptEnvelope::parse(&text).expect("should parse");
-        assert_eq!(
-            parsed.body,
-            "the closing </agent_message> tag inside prose"
-        );
+        assert_eq!(parsed.body, "the closing </agent_message> tag inside prose");
         assert_eq!(parsed.rewrap(&parsed.body), text);
     }
 
@@ -296,10 +377,70 @@ mod tests {
         };
         assert_eq!(text.text, "hello");
 
-        // Non-mail blocks pass through untouched.
         let plain = vec![acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
             "just a prompt",
         ))];
         assert_eq!(strip_mail_envelope_blocks(&plain), plain);
+    }
+
+    #[test]
+    fn parses_batch_of_envelopes() {
+        let text = format!(
+            "<agent_message from=\"jobs@bmo via agent-mail, to zed-x@amo\" session_id=\"jobs@bmo\">\njob STARTED\n</agent_message>\n<agent_message from=\"zed-1@amo via agent-mail, to zed-x@amo\" session_id=\"zed-1@amo\">\njob DONE\nprobe-done\n\n</agent_message>\n{MAIL_PROMPT_TRAILER}"
+        );
+        let sections = MailPromptEnvelope::parse_sections(&text).expect("batch parses");
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[0].body, "job STARTED");
+        assert_eq!(sections[1].body, "job DONE\nprobe-done\n");
+        assert_eq!(sections[0].from.as_deref(), Some("jobs@bmo via agent-mail"));
+        assert_eq!(sections[1].to.as_deref(), Some("zed-x@amo"));
+        // Section raw forms are byte-exact slices of the prompt.
+        assert!(text.starts_with(sections[0].raw().as_str()));
+        assert!(text.contains(sections[1].raw().as_str()));
+        // The whole prompt round-trips through the last section.
+        assert_eq!(sections[1].rewrap(&sections[1].body), text);
+        // `parse` remains single-envelope-only: batches render via sections.
+        assert!(MailPromptEnvelope::parse(&text).is_none());
+
+        // Display joins the bare bodies; the prompt counts as a batch.
+        let blocks = vec![acp_v2::ContentBlock::Text(acp_v2::TextContent::new(text))];
+        let stripped = strip_mail_envelope_blocks(&blocks);
+        let acp_v2::ContentBlock::Text(display) = &stripped[0] else {
+            panic!("expected text block");
+        };
+        assert_eq!(display.text, "job STARTED\n\njob DONE\nprobe-done\n");
+        assert!(is_batch_mail_blocks(&blocks));
+        assert!(!is_batch_mail_blocks(&[acp_v2::ContentBlock::Text(
+            acp_v2::TextContent::new(envelope_text("a@b", "s", "hello"))
+        )]));
+    }
+
+    #[test]
+    fn batch_with_preempt_notice_marks_sections_urgent() {
+        let text = format!(
+            "{MAIL_PROMPT_PREEMPT_NOTICE}\n<agent_message from=\"a@b\" session_id=\"s1\">\nfirst\n</agent_message>\n<agent_message from=\"c@d\" session_id=\"s2\">\nsecond\n</agent_message>"
+        );
+        let sections = MailPromptEnvelope::parse_sections(&text).expect("batch parses");
+        assert_eq!(sections.len(), 2);
+        assert!(sections.iter().all(|section| section.urgent));
+        assert_eq!(sections[0].body, "first");
+        assert_eq!(sections[1].body, "second");
+    }
+
+    #[test]
+    fn batch_keeps_body_that_mentions_the_tags() {
+        let text = concat!(
+            "<agent_message from=\"a@b\" session_id=\"s1\">\n",
+            "the closing </agent_message> tag inside prose; an opening <agent_message from=\"x\" session_id=\"y\"> mention too\n",
+            "</agent_message>\n",
+            "<agent_message from=\"c@d\" session_id=\"s2\">\nsecond\n</agent_message>",
+        );
+        let sections = MailPromptEnvelope::parse_sections(text).expect("batch parses");
+        assert_eq!(sections.len(), 2);
+        assert_eq!(
+            sections[0].body,
+            "the closing </agent_message> tag inside prose; an opening <agent_message from=\"x\" session_id=\"y\"> mention too"
+        );
+        assert_eq!(sections[1].body, "second");
     }
 }
