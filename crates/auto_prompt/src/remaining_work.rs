@@ -42,6 +42,14 @@ pub(crate) fn strip_advisory_next_actions(text: &str) -> &str {
     }
 }
 
+/// The advisory `**(5) Suggested next actions**` section (label line through
+/// end of text), or `None`. Line-anchored like [`advisory_next_actions_offset`]
+/// so a prose mention never matches. The offset is a line start, so slicing is
+/// always on a char boundary.
+pub(crate) fn advisory_next_actions_section(text: &str) -> Option<&str> {
+    advisory_next_actions_offset(text).map(|offset| text[offset..].trim())
+}
+
 /// Code-level remaining work detection: scans the last assistant message
 /// for patterns that explicitly indicate incomplete work. This is a safety
 /// net that catches cases where the LLM ignores its own Rule 10.
@@ -115,7 +123,8 @@ pub(crate) enum SummaryContinuation {
     NothingLeft,
     /// Every remaining item is non-executable now: armed-but-not-built
     /// levers, deferred items, owner-gated arms, thermal/cooldown-gated
-    /// benchmark cells. The chain must STOP — gated work is not picked up
+    /// benchmark cells. The chain stops after at most ONE gated-verdict pass
+    /// (plan 036 `#OwnerGate` protocol) — gated work is not picked up
     /// autonomously and unrelated housekeeping would run uninvited (plan 031
     /// silent stop). Beats remaining plan tasks by design.
     Terminal,
@@ -451,8 +460,15 @@ pub(crate) fn housekeeping_continuation() -> String {
     "Summary reports no remaining work. Do NOT summarize again — housekeeping, in order:\n\
      1. Run the boundary-guard and doc-sync skills for this repo.\n\
      2. Mine the next riir-clippy batch; search online to unblock blocked tasks.\n\
-     3. Re-run benchmarks if the working tree is dirty.\n\
-     4. This lane empty is NOT the fleet empty — sweep the queues: read the boss \
+     3. Benchmarks only when perf-relevant code landed this pass or a plan pins \
+     a re-measure — docs-only dirt is not a trigger; route heavy sweeps via \
+     `agent-mail rig run --est` and never bench a busy rig.\n\
+     4. Teardown: COMMIT AND PUSH your work; remove worktrees you landed or \
+     abandoned (`git worktree remove` + prune) and their target dirs; `rm` this \
+     plan's `/tmp` CARGO_TARGET_DIR when it closes; record landed work in \
+     `.docs/`; for a fixed issue note the fix + commit hash in the related doc, \
+     then `rm` the issue file. Never delete another agent's today-work.\n\
+     5. This lane empty is NOT the fleet empty — sweep the queues: read the boss \
      counts (`agent-mail rig status`, `~/.agent-mail/fleet-cache.json`), then grep \
      every non-zero repo's `.issues` and `.plans` markdown for `**Claimed:**` + \
      expiry. Missing claim or expired lease = claimable — first check the claimer \
@@ -462,12 +478,69 @@ pub(crate) fn housekeeping_continuation() -> String {
      needs no GPU or exclusive rig; rig-bound work goes out via `agent-mail rig \
      run --est`. 'Owner-gated' means ONLY a credential/secret deploy touch — \
      anything else resolves through a recorded Claude verdict.\n\
-     5. Stop only with proof: the what-remains section must list every open unit \
+     6. Stop only with proof: the what-remains section must list every open unit \
      found (path / status / routed-to), and it is a DUTY to have claimed every \
      unclaimed, unblocked, box-actionable item before stopping — anything left \
      unclaimed there betrays the sweep. Otherwise stop cleanly: lone `<stop>` \
      line; do not invent work."
         .to_string()
+}
+
+/// Appends the summary's advisory `**(5) Suggested next actions**` section to
+/// a continuation prompt with routing instructions. The stop contract and the
+/// steps extraction strip this section (its bullets look executable but carry
+/// decision guidance — the loop-bug shape), and that stripping stays; the
+/// housekeeping pass is where the suggestions get ROUTED instead of dropped:
+/// execute what this box can do, mail sibling-owned lanes, resolve owner-calls
+/// through the verdict lane, keep future-dated items parked. The section is
+/// capped so a long tail cannot flood the continuation prompt.
+pub(crate) fn with_advisory_next_actions(prompt: String, summary: Option<&str>) -> String {
+    const MAX_SECTION_CHARS: usize = 2000;
+    let Some(section) = summary.and_then(advisory_next_actions_section) else {
+        return prompt;
+    };
+    let raw_end = section.len().min(MAX_SECTION_CHARS);
+    let end = section.floor_char_boundary(raw_end);
+    let mut out = prompt;
+    out.push_str("\n\nSUGGESTED NEXT ACTIONS (summary section 5) — route them now, do not re-summarize and do not invent new work:\n");
+    out.push_str(&section[..end]);
+    out.push('\n');
+    out.push_str(
+        "Routing: executable on this box now → do it this pass; sibling-owned → mail the \
+         owning lane (`agent-mail send` or SendMessage) — filing is not routing; owner-call \
+         → resolve through the verdict lane (call `request_verdict` with an `#OwnerGate` \
+         section, one decision per item, then execute DO and record SKIP/DEFER) — only a \
+         credential/secret deploy touch stays parked for the owner; future-dated → keep it \
+         in what-remains, optionally schedule a timed wake (`agent-mail send --at`) instead \
+         of polling.",
+    );
+    out
+}
+
+/// One gated-verdict pass for a terminal chain (plan 036 protocol): every
+/// remaining item is armed/deferred/owner-gated, so the only productive round
+/// left is resolving the parked decisions through the verdict lane — not
+/// restarting work, and not full housekeeping (plan 031 keeps that uninvited).
+/// Dispatched once per session (`chain::verdict_pass_sent`).
+pub(crate) fn verdict_pass_continuation(items: &[String]) -> String {
+    let mut prompt = "Everything that remains is armed/deferred/owner-gated. ONE verdict \
+     round before the halt — do NOT start unrelated work and do NOT summarize again:\n\
+     1. Call `request_verdict` with your complete `## Summary` plus ONE \
+     consolidated `#OwnerGate` section — one decision per item below, in the \
+     `- <item>: DO <action> | SKIP | DEFER — reason` form.\n\
+     2. Record each decision in the owning plan/proposal, then act on it: \
+     execute DO decisions; record SKIP/DEFER. Destructive, irreversible, paid, \
+     or outward-publishing actions stay with the user.\n\
+     3. End with a lone `<stop>` line, listing whatever is still parked in the \
+     what-remains section.\n\
+     Gated items:\n"
+        .to_string();
+    for item in items {
+        prompt.push_str("- ");
+        prompt.push_str(item);
+        prompt.push('\n');
+    }
+    prompt
 }
 
 /// Extract the "what to do next" section from a ContextOverflow Phase 1 summary.
@@ -603,9 +676,11 @@ pub(crate) fn extract_summary_next_steps(summary: &str) -> Option<SummaryContinu
          {section}\n\n\
          Pick up from here. Do NOT summarize again — start working immediately: \
          execute the highest-priority item above; where a decision is needed, \
-         make the call yourself and proceed — unless the item is explicitly \
-         owner-gated ('owner go', 'gated on'), in which case skip it, say why, \
-         and take the next ungated item."
+         make the call yourself and proceed — when an item is owner-gated, \
+         resolve it through the verdict lane (call `request_verdict` with an \
+         `#OwnerGate` section, one decision per item, then execute DO and \
+         record SKIP/DEFER); skip only a credential/secret deploy touch for \
+         the owner, saying why, and take the next item."
     )))
 }
 
@@ -1780,6 +1855,11 @@ mod tests {
             result.contains("owner-gated"),
             "tail must instruct the agent to respect explicit owner gates: {result}"
         );
+        // Gated items route through the verdict lane (plan 036), not a silent skip.
+        assert!(
+            result.contains("request_verdict"),
+            "gated items must route through the verdict lane: {result}"
+        );
         // All-gated remains are NOT nothing-left: there is still work the
         // owner can ungat, so the housekeeping path must not fire.
         assert!(!result.contains("boundary-guard"));
@@ -1841,7 +1921,14 @@ mod tests {
         assert!(prompt.contains("boundary-guard"));
         assert!(prompt.contains("doc-sync"));
         assert!(prompt.contains("riir-clippy"));
-        assert!(prompt.contains("Re-run benchmarks"));
+        // Bench routine stays, but the trigger is perf-relevance, not mere dirt.
+        assert!(prompt.contains("Benchmarks only when perf-relevant"));
+        assert!(prompt.contains("agent-mail rig run"));
+        // Teardown law: worktrees, per-plan target dirs, fixed-issue removal.
+        assert!(prompt.contains("Teardown"));
+        assert!(prompt.contains("git worktree remove"));
+        assert!(prompt.contains("CARGO_TARGET_DIR"));
+        assert!(prompt.contains("`rm` the issue file"));
         assert!(prompt.contains("**Claimed:**"));
         assert!(prompt.contains("expired lease = claimable"));
         assert!(prompt.contains("fleet-cache.json"));
@@ -1853,6 +1940,92 @@ mod tests {
             "must end with a stop instruction so the loop terminates"
         );
         assert!(prompt.contains("Do NOT summarize again"));
+        // The advisory section is attached only via with_advisory_next_actions.
+        assert!(!prompt.contains("SUGGESTED NEXT ACTIONS"));
+    }
+
+    #[test]
+    fn test_advisory_next_actions_section_label_forms() {
+        let bold = "**(3) What remains:** done.\n\n**(5) Suggested next actions:**\n- arm the wake";
+        assert_eq!(
+            advisory_next_actions_section(bold),
+            Some("**(5) Suggested next actions:**\n- arm the wake")
+        );
+        let bare = "state: settled.\n\n(5) suggested next actions:\n- x";
+        assert_eq!(
+            advisory_next_actions_section(bare),
+            Some("(5) suggested next actions:\n- x")
+        );
+        let heading = "## What remains\n\nNone.\n\n## Suggested next actions\n\n- x";
+        assert_eq!(
+            advisory_next_actions_section(heading),
+            Some("## Suggested next actions\n\n- x")
+        );
+        // A mid-sentence mention is NOT a label — never matches.
+        let prose = "We reviewed the suggested next actions from yesterday.";
+        assert_eq!(advisory_next_actions_section(prose), None);
+        // No label at all.
+        assert_eq!(advisory_next_actions_section("nothing here"), None);
+    }
+
+    #[test]
+    fn test_with_advisory_next_actions_routes_the_section() {
+        let base = housekeeping_continuation();
+        // No summary / no section: prompt unchanged.
+        assert_eq!(
+            with_advisory_next_actions(base.clone(), None),
+            base,
+            "no summary must leave the prompt untouched"
+        );
+        let plain = "## Summary\n\nAll done.";
+        assert_eq!(
+            with_advisory_next_actions(base.clone(), Some(plain)),
+            base,
+            "a summary without the section-5 label must leave the prompt untouched"
+        );
+        let summary = "**(3) What remains:** parked.\n\n\
+                       **(5) Suggested next actions:**\n\
+                       - (a) sibling lane: S06 retake at amo\n\
+                       - (b) Owner (on wake): review the render\n\
+                       - (c) Recording day (11-18): the batch";
+        let routed = with_advisory_next_actions(base, Some(summary));
+        assert!(routed.contains("SUGGESTED NEXT ACTIONS"));
+        assert!(routed.contains("- (a) sibling lane: S06 retake at amo"));
+        assert!(routed.contains("request_verdict"));
+        assert!(routed.contains("#OwnerGate"));
+        assert!(routed.contains("filing is not routing"));
+        assert!(routed.contains("agent-mail send --at"));
+        // A long tail is truncated at a char boundary, never mid-character:
+        // the emoji head survives, the marker beyond the cap does not.
+        let long = format!(
+            "x\n\n**(5) Suggested next actions:**\n- {}\n{}TAIL-MARKER-BEYOND-CAP",
+            "\u{1F680}".repeat(300),
+            "- filler item with plenty of text\n".repeat(60)
+        );
+        let truncated = with_advisory_next_actions(String::new(), Some(&long));
+        assert!(
+            truncated.len() < 4000,
+            "section must be capped: {}",
+            truncated.len()
+        );
+        assert!(truncated.contains('\u{1F680}'));
+        assert!(!truncated.contains("TAIL-MARKER-BEYOND-CAP"));
+    }
+
+    #[test]
+    fn test_verdict_pass_continuation_lists_protocol_and_items() {
+        let items = vec![
+            "- [ ] deploy the fleet webhook (owner-gated: needs token rotation)".to_string(),
+            "- [ ] rotate keys — gated on owner decision".to_string(),
+        ];
+        let prompt = verdict_pass_continuation(&items);
+        assert!(prompt.contains("request_verdict"));
+        assert!(prompt.contains("#OwnerGate"));
+        assert!(prompt.contains("DO <action> | SKIP | DEFER"));
+        assert!(prompt.contains("<stop>"));
+        assert!(prompt.contains("do NOT start unrelated work"));
+        assert!(prompt.contains("deploy the fleet webhook"));
+        assert!(prompt.contains("rotate keys"));
     }
 
     #[test]

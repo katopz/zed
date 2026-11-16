@@ -73,6 +73,10 @@ struct ChainState {
     /// A valid `<stop>` already got its one housekeeping pass; the next
     /// `<stop>` in this session halts the chain outright.
     stop_housekeeping_sent: bool,
+    /// This session's terminal chain already got its one gated-verdict pass
+    /// (plan 036 `#OwnerGate` protocol); a second terminal classification in
+    /// the same session halts instead of re-asking the reviewer.
+    verdict_pass_sent: bool,
     /// Fingerprint of the last rejected keyword-stop section. The same
     /// section re-emitted after its corrective round honors the stop —
     /// one correction round is enough, and the runaway caps stay a
@@ -453,6 +457,16 @@ pub fn stop_housekeeping_sent(session_id: &str) -> bool {
 
 pub fn record_stop_housekeeping_sent(session_id: &str) {
     with_chain(session_id, |chain| chain.stop_housekeeping_sent = true);
+}
+
+/// Whether this session's terminal chain already got its one gated-verdict
+/// pass.
+pub fn verdict_pass_sent(session_id: &str) -> bool {
+    with_chain(session_id, |chain| chain.verdict_pass_sent)
+}
+
+pub fn record_verdict_pass_sent(session_id: &str) {
+    with_chain(session_id, |chain| chain.verdict_pass_sent = true);
 }
 
 /// Pure read: has this exact violating section already been rejected once in

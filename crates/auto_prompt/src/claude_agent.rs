@@ -234,8 +234,10 @@ pub fn decide_claude(
     // retries and idle accounting. Verdict comes from the shared
     // `classify_keyword_stop` (see decide_precheck): a non-repeated
     // violating stop is re-prompted with the offending section; a plan-031
-    // terminal summary stops without housekeeping; the first valid stop
-    // dispatches one housekeeping pass before the halt; repeats halt.
+    // terminal summary gets one gated-verdict pass (plan 036) when claimed
+    // plans hold gated items, then stops without housekeeping; the first
+    // valid stop dispatches one housekeeping pass before the halt; repeats
+    // halt.
     {
         let last_message = thread.read(cx).last_assistant_message_text(cx);
         if last_message
@@ -268,15 +270,33 @@ pub fn decide_claude(
                         "[auto_prompt::claude] valid `{}` stop — dispatching one housekeeping pass before the halt",
                         crate::STOP_KEYWORD
                     );
+                    let gates = crate::owner_gated_items(&session_key, None);
                     let action = crate::stop_followup_action(
                         &thread,
                         cx,
-                        crate::housekeeping_continuation(),
+                        crate::housekeeping_dispatch(last_message.as_deref(), &gates),
                         last_message.clone(),
                     );
                     return AutoPromptDecision::DispatchNow(action);
                 }
                 crate::KeywordStop::Terminal => {
+                    let gates = crate::owner_gated_items(&session_key, None);
+                    if !gates.is_empty() && !crate::chain::verdict_pass_sent(&session_key) {
+                        // Plan 036: one gated-verdict round before the halt.
+                        crate::chain::record_verdict_pass_sent(&session_key);
+                        log::warn!(
+                            "[auto_prompt::claude] `{}` stop over a terminal summary with {} owner-gated item(s) — one gated-verdict pass before the halt",
+                            crate::STOP_KEYWORD,
+                            gates.len()
+                        );
+                        let action = crate::stop_followup_action(
+                            &thread,
+                            cx,
+                            crate::verdict_pass_continuation(&gates),
+                            last_message.clone(),
+                        );
+                        return AutoPromptDecision::DispatchNow(action);
+                    }
                     log::warn!(
                         "[auto_prompt::claude] `{}` stop over a terminal summary — stopping chain without housekeeping",
                         crate::STOP_KEYWORD

@@ -58,7 +58,7 @@ use overflow::{
 };
 pub(crate) use remaining_work::{
     STOP_KEYWORD, housekeeping_continuation, message_requests_stop, stop_keyword_violation_prompt,
-    stop_keyword_violation_section,
+    stop_keyword_violation_section, verdict_pass_continuation, with_advisory_next_actions,
 };
 use remaining_work::{
     SummaryContinuation, detect_remaining_work, extract_summary_next_steps,
@@ -77,7 +77,8 @@ pub(crate) enum KeywordStop {
         repeat: bool,
     },
     /// Everything that remains is armed/deferred/owner-gated (plan 031
-    /// terminal summary) — silent stop, no housekeeping pass.
+    /// terminal summary) — one gated-verdict pass (plan 036, when claimed
+    /// plans hold gated items), then a silent stop.
     Terminal,
     /// Valid quiet stop that has not had its single housekeeping pass yet.
     Housekeeping,
@@ -846,7 +847,10 @@ fn line_is_owner_gated(line: &str) -> bool {
 /// consolidated `#OwnerGate` list instead of one question per summary
 /// (issue 057; the review-bandwidth lesson). Lines are capped so a
 /// gate-heavy plan cannot flood the continuation prompt.
-fn owner_gated_items(session_id: &str, project_root: Option<&std::path::Path>) -> Vec<String> {
+pub(crate) fn owner_gated_items(
+    session_id: &str,
+    project_root: Option<&std::path::Path>,
+) -> Vec<String> {
     const MAX_ITEMS: usize = 12;
     const MAX_ITEM_CHARS: usize = 200;
     let claims = plan_registry::claims_for_session(session_id);
@@ -880,19 +884,34 @@ fn owner_gated_items(session_id: &str, project_root: Option<&std::path::Path>) -
 
 /// Appends the consolidated `#OwnerGate` demand to the housekeeping prompt
 /// when this chain's claimed plans hold gated work (issue 057). Empty plans
-/// get the plain prompt — no point teaching the block on an empty list.
+/// get the plain prompt — no point teaching the block on an empty list. Per
+/// plan 036 the demand is the verdict protocol, not a collection request:
+/// call `request_verdict`, get one `DO <action> | SKIP | DEFER` decision per
+/// item, record it, and act.
 fn with_owner_gate_batching(prompt: String, items: &[String]) -> String {
     if items.is_empty() {
         return prompt;
     }
     let mut section = prompt;
-    section.push_str("\n\nOWNER-GATE CONSOLIDATION (this chain's last pass): before your final `<stop>`, collect every owner-gated item below into ONE consolidated `#OwnerGate` list in the final summary context — one decision per item, no scattering across sections:\n");
+    section.push_str("\n\nOWNER-GATE CONSOLIDATION (this chain's last pass): before your final `<stop>`, resolve every owner-gated item below through the verdict lane — call `request_verdict` with ONE consolidated `#OwnerGate` section, one decision per item in the `- <item>: DO <action> | SKIP | DEFER — reason` form, record the decisions in the owning plan, and execute the DO decisions; destructive, irreversible, paid, or outward-publishing actions stay with the user:\n");
     for item in items {
         section.push_str("- ");
         section.push_str(item);
         section.push('\n');
     }
     section
+}
+
+/// The housekeeping continuation enriched for dispatch: the summary's
+/// advisory section-5 routing block first, then the consolidated `#OwnerGate`
+/// verdict demand (gates last — the final instruction is the one acted on).
+/// Every housekeeping dispatch site routes through this so no lane drops the
+/// advisory routing or the gated verdicts.
+pub(crate) fn housekeeping_dispatch(summary: Option<&str>, gates: &[String]) -> String {
+    with_owner_gate_batching(
+        with_advisory_next_actions(housekeeping_continuation(), summary),
+        gates,
+    )
 }
 
 /// Confidence threshold below which we stop during the Working phase.
@@ -1076,7 +1095,7 @@ const DECISIVE_STOP_THRESHOLD: f64 = 0.15;
 /// new/same thread is continued with this instruction and the summary itself
 /// carries "what remains". The manual click dispatches this same directive
 /// directly, with no orchestrator call at all.
-pub const CONTINUE_REMAINS_DECISION: &str = "Continue remaining work — best perf/sec, prod-grade (SOLID/DRY); file issues/plans for full coverage. Nothing left? Housekeeping (doc-sync, riir-clippy mining, code-smell hunt, online search to unblock deferred work) or unclaimed tasks in other repos. Do not loop re-checking: if everything that remains is blocked/deferred/owner-gated, say so in the what-remains section and end with a lone <stop> line — a <stop> above open, unblocked work is rejected and re-prompts.";
+pub const CONTINUE_REMAINS_DECISION: &str = "Continue remaining work — best perf/sec, prod-grade (SOLID/DRY); file issues/plans for full coverage. Nothing left? Housekeeping (doc-sync, riir-clippy mining, teardown of landed worktrees/target dirs/fixed-issue files, online search to unblock deferred work) or unclaimed tasks in other repos. Owner-gated items resolve through the verdict lane (call `request_verdict` with an `#OwnerGate` section — execute DO decisions, record SKIP/DEFER); only a credential/secret deploy touch waits for the owner. Do not loop re-checking: if everything that remains is blocked/deferred/owner-gated, say so in the what-remains section and end with a lone <stop> line — a <stop> above open, unblocked work is rejected and re-prompts.";
 
 /// Returns true when the orchestration LLM is decisively stopping.
 /// A decisive stop has very low confidence and no prompt — the LLM is
@@ -1160,7 +1179,8 @@ pub fn is_waiting_for_user_decision(last_assistant_message: Option<&str>) -> boo
 ///   housekeeping directive (rules; the old deferral paid an orchestrator
 ///   call only to stop into the same hook);
 /// - summary is TERMINAL (every remaining item armed/deferred/owner-gated) →
-///   `Stopped` — gated work is not picked up autonomously (plan 031);
+///   one gated-verdict pass (plan 036, when claimed plans hold gated items)
+///   else `Stopped` — gated work is not picked up autonomously (plan 031);
 /// - no next-steps section → continue same-thread with the fixed directive.
 ///
 /// Returns `None` also when there is no summary at the last paragraph (the
@@ -1199,10 +1219,25 @@ pub fn summary_continuation_fast_path(data: &LlmCallData) -> Option<AutoPromptOu
             log::info!(
                 "[auto_prompt] summary fast path: summary declares nothing left — switching to housekeeping (rules, no orchestrator call)"
             );
-            let action = data.make_continue_action(housekeeping_continuation());
+            let session_key = data.session_id.to_string();
+            let gates = owner_gated_items(&session_key, None);
+            let action = data.make_continue_action(housekeeping_dispatch(Some(last), &gates));
             return Some(AutoPromptOutcome::Continue(action));
         }
         Some(SummaryContinuation::Terminal) => {
+            let session_key = data.session_id.to_string();
+            let gates = owner_gated_items(&session_key, None);
+            if !gates.is_empty() && !chain::verdict_pass_sent(&session_key) {
+                // Plan 036: parked owner decisions get ONE verdict round
+                // before the halt — acting on them may still unlock work.
+                chain::record_verdict_pass_sent(&session_key);
+                log::warn!(
+                    "[auto_prompt] summary fast path: terminal summary with {} owner-gated item(s) — dispatching one gated-verdict pass before the halt",
+                    gates.len()
+                );
+                let action = data.make_continue_action(verdict_pass_continuation(&gates));
+                return Some(AutoPromptOutcome::Continue(action));
+            }
             log::warn!(
                 "[auto_prompt] summary fast path: summary is terminal (all remaining work armed/deferred/owner-gated) — stopping the chain (housekeeping skipped)"
             );
@@ -1242,8 +1277,9 @@ pub fn summary_continuation_fast_path(data: &LlmCallData) -> Option<AutoPromptOu
 /// True when the last assistant message is a voluntary summary whose
 /// remaining-work section is entirely non-executable now — every bullet
 /// armed / deferred / owner-gated / thermal-gated (plan 031 silent stop).
-/// Such a summary ends the chain: gated work is not picked up autonomously,
-/// and the stop-time housekeeping hook is skipped so nothing new spins up.
+/// Such a summary ends the chain after at most ONE gated-verdict pass (plan
+/// 036 `#OwnerGate` protocol): gated work is not picked up autonomously, and
+/// the stop-time housekeeping hook is skipped so nothing else spins up.
 pub fn summary_declares_terminal(last_assistant_message: Option<&str>) -> bool {
     let Some(text) = last_assistant_message
         .map(str::trim)
@@ -1353,6 +1389,19 @@ pub(crate) fn stop_keyword_outcome(data: &LlmCallData) -> Option<AutoPromptOutco
             )))
         }
         KeywordStop::Terminal => {
+            let gates = owner_gated_items(&session_key, None);
+            if !gates.is_empty() && !chain::verdict_pass_sent(&session_key) {
+                // Plan 036: the parked decisions get ONE verdict round before
+                // the halt — acting on DO decisions may still unlock work.
+                chain::record_verdict_pass_sent(&session_key);
+                log::warn!(
+                    "[auto_prompt::decide_with_llm] `{STOP_KEYWORD}` stop over a terminal summary with {} owner-gated item(s) — one gated-verdict pass before the halt (session={session_key})",
+                    gates.len()
+                );
+                return Some(AutoPromptOutcome::Continue(
+                    data.make_continue_action(verdict_pass_continuation(&gates)),
+                ));
+            }
             log::warn!(
                 "[auto_prompt::decide_with_llm] `{STOP_KEYWORD}` stop over a terminal summary — stopping chain without housekeeping (session={session_key})"
             );
@@ -1368,7 +1417,7 @@ pub(crate) fn stop_keyword_outcome(data: &LlmCallData) -> Option<AutoPromptOutco
             );
             let gates = owner_gated_items(&session_key, None);
             Some(AutoPromptOutcome::Continue(data.make_continue_action(
-                with_owner_gate_batching(housekeeping_continuation(), &gates),
+                housekeeping_dispatch(Some(text), &gates),
             )))
         }
         KeywordStop::Final => {
@@ -1506,7 +1555,9 @@ fn decide_precheck(
     // - Violation (open, unblocked work still listed): fall through —
     //   `decide_with_llm` re-prompts with the offending section (`loop-bug`
     //   contract: `<stop>` requires everything left blocked/gated/waiting).
-    // - Terminal (plan 031, all-deferred): silent stop, no housekeeping.
+    // - Terminal (plan 031, all-deferred): one gated-verdict pass (plan 036)
+    //   when claimed plans hold gated items, then a silent stop — no
+    //   housekeeping.
     // - Housekeeping: the first valid stop dispatches one housekeeping pass
     //   before the halt — skipping it starved the idle lane.
     // - Final / repeated Violation: halt outright.
@@ -1544,12 +1595,29 @@ fn decide_precheck(
                 let action = stop_followup_action(
                     &thread,
                     cx,
-                    with_owner_gate_batching(housekeeping_continuation(), &gates),
+                    housekeeping_dispatch(last_assistant_message.as_deref(), &gates),
                     last_assistant_message.clone(),
                 );
                 return DecidePrecheck::Decision(AutoPromptDecision::DispatchNow(action));
             }
             KeywordStop::Terminal => {
+                let gates = owner_gated_items(&session_key, project_root.as_deref());
+                if !gates.is_empty() && !chain::verdict_pass_sent(&session_key) {
+                    // Plan 036: one gated-verdict round before the halt.
+                    chain::record_verdict_pass_sent(&session_key);
+                    log::warn!(
+                        "[auto_prompt::decide] `{STOP_KEYWORD}` stop over a terminal summary with {} owner-gated item(s) — dispatching one gated-verdict pass (session={:?})",
+                        gates.len(),
+                        thread.read(cx).session_id()
+                    );
+                    let action = stop_followup_action(
+                        &thread,
+                        cx,
+                        verdict_pass_continuation(&gates),
+                        last_assistant_message.clone(),
+                    );
+                    return DecidePrecheck::Decision(AutoPromptDecision::DispatchNow(action));
+                }
                 log::warn!(
                     "[auto_prompt::decide] `{STOP_KEYWORD}` stop over a terminal summary — stopping chain without housekeeping (session={:?})",
                     thread.read(cx).session_id()

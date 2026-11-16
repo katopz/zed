@@ -1,6 +1,8 @@
 use super::*;
 use crate::lightweight_context::is_actionable_checkbox;
-use crate::remaining_work::{SummaryContinuation, extract_summary_next_steps, strip_advisory_next_actions};
+use crate::remaining_work::{
+    SummaryContinuation, extract_summary_next_steps, strip_advisory_next_actions,
+};
 use language_model::LanguageModelCompletionEvent;
 use std::time::Duration;
 
@@ -50,13 +52,19 @@ fn advisory_next_actions_section_never_becomes_continuation_steps() {
 #[test]
 fn strip_cuts_from_the_label_and_keeps_prose_mentions() {
     let text = "**(3) What remains:** done.\n\n**(5) Suggested next actions:**\n- arm the wake";
-    assert_eq!(strip_advisory_next_actions(text), "**(3) What remains:** done.");
+    assert_eq!(
+        strip_advisory_next_actions(text),
+        "**(3) What remains:** done."
+    );
     // Lowercase + bare (5) form also cuts.
     let loose = "state: settled.\n\n(5) suggested next actions: none";
     assert_eq!(strip_advisory_next_actions(loose), "state: settled.");
     // A heading form cuts too.
     let heading = "## What remains\n\nNone.\n\n## Suggested next actions\n\n- x";
-    assert_eq!(strip_advisory_next_actions(heading), "## What remains\n\nNone.");
+    assert_eq!(
+        strip_advisory_next_actions(heading),
+        "## What remains\n\nNone."
+    );
     // A mid-sentence mention is NOT a label — never cut.
     let prose = "We reviewed the suggested next actions from yesterday.";
     assert_eq!(strip_advisory_next_actions(prose), prose);
@@ -168,8 +176,39 @@ fn housekeeping_prompt_gains_the_owner_gate_block_only_when_gates_exist() {
     );
     assert!(batched.contains("OWNER-GATE CONSOLIDATION"));
     assert!(batched.contains("#OwnerGate"));
+    assert!(batched.contains("request_verdict"));
+    assert!(batched.contains("DO <action> | SKIP | DEFER"));
     assert!(batched.contains("- [ ] ship it (owner-gated)"));
     assert!(batched.starts_with(&housekeeping_continuation()));
+}
+
+#[test]
+fn housekeeping_dispatch_attaches_advisory_then_gates() {
+    let base = housekeeping_continuation();
+    let plain = housekeeping_dispatch(None, &[]);
+    assert_eq!(
+        plain, base,
+        "no advice + no gates must yield the plain prompt"
+    );
+    let summary = "**(3) What remains:** parked.\n\n\
+                   **(5) Suggested next actions:**\n\
+                   - (a) sibling lane: S06 retake at amo";
+    let advised = housekeeping_dispatch(Some(summary), &[]);
+    assert!(advised.starts_with(&base));
+    assert!(advised.contains("SUGGESTED NEXT ACTIONS"));
+    assert!(advised.contains("- (a) sibling lane: S06 retake at amo"));
+    let batched =
+        housekeeping_dispatch(Some(summary), &["- [ ] ship it (owner-gated)".to_string()]);
+    assert!(batched.contains("OWNER-GATE CONSOLIDATION"));
+    // Advisory routing first, owner-gate demand last — the final instruction
+    // is the one acted on.
+    let advisory_pos = batched
+        .find("SUGGESTED NEXT ACTIONS")
+        .expect("advisory block present");
+    let gates_pos = batched
+        .find("OWNER-GATE CONSOLIDATION")
+        .expect("gates block present");
+    assert!(advisory_pos < gates_pos);
 }
 
 #[test]
@@ -187,12 +226,18 @@ fn make_continue_action_prepends_resume_state_without_stacking() {
 
     let with_state = data.make_continue_action("continue".to_string());
     assert!(
-        with_state.next_prompt.starts_with("RESUME-STATE (chain facts"),
+        with_state
+            .next_prompt
+            .starts_with("RESUME-STATE (chain facts"),
         "resume state leads the prompt: {}",
         with_state.next_prompt
     );
     assert!(with_state.next_prompt.contains("attempt 1"));
-    assert!(with_state.next_prompt.contains("runaway budget left: 19 rounds"));
+    assert!(
+        with_state
+            .next_prompt
+            .contains("runaway budget left: 19 rounds")
+    );
     // Idle streak 2 → budget 20 - 2 = 18 on the next build, attempt 2.
     chain::record_turn(session, false);
     let again = data.make_continue_action("continue".to_string());
@@ -421,7 +466,8 @@ fn stop_keyword_outcome_repeated_violation_is_honored() {
 #[test]
 fn stop_keyword_outcome_terminal_summary_stops_without_housekeeping() {
     // Plan 031: a `<stop>` above an all-deferred summary is a silent stop —
-    // no housekeeping pass may run behind it.
+    // no housekeeping pass may run behind it. (No claimed plans → no gated
+    // items → no verdict pass either.)
     let session = "stop-terminal-summary-test";
     let message = "\n## Summary\n\n\
         **(1) Original task:** Build and measure the q8 arm.\n\n\
@@ -438,6 +484,60 @@ fn stop_keyword_outcome_terminal_summary_stops_without_housekeeping() {
         Some(AutoPromptOutcome::Stopped { .. }) => {}
         other => panic!("expected Stopped (terminal, plan 031), got {other:?}"),
     }
+}
+
+#[test]
+fn stop_keyword_outcome_terminal_with_gates_gets_one_verdict_pass() {
+    // Plan 036: a terminal stop whose claimed plans hold owner-gated items
+    // gets ONE gated-verdict round before the halt; the next terminal stop
+    // is final (the once-flag keeps this single-shot per session).
+    let _lock = plan_registry::lock_for_test();
+    let session = "stop-terminal-gates-test";
+    plan_registry::release_all_for_session(session);
+    chain::clear_session(session);
+    let plan_path = std::env::temp_dir().join(format!(
+        "auto-prompt-terminal-gates-test-{}.md",
+        std::process::id()
+    ));
+    std::fs::write(
+        &plan_path,
+        "# Plan\n\n- [ ] scope T3.1 (owner-gated: needs owner scoping)\n",
+    )
+    .expect("write plan");
+    plan_registry::try_claim(&plan_path.to_string_lossy(), session, "terminal gates test")
+        .expect("claim the gate plan");
+
+    let message = "\n## Summary\n\n\
+        **(1) Original task:** Build and measure the q8 arm.\n\n\
+        **(2) Accomplished:**\n\
+        - All gates PASS.\n\n\
+        **(3) What remains:**\n\
+        - 32K cooled-window cell (7-min cooldown protocol).\n\
+        - Phase 3: owner-gated, needs you to scope T3.1.\n\n\
+        **(4) Active plan state:** `.plans/562_x.md` — COMPLETE.\n\n\
+        <stop>";
+    let mut data = overflow_test_data(session, Some(message));
+    data.context_exceeds_limit = false;
+    match stop_keyword_outcome(&data) {
+        Some(AutoPromptOutcome::Continue(action)) => {
+            assert!(
+                action.next_prompt.contains("request_verdict")
+                    && action.next_prompt.contains("#OwnerGate")
+                    && action.next_prompt.contains("scope T3.1"),
+                "terminal stop with gates must dispatch the verdict pass: {}",
+                action.next_prompt
+            );
+        }
+        other => panic!("expected Continue(verdict pass), got {other:?}"),
+    }
+    match stop_keyword_outcome(&data) {
+        Some(AutoPromptOutcome::Stopped { .. }) => {}
+        other => panic!("expected Stopped on the second terminal stop, got {other:?}"),
+    }
+
+    plan_registry::release_all_for_session(session);
+    let _ = std::fs::remove_file(&plan_path);
+    chain::clear_session(session);
 }
 
 #[test]
@@ -722,6 +822,65 @@ fn summary_fast_path_stops_on_terminal_summary() {
         }
         other => panic!("expected Stopped, got {other:?}"),
     }
+}
+
+#[test]
+fn summary_fast_path_terminal_with_gates_gets_one_verdict_pass() {
+    // Plan 036: a terminal summary whose claimed plans hold owner-gated items
+    // continues ONCE with the gated-verdict pass; the second terminal summary
+    // halts (verdict_pass_sent keeps this single-shot per session).
+    let _lock = plan_registry::lock_for_test();
+    let session = "summary-fast-path-terminal-gates-test";
+    plan_registry::release_all_for_session(session);
+    chain::clear_session(session);
+    clear_summary_for_session(session);
+    let plan_path = std::env::temp_dir().join(format!(
+        "auto-prompt-fast-path-gates-test-{}.md",
+        std::process::id()
+    ));
+    std::fs::write(
+        &plan_path,
+        "# Plan\n\n- [ ] arm the wake lever (owner-gated: needs owner approval)\n",
+    )
+    .expect("write plan");
+    plan_registry::try_claim(
+        &plan_path.to_string_lossy(),
+        session,
+        "fast path gates test",
+    )
+    .expect("claim the gate plan");
+
+    let mut data = overflow_test_data(
+        session,
+        Some(
+            "## Summary\n\nWash @16K measured.\n\n## What Remains\n\n\
+                 - 32K cooled-window cell (7-min-cooldown protocol).\n\
+                 - T2c-b — P3, deferred.\n\
+                 - League lanes unchanged.",
+        ),
+    );
+    data.context_exceeds_limit = false;
+    match summary_continuation_fast_path(&data) {
+        Some(AutoPromptOutcome::Continue(action)) => {
+            assert!(
+                action.next_prompt.contains("request_verdict")
+                    && action.next_prompt.contains("arm the wake lever"),
+                "terminal summary with gates must dispatch one verdict pass: {}",
+                action.next_prompt
+            );
+        }
+        other => panic!("expected Continue(verdict pass), got {other:?}"),
+    }
+    match summary_continuation_fast_path(&data) {
+        Some(AutoPromptOutcome::Stopped { reason }) => {
+            assert!(reason.contains("terminal"), "reason: {reason}");
+        }
+        other => panic!("expected Stopped on the second terminal summary, got {other:?}"),
+    }
+
+    plan_registry::release_all_for_session(session);
+    let _ = std::fs::remove_file(&plan_path);
+    chain::clear_session(session);
 }
 
 #[test]

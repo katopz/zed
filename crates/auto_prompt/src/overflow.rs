@@ -3,14 +3,15 @@
 
 use crate::remaining_work::{
     PlanRepoFilter, SummaryContinuation, auto_claim_plan, detect_remaining_plan_tasks,
-    extract_summary_next_steps, housekeeping_continuation, looks_like_voluntary_summary,
+    extract_summary_next_steps, looks_like_voluntary_summary,
 };
 use crate::{
     AutoPromptAction, AutoPromptConfig, AutoPromptDecision, AutoPromptDelayReason,
     AutoPromptOutcome, CONTINUE_REMAINS_DECISION, LlmCallData, api_unreachable,
     build_prompt_summary, call_language_model, chain, clear_summary_for_session, debug_log,
-    load_config_cached, paused, peer_states, reset_iteration_with_session, set_summary_state,
-    summary_state_for, truncate_at_char_boundary, with_first_prompt_context,
+    housekeeping_dispatch, load_config_cached, owner_gated_items, paused, peer_states,
+    reset_iteration_with_session, set_summary_state, summary_state_for, truncate_at_char_boundary,
+    with_first_prompt_context,
 };
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -492,7 +493,9 @@ pub(crate) fn context_overflow_outcome(data: &LlmCallData) -> AutoPromptOutcome 
             // Plan 031 silent stop: a terminal summary (all remaining work
             // armed/deferred/owner-gated) ends the chain — plan tasks do NOT
             // resurrect it, and the stop-time housekeeping hook is skipped by
-            // the caller via summary_declares_terminal.
+            // the caller via summary_declares_terminal. (The gated-verdict
+            // pass lives in the same-thread paths only: a fork starts a fresh
+            // session whose chain state cannot carry the once-flag.)
             log::warn!(
                 "auto_prompt: ContextOverflow Phase 2 — summary is terminal (all remaining work armed/deferred/owner-gated) — stopping; plan tasks do not resurrect a terminal chain"
             );
@@ -525,7 +528,8 @@ pub(crate) fn context_overflow_outcome(data: &LlmCallData) -> AutoPromptOutcome 
                 log::warn!(
                     "auto_prompt: ContextOverflow Phase 2 — summary declares nothing left and no plan tasks remain, switching to housekeeping"
                 );
-                housekeeping_continuation()
+                let gates = owner_gated_items(&data.session_id.to_string(), None);
+                housekeeping_dispatch(data.last_assistant_message.as_deref(), &gates)
             }
         } else {
             log::warn!(
@@ -751,7 +755,8 @@ pub(crate) async fn cutoff_context_full_outcome(
             if plan_tasks_remain {
                 CONTINUE_REMAINS_DECISION.to_string()
             } else {
-                housekeeping_continuation()
+                let gates = owner_gated_items(&data.session_id.to_string(), None);
+                housekeeping_dispatch(Some(summary.as_str()), &gates)
             }
         }
         Some(SummaryContinuation::Steps(steps)) => {
