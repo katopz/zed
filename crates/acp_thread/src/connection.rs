@@ -113,6 +113,21 @@ pub trait AgentConnection {
         cx: &mut App,
     ) -> Task<Result<Entity<AcpThread>>>;
 
+    /// Creates a session whose creation request carries agent-specific
+    /// `_meta` (for example a pinned model). Connections that cannot carry it
+    /// refuse, so a caller never believes options applied that were dropped.
+    fn new_session_with_meta(
+        self: Rc<Self>,
+        _project: Entity<Project>,
+        _work_dirs: PathList,
+        _meta: acp_v2::Meta,
+        _cx: &mut App,
+    ) -> Task<Result<Entity<AcpThread>>> {
+        Task::ready(Err(anyhow::anyhow!(
+            "this agent connection does not support session creation options"
+        )))
+    }
+
     /// Whether this agent supports loading existing sessions.
     fn supports_load_session(&self) -> bool {
         false
@@ -1001,6 +1016,9 @@ mod test_support {
         supports_truncate: bool,
         blocking_retry: bool,
         close_count: Arc<AtomicUsize>,
+        /// `None` refuses `new_session_with_meta`, like a connection that
+        /// cannot carry session creation options.
+        session_metas: Option<Arc<Mutex<Vec<acp_v2::Meta>>>>,
         agent_id: AgentId,
         telemetry_id: SharedString,
         prompt_capabilities_rx: watch::Receiver<acp_v2::PromptCapabilities>,
@@ -1054,6 +1072,7 @@ mod test_support {
                 supports_truncate: true,
                 blocking_retry: false,
                 close_count: Arc::new(AtomicUsize::new(0)),
+                session_metas: None,
                 agent_id: AgentId::new("stub"),
                 telemetry_id: "stub".into(),
                 prompt_capabilities_rx: watch::Receiver::constant(
@@ -1247,6 +1266,14 @@ mod test_support {
             self
         }
 
+        /// Accepts `new_session_with_meta` and records each meta in the
+        /// returned log.
+        pub fn with_session_meta_log(mut self) -> (Self, Arc<Mutex<Vec<acp_v2::Meta>>>) {
+            let log = Arc::new(Mutex::new(Vec::new()));
+            self.session_metas = Some(log.clone());
+            (self, log)
+        }
+
         pub fn with_agent_id(mut self, agent_id: AgentId) -> Self {
             self.agent_id = agent_id;
             self
@@ -1357,6 +1384,22 @@ mod test_support {
             let session_id = acp_v2::SessionId::new(StubSessionCounter::next(cx).to_string());
             let thread = self.create_session(session_id, project, work_dirs, None, cx);
             Task::ready(Ok(thread))
+        }
+
+        fn new_session_with_meta(
+            self: Rc<Self>,
+            project: Entity<Project>,
+            work_dirs: PathList,
+            meta: acp_v2::Meta,
+            cx: &mut gpui::App,
+        ) -> Task<gpui::Result<Entity<AcpThread>>> {
+            let Some(session_metas) = self.session_metas.clone() else {
+                return Task::ready(Err(anyhow::Error::msg(
+                    "stub connection does not support session creation options",
+                )));
+            };
+            session_metas.lock().push(meta);
+            self.new_session(project, work_dirs, cx)
         }
 
         fn supports_load_session(&self) -> bool {

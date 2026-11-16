@@ -1,7 +1,9 @@
 //! Fork-owned agent settings (plan 038), kept out of `agent_settings.rs` so
 //! upstream syncs don't conflict on them.
 
-use settings::{ForkAgentSettingsContent, LanguageModelSelection, VerdictReviewerSetting};
+use settings::{
+    ForkAgentSettingsContent, LanguageModelSelection, VerdictAdvisorSetting, VerdictReviewerSetting,
+};
 
 /// Default for `AgentSettings::stream_idle_timeout_secs`.
 pub const DEFAULT_STREAM_IDLE_TIMEOUT_SECS: u64 = 120;
@@ -25,6 +27,9 @@ pub struct ForkAgentSettings {
     /// Model for the secondary verdict entry (`reviewer: "secondary"`).
     /// `None` hides that entry.
     pub verdict_secondary_model: Option<LanguageModelSelection>,
+    /// Executor and advisor models for the `claude_code` reviewer's advisor
+    /// route. `None` keeps the plain session.
+    pub verdict_advisor: Option<VerdictAdvisorSetting>,
     pub claude_md_symlink: bool,
     pub project_claude_md_symlink: bool,
     /// Whether auto_prompt should steal keyboard focus when it creates a new
@@ -58,6 +63,7 @@ impl ForkAgentSettings {
                 .unwrap_or(DEFAULT_VERDICT_MAX_ROUNDS),
             verdict_reviewer: content.verdict_reviewer.unwrap_or_default(),
             verdict_secondary_model: content.verdict_secondary_model,
+            verdict_advisor: content.verdict_advisor,
             claude_md_symlink: content.claude_md_symlink.unwrap_or(true),
             project_claude_md_symlink: content.project_claude_md_symlink.unwrap_or(false),
             auto_focus_new_thread: content.auto_focus_new_thread.unwrap_or(false),

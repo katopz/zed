@@ -45,6 +45,16 @@ pub struct ForkAgentSettingsContent {
     /// Default: null
     pub verdict_secondary_model: Option<LanguageModelSelection>,
 
+    /// Runs the `claude_code` reviewer as a cheaper executor model that
+    /// consults a stronger advisor model through Claude Code's advisor tool
+    /// (`.issues/067`), for example
+    /// `{ "executor_model": "sonnet", "advisor_model": "fable" }`. If the
+    /// advisor session cannot be created the reviewer falls back to the plain
+    /// `claude_code` session. Unset keeps the plain session.
+    ///
+    /// Default: null
+    pub verdict_advisor: Option<VerdictAdvisorSetting>,
+
     /// Whether to symlink `~/.claude/CLAUDE.md` to your user-global `AGENTS.md`,
     /// so Claude Code reads the same personal instructions Zed's agent does.
     ///
@@ -124,6 +134,17 @@ pub struct ForkAgentSettingsContent {
     ///
     /// Default: false
     pub agent_mail_spawn_threads: Option<bool>,
+}
+
+/// Model pairing for the advisor route of the `claude_code` verdict reviewer.
+/// Both are Claude Code model names or aliases.
+#[with_fallible_options]
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, MergeFrom, PartialEq)]
+pub struct VerdictAdvisorSetting {
+    /// The model that runs the reviewer session and writes the verdict.
+    pub executor_model: String,
+    /// The model the executor consults before answering.
+    pub advisor_model: String,
 }
 
 /// Which backend provides the reviewer thread for the `request_verdict` tool.

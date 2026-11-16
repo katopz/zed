@@ -47,6 +47,7 @@ use acp_thread::{AcpThread, LoadError, TerminalProviderEvent};
 use terminal::TerminalBuilder;
 use terminal::terminal_settings::{AlternateScroll, CursorShape};
 
+use super::claude_session::{McpSecretEnvironment, merge_meta};
 use crate::{CURSOR_ID, GEMINI_ID};
 
 pub const GEMINI_TERMINAL_AUTH_METHOD_ID: &str = "spawn-gemini-cli";
@@ -1231,30 +1232,33 @@ struct SessionDirectories {
 }
 
 impl SessionDirectories {
-    fn into_new_session_request(self, mcp_servers: Vec<acp::McpServer>) -> acp::NewSessionRequest {
+    fn into_new_session_request(self, mcp: SessionMcpServers) -> acp::NewSessionRequest {
         acp::NewSessionRequest::new(self.cwd)
             .additional_directories(self.additional_directories)
-            .mcp_servers(mcp_servers)
+            .mcp_servers(mcp.servers)
+            .meta(mcp.meta)
     }
 
     fn into_load_session_request(
         self,
         session_id: acp_v2::SessionId,
-        mcp_servers: Vec<acp::McpServer>,
+        mcp: SessionMcpServers,
     ) -> acp::LoadSessionRequest {
         acp::LoadSessionRequest::new(acp::SessionId::new(session_id.0), self.cwd)
             .additional_directories(self.additional_directories)
-            .mcp_servers(mcp_servers)
+            .mcp_servers(mcp.servers)
+            .meta(mcp.meta)
     }
 
     fn into_resume_session_request(
         self,
         session_id: acp_v2::SessionId,
-        mcp_servers: Vec<acp::McpServer>,
+        mcp: SessionMcpServers,
     ) -> acp::ResumeSessionRequest {
         acp::ResumeSessionRequest::new(acp::SessionId::new(session_id.0), self.cwd)
             .additional_directories(self.additional_directories)
-            .mcp_servers(mcp_servers)
+            .mcp_servers(mcp.servers)
+            .meta(mcp.meta)
     }
 }
 
@@ -1326,23 +1330,16 @@ fn meta_terminal_auth_task(
     ))
 }
 
-impl AgentConnection for AcpConnection {
-    fn agent_id(&self) -> AgentId {
-        self.id.clone()
-    }
-
-    fn telemetry_id(&self) -> SharedString {
-        self.telemetry_id.clone()
-    }
-
-    fn agent_version(&self) -> Option<SharedString> {
-        self.agent_version.clone()
-    }
-
-    fn new_session(
+impl AcpConnection {
+    /// `pinned_meta` is session `_meta` chosen by the caller. A session
+    /// created with it does not receive the user's saved default config
+    /// options, which would otherwise overwrite what the caller pinned (a
+    /// saved default model replaces a pinned one).
+    fn create_session(
         self: Rc<Self>,
         project: Entity<Project>,
         work_dirs: PathList,
+        pinned_meta: Option<acp_v2::Meta>,
         cx: &mut App,
     ) -> Task<Result<Entity<AcpThread>>> {
         let directories = match self.session_directories_from_work_dirs(&work_dirs) {
@@ -1350,7 +1347,9 @@ impl AgentConnection for AcpConnection {
             Err(error) => return Task::ready(Err(error)),
         };
         let name = self.id.0.clone();
-        let mcp_servers = mcp_servers_for_project(&project, cx);
+        let applies_saved_defaults = pinned_meta.is_none();
+        let mut mcp_servers = mcp_servers_for_project(&self.id, &project, cx);
+        mcp_servers.meta = merge_meta(mcp_servers.meta, pinned_meta);
 
         cx.spawn(async move |cx| {
             let (response_sender, response_received) = futures::channel::oneshot::channel();
@@ -1463,7 +1462,10 @@ impl AgentConnection for AcpConnection {
             }
 
             let session_id = acp_v2::SessionId::new(response.session_id.0);
-            let default_config_task = config_options.as_ref().map(|options| {
+            let default_config_task = config_options
+                .as_ref()
+                .filter(|_| applies_saved_defaults)
+                .map(|options| {
                 self.apply_default_config_options(&session_id, options, cx)
                     .shared()
             });
@@ -1501,7 +1503,39 @@ impl AgentConnection for AcpConnection {
             Ok(thread)
         })
     }
+}
 
+impl AgentConnection for AcpConnection {
+    fn agent_id(&self) -> AgentId {
+        self.id.clone()
+    }
+
+    fn telemetry_id(&self) -> SharedString {
+        self.telemetry_id.clone()
+    }
+
+    fn agent_version(&self) -> Option<SharedString> {
+        self.agent_version.clone()
+    }
+
+    fn new_session(
+        self: Rc<Self>,
+        project: Entity<Project>,
+        work_dirs: PathList,
+        cx: &mut App,
+    ) -> Task<Result<Entity<AcpThread>>> {
+        self.create_session(project, work_dirs, None, cx)
+    }
+
+    fn new_session_with_meta(
+        self: Rc<Self>,
+        project: Entity<Project>,
+        work_dirs: PathList,
+        meta: acp_v2::Meta,
+        cx: &mut App,
+    ) -> Task<Result<Entity<AcpThread>>> {
+        self.create_session(project, work_dirs, Some(meta), cx)
+    }
     fn supports_load_session(&self) -> bool {
         self.agent_capabilities.load_session
     }
@@ -1538,7 +1572,7 @@ impl AgentConnection for AcpConnection {
             ))));
         }
 
-        let mcp_servers = mcp_servers_for_project(&project, cx);
+        let mcp_servers = mcp_servers_for_project(&self.id, &project, cx);
         self.open_or_create_session(
             session_id,
             project,
@@ -1582,7 +1616,7 @@ impl AgentConnection for AcpConnection {
             ))));
         }
 
-        let mcp_servers = mcp_servers_for_project(&project, cx);
+        let mcp_servers = mcp_servers_for_project(&self.id, &project, cx);
         self.open_or_create_session(
             session_id,
             project,
@@ -6004,12 +6038,14 @@ mod tests {
         );
 
         let session_id = acp_v2::SessionId::new("session-1");
-        let new_session_request = directories.clone().into_new_session_request(Vec::new());
+        let new_session_request = directories
+            .clone()
+            .into_new_session_request(SessionMcpServers::default());
         let load_session_request = directories
             .clone()
-            .into_load_session_request(session_id.clone(), Vec::new());
+            .into_load_session_request(session_id.clone(), SessionMcpServers::default());
         let resume_session_request =
-            directories.into_resume_session_request(session_id, Vec::new());
+            directories.into_resume_session_request(session_id, SessionMcpServers::default());
 
         assert_eq!(
             new_session_request.cwd,
@@ -6043,8 +6079,9 @@ mod tests {
             };
             let load = directories
                 .clone()
-                .into_load_session_request(session_id.clone(), Vec::new());
-            let resume = directories.into_resume_session_request(session_id, Vec::new());
+                .into_load_session_request(session_id.clone(), SessionMcpServers::default());
+            let resume =
+                directories.into_resume_session_request(session_id, SessionMcpServers::default());
 
             for wire_id in [&load.session_id, &resume.session_id] {
                 assert_eq!(wire_id.0.as_ref(), value);
@@ -9931,8 +9968,38 @@ exit 7
     }
 }
 
-fn mcp_servers_for_project(project: &Entity<Project>, cx: &App) -> Vec<acp::McpServer> {
-    mcp_configurations_for_project(project, cx)
+/// The MCP servers forwarded on session creation, plus the `_meta` that must
+/// accompany them.
+#[derive(Default)]
+struct SessionMcpServers {
+    servers: Vec<acp::McpServer>,
+    meta: Option<acp::Meta>,
+}
+
+fn mcp_servers_for_project(
+    agent_id: &AgentId,
+    project: &Entity<Project>,
+    cx: &App,
+) -> SessionMcpServers {
+    mcp_servers_from_configurations(agent_id, mcp_configurations_for_project(project, cx))
+}
+
+fn mcp_servers_from_configurations(
+    agent_id: &AgentId,
+    configurations: Vec<(
+        String,
+        Arc<project::context_server_store::ContextServerConfiguration>,
+    )>,
+) -> SessionMcpServers {
+    // `${VAR}` expansion is Claude Code behaviour; any other agent would send
+    // the placeholder text to the server verbatim.
+    let mut secrets =
+        (agent_id.as_ref() == crate::CLAUDE_AGENT_ID).then(McpSecretEnvironment::default);
+    let mut forwarded_value = |server_name: &str, key: &str, value: &str| match secrets.as_mut() {
+        Some(secrets) => secrets.placeholder(server_name, key, value),
+        None => value.to_string(),
+    };
+    let servers = configurations
         .into_iter()
         .map(|(name, configuration)| match &*configuration {
             project::context_server_store::ContextServerConfiguration::Custom {
@@ -9941,32 +10008,44 @@ fn mcp_servers_for_project(project: &Entity<Project>, cx: &App) -> Vec<acp::McpS
             | project::context_server_store::ContextServerConfiguration::Extension {
                 command,
                 ..
-            } => acp::McpServer::Stdio(
-                acp::McpServerStdio::new(name, &command.path)
-                    .args(command.args.clone())
-                    .env(if let Some(env) = command.env.as_ref() {
-                        env.iter()
-                            .map(|(name, value)| acp::EnvVariable::new(name, value))
-                            .collect()
-                    } else {
-                        vec![]
-                    }),
-            ),
+            } => {
+                let environment = if let Some(env) = command.env.as_ref() {
+                    env.iter()
+                        .map(|(variable, value)| {
+                            acp::EnvVariable::new(variable, forwarded_value(&name, variable, value))
+                        })
+                        .collect()
+                } else {
+                    vec![]
+                };
+                acp::McpServer::Stdio(
+                    acp::McpServerStdio::new(name, &command.path)
+                        .args(command.args.clone())
+                        .env(environment),
+                )
+            }
             project::context_server_store::ContextServerConfiguration::Http {
                 url,
                 headers,
                 timeout: _,
                 oauth: _,
-            } => acp::McpServer::Http(
-                acp::McpServerHttp::new(name, url.to_string()).headers(
-                    headers
-                        .iter()
-                        .map(|(name, value)| acp::HttpHeader::new(name, value))
-                        .collect(),
-                ),
-            ),
+            } => {
+                let headers = headers
+                    .iter()
+                    .map(|(header, value)| {
+                        acp::HttpHeader::new(header, forwarded_value(&name, header, value))
+                    })
+                    .collect();
+                acp::McpServer::Http(
+                    acp::McpServerHttp::new(name, url.to_string()).headers(headers),
+                )
+            }
         })
-        .collect()
+        .collect();
+    SessionMcpServers {
+        servers,
+        meta: secrets.and_then(McpSecretEnvironment::into_meta),
+    }
 }
 
 fn config_state(
@@ -10673,4 +10752,103 @@ fn handle_wait_for_terminal_exit(
         );
     })
     .detach();
+}
+
+#[cfg(test)]
+mod mcp_forwarding_tests {
+    use super::*;
+    use project::context_server_store::ContextServerConfiguration;
+
+    const SECRET_HEADER: &str = "Bearer hunter2-header";
+    const SECRET_ENVIRONMENT: &str = "hunter2-environment";
+
+    fn configurations() -> Vec<(String, Arc<ContextServerConfiguration>)> {
+        vec![
+            (
+                "web-reader".to_string(),
+                Arc::new(ContextServerConfiguration::Http {
+                    url: "https://example.com/mcp".parse().expect("valid url"),
+                    headers: collections::HashMap::from_iter([(
+                        "Authorization".to_string(),
+                        SECRET_HEADER.to_string(),
+                    )]),
+                    timeout: None,
+                    oauth: None,
+                }),
+            ),
+            (
+                "vision".to_string(),
+                Arc::new(ContextServerConfiguration::Custom {
+                    command: serde_json::from_value(serde_json::json!({
+                        "command": "/bin/vision",
+                        "args": ["serve"],
+                        "env": { "API_KEY": SECRET_ENVIRONMENT },
+                    }))
+                    .expect("valid command"),
+                    remote: false,
+                    launcher: None,
+                }),
+            ),
+        ]
+    }
+
+    fn new_session_request_json(agent_id: &str) -> serde_json::Value {
+        let directories = SessionDirectories {
+            cwd: PathBuf::from("/a"),
+            additional_directories: Vec::new(),
+        };
+        let mcp = mcp_servers_from_configurations(&AgentId::new(agent_id), configurations());
+        serde_json::to_value(directories.into_new_session_request(mcp))
+            .expect("serializable request")
+    }
+
+    #[test]
+    fn claude_sessions_carry_mcp_secrets_in_environment_not_in_servers() {
+        let request = new_session_request_json(crate::CLAUDE_AGENT_ID);
+
+        // `mcpServers` is what the adapter turns into the CLI's `--mcp-config`
+        // argument, so no secret may appear anywhere inside it.
+        let servers = request["mcpServers"].to_string();
+        assert!(
+            !servers.contains("hunter2"),
+            "secret in argv payload: {servers}"
+        );
+        assert!(servers.contains("${ZED_MCP_WEB_READER_AUTHORIZATION}"));
+        assert!(servers.contains("${ZED_MCP_VISION_API_KEY}"));
+
+        let environment = &request["_meta"]["claudeCode"]["options"]["env"];
+        assert_eq!(
+            environment["ZED_MCP_WEB_READER_AUTHORIZATION"],
+            SECRET_HEADER
+        );
+        assert_eq!(environment["ZED_MCP_VISION_API_KEY"], SECRET_ENVIRONMENT);
+    }
+
+    #[test]
+    fn other_agents_receive_literal_values() {
+        let request = new_session_request_json("some-other-agent");
+
+        let servers = request["mcpServers"].to_string();
+        assert!(servers.contains(SECRET_HEADER));
+        assert!(servers.contains(SECRET_ENVIRONMENT));
+        assert!(!servers.contains("${ZED_MCP_"));
+        assert!(request.get("_meta").is_none_or(serde_json::Value::is_null));
+    }
+
+    #[test]
+    fn pinned_meta_shares_options_with_the_secret_environment() {
+        let mut mcp = mcp_servers_from_configurations(
+            &AgentId::new(crate::CLAUDE_AGENT_ID),
+            configurations(),
+        );
+        let pinned = acp::Meta::from_iter([(
+            "claudeCode".to_string(),
+            serde_json::json!({ "options": { "model": "sonnet" } }),
+        )]);
+        mcp.meta = merge_meta(mcp.meta, Some(pinned));
+
+        let options = &mcp.meta.expect("merged meta")["claudeCode"]["options"];
+        assert_eq!(options["model"], "sonnet");
+        assert_eq!(options["env"]["ZED_MCP_VISION_API_KEY"], SECRET_ENVIRONMENT);
+    }
 }

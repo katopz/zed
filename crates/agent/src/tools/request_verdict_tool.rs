@@ -473,6 +473,8 @@ impl RequestVerdictTool {
             (thread, session_id, verdict::REVIEWER_COLD_START_TURN_TIMEOUT)
         };
 
+        *route = ReviewerRoute::External(ReviewerLabel(provider.session_label(&session_id)));
+
         let round = cx.update(|_cx| {
             verdict::register_reviewer_session(&session_id, thread.clone())
         });

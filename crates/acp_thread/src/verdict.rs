@@ -50,6 +50,12 @@ pub trait VerdictReviewer: Send + Sync {
     /// Backend label for logs and tool output (e.g. `"claude_code"`).
     fn label(&self) -> &'static str;
 
+    /// Label for one spawned session, when the backend has more than one way
+    /// to run a reviewer and the choice is only known after the spawn.
+    fn session_label(&self, _session_id: &acp::SessionId) -> &'static str {
+        self.label()
+    }
+
     /// Spawns a NEW reviewer session on the external agent connection.
     /// Visibility matches the hidden orchestrator: the session is never
     /// registered in any panel list, so it's invisible to the user.

@@ -1,3 +1,4 @@
+mod claude_session;
 mod debug_log;
 pub mod detachable;
 pub mod external_subagents;

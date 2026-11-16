@@ -614,6 +614,7 @@ mod tests {
                 verdict_max_rounds: 3,
                 verdict_reviewer: settings::VerdictReviewerSetting::default(),
                 verdict_secondary_model: None,
+                verdict_advisor: None,
                 claude_md_symlink: false,
                 project_claude_md_symlink: false,
                 auto_focus_new_thread: false,
