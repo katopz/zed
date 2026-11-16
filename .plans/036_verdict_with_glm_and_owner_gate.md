@@ -39,3 +39,20 @@ Status: IMPLEMENTED — clippy + unit tests green; live GLM click-through pendin
 - [x] user settings: `verdict_secondary_model = GLM/glm-5.3`
 - [x] clippy + `request_verdict_tool` tests green (7/7 incl. `secondary_reviewer_routes_to_its_model_and_never_falls_back`)
 - [-] live check: click "Verdict with GLM" on a summary and confirm keys rotate on a 429 — needs a rebuilt Zed running with the GLM keys (a manual UI step); the routing is unit-tested and the key rotation is the existing `open_ai_compatible` path
+
+## Follow-through (issue 069, fixed in bcd6e099b0, 2026-11-16)
+- The `#OwnerGate` protocol is now wired into the auto-prompt continuations, not just the tool:
+  `housekeeping_dispatch` attaches the summary's advisory `**(5) Suggested next actions**` routing
+  block + the consolidated `#OwnerGate` verdict demand to EVERY housekeeping pass (fast path,
+  keyword-stop native/claude, both overflow sites — previously the NothingLeft fast path and the
+  Claude lane batched nothing).
+- `with_owner_gate_batching` now demands the verdict protocol (call `request_verdict`, one
+  `DO <action> | SKIP | DEFER` per item, record + act) instead of a list-collection request.
+- Terminal chains (all remaining work armed/deferred/owner-gated) get ONE gated-verdict pass
+  (`verdict_pass_continuation`, once per session via `chain::verdict_pass_sent`) before the plan-031
+  silent stop — overflow fork paths stay silent (chain state does not survive a fork).
+- The `Steps` continuation routes owner-gated items through the verdict lane instead of skipping them.
+- Housekeeping prompt gains the teardown step (worktrees + their target dirs, per-plan `/tmp`
+  CARGO_TARGET_DIR, fixed-issue file removal after the hash note) and the bench trigger tightened to
+  perf-relevant/plan-pinned (docs-only dirt no longer fires a sweep); heavy sweeps route via
+  `agent-mail rig run --est`.
