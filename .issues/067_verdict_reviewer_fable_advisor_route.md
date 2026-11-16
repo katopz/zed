@@ -1,6 +1,6 @@
 # 067 — verdict reviewer: opt-in "cheap executor + Fable advisor" route for the `claude_code` lane
- Code: `2db38f44e8`.
-Status: LANDED default-off 2026-11-16 (zed-b3@m3) — `agent.verdict_advisor` routes the `claude_code` reviewer through executor+advisor; contract proven against the real adapter (0.107.0). Open: first verdict through a rebuilt Zed, the PSA quota measurement, bench 001 A/B.
+
+Status: LANDED default-off 2026-11-16 (zed-b3@m3) — `agent.verdict_advisor` routes the `claude_code` reviewer through executor+advisor; contract proven against the real adapter (0.107.0). Open: first verdict through a rebuilt Zed, the PSA quota measurement, bench 001 A/B. Code: `2db38f44e8`.
 
 ## What
 
