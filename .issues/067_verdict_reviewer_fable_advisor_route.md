@@ -1,6 +1,6 @@
 # 067 — verdict reviewer: opt-in "cheap executor + Fable advisor" route for the `claude_code` lane
-
-Status: OPEN — filed 2026-11-16 (zed-b3@m3), owner-directed. Implementation in flight in the same session.
+ Code: `2db38f44e8`.
+Status: LANDED default-off 2026-11-16 (zed-b3@m3) — `agent.verdict_advisor` routes the `claude_code` reviewer through executor+advisor; contract proven against the real adapter (0.107.0). Open: first verdict through a rebuilt Zed, the PSA quota measurement, bench 001 A/B.
 
 ## What
 
@@ -37,15 +37,25 @@ endpoint. The only route is GLM -> `request_verdict` -> `claude_code` reviewer s
 
 ## Tasks
 
-- [ ] `new_session_with_meta` on `AgentConnection` + v1 ACP implementation
-- [ ] `agent.verdict_advisor` setting
-- [ ] `ClaudeCodeReviewer` advisor route + fallback + label
-- [ ] Tests: meta reaches `session/new`; defaults skipped; fallback on refusal
-- [ ] Live trial: one real verdict through the advisor route, advisor call observed
+- [x] `new_session_with_meta` on `AgentConnection` + v1 ACP implementation (`AcpConnection::create_session`)
+- [x] `agent.verdict_advisor` setting (`VerdictAdvisorSetting`)
+- [x] `ClaudeCodeReviewer` advisor route + fallback + label (`claude_code+advisor` via `VerdictReviewer::session_label`)
+- [x] Tests: meta pinned on the session, fallback on refusal, plain session while unset (`verdict_reviewer.rs`); meta merge (`claude_session.rs`, `v1.rs`)
+- [ ] Test that a pinned session skips saved default config options end to end (needs a fake agent that answers `session/new` with config options; today covered by reading `create_session` only)
+- [x] Contract trial against the real `claude-agent-acp` 0.107.0 over stdio with the exact `_meta` Zed sends: executor ran `claude-sonnet-5-5` (`model_usage`), the `advisor` tool call fired, reply started `#Verdict: AGREE`
+- [ ] First real `request_verdict` through a rebuilt Zed with the setting on (the installed Zed Dev build predates this change)
 - [-] Measure the PSA claim (Fable weekly meter before/after N advisor verdicts) — needs the owner's usage page
 - [-] Bench 001 A/B (agreement quality + abort rate, advisor route vs plain) before any default flip
 
+## How to turn it on
+
+    "agent": { "verdict_advisor": { "executor_model": "sonnet", "advisor_model": "fable" } }
+
+Needs a Zed build containing this change. Scorer rows carry `reviewer: "claude_code+advisor"`.
+
 ## Caveats
+
+- The session's model picker reads `default` even though the executor is pinned; the session is hidden, so this is cosmetic.
 
 - The executor's tokens still hit the normal session window; issue 037's 5-hour failures are not fixed by this.
 - The verdict is written by the executor with Fable's advice; the executor decides whether to consult.

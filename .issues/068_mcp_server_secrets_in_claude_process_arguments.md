@@ -1,6 +1,6 @@
 # 068 — MCP server secrets forwarded to Claude Code end up in its process arguments
 
-Status: OPEN — filed 2026-11-16 (zed-b3@m3), owner-directed. Implementation in flight in the same session.
+Status: LANDED 2026-11-16 (zed-b3@m3) for the v1 ACP lane — Claude sessions get `${ZED_MCP_*}` placeholders in `mcpServers` and the values in `_meta.claudeCode.options.env`; reproducer re-run against the real adapter shows no secret in argv. Open: v2 lane, key roll (owner), takes effect once Zed is rebuilt. Code: `2db38f44e8`.
 
 ## What
 
@@ -40,10 +40,11 @@ argv by definition) and same-user `ps e` reading the environment.
 
 ## Tasks
 
-- [ ] Placeholder indirection + env meta for the Claude agent (v1 new/load/resume)
-- [ ] Tests: no secret value in the serialized `mcpServers`; env meta carries it; other agents unchanged
-- [ ] Re-run the reproducer on a live session (`ps` shows placeholders, MCP tools still work)
-- [ ] Skill telling Claude how to hand work to a Zed GLM agent (owner ask, same thread)
+- [x] Placeholder indirection + env meta for the Claude agent, v1 new/load/resume (`acp/claude_session.rs`, `mcp_servers_from_configurations`)
+- [x] Tests: no secret value in the serialized `mcpServers`; env meta carries it; other agents unchanged (7 tests)
+- [x] Reproducer re-run against the real `claude-agent-acp` 0.107.0 with the same payload shape: `ps` shows `${ZED_MCP_PROBE_K}` and no secret; the stdio server received the real env value and the HTTP server the real `Authorization` header
+- [ ] Same check on a rebuilt Zed with the real z.ai servers (tools list still loads)
+- [x] Skill telling Claude how to hand work to a Zed GLM agent: `katgpt-rs/.agents/skills/call-glm` (katgpt-rs `e9feaba0b`), linked into `~/.claude/skills/`. The spawn route itself is unproven: a probe to `glm-skill-probe@m3` sat unclaimed (spawn budget is shared across ~470 inboxes)
 - [-] ACP v2 lane (`acp-beta` flag) — same change once v2 carries session `_meta`
 - [-] Roll the z.ai key (owner): it is in one session transcript
 
