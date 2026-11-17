@@ -24,7 +24,9 @@ rig's agent sessions. Upstream base plus a local feature lane maintained on
   prediction ring (plans 001–008, 012, 027, 030)
 - `agent_board` + web UI, war-room panel, activity bars (plans 013–015, 024–025)
 - verdict-reviewer lane — `claude_code` offscreen backend + GLM native-subagent
-  secondary reviewer, owner-gate decisions (plans 029, 014, 036)
+  secondary reviewer + opt-in Fable-advisor route (`agent.verdict_advisor`,
+  default-off), owner-gate decisions, gated-stop verdict routing + teardown
+  housekeeping (plans 029, 014, 036; issues 067, 069)
 - thread/session ergonomics — continuation indicator, pin sidebar, resume toast,
   stream-cutoff summary-first, subagent retry (plans 007, 009, 011, 021, 032, 035)
 - Work Remote lane — `crates/agentd` (`zed-agentd`, std-only detachable ACP
