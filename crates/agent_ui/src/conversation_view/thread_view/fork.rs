@@ -2703,6 +2703,12 @@ impl ThreadView {
                             .as_deref()
                             .map(|value| mail_header_chip("session", value, cx)),
                     )
+                    .children(
+                        section
+                            .scheduled_local
+                            .as_deref()
+                            .map(|value| mail_header_chip("due", value, cx)),
+                    )
                     .when(section.urgent, |this| {
                         this.child(mail_header_flag_chip("urgent", Color::Error, cx))
                     })

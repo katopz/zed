@@ -43,6 +43,10 @@ pub(crate) struct MailPromptEnvelope {
     pub session_id: Option<String>,
     /// The delivery was fyi-mode (no reply needed).
     pub fyi: bool,
+    /// The sender-box local-time twin of `scheduled_for` (`scheduled_local`
+    /// attribute; issue 070) — a due wake must not read past-due against a
+    /// non-UTC wall clock.
+    pub scheduled_local: Option<String>,
     /// The prompt interrupted a running turn for urgent delivery.
     pub urgent: bool,
     /// Everything before the body: the optional preempt notice, the opening
@@ -162,6 +166,7 @@ impl MailPromptEnvelope {
                 to: None,
                 session_id: attributes.get("session_id").cloned(),
                 fyi: false,
+                scheduled_local: attributes.get("scheduled_local").cloned(),
                 urgent,
                 head,
                 tail,
@@ -323,6 +328,21 @@ mod tests {
         assert!(parsed.fyi);
         assert_eq!(parsed.to.as_deref(), Some("*@amo"));
         assert_eq!(parsed.body, "status report");
+        assert_eq!(parsed.rewrap(&parsed.body), text);
+    }
+
+    #[test]
+    fn parses_scheduled_local_chip() {
+        // `agent-mail` render() stamps a `scheduled_local` twin beside
+        // `scheduled_for` (issue 070); the header shows it as a `due` chip and
+        // the exact scheduled_for value stays untouched for parsers.
+        let text = "<agent_mail from=\"a@b\" to=\"c@d\" id=\"01\" sent_at=\"t\" scheduled_for=\"2026-11-18T22:20:00+00:00\" scheduled_local=\"2026-11-19 05:20 +07:00\">\nwake\n</agent_mail>\n";
+        let parsed = MailPromptEnvelope::parse(text).expect("should parse");
+        assert_eq!(
+            parsed.scheduled_local.as_deref(),
+            Some("2026-11-19 05:20 +07:00")
+        );
+        // Lossless splice holds with the extra attributes present.
         assert_eq!(parsed.rewrap(&parsed.body), text);
     }
 

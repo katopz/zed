@@ -639,7 +639,10 @@ fn draw_mail(frame: &mut Frame, app: &mut App, area: Rect) {
                 envelope
                     .deliver_at
                     .as_deref()
-                    .map(|at| format!(" (scheduled {at})"))
+                    .map(|at| match crate::local_due(at) {
+                        Some(local) => format!(" (scheduled {at}, local {local})"),
+                        None => format!(" (scheduled {at})"),
+                    })
                     .unwrap_or_default(),
                 envelope.body
             )

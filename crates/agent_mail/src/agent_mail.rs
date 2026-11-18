@@ -1452,7 +1452,15 @@ pub fn render(mail: &[Envelope], self_name: Option<&str>) -> String {
         let scheduled = envelope
             .deliver_at
             .as_deref()
-            .map(|at| format!(" scheduled_for=\"{at}\""))
+            .map(|at| {
+                // The exact timestamp stays byte-identical for parsers; the
+                // local twin rides as its own quoted attribute (issue 070).
+                let mut text = format!(" scheduled_for=\"{at}\"");
+                if let Some(local) = local_due(at) {
+                    text.push_str(&format!(" scheduled_local=\"{local}\""));
+                }
+                text
+            })
             .unwrap_or_default();
         let mode = match envelope.mode {
             MailMode::Queued => String::new(),
@@ -1464,6 +1472,19 @@ pub fn render(mail: &[Envelope], self_name: Option<&str>) -> String {
         ));
     }
     text
+}
+
+/// The recipient's local-time twin of a stored RFC 3339 `deliver_at`
+/// (issue 070): the UTC-only form read against a local wall clock looked
+/// past-due on a +0700 box. `None` when the stored value does not parse —
+/// the annotation degrades, it never replaces the exact timestamp.
+pub(crate) fn local_due(at: &str) -> Option<String> {
+    let at = chrono::DateTime::parse_from_rfc3339(at).ok()?;
+    Some(
+        at.with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %H:%M %:z")
+            .to_string(),
+    )
 }
 
 /// When to deliver scheduled mail: a delay (`90s`, `30m`, `8h`, `2d`), a local
@@ -1769,6 +1790,48 @@ mod tests {
         fs::rename(&parked, later_dir.join(format!("1_{rest}"))).unwrap();
         assert_eq!(room.claim(&names).unwrap(), vec![later]);
         assert!(room.scheduled(&names).unwrap().is_empty());
+    }
+
+    #[test]
+    fn render_annotates_scheduled_mail_with_local_time() {
+        let scheduled = Envelope {
+            id: "01".into(),
+            from: "me@amo".into(),
+            to: "you@amo".into(),
+            sent_at: "2026-11-18T16:00:00+00:00".into(),
+            reply_to: None,
+            deliver_at: Some("2026-11-18T22:20:00+00:00".into()),
+            mode: MailMode::Queued,
+            body: "wake".into(),
+        };
+        let rendered = render(std::slice::from_ref(&scheduled), None);
+        assert!(
+            rendered.contains(" scheduled_for=\"2026-11-18T22:20:00+00:00\""),
+            "the exact timestamp must stay byte-identical for parsers: {rendered}"
+        );
+        let local = rendered
+            .split(" scheduled_local=\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("a parseable deliver_at carries a local twin");
+        // The twin is the same instant in the box's own zone: parsing it back
+        // and comparing instants is timezone-edit-proof.
+        let stamp = chrono::DateTime::parse_from_rfc3339("2026-11-18T22:20:00+00:00").unwrap();
+        let local_zone = chrono::Local;
+        let expected_minute = stamp.with_timezone(&local_zone).format("%Y-%m-%d %H:%M");
+        assert!(
+            local.starts_with(&expected_minute.to_string()),
+            "local twin {local:?} should start with {expected_minute}"
+        );
+
+        // An unparseable stored value degrades to the exact form alone.
+        let garbage = Envelope {
+            deliver_at: Some("not-a-timestamp".into()),
+            ..scheduled
+        };
+        let rendered = render(&[garbage], None);
+        assert!(rendered.contains("scheduled_for=\"not-a-timestamp\""));
+        assert!(!rendered.contains("scheduled_local"));
     }
 
     #[test]
