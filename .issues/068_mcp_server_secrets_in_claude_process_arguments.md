@@ -51,3 +51,5 @@ argv by definition) and same-user `ps e` reading the environment.
 ## Refs
 
 - `crates/agent_servers/src/acp/v1.rs` (`mcp_servers_for_project`), `crates/agent_servers/src/acp.rs`
+
+**Status addendum 2026-11-18 (delegated verdict session d9c2bb28, the seal-sprints GOLF.md trim): OWNER-CREDENTIAL-PENDING — the key roll stays with the owner, tracked HERE (zed 068) and no longer in seal-sprints .issues/GOLF.md. Severity note: if the old secret ever reached argv pre-v1, treat it as EXPOSED until rolled — the roll is not cosmetic.
