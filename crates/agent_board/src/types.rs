@@ -82,7 +82,7 @@ pub struct BoardMessage {
 /// of the Phase 2 spec).
 pub const MAX_STATE_TEXT_BYTES: usize = 256;
 
-/// Per-entry byte cap for web Threads-tab timeline entries (Plan 026). Much
+/// Per-entry byte cap for web Threads-tab timeline entries (Plan 060). Much
 /// larger than states — thread entries are the actual turn content, not a
 /// breadcrumb — but still bounded so one pathological tool dump can't blow up
 /// KV values or the browser.
@@ -204,7 +204,7 @@ pub struct WebReply {
     pub ts: i64,
 }
 
-/// One thread-timeline entry on the wire (Plan 026). `role` is `user`,
+/// One thread-timeline entry on the wire (Plan 060). `role` is `user`,
 /// `assistant`, or `tool`; `text` is markdown pre-capped by the producer.
 /// `seq` is the entry's index in the local thread — the worker UPSERTS by it,
 /// so a still-streaming entry re-sent with grown content replaces its partial.
@@ -221,7 +221,7 @@ pub struct ThreadEntryWire {
 }
 
 /// Body for `POST /v1/rooms/{room}/thread` — append timeline entries for one
-/// session (Plan 026 web Threads tab).
+/// session (Plan 060 web Threads tab).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PostThreadBody {
     #[serde(default)]

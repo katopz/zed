@@ -211,7 +211,7 @@ pub(super) struct ForkAgentPanelState {
     /// `auto_prompt::peer_states` and injects them into the active agent
     /// thread as `AgentBoardNotification` entries. Held to keep the task alive.
     pub(super) _notification_drain_task: Option<Task<()>>,
-    /// Plan 026: per-session tail fingerprint (entry count + hash of the last
+    /// Plan 060: per-session tail fingerprint (entry count + hash of the last
     /// entry's markdown) already mirrored to the web Threads tab. Streaming
     /// entries update in place, so a plain count is not enough — the tail hash
     /// catches in-place growth and re-sends the entry (the worker upserts by
@@ -335,7 +335,7 @@ impl AgentPanel {
     /// Plan 015: also drains web steering replies, resolving them by session-id
     /// prefix to the correct thread and injecting via `send` + steering flag.
     ///
-    /// Plan 026: (a) mirrors new thread entries to the board so the web
+    /// Plan 060: (a) mirrors new thread entries to the board so the web
     /// Threads tab can render them, and (b) honors `!stop` / `!retry` reply
     /// commands by driving `AcpThread::cancel` / `retry` directly.
     ///
@@ -444,7 +444,7 @@ impl AgentPanel {
         self.fork._notification_drain_task = Some(timer);
     }
 
-    /// Plan 026: mirror the tail of every conversation view's root thread to
+    /// Plan 060: mirror the tail of every conversation view's root thread to
     /// the board for the web Threads tab. Sends the last few entries every time
     /// the tail changes (new entry OR in-place growth of the last one); the
     /// worker upserts by `seq`, so re-sends replace rather than duplicate.

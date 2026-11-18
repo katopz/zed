@@ -27,7 +27,7 @@ pub trait AgentStateBroadcaster: Send + Sync {
     /// implementation handles truncation + the actual HTTP call.
     fn broadcast(&self, session_id: &str, sub_agent_id: Option<&str>, state_text: &str, meta: &str);
 
-    /// Fire-and-forget batch of thread-timeline entries (Plan 026 web Threads
+    /// Fire-and-forget batch of thread-timeline entries (Plan 060 web Threads
     /// tab). Default no-op so existing implementations (tests, boards without
     /// the endpoint) are unaffected.
     fn broadcast_thread_update(
@@ -140,7 +140,7 @@ pub fn broadcast_state(session_id: &str, sub_agent_id: Option<&str>, state_text:
 }
 
 /// Broadcast new thread-timeline entries for a session (fire-and-forget,
-/// Plan 026). Same no-op semantics as [`broadcast_state`].
+/// Plan 060). Same no-op semantics as [`broadcast_state`].
 pub fn broadcast_thread_update(session_id: &str, title: Option<&str>, entries: &[ThreadEntry]) {
     let broadcaster = match BROADCASTER.read() {
         Ok(guard) => guard.clone(),

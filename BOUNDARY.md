@@ -22,7 +22,7 @@ rig's agent sessions. Upstream base plus a local feature lane maintained on
 - `open_ai_compatible` multi-key lane — per-key 429 backoff, `reset_key_session`
   on new-thread creation, key-health UI, priority rotation, next-limit
   prediction ring (plans 001–008, 012, 027, 030)
-- `agent_board` + web UI, war-room panel, activity bars (plans 013–015, 024–025)
+- `agent_board` + web UI, war-room panel, activity bars (plans 013–015, 024 + 059)
 - verdict-reviewer lane — `claude_code` offscreen backend + GLM native-subagent
   secondary reviewer + opt-in Fable-advisor route (`agent.verdict_advisor`,
   default-off), owner-gate decisions, gated-stop verdict routing + teardown

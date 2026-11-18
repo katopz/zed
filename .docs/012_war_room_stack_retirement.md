@@ -12,7 +12,7 @@
 Issue 030 measured the `AGENT_BOARD` KV namespace at 15.2M reads/day and
 1.29M list operations/day (~176 and ~15 per second sustained) — 152× and
 1290× over the Cloudflare free tier, ≈ $400/month on Workers Paid. The only
-consumer was the agent-board/war-room stack (plans 013/015/024/026): the
+consumer was the agent-board/war-room stack (plans 013/015/024/060; the web-threads plan was 026 at the time, renumbered 060 by the 2026-11-18 numbering-hygiene pass, issue 071): the
 feeder's poll loop amplified every status view into KV reads/lists.
 
 ## Decision
