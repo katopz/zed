@@ -132,6 +132,12 @@ pub struct Contender {
     /// has no vm class.
     #[serde(default)]
     pub vm_infra: bool,
+    /// Process start time as a unix epoch (sprint!054): fetched lazily per
+    /// contender ONLY when a probe needs the own-VM correlation, so the hot
+    /// classification path pays nothing. None = unfetched or unavailable
+    /// (Windows sysinfo arm), which the probe treats as uncorrelatable.
+    #[serde(default)]
+    pub lstart_epoch: Option<i64>,
 }
 
 /// One row of the process table, normalized like `contender_candidates`.
@@ -471,6 +477,7 @@ pub fn contention(exclude_trees: &[u32]) -> Contention {
                             .then(|| truncate_chars(&row.command, MAX_COMMAND_CHARS)),
                         cwd: None,
                         vm_infra: vocabulary.is_vm_infrastructure(&row.name),
+                        lstart_epoch: None,
                     })
                 })
                 .collect();
@@ -794,6 +801,63 @@ fn meminfo_kib(label: &str) -> Option<f64> {
         .nth(1)?
         .parse()
         .ok()
+}
+
+/// Process start time as a unix epoch, per pid (`ps -o lstart=` parses on
+/// macOS/Linux; the Windows arm has no equivalent so it answers None).
+/// sprint!054: the own-VM discriminator correlates this with the job's
+/// start - a VM born within the job's own window is the job's own.
+pub fn process_lstart(pid: u32) -> Option<i64> {
+    #[cfg(windows)]
+    {
+        let _ = pid;
+        None
+    }
+    #[cfg(not(windows))]
+    {
+        let output = run("ps", &["-p", &pid.to_string(), "-o", "lstart="])?;
+        parse_lstart(output.trim())
+    }
+}
+
+/// `ps -o lstart=` prints e.g. `Wed Nov 19 08:02:11 2026` (LOCAL wall
+/// clock); parse to a unix epoch.
+fn parse_lstart(text: &str) -> Option<i64> {
+    use chrono::{Local, NaiveDate, TimeZone};
+    let parts: Vec<&str> = text.split_whitespace().collect();
+    if parts.len() != 5 {
+        return None;
+    }
+    let month = match parts[0] {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    let day: u32 = parts[1].parse().ok()?;
+    let clock: Vec<&str> = parts[2].split(':').collect();
+    if clock.len() != 3 {
+        return None;
+    }
+    let (h, m, s): (u32, u32, u32) = (
+        clock[0].parse().ok()?,
+        clock[1].parse().ok()?,
+        clock[2].parse().ok()?,
+    );
+    let year: i32 = parts[3].parse().ok()?;
+    let date = NaiveDate::from_ymd_opt(year, month, day)?;
+    let naive_dt = date.and_hms_opt(h, m, s)?;
+    let local = Local.from_local_datetime(&naive_dt).single()?;
+    Some(local.timestamp())
 }
 
 fn disk_free_gb() -> Option<f64> {
@@ -1366,7 +1430,7 @@ mod tests {
         assert!(vocab.is_vm_infrastructure("com.apple.Virtualization.VirtualMachine"));
         assert!(vocab.is_vm_infrastructure("qemu-system-x86_64"));
         assert!(!vocab.is_vm_infrastructure("cargo"));
-        assert!(!vocab.is_vm_infrastructure("VirtIO"));// anchored: prefix never matches
+        assert!(!vocab.is_vm_infrastructure("VirtIO")); // anchored: prefix never matches
     }
 
     #[test]

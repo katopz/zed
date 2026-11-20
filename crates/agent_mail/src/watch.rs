@@ -1327,6 +1327,7 @@ mod tests {
             command: Some(command.into()),
             cwd: None,
             vm_infra: false,
+            lstart_epoch: None,
         }
     }
 

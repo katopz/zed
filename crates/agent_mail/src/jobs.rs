@@ -333,6 +333,56 @@ fn short(id: &str) -> &str {
     id.get(id.len().saturating_sub(8)..).unwrap_or(id)
 }
 
+/// sprint!060: `rig status` renders `short(&id)` (the last 8 hex chars), but
+/// `rig cancel`/`log`/`set` used to key file lookups on the literal id, so a
+/// short id answered a false "no such job here" - a non-answer about the
+/// world, reproduced 4x in one hour across two routes. Resolve it: when the
+/// id is short (not a full uuid), scan the job dirs for the unique record
+/// whose stem ENDS WITH the id (exactly `short()`'s rendering rule) and
+/// return the full id. Ambiguous and unknown both refuse - naming what the
+/// caller should pass - never a false absence.
+fn resolve_job_id(jobs_root: &Path, id: &str) -> Result<String> {
+    let looks_full = id.contains('-') && id.len() >= 32;
+    if looks_full {
+        return Ok(id.to_string());
+    }
+    let mut hits: Vec<String> = Vec::new();
+    let mut scan = |sub: &str, suffix: &str| {
+        if let Ok(entries) = fs::read_dir(jobs_root.join(sub)) {
+            for entry in entries.flatten() {
+                let name_os = entry.file_name();
+                let stem = name_os.to_str();
+                if let Some(stem) = stem {
+                    if let Some(stem) = stem.strip_suffix(suffix) {
+                        if stem.len() >= id.len() && stem.ends_with(id) {
+                            hits.push(stem.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    };
+    scan("queue", ".json");
+    scan("running", ".json");
+    scan("running", ".starting");
+    scan("running", ".cancel");
+    scan("done", ".json");
+    scan("logs", ".log");
+    hits.sort();
+    hits.dedup();
+    match hits.as_slice() {
+        [one] => Ok(one.clone()),
+        [] => anyhow::bail!(
+            "no job matching {id} here (short ids resolve against queue/running/done/logs - pass the full uuid from `rig status <rig>` or the end mail)"
+        ),
+        many => anyhow::bail!(
+            "short id {id} matches {} jobs ({}) - pass the full uuid from `rig status <rig>`",
+            many.len(),
+            many.iter().map(|m| short(m)).collect::<Vec<_>>().join(", ")
+        ),
+    }
+}
+
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
     serde_json::from_slice(&fs::read(path).ok()?).ok()
 }
@@ -933,16 +983,34 @@ impl Mailroom {
         // pid — VM-infrastructure pids existing BEFORE start are shared or
         // foreign (the vm_shared bucket), pids born after start are the
         // job's own (vm_exempt). No class or blind table = no exemption.
+        // sprint!054: EVERY exclusive job now carries the policy's own-window
+        // (its start ± the discriminator) so the job's own Docker Desktop VM
+        // is classified by lstart correlation instead of stamping POISONED ×N
+        // on an otherwise quiet window; a pre-existing VM (lstart before the
+        // window) still reads shared/foreign, and the no-vocabulary/no-clock
+        // posture poisons exactly as before (fail-closed).
+        let own_window = chrono::DateTime::parse_from_rfc3339(&record.started_at)
+            .ok()
+            .map(|at| {
+                let unix = at.timestamp();
+                (unix, unix + 120)
+            });
         let vm_policy = if record.spec.needs.caps.iter().any(|cap| cap == "vm") {
             let vocabulary = rig::vocabulary_dir()
                 .map(|dir| rig::Vocabulary::load(&dir))
                 .and_then(|loaded| loaded.ok());
             let start_pids = vocabulary.and_then(|vocabulary| vocabulary.vm_infrastructure_pids());
-            start_pids.map(|pids| VmPolicy {
-                start_pids: pids.into_iter().collect(),
+            Some(VmPolicy {
+                start_pids: start_pids
+                    .map(|pids| pids.into_iter().collect())
+                    .unwrap_or_default(),
+                own_window,
             })
         } else {
-            None
+            Some(VmPolicy {
+                start_pids: Default::default(),
+                own_window,
+            })
         };
         write_json(&record_path, &record)?;
 
@@ -1459,6 +1527,7 @@ impl Mailroom {
             est_secs.is_some() || urgent.is_some(),
             "nothing to set: pass --est and/or --urgent/--deurgent"
         );
+        let id = &resolve_job_id(&self.jobs_dir(""), id)?;
         let queued = self.jobs_dir("queue").join(format!("{id}.json"));
         let mut spec: JobSpec = read_json(&queued).with_context(|| {
             format!("no queued job {id} on this rig (running jobs cannot be re-tiered)")
@@ -1477,7 +1546,7 @@ impl Mailroom {
         sort_queue(&mut queue);
         let position = queue
             .iter()
-            .position(|job| job.id == id)
+            .position(|job| job.id == *id)
             .map_or("?".to_string(), |index| {
                 format!("{} of {}", index + 1, queue.len())
             });
@@ -1499,6 +1568,7 @@ impl Mailroom {
     /// Cancels a queued or running job on this rig.
     pub fn cancel_job(&self, id: &str) -> Result<String> {
         validate_name(id)?;
+        let id = &resolve_job_id(&self.jobs_dir(""), id)?;
         let queued = self.jobs_dir("queue").join(format!("{id}.json"));
         if let Some(spec) = read_json::<JobSpec>(&queued) {
             fs::remove_file(&queued)?;
@@ -1560,8 +1630,14 @@ impl Mailroom {
 
     pub fn job_log(&self, id: &str, lines: usize) -> Result<String> {
         validate_name(id)?;
-        let text = fs::read_to_string(self.jobs_dir("logs").join(format!("{id}.log")))
-            .with_context(|| format!("no log for job {id}"))?;
+        let id = resolve_job_id(&self.jobs_dir(""), id)?;
+        let log_path = self.jobs_dir("logs").join(format!("{id}.log"));
+        let text = fs::read_to_string(&log_path).with_context(|| {
+            format!(
+                "job {id} is known but has no log at {} (purged? pass the full uuid from the end mail)",
+                log_path.display()
+            )
+        })?;
         let all: Vec<&str> = text.lines().collect();
         Ok(all[all.len().saturating_sub(lines)..].join("\n"))
     }
@@ -1928,7 +2004,19 @@ fn raise_nofile() -> Option<(u64, u64)> {
 
 fn shell_command(argv: &[String]) -> Command {
     match argv {
+        // sprint!058: a first element holding whitespace can never start a
+        // process directly, but it IS the recorded workaround's shape (the
+        // whole compound quoted as one argument) - shell it, exactly like
+        // the single-element form, instead of failing with a bare ENOENT.
         [single] if single.contains(char::is_whitespace) => shell(single),
+        [first, rest @ ..] if first.contains(char::is_whitespace) => {
+            let mut joined = first.clone();
+            for part in rest {
+                joined.push(' ');
+                joined.push_str(part);
+            }
+            shell(&joined)
+        }
         _ => {
             let mut command = crate::command(&argv[0]);
             command.args(&argv[1..]);
@@ -2000,6 +2088,13 @@ pub struct VmPolicy {
     /// VM-infrastructure pids alive before the job started: their load is
     /// shared or foreign, never the job's own.
     pub start_pids: std::collections::BTreeSet<u32>,
+    /// sprint!054: the job's own-window `[started_unix, started_unix + 120]`.
+    /// A VM-infrastructure contender NOT in `start_pids` whose own start
+    /// (lstart) falls inside this window is the job's Docker/Virtualization
+    /// VM hosting the job's container boots - `own-vm`, never poison. None
+    /// (the pre-054 shape: no cap declared, or an unusable clock) disables
+    /// the correlation and every unlisted vm contender poisons as before.
+    pub own_window: Option<(i64, i64)>,
 }
 
 /// Contenders not already recorded as poison for this run. With a
@@ -2024,13 +2119,38 @@ pub fn probe_poison(
             name: contender.name.clone(),
             command: contender.command.clone(),
         };
-        let classified_vm = vm_policy.is_some() && contender.vm_infra;
-        if !classified_vm {
-            probe.poison.push(poison);
-        } else if vm_policy.is_some_and(|policy| policy.start_pids.contains(&contender.pid)) {
-            probe.vm_shared.push(poison);
-        } else {
-            probe.vm_exempt.push(poison);
+        let vm_policy = vm_policy.filter(|_| contender.vm_infra);
+        match vm_policy {
+            None => probe.poison.push(poison),
+            Some(policy) => {
+                if policy.start_pids.contains(&contender.pid) {
+                    probe.vm_shared.push(poison);
+                } else if policy.own_window.is_none() {
+                    // The pre-054 shape (no cap, no usable clock): every
+                    // unlisted vm contender poisons exactly as before.
+                    probe.poison.push(poison);
+                } else {
+                    // sprint!054: correlate the contender's own lstart with
+                    // the job's own-window [start, start+120] - a VM born
+                    // inside it hosts the job's own container boots
+                    // (own-vm, exempt). Everything else - a pre-existing VM
+                    // (lstart before the window), a late foreign VM (after
+                    // it), or an uncorrelatable one (no lstart on this
+                    // platform) - poisons: the detector's real job stands
+                    // and a blanket VM whitelist never happens.
+                    let own = match (policy.own_window, contender.lstart_epoch) {
+                        (Some((window_start, window_end)), Some(lstart)) => {
+                            (window_start..=window_end).contains(&lstart)
+                        }
+                        _ => false,
+                    };
+                    if own {
+                        probe.vm_exempt.push(poison);
+                    } else {
+                        probe.poison.push(poison);
+                    }
+                }
+            }
         }
     }
     probe
@@ -2669,6 +2789,15 @@ mod tests {
     }
 
     fn contender(pid: u32, name: &str, vm_infra: bool) -> crate::rig::Contender {
+        contender_lstart(pid, name, vm_infra, None)
+    }
+
+    fn contender_lstart(
+        pid: u32,
+        name: &str,
+        vm_infra: bool,
+        lstart_epoch: Option<i64>,
+    ) -> crate::rig::Contender {
         crate::rig::Contender {
             pid,
             name: name.into(),
@@ -2678,6 +2807,7 @@ mod tests {
             command: None,
             cwd: None,
             vm_infra,
+            lstart_epoch,
         }
     }
 
@@ -2696,15 +2826,30 @@ mod tests {
 
     #[test]
     fn a_vm_declaring_job_exemptes_vms_born_after_start_and_shares_preexisting_ones() {
+        // sprint!054 semantics: born-after-start is decided by the lstart
+        // correlation (the job's own-window), not by absence from the
+        // start-pid snapshot - the pid snapshot alone cannot tell the job's
+        // own VM from a foreign one that merely appeared later.
         let rows = vec![
-            contender(10, "com.apple.Virtualization.VirtualMachine", true), // born after
-            contender(11, "qemu-system-x86_64", true),                      // predates
-            contender(12, "cargo", false),                                  // never exempt
+            contender_lstart(
+                10,
+                "com.apple.Virtualization.VirtualMachine",
+                true,
+                Some(1_000_000_060), // born 60 s into the job's own window
+            ),
+            contender_lstart(
+                11,
+                "qemu-system-x86_64",
+                true,
+                Some(999_999_000), // predates the window entirely
+            ),
+            contender(12, "cargo", false), // never exempt
         ];
         let contention = contention_with(&rows);
         let known: Vec<Poison> = Vec::new();
         let policy = VmPolicy {
             start_pids: [11u32].into_iter().collect(),
+            own_window: Some((1_000_000_000, 1_000_000_120)),
         };
         let probe = probe_poison(&contention, &known, Some(&policy));
         assert!(
@@ -2735,9 +2880,117 @@ mod tests {
     }
 
     #[test]
-    fn exempted_vms_are_recorded_never_laundered_and_deduped_by_pid() {
+    fn resolve_job_id_accepts_full_ids_verbatim_and_refuses_unknown_short_ones() {
+        let root = std::env::temp_dir().join(format!("am060_{}", std::process::id()));
+        fs::create_dir_all(root.join("queue")).unwrap();
+        fs::create_dir_all(root.join("logs")).unwrap();
+        let full = "01a1de08-70f6-7ef3-ac4e-8fd4e9ef47b7";
+        fs::write(root.join("queue").join(format!("{full}.json")), "{}").unwrap();
+        // Full id passes through verbatim.
+        assert_eq!(resolve_job_id(&root, full).unwrap(), full);
+        // The short id the status panel renders resolves to it.
+        assert_eq!(resolve_job_id(&root, "e9ef47b7").unwrap(), full);
+        // An unknown short id refuses, naming the resolution set - never a
+        // false "no such job" about a full id that was never tried.
+        let error = format!("{}", resolve_job_id(&root, "deadbeef").unwrap_err());
+        assert!(
+            error.contains("deadbeef") && error.contains("full uuid"),
+            "{error}"
+        );
+        // Ambiguity refuses with both candidates named.
+        let second = "01a1de08-70f6-7ef3-ac4e-5f5ce9ef47b7";
+        fs::write(root.join("logs").join(format!("{second}.log")), "").unwrap();
+        let error = format!("{}", resolve_job_id(&root, "e9ef47b7").unwrap_err());
+        assert!(error.contains("2 jobs"), "{error}");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn shell_command_shells_a_split_compound_first_element_instead_of_enoent() {
+        // sprint!058: `ARMS="p1 p2" bash x.sh` pre-split by a Zed terminal
+        // arrives with argv[0] holding whitespace - the direct-spawn arm
+        // would ENOENT. The shell arm runs the joined line like the
+        // single-element workaround form.
+        let argv = vec!["echo".into()];
+        let single_command = shell_command(&argv);
+        assert_eq!(single_command.get_program().to_string_lossy(), "echo");
+        let compound = shell_command(&["ARMS=p1 p2 bash -c echo hi".to_string()]);
+        assert_eq!(compound.get_program().to_string_lossy(), "sh");
+        let compound2 = shell_command(&[
+            "ARMS=p1 p2".to_string(),
+            "bash".to_string(),
+            "-c".to_string(),
+            "echo".to_string(),
+        ]);
+        assert_eq!(compound2.get_program().to_string_lossy(), "sh");
+    }
+
+    #[test]
+    fn a_vm_born_after_start_without_a_vm_cap_classifies_own_by_lstart_not_poison() {
+        // sprint!054 exact victim shape: no `vm` cap declared, the job's own
+        // Docker Desktop VM appears AFTER the quiet pre-window and stamped
+        // POISONED x6. The every-exclusive policy's own-window classifies it.
+        let rows = vec![
+            contender_lstart(
+                8326,
+                "com.apple.Virtualization.VirtualMachine",
+                true,
+                Some(1_000_000_003), // lstart 3 s after the job start
+            ),
+            contender(9, "p633_p21.py", true), // a real foreign process, no vm class
+        ];
+        let probe = probe_poison(
+            &contention_with(&rows),
+            &[],
+            Some(&VmPolicy {
+                start_pids: Default::default(),
+                own_window: Some((1_000_000_000, 1_000_000_120)),
+            }),
+        );
+        assert_eq!(
+            probe.vm_exempt.len(),
+            1,
+            "the job's own VM is own-vm, never POISONED"
+        );
+        assert_eq!(probe.vm_exempt[0].pid, 8326);
+        assert_eq!(
+            probe.poison.len(),
+            1,
+            "the real foreign process still poisons"
+        );
+        assert_eq!(probe.poison[0].pid, 9);
+    }
+
+    #[test]
+    fn a_pre_existing_vm_with_lstart_before_the_window_stays_shared() {
+        let rows = vec![contender_lstart(
+            100,
+            "com.apple.Virtualization.VirtualMachine",
+            true,
+            Some(999_999_500), // started BEFORE the job
+        )];
+        let probe = probe_poison(
+            &contention_with(&rows),
+            &[],
+            Some(&VmPolicy {
+                start_pids: Default::default(),
+                own_window: Some((1_000_000_000, 1_000_000_120)),
+            }),
+        );
+        assert_eq!(
+            probe.poison.len(),
+            1,
+            "a pre-existing VM stays poison (the issue's bullet 2)"
+        );
+        assert!(probe.vm_shared.is_empty() && probe.vm_exempt.is_empty());
+    }
+
+    #[test]
+    fn an_unfetched_lstart_poisons_fail_closed() {
+        // The detector's real job stands: no correlation evidence = no
+        // own-vm claim.
         let rows = vec![contender(
-            10,
+            200,
             "com.apple.Virtualization.VirtualMachine",
             true,
         )];
@@ -2746,6 +2999,27 @@ mod tests {
             &[],
             Some(&VmPolicy {
                 start_pids: Default::default(),
+                own_window: Some((1_000_000_000, 1_000_000_120)),
+            }),
+        );
+        assert_eq!(probe.poison.len(), 1, "uncorrelatable vm poisons");
+        assert!(probe.vm_exempt.is_empty());
+    }
+
+    #[test]
+    fn exempted_vms_are_recorded_never_laundered_and_deduped_by_pid() {
+        let rows = vec![contender_lstart(
+            10,
+            "com.apple.Virtualization.VirtualMachine",
+            true,
+            Some(5_000_000_000), // inside the job's own window
+        )];
+        let probe = probe_poison(
+            &contention_with(&rows),
+            &[],
+            Some(&VmPolicy {
+                start_pids: Default::default(),
+                own_window: Some((5_000_000_000, 5_000_000_120)),
             }),
         );
         assert_eq!(probe.vm_exempt.len(), 1);
@@ -2764,6 +3038,7 @@ mod tests {
             known,
             Some(&VmPolicy {
                 start_pids: Default::default(),
+                own_window: None,
             }),
         );
         assert!(

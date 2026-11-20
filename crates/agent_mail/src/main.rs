@@ -593,6 +593,22 @@ fn rig_run(room: &Mailroom, args: Vec<String>) -> Result<i32> {
         !argv.is_empty(),
         "no command: pass the command after `--`, or use --verify-manifest"
     );
+    // sprint!058: a first argv element holding whitespace can never start a
+    // process - the rig's executor spawns `argv` directly, so a shell
+    // compound the terminal pre-split (`ARMS="p1 p2" bash x.sh` arriving
+    // with `ARMS="p1 p2"` as argv[0]) died as ENOENT far from the caller,
+    // twice in one night. Multi-element argv with `NAME=VALUE` env prefixes
+    // stays legal (exec's env form); the guard fires only on the compound
+    // shape. The executor side shells the joined line (jobs.rs
+    // `shell_command`), so the recorded one-quoted-arg workaround form
+    // still runs when it reaches a 0.1.0 binary.
+    if argv.len() > 1 && argv[0].contains(char::is_whitespace) {
+        anyhow::bail!(
+            "argv[0] {:?} contains whitespace and can never start a process - the rig spawns argv directly. Quote the ENTIRE command as ONE argument after `--` (the executor shells single-element commands): -- \"{}\"",
+            argv[0],
+            argv.join(" ")
+        );
+    }
     let rigs = room.rigs()?;
     let notify = notify.or_else(|| {
         room.whoami().ok().map(|name| {
