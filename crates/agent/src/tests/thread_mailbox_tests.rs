@@ -1151,6 +1151,191 @@ async fn test_agent_mail_resumes_saved_thread_for_zed_name(cx: &mut TestAppConte
     assert!(prompt.contains("continue where you left off"), "{prompt}");
 }
 
+/// Issue 075: mail addressed to a specific `zed-*` inbox names that thread,
+/// so waking it must not depend on the opt-in `[M]` spawn setting. With the
+/// default settings (spawning off), a saved thread's inbox still resumes it.
+#[gpui::test]
+async fn test_agent_mail_resumes_saved_thread_without_spawn_setting(cx: &mut TestAppContext) {
+    let setup = setup_threads(1, cx).await;
+    let (agent, fake) = (&setup.agent, &setup.fake);
+    let (_home, sender) = enable_agent_mail(agent, cx);
+
+    // A thread that is not live: only a row in the thread database.
+    let departed_id = acp_v2::SessionId::new("11111111-2222-3333-4444-555555555555");
+    let mail_name = agent_mail_bridge::native_thread_mail_name(&departed_id);
+    let database = cx
+        .update(|cx| crate::db::ThreadsDatabase::connect(cx))
+        .await
+        .unwrap();
+    database
+        .save_thread(
+            departed_id.clone(),
+            make_saved_thread("Departed"),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+
+    mail_to_name(&sender, &mail_name, "continue where you left off");
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.run_until_parked();
+
+    let resumed_model = agent.read_with(cx, |agent, cx| {
+        assert!(
+            agent.sessions.contains_key(&departed_id),
+            "mail to a saved thread's inbox should resume it without the spawn setting"
+        );
+        assert_eq!(agent.sessions.len(), 2);
+        agent.sessions[&departed_id]
+            .thread
+            .read(cx)
+            .model()
+            .unwrap()
+            .clone()
+    });
+
+    let pending = fake.pending_completions_for(&resumed_model);
+    assert_eq!(
+        pending.len(),
+        1,
+        "the mail should start the resumed thread's turn"
+    );
+    let prompt = pending[0].messages.last().unwrap().string_contents();
+    assert!(prompt.contains("continue where you left off"), "{prompt}");
+}
+
+/// Issue 075: a thread waiting on its own scheduled wake must keep receiving
+/// it even after its panel view closes. The waiting keep-alive pin holds the
+/// session open, the poller keeps claiming its inbox, and the due wake starts
+/// a turn — no user click required.
+#[gpui::test]
+async fn test_waiting_thread_keeps_wake_after_view_release(cx: &mut TestAppContext) {
+    let setup = setup_threads(1, cx).await;
+    let (agent, fake) = (&setup.agent, &setup.fake);
+    let thread = &setup.threads[0];
+    let (home, _sender) = enable_agent_mail(agent, cx);
+    let name = agent_mail_bridge::native_thread_mail_name(&thread.session_id);
+    let session_id = thread.session_id.clone();
+    let model = thread.model.clone();
+
+    let turn = setup.send(thread, "Start the long job, then check it later", cx);
+    cx.run_until_parked();
+    let tool_input = json!({
+        "to": format!("{name}@m3"),
+        "message": "check the long job",
+        "deliver_at": "8h",
+    });
+    fake.send_last_event(
+        &thread.model,
+        LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
+            id: "wake_1".into(),
+            name: SendMessageTool::NAME.into(),
+            raw_input: tool_input.to_string(),
+            input: language_model::LanguageModelToolUseInput::Json(tool_input),
+            is_input_complete: true,
+            thought_signature: None,
+        }),
+    );
+    fake.end_last(&thread.model);
+    cx.run_until_parked();
+    fake.send_last_text(&thread.model, "Scheduled; going idle.");
+    fake.end_last(&thread.model);
+    assert_eq!(turn.await.unwrap(), acp_v2::StopReason::EndTurn);
+
+    // Simulate the user closing the panel view: drop the test's strong
+    // handle. The keep-alive pin must keep the session live.
+    let MailboxTestSetup {
+        agent,
+        fake,
+        threads,
+        ..
+    } = setup;
+    drop(threads);
+    agent.read_with(cx, |agent, _| {
+        assert!(
+            agent.sessions.contains_key(&session_id),
+            "the waiting thread's session must survive the view closing"
+        );
+    });
+
+    // The due time arrives (simulated by back-dating the parked file).
+    let later = home.path().join("inbox").join(&name).join("later");
+    let parked = std::fs::read_dir(&later)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let file_name = parked.file_name().unwrap().to_str().unwrap().to_string();
+    let (_, rest) = file_name.split_once('_').unwrap();
+    std::fs::rename(&parked, later.join(format!("1_{rest}"))).unwrap();
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.run_until_parked();
+
+    let pending = fake.pending_completions_for(&model);
+    assert_eq!(
+        pending.len(),
+        1,
+        "the scheduled wake should start the thread's turn without a click"
+    );
+    let prompt = pending[0].messages.last().unwrap().string_contents();
+    assert!(prompt.contains("check the long job"), "{prompt}");
+}
+
+/// Issue 075: fire-and-forget mail expects nothing back, so it must neither
+/// mark the sender waiting nor keep-alive-pin it — the session must release
+/// normally once the view closes.
+#[gpui::test]
+async fn test_fire_and_forget_mail_neither_waits_nor_pins(cx: &mut TestAppContext) {
+    let setup = setup_threads(1, cx).await;
+    let (agent, fake) = (&setup.agent, &setup.fake);
+    let thread = &setup.threads[0];
+    let (_home, _sender) = enable_agent_mail(agent, cx);
+    let session_id = thread.session_id.clone();
+
+    let turn = setup.send(thread, "Tell the peer, don't wait", cx);
+    cx.run_until_parked();
+    let tool_input = json!({
+        "to": "peer-x@m3",
+        "message": "heads up",
+    });
+    fake.send_last_event(
+        &thread.model,
+        LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
+            id: "send_1".into(),
+            name: SendMessageTool::NAME.into(),
+            raw_input: tool_input.to_string(),
+            input: language_model::LanguageModelToolUseInput::Json(tool_input),
+            is_input_complete: true,
+            thought_signature: None,
+        }),
+    );
+    fake.end_last(&thread.model);
+    cx.run_until_parked();
+    fake.send_last_text(&thread.model, "Sent.");
+    fake.end_last(&thread.model);
+    assert_eq!(turn.await.unwrap(), acp_v2::StopReason::EndTurn);
+
+    thread.acp_thread.read_with(cx, |thread, _| {
+        assert!(
+            !thread.is_waiting_for_mail(),
+            "fire-and-forget mail must not mark the sender waiting"
+        );
+    });
+
+    // Dropping the view handle must release the session again: no pin.
+    let MailboxTestSetup { agent, threads, .. } = setup;
+    drop(threads);
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.run_until_parked();
+    agent.read_with(cx, |agent, _| {
+        assert!(
+            !agent.sessions.contains_key(&session_id),
+            "without a waiting pin the session must release once the view closes"
+        );
+    });
+}
+
 #[gpui::test]
 async fn test_agent_mail_never_spawns_for_zed_names(cx: &mut TestAppContext) {
     let setup = setup_threads(1, cx).await;

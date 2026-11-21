@@ -41,6 +41,14 @@ pub(crate) struct AgentMailState {
     /// this the `AcpThread` release would clean the session up the moment the
     /// spawn/resume returns. Also the cap source for mail-driven threads.
     pub(crate) pinned_threads: HashMap<acp_v2::SessionId, Entity<acp_thread::AcpThread>>,
+    /// Keep-alive pins for threads waiting on mail (issue 075): a thread that
+    /// sent mail expecting a reply or a scheduled wake parks idle; if its
+    /// panel view closes, the `AcpThread` release would remove the session and
+    /// nothing would claim its inbox — the wake would sit parked until the
+    /// user clicked the thread back open. The pin holds the `AcpThread` so the
+    /// session stays live and the poller keeps delivering; it drops when the
+    /// mail is claimed back into the inbox.
+    pub(crate) waiting_pins: HashMap<acp_v2::SessionId, Entity<acp_thread::AcpThread>>,
     _poller: Task<()>,
     _settings: Subscription,
 }
@@ -81,7 +89,7 @@ impl AgentMailState {
                     // appeared (a new thread, or a stopped thread the user
                     // just clicked back open) re-enter at `now`, so they
                     // claim only broadcasts sent from then on.
-                    let Ok(Some((claims, live_entries, inbox_names, spawn_budget))) =
+                    let Ok(Some((claims, live_entries, inbox_names, mail_budget, spawn_budget))) =
                         this.update(cx, |agent, cx| {
                             let Some(state) = agent.agent_mail.as_mut() else {
                                 return None;
@@ -96,6 +104,11 @@ impl AgentMailState {
                             state
                                 .pinned_threads
                                 .retain(|session_id, _| agent.sessions.contains_key(session_id));
+                            state.waiting_pins.retain(|session_id, pin| {
+                                agent.sessions.contains_key(session_id)
+                                    && (pin.read(cx).is_waiting_for_mail()
+                                        || pin.read(cx).status() != ThreadStatus::Idle)
+                            });
                             let mut claims = Vec::new();
                             let mut live_entries = Vec::new();
                             let mut inbox_names = Vec::new();
@@ -112,16 +125,20 @@ impl AgentMailState {
                                 live_entries.push((inbox.clone(), status, kind));
                                 inbox_names.push(inbox);
                             }
+                            let mail_budget = if !agent.sessions.is_empty()
+                                && state.pinned_threads.len() < MAX_MAIL_SPAWNED_THREADS
+                            {
+                                Some(MAX_MAIL_SPAWNED_THREADS - state.pinned_threads.len())
+                            } else {
+                                None
+                            };
                             let spawn_budget =
-                                if AgentSettings::get_global(cx).fork.agent_mail_spawn_threads
-                                    && !agent.sessions.is_empty()
-                                    && state.pinned_threads.len() < MAX_MAIL_SPAWNED_THREADS
-                                {
-                                    Some(MAX_MAIL_SPAWNED_THREADS - state.pinned_threads.len())
+                                if AgentSettings::get_global(cx).fork.agent_mail_spawn_threads {
+                                    mail_budget
                                 } else {
                                     None
                                 };
-                            Some((claims, live_entries, inbox_names, spawn_budget))
+                            Some((claims, live_entries, inbox_names, mail_budget, spawn_budget))
                         })
                     else {
                         break;
@@ -157,11 +174,15 @@ impl AgentMailState {
                     } else {
                         Vec::new()
                     };
-                    // Plan 053 follow-up: mail to a `zed-*` inbox whose
-                    // session is not live names a thread in this rig's
-                    // history — resume it instead of parking, under the same
-                    // gate and cap as spawning.
-                    let resume_targets = if let Some(budget) = spawn_budget {
+                    // Plan 053 follow-up, widened by issue 075: mail to a
+                    // `zed-*` inbox whose session is not live names a thread
+                    // in this rig's history — resume it instead of parking.
+                    // The address names that specific thread, so waking it is
+                    // what the mail asks for; unlike `[M]` spawning this is
+                    // not opt-in, but it stays under the same cap and needs a
+                    // donor session like spawning (mail_budget is None
+                    // without one).
+                    let resume_targets = if let Some(budget) = mail_budget {
                         let mailroom = mailroom.clone();
                         let resume_names = cx
                             .background_spawn(async move {
@@ -303,6 +324,7 @@ impl AgentMailState {
             live_since: HashMap::default(),
             spawned_names: HashMap::default(),
             pinned_threads: HashMap::default(),
+            waiting_pins: HashMap::default(),
             _poller: poller,
             _settings: settings,
         };
@@ -602,6 +624,20 @@ impl NativeAgent {
         }
     }
 
+    /// Pins a thread that is waiting on mail (issue 075): the keep-alive that
+    /// lets a parked thread keep receiving its wake after its panel view
+    /// closes. The poller drops the pin once the thread is neither waiting
+    /// nor generating any more.
+    pub(crate) fn pin_waiting_thread(
+        &mut self,
+        session_id: &acp_v2::SessionId,
+        acp_thread: Entity<acp_thread::AcpThread>,
+    ) {
+        if let Some(state) = self.agent_mail.as_mut() {
+            state.waiting_pins.insert(session_id.clone(), acp_thread);
+        }
+    }
+
     /// Queues claimed mail like a `send_message` from a local thread, so an
     /// idle thread starts a turn and a busy one gets it when its turn ends —
     /// unless the envelope's mode asks otherwise (issue 046): `steering` ends
@@ -626,7 +662,10 @@ impl NativeAgent {
         // Mail claimed for this thread means its wait is over (the reply or
         // scheduled wake arrived), whether it is delivered now or queued for
         // the current turn's end — but an unrelated fyi blast must not end a
-        // mail wait it has nothing to do with.
+        // mail wait it has nothing to do with. The keep-alive pin (issue 075)
+        // is deliberately NOT dropped here: unpinning before the wake delivery
+        // starts can release the session mid-delivery; the poller prunes the
+        // pin once the thread is neither waiting nor generating.
         if !fyi_only {
             if let Some(session) = self.sessions.get(session_id)
                 && let Some(acp_thread) = session.acp_thread.upgrade()
@@ -777,13 +816,24 @@ impl NativeThreadEnvironment {
                 .await?;
             // The sender now waits on the reply (or its own scheduled wake):
             // its turn usually ends here, and the sidebar marks it waiting
-            // until the mail is claimed back into its inbox.
+            // until the mail is claimed back into its inbox. Fire-and-forget
+            // mail expects nothing back, so it neither waits nor pins. The
+            // pin keeps the session live while its view is closed, so the
+            // wake still reaches the thread (issue 075).
+            let expects_mail_back = request.wait_for_reply || request.deliver_at.is_some();
             agent
                 .update(cx, |agent, cx| {
-                    if let Some(session) = agent.sessions.get(&sender)
-                        && let Some(acp_thread) = session.acp_thread.upgrade()
-                    {
-                        acp_thread.update(cx, |thread, cx| thread.set_waiting_for_mail(true, cx));
+                    let acp_thread = agent
+                        .sessions
+                        .get(&sender)
+                        .and_then(|session| session.acp_thread.upgrade());
+                    if let Some(acp_thread) = acp_thread {
+                        acp_thread.update(cx, |thread, cx| {
+                            thread.set_waiting_for_mail(expects_mail_back, cx)
+                        });
+                        if expects_mail_back {
+                            agent.pin_waiting_thread(&sender, acp_thread);
+                        }
                     }
                 })
                 .log_err();
