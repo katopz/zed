@@ -6,7 +6,7 @@ use settings::{
 };
 
 /// Default for `AgentSettings::stream_idle_timeout_secs`.
-pub const DEFAULT_STREAM_IDLE_TIMEOUT_SECS: u64 = 120;
+pub const DEFAULT_STREAM_IDLE_TIMEOUT_SECS: u64 = 240;
 
 /// Default for `AgentSettings::verdict_max_rounds` (proposal 001).
 pub const DEFAULT_VERDICT_MAX_ROUNDS: usize = 3;
@@ -40,16 +40,19 @@ pub struct ForkAgentSettings {
     /// None (prompts wait indefinitely).
     pub auto_allow_permissions_after_seconds: Option<u64>,
     /// Maximum time to wait for a streamed completion event before treating
-    /// the stream as dead and retrying. 0 disables the timeout. Default: 120
-    /// seconds — long enough for time-to-first-token on very large contexts,
-    /// short enough that a wedged stream recovers without the watchdog.
+    /// the stream as dead and retrying. 0 disables the timeout. Default: 240
+    /// seconds — long enough for time-to-first-token on very large contexts
+    /// (issue 074), short enough that a wedged stream recovers without the
+    /// watchdog.
     pub stream_idle_timeout_secs: u64,
     /// Whether external agents are offered the ACP subagents capability.
     pub external_subagents: bool,
     /// Watchdog interval pushed to the agent-mail orchestrator rig (plan 048).
     pub agent_mail_watch_interval_minutes: Option<u64>,
     /// Whether mail for an inbox no live thread claims spawns a new `[M]`-
-    /// titled thread (plan 053). Default: false.
+    /// titled thread (plan 053). Default: false. Mail addressed to a specific
+    /// `zed-*` inbox is not affected: its saved thread is resumed whenever it
+    /// holds waking mail (issue 075), spawn setting or not.
     pub agent_mail_spawn_threads: bool,
 }
 

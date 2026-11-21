@@ -105,7 +105,7 @@ pub struct ForkAgentSettingsContent {
     /// only fires when no tool results are pending; while tools run, a silent
     /// stream is legitimate. Set to 0 to disable.
     ///
-    /// Default: 120
+    /// Default: 240
     pub stream_idle_timeout_secs: Option<u64>,
 
     /// Whether external agents (ACP) are offered the subagents capability, so
@@ -131,6 +131,11 @@ pub struct ForkAgentSettingsContent {
     /// `zed-*` addresses, and the shared `_any` inbox never spawn. At most 8
     /// mail-spawned threads are live at once. A remote work trigger: enable
     /// per rig (worker rigs yes, an owner's laptop no).
+    ///
+    /// A `zed-*` address is not gated by this setting: mail holding a waking
+    /// message for one resumes that saved thread even when spawning is off,
+    /// so a stopped thread is woken by its mail instead of staying parked
+    /// until the user clicks it (issue 075).
     ///
     /// Default: false
     pub agent_mail_spawn_threads: Option<bool>,

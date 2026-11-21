@@ -31,11 +31,11 @@ async fn test_stream_idle_timeout_recovers_hung_stream(cx: &mut TestAppContext) 
         .unwrap();
     cx.run_until_parked();
 
-    // Default `stream_idle_timeout_secs` is 120; idle timeouts retry up to
+    // Default `stream_idle_timeout_secs` is 240; idle timeouts retry up to
     // 4 times with a 30s fixed delay, so the full cascade (5 attempts) needs
-    // ~720s of virtual time. Advance in chunks so each due timer's task
+    // ~1320s of virtual time. Advance in chunks so each due timer's task
     // runs before the next clock jump.
-    for _ in 0..14 {
+    for _ in 0..24 {
         cx.executor().advance_clock(Duration::from_secs(60));
         cx.run_until_parked();
     }
@@ -94,7 +94,7 @@ async fn test_stream_idle_timeout_recovers_mid_retry_cascade(cx: &mut TestAppCon
         .unwrap();
     cx.run_until_parked();
 
-    // Two attempts hang; each burns the 120s idle timeout plus a 30s
+    // Two attempts hang; each burns the 240s idle timeout plus a 30s
     // retry delay. Advance in 60s chunks until the third stream opens.
     for _ in 0..10 {
         if fake.pending_completions_for(&model).len() >= 3 {
@@ -182,10 +182,10 @@ async fn test_request_phase_idle_timeout_retries_hung_request(cx: &mut TestAppCo
         .unwrap();
     cx.run_until_parked();
 
-    // Five attempts (initial + 4 retries), each burning the 120s
-    // request-phase idle timeout plus a 30s retry delay (~750s of virtual
+    // Five attempts (initial + 4 retries), each burning the 240s
+    // request-phase idle timeout plus a 30s retry delay (~1350s of virtual
     // time). Advance in chunks so each due timer's task runs first.
-    for _ in 0..14 {
+    for _ in 0..24 {
         cx.executor().advance_clock(Duration::from_secs(60));
         cx.run_until_parked();
     }
@@ -246,7 +246,7 @@ async fn test_request_phase_idle_timeout_recovers_mid_cascade(cx: &mut TestAppCo
         .unwrap();
     cx.run_until_parked();
 
-    // Two attempts hang; each burns the 120s request-phase idle timeout plus
+    // Two attempts hang; each burns the 240s request-phase idle timeout plus
     // a 30s retry delay. Advance in 60s chunks until the second request opens.
     for _ in 0..10 {
         if fake.pending_completions_for(&model).len() >= 2 {
@@ -338,10 +338,10 @@ async fn test_metadata_request_idle_timeout_retries_then_errors(cx: &mut TestApp
     });
     cx.run_until_parked();
 
-    // Three attempts (initial + 2 retries), each burning the 120s idle
-    // timeout plus a 500ms retry delay (~361s of virtual time); advance in
+    // Three attempts (initial + 2 retries), each burning the 240s idle
+    // timeout plus a 500ms retry delay (~721s of virtual time); advance in
     // chunks so each due timer's task runs first.
-    for _ in 0..8 {
+    for _ in 0..13 {
         cx.executor().advance_clock(Duration::from_secs(60));
         cx.run_until_parked();
     }
@@ -409,10 +409,10 @@ async fn test_compaction_stream_idle_timeout_recovers_hung_stream(cx: &mut TestA
         .unwrap();
     cx.run_until_parked();
 
-    // Five compaction attempts (initial + 4 retries) at 120s idle + 30s
-    // delay each (~720s virtual time total); advance in chunks so each
+    // Five compaction attempts (initial + 4 retries) at 240s idle + 30s
+    // delay each (~1350s virtual time total); advance in chunks so each
     // due timer's task runs first.
-    for _ in 0..14 {
+    for _ in 0..24 {
         cx.executor().advance_clock(Duration::from_secs(60));
         cx.run_until_parked();
     }
