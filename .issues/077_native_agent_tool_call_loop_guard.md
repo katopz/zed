@@ -8,7 +8,7 @@
 - [x] Tests added — `test_tool_loop_guard_stops_identical_calls` (4th consecutive refused), `test_tool_loop_guard_resets_when_tool_call_changes` (A,A,B,A,A,A,A trips at 7th only, pinning the reset), `test_tool_loop_guard_allows_non_consecutive_repeats` (12 alternating never trip)
 - [x] `cargo clippy -p agent` clean (release, all-targets, all-features, deny warnings; the 9 cargo-shear hits are pre-existing, in other crates — `agent_acp_server`, `auto_prompt`, `eval_cli`, …)
 - [x] Committed on `develop` + pushed — `01d0b094106eeecc7a53e6b3a6814c190299b7c6`
-- [x] Revised to limit 3 consecutive (owner call: "3 is enough") + reset-on-different-call semantics pinned by test; `test_tool_authorization` calls made distinguishable (its 5 identical `{}` permission calls are now legit guard trips)
+- [x] Revised to limit 3 consecutive (owner call: "3 is enough") + reset-on-different-call semantics pinned by test; `test_tool_authorization` calls made distinguishable (its 5 identical `{}` permission calls are now legit guard trips) — `f90025eaa11` on `develop`
 
 Note 2026-11-22: full `cargo test -p agent --lib` runs show 848-850 passed; the only
 intermittent failure is a pre-existing flake
