@@ -1251,6 +1251,133 @@ async fn test_tool_call_id_scoped_per_completion_request(cx: &mut TestAppContext
     );
 }
 
+#[gpui::test]
+async fn test_tool_loop_guard_stops_identical_calls(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        fake,
+        thread,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+
+    thread.update(cx, |thread, _cx| {
+        thread.add_tool(EchoTool);
+    });
+
+    let mut events = thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Run the echo tool"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    let identical_tool_use = |round: usize| {
+        LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
+            id: format!("call_{round}").into(),
+            name: EchoTool::NAME.into(),
+            raw_input: json!({"text": "same"}).to_string(),
+            input: language_model::LanguageModelToolUseInput::Json(json!({"text": "same"})),
+            is_input_complete: true,
+            thought_signature: None,
+        })
+    };
+
+    // Ten identical calls (same tool + arguments, fresh id per round) run
+    // normally, one per completion round.
+    for round in 1..=10 {
+        fake.send_last_event(&model, identical_tool_use(round));
+        fake.end_last(&model);
+        next_tool_call(&mut events).await;
+        cx.run_until_parked();
+    }
+
+    // The eleventh identical call is refused and the turn ends without
+    // issuing another completion request to the model.
+    fake.send_last_event(&model, identical_tool_use(11));
+    fake.end_last(&model);
+    next_tool_call(&mut events).await;
+    let remaining = events.collect::<Vec<_>>().await;
+    assert_eq!(stop_events(remaining), vec![acp_v2::StopReason::EndTurn]);
+    assert!(
+        fake.pending_completions().is_empty(),
+        "no further completion request should be issued after the loop guard tripped"
+    );
+
+    let markdown = thread.read_with(cx, |thread, _| thread.to_markdown());
+    assert_eq!(
+        markdown.matches("**Tool Use**: echo").count(),
+        11,
+        "{markdown}"
+    );
+    assert_eq!(
+        markdown.matches("**Tool Result**: echo").count(),
+        11,
+        "{markdown}"
+    );
+    assert_eq!(markdown.matches("**ERROR:**").count(), 1, "{markdown}");
+    assert!(markdown.contains("Tool call loop guard"), "{markdown}");
+    assert!(markdown.contains("11 times"), "{markdown}");
+}
+
+#[gpui::test]
+async fn test_tool_loop_guard_allows_distinct_calls(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        fake,
+        thread,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+
+    thread.update(cx, |thread, _cx| {
+        thread.add_tool(EchoTool);
+    });
+
+    let mut events = thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Run the echo tool"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    // Calls with distinct arguments never trip the guard, even past the
+    // repetition limit.
+    for round in 1..=11 {
+        fake.send_last_event(
+            &model,
+            LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
+                id: format!("call_{round}").into(),
+                name: EchoTool::NAME.into(),
+                raw_input: json!({"text": format!("distinct {round}")}).to_string(),
+                input: language_model::LanguageModelToolUseInput::Json(json!({
+                    "text": format!("distinct {round}")
+                })),
+                is_input_complete: true,
+                thought_signature: None,
+            }),
+        );
+        fake.end_last(&model);
+        next_tool_call(&mut events).await;
+        cx.run_until_parked();
+    }
+
+    fake.send_last_event(
+        &model,
+        LanguageModelCompletionEvent::Stop(StopReason::EndTurn),
+    );
+    fake.end_last(&model);
+    let remaining = events.collect::<Vec<_>>().await;
+    assert_eq!(stop_events(remaining), vec![acp_v2::StopReason::EndTurn]);
+
+    let markdown = thread.read_with(cx, |thread, _| thread.to_markdown());
+    assert_eq!(
+        markdown.matches("**Tool Result**: echo").count(),
+        11,
+        "{markdown}"
+    );
+    assert_eq!(markdown.matches("**ERROR:**").count(), 0, "{markdown}");
+    assert!(!markdown.contains("Tool call loop guard"), "{markdown}");
+}
+
 /// Same bug as `test_tool_call_id_scoped_per_completion_request`, but
 /// exercised through persistence and `Thread::replay()` instead of live
 /// streaming.
