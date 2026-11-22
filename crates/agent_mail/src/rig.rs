@@ -146,6 +146,12 @@ pub struct ProcessRow {
     pub pid: u32,
     /// Lets a managed job tell its own descendants from intruders.
     pub parent: Option<u32>,
+    /// Process-group id (sprint!087 F3). A managed job's child leads its own
+    /// group, and a `rustc`/`clang` whose `cargo` parent exited re-parents to
+    /// launchd/init but KEEPS the group — so the group, not the snapshot's
+    /// parent chain, is what keeps a job's orphaned compile legs its own.
+    /// None where the table has no group column (the Windows sysinfo arm).
+    pub group: Option<u32>,
     /// Binary basename; for interpreter-hosted runs, the script basename.
     pub name: String,
     /// Per-core percent (100 = one full core), as `ps` reports it.
@@ -362,7 +368,7 @@ pub fn cputime_minutes(time: &str) -> f64 {
     days * 24.0 * 60.0 + minutes
 }
 
-/// Parses `ps -axo pid=,ppid=,pcpu=,rss=,time=,args=` (RSS in KiB).
+/// Parses `ps -axo pid=,ppid=,pgid=,pcpu=,rss=,time=,args=` (RSS in KiB).
 pub fn parse_ps(output: &str) -> Vec<ProcessRow> {
     output
         .lines()
@@ -370,6 +376,7 @@ pub fn parse_ps(output: &str) -> Vec<ProcessRow> {
             let mut fields = line.split_whitespace();
             let pid = fields.next()?.parse().ok()?;
             let parent = fields.next()?.parse().ok();
+            let group = fields.next()?.parse().ok();
             let cpu_pct = fields.next()?.parse().ok()?;
             let rss_kib: u64 = fields.next()?.parse().ok()?;
             let time = fields.next()?;
@@ -377,6 +384,7 @@ pub fn parse_ps(output: &str) -> Vec<ProcessRow> {
             Some(ProcessRow {
                 pid,
                 parent,
+                group,
                 name: process_identity(&command)?,
                 cpu_pct,
                 rss_bytes: rss_kib * 1024,
@@ -437,6 +445,24 @@ impl Contention {
     }
 }
 
+/// The processes a managed job owns (sprint!087 F3): every process whose
+/// process group is one of `roots` (each managed pid leads its own group —
+/// `process_group(0)` at spawn — and a pid is never reused while a group of
+/// that id lives, so the match cannot hit an unrelated process), plus the
+/// snapshot descendants of the roots and of those group members. The group
+/// arm is what keeps an orphaned `rustc`/`clang` — re-parented to launchd
+/// when its `cargo` exited between probe ticks — excluded; the descendant
+/// arm still covers children that left the group (a nested `setsid`).
+pub fn job_tree(rows: &[ProcessRow], roots: &[u32]) -> std::collections::HashSet<u32> {
+    let mut seeds: Vec<u32> = roots.to_vec();
+    seeds.extend(
+        rows.iter()
+            .filter(|row| row.group.is_some_and(|group| roots.contains(&group)))
+            .map(|row| row.pid),
+    );
+    descendants(rows, &seeds)
+}
+
 /// `root` and every process descending from it.
 pub fn descendants(rows: &[ProcessRow], roots: &[u32]) -> std::collections::HashSet<u32> {
     let mut tree: std::collections::HashSet<u32> = roots.iter().copied().collect();
@@ -457,7 +483,7 @@ pub fn contention(exclude_trees: &[u32]) -> Contention {
     let processes = process_table();
     let mut roots = exclude_trees.to_vec();
     roots.push(std::process::id());
-    let excluded = descendants(&processes.rows, &roots);
+    let excluded = job_tree(&processes.rows, &roots);
     let (contenders, blind) = match vocabulary_dir().map(|dir| Vocabulary::load(&dir)) {
         Some(Ok(vocabulary)) => {
             let limits = Thresholds::from_env();
@@ -649,7 +675,7 @@ pub fn process_command_lines() -> Option<Vec<String>> {
 
 #[cfg(unix)]
 fn process_table() -> ProcessTable {
-    match run("ps", &["-axo", "pid=,ppid=,pcpu=,rss=,time=,args="]) {
+    match run("ps", &["-axo", "pid=,ppid=,pgid=,pcpu=,rss=,time=,args="]) {
         Some(output) => ProcessTable {
             rows: parse_ps(&output),
             ..ProcessTable::default()
@@ -692,6 +718,7 @@ fn process_table() -> ProcessTable {
             ProcessRow {
                 pid: process.pid().as_u32(),
                 parent: process.parent().map(|parent| parent.as_u32()),
+                group: None,
                 name: name
                     .strip_suffix(".exe")
                     .map(str::to_string)
@@ -1406,6 +1433,7 @@ mod tests {
         ProcessRow {
             pid: 1,
             parent: None,
+            group: None,
             name: name.into(),
             cpu_pct,
             rss_bytes: (rss_gb * GIB) as u64,
@@ -1512,15 +1540,48 @@ mod tests {
     #[test]
     fn parses_ps_rows_and_cpu_time() {
         let rows = parse_ps(
-            "  101  1  230.5  4194304  12:34.56 /usr/bin/cargo build --release\n\
-             202  1   0.0     1024   1-02:03:04 /sbin/launchd\n\
+            "  101  1  101  230.5  4194304  12:34.56 /usr/bin/cargo build --release\n\
+             202  1  202   0.0     1024   1-02:03:04 /sbin/launchd\n\
              garbage line\n",
         );
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].name, "cargo");
+        assert_eq!(rows[0].group, Some(101));
         assert_eq!(rows[0].rss_bytes, 4 * 1024 * 1024 * 1024);
         assert_eq!(rows[0].cputime_min, 12.0);
         assert_eq!(rows[1].cputime_min, 24.0 * 60.0 + 2.0 * 60.0 + 3.0);
+    }
+
+    /// sprint!087 F3: a job's `rustc` whose `cargo` parent exited between
+    /// probe ticks re-parents to launchd (ppid 1) — the parent chain loses
+    /// it, the process group keeps it. A foreign build in its own group
+    /// still counts, and so does a foreign child of launchd.
+    #[test]
+    fn job_tree_keeps_orphaned_children_by_process_group() {
+        let rows = parse_ps(
+            "  500     1   500   0.0  1024  0:00.10 agent-mail rig exec j\n\
+             600   500   600   0.0  1024  0:00.10 bash -lc cargo build\n\
+             610     1   600  99.0  4194304  3:00.00 /bin/rustc --crate-name orphan\n\
+             611   610   600  99.0  4194304  3:00.00 /usr/bin/clang -c x.c\n\
+             700     1   700  99.0  4194304  3:00.00 /bin/rustc --crate-name foreign\n\
+             701     1   701  99.0  4194304  3:00.00 /usr/bin/ld foreign\n",
+        );
+        let tree = job_tree(&rows, &[500, 600]);
+        assert!(
+            tree.contains(&610),
+            "the re-parented rustc stays the job's own"
+        );
+        assert!(tree.contains(&611), "and so does its child");
+        assert!(
+            !tree.contains(&700) && !tree.contains(&701),
+            "foreign builds stay contenders"
+        );
+        // The pre-087 snapshot-descendant arm loses the orphan — the defect.
+        let old = descendants(&rows, &[500, 600]);
+        assert!(
+            !old.contains(&610),
+            "the parent chain alone cannot see the orphan"
+        );
     }
 
     #[test]

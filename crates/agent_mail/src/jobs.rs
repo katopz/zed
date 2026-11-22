@@ -186,6 +186,12 @@ pub struct JobRecord {
     pub exit_code: Option<i32>,
     #[serde(default)]
     pub poisoned: Vec<Poison>,
+    /// Last probe that saw ANY poisoner — a fresh pid or a recorded one still
+    /// running (sprint!087 F2). `Poison::at` is first sight only, so a
+    /// foreign build lasting an hour registers once; this is what proves the
+    /// later part of a long exclusive run clean ("clean since").
+    #[serde(default)]
+    pub poison_last_seen: Option<String>,
     /// VM-infrastructure processes born after this job started, while the
     /// job declared `vm` (issue 039): treated as the job's own. Recorded,
     /// never poison, never mailed per-probe.
@@ -242,6 +248,10 @@ pub struct JobLine {
     /// Poison-probe strikes against an exclusive run.
     #[serde(default)]
     pub poisoned: usize,
+    /// When a poisoner was last seen on the rig (RFC 3339; sprint!087 F2) —
+    /// a poisoned run that went clean shows how long it has been clean.
+    #[serde(default)]
+    pub poison_last_seen: Option<String>,
     /// Proposed wall-clock estimate in seconds (`rig run --est 30m`).
     #[serde(default)]
     pub est_secs: Option<u64>,
@@ -331,6 +341,78 @@ fn now() -> String {
 
 fn short(id: &str) -> &str {
     id.get(id.len().saturating_sub(8)..).unwrap_or(id)
+}
+
+/// The time a run was last seen poisoned: the explicit last sighting, else
+/// (records from builds before sprint!087) the newest first-sight stamp.
+fn poison_last_seen<'a>(poisoned: &'a [Poison], last_seen: Option<&'a str>) -> Option<&'a str> {
+    last_seen.or_else(|| poisoned.iter().map(|poison| poison.at.as_str()).max())
+}
+
+/// Whole minutes from `from` to `to` (RFC 3339), floored at 0.
+fn minutes_between(from: &str, to: &str) -> Option<i64> {
+    let from = chrono::DateTime::parse_from_rfc3339(from).ok()?;
+    let to = chrono::DateTime::parse_from_rfc3339(to).ok()?;
+    Some(to.signed_duration_since(from).num_minutes().max(0))
+}
+
+/// The `rig status` poison tag (sprint!087 F2): the count alone conflated
+/// "poisoned once in hour one" with "poisoned now"; the tag carries the last
+/// sighting and how long the rig has been clean since, so an adjudicator can
+/// tell the clean measurement windows of a long exclusive run. Empty when
+/// the run was never poisoned.
+pub fn poison_tag(count: usize, last_seen: Option<&str>, now: &str) -> String {
+    if count == 0 {
+        return String::new();
+    }
+    let Some(last) = last_seen else {
+        return format!(" · POISONED ×{count}");
+    };
+    let clock = chrono::DateTime::parse_from_rfc3339(last)
+        .map(|at| at.with_timezone(&chrono::Utc).format("%H:%MZ").to_string())
+        .unwrap_or_else(|_| last.to_string());
+    match minutes_between(last, now) {
+        Some(clean) if clean >= 1 => {
+            format!(" · POISONED ×{count}, last {clock}, clean {clean} min since")
+        }
+        _ => format!(" · POISONED ×{count}, last {clock} (live)"),
+    }
+}
+
+/// The end-mail poison window (sprint!087 F2): first and last sighting plus
+/// the clean tail, so the verdict separates an early taint from a run
+/// measured poisoned to its end. Empty when the run was never poisoned.
+pub fn poison_window(poisoned: &[Poison], last_seen: Option<&str>, ended_at: &str) -> String {
+    let Some(first) = poisoned.iter().map(|poison| poison.at.as_str()).min() else {
+        return String::new();
+    };
+    let last = poison_last_seen(poisoned, last_seen).unwrap_or(first);
+    let tail = match minutes_between(last, ended_at) {
+        Some(clean) if clean >= 1 => format!("clean for the final {clean} min of the run"),
+        _ => "poisoned to the end of the run".to_string(),
+    };
+    format!(
+        "\nPOISON WINDOW: ×{} first {first}, last seen {last}; {tail} (ended {ended_at})",
+        poisoned.len()
+    )
+}
+
+/// Whether a job's process group still has members (sprint!087 F1). The job
+/// child leads its own group, so an executor that died while its child ran
+/// leaves a live group: the rig is NOT empty and the reservation must hold.
+#[cfg(unix)]
+fn group_alive(pgid: u32) -> bool {
+    let Ok(group) = libc::pid_t::try_from(pgid) else {
+        return false;
+    };
+    // SAFETY: signal 0 to a process group only checks that it exists.
+    let result = unsafe { libc::kill(-group, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn group_alive(pgid: u32) -> bool {
+    crate::process_alive(pgid)
 }
 
 /// sprint!060: `rig status` renders `short(&id)` (the last 8 hex chars), but
@@ -721,11 +803,37 @@ impl Mailroom {
             let Some(record) = read_json::<JobRecord>(&path) else {
                 continue;
             };
-            match crate::process_alive(record.executor_pid) {
-                true => running.push(record.spec),
-                false => self.finish(record, "executor-died", None, &path),
+            if crate::process_alive(record.executor_pid) {
+                running.push(record.spec);
+                continue;
             }
+            // sprint!087 F1: the executor died but its child's process group
+            // still runs — the rig is not empty. Reaping here used to free
+            // the reservation while the orphaned work kept going, so the next
+            // admission started jobs beside a still-running exclusive cell.
+            // Hold it until the group is gone; a cancel nobody else can now
+            // serve (the executor read the cancel file) is served here.
+            if let Some(child) = record.child_pid.filter(|child| group_alive(*child)) {
+                let cancel = self
+                    .jobs_dir("running")
+                    .join(format!("{}.cancel", record.spec.id));
+                if cancel.exists() {
+                    kill_tree(child);
+                    fs::remove_file(&cancel).ok();
+                    self.finish(record, "cancelled", None, &path);
+                } else {
+                    running.push(record.spec);
+                }
+                continue;
+            }
+            self.finish(record, "executor-died", None, &path);
         }
+        // sprint!087 F1: a claimed job (`.starting`, between the claim and its
+        // executor writing the record) is already running for admission — the
+        // exclusive job that just left the queue reserves the rig from the
+        // claim on, so a scheduler pass inside that window (a status probe, the
+        // kicker) cannot start the shared jobs queued behind it.
+        running.extend(starting_claims(&self.jobs_dir("running")));
         if !may_start {
             return Ok(Vec::new());
         }
@@ -885,7 +993,6 @@ impl Mailroom {
         let starting = running_dir.join(format!("{id}.starting"));
         let record_path = running_dir.join(format!("{id}.json"));
         let spec: JobSpec = read_json(&starting).context("job is not waiting to start")?;
-        fs::remove_file(&starting).ok();
         let mut record = JobRecord {
             spec,
             executor_pid: std::process::id(),
@@ -895,12 +1002,20 @@ impl Mailroom {
             outcome: None,
             exit_code: None,
             poisoned: Vec::new(),
+            poison_last_seen: None,
             vm_exempt: Vec::new(),
             vm_shared: Vec::new(),
             environment: None,
             measured: None,
             verify_outcome: None,
         };
+        // sprint!087 F1: the record lands BEFORE the claim is released — the
+        // claim-to-record gap used to span the environment capture below
+        // (a `rustc --version` spawn + a full process-table probe), a window
+        // in which no file said the rig was taken and a scheduler pass could
+        // admit shared work beside a starting exclusive job.
+        write_json(&record_path, &record)?;
+        fs::remove_file(&starting).ok();
         let rig_name = self.rigs().map(|rigs| rigs.self_rig).unwrap_or_default();
         let mut environment = RunEnvironment::capture(
             &rig_name,
@@ -1038,12 +1153,17 @@ impl Mailroom {
             }
             if record.spec.lane == Lane::Exclusive && last_probe.elapsed() >= POISON_PROBE_EVERY {
                 last_probe = Instant::now();
-                let probe = probe_poison(
-                    &rig::contention(&[std::process::id(), child.id()]),
-                    &record.poisoned,
-                    vm_policy.as_ref(),
-                );
+                let contention = rig::contention(&[std::process::id(), child.id()]);
+                // sprint!087 F2: a recorded poisoner still running keeps the
+                // run poisoned — dedup by pid hides it from `fresh`, so it is
+                // checked here or "clean since" would lie through a long build.
+                let known_live = still_poisoning(&contention, &record.poisoned);
+                let probe = probe_poison(&contention, &record.poisoned, vm_policy.as_ref());
                 let fresh = probe.poison;
+                if known_live && fresh.is_empty() {
+                    record.poison_last_seen = Some(now());
+                    write_json(&record_path, &record)?;
+                }
                 if !probe.vm_exempt.is_empty() || !probe.vm_shared.is_empty() {
                     // Issue 039: exempted and shared VM processes are
                     // recorded, deduplicated by pid, never mailed per-probe.
@@ -1073,6 +1193,7 @@ impl Mailroom {
                         .collect::<Vec<_>>()
                         .join(", ");
                     record.poisoned.extend(fresh);
+                    record.poison_last_seen = Some(now());
                     write_json(&record_path, &record)?;
                     if first_poison {
                         self.job_mail(
@@ -1184,13 +1305,18 @@ impl Mailroom {
         let poison = match record.poisoned.is_empty() {
             true => String::new(),
             false => format!(
-                "\nPOISONED by: {}",
+                "\nPOISONED by: {}{}",
                 record
                     .poisoned
                     .iter()
                     .map(|poison| format!("{} (pid {}) at {}", poison.name, poison.pid, poison.at))
                     .collect::<Vec<_>>()
-                    .join("; ")
+                    .join("; "),
+                poison_window(
+                    &record.poisoned,
+                    record.poison_last_seen.as_deref(),
+                    record.ended_at.as_deref().unwrap_or_default(),
+                )
             ),
         };
         let verify = match &record.verify_outcome {
@@ -1719,10 +1845,11 @@ impl Mailroom {
                     elapsed,
                     record.spec.title,
                     record.spec.notify.as_deref().unwrap_or("-"),
-                    match record.poisoned.len() {
-                        0 => String::new(),
-                        count => format!(" · POISONED ×{count}"),
-                    }
+                    poison_tag(
+                        record.poisoned.len(),
+                        poison_last_seen(&record.poisoned, record.poison_last_seen.as_deref()),
+                        &now(),
+                    )
                 ),
                 title: Some(record.spec.title.clone()),
                 lane: Some(format!("{:?}", record.spec.lane)),
@@ -1730,6 +1857,11 @@ impl Mailroom {
                 minutes: Some(elapsed),
                 notify: record.spec.notify.clone(),
                 poisoned: record.poisoned.len(),
+                poison_last_seen: poison_last_seen(
+                    &record.poisoned,
+                    record.poison_last_seen.as_deref(),
+                )
+                .map(str::to_string),
                 est_secs: record.spec.est_secs,
                 urgent: record.spec.urgent,
             });
@@ -1766,6 +1898,7 @@ impl Mailroom {
                 minutes: None,
                 notify: spec.notify.clone(),
                 poisoned: 0,
+                poison_last_seen: None,
                 est_secs: spec.est_secs,
                 urgent: spec.urgent,
             });
@@ -2095,6 +2228,34 @@ pub struct VmPolicy {
     /// (the pre-054 shape: no cap declared, or an unusable clock) disables
     /// the correlation and every unlisted vm contender poisons as before.
     pub own_window: Option<(i64, i64)>,
+}
+
+/// Whether a poisoner already recorded for this run is still a contender
+/// (sprint!087 F2) — same pid in the current contention.
+pub fn still_poisoning(contention: &Contention, known: &[Poison]) -> bool {
+    contention
+        .contenders
+        .iter()
+        .any(|contender| known.iter().any(|poison| poison.pid == contender.pid))
+}
+
+/// Specs of claimed-but-unrecorded jobs (`<id>.starting` with no
+/// `<id>.json` beside it) — running for admission (sprint!087 F1).
+fn starting_claims(running_dir: &Path) -> Vec<JobSpec> {
+    let Ok(entries) = fs::read_dir(running_dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let id = path.file_name()?.to_str()?.strip_suffix(".starting")?;
+            if running_dir.join(format!("{id}.json")).exists() {
+                return None;
+            }
+            read_json::<JobSpec>(&path)
+        })
+        .collect()
 }
 
 /// Contenders not already recorded as poison for this run. With a
@@ -3075,6 +3236,190 @@ mod tests {
             "an unclaimed id has no holder"
         );
         assert!(!holder_alive(&[], "01aaa"));
+    }
+
+    /// sprint!087 F1: an exclusive job claimed (`.starting`) but not yet
+    /// recorded already holds the rig — the shared job queued behind it is
+    /// not admitted inside the claim window. Pre-087 the scheduler counted
+    /// only `*.json` records, so `admit` saw an empty rig and tried to start
+    /// the shared job (here: an Err, since tests cannot spawn executors).
+    #[cfg(unix)]
+    #[test]
+    fn a_claimed_exclusive_job_reserves_the_rig_before_its_record_lands() {
+        let dir = tempfile::tempdir().unwrap();
+        let room = Mailroom::new(dir.path().to_path_buf());
+        room.init("amo").unwrap();
+        let running = dir.path().join("jobs/running");
+        let queue = dir.path().join("jobs/queue");
+        fs::create_dir_all(&running).unwrap();
+        fs::create_dir_all(&queue).unwrap();
+        let exclusive = job("01exc000000000000000000000000001", Lane::Exclusive, 0.0);
+        write_json(
+            &running.join(format!("{}.starting", exclusive.id)),
+            &exclusive,
+        )
+        .unwrap();
+        let shared = job("01shr000000000000000000000000001", Lane::Shared, 0.0);
+        write_json(&queue.join(format!("{}.json", shared.id)), &shared).unwrap();
+        let started = room.schedule_jobs_inner(false, true).unwrap();
+        assert!(
+            started.is_empty(),
+            "nothing starts beside a claimed exclusive job"
+        );
+        assert!(queue.join(format!("{}.json", shared.id)).exists());
+        // The pure half: the claim counts as a running exclusive job.
+        let claims = starting_claims(&running);
+        assert_eq!(claims.len(), 1);
+        assert!(
+            admit(
+                std::slice::from_ref(&shared),
+                &claims,
+                &capacity(16.0, 0.0),
+                true,
+                true
+            )
+            .is_empty()
+        );
+        // A claim whose record already landed is not counted twice.
+        fs::write(running.join(format!("{}.json", exclusive.id)), "{}").unwrap();
+        assert!(starting_claims(&running).is_empty());
+    }
+
+    /// sprint!087 F1: an executor that died while its child's process group
+    /// still runs no longer frees the rig — the record stays running until
+    /// the group is gone, then reaps as `executor-died`.
+    #[cfg(unix)]
+    #[test]
+    // agent-mail is a runtime-free std binary; the smol-preferring lint targets async gpui code.
+    #[allow(clippy::disallowed_methods)]
+    fn an_orphaned_job_group_holds_the_reservation_until_it_exits() {
+        use std::os::unix::process::CommandExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let room = Mailroom::new(dir.path().to_path_buf());
+        room.init("amo").unwrap();
+        let running = dir.path().join("jobs/running");
+        fs::create_dir_all(&running).unwrap();
+        let mut dead = Command::new("true").spawn().unwrap();
+        let dead_pid = dead.id();
+        dead.wait().unwrap();
+        let mut orphan = Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let spec = job("01orp000000000000000000000000001", Lane::Exclusive, 0.0);
+        let record = JobRecord {
+            spec: spec.clone(),
+            executor_pid: dead_pid,
+            child_pid: Some(orphan.id()),
+            started_at: now(),
+            ended_at: None,
+            outcome: None,
+            exit_code: None,
+            poisoned: Vec::new(),
+            poison_last_seen: None,
+            vm_exempt: Vec::new(),
+            vm_shared: Vec::new(),
+            environment: None,
+            measured: None,
+            verify_outcome: None,
+        };
+        let path = running.join(format!("{}.json", spec.id));
+        write_json(&path, &record).unwrap();
+        room.schedule_jobs_inner(false, false).unwrap();
+        assert!(path.exists(), "the live orphan group keeps the job running");
+        orphan.kill().unwrap();
+        orphan.wait().unwrap();
+        room.schedule_jobs_inner(false, false).unwrap();
+        assert!(!path.exists(), "a gone group reaps");
+        let done: JobRecord = read_json(
+            &dir.path()
+                .join("jobs/done")
+                .join(format!("{}.json", spec.id)),
+        )
+        .unwrap();
+        assert_eq!(done.outcome.as_deref(), Some("executor-died"));
+    }
+
+    fn poison_at(at: &str, pid: u32) -> Poison {
+        Poison {
+            at: at.into(),
+            pid,
+            name: "rustc".into(),
+            command: None,
+        }
+    }
+
+    /// sprint!087 F2: the status tag and end window carry the last sighting
+    /// and the clean tail instead of a bare sticky count.
+    #[test]
+    fn poison_label_carries_last_sighting_and_clean_tail() {
+        assert_eq!(poison_tag(0, None, "2026-11-20T14:00:00Z"), "");
+        assert_eq!(
+            poison_tag(6, Some("2026-11-20T13:40:00Z"), "2026-11-20T14:27:30Z"),
+            " · POISONED ×6, last 13:40Z, clean 47 min since"
+        );
+        assert_eq!(
+            poison_tag(2, Some("2026-11-20T13:40:00Z"), "2026-11-20T13:40:20Z"),
+            " · POISONED ×2, last 13:40Z (live)"
+        );
+        let poisoned = [
+            poison_at("2026-11-20T12:05:00Z", 1),
+            poison_at("2026-11-20T12:30:00Z", 2),
+        ];
+        // Pre-087 records carry no last_seen: the newest first-sight stamp.
+        assert_eq!(
+            poison_last_seen(&poisoned, None),
+            Some("2026-11-20T12:30:00Z")
+        );
+        // A recorded poisoner seen later moves the sighting forward.
+        assert_eq!(
+            poison_last_seen(&poisoned, Some("2026-11-20T13:00:00Z")),
+            Some("2026-11-20T13:00:00Z")
+        );
+        let window = poison_window(
+            &poisoned,
+            Some("2026-11-20T13:00:00Z"),
+            "2026-11-21T07:00:00Z",
+        );
+        assert!(window.contains("×2 first 2026-11-20T12:05:00Z"), "{window}");
+        assert!(
+            window.contains("last seen 2026-11-20T13:00:00Z"),
+            "{window}"
+        );
+        assert!(window.contains("clean for the final 1080 min"), "{window}");
+        let tainted = poison_window(
+            &poisoned,
+            Some("2026-11-21T07:00:00Z"),
+            "2026-11-21T07:00:00Z",
+        );
+        assert!(
+            tainted.contains("poisoned to the end of the run"),
+            "{tainted}"
+        );
+        assert_eq!(poison_window(&[], None, "2026-11-21T07:00:00Z"), "");
+    }
+
+    /// sprint!087 F2: a recorded poisoner still in the contention keeps the
+    /// sighting live even though pid dedup hides it from the fresh list.
+    #[test]
+    fn a_recorded_poisoner_still_running_keeps_the_run_poisoned() {
+        let row = |pid: u32| crate::rig::Contender {
+            pid,
+            name: "rustc".into(),
+            cpu_pct: 100.0,
+            rss_gb: 1.0,
+            arm: "name".into(),
+            command: None,
+            cwd: None,
+            vm_infra: false,
+            lstart_epoch: None,
+        };
+        let contention = contention_with(&[row(7)]);
+        let known = [poison_at("2026-11-20T12:05:00Z", 7)];
+        assert!(still_poisoning(&contention, &known));
+        assert!(probe_poison(&contention, &known, None).poison.is_empty());
+        assert!(!still_poisoning(&contention_with(&[row(8)]), &known));
     }
 
     #[cfg(unix)]
