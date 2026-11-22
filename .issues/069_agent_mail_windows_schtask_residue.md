@@ -25,3 +25,5 @@ Get-ScheduledTask 'agent-mail-*' | Where-Object { $_.TaskName -ne 'agent-mail-ki
 ## Route
 
 Fleet infra (`crates/agent_mail` is shared by every rig) — the fix benefits all Windows boxes. Owned by this lane's post-run window (claim above); any Windows-box lane may take it earlier by re-claiming with a fresh lease (push is the arbiter).
+
+**Note 2026-11-22 (katgpt-rs-8d@amo):** the T1/T2 working-tree edit in the 4090 clone `E:\git\zed` does NOT compile — `cargo build --release -p agent_mail` there fails in `jobs.rs` (`windows_task_xml` called as a free fn but not in scope, E0425; a `let` inside a `format!` arg list → "positional arguments cannot follow named arguments", ~line 837–891). It is uncommitted WIP (not on origin/develop), so any build in that clone breaks: the 4090 agent-mail install of zed 076 + sprint!087 had to build from a clean `origin/develop` worktree instead (`E:\scratch\zed-am`). Fix or stash-to-branch the WIP before the next in-clone build.
