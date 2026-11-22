@@ -1032,7 +1032,8 @@ impl Mailroom {
         environment.quiet_at_start = Some(rig::contention(&[std::process::id()]).quiet());
         record.environment = Some(environment);
         write_json(&record_path, &record)?;
-        self.job_mail(
+        self.job_mail_kind(
+            NoticeKind::Progress,
             &record.spec,
             format!(
                 "job {} STARTED on {rig_name} ({:?} lane): {}",
@@ -1196,7 +1197,8 @@ impl Mailroom {
                     record.poison_last_seen = Some(now());
                     write_json(&record_path, &record)?;
                     if first_poison {
-                        self.job_mail(
+                        self.job_mail_kind(
+                            NoticeKind::Progress,
                             &record.spec,
                             format!(
                                 "job {} POISONED on {rig_name}: {names} started during your exclusive run; results from now on are suspect. Still running: decide whether to keep or re-run.",
@@ -1451,7 +1453,23 @@ impl Mailroom {
         Ok(())
     }
 
+    /// Terminal notice (DONE/FAILED/CANCELLED): delivered with the job's own
+    /// `notify_mode`, so it wakes an idle session.
     fn job_mail(&self, spec: &JobSpec, body: String) {
+        self.job_mail_kind(NoticeKind::Terminal, spec, body);
+    }
+
+    /// Issue 076 — a progress notice (STARTED, first POISON on a still-running
+    /// job) is information, not a decision point: it rides `MailMode::Fyi`,
+    /// which the Claude Stop hook never wakes a session for — it lands at the
+    /// next tool/prompt boundary for free. Only the terminal notice keeps the
+    /// spec's mode. Before this, every job woke its owner up to three times.
+    fn job_mail_kind(&self, kind: NoticeKind, spec: &JobSpec, body: String) {
+        let mode = notice_mode(kind, spec.notify_mode);
+        self.job_mail_with_mode(mode, spec, body);
+    }
+
+    fn job_mail_with_mode(&self, mode: MailMode, spec: &JobSpec, body: String) {
         let Some(notify) = &spec.notify else {
             return;
         };
@@ -1488,7 +1506,7 @@ impl Mailroom {
         };
         if let Ok(envelope) = self.compose(&to, "jobs", body, None) {
             let mut envelope = envelope;
-            envelope.mode = spec.notify_mode;
+            envelope.mode = mode;
             self.send(&envelope).ok();
         }
     }
@@ -2359,8 +2377,33 @@ pub fn decode<T: for<'de> Deserialize<'de>>(payload: &str) -> Result<T> {
     serde_json::from_slice(&bytes).context("unparseable payload")
 }
 
+/// Issue 076 — which notices may wake an idle owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NoticeKind {
+    /// STARTED / first POISON while still running — informational.
+    Progress,
+    /// DONE / FAILED / CANCELLED / TIMEOUT — the owner's decision point.
+    Terminal,
+}
+
+fn notice_mode(kind: NoticeKind, configured: MailMode) -> MailMode {
+    match kind {
+        NoticeKind::Progress => MailMode::Fyi,
+        NoticeKind::Terminal => configured,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn progress_notices_never_wake_terminal_keeps_configured_mode() {
+        use super::{NoticeKind, notice_mode};
+        for configured in [MailMode::Urgent, MailMode::Steering, MailMode::Fyi] {
+            assert_eq!(notice_mode(NoticeKind::Progress, configured), MailMode::Fyi);
+            assert_eq!(notice_mode(NoticeKind::Terminal, configured), configured);
+        }
+    }
+
     use super::*;
     use crate::verify::{Baseline, BaselineNumber};
 
