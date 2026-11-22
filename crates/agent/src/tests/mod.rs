@@ -976,8 +976,8 @@ async fn test_tool_authorization(cx: &mut TestAppContext) {
         LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
             id: "tool_id_1".into(),
             name: ToolRequiringPermission::NAME.into(),
-            raw_input: "{}".into(),
-            input: language_model::LanguageModelToolUseInput::Json(json!({})),
+            raw_input: json!({"note": "first"}).to_string(),
+            input: language_model::LanguageModelToolUseInput::Json(json!({"note": "first"})),
             is_input_complete: true,
             thought_signature: None,
         }),
@@ -987,8 +987,8 @@ async fn test_tool_authorization(cx: &mut TestAppContext) {
         LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
             id: "tool_id_2".into(),
             name: ToolRequiringPermission::NAME.into(),
-            raw_input: "{}".into(),
-            input: language_model::LanguageModelToolUseInput::Json(json!({})),
+            raw_input: json!({"note": "second"}).to_string(),
+            input: language_model::LanguageModelToolUseInput::Json(json!({"note": "second"})),
             is_input_complete: true,
             thought_signature: None,
         }),
@@ -998,8 +998,8 @@ async fn test_tool_authorization(cx: &mut TestAppContext) {
         LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
             id: "tool_id_interrupted".into(),
             name: ToolRequiringPermission::NAME.into(),
-            raw_input: "{}".into(),
-            input: language_model::LanguageModelToolUseInput::Json(json!({})),
+            raw_input: json!({"note": "follow-up"}).to_string(),
+            input: language_model::LanguageModelToolUseInput::Json(json!({"note": "follow-up"})),
             is_input_complete: true,
             thought_signature: None,
         }),
@@ -1071,8 +1071,8 @@ async fn test_tool_authorization(cx: &mut TestAppContext) {
         LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
             id: "tool_id_3".into(),
             name: ToolRequiringPermission::NAME.into(),
-            raw_input: "{}".into(),
-            input: language_model::LanguageModelToolUseInput::Json(json!({})),
+            raw_input: json!({"note": "third"}).to_string(),
+            input: language_model::LanguageModelToolUseInput::Json(json!({"note": "third"})),
             is_input_complete: true,
             thought_signature: None,
         }),
@@ -1111,8 +1111,8 @@ async fn test_tool_authorization(cx: &mut TestAppContext) {
         LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
             id: "tool_id_4".into(),
             name: ToolRequiringPermission::NAME.into(),
-            raw_input: "{}".into(),
-            input: language_model::LanguageModelToolUseInput::Json(json!({})),
+            raw_input: json!({"note": "fourth"}).to_string(),
+            input: language_model::LanguageModelToolUseInput::Json(json!({"note": "fourth"})),
             is_input_complete: true,
             thought_signature: None,
         }),
@@ -1282,18 +1282,18 @@ async fn test_tool_loop_guard_stops_identical_calls(cx: &mut TestAppContext) {
         })
     };
 
-    // Ten identical calls (same tool + arguments, fresh id per round) run
+    // Three identical calls (same tool + arguments, fresh id per round) run
     // normally, one per completion round.
-    for round in 1..=10 {
+    for round in 1..=3 {
         fake.send_last_event(&model, identical_tool_use(round));
         fake.end_last(&model);
         next_tool_call(&mut events).await;
         cx.run_until_parked();
     }
 
-    // The eleventh identical call is refused and the turn ends without
-    // issuing another completion request to the model.
-    fake.send_last_event(&model, identical_tool_use(11));
+    // The fourth consecutive identical call is refused and the turn ends
+    // without issuing another completion request to the model.
+    fake.send_last_event(&model, identical_tool_use(4));
     fake.end_last(&model);
     next_tool_call(&mut events).await;
     let remaining = events.collect::<Vec<_>>().await;
@@ -1306,21 +1306,21 @@ async fn test_tool_loop_guard_stops_identical_calls(cx: &mut TestAppContext) {
     let markdown = thread.read_with(cx, |thread, _| thread.to_markdown());
     assert_eq!(
         markdown.matches("**Tool Use**: echo").count(),
-        11,
+        4,
         "{markdown}"
     );
     assert_eq!(
         markdown.matches("**Tool Result**: echo").count(),
-        11,
+        4,
         "{markdown}"
     );
     assert_eq!(markdown.matches("**ERROR:**").count(), 1, "{markdown}");
     assert!(markdown.contains("Tool call loop guard"), "{markdown}");
-    assert!(markdown.contains("11 times"), "{markdown}");
+    assert!(markdown.contains("4 times in a row"), "{markdown}");
 }
 
 #[gpui::test]
-async fn test_tool_loop_guard_allows_distinct_calls(cx: &mut TestAppContext) {
+async fn test_tool_loop_guard_resets_when_tool_call_changes(cx: &mut TestAppContext) {
     let ThreadTest {
         model,
         fake,
@@ -1339,18 +1339,79 @@ async fn test_tool_loop_guard_allows_distinct_calls(cx: &mut TestAppContext) {
         .unwrap();
     cx.run_until_parked();
 
-    // Calls with distinct arguments never trip the guard, even past the
-    // repetition limit.
-    for round in 1..=11 {
+    let tool_use = |round: usize, text: &str| {
+        LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
+            id: format!("call_{round}").into(),
+            name: EchoTool::NAME.into(),
+            raw_input: json!({"text": text}).to_string(),
+            input: language_model::LanguageModelToolUseInput::Json(json!({"text": text})),
+            is_input_complete: true,
+            thought_signature: None,
+        })
+    };
+
+    // A different call in between resets the run: A, A, B, A, A, A, A only
+    // trips at the seventh call — the fourth A *in a row* — not at the fifth,
+    // which is only the fourth A overall. A per-turn accumulator would have
+    // refused call 5 instead.
+    let sequence = ["same", "same", "other", "same", "same", "same", "same"];
+    for (round, text) in sequence.into_iter().enumerate() {
+        fake.send_last_event(&model, tool_use(round + 1, text));
+        fake.end_last(&model);
+        next_tool_call(&mut events).await;
+        cx.run_until_parked();
+    }
+
+    let remaining = events.collect::<Vec<_>>().await;
+    assert_eq!(stop_events(remaining), vec![acp_v2::StopReason::EndTurn]);
+    assert!(
+        fake.pending_completions().is_empty(),
+        "no further completion request should be issued after the loop guard tripped"
+    );
+
+    let markdown = thread.read_with(cx, |thread, _| thread.to_markdown());
+    assert_eq!(
+        markdown.matches("**Tool Result**: echo").count(),
+        7,
+        "{markdown}"
+    );
+    assert_eq!(markdown.matches("**ERROR:**").count(), 1, "{markdown}");
+    assert!(markdown.contains("4 times in a row"), "{markdown}");
+}
+
+#[gpui::test]
+async fn test_tool_loop_guard_allows_non_consecutive_repeats(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        fake,
+        thread,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+
+    thread.update(cx, |thread, _cx| {
+        thread.add_tool(EchoTool);
+    });
+
+    let mut events = thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Run the echo tool"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    // Repeats that are not consecutive never trip the guard: alternating two
+    // signatures keeps every run of identical calls at one, though each
+    // signature recurs well past the limit (the legitimate watch-fix-retest
+    // pattern relies on this).
+    for round in 1..=12 {
+        let text = if round % 2 == 0 { "even" } else { "odd" };
         fake.send_last_event(
             &model,
             LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
                 id: format!("call_{round}").into(),
                 name: EchoTool::NAME.into(),
-                raw_input: json!({"text": format!("distinct {round}")}).to_string(),
-                input: language_model::LanguageModelToolUseInput::Json(json!({
-                    "text": format!("distinct {round}")
-                })),
+                raw_input: json!({"text": text}).to_string(),
+                input: language_model::LanguageModelToolUseInput::Json(json!({"text": text})),
                 is_input_complete: true,
                 thought_signature: None,
             }),
@@ -1371,7 +1432,7 @@ async fn test_tool_loop_guard_allows_distinct_calls(cx: &mut TestAppContext) {
     let markdown = thread.read_with(cx, |thread, _| thread.to_markdown());
     assert_eq!(
         markdown.matches("**Tool Result**: echo").count(),
-        11,
+        12,
         "{markdown}"
     );
     assert_eq!(markdown.matches("**ERROR:**").count(), 0, "{markdown}");

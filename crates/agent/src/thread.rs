@@ -75,9 +75,11 @@ use uuid::Uuid;
 
 const TOOL_CANCELED_MESSAGE: &str = "Tool canceled by user";
 
-/// Maximum number of tool calls with identical name and arguments permitted
-/// per turn before the loop guard refuses further calls and stops the turn.
-const TOOL_LOOP_CALL_LIMIT: usize = 10;
+/// Maximum number of consecutive tool calls with identical name and arguments
+/// permitted within a turn before the loop guard refuses further calls and
+/// stops the turn. Repeats that are not consecutive (e.g. re-running the same
+/// command after an edit) never accumulate toward it.
+const TOOL_LOOP_CALL_LIMIT: usize = 3;
 const TOOL_CALL_INTERRUPTED_BY_FOLLOW_UP_MESSAGE: &str =
     "Permission denied: user sent a follow-up message instead of approving the tool call.";
 pub(crate) const FOLLOW_UP_PERMISSION_DENIED_OPTION_ID: &str = "follow_up_permission_denied";
@@ -5249,15 +5251,18 @@ enum ToolLoopDecision {
 }
 
 /// Per-turn guard against a model repeating the same tool call forever (the
-/// "slop loop": e.g. the same command re-run 13+ times within one turn). Calls
-/// are counted by hashing the tool name and raw input, so an identical repeat
-/// is detected regardless of the per-call ids a provider mints. Once the
-/// repetition exceeds [`TOOL_LOOP_CALL_LIMIT`], further calls are refused with
-/// an error result telling the model to change approach, and the turn is
-/// stopped instead of issuing another model request.
+/// "slop loop": e.g. the same command re-run 13+ times within one turn). Runs
+/// of consecutive calls are counted by hashing the tool name and raw input, so
+/// an identical repeat is detected regardless of the per-call ids a provider
+/// mints; any different call resets the run, leaving non-consecutive repeats
+/// (re-run a test after an edit) untouched. Once a run exceeds
+/// [`TOOL_LOOP_CALL_LIMIT`], further calls are refused with an error result
+/// telling the model to change approach, and the turn is stopped instead of
+/// issuing another model request.
 #[derive(Default)]
 struct ToolLoopGuard {
-    signature_counts: HashMap<u64, usize>,
+    last_signature: Option<u64>,
+    consecutive_calls: usize,
     refused_tool_use_ids: HashSet<LanguageModelToolUseId>,
     tripped: Option<String>,
 }
@@ -5272,17 +5277,18 @@ impl ToolLoopGuard {
             };
         }
         let signature = Self::signature(&tool_use.name, &tool_use.raw_input);
-        let count = self
-            .signature_counts
-            .entry(signature)
-            .and_modify(|count| *count += 1)
-            .or_insert(1);
-        if *count > TOOL_LOOP_CALL_LIMIT {
+        if self.last_signature == Some(signature) {
+            self.consecutive_calls += 1;
+        } else {
+            self.last_signature = Some(signature);
+            self.consecutive_calls = 1;
+        }
+        if self.consecutive_calls > TOOL_LOOP_CALL_LIMIT {
             let notice = format!(
-                "Tool call loop guard: `{}` was called {} times with identical arguments in this \
-                 turn (limit {}). The turn has been stopped. Do not repeat the same call; review \
-                 the earlier results and change approach instead.",
-                tool_use.name, count, TOOL_LOOP_CALL_LIMIT
+                "Tool call loop guard: `{}` was called {} times in a row with identical arguments \
+                 (limit {}). The turn has been stopped. Do not repeat the same call; review the \
+                 earlier results and change approach instead.",
+                tool_use.name, self.consecutive_calls, TOOL_LOOP_CALL_LIMIT
             );
             self.tripped = Some(notice.clone());
             self.refused_tool_use_ids.insert(tool_use.id.clone());
