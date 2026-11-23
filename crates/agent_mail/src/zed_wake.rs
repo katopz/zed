@@ -6,7 +6,7 @@
 //! `agent-mail rig zed-wake --once` from your own scheduler (e.g. Task
 //! Scheduler on Windows).
 
-use crate::{ALL_NAME, ANY_NAME, MailMode, Mailroom};
+use crate::{ALL_NAME, ANY_NAME, MailMode, Mailroom, windows_task};
 use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -84,17 +84,29 @@ pub fn tick(mailroom: &Mailroom, now: chrono::DateTime<chrono::Utc>) -> Result<W
             woke: false,
         });
     }
-    launch(&candidates)?;
-    fs::create_dir_all(state_path.parent().context("zed-wake state dir")?)?;
-    fs::write(
-        &state_path,
-        serde_json::to_string(&WakeState {
-            last_launch: Some(now.to_rfc3339()),
-        })?,
-    )?;
+    let launched = match launch(&candidates) {
+        Ok(()) => true,
+        // The promotion already happened (tick's inbox scan promotes due
+        // mail as a side effect): a missing launch command — the Windows
+        // default — must not fail the whole tick, or the driver task errors
+        // every minute and the promoted mail is reported as lost (issue 072).
+        Err(error) => {
+            eprintln!("zed-wake: due mail promoted, but not launching: {error:#}");
+            false
+        }
+    };
+    if launched {
+        fs::create_dir_all(state_path.parent().context("zed-wake state dir")?)?;
+        fs::write(
+            &state_path,
+            serde_json::to_string(&WakeState {
+                last_launch: Some(now.to_rfc3339()),
+            })?,
+        )?;
+    }
     Ok(WakeReport {
         candidates,
-        woke: true,
+        woke: launched,
     })
 }
 
@@ -147,10 +159,25 @@ fn launch_argv() -> Result<Vec<String>> {
     )
 }
 
+/// Registers the Task Scheduler driver on Windows (issue 072): one
+/// `rig zed-wake --once` tick per minute, forever. Also the self-heal target
+/// — every scheduled delivery re-runs this overwrite.
+pub fn install_windows_driver() -> Result<()> {
+    if let Err(error) = crate::jobs::require_standalone() {
+        anyhow::bail!(
+            "{error}; the wake driver must run the standalone agent-mail, \
+             not the embedding host"
+        );
+    }
+    windows_task::ensure_zed_wake_driver()
+}
+
 /// Writes a launchd plist that ticks [`tick`] every minute (macOS).
 pub fn install_launchd(mailroom: &Mailroom) -> Result<PathBuf> {
     if let Err(error) = crate::jobs::require_standalone() {
-        anyhow::bail!("{error}; the launchd plist must run the standalone agent-mail, not the embedding host");
+        anyhow::bail!(
+            "{error}; the launchd plist must run the standalone agent-mail, not the embedding host"
+        );
     }
     let binary = std::env::current_exe()?;
     let home = std::env::var("HOME").context("HOME unset")?;

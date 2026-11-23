@@ -396,13 +396,29 @@ fn run(args: Vec<String>) -> Result<i32> {
                 }
                 let _ = once; // --once is the invocation shape; a tick runs either way
                 if install {
-                    let path = agent_mail::zed_wake::install_launchd(&room)?;
-                    println!(
-                        "wrote {}\nload it with: launchctl bootstrap gui/$(id -u) {}",
-                        path.display(),
-                        path.display()
-                    );
-                    return Ok(0);
+                    #[cfg(target_os = "macos")]
+                    {
+                        let path = agent_mail::zed_wake::install_launchd(&room)?;
+                        println!(
+                            "wrote {}\nload it with: launchctl bootstrap gui/$(id -u) {}",
+                            path.display(),
+                            path.display()
+                        );
+                        return Ok(0);
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        agent_mail::zed_wake::install_windows_driver()?;
+                        println!(
+                            "armed the agent-mail-zed-wake driver: one tick per minute. To also \
+                             LAUNCH Zed on unclaimed mail, set the user env var {} to a \
+                             space-separated argv, e.g. `setx {} \"cmd /c start ...zed.exe\"` \
+                             (issue 072: without it the driver still promotes due mail)",
+                            agent_mail::zed_wake::WAKE_COMMAND_ENV,
+                            agent_mail::zed_wake::WAKE_COMMAND_ENV
+                        );
+                        return Ok(0);
+                    }
                 }
                 let report = agent_mail::zed_wake::tick(&room, chrono::Utc::now())?;
                 if report.woke {
@@ -453,17 +469,17 @@ use agent_mail::jobs::END_MARKER;
 
 /// Shared flag parser for `rig set` and `rig set-local`: `--est DURATION`
 /// and/or `--urgent`/`--deurgent`, at least one of them.
-fn parse_set_flags(
-    args: &mut std::vec::IntoIter<String>,
-) -> Result<(Option<u64>, Option<bool>)> {
+fn parse_set_flags(args: &mut std::vec::IntoIter<String>) -> Result<(Option<u64>, Option<bool>)> {
     let mut est_secs = None;
     let mut urgent = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--est" => {
                 est_secs = Some(
-                    agent_mail::jobs::parse_duration(&args.next().context("--est needs a duration")?)?
-                        .as_secs(),
+                    agent_mail::jobs::parse_duration(
+                        &args.next().context("--est needs a duration")?,
+                    )?
+                    .as_secs(),
                 )
             }
             "--urgent" => urgent = Some(true),
@@ -521,8 +537,7 @@ fn rig_run(room: &Mailroom, args: Vec<String>) -> Result<i32> {
                 timeout = Some(agent_mail::jobs::parse_duration(&value("--timeout")?)?.as_secs())
             }
             "--est" => {
-                est_secs =
-                    Some(agent_mail::jobs::parse_duration(&value("--est")?)?.as_secs())
+                est_secs = Some(agent_mail::jobs::parse_duration(&value("--est")?)?.as_secs())
             }
             "--urgent" => urgent = true,
             "--verify-manifest" => {
@@ -530,9 +545,7 @@ fn rig_run(room: &Mailroom, args: Vec<String>) -> Result<i32> {
                     .context("reading the verify manifest")?;
                 let manifest: agent_mail::verify::VerifyManifest =
                     serde_json::from_slice(&bytes).context("parsing the verify manifest")?;
-                let manifest = manifest
-                    .validated()
-                    .context("invalid verify manifest")?;
+                let manifest = manifest.validated().context("invalid verify manifest")?;
                 // A measured re-run must hold a quiet rig alone, and the
                 // manifest pins the exact command, commit, and cell path.
                 lane = Lane::Exclusive;
@@ -547,9 +560,7 @@ fn rig_run(room: &Mailroom, args: Vec<String>) -> Result<i32> {
                         manifest.baseline.plan
                     ));
                 }
-                let manifest_blake3 = manifest
-                    .blake3()
-                    .context("hashing the verify manifest")?;
+                let manifest_blake3 = manifest.blake3().context("hashing the verify manifest")?;
                 verify = Some(agent_mail::verify::VerifySpec {
                     origin_job: manifest.origin_job.clone(),
                     produced_on: manifest.produced_on.clone(),
@@ -611,9 +622,9 @@ fn rig_run(room: &Mailroom, args: Vec<String>) -> Result<i32> {
     }
     let rigs = room.rigs()?;
     let notify = notify.or_else(|| {
-        room.whoami().ok().map(|name| {
-            format!("{name}@{}", rigs.self_rig)
-        })
+        room.whoami()
+            .ok()
+            .map(|name| format!("{name}@{}", rigs.self_rig))
     });
     // Issue 061: notify=None is a spec bug, not a default — the job would
     // run to a terminal outcome with nobody told (the silent-rot class the
@@ -929,7 +940,13 @@ mod tests {
     #[test]
     fn set_flags_parse_strictly() {
         let parse = |args: Vec<&str>| {
-            parse_set_flags(&mut args.into_iter().map(String::from).collect::<Vec<_>>().into_iter())
+            parse_set_flags(
+                &mut args
+                    .into_iter()
+                    .map(String::from)
+                    .collect::<Vec<_>>()
+                    .into_iter(),
+            )
         };
         assert_eq!(parse(vec!["--est", "30m"]).unwrap(), (Some(1_800), None));
         assert_eq!(parse(vec!["--urgent"]).unwrap(), (None, Some(true)));

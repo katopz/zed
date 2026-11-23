@@ -13,6 +13,7 @@ pub mod rig;
 pub mod tui;
 pub mod verify;
 pub mod watch;
+pub mod windows_task;
 pub mod zed_wake;
 
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -641,6 +642,13 @@ impl Mailroom {
             None => inbox.join("new").join(&file_name),
         };
         fs::rename(&staged, target)?;
+        // Scheduled mail on Windows needs the zed-wake driver: without a
+        // per-minute tick, `later/` only promotes when some inbox scan
+        // happens to run (issue 072). Re-arming on every scheduled delivery
+        // is the self-heal; everywhere else this is a compile-time no-op.
+        if due.is_some() && cfg!(windows) {
+            windows_task::ensure_zed_wake_driver_warn();
+        }
         prune_claimed(&inbox.join("cur"));
         if address.name == ALL_NAME {
             // Broadcasts stay in new/ (never claimed), so age them out here.

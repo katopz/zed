@@ -14,6 +14,7 @@ use crate::verify::{
     RunEnvironment, VerifyLedgerRow, VerifyOutcome, VerifySpec, read_result_file,
     verify_against_baseline,
 };
+use crate::windows_task;
 use crate::{Address, MailMode, Mailroom, validate_name};
 use anyhow::{Context as _, Result, anyhow, bail};
 use base64::Engine as _;
@@ -950,19 +951,34 @@ impl Mailroom {
         fs::create_dir_all(&logs)?;
         if cfg!(windows) {
             // Processes started from an sshd session die with it on the 4090;
-            // a one-shot scheduled task outlives the session.
-            let task = format!("agent-mail-{label}");
-            let action = format!("\"{}\" {}", binary.display(), args.join(" "));
-            let created = crate::command("schtasks")
-                .args([
-                    "/create", "/tn", &task, "/tr", &action, "/sc", "once", "/st", "00:00", "/f",
-                ])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()?;
-            anyhow::ensure!(created.success(), "schtasks /create failed");
+            // a one-shot scheduled task outlives the session. The XML shape
+            // (issue 069) gives the task a trigger window with
+            // DeleteExpiredTaskAfter, so the scheduler removes the
+            // registration itself — the admin-gated end-of-job delete no
+            // longer leaves permanent residue. The /run below starts the
+            // work immediately; the trigger is the safety net (a stray re-fire
+            // of `rig exec <id>` on a job that already started is a no-op —
+            // its `.starting` claim file is gone), and StartBoundary stays
+            // beyond the run so the /run instance is never doubled.
+            let now = chrono::Utc::now();
+            // `rig kick` loops until the queue drains (it is re-armed by the
+            // next scheduler pass if the boundary ever catches it — the task
+            // name is fixed, so each spawn overwrites the one entry);
+            // `rig exec <id>` runs the job to its timeout, bounded by the
+            // PT72H execution limit.
+            let end_boundary = match args.get(1) {
+                Some(&"kick") => now + chrono::Duration::hours(8),
+                _ => now + chrono::Duration::hours(73),
+            };
+            let task = windows_task::OneShotTask {
+                action: format!("\"{}\"", binary.display()),
+                arguments: args.join(" "),
+                start_boundary: now + chrono::Duration::minutes(5),
+                end_boundary,
+            };
+            windows_task::create_task(&format!("agent-mail-{label}"), &task.xml())?;
             crate::command("schtasks")
-                .args(["/run", "/tn", &task])
+                .args(["/run", "/tn", &format!("agent-mail-{label}")])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status()?;
@@ -1224,12 +1240,26 @@ impl Mailroom {
         }
         self.finish(record, outcome.0, outcome.1, &record_path);
         if cfg!(windows) {
-            crate::command("schtasks")
+            // Best-effort: with the issue-069 task shape the scheduler
+            // deletes the registration itself at the EndBoundary, so a
+            // failed delete here is residue-with-an-expiry-date — but it
+            // must not stay silent, or boxes accumulate tasks unnoticed.
+            match crate::command("schtasks")
                 .args(["/delete", "/tn", &format!("agent-mail-{id}"), "/f"])
+                .stderr(Stdio::piped())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
                 .status()
-                .ok();
+            {
+                Ok(status) if status.success() => {}
+                Ok(status) => eprintln!(
+                    "[jobs] schtasks /delete agent-mail-{id} failed: {status}; the task \
+                     self-expires via its EndBoundary"
+                ),
+                Err(error) => eprintln!(
+                    "[jobs] schtasks /delete agent-mail-{id} failed: {error}; the task \
+                     self-expires via its EndBoundary"
+                ),
+            }
         }
         self.schedule_jobs().ok();
         Ok(())
