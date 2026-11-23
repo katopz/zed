@@ -4,7 +4,7 @@ Status: done — 19/19 tasks checked
 ## Goal
 When a request fails on key A with a backoff-worthy error, retry the SAME user
 request on key B (and C if needed) instead of failing the user's request
-entirely. This is the natural follow-up to the per-key backoff work in plan 002:
+entirely. This is the natural follow-up to the per-key backoff work in plan 062:
 backoff prevents FUTURE requests from picking a poisoned key, but the CURRENT
 request still fails unless we rotate within the call.
 
@@ -24,7 +24,7 @@ Inside `request_limiter.stream(...)` — the rate-limit semaphore is held across
 all retry attempts for a single user request, so we don't release and re-acquire
 on each attempt. The retry loop runs in the background-executor closure where
 `Arc<Mutex<KeyHealthTracker>>` is already accessible (the `!Send` `AsyncApp`
-constraint from plan 002 still applies).
+constraint from plan 062 still applies).
 
 ### `retry_stream` helper
 Generic over the stream type `S`. Takes:
@@ -118,7 +118,7 @@ All are pure serializable data; adding `Clone` is non-breaking.
 - Backoff-worthy failures poison the slot and rotate to next candidate (verified
   by `retry_stream_rotates_on_backoff_worthy_failure`).
 - Success clears the slot's health (verified by same test).
-- All existing backoff/compute tests from plan 002 still pass unchanged.
+- All existing backoff/compute tests from plan 062 still pass unchanged.
 
 ## Non-goals (still)
 - No persistence of backoff state across restarts. Restart = fresh slate.

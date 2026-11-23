@@ -12,7 +12,7 @@
 Cloudflare Worker backing Zed's `agent_board` panel. A single-user,
 KV-backed notepad that mirrors `auto_prompt::plan_registry` claims across
 devices so two agents (e.g. the M3 laptop and the 4090 box) don't clobber each
-other's work. See `../.plans/001_agent_board.md` for the full design.
+other's work. See `../.plans/013_agent_board.md` for the full design.
 
 ## Endpoints (v1)
 

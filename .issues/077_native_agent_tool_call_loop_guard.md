@@ -1,6 +1,6 @@
 # Issue 077: zed native agent loops identical tool calls (slop loop) with no guard
 
-**Claimed:** m3 (this session — filing + fix in one pass)
+**Lease closed:** m3 (filing + fix in one pass; pre-epoch-era claim line — no epoch/expiry to carry) — work LANDED: 01d0b094106eeecc + f90025eaa11 on develop
 
 ## Status
 - [x] Root cause identified (no per-turn tool-call repetition guard in `crates/agent` `Thread`)

@@ -1,4 +1,4 @@
-# 006: OpenAI-Compatible API Key Backoff Persistence
+# 066: OpenAI-Compatible API Key Backoff Persistence
 Status: done — 13/13 tasks checked
 
 ## Goal

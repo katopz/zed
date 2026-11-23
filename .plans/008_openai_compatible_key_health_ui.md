@@ -42,7 +42,7 @@ configuration view, plus one rotation-behavior fix:
   etc.) where a different key genuinely might help.
 
 ### Design decision: why RateLimitExceeded specifically (not all backoff-worthy)
-Per `.plans/003` the intra-request retry was added so a flaky key A doesn't kill
+Per `.plans/063` the intra-request retry was added so a flaky key A doesn't kill
 a request when healthy key B exists — correct for *per-key* failures. But
 `RateLimitExceeded` is the one error class that is *commonly* account-wide:
 multiple keys under one org share one quota, so a 429 on key1 is a strong
@@ -50,7 +50,7 @@ predictor of a 429 on key2. Rotating in that case is strictly harmful (burns
 the pool). Other backoff-worthy errors (`ServerOverloaded`, `HttpSend`,
 `StreamEndedUnexpectedly`, `UpstreamProviderError`) are more likely per-key or
 per-request, so rotation still makes sense there. This keeps the
-per-key-reliability win from plan 003 for the errors where it matters, while
+per-key-reliability win from plan 063 for the errors where it matters, while
 fixing the account-wide-quota footgun the user hit.
 
 ## Design

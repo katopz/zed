@@ -4,7 +4,7 @@ Status: done — 11/11 tasks checked
 ## Goal
 Surface per-key backoff state in the provider configuration view so users can
 see when a key is being rotated out, why, and how long until it re-qualifies.
-Closes the loop on the prior work (plan 002 = backoff, plan 003 = rotation) by
+Closes the loop on the prior work (plan 062 = backoff, plan 063 = rotation) by
 making the previously-invisible health state observable.
 
 ## Why
