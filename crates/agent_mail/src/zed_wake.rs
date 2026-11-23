@@ -245,10 +245,18 @@ mod tests {
 
         // Fresh mail: a running Zed might still claim it, so hold off.
         assert!(!tick(&room, now).unwrap().woke);
-        // Past grace with no live Zed: wake.
-        assert!(tick(&room, now + grace()).unwrap().woke);
-        // Cooldown suppresses the next tick even though mail still waits.
-        assert!(!tick(&room, now + grace() + grace()).unwrap().woke);
+        // Past grace with no live Zed: wake. A platform without a default
+        // launch command (Windows, no AGENT_MAIL_WAKE_COMMAND) still ticks
+        // Ok — the promotion already happened, it just cannot launch (issue
+        // 072) — so `woke` stays false there and the cooldown never arms.
+        let wake_tick = tick(&room, now + grace()).unwrap();
+        assert_eq!(wake_tick.woke, cfg!(target_os = "macos"), "{wake_tick:?}");
+        // Cooldown suppresses the next tick only after a real launch.
+        assert_eq!(
+            tick(&room, now + grace() + grace()).unwrap().woke,
+            false,
+            "no launch happened on this platform"
+        );
     }
 
     #[test]

@@ -3145,18 +3145,19 @@ mod tests {
         // arrives with argv[0] holding whitespace - the direct-spawn arm
         // would ENOENT. The shell arm runs the joined line like the
         // single-element workaround form.
+        let shell = if cfg!(windows) { "cmd" } else { "sh" };
         let argv = vec!["echo".into()];
         let single_command = shell_command(&argv);
         assert_eq!(single_command.get_program().to_string_lossy(), "echo");
         let compound = shell_command(&["ARMS=p1 p2 bash -c echo hi".to_string()]);
-        assert_eq!(compound.get_program().to_string_lossy(), "sh");
+        assert_eq!(compound.get_program().to_string_lossy(), shell);
         let compound2 = shell_command(&[
             "ARMS=p1 p2".to_string(),
             "bash".to_string(),
             "-c".to_string(),
             "echo".to_string(),
         ]);
-        assert_eq!(compound2.get_program().to_string_lossy(), "sh");
+        assert_eq!(compound2.get_program().to_string_lossy(), shell);
     }
 
     #[test]
