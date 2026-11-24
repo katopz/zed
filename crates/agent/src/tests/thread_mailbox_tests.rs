@@ -971,6 +971,190 @@ fn mail_to_name(sender: &::agent_mail::Mailroom, name: &str, body: &str) -> ::ag
     envelope
 }
 
+/// Schedules a wake the way the CLI lane does (`agent-mail send --at`): the
+/// envelope goes to the spool with a future `deliver_at`, so it parks in the
+/// inbox's `later/` directory and never touches the `send_message` tool path
+/// (issue 080).
+fn schedule_mail(
+    sender: &::agent_mail::Mailroom,
+    session_id: &acp_v2::SessionId,
+    body: &str,
+    deliver_in: chrono::Duration,
+    mode: ::agent_mail::MailMode,
+) -> ::agent_mail::Envelope {
+    let name = agent_mail_bridge::native_thread_mail_name(session_id);
+    let to = ::agent_mail::Address::parse(&format!("{name}@m3")).unwrap();
+    let mut envelope = sender
+        .compose(&to, "zed-bb@m3", body.to_string(), None)
+        .unwrap();
+    envelope.deliver_at = Some(
+        (chrono::Utc::now() + deliver_in).to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+    );
+    envelope.mode = mode;
+    sender.send(&envelope).unwrap();
+    envelope
+}
+
+/// Issue 080: a wake scheduled through the CLI lane parks in `later/`, where
+/// only the poller's reconcile leg can see it. The thread must read as
+/// waiting (the sidebar's Waiting icon keys off the flag) and hold its
+/// keep-alive pin while the wake is still in the future, then lose both when
+/// the wake comes due and is claimed.
+#[gpui::test]
+async fn test_cli_scheduled_mail_arms_waiting_until_wake_is_claimed(cx: &mut TestAppContext) {
+    let setup = setup_threads(1, cx).await;
+    let (agent, fake) = (&setup.agent, &setup.fake);
+    let thread = &setup.threads[0];
+    let (home, sender) = enable_agent_mail(agent, cx);
+
+    schedule_mail(
+        &sender,
+        &thread.session_id,
+        "check the long job",
+        chrono::Duration::hours(1),
+        ::agent_mail::MailMode::Queued,
+    );
+    cx.executor().advance_clock(Duration::from_secs(6));
+    cx.run_until_parked();
+
+    assert!(
+        thread
+            .acp_thread
+            .read_with(cx, |thread, _| thread.is_waiting_for_mail()),
+        "a CLI-scheduled wake must arm the waiting flag from the spool"
+    );
+    assert!(
+        agent.read_with(cx, |agent, _| agent
+            .agent_mail
+            .as_ref()
+            .unwrap()
+            .waiting_pins
+            .contains_key(&thread.session_id)),
+        "the arm leg must pin the parked thread or its view close kills it"
+    );
+    assert_eq!(
+        fake.pending_completions_for(&thread.model).len(),
+        0,
+        "a wake still in the future must not start a turn"
+    );
+
+    // The wake comes due (back-date the parked file's due prefix); the claim
+    // clears the waiting state and the poller prunes the pin after delivery.
+    let name = agent_mail_bridge::native_thread_mail_name(&thread.session_id);
+    let later = home.path().join("inbox").join(&name).join("later");
+    let parked = std::fs::read_dir(&later)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let file_name = parked.file_name().unwrap().to_str().unwrap().to_string();
+    let (_, rest) = file_name.split_once('_').unwrap();
+    std::fs::rename(&parked, later.join(format!("1_{rest}"))).unwrap();
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.run_until_parked();
+
+    let pending = fake.pending_completions_for(&thread.model);
+    assert_eq!(pending.len(), 1, "the scheduled mail should wake the thread");
+    assert!(
+        pending[0]
+            .messages
+            .last()
+            .unwrap()
+            .string_contents()
+            .contains("check the long job"),
+    );
+    assert!(
+        !thread
+            .acp_thread
+            .read_with(cx, |thread, _| thread.is_waiting_for_mail()),
+        "claiming the wake must clear the waiting flag"
+    );
+
+    // While the delivered turn runs the pin rightly stays (the retain keeps
+    // any generating thread); once the turn ends idle and not waiting, the
+    // poller prunes it.
+    fake.send_last_text(&thread.model, "Done.");
+    fake.end_last(&thread.model);
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.run_until_parked();
+    assert!(
+        !agent.read_with(cx, |agent, _| agent
+            .agent_mail
+            .as_ref()
+            .unwrap()
+            .waiting_pins
+            .contains_key(&thread.session_id)),
+        "the keep-alive pin must drop once the wake is delivered"
+    );
+}
+
+/// Issue 080: fyi scheduled mail never wakes anyone, so it must not arm the
+/// waiting flag or pin either — a thread parked on an fyi drop reads as
+/// finished, not waiting.
+#[gpui::test]
+async fn test_fyi_scheduled_mail_does_not_arm_waiting(cx: &mut TestAppContext) {
+    let setup = setup_threads(1, cx).await;
+    let (agent, _) = (&setup.agent, &setup.fake);
+    let thread = &setup.threads[0];
+    let (_home, sender) = enable_agent_mail(agent, cx);
+
+    schedule_mail(
+        &sender,
+        &thread.session_id,
+        "heads up, later",
+        chrono::Duration::hours(1),
+        ::agent_mail::MailMode::Fyi,
+    );
+    cx.executor().advance_clock(Duration::from_secs(6));
+    cx.run_until_parked();
+
+    assert!(
+        !thread
+            .acp_thread
+            .read_with(cx, |thread, _| thread.is_waiting_for_mail())
+    );
+    assert!(agent.read_with(cx, |agent, _| agent
+        .agent_mail
+        .as_ref()
+        .unwrap()
+        .waiting_pins
+        .is_empty()));
+}
+
+/// The arm leg skips rows due within the next poll tick: one that comes due
+/// mid-tick is promoted and claimed right away, and arming it would leave a
+/// phantom Waiting state racing the delivery.
+#[gpui::test]
+async fn test_scheduled_mail_due_within_a_tick_is_not_armed(cx: &mut TestAppContext) {
+    let setup = setup_threads(1, cx).await;
+    let (agent, fake) = (&setup.agent, &setup.fake);
+    let thread = &setup.threads[0];
+    let (_home, sender) = enable_agent_mail(agent, cx);
+
+    schedule_mail(
+        &sender,
+        &thread.session_id,
+        "due almost now",
+        chrono::Duration::milliseconds(100),
+        ::agent_mail::MailMode::Queued,
+    );
+    cx.executor().advance_clock(Duration::from_secs(6));
+    cx.run_until_parked();
+
+    assert!(
+        !thread
+            .acp_thread
+            .read_with(cx, |thread, _| thread.is_waiting_for_mail()),
+        "a row due within a tick must not arm the waiting flag"
+    );
+    assert_eq!(
+        fake.pending_completions_for(&thread.model).len(),
+        0,
+        "the real clock has not reached the due time yet"
+    );
+}
+
 #[gpui::test]
 async fn test_agent_mail_spawns_thread_for_unknown_name(cx: &mut TestAppContext) {
     let setup = setup_threads(1, cx).await;
@@ -1149,6 +1333,157 @@ async fn test_agent_mail_resumes_saved_thread_for_zed_name(cx: &mut TestAppConte
     );
     let prompt = pending[0].messages.last().unwrap().string_contents();
     assert!(prompt.contains("continue where you left off"), "{prompt}");
+}
+
+/// The owner's report: a thread parked waiting on a wake loses its panel
+/// view, the release removes the session, and only clicking the thread back
+/// open lets the mail through. With the donor keep-alive, one session stays
+/// live no matter how many views close, so the parked thread is woken by the
+/// poller — the simulated click — with no user interaction.
+#[gpui::test]
+async fn test_mail_wakes_a_view_closed_thread_without_click(cx: &mut TestAppContext) {
+    let mut setup = setup_threads(2, cx).await;
+    let (agent, fake) = (&setup.agent, &setup.fake);
+    let target = &setup.threads[0];
+    let (_home, sender) = enable_agent_mail(agent, cx);
+
+    // The donor pin arms within the first poller ticks, while both views are
+    // still open.
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.run_until_parked();
+    assert!(
+        agent.read_with(cx, |agent, _| agent
+            .agent_mail
+            .as_ref()
+            .unwrap()
+            .donor_pin
+            .is_some()),
+        "the donor keep-alive must arm while sessions are live"
+    );
+
+    // Give the target history so its release lands in the thread database:
+    // empty threads are never saved, and the resume path works off history.
+    let target_turn = setup.send(target, "Do work", cx);
+    cx.run_until_parked();
+    fake.send_last_text(&target.model, "Done.");
+    fake.end_last(&target.model);
+    assert_eq!(target_turn.await.unwrap(), acp_v2::StopReason::EndTurn);
+    cx.run_until_parked();
+
+    // Close every view: the test's strong handles stand in for the panel's.
+    let target_id = target.session_id.clone();
+    let target_model = target.model.clone();
+    let mail_name = agent_mail_bridge::native_thread_mail_name(&target_id);
+    setup.threads = Vec::new();
+    // Releases fire inside an update scope's effect flush; run_until_parked
+    // alone won't get there while every timer is still in the future.
+    cx.update(|_| {});
+    cx.run_until_parked();
+    agent.read_with(cx, |agent, _| {
+        assert_eq!(
+            agent.sessions.len(),
+            1,
+            "exactly the donor-pinned session must survive closing every view"
+        );
+    });
+
+    // The parked thread's wake arrives. No click: the surviving donor keeps
+    // the resume path alive, and the poller wakes the target within a tick —
+    // directly if it is the donor itself, via a history resume otherwise.
+    mail_to_name(&sender, &mail_name, "continue where you left off");
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.run_until_parked();
+
+    agent.read_with(cx, |agent, _| {
+        assert!(
+            agent.sessions.contains_key(&target_id),
+            "the view-closed thread must be live again without a click"
+        );
+    });
+    let pending = fake.pending_completions_for(&target_model);
+    assert_eq!(
+        pending.len(),
+        1,
+        "the mail should start the target's turn with no click"
+    );
+    let prompt = pending[0].messages.last().unwrap().string_contents();
+    assert!(prompt.contains("continue where you left off"), "{prompt}");
+}
+
+/// A resumed thread must land in the repository its saved work dirs name,
+/// not in whichever session the donor pick happens to find first.
+#[gpui::test]
+async fn test_resume_prefers_the_project_matching_the_saved_dirs(cx: &mut TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/",
+        json!({ "a": { "b.md": "Lorem" }, "b": { "c.md": "Ipsum" } }),
+    )
+    .await;
+    let project_a = Project::test(fs.clone(), [path!("/a").as_ref()], cx).await;
+    let project_b = Project::test(fs.clone(), [path!("/b").as_ref()], cx).await;
+    let thread_store = cx.new(|cx| ThreadStore::new(cx));
+    let agent =
+        cx.update(|cx| NativeAgent::new(thread_store.clone(), Templates::new(), fs.clone(), cx));
+    let connection = Rc::new(NativeAgentConnection(agent.clone()));
+    let mut session_handles = Vec::new();
+    for (project, dir) in [(project_a.clone(), ""), (project_b.clone(), "/b")] {
+        session_handles.push(
+            cx.update(|cx| {
+                connection.clone().new_session(
+                    project.clone(),
+                    PathList::new(&[Path::new(dir)]),
+                    cx,
+                )
+            })
+            .await
+            .unwrap(),
+        );
+    }
+    cx.run_until_parked();
+
+    let (_home, sender) = enable_agent_mail(&agent, cx);
+
+    // A departed thread whose saved work dirs name /b.
+    let departed_id = acp_v2::SessionId::new("11111111-2222-3333-4444-555555555555");
+    let mail_name = agent_mail_bridge::native_thread_mail_name(&departed_id);
+    let database = cx
+        .update(|cx| crate::db::ThreadsDatabase::connect(cx))
+        .await
+        .unwrap();
+    database
+        .save_thread(
+            departed_id.clone(),
+            make_saved_thread("Departed in /b"),
+            PathList::new(&[Path::new("/b")]),
+        )
+        .await
+        .unwrap();
+
+    mail_to_name(&sender, &mail_name, "continue where you left off");
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.run_until_parked();
+
+    agent.read_with(cx, |agent, cx| {
+        assert!(agent.sessions.contains_key(&departed_id));
+        let resumed_project = agent.sessions[&departed_id]
+            .thread
+            .read(cx)
+            .project
+            .clone();
+        let roots = resumed_project
+            .read(cx)
+            .worktrees(cx)
+            .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+            .collect::<Vec<_>>();
+        assert!(
+            roots.iter().any(|root| root.starts_with("/b")),
+            "the resumed thread must land in the project covering its saved \
+             work dirs, got {roots:?}"
+        );
+    });
 }
 
 /// Issue 075: mail addressed to a specific `zed-*` inbox names that thread,

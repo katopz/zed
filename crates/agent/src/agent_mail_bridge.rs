@@ -20,6 +20,10 @@ const LIVE_REFRESH_TICKS: u32 = 10;
 /// Cap on live threads spawned from mail (plan 053): a runaway sender must
 /// not fill the sidebar with threads.
 const MAX_MAIL_SPAWNED_THREADS: usize = 8;
+/// Reconcile cadence for the scheduled-mail arm leg (issue 080): one
+/// `later/` spool listing per live session every ~5 s, cheap enough to run
+/// alongside the 500 ms claim loop.
+const SCHEDULED_RECONCILE_TICKS: u32 = 10;
 
 pub(crate) struct AgentMailState {
     mailroom: Arc<Mailroom>,
@@ -49,6 +53,15 @@ pub(crate) struct AgentMailState {
     /// session stays live and the poller keeps delivering; it drops when the
     /// mail is claimed back into the inbox.
     pub(crate) waiting_pins: HashMap<acp_v2::SessionId, Entity<acp_thread::AcpThread>>,
+    /// The donor keep-alive (the owner's "one boss awake"): one live session
+    /// held so the wake-resume and mail-spawn paths always have a project to
+    /// borrow. Without it, closing every thread view releases the last
+    /// session, the project store empties, and parked mail can no longer wake
+    /// anyone until the user clicks a thread open. The pick is arbitrary (any
+    /// live session's project works); the pin itself keeps the session alive,
+    /// so it is normally a one-time pick that survives view closes. Not a
+    /// mail-driven thread: it consumes no spawn/resume budget slot.
+    pub(crate) donor_pin: Option<(acp_v2::SessionId, Entity<acp_thread::AcpThread>)>,
     _poller: Task<()>,
     _settings: Subscription,
 }
@@ -109,6 +122,30 @@ impl AgentMailState {
                                     && (pin.read(cx).is_waiting_for_mail()
                                         || pin.read(cx).status() != ThreadStatus::Idle)
                             });
+                            // The donor keep-alive: re-pick only when the last
+                            // one is gone. The pin holds its session's
+                            // `AcpThread`, so its release cannot fire while the
+                            // pin lives; the session can only vanish through
+                            // this prune, after which the next tick re-pins
+                            // while any session remains.
+                            if state
+                                .donor_pin
+                                .as_ref()
+                                .is_none_or(|(session_id, _)| {
+                                    !agent.sessions.contains_key(session_id)
+                                })
+                            {
+                                state.donor_pin = agent.sessions.keys().next().cloned().and_then(
+                                    |session_id| {
+                                        agent.sessions.get(&session_id).and_then(|session| {
+                                            session
+                                                .acp_thread
+                                                .upgrade()
+                                                .map(|acp_thread| (session_id, acp_thread))
+                                        })
+                                    },
+                                );
+                            }
                             let mut claims = Vec::new();
                             let mut live_entries = Vec::new();
                             let mut inbox_names = Vec::new();
@@ -249,6 +286,79 @@ impl AgentMailState {
                         })
                         .await
                     };
+                    // Issue 080: the arm leg. The waiting flag + keep-alive
+                    // pin arm on the send-message tool path when a mail goes
+                    // out; a thread that parked on a wake scheduled through
+                    // the CLI lane never armed either, so its row read
+                    // Completed and, once its view closed, nothing kept the
+                    // session alive to claim the wake. Scheduled rows still in
+                    // `later/` name the sessions parked waiting; arm flag +
+                    // pin for those. This runs after the claim step, so due
+                    // mail has already left `later/` and just-delivered wakes
+                    // don't re-arm, and only rows due beyond the next tick
+                    // arm (one that comes due mid-tick is promoted and
+                    // delivered without ever needing the flag).
+                    if ticks.is_multiple_of(SCHEDULED_RECONCILE_TICKS) {
+                        let mailroom = mailroom.clone();
+                        let Ok(pairs) = this.update(cx, |agent, _| {
+                            agent
+                                .sessions
+                                .keys()
+                                .map(|session_id| {
+                                    let name = agent.mail_name_for_session(session_id);
+                                    (session_id.clone(), name)
+                                })
+                                .collect::<Vec<_>>()
+                        }) else {
+                            break;
+                        };
+                        let waiting_sessions = cx
+                            .background_spawn(async move {
+                                let arm_after = chrono::Utc::now() + MAIL_POLL_INTERVAL;
+                                pairs
+                                    .into_iter()
+                                    .filter_map(|(session_id, name)| {
+                                        mailroom
+                                            .scheduled(std::slice::from_ref(&name))
+                                            .ok()
+                                            .filter(|mail| {
+                                                mail.iter().any(|envelope| {
+                                                    envelope.mode != MailMode::Fyi
+                                                        && envelope
+                                                            .deliver_at
+                                                            .as_deref()
+                                                            .and_then(|at| {
+                                                                chrono::DateTime::parse_from_rfc3339(
+                                                                    at,
+                                                                )
+                                                                .ok()
+                                                            })
+                                                            .is_some_and(|due| {
+                                                                due.with_timezone(&chrono::Utc)
+                                                                    > arm_after
+                                                            })
+                                                })
+                                            })
+                                            .map(|_| session_id)
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                            .await;
+                        let Ok(()) = this.update(cx, |agent, cx| {
+                            for session_id in waiting_sessions {
+                                if let Some(session) = agent.sessions.get(&session_id)
+                                    && let Some(acp_thread) = session.acp_thread.upgrade()
+                                {
+                                    acp_thread.update(cx, |thread, cx| {
+                                        thread.set_waiting_for_mail(true, cx)
+                                    });
+                                    agent.pin_waiting_thread(&session_id, acp_thread);
+                                }
+                            }
+                        }) else {
+                            break;
+                        };
+                    }
                     if claimed.is_empty() && claimed_spawns.is_empty() && claimed_resumes.is_empty()
                     {
                         continue;
@@ -325,6 +435,7 @@ impl AgentMailState {
             spawned_names: HashMap::default(),
             pinned_threads: HashMap::default(),
             waiting_pins: HashMap::default(),
+            donor_pin: None,
             _poller: poller,
             _settings: settings,
         };
@@ -584,15 +695,20 @@ impl NativeAgent {
     }
 
     /// Begins resuming the saved thread a `zed-*` inbox asks for (plan 053
-    /// follow-up): the donor session's project, the thread's original work
-    /// dirs. `None` when no live session exists to borrow a project from —
-    /// the mail stays claimed-but-parked in that rare case, retried next tick.
+    /// follow-up): the thread's original work dirs, hosted by the session
+    /// whose project covers them when one exists (so the resumed thread lands
+    /// in the right repository instead of an arbitrary donor's), else any
+    /// live session. `None` when no live session exists to borrow a project
+    /// from — the mail stays claimed-but-parked in that rare case, retried
+    /// next tick (the donor keep-alive exists precisely to keep this live).
     fn open_saved_mail_thread(
         &mut self,
         target: &SavedThreadTarget,
         cx: &mut Context<Self>,
     ) -> Option<Task<Result<Entity<acp_thread::AcpThread>>>> {
-        let donor = self.sessions.values().next()?;
+        let donor = self
+            .donor_for_work_dirs(&target.work_dirs, cx)
+            .or_else(|| self.sessions.values().next())?;
         let project = self.projects.get(&donor.project_id)?.project.clone();
         let work_dirs = if target.work_dirs.is_empty() {
             donor
@@ -609,6 +725,28 @@ impl NativeAgent {
             Some(work_dirs),
             cx,
         ))
+    }
+
+    /// The session best placed to host a resumed thread for `work_dirs`: one
+    /// whose project holds a worktree inside (or containing) one of the
+    /// dirs. `None` when no session's project covers them.
+    fn donor_for_work_dirs(&self, work_dirs: &PathList, cx: &App) -> Option<&Session> {
+        self.sessions.values().find(|session| {
+            let Some(project_state) = self.projects.get(&session.project_id) else {
+                return false;
+            };
+            project_state
+                .project
+                .read(cx)
+                .worktrees(cx)
+                .any(|worktree| {
+                    let root = worktree.read(cx).abs_path();
+                    work_dirs
+                        .paths()
+                        .iter()
+                        .any(|dir| root.starts_with(dir) || dir.starts_with(&*root))
+                })
+        })
     }
 
     /// Pins a mail-driven thread's `AcpThread` (plan 053): spawned and

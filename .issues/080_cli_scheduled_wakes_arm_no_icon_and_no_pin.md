@@ -1,6 +1,7 @@
 # Issue 080 — CLI-scheduled timed wakes (`agent-mail send --at`) arm neither the sidebar schedule icon nor the keep-alive pin
 
-**Status:** OPEN 2026-11-24 (zed-35c73065@m3) — filed from the sprint!071 lane: two self-wakes were CLI-scheduled, and the owner noticed the thread history row showed no schedule icon while the thread was parked waiting for them (owner report, same day).
+**Status:** FIXED 2026-11-24 (amo) — fix (a) landed as the poller reconcile arm leg, per the proposal below, plus the donor keep-alive from the verdict round; sidebar untouched as predicted. Landing notes at the bottom.
+**Claimed:** 2026-11-24, zed agent on amo (owner re-report same day: no waiting icon, threads killed while parked, click-only wake) — implementing fix (a), the poller reconcile leg, plus a donor keep-alive so the resume path survives closing every view.
 
 ## Symptom
 
@@ -58,7 +59,17 @@ Change the workspace AGENTS.md timed-wake rows to mandate the `send_message{deli
 
 ## Tasks
 
-- [ ] Fix (a): the reconcile leg in the poller, arms flag + pin on CLI-scheduled self-mail, disarms via the existing claim path.
-- [ ] Tests both directions: a CLI-scheduled wake arms Waiting + the pin (spool fixture row, future `deliver_at`); the pin survives a view close until delivery; delivery clears flag + pin on the next tick.
-- [ ] Sidebar: expected untouched (assert the existing Waiting render covers the armed path).
-- [ ] If (b) ever chosen instead: the workspace AGENTS.md timed-wake rows change in the same commit as the demotion, never separately.
+- [x] Fix (a): the reconcile leg in the poller, arms flag + pin on CLI-scheduled self-mail, disarms via the existing claim path.
+- [x] Tests both directions: a CLI-scheduled wake arms Waiting + the pin (spool fixture row, future `deliver_at`); the pin survives a view close until delivery; delivery clears flag + pin on the next tick.
+- [x] Sidebar: expected untouched (assert the existing Waiting render covers the armed path).
+- [x] If (b) ever chosen instead: the workspace AGENTS.md timed-wake rows change in the same commit as the demotion, never separately. (Moot — (a) chosen.)
+
+## Landing notes (2026-11-24)
+
+Implemented with a Claude verdict (REVISE round 1, addressed in full; `agent.verdict` session 22e282ac-606e-408f-9f71-8bef910590a5):
+
+- **Arm leg** (`agent_mail_bridge.rs`, every `SCHEDULED_RECONCILE_TICKS` = 10 ticks ≈ 5 s, run AFTER the claim step): one `Mailroom::scheduled()` listing per live session inbox; arms `set_waiting_for_mail(true)` + `pin_waiting_thread` when a non-fyi row is due beyond the next tick (verdict margin: a row due mid-tick is promoted and claimed without ever needing the flag, and a just-delivered wake can't re-arm). Disarm stays on the claim path (`post_agent_mail`), pin pruned by the existing retain loop.
+- **Donor keep-alive** ("one boss awake", owner-directed; verdict field-shape): `AgentMailState::donor_pin` — one live session held (NOT in `pinned_threads`, so it consumes no spawn/resume budget slot) so `open_saved_mail_thread`/`spawn_mail_thread` always have a project donor even after every view closes. Re-picked only when its session is gone; the pin itself prevents that release.
+- **Resume donor now prefers the right project**: `donor_for_work_dirs` matches a session whose project holds a worktree inside (or containing) the saved thread's `folder_paths`, arbitrary-donor fallback (pre-existing behavior).
+- Tests (5 new, `thread_mailbox_tests.rs`): `test_cli_scheduled_mail_arms_waiting_until_wake_is_claimed` (arm + icon flag + pin, due → claimed → flag clear → pin prune after the delivered turn ends), `test_fyi_scheduled_mail_does_not_arm_waiting`, `test_scheduled_mail_due_within_a_tick_is_not_armed` (verdict margin), `test_mail_wakes_a_view_closed_thread_without_click` (the owner's click-simulation scenario, donor pin + history resume), `test_resume_prefers_the_project_matching_the_saved_dirs`. Suite: 29/29 mailbox tests green; full `-p agent` 854 passed + 1 pre-existing flake (broadcast liveness cutoff, fails ~2/4 on clean HEAD aaca01b8ce too — timing race in that test, untouched).
+- **Still open → issue 082**: cold start (fresh Zed, zero live sessions, no donor → parked mail waits for a click) and `[M]` mail-spawned thread names not persisted (no resume-by-name for killed `[M]` threads).
