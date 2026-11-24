@@ -614,6 +614,7 @@ pub fn probe(mailroom: &Mailroom) -> RigProbe {
     };
     let jobs = mailroom.job_summary();
     let contention = contention(&jobs.managed_pids);
+    let not_quiet_because = quiet_reasons(contention.not_quiet_because, jobs.running.len());
     RigProbe {
         rig,
         os: std::env::consts::OS.into(),
@@ -637,8 +638,8 @@ pub fn probe(mailroom: &Mailroom) -> RigProbe {
             .filter(|rigs| rigs.orchestrator.as_deref() == Some(rigs.self_rig.as_str()))
             .and_then(|_| mailroom.watch_last_tick())
             .map(|at| at.to_rfc3339()),
-        quiet: contention.not_quiet_because.is_empty(),
-        not_quiet_because: contention.not_quiet_because,
+        quiet: not_quiet_because.is_empty(),
+        not_quiet_because,
         contenders: contention.contenders,
         blind: contention.blind,
         outbox: mailroom
@@ -1135,9 +1136,63 @@ struct FleetCache {
     issues: Option<BTreeMap<String, usize>>,
 }
 
-/// One line per rig, for an LLM's context: role, state, what it is busy with,
-/// managed jobs. Written by every full `rig status` (the panel, the badge, the
-/// watchdog), so readers like auto_prompt's decider cost no extra requests.
+/// QUIET once meant "no unmanaged contenders": managed jobs are excluded
+/// from contenders by design, so a rig deep in an 18-hour exclusive
+/// benchmark probed as QUIET and every routing consumer read it as free.
+/// Running managed jobs are not quiet either. Benchmark cleanliness keeps
+/// checking `contention()` directly, which stays purely contention-based.
+fn quiet_reasons(mut not_quiet_because: Vec<String>, running_jobs: usize) -> Vec<String> {
+    if running_jobs > 0 {
+        not_quiet_because.push(format!("{running_jobs} managed job(s) running"));
+    }
+    not_quiet_because
+}
+
+/// Load and job counts instead of a QUIET/BUSY verdict: a consumer routing
+/// work reasons on `cpu 172% (load 51.6/30) · gpu 15% · jobs 1 run (1 excl) ·
+/// 5 qd` better than on a label that could not see managed jobs.
+pub fn rig_facts(probe: &RigProbe, accepts_jobs: bool) -> String {
+    let mut facts = vec![cpu_fact(probe)];
+    for gpu in &probe.gpus {
+        facts.push(format!("gpu {:.0}%", gpu.util_pct));
+    }
+    if accepts_jobs {
+        facts.push(jobs_fact(probe));
+    }
+    facts.join(" · ")
+}
+
+fn cpu_fact(probe: &RigProbe) -> String {
+    match probe.load1 {
+        Some(load) => {
+            let cores = probe.cores.max(1);
+            format!(
+                "cpu {}% (load {load:.1}/{cores})",
+                (load / cores as f64 * 100.0).round() as i64
+            )
+        }
+        None => format!("{} cores", probe.cores),
+    }
+}
+
+fn jobs_fact(probe: &RigProbe) -> String {
+    let exclusive = probe
+        .running
+        .iter()
+        .filter(|job| job.lane.as_deref() == Some("Exclusive"))
+        .count();
+    let run = match exclusive {
+        0 => format!("{} run", probe.running.len()),
+        _ => format!("{} run ({exclusive} excl)", probe.running.len()),
+    };
+    format!("jobs {run} · {} qd", probe.queued.len())
+}
+
+/// One line per rig, for an LLM's context: role, load/GPU/job-count facts
+/// (no verdict — reason on the numbers), contention notes, what it is busy
+/// with, managed jobs. Written by every full `rig status` (the panel, the
+/// badge, the watchdog), so readers like auto_prompt's decider cost no
+/// extra requests.
 pub fn fleet_summary(
     results: &[(String, Result<RigProbe>, Duration)],
     rigs: &crate::Rigs,
@@ -1184,14 +1239,15 @@ pub fn fleet_summary(
                     .map(|job| truncate_chars(&job.text, 60))
                     .collect();
                 format!(
-                    "- {name} ({role}{no_jobs}): {}{}{}{}",
-                    match probe.quiet {
-                        true => "QUIET".to_string(),
-                        false => format!("BUSY ({})", probe.not_quiet_because.join(", ")),
-                    },
+                    "- {name} ({role}{no_jobs}): {}{}{}{}{}",
+                    rig_facts(probe, no_jobs.is_empty()),
                     match probe.via.as_deref() {
                         Some(via) => format!(" (via {via})"),
                         None => String::new(),
+                    },
+                    match probe.not_quiet_because.is_empty() {
+                        true => String::new(),
+                        false => format!("; not quiet: {}", probe.not_quiet_because.join(", ")),
                     },
                     match busy.is_empty() {
                         true => String::new(),
@@ -1199,7 +1255,7 @@ pub fn fleet_summary(
                     },
                     match jobs.is_empty() {
                         true => String::new(),
-                        false => format!("; jobs: {}", jobs.join(" | ")),
+                        false => format!("; running: {}", jobs.join(" | ")),
                     }
                 )
             }
@@ -1322,15 +1378,10 @@ pub fn render(results: &[(String, Result<RigProbe>, Duration)], rigs: &crate::Ri
                 continue;
             }
         };
-        let quiet = match probe.quiet {
-            true => "QUIET".to_string(),
-            false => format!("BUSY ({})", probe.not_quiet_because.join(", ")),
-        };
         let mut facts = Vec::new();
-        if let Some(load) = probe.load1 {
-            facts.push(format!("load {load:.1}/{}", probe.cores));
-        } else {
-            facts.push(format!("{} cores", probe.cores));
+        facts.push(cpu_fact(probe));
+        if rig.is_none_or(|rig| rig.accepts_jobs) {
+            facts.push(jobs_fact(probe));
         }
         if let (Some(free), Some(total)) = (probe.mem_free_gb, probe.mem_total_gb) {
             facts.push(format!("mem {free:.0}/{total:.0} GB free"));
@@ -1347,8 +1398,11 @@ pub fn render(results: &[(String, Result<RigProbe>, Duration)], rigs: &crate::Ri
                 gpu.util_pct, gpu.mem_used_gb, gpu.mem_total_gb
             ));
         }
+        if !probe.not_quiet_because.is_empty() {
+            facts.push(format!("not quiet: {}", probe.not_quiet_because.join(", ")));
+        }
         out.push_str(&format!(
-            "{name:<5} {role}{jobs} · {quiet} · {} · {} ms\n",
+            "{name:<5} {role}{jobs} · {} · {} ms\n",
             facts.join(" · "),
             elapsed.as_millis()
         ));
@@ -1628,7 +1682,7 @@ mod tests {
         let summary = fleet_summary(&results, &rigs);
         assert_eq!(
             summary,
-            "- bmo (runner): BUSY (1 contender(s)) (via amo); heavy: bench_809; jobs: 0e6ffdbe Shared 9 min · zed release build\n- m3 (orchestrator, takes no jobs): offline"
+            "- bmo (runner): 30 cores · jobs 1 run · 0 qd (via amo); not quiet: 1 contender(s); heavy: bench_809; running: 0e6ffdbe Shared 9 min · zed release build\n- m3 (orchestrator, takes no jobs): offline"
         );
 
         // A multi-route rig that is down names its routes in the offline line.
@@ -1659,20 +1713,66 @@ mod tests {
         )];
         assert_eq!(
             fleet_summary(&results, &rigs),
-            "- bmo (runner): QUIET (via amo)"
+            "- bmo (runner): 30 cores · jobs 0 run · 0 qd (via amo)"
         );
         let results = vec![("bmo".to_string(), Ok(quiet_probe(None)), Duration::ZERO)];
-        assert_eq!(fleet_summary(&results, &rigs), "- bmo (runner): QUIET");
+        assert_eq!(
+            fleet_summary(&results, &rigs),
+            "- bmo (runner): 30 cores · jobs 0 run · 0 qd"
+        );
 
         write_fleet_cache(&room, &results, &rigs);
         assert_eq!(
             cached_fleet_summary(&room, chrono::Duration::minutes(5)),
-            Some("- bmo (runner): QUIET".to_string())
+            Some("- bmo (runner): 30 cores · jobs 0 run · 0 qd".to_string())
         );
         assert_eq!(
             cached_fleet_summary(&room, chrono::Duration::seconds(-1)),
             None,
             "stale cache is ignored"
+        );
+    }
+
+    #[test]
+    fn running_managed_jobs_are_not_quiet_and_read_as_facts() {
+        // bmo once probed QUIET while an 18-hour exclusive census ran: managed
+        // jobs are not contenders, so the verdict could not see them. The probe
+        // names them as a not-quiet reason and the summary carries raw numbers.
+        assert!(quiet_reasons(Vec::new(), 0).is_empty());
+        assert_eq!(
+            quiet_reasons(vec!["1 contender(s)".into()], 2),
+            vec!["1 contender(s)", "2 managed job(s) running"]
+        );
+        let probe: RigProbe = serde_json::from_str(
+            r#"{"rig":"bmo","os":"macos","at":"","cores":30,"load1":51.6,"quiet":false,
+                "not_quiet_because":["1 managed job(s) running"],
+                "running":[{"id":"x","text":"8aaf2bc9 Exclusive 753 min · i1241 census","lane":"Exclusive"}],
+                "queued":[{"id":"y","text":"61f26ae8 Shared · probe"}]}"#,
+        )
+        .unwrap();
+        assert!(!probe.quiet);
+        assert_eq!(
+            rig_facts(&probe, true),
+            "cpu 172% (load 51.6/30) · jobs 1 run (1 excl) · 1 qd"
+        );
+        // A rig that takes no jobs shows capacity facts only.
+        assert_eq!(rig_facts(&probe, false), "cpu 172% (load 51.6/30)");
+        // The status block reports the same numbers; the not-quiet reason
+        // replaces the old BUSY/QUIET verdict slot.
+        let rigs: crate::Rigs = serde_json::from_str(
+            r#"{"self":"amo","rigs":{"bmo":{"ssh":["katopz@bmo"],"role":"runner"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            render(&[("bmo".to_string(), Ok(probe), Duration::ZERO)], &rigs),
+            "bmo   runner · cpu 172% (load 51.6/30) · jobs 1 run (1 excl) · 1 qd · not quiet: 1 managed job(s) running · 0 ms\n      job    RUNNING 8aaf2bc9 Exclusive 753 min · i1241 census\n      job    queued  61f26ae8 Shared · probe\n"
+        );
+        let idle: RigProbe =
+            serde_json::from_str(r#"{"rig":"bmo","os":"macos","at":"","cores":30,"quiet":true}"#)
+                .unwrap();
+        assert_eq!(
+            render(&[("bmo".to_string(), Ok(idle), Duration::ZERO)], &rigs),
+            "bmo   runner · 30 cores · jobs 0 run · 0 qd · 0 ms\n"
         );
     }
 }

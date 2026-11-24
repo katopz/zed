@@ -224,7 +224,7 @@ fn fleet_context() -> Option<String> {
         chrono::Duration::minutes(FLEET_CONTEXT_MAX_AGE_MINUTES),
     )?;
     let mut text = format!(
-        "Rigs (agent-mail fleet; heavy or timing-sensitive work goes through `agent-mail rig run`, never on a BUSY rig or on m3):\n{summary}\n"
+        "Rigs (agent-mail fleet; heavy or timing-sensitive work goes through `agent-mail rig run`, never on m3 — reason on each rig's cpu%/load, GPU, and running/queued job counts before assuming headroom):\n{summary}\n"
     );
     // Plan 056 W0: name the unclaimed queue so a "lane empty, everything else
     // gated" summary cannot silently fold it away.

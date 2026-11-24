@@ -35,8 +35,9 @@ USAGE:
   agent-mail top [SECS]            terminal UI: rigs, jobs, live job log, mail (read-only)
   agent-mail rig status [RIG...] [--json] [--watch [SECS]]
                                    what every rig is busy with: heavy processes (riir-ai's
-                                   contender rules), agents, load, memory, disk, power, GPU,
-                                   and whether it is QUIET enough for a benchmark
+                                   contender rules), agents, cpu%/load, memory, disk, power,
+                                   GPU, job counts, and `not quiet:` reasons (unmanaged heavy
+                                   work — the benchmark-cleanliness signal)
   agent-mail rig run <RIG|auto> [--shared|--exclusive] [--key K] [--title T] [--cores N]
                 [--mem GB] [--gpu-mem GB] [--needs cuda,metal] [--timeout 2h]
                 [--est 30m] [--urgent] [--worktree repo@sha] [--cwd DIR]

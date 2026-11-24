@@ -1093,10 +1093,7 @@ pub fn digest(
         let line = match outcome {
             Ok(probe) => format!(
                 "{name}: {} · {} agent(s) · {}",
-                match probe.quiet {
-                    true => "QUIET".to_string(),
-                    false => format!("BUSY ({})", probe.not_quiet_because.join(", ")),
-                },
+                crate::rig::rig_facts(probe, true),
                 probe.agents.len(),
                 match probe.contenders.is_empty() {
                     true => "no heavy work".to_string(),
