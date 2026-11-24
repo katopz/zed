@@ -1,6 +1,6 @@
 # Issue 082 — mail-wake coverage holes: cold start has no donor, `[M]` thread names are not persisted
 
-**Status:** OPEN 2026-11-24 (zed agent on amo) — split out of issue 080's landing; the owner's click-only-wake report is fixed for the running-Zed cases, these two remain.
+**Status:** OPEN 2026-11-24 (zed agent on amo) — split out of issue 080's landing; the owner's click-only-wake report is fixed for the running-Zed cases (issue 080, fix commit d401e75a12), these two remain.
 
 ## Symptom
 
