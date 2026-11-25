@@ -1,6 +1,6 @@
 # Issue 079 — `rig run --gpu-mem N` never admits on Metal rigs (amo/bmo/m3)
 
-**Status:** FIXED 2026-11-25 (zed-504dde51@amo, this landing) — all four fix-shape rows landed + tests; amo's installed binary carries the fix and the live admission proof ran. Remaining: rebuild+install on m3/bmo (same command as amo) and the 4090 (ride issue 081's rebuild).
+**Status:** FIXED 2026-11-25 (zed-504dde51@amo, this landing) — all four fix-shape rows landed + tests; amo's installed binary carries the fix and the live admission proof ran. Remaining: the 4090 only (ride issue 081's rebuild — m3 rebuilt from source 2026-11-25 37.5 s; bmo got amo's binary over the bridge per the no-source-on-bmo rule; both probes answer).
 **Lease closed:** zed-504dde51@amo, claimed 1795575237 — folded at the same-session landing (all four fix-shape rows + tests + amo install + the live admission proof).
 
 ## Defect
