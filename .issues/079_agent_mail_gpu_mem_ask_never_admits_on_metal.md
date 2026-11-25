@@ -1,7 +1,7 @@
 # Issue 079 — `rig run --gpu-mem N` never admits on Metal rigs (amo/bmo/m3)
 
-**Status:** OPEN — unclaimed (filed 2026-11-24 by katgpt-rs-ff@amo)
-**Claimed:** zed-504dde51@amo, 1795575237, expires 2026-11-26T03:20:00+00:00 — scope: the whole fix shape (unified-memory arm + loud never-fits refusal + queue-head blocked reason + tests), one landing.
+**Status:** FIXED 2026-11-25 (zed-504dde51@amo, this landing) — all four fix-shape rows landed + tests; amo's installed binary carries the fix and the live admission proof ran. Remaining: rebuild+install on m3/bmo (same command as amo) and the 4090 (ride issue 081's rebuild).
+**Lease closed:** zed-504dde51@amo, claimed 1795575237 — folded at the same-session landing (all four fix-shape rows + tests + amo install + the live admission proof).
 
 ## Defect
 
@@ -16,11 +16,38 @@ within seconds.
 
 ## Fix shape
 
-- [ ] Metal rigs have unified memory. When `gpus()` is empty on macOS, treat the GPU ask as
-      a memory ask: fold `gpu_mem_gb` into the `mem_free_gb` check. Alternatively, report
-      `gpu_free_gb` from `memory_free_gb()` on Apple silicon.
-- [ ] A job that can NEVER fit on its rig (a capability the rig cannot report) should be
-      refused at submit, or poisoned with a reason. It must not wait silently.
-- [ ] `rig status` should show the admit-blocking reason for the queue head.
-- [ ] Test: a macOS capacity (`gpu_free_gb: None`) with a `gpu_mem_gb > 0` job either admits
-      or is refused loudly, and never waits forever.
+- [x] Metal rigs have unified memory — LANDED: `rig::gpu_free_gb()` (rig.rs) returns the
+      discrete nvidia-smi max when GPUs exist, else the macOS unified-memory free-RAM number
+      (`memory_free_gb()`), else None; pure core `gpu_free_from(&[Gpu], macos, mem_free)` is
+      unit-tested both directions. `Capacity` (scheduler + the new queue-head render) reads it.
+- [x] A job that can NEVER fit on its rig is refused at submit — LANDED:
+      `jobs::ensure_gpu_ask_servable(gpu_mem_gb, gpu_capable)` called at `rig enqueue`
+      (main.rs — the rig-side path, so remote submissions refuse with the rig's OWN view).
+      `rig::gpu_capable()` = macOS or nvidia-smi on PATH (presence, not health — a probe
+      hiccup never rejects a real submission). Refusal names the reason and never queues.
+- [x] `rig status` shows the admit-blocking reason for the queue head — LANDED: the first
+      Shared job's line gains ` · BLOCKED: <axis>` (`jobs::blocking_axis` — cores / memory /
+      gpu-memory, first failing axis, same construction as `fits`; running reservations
+      folded in). Verified live: amo's head renders `BLOCKED: memory` under the running job.
+- [x] Tests — LANDED: `gpu_free_falls_back_to_unified_memory_on_macos` (discrete wins,
+      macOS fallback, non-macOS None), `gpu_ask_against_an_incapable_rig_refuses_at_enqueue`
+      (measured-incident shape refuses, capable accepts, no-ask never refused),
+      `blocking_axis_names_cores_memory_then_gpu` (axis order + reservations). Lib 112/112,
+      clippy -D warnings clean.
+
+## Landing record (2026-11-25, zed-504dde51@amo)
+
+- Diff: `rig.rs` (+43: gpu_free_gb / gpu_free_from / gpu_capable / command_on_path),
+  `jobs.rs` (+196 net incl. tests: Capacity wiring, blocking_axis, ensure_gpu_ask_servable,
+  render_capacity, the queue-head BLOCKED tag, 3 tests), `main.rs` (+7: the enqueue-side
+  refusal). rustfmt 2024 clean; release build 27.5 s (isolated /tmp target).
+- **Install lesson (recorded for every future agent-mail install):** `cp` over the live
+  `~/.cargo/bin/agent-mail` path left the new binary SIGKILLed at exec (rc 137, "Killed: 9")
+  while the IDENTICAL bytes ran from /tmp and under a fresh name in the same dir — macOS
+  caches signature validation per inode+path. The correct install is cp-to-temp + `mv -f`
+  (rename) onto the live path; verified 3× green after the mv. The running old-inode
+  processes (claude-hook, rig exec, rig kick) were never disturbed.
+- **Live admission proof:** `rig run amo --shared --gpu-mem 1 -- true` → job `01a210a5`
+  admitted immediately (the measured incident's exact shape queued 5 h on 2026-11-23),
+  exit 0, ended in 2 s. Queue-head render: `#1 cebad5d8 … · BLOCKED: memory` names the
+  axis while amo's 22 GB free is under the head's ask.

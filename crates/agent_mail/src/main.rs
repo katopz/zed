@@ -273,6 +273,13 @@ fn run(args: Vec<String>) -> Result<i32> {
             Some("enqueue") => {
                 let spec: agent_mail::jobs::JobSpec =
                     agent_mail::jobs::decode(&args.next().context("enqueue needs a payload")?)?;
+                // Issue 079: a GPU ask a rig can never serve is refused loud
+                // here (the rig's own view, remote submissions included), not
+                // queued into a silent forever-wait.
+                agent_mail::jobs::ensure_gpu_ask_servable(
+                    spec.needs.gpu_mem_gb,
+                    agent_mail::rig::gpu_capable(),
+                )?;
                 room.enqueue_job(&spec)?;
                 println!("queued {}", spec.id);
                 Ok(0)

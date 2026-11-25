@@ -957,6 +957,45 @@ pub(crate) fn gpus() -> Vec<Gpu> {
         .collect()
 }
 
+/// GPU free capacity the rig can honestly report (issue 079). NVIDIA rigs
+/// read nvidia-smi; Apple-silicon rigs have UNIFIED memory, so the free-RAM
+/// number IS the free-GPU number — `gpus()` is empty on macOS and a
+/// `--gpu-mem` ask used to sit queued forever against `gpu_free_gb: None`.
+/// A rig that can report neither returns None, and a GPU ask against it is
+/// refused at enqueue (`gpu_capable`) instead of waiting silently.
+pub(crate) fn gpu_free_gb() -> Option<f64> {
+    gpu_free_from(&gpus(), cfg!(target_os = "macos"), memory_free_gb())
+}
+
+/// Pure core of [`gpu_free_gb`] for tests: discrete max first, the macOS
+/// unified-memory fallback second, None last.
+pub(crate) fn gpu_free_from(gpus: &[Gpu], macos: bool, mem_free: Option<f64>) -> Option<f64> {
+    let discrete = gpus
+        .iter()
+        .map(|gpu| gpu.mem_total_gb - gpu.mem_used_gb)
+        .reduce(f64::max);
+    discrete.or_else(|| macos.then_some(()).and(mem_free))
+}
+
+/// Whether this rig can EVER serve a `--gpu-mem` ask: Apple silicon
+/// (unified memory) or an nvidia-smi on PATH. A rig that fails both refuses
+/// GPU-ask submissions loudly at enqueue time (issue 079) — a probe that
+/// merely hiccups still counts as capable, so a transient nvidia-smi
+/// failure never rejects a real submission.
+pub fn gpu_capable() -> bool {
+    if cfg!(target_os = "macos") {
+        return true;
+    }
+    command_on_path("nvidia-smi")
+}
+
+fn command_on_path(program: &str) -> bool {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(program))
+        .any(|candidate| candidate.is_file())
+}
+
 #[derive(Deserialize)]
 struct SessionFile {
     pid: u32,

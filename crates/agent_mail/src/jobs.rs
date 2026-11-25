@@ -548,6 +548,56 @@ pub fn fits(needs: &Needs, capacity: &Capacity, reserved: &Needs) -> bool {
     cores_ok && mem_ok && gpu_ok
 }
 
+/// The capacity the queue-head render reads (issue 079). The scheduler
+/// builds the same struct at admit time; one constructor keeps the render
+/// and the admission honest about the same box.
+fn render_capacity() -> Capacity {
+    Capacity {
+        cores: std::thread::available_parallelism().map_or(1.0, |cores| cores.get() as f64),
+        load1: rig::load_average(),
+        mem_free_gb: rig::memory_free_gb(),
+        gpu_free_gb: rig::gpu_free_gb(),
+    }
+}
+
+/// Issue 079 — which axis of [`fits`] fails first, for the queue-head
+/// render. Pure; the scheduler admits, this only names the blocker.
+pub fn blocking_axis(needs: &Needs, capacity: &Capacity, reserved: &Needs) -> Option<&'static str> {
+    let busy_cores = capacity.load1.unwrap_or(0.0).max(reserved.cores);
+    if needs.cores > (capacity.cores - busy_cores).max(0.0) {
+        return Some("cores");
+    }
+    if capacity
+        .mem_free_gb
+        .is_some_and(|free| needs.mem_gb + MEM_HEADROOM_GB > free)
+    {
+        return Some("memory");
+    }
+    if needs.gpu_mem_gb > 0.0
+        && capacity
+            .gpu_free_gb
+            .is_none_or(|free| needs.gpu_mem_gb > free - reserved.gpu_mem_gb)
+    {
+        return Some("gpu-memory");
+    }
+    None
+}
+
+/// Issue 079 — the enqueue-side loud refusal. A rig that can never report
+/// GPU capacity (not macOS, no nvidia-smi on PATH) cannot serve a
+/// `--gpu-mem` ask: refuse at submission with the reason, never queue it
+/// into a silent forever-wait. A `None` from a probe HICCUP on a capable
+/// rig is not this case — `gpu_capable()` checks presence, not health.
+pub fn ensure_gpu_ask_servable(gpu_mem_gb: f64, gpu_capable: bool) -> Result<()> {
+    if gpu_mem_gb > 0.0 && !gpu_capable {
+        bail!(
+            "rig reports no GPU capacity (not macOS unified memory, no nvidia-smi on PATH) — \
+             a --gpu-mem ask would wait forever; submit to a rig that has one"
+        );
+    }
+    Ok(())
+}
+
 /// Tier boundaries for the queue order: estimates under a minute, under a
 /// day, and everything longer (owner decree 2026-11-12). Within a tier the
 /// shortest estimate starts first; across tiers the shorter tier wins.
@@ -862,10 +912,9 @@ impl Mailroom {
             cores: std::thread::available_parallelism().map_or(1.0, |cores| cores.get() as f64),
             load1: rig::load_average(),
             mem_free_gb: rig::memory_free_gb(),
-            gpu_free_gb: rig::gpus()
-                .iter()
-                .map(|gpu| gpu.mem_total_gb - gpu.mem_used_gb)
-                .reduce(f64::max),
+            // Issue 079: macOS falls back to unified-memory free — a
+            // `--gpu-mem` ask must not queue forever against `None`.
+            gpu_free_gb: rig::gpu_free_gb(),
         };
         let start = admit(&queue, &running, &capacity, quiet, cooled);
         for id in &start {
@@ -1875,10 +1924,14 @@ impl Mailroom {
             queued: Vec::new(),
             managed_pids: Vec::new(),
         };
+        let mut reserved = Needs::default();
         for path in json_files(&self.jobs_dir("running")) {
             let Some(record) = read_json::<JobRecord>(&path) else {
                 continue;
             };
+            reserved.cores += record.spec.needs.cores;
+            reserved.mem_gb += record.spec.needs.mem_gb;
+            reserved.gpu_mem_gb += record.spec.needs.gpu_mem_gb;
             summary.managed_pids.push(record.executor_pid);
             summary.managed_pids.extend(record.child_pid);
             let elapsed = chrono::DateTime::parse_from_rfc3339(&record.started_at)
@@ -1920,6 +1973,15 @@ impl Mailroom {
             .collect();
         // Render the order admission will follow, not the submission order.
         sort_queue(&mut queued);
+        // Issue 079: when the queue HEAD would not fit, name the blocking
+        // axis on its line — a waiting job must be legible, not silent.
+        let head_block = queued
+            .first()
+            .filter(|head| head.lane == Lane::Shared)
+            .and_then(|head| {
+                blocking_axis(&head.needs, &render_capacity(), &reserved)
+                    .map(|axis| format!(" · BLOCKED: {axis}"))
+            });
         for (position, spec) in queued.iter().enumerate() {
             let tier = job_tier(spec.est_secs);
             let est = spec.est_secs.map_or_else(|| "-".to_string(), format_secs);
@@ -1927,10 +1989,14 @@ impl Mailroom {
                 true => "URGENT · ",
                 false => "",
             };
+            let head_tag = match (position == 0, head_block.as_deref()) {
+                (true, Some(tag)) => tag,
+                _ => "",
+            };
             summary.queued.push(JobLine {
                 id: spec.id.clone(),
                 text: format!(
-                    "#{} {} {:?} · {}{} · est {} · {} · for {}",
+                    "#{} {} {:?} · {}{} · est {} · {} · for {}{}",
                     position + 1,
                     short(&spec.id),
                     spec.lane,
@@ -1938,7 +2004,8 @@ impl Mailroom {
                     tier.as_str(),
                     est,
                     spec.title,
-                    spec.notify.as_deref().unwrap_or("-")
+                    spec.notify.as_deref().unwrap_or("-"),
+                    head_tag,
                 ),
                 title: Some(spec.title.clone()),
                 lane: Some(format!("{:?}", spec.lane)),
@@ -2515,6 +2582,83 @@ mod tests {
         // While an exclusive job runs, nothing else does.
         let running = [job("x0", Lane::Exclusive, 1.0)];
         assert!(admit(&[job("s", Lane::Shared, 1.0)], &running, &idle, true, true).is_empty());
+    }
+
+    #[test]
+    fn gpu_free_falls_back_to_unified_memory_on_macos() {
+        let nvidia = [crate::rig::Gpu {
+            name: "RTX".into(),
+            util_pct: 0.0,
+            mem_used_gb: 4.0,
+            mem_total_gb: 24.0,
+        }];
+        // Discrete GPU wins over the unified-memory number.
+        assert_eq!(
+            crate::rig::gpu_free_from(&nvidia, true, Some(77.0)),
+            Some(20.0)
+        );
+        // macOS with no discrete GPU: free RAM IS free GPU (issue 079).
+        assert_eq!(crate::rig::gpu_free_from(&[], true, Some(77.0)), Some(77.0));
+        assert_eq!(crate::rig::gpu_free_from(&[], true, None), None);
+        // Not macOS, no discrete GPU: None (the silent-wait class the
+        // enqueue refusal covers).
+        assert_eq!(crate::rig::gpu_free_from(&[], false, Some(77.0)), None);
+        assert_eq!(
+            crate::rig::gpu_free_from(&nvidia, false, Some(77.0)),
+            Some(20.0)
+        );
+    }
+
+    #[test]
+    fn gpu_ask_against_an_incapable_rig_refuses_at_enqueue() {
+        // The measured incident: `--gpu-mem 12` queued 5 h on a quiet rig.
+        assert!(ensure_gpu_ask_servable(12.0, false).is_err());
+        // Capable rigs (macOS unified memory, nvidia-smi) accept it.
+        assert!(ensure_gpu_ask_servable(12.0, true).is_ok());
+        // No ask: never refused, capable or not.
+        assert!(ensure_gpu_ask_servable(0.0, false).is_ok());
+        let error = format!("{}", ensure_gpu_ask_servable(12.0, false).unwrap_err());
+        assert!(error.contains("--gpu-mem"), "{error}");
+    }
+
+    #[test]
+    fn blocking_axis_names_cores_memory_then_gpu() {
+        let mut gpu_job = job("g", Lane::Shared, 1.0);
+        gpu_job.needs.gpu_mem_gb = 10.0;
+        gpu_job.needs.mem_gb = 4.0;
+        // GPU ask vs None reads gpu-memory only when cores/memory pass.
+        assert_eq!(
+            blocking_axis(&gpu_job.needs, &capacity(16.0, 0.0), &Needs::default()),
+            Some("gpu-memory")
+        );
+        // Cores blocks first.
+        assert_eq!(
+            blocking_axis(&gpu_job.needs, &capacity(16.0, 16.0), &Needs::default()),
+            Some("cores")
+        );
+        // Memory blocks before GPU.
+        let mut tight = capacity(16.0, 0.0);
+        tight.mem_free_gb = Some(2.0);
+        assert_eq!(
+            blocking_axis(&gpu_job.needs, &tight, &Needs::default()),
+            Some("memory")
+        );
+        // Everything passing: no axis.
+        let mut fine = capacity(16.0, 0.0);
+        fine.gpu_free_gb = Some(20.0);
+        assert_eq!(
+            blocking_axis(&gpu_job.needs, &fine, &Needs::default()),
+            None
+        );
+        // Reserved GPU on the running set narrows the free band.
+        let reserved = Needs {
+            gpu_mem_gb: 15.0,
+            ..Needs::default()
+        };
+        assert_eq!(
+            blocking_axis(&gpu_job.needs, &fine, &reserved),
+            Some("gpu-memory")
+        );
     }
 
     #[test]
