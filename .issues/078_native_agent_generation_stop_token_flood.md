@@ -1,5 +1,6 @@
 # Issue 078: native-agent generation degenerated into a `stop:` token flood — needs a repetition-loop breaker in the streaming path
 
+**Claimed:** zed-504dde51@amo, 1795576267, expires 2026-11-27T03:11:07+00:00 — scope: the streaming repetition breaker (ask 1) + the auto-retry assessment (ask 2) in crates/agent; UI cap (ask 3) rides only if cheap.
 **Status:** OPEN — filed 2026-11-23 by zed-0a464098@amo (the amo builder rig's Zed native-agent thread, model GLM 5.3 Flash). Adjacent to but distinct from [077](077_native_agent_tool_call_loop_guard.md): 077 is the TOOL-CALL loop (identical calls, no per-turn guard, fix in flight in this tree); this is the TOKEN-level loop inside one generation.
 
 ## What happened
