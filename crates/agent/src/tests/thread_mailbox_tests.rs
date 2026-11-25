@@ -609,9 +609,21 @@ async fn test_agent_mail_broadcast_respects_liveness_cutoff(cx: &mut TestAppCont
     let reentered_thread = &setup.threads[1];
     let (_home, sender) = enable_agent_mail(agent, cx);
 
-    // Let one poller tick run so both sessions have liveness cutoffs stamped
-    // before any mail is sent (chrono reads the real clock, so ordering is
-    // otherwise racy against the executor's timers).
+    // Stamp both sessions' liveness cutoffs EXPLICITLY, a minute in the past
+    // (the poller stamps with `or_insert(now)`, so this wins and is never
+    // overwritten). Issue 083: relying on a poller tick to stamp them raced
+    // the real-clock stamp against the real-clock blast — a cutoff stamped in
+    // the same millisecond the blast landed read `sent_at >= cutoff` and
+    // silently dropped blast one from the live thread (~50% of runs). The
+    // minute margin makes every later blast strictly post-cutoff.
+    let cutoff = chrono::Utc::now() - chrono::Duration::minutes(1);
+    agent.update(cx, |agent, _| {
+        if let Some(state) = agent.agent_mail.as_mut() {
+            for thread in setup.threads.iter() {
+                state.live_since.insert(thread.session_id.clone(), cutoff);
+            }
+        }
+    });
     cx.executor().advance_clock(Duration::from_secs(1));
     cx.run_until_parked();
 
@@ -1055,7 +1067,11 @@ async fn test_cli_scheduled_mail_arms_waiting_until_wake_is_claimed(cx: &mut Tes
     cx.run_until_parked();
 
     let pending = fake.pending_completions_for(&thread.model);
-    assert_eq!(pending.len(), 1, "the scheduled mail should wake the thread");
+    assert_eq!(
+        pending.len(),
+        1,
+        "the scheduled mail should wake the thread"
+    );
     assert!(
         pending[0]
             .messages
@@ -1114,12 +1130,9 @@ async fn test_fyi_scheduled_mail_does_not_arm_waiting(cx: &mut TestAppContext) {
             .acp_thread
             .read_with(cx, |thread, _| thread.is_waiting_for_mail())
     );
-    assert!(agent.read_with(cx, |agent, _| agent
-        .agent_mail
-        .as_ref()
-        .unwrap()
-        .waiting_pins
-        .is_empty()));
+    assert!(agent.read_with(cx, |agent, _| {
+        agent.agent_mail.as_ref().unwrap().waiting_pins.is_empty()
+    }));
 }
 
 /// The arm leg skips rows due within the next poll tick: one that comes due
@@ -1468,11 +1481,7 @@ async fn test_resume_prefers_the_project_matching_the_saved_dirs(cx: &mut TestAp
 
     agent.read_with(cx, |agent, cx| {
         assert!(agent.sessions.contains_key(&departed_id));
-        let resumed_project = agent.sessions[&departed_id]
-            .thread
-            .read(cx)
-            .project
-            .clone();
+        let resumed_project = agent.sessions[&departed_id].thread.read(cx).project.clone();
         let roots = resumed_project
             .read(cx)
             .worktrees(cx)
