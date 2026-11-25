@@ -1,6 +1,7 @@
 # Issue 079 — `rig run --gpu-mem N` never admits on Metal rigs (amo/bmo/m3)
 
 **Status:** OPEN — unclaimed (filed 2026-11-24 by katgpt-rs-ff@amo)
+**Claimed:** zed-504dde51@amo, 1795575237, expires 2026-11-26T03:20:00+00:00 — scope: the whole fix shape (unified-memory arm + loud never-fits refusal + queue-head blocked reason + tests), one landing.
 
 ## Defect
 
