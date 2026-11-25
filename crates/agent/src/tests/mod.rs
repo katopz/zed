@@ -1252,6 +1252,140 @@ async fn test_tool_call_id_scoped_per_completion_request(cx: &mut TestAppContext
 }
 
 #[gpui::test]
+async fn test_generation_loop_guard_stops_identical_text_flood(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        fake,
+        thread,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+
+    let mut events = thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Say something"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    // A legitimate run of identical chunks below the limit streams fine.
+    for _ in 0..(GENERATION_LOOP_CHUNK_LIMIT) {
+        fake.send_last_text(&model, "stop");
+    }
+    cx.run_until_parked();
+
+    // The next identical chunk trips the guard: the generation is aborted,
+    // the tripping chunk is NOT forwarded, and the typed error drives ONE
+    // bounded retry (RetryStatus with max_attempts 1) — the issue-078 ask.
+    fake.send_last_text(&model, "stop");
+    fake.end_last(&model);
+    cx.run_until_parked();
+
+    // Drain the queued events non-blockingly (never awaiting across the
+    // executor's fake timers — the retried stream's idle timer would fire
+    // before it is driven) and find the trip's Retry row. `try_next` errs
+    // `Empty` when the queue is momentarily drained — the retry delay timer
+    // is still pending — and that is the drain's end, not a failure.
+    let mut retry_errors = Vec::new();
+    loop {
+        match events.try_next() {
+            Ok(Some(Ok(ThreadEvent::Retry(status))))
+                if status.last_error.contains("generation loop detected") =>
+            {
+                retry_errors.push(status);
+            }
+            Ok(Some(Ok(ThreadEvent::Stop(..)))) => break,
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => break,
+        }
+    }
+    assert_eq!(
+        retry_errors.len(),
+        1,
+        "exactly one bounded retry: {retry_errors:?}"
+    );
+    let error_text = &retry_errors[0].last_error;
+    assert!(error_text.contains("101 times in a row"), "{error_text}");
+    assert!(
+        error_text.contains("stop"),
+        "the error should name the flooding chunk: {error_text}"
+    );
+    assert_eq!(
+        (retry_errors[0].attempt, retry_errors[0].max_attempts),
+        (1, 1),
+        "the breaker grants exactly one retry attempt"
+    );
+
+    // Walk the retry's delay explicitly, then drive the fresh generation
+    // IMMEDIATELY — before its idle timer can fire.
+    cx.executor().advance_clock(Duration::from_secs(31));
+    cx.run_until_parked();
+    fake.send_last_text(&model, "All done.");
+    fake.end_last(&model);
+    let remaining = events.collect::<Vec<_>>().await;
+    assert_eq!(stop_events(remaining), vec![acp_v2::StopReason::EndTurn]);
+
+    // The transcript holds exactly the limit's worth of the flooded chunk
+    // (the guard's cut) plus the retry's fresh text — not the flood.
+    thread.read_with(cx, |thread, _cx| {
+        let markdown = thread.to_markdown();
+        assert_eq!(
+            markdown.matches("stop").count(),
+            GENERATION_LOOP_CHUNK_LIMIT,
+            "the guard must stop the flood at the limit, not stream it"
+        );
+        assert!(
+            markdown.contains("All done."),
+            "the retried generation must complete: {markdown}"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_generation_loop_guard_resets_when_text_changes(cx: &mut TestAppContext) {
+    let ThreadTest {
+        model,
+        fake,
+        thread,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+
+    let mut events = thread
+        .update(cx, |thread, cx| {
+            thread.send(ClientUserMessageId::new(), ["Say something"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    // Alternating chunks never trip: any different chunk resets the run.
+    for _ in 0..4 {
+        for _ in 0..GENERATION_LOOP_CHUNK_LIMIT {
+            fake.send_last_text(&model, "stop");
+        }
+        fake.send_last_text(&model, ":");
+    }
+    fake.send_last_event(
+        &model,
+        LanguageModelCompletionEvent::Stop(StopReason::EndTurn),
+    );
+    fake.end_last(&model);
+
+    let collected = events.collect::<Vec<_>>().await;
+    assert!(
+        collected.iter().all(|event| event.as_ref().err().is_none()),
+        "alternating chunks must never trip the guard: {collected:?}"
+    );
+    assert_eq!(stop_events(collected), vec![acp_v2::StopReason::EndTurn]);
+    thread.read_with(cx, |thread, _cx| {
+        let markdown = thread.to_markdown();
+        assert_eq!(
+            markdown.matches("stop").count(),
+            4 * GENERATION_LOOP_CHUNK_LIMIT,
+            "every legitimate chunk must reach the transcript"
+        );
+    });
+}
+
+#[gpui::test]
 async fn test_tool_loop_guard_stops_identical_calls(cx: &mut TestAppContext) {
     let ThreadTest {
         model,

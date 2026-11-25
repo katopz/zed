@@ -61,7 +61,7 @@ use settings::{
 use std::fmt::Write;
 use std::{cell::RefCell, ops::ControlFlow};
 use std::{
-    collections::{hash_map::DefaultHasher, BTreeMap},
+    collections::{BTreeMap, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
     marker::PhantomData,
     ops::RangeInclusive,
@@ -80,6 +80,11 @@ const TOOL_CANCELED_MESSAGE: &str = "Tool canceled by user";
 /// stops the turn. Repeats that are not consecutive (e.g. re-running the same
 /// command after an edit) never accumulate toward it.
 const TOOL_LOOP_CALL_LIMIT: usize = 3;
+/// Issue 078: how many consecutive identical non-empty text chunks a turn
+/// may stream before the generation is declared degenerate. Far above any
+/// legitimate repetition (a table, a repeated heading), far below the
+/// observed flood (thousands of one token).
+pub(crate) const GENERATION_LOOP_CHUNK_LIMIT: usize = 100;
 const TOOL_CALL_INTERRUPTED_BY_FOLLOW_UP_MESSAGE: &str =
     "Permission denied: user sent a follow-up message instead of approving the tool call.";
 pub(crate) const FOLLOW_UP_PERMISSION_DENIED_OPTION_ID: &str = "follow_up_permission_denied";
@@ -3723,8 +3728,15 @@ impl Thread {
             StartMessage { .. } => {
                 self.flush_pending_message(cx);
                 self.pending_message = Some(AgentMessage::default());
+                // A new completion attempt is a new generation (issue 078):
+                // the flood counter starts over, so the bounded retry gets a
+                // clean guard and a second degenerate generation trips on
+                // its own run.
+                if let Some(running_turn) = self.running_turn.as_mut() {
+                    running_turn.text_loop_guard.reset();
+                }
             }
-            Text(new_text) => self.handle_text_event(new_text, event_stream),
+            Text(new_text) => self.handle_text_event(new_text, event_stream)?,
             Thinking { text, signature } => {
                 self.handle_thinking_event(text, signature, event_stream)
             }
@@ -3790,7 +3802,27 @@ impl Thread {
         Ok(None)
     }
 
-    fn handle_text_event(&mut self, new_text: String, event_stream: &ThreadEventStream) {
+    fn handle_text_event(
+        &mut self,
+        new_text: String,
+        event_stream: &ThreadEventStream,
+    ) -> Result<(), LanguageModelCompletionError> {
+        // Issue 078: the degenerate-generation breaker runs BEFORE the chunk
+        // is forwarded, so the flood stops at the limit instead of landing in
+        // the transcript.
+        if let Some(detail) = self
+            .running_turn
+            .as_mut()
+            .and_then(|turn| turn.text_loop_guard.record_text(&new_text))
+        {
+            log::warn!("Generation loop guard tripped, aborting turn: {detail}");
+            telemetry::event!(
+                "Agent Generation Loop Guard Tripped",
+                thread_id = self.id.to_string(),
+                detail
+            );
+            return Err(GenerationLoopDetected::error(detail));
+        }
         event_stream.send_text(&new_text);
 
         let last_message = self.pending_message();
@@ -3801,6 +3833,7 @@ impl Thread {
                 .content
                 .push(AgentMessageContent::Text(new_text));
         }
+        Ok(())
     }
 
     fn handle_thinking_event(
@@ -3898,10 +3931,7 @@ impl Thread {
 
                 // First partial input of a new streaming call: this is where
                 // the call starts executing, so it counts toward the loop guard.
-                match running_turn
-                    .tool_loop_guard
-                    .record_execution(&tool_use)
-                {
+                match running_turn.tool_loop_guard.record_execution(&tool_use) {
                     ToolLoopDecision::Run => {}
                     ToolLoopDecision::Refuse(notice) => {
                         return Some(Self::loop_guard_refused_task(
@@ -4994,6 +5024,14 @@ impl Thread {
             // Retrying won't help until the thread picks another model.
             ModelUnavailable { .. } => None,
             Other(error) if StreamIdleTimeout::is(error) => Some(STREAM_IDLE_RETRY_STRATEGY),
+            // Issue 078: a degenerate generation gets exactly ONE fresh
+            // attempt — a transient sampling glitch costs one retry, a
+            // persistent loop surfaces the typed error after the second flood
+            // is cut off at the limit.
+            Other(error) if GenerationLoopDetected::is(error) => Some(RetryStrategy::FixedDelay {
+                delay: BASE_RETRY_DELAY,
+                max_attempts: 1,
+            }),
             // `Other` includes mid-stream mapping failures that can be caused by
             // a transient malformed or interrupted provider event.
             Other(..) => Some(RetryStrategy::FixedDelay {
@@ -5236,6 +5274,56 @@ struct RunningTurn {
     streaming_tool_inputs: HashMap<LanguageModelToolUseId, ToolInputSender>,
     /// Detects the model repeating identical tool calls within this turn.
     tool_loop_guard: ToolLoopGuard,
+    text_loop_guard: TextLoopGuard,
+}
+
+/// Per-turn guard against a degenerate generation streaming the same text
+/// chunk forever (issue 078: the token `stop:` repeated thousands of times
+/// into the transcript until the owner cancelled). Counts consecutive
+/// identical non-empty chunks; any different chunk resets the run, so
+/// legitimate repetition (tables, repeated headings) never trips at
+/// realistic sizes. At [`GENERATION_LOOP_CHUNK_LIMIT`] the turn aborts with
+/// the typed [`GenerationLoopDetected`] error (one bounded retry), instead
+/// of streaming the flood.
+#[derive(Default)]
+struct TextLoopGuard {
+    last_chunk: Option<String>,
+    consecutive_chunks: usize,
+}
+
+impl TextLoopGuard {
+    /// Records a streamed text chunk; `Some(detail)` when the generation is
+    /// declared degenerate and the turn must abort (the tripping chunk is
+    /// NOT forwarded).
+    fn record_text(&mut self, new_text: &str) -> Option<String> {
+        let normalized = new_text.trim();
+        if normalized.is_empty() {
+            return None;
+        }
+        if self.last_chunk.as_deref() == Some(normalized) {
+            self.consecutive_chunks += 1;
+        } else {
+            self.last_chunk = Some(normalized.to_string());
+            self.consecutive_chunks = 1;
+        }
+        if self.consecutive_chunks > GENERATION_LOOP_CHUNK_LIMIT {
+            let preview_len = normalized.len().min(40);
+            return Some(format!(
+                "the same text chunk repeated {} times in a row (limit {}), starting {:?}",
+                self.consecutive_chunks,
+                GENERATION_LOOP_CHUNK_LIMIT,
+                &normalized[..preview_len]
+            ));
+        }
+        None
+    }
+
+    /// A fresh completion attempt is a fresh sampling: the run counting
+    /// starts over, so the bounded retry (issue 078) gets a clean guard and
+    /// a SECOND degenerate generation trips on its own run.
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
 }
 
 /// What [`ToolLoopGuard::record_execution`] decided about a tool call that is
@@ -5322,6 +5410,7 @@ impl RunningTurn {
             cancellation_tx,
             streaming_tool_inputs: HashMap::default(),
             tool_loop_guard: ToolLoopGuard::default(),
+            text_loop_guard: TextLoopGuard::default(),
         }
     }
 
@@ -9900,7 +9989,9 @@ mod tests {
 
         // Fast mode defaults to on when `agent.default_model.speed` is unset.
         let thread = new_thread(cx);
-        thread.read_with(cx, |thread, _| assert_eq!(thread.speed(), Some(Speed::Fast)));
+        thread.read_with(cx, |thread, _| {
+            assert_eq!(thread.speed(), Some(Speed::Fast))
+        });
 
         // An explicit `agent.default_model.speed` still takes precedence.
         cx.update(|cx| {

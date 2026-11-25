@@ -77,6 +77,31 @@ pub(crate) const MAX_RETRY_AFTER: Duration = Duration::from_secs(2 * 60);
 /// recovers, so keep the turn alive with a longer automatic budget (4 retries
 /// × 30s, on top of each attempt's own idle-timeout wait) instead of surfacing
 /// the error and waiting for the user to click retry.
+/// Payload of the `LanguageModelCompletionError::Other` raised when a
+/// generation streams the same text chunk past the repetition limit
+/// (issue 078: a token flooded the transcript for thousands of repetitions
+/// until the owner cancelled). Typed so the retry strategy can grant the
+/// aborted turn exactly ONE bounded retry — a transient sampling glitch
+/// costs one fresh generation, a persistent loop surfaces the typed error
+/// instead of re-flooding — without string matching.
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub(crate) struct GenerationLoopDetected {
+    message: String,
+}
+
+impl GenerationLoopDetected {
+    pub(crate) fn error(detail: impl std::fmt::Display) -> LanguageModelCompletionError {
+        LanguageModelCompletionError::Other(anyhow::Error::new(Self {
+            message: format!("generation loop detected: {detail}"),
+        }))
+    }
+
+    pub(super) fn is(error: &anyhow::Error) -> bool {
+        error.downcast_ref::<Self>().is_some()
+    }
+}
+
 pub(super) const STREAM_IDLE_RETRY_STRATEGY: RetryStrategy = RetryStrategy::FixedDelay {
     delay: STREAM_IDLE_RETRY_DELAY,
     max_attempts: MAX_RETRY_ATTEMPTS,
