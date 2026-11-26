@@ -445,6 +445,39 @@ impl Contention {
     }
 }
 
+/// Distinctive substring markers for the broken-parentage affinity arm,
+/// extracted from a job's own payload command (riir-ai 1263 watcher item,
+/// 2026-11-26): path-like and separator-bearing tokens long enough that a
+/// foreign process cannot carry them by coincidence
+/// (`/e/tmp/t2_gpu_leg_run.ps1`, `bench_734-8926a1b`). Short words and bare
+/// flags are dropped; a token already covered by a kept marker is dropped
+/// (containment dedup); lowercase for Windows path-case tolerance; capped
+/// at 16.
+pub fn payload_markers(argv: &[String]) -> Vec<String> {
+    let mut markers: Vec<String> = Vec::new();
+    for arg in argv {
+        for token in arg.split_whitespace() {
+            let token = token.trim_matches('"').trim_matches('\'');
+            let distinctive = token.len() >= 8
+                && (token.contains('/')
+                    || token.contains('\\')
+                    || token.contains('.')
+                    || token.contains('_')
+                    || token.contains('='));
+            let covered = markers
+                .iter()
+                .any(|marker| token.contains(marker.as_str()) || marker.contains(token));
+            if distinctive && !covered {
+                markers.push(token.to_ascii_lowercase());
+                if markers.len() >= 16 {
+                    return markers;
+                }
+            }
+        }
+    }
+    markers
+}
+
 /// The processes a managed job owns (sprint!087 F3): every process whose
 /// process group is one of `roots` (each managed pid leads its own group —
 /// `process_group(0)` at spawn — and a pid is never reused while a group of
@@ -453,13 +486,54 @@ impl Contention {
 /// arm is what keeps an orphaned `rustc`/`clang` — re-parented to launchd
 /// when its `cargo` exited between probe ticks — excluded; the descendant
 /// arm still covers children that left the group (a nested `setsid`).
-pub fn job_tree(rows: &[ProcessRow], roots: &[u32]) -> std::collections::HashSet<u32> {
+///
+/// `markers` (riir-ai 1263, the rig watcher item, 2026-11-26) arms the
+/// broken-parentage affinity arm: on Windows a child of an exited MSYS fork
+/// stub keeps its `parent` pointing at a pid that is absent from every later
+/// snapshot — Windows never re-parents orphans — so the job's own
+/// cargo/rustc compile legs read as intruders (the documented POISONED ×N
+/// own-children false-positive class; three adjudications on 2026-11-26
+/// alone). A broken-parentage row (parent pid absent from `rows`, the row
+/// not itself a seed) whose command carries one of the job's own payload
+/// markers is seeded into the tree, so its live children rejoin through the
+/// normal descendant walk. The marker set derives from the job's own
+/// command, which no foreign process carries by coincidence; a
+/// broken-parentage row WITHOUT a marker hit still poisons (fail-safe),
+/// and rows with a live parent are untouched by the arm. On Unix this is a
+/// secondary defense beside the group arm and fires only on the transient
+/// not-yet-reparented class.
+pub fn job_tree(
+    rows: &[ProcessRow],
+    roots: &[u32],
+    markers: &[String],
+) -> std::collections::HashSet<u32> {
     let mut seeds: Vec<u32> = roots.to_vec();
     seeds.extend(
         rows.iter()
             .filter(|row| row.group.is_some_and(|group| roots.contains(&group)))
             .map(|row| row.pid),
     );
+    if !markers.is_empty() {
+        let live: std::collections::HashSet<u32> = rows.iter().map(|row| row.pid).collect();
+        for row in rows {
+            if seeds.contains(&row.pid) {
+                continue;
+            }
+            let Some(parent) = row.parent else {
+                continue;
+            };
+            if live.contains(&parent) {
+                continue;
+            }
+            if row.command.is_empty() {
+                continue;
+            }
+            let lowered = row.command.to_ascii_lowercase();
+            if markers.iter().any(|marker| lowered.contains(marker)) {
+                seeds.push(row.pid);
+            }
+        }
+    }
     descendants(rows, &seeds)
 }
 
@@ -479,11 +553,11 @@ pub fn descendants(rows: &[ProcessRow], roots: &[u32]) -> std::collections::Hash
     }
 }
 
-pub fn contention(exclude_trees: &[u32]) -> Contention {
+pub fn contention(exclude_trees: &[u32], payload_markers: &[String]) -> Contention {
     let processes = process_table();
     let mut roots = exclude_trees.to_vec();
     roots.push(std::process::id());
-    let excluded = job_tree(&processes.rows, &roots);
+    let excluded = job_tree(&processes.rows, &roots, payload_markers);
     let (contenders, blind) = match vocabulary_dir().map(|dir| Vocabulary::load(&dir)) {
         Some(Ok(vocabulary)) => {
             let limits = Thresholds::from_env();
@@ -613,7 +687,8 @@ pub fn probe(mailroom: &Mailroom) -> RigProbe {
         ProbeSweep::ReapOnly => mailroom.reap_jobs_only().ok(),
     };
     let jobs = mailroom.job_summary();
-    let contention = contention(&jobs.managed_pids);
+    let markers = payload_markers(&jobs.payload_argv);
+    let contention = contention(&jobs.managed_pids, &markers);
     let not_quiet_because = quiet_reasons(contention.not_quiet_because, jobs.running.len());
     RigProbe {
         rig,
@@ -1659,7 +1734,7 @@ mod tests {
              700     1   700  99.0  4194304  3:00.00 /bin/rustc --crate-name foreign\n\
              701     1   701  99.0  4194304  3:00.00 /usr/bin/ld foreign\n",
         );
-        let tree = job_tree(&rows, &[500, 600]);
+        let tree = job_tree(&rows, &[500, 600], &[]);
         assert!(
             tree.contains(&610),
             "the re-parented rustc stays the job's own"
@@ -1674,6 +1749,82 @@ mod tests {
         assert!(
             !old.contains(&610),
             "the parent chain alone cannot see the orphan"
+        );
+    }
+
+    /// riir-ai 1263 (2026-11-26): on Windows a child of an exited MSYS fork
+    /// stub keeps `parent` pointing at an absent pid forever (no reparent).
+    /// The job's own cargo/rustc must rejoin the owned tree through the
+    /// payload-marker affinity arm; a broken-parentage row without a marker
+    /// hit stays a contender (fail-safe), and a live-parent row is untouched.
+    #[test]
+    fn broken_parentage_rows_rejoin_through_payload_markers() {
+        let rows = parse_ps(
+            "  500     1   500   0.0  1024  0:00.10 agent-mail rig exec j\n\
+             600   500   600   0.0  1024  0:00.10 powershell -File /e/tmp/t2_gpu_leg_run.ps1\n\
+             610  999999   610  99.0 4194304  3:00.00 cargo.exe bench --bench bench_734_stub\n\
+             611   610   610  99.0 4194304  3:00.00 rustc --crate-name=bench_734_stub\n\
+             700  888888   700  99.0 4194304  3:00.00 cargo.exe test --manifest-path E:\\other\\repo\\Cargo.toml\n\
+             900       1   900   0.0  1024  0:00.01 init-spawned monitor\n\
+             800   900   800  99.0 4194304  3:00.00 cargo.exe build --release\n",
+        );
+        let argv = vec![
+            "powers".to_string(),
+            "-File".to_string(),
+            "/e/tmp/t2_gpu_leg_run.ps1 --bench bench_734_stub".to_string(),
+        ];
+        let markers = payload_markers(&argv);
+        assert!(
+            markers.iter().any(|m| m.contains("t2_gpu_leg_run.ps1")),
+            "the payload script path is a marker, got {markers:?}"
+        );
+        assert!(
+            markers.iter().any(|m| m.contains("bench_734_stub")),
+            "the bench target is a marker, got {markers:?}"
+        );
+        let tree = job_tree(&rows, &[500, 600], &markers);
+        assert!(
+            tree.contains(&610),
+            "the stub-orphaned cargo carries the payload marker and rejoins"
+        );
+        assert!(
+            tree.contains(&611),
+            "its live rustc child rejoins through the descendant walk"
+        );
+        assert!(
+            !tree.contains(&700),
+            "a broken-parentage foreign build without a marker hit stays a contender"
+        );
+        assert!(
+            !tree.contains(&800),
+            "a live-parent row (parent present, outside the tree) is untouched by the affinity arm"
+        );
+        // The old two-arg shape: no markers, no affinity — both stay foreign.
+        let plain = job_tree(&rows, &[500, 600], &[]);
+        assert!(!plain.contains(&610), "markers off: the stub class poisons as before");
+    }
+
+    #[test]
+    fn payload_markers_keep_only_distinctive_tokens() {
+        let argv = vec![
+            "bash".to_string(),
+            "-lc".to_string(),
+            "cargo bench --bench bench_947 --features deltanet_ternary_inference".to_string(),
+            "/e/tmp/driver.sh".to_string(),
+        ];
+        let markers = payload_markers(&argv);
+        assert!(
+            markers.iter().any(|m| m.contains("driver.sh")),
+            "path token kept, got {markers:?}"
+        );
+        assert!(
+            markers.iter().any(|m| m.contains("deltanet_ternary_inference")),
+            "long feature token kept, got {markers:?}"
+        );
+        assert!(
+            !markers.iter().any(|m| m.contains("cargo"))
+                && !markers.iter().any(|m| m.contains("bash")),
+            "short generic words dropped, got {markers:?}"
         );
     }
 

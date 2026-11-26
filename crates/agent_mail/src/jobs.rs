@@ -266,6 +266,9 @@ pub struct JobSummary {
     pub queued: Vec<JobLine>,
     /// Executor + child pids of running jobs: their trees are not contenders.
     pub managed_pids: Vec<u32>,
+    /// The running jobs' own payload commands (riir-ai 1263): the marker
+    /// source for the broken-parentage affinity arm in `rig::job_tree`.
+    pub payload_argv: Vec<String>,
 }
 
 /// Picks the rig for `rig run auto`: takes jobs, online, has the required
@@ -902,7 +905,8 @@ impl Mailroom {
             .iter()
             .find(|job| job.lane == Lane::Exclusive)
             .is_some();
-        let quiet = needs_quiet && running.is_empty() && rig::contention(&[]).quiet();
+        let quiet =
+            needs_quiet && running.is_empty() && rig::contention(&[], &[]).quiet();
         let cooled = fs::metadata(self.jobs_dir("last_exclusive_end"))
             .and_then(|metadata| metadata.modified())
             .ok()
@@ -1094,7 +1098,7 @@ impl Mailroom {
         // Clean-environment evidence (issue 056): a timed cell that did not
         // start QUIET is suspect however its numbers turn out. Own pid is
         // excluded — the executor itself is not a contender.
-        environment.quiet_at_start = Some(rig::contention(&[std::process::id()]).quiet());
+        environment.quiet_at_start = Some(rig::contention(&[std::process::id()], &[]).quiet());
         record.environment = Some(environment);
         write_json(&record_path, &record)?;
         self.job_mail_kind(
@@ -1219,7 +1223,10 @@ impl Mailroom {
             }
             if record.spec.lane == Lane::Exclusive && last_probe.elapsed() >= POISON_PROBE_EVERY {
                 last_probe = Instant::now();
-                let contention = rig::contention(&[std::process::id(), child.id()]);
+                let contention = rig::contention(
+                    &[std::process::id(), child.id()],
+                    &rig::payload_markers(&record.spec.argv),
+                );
                 // sprint!087 F2: a recorded poisoner still running keeps the
                 // run poisoned — dedup by pid hides it from `fresh`, so it is
                 // checked here or "clean since" would lie through a long build.
@@ -1923,6 +1930,7 @@ impl Mailroom {
             running: Vec::new(),
             queued: Vec::new(),
             managed_pids: Vec::new(),
+            payload_argv: Vec::new(),
         };
         let mut reserved = Needs::default();
         for path in json_files(&self.jobs_dir("running")) {
@@ -1934,6 +1942,7 @@ impl Mailroom {
             reserved.gpu_mem_gb += record.spec.needs.gpu_mem_gb;
             summary.managed_pids.push(record.executor_pid);
             summary.managed_pids.extend(record.child_pid);
+            summary.payload_argv.extend(record.spec.argv.iter().cloned());
             let elapsed = chrono::DateTime::parse_from_rfc3339(&record.started_at)
                 .map(|at| chrono::Utc::now().signed_duration_since(at).num_minutes())
                 .unwrap_or(0);
