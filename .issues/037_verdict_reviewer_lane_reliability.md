@@ -1,9 +1,8 @@
 # 037 — verdict reviewer lane reliability (abort+error 4x over gate)
 
-Status: OPEN — filed 2026-11-11 (amo idle lane) from the bench-001 verdict session (`.benchmarks/001`, 2026-11-11 section): the reviewer lane's failure rate, not the `verdict_ping_pong` flag default, is where the verdict lane loses its value.
+Status: OPEN — tasks 1+2 LANDED `0145308da0` (2026-11-12, "verdict reviewer lane survives rate limits and transient failures"; verified in-tree this session: `classify_reviewer_failure` + `Verdict Reviewer Failover`/`Failed` telemetry in `crates/acp_thread/src/verdict.rs` + `crates/agent/src/tools/request_verdict_tool.rs`, the scorer `reliability` block live at script/verdict_scorer.py:651); task 4 (the <10% abort+error gate) stays bound to the next bench-001 re-run at +20 ON chains — mechanical, not actionable until verdict traffic accrues. Filed 2026-11-11 (amo idle lane) from the bench-001 verdict session: the reviewer lane's failure rate, not the `verdict_ping_pong` flag default, is where the verdict lane loses its value.
 **Lease closed:** amo-zed-037acct@amo (epoch 1794477600) — scoped to task 3, which landed 2026-11-11 (the scorer `reliability` block + gate line); reshaped 2026-11-12 when tasks 1/2 were re-claimed.
-**Claimed:** amo-zed-037fb@amo, 1794445702, expires 2026-11-14T01:08:22+00:00
-Scoped to tasks 1+2 (rate-limit failover/re-park + bounded transient retry); task 4 (gate check) stays with the next bench-001 re-run at +20 ON chains.
+**Lease closed:** amo-zed-037fb@amo (epoch 1794445702, was expires 2026-11-14T01:08:22+00:00) — tasks 1+2 delivered by `0145308da0`; the lease expired with the fold never run; folded 2026-11-28 by the i1253 wake-chain lane's queue sweep (zed-89f80932@amo).
 
 ## Evidence
 
