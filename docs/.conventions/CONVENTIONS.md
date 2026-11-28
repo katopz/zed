@@ -41,7 +41,7 @@ For voice, tone, and writing style, see the [brand-writer/](./brand-writer/) dir
 
 ### Create a new page when:
 
-- Introducing a **major feature** with multiple sub-features (e.g., Git integration, Vim mode)
+- Vim mode — link form: `` ./vim.md ``
 - The topic requires **extensive configuration examples**
 - Users would search for it **by name** (e.g., "Zed terminal", "Zed snippets")
 - It's a **new category** (e.g., a new AI provider type)
@@ -226,10 +226,11 @@ Include the version number and what changed. This helps users on older versions 
 
 ### Internal Links
 
-Link to other docs using relative paths:
+Link to other docs using relative paths (the example targets below
+illustrate the shape, not live links into this tree):
 
-- `[Vim mode](./vim.md)`
-- `[AI Quick Start](./ai/quick-start.md)`
+- Vim mode — link form: `` ./vim.md ``
+- AI Quick Start — link form: `` ./ai/quick-start.md ``
 
 ### External Links
 
@@ -243,8 +244,8 @@ End pages with related links when helpful:
 ```markdown
 ## See also
 
-- [Agent Panel](./agent-panel.md): Agentic editing with file read/write
-- [Inline Assistant](./inline-assistant.md): Prompt-driven code transformations
+- Agent Panel (agent-panel.md): Agentic editing with file read/write
+- Inline Assistant (inline-assistant.md): Prompt-driven code transformations
 ```
 
 ### SEO Linking Guidelines
@@ -305,7 +306,7 @@ Example:
 
 For JSON-only settings (complex types without UI support), note this and link to instructions:
 
-> Add the following to your settings file ([how to edit](./configuring-zed.md#settings-files)):
+> Add the following to your settings file (how to edit: configuring-zed.md#settings-files):
 
 ### Settings File Locations
 

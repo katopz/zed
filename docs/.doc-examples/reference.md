@@ -22,11 +22,11 @@ description: Built-in tools for Zed's AI agent including file editing, code sear
 
 # Tools
 
-Zed's built-in agent has access to these tools for reading, searching, and editing your codebase. These tools are used in the [Agent Panel](./agent-panel.md) during conversations with AI agents.
+Zed's built-in agent has access to these tools for reading, searching, and editing your codebase. These tools are used in the [Agent Panel](../src/ai/agent-panel.md) during conversations with AI agents.
 
-You can configure permissions for tool actions, including situations where they are automatically approved, automatically denied, or require your confirmation on a case-by-case basis. See [Tool Permissions](./tool-permissions.md) for the list of permission-gated tools and details.
+You can configure permissions for tool actions, including situations where they are automatically approved, automatically denied, or require your confirmation on a case-by-case basis. See [Tool Permissions](../src/ai/tool-permissions.md) for the list of permission-gated tools and details.
 
-To add custom tools beyond these built-in ones, see [MCP servers](./mcp.md).
+To add custom tools beyond these built-in ones, see [MCP servers](../src/ai/mcp.md).
 
 ## Read & Search Tools {#read-search-tools}
 
@@ -100,6 +100,6 @@ Spawns a subagent with its own context window to perform a delegated task. Usefu
 
 ## See Also {#see-also}
 
-- [Agent Panel](./agent-panel.md) — Where you interact with AI agents
-- [Tool Permissions](./tool-permissions.md) — Configure which tools require approval
-- [MCP Servers](./mcp.md) — Add custom tools via Model Context Protocol
+- [Agent Panel](../src/ai/agent-panel.md) — Where you interact with AI agents
+- [Tool Permissions](../src/ai/tool-permissions.md) — Configure which tools require approval
+- [MCP Servers](../src/ai/mcp.md) — Add custom tools via Model Context Protocol

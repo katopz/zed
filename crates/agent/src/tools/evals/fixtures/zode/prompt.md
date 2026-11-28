@@ -24,7 +24,7 @@ and offers both synchronous and asynchronous clients powered by [httpx](https://
 
 ## Documentation
 
-The REST API documentation can be found on [docs.anthropic.com](https://docs.anthropic.com/claude/reference/). The full API of this library can be found in [api.md](api.md).
+The REST API documentation can be found on [docs.anthropic.com](https://docs.anthropic.com/claude/reference/). The full API of this library can be found in api.md.
 
 ## Installation
 
@@ -35,7 +35,7 @@ pip install anthropic
 
 ## Usage
 
-The full API of this library can be found in [api.md](api.md).
+The full API of this library can be found in api.md.
 
 ```python
 import os
@@ -173,7 +173,7 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-Streaming with `client.messages.stream(...)` exposes [various helpers for your convenience](helpers.md) including accumulation & SDK-specific events.
+Streaming with `client.messages.stream(...)` exposes various helpers for your convenience (helpers.md) including accumulation & SDK-specific events.
 
 Alternatively, you can use `client.messages.create(..., stream=True)` which only returns an async iterable of the events in the stream and thus uses less memory (it does not build up a final message object for you).
 
@@ -755,7 +755,7 @@ Python 3.8 or higher.
 
 ## Contributing
 
-See [the contributing documentation](./CONTRIBUTING.md).
+See the contributing documentation (CONTRIBUTING.md).
 ```
 
 
@@ -1413,7 +1413,7 @@ MCP servers declare capabilities during initialization:
 
 ## Contributing
 
-We are passionate about supporting contributors of all levels of experience and would love to see you get involved in the project. See the [contributing guide](CONTRIBUTING.md) to get started.
+We are passionate about supporting contributors of all levels of experience and would love to see you get involved in the project. See the contributing guide (CONTRIBUTING.md) to get started.
 
 ## License
 

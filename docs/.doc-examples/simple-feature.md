@@ -28,7 +28,7 @@ Zed provides several ways to move around your codebase quickly. Here's an overvi
 
 The Command Palette ({#kb command_palette::Toggle}) is your gateway to almost everything in Zed. Type a few characters to filter commands, then press Enter to execute.
 
-[Learn more about the Command Palette →](./command-palette.md)
+[Learn more about the Command Palette →](../src/command-palette.md)
 
 ## File Finder {#file-finder}
 
@@ -36,7 +36,7 @@ Open any file in your project with {#kb file_finder::Toggle}. Type part of the f
 
 ## Project Search {#project-search}
 
-Search across all files with {#kb pane::DeploySearch}. Results appear in a [multibuffer](./multibuffers.md), letting you edit matches in place.
+Search across all files with {#kb pane::DeploySearch}. Results appear in a [multibuffer](../src/multibuffers.md), letting you edit matches in place.
 
 ## Go to Definition {#go-to-definition}
 
@@ -49,15 +49,15 @@ Jump to where a symbol is defined with {#kb editor::GoToDefinition} (or `Cmd+Cli
 
 ## Outline Panel {#outline-panel}
 
-The Outline Panel ({#kb outline_panel::ToggleFocus}) shows a persistent tree view of symbols in the current file. It's especially useful with [multibuffers](./multibuffers.md) for navigating search results or diagnostics.
+The Outline Panel ({#kb outline_panel::ToggleFocus}) shows a persistent tree view of symbols in the current file. It's especially useful with [multibuffers](../src/multibuffers.md) for navigating search results or diagnostics.
 
-[Learn more about the Outline Panel →](./outline-panel.md)
+[Learn more about the Outline Panel →](../src/outline-panel.md)
 
 ## Tab Switcher {#tab-switcher}
 
 Quickly switch between open tabs with {#kb tab_switcher::Toggle}. Tabs are sorted by recent use—keep holding Ctrl and press Tab to cycle through them.
 
-[Learn more about the Tab Switcher →](./tab-switcher.md)
+[Learn more about the Tab Switcher →](../src/tab-switcher.md)
 
 ## Quick Reference {#quick-reference}
 
@@ -75,7 +75,7 @@ Quickly switch between open tabs with {#kb tab_switcher::Toggle}. Tabs are sorte
 
 ## See Also {#see-also}
 
-- [Command Palette](./command-palette.md) — Full command palette documentation
-- [Multibuffers](./multibuffers.md) — Edit multiple files simultaneously
-- [Outline Panel](./outline-panel.md) — Symbol tree view
-- [Tab Switcher](./tab-switcher.md) — Switch between open files
+- [Command Palette](../src/command-palette.md) — Full command palette documentation
+- [Multibuffers](../src/multibuffers.md) — Edit multiple files simultaneously
+- [Outline Panel](../src/outline-panel.md) — Symbol tree view
+- [Tab Switcher](../src/tab-switcher.md) — Switch between open files

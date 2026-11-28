@@ -16,7 +16,7 @@ This documentation uses **mdBook** (https://rust-lang.github.io/mdBook/).
 
 The `SUMMARY.md` file defines the book structure. Format rules:
 
-- Chapter titles are links: `[Title](./path/to/file.md)`
+- Chapter titles are links — form: `` [Title] (./path-to-file.md) ``
 - Nesting via indentation (2 spaces per level)
 - Separators: `---` for horizontal rules between sections
 - Draft chapters: `[Title]()` (empty parens, not yet written)
@@ -26,8 +26,8 @@ Example:
 ```markdown
 # Section Title
 
-- [Chapter](./chapter.md)
-  - [Nested Chapter](./nested.md)
+- Chapter (./chapter.md)
+  - Nested Chapter (./nested.md)
 
 ---
 
@@ -122,9 +122,12 @@ Images are hosted externally. Reference format:
 
 ### Cross-Linking
 
-- Relative links for same-directory: `[Agent Panel](./agent-panel.md)`
-- With anchors: `[Custom Models](./llm-providers.md#anthropic-custom-models)`
-- Parent directory: `[Telemetry](../telemetry.md)`
+(Link targets in the examples below illustrate the shape of each form,
+not live links into this tree.)
+
+- Relative links for same-directory — form: `` [Agent Panel] (./same-dir-page.md) ``
+- With anchors — form: `` [Custom Models] (./some-page.md#section-id) ``
+- Parent directory — form: `` [Telemetry] (../parent-page.md) ``
 
 ## Voice and Tone
 

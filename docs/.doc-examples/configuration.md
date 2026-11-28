@@ -23,7 +23,7 @@ description: Configure Zed with the Settings Editor, JSON files, and project-spe
 
 This guide explains how Zed's settings system works, including the Settings Editor, JSON configuration files, and project-specific settings.
 
-For visual customization (themes, fonts, icons), see [Appearance](./appearance.md).
+For visual customization (themes, fonts, icons), see [Appearance](../src/appearance.md).
 
 ## Settings Editor {#settings-editor}
 
@@ -152,7 +152,7 @@ These are useful for sharing configuration tips or linking from documentation.
 
 ## See Also {#see-also}
 
-- [Appearance](./appearance.md) — Themes, fonts, and visual customization
-- [Key bindings](./key-bindings.md) — Customize keyboard shortcuts
-- [AI Quick Start](./ai/quick-start.md) — Set up AI providers, models, and agent settings
-- [All Settings](./reference/all-settings.md) — Complete settings reference
+- [Appearance](../src/appearance.md) — Themes, fonts, and visual customization
+- [Key bindings](../src/key-bindings.md) — Customize keyboard shortcuts
+- [AI Quick Start](../src/ai/quick-start.md) — Set up AI providers, models, and agent settings
+- [All Settings](../src/reference/all-settings.md) — Complete settings reference

@@ -226,10 +226,10 @@ Zed currently supports LLM-powered commit message generation.
 You can ask AI to generate a commit message by focusing on the message editor within the Git Panel and either clicking on the pencil icon in the bottom left, or reaching for the {#action git::GenerateCommitMessage} ({#kb git::GenerateCommitMessage}) keybinding.
 
 > **Note:** You need to have an LLM provider configured either via your own API keys or through Zed's hosted AI models.
-> Visit [AI Quick Start](./ai/quick-start.md) to learn how to do so.
+> Visit [AI Quick Start](../src/ai/quick-start.md) to learn how to do so.
 
 You can specify your preferred model to use by providing a `commit_message_model` agent setting.
-See [Feature-specific models](./ai/agent-settings.md#feature-specific-models) for more information.
+See [Feature-specific models](../src/ai/agent-settings.md#feature-specific-models) for more information.
 
 ```json [settings]
 {
@@ -291,8 +291,8 @@ You can configure multiple custom providers if you work with several self-hosted
 
 Zed also has a Copy Permalink feature to create a permanent link to a code snippet on your Git hosting service.
 These links are useful for sharing a specific line or range of lines in a file at a specific commit.
-Trigger this action via the [Command Palette](./getting-started.md#command-palette) (search for `permalink`),
-by creating a [custom key bindings](key-bindings.md#custom-key-bindings) to the
+Trigger this action via the [Command Palette](../src/getting-started.md#command-palette) (search for `permalink`),
+by creating a [custom key bindings](../src/key-bindings.md#custom-key-bindings) to the
 `editor::CopyPermalinkToLine` or `editor::OpenPermalinkToLine` actions
 or by simply right clicking and selecting `Copy Permalink` with line(s) selected in your editor.
 
@@ -339,7 +339,7 @@ When viewing files with changes, Zed displays diff hunks that can be expanded or
 | {#action editor::ExpandAllDiffHunks}      | {#kb editor::ExpandAllDiffHunks}      |
 | {#action editor::ToggleSelectedDiffHunks} | {#kb editor::ToggleSelectedDiffHunks} |
 
-> **Note:** Not all actions have default keybindings, but can be bound by [customizing your keymap](./key-bindings.md#user-keymaps).
+> **Note:** Not all actions have default keybindings, but can be bound by [customizing your keymap](../src/key-bindings.md#user-keymaps).
 
 ## Git CLI Configuration {#cli-configuration}
 

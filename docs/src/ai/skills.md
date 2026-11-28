@@ -145,11 +145,15 @@ Skills with invalid names fail to load and surface an error in the UI.
 Keep the body of `SKILL.md` under 500 lines. Move detailed material to reference files and link to them from the body:
 
 ```markdown
-See [reference guide](references/REFERENCE.md) for complete API details.
+See [reference guide] (references/REFERENCE.md) for complete API details.
 
 Run the extraction script:
 scripts/extract.py
 ```
+
+(In this fenced example `references/REFERENCE.md` and
+`scripts/extract.py` are illustrative names inside the quoted
+template, not live links into this tree.)
 
 The agent loads these files on demand using the `read_file` and `list_directory` tools. Global skills under `~/.agents/skills/` are accessible to the agent even though they're outside your project.
 
